@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Testing
+.pytest_cache/
+
+# IDE / tools
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Storage (runtime data)
+.virtualcontext/
+
+# OS
+.DS_Store
