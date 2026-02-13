@@ -1,0 +1,131 @@
+version: "1.0"
+storage_root: ".virtualcontext"
+context_window: 120000
+token_counter: "estimate"   # "estimate" | "tiktoken" | "callable:module.path:func"
+
+domains:
+  legal:
+    description: "Legal matters, court filings, case strategy, attorney communications"
+    keywords:
+      - court
+      - filing
+      - motion
+      - attorney
+      - legal
+      - case
+      - judge
+      - plaintiff
+      - defendant
+      - deposition
+      - settlement
+      - statute
+      - jurisdiction
+    patterns:
+      - "\\bN\\.?J\\.?S\\.?A\\.?\\b"
+      - "\\bR\\.?\\s*\\d+:\\d+"
+      - "\\b\\d{2}-cv-\\d+"
+    priority: 9
+    summary_prompt: |
+      Summarize this legal discussion. Preserve case names, filing deadlines,
+      court orders, legal strategies, and opposing counsel positions.
+    retrieval_limit: 5
+    retrieval_max_tokens: 8000
+    ttl_days: null
+
+  medical:
+    description: "Health, medications, symptoms, lab results, doctor visits"
+    keywords:
+      - insulin
+      - medication
+      - doctor
+      - lab
+      - blood
+      - glucose
+      - prescription
+      - diagnosis
+      - symptoms
+      - appointment
+    priority: 8
+    retrieval_limit: 3
+    retrieval_max_tokens: 5000
+    ttl_days: 90
+
+  code:
+    description: "Programming, software development, debugging"
+    keywords:
+      - code
+      - function
+      - bug
+      - deploy
+      - git
+      - API
+      - database
+      - server
+      - error
+      - debug
+    priority: 6
+    retrieval_limit: 4
+    retrieval_max_tokens: 6000
+    ttl_days: 30
+
+  _general:
+    description: "General conversation"
+    priority: 1
+    retrieval_limit: 2
+    retrieval_max_tokens: 2000
+    ttl_days: 14
+
+classifier:
+  min_confidence: 0.3
+  pipeline:
+    - type: keyword
+    # - type: embedding       # v0.2
+    #   model: "all-MiniLM-L6-v2"
+    # - type: llm             # v0.3
+    #   provider: "anthropic"
+    #   model: "claude-haiku-4-5"
+
+compaction:
+  soft_threshold: 0.70
+  hard_threshold: 0.85
+  protected_recent_turns: 6
+  overflow_buffer: 1.2
+  summary_ratio: 0.15
+  min_summary_tokens: 200
+  max_summary_tokens: 2000
+  max_concurrent_summaries: 4
+
+summarization:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+  max_tokens: 1000
+  temperature: 0.3
+
+providers:
+  anthropic:
+    type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
+
+storage:
+  backend: "filesystem"
+  filesystem:
+    root: ".virtualcontext/store"
+
+assembly:
+  core_context_max_tokens: 18000
+  domain_context_max_tokens: 30000
+  core_files:
+    - path: "SOUL.md"
+      priority: 10
+    - path: "USER.md"
+      priority: 9
+    - path: "MEMORY.md"
+      priority: 7
+
+retrieval:
+  deep_retrieve_threshold: 0.8
+  skip_active_domains: true
+  active_domain_lookback: 4
+  velocity_fallback: true       # fall back to high-velocity domains when no keyword match
+  velocity_lookback: 10         # turn pairs to analyze for velocity
+  velocity_threshold: 0.3       # min domain concentration to trigger fallback
