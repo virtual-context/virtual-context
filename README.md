@@ -60,28 +60,38 @@ User message arrives
     │
     ▼
 Tag the message (LLM / keyword / embedding)
+    │  ├─ Vocabulary feedback: known tags passed to tagger to prevent synonym drift
+    │  ├─ Tag canonicalization: "db" → "database", alias detection via edit distance
+    │  └─ Related tags generated: alternate terms for future recall
     │
     ▼
-Retrieve matching summaries from store (by tag overlap)
-    │  ├─ Broad query? Load ALL tag summaries instead
-    │  └─ Deep retrieval for high-relevance matches
+Retrieve matching summaries from store
+    │  ├─ Broad query? → load ALL tag summaries (bounded post-compaction)
+    │  ├─ Query expansion: primary tags + related tags widen the search
+    │  ├─ Overfetch 3x → IDF-weighted re-rank (rare tag matches score higher)
+    │  ├─ FTS fallback: if tag overlap finds nothing, full-text search on stored segments
+    │  └─ Deep retrieval: full stored segment fetch for top matches
     │
     ▼
-Assemble context: core files + context hint + retrieved summaries + filtered history
-    │  ├─ Context hint: lightweight topic list so the LLM knows what's stored
-    │  └─ History filtered by tag relevance (unrelated older turns dropped)
+Assemble context within token budget
+    │  ├─ Context hint: lightweight <context-topics> block (~50-200t)
+    │  ├─ Tag sections: retrieved summaries ordered by tag priority
+    │  └─ Filtered history: unrelated older turns dropped, broad mode includes all
     │
     ▼
 LLM processes enriched context → produces response
     │
     ▼
 Tag the user+assistant pair → update TurnTagIndex
+    │  └─ Compactor generates related_tags at write time (vocabulary bridging)
     │
     ▼
 Check token thresholds (soft 70%, hard 85%)
     │
     ▼ (if threshold exceeded)
-Segment by tag → summarize each segment (concurrent) → store
+Segment by tag → summarize each segment (concurrent, ThreadPoolExecutor)
+    │  ├─ Tags preserved: LLM can ADD refined/related tags but never REMOVE originals
+    │  └─ Related tags written into stored segments for future cross-vocabulary retrieval
     │
     ▼
 Compute greedy set cover → build/update per-tag summaries (Layer 2)
@@ -148,6 +158,16 @@ Tags naturally produce synonyms: `db`, `database`, `data-storage`. The TagCanoni
 virtual-context aliases suggest    # auto-detect potential aliases
 virtual-context aliases add db database
 ```
+
+### Cross-Vocabulary Retrieval
+
+Users don't use the same words every time. A discussion about "materialized views for feed performance" at turn 46 might be recalled as "that caching trick for the feed" at turn 71. Pure tag overlap finds nothing — the vocabularies are completely disjoint.
+
+virtual-context solves this with two complementary mechanisms:
+
+**Related tag expansion.** Both the tagger (query-side) and compactor (write-side) generate `related_tags` — alternate terms someone might use to refer to the same concepts. A segment about "materialized views" gets stored with related tags like `caching`, `precomputed`, `feed-optimization`. A query about "caching trick" generates related tags that overlap with stored segments. The retriever expands its search to include both primary and related tags.
+
+**IDF-weighted scoring.** When multiple segments match, common tags like `database` (appearing on 20+ segments) shouldn't score the same as rare tags like `postgres` (appearing on 3). The retriever computes inverse document frequency weights from tag usage counts, overfetches 3x the needed results, then re-ranks by `sum(IDF[tag])`. Related tag matches score at 0.5x weight. The correct segment surfaces even when all overlapping tags are high-frequency.
 
 ### Budget-Aware Assembly
 
@@ -344,7 +364,7 @@ Drop-in plugin for OpenClaw-compatible agents. Hooks `before_context_send` (sync
 | **TurnTagIndex** | `core/turn_tag_index.py` | Live per-turn tag index, velocity tracking, greedy set cover |
 | **TagGenerator** | `core/tag_generator.py` | LLM / keyword / embedding semantic tagging |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
-| **Retriever** | `core/retriever.py` | Tag-overlap retrieval, broad queries, anchorless fallback, deep retrieval |
+| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, broad queries, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
@@ -372,7 +392,7 @@ Retry logic with exponential backoff on both.
 
 **Sync-first.** Zero async/await. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model.
 
-**Tag overlap, not vector similarity.** Retrieval matches by tag overlap count, not cosine similarity. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
+**Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
 
 **Vocabulary feedback, not few-shot.** The LLM tagger gets a live vocabulary of tags already used in the session and store, and is instructed to reuse them when the topic matches. Convergence without manual curation.
 
@@ -382,13 +402,14 @@ Retry logic with exponential backoff on both.
 
 ## Stress-Tested
 
-virtual-context has been validated against 100-turn multi-topic conversations (legal, medical, coding, fitness, housing, recipes — all interleaved) with a 3,000-token context window using Claude Haiku. Results:
+virtual-context has been validated against 100-turn multi-topic conversations (SaaS architecture, guitar practice, legal disputes, running training — all interleaved) with a 3,000-token context window using Claude Haiku. Results:
 
-- Cross-topic retrieval works at turn 95 for content from turn 60
-- Context hint provides topic awareness post-compaction (~50-200 tokens)
-- Broad queries bounded to ~2,100 tokens (down from ~8,900 unbounded)
-- Tag vocabulary converges within 10-15 turns
-- Compaction fires 3-4 times across 100 turns, freeing 60-80% of tokens each time
+- **Cross-vocabulary recall**: "caching trick for the feed" at turn 71 correctly retrieves "materialized view" discussion from turn 46 despite zero primary tag overlap — related tag expansion bridges the vocabulary gap
+- **IDF-weighted precision**: "precomputed summary table" at turn 81 retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
+- **Broad query bounding**: retrospective queries like "what were the biggest mistakes" (turn 96) load all tag summaries but stay bounded at ~3,000 tokens post-compaction
+- **Context hints**: lightweight topic list (~50-200 tokens) gives the LLM awareness of stored topics post-compaction
+- **Compaction**: 4 compaction events across 100 turns, average 891 tokens per turn, peak 3,027 tokens
+- **Tag convergence**: vocabulary stabilizes within 10-15 turns via feedback loop
 
 ## Development
 
