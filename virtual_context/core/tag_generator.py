@@ -12,6 +12,7 @@ from ..types import (
     LLMProvider,
     TagGeneratorConfig,
     TagResult,
+    DEFAULT_TEMPORAL_PATTERNS,
 )
 from .tag_canonicalizer import TagCanonicalizer
 
@@ -55,11 +56,27 @@ Rules:
   - "What was the knee issue again?" (specific back-reference)
   - "How does feature X work for screen readers?" (specific cross-reference)
   - "Would that approach work at scale?" (follow-up to current topic)
+- Set "temporal" to true when the query references a specific time position in
+  the conversation — "the first thing we discussed", "at the beginning",
+  "early on", "going way back", "when we first started". False for general
+  queries, even if they reference the past ("remind me about X" is NOT temporal
+  — it's looking for a topic, not a time position).
+
+  temporal: true examples (references conversation position):
+  - "Going back to the very first thing we discussed"
+  - "What did we decide at the beginning?"
+  - "Early on we talked about X — has that changed?"
+  - "When we first started, what was the architecture?"
+
+  temporal: false examples (topic recall, not time-positioned):
+  - "Remind me what we said about auth" (looking for a topic)
+  - "What was the middleware pattern?" (specific topic)
+  - "Summarize everything" (broad, not temporal)
 - Generate 2-5 related_tags: alternate words someone might use when referring back
   to these same concepts later (e.g. if tagging a discussion about "materialized views",
   related_tags might include "caching", "precomputed", "feed-optimization").
   These help future recall when the user uses different vocabulary.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "related_tags": ["alt1", "alt2"]}}
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - The "primary" tag is the single most relevant tag
 - No markdown fences, no extra text
 """
@@ -71,8 +88,9 @@ Rules:
 - Prefer single-word tags ("database", "fitness"). Hyphenate only when ambiguous ("machine-learning").
 - Reuse existing tags when the topic matches. Create new tags only for genuinely new topics.
 - Set "broad" to true for vague/broad/retrospective/recall queries, false otherwise.
+- Set "temporal" to true when the query references a time position ("the first thing", "at the beginning", "early on").
 - Generate 2-5 related_tags: alternate words for future recall.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "related_tags": ["alt1", "alt2"]}}
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - No markdown fences, no extra text
 """
 
@@ -108,6 +126,14 @@ def detect_broad_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
     return False
 
 
+def detect_temporal_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
+    """Deterministic temporal-query detection via regex patterns."""
+    for pattern in patterns:
+        if pattern.search(text):
+            return True
+    return False
+
+
 class LLMTagGenerator:
     """Generate semantic tags using a local LLM."""
 
@@ -122,6 +148,7 @@ class LLMTagGenerator:
         self._tag_vocabulary: dict[str, int] = {}
         self._canonicalizer = canonicalizer
         self._broad_patterns = _compile_broad_patterns(config.broad_patterns)
+        self._temporal_patterns = _compile_broad_patterns(config.temporal_patterns)
 
     def generate_tags(
         self, text: str, existing_tags: list[str] | None = None
@@ -156,6 +183,11 @@ class LLMTagGenerator:
         if not result.broad and detect_broad_heuristic(text, self._broad_patterns):
             logger.debug("Broad heuristic override: LLM missed broad, heuristic caught it")
             result.broad = True
+
+        # Deterministic override: catch temporal queries the LLM missed
+        if not result.temporal and detect_temporal_heuristic(text, self._temporal_patterns):
+            logger.debug("Temporal heuristic override: LLM missed temporal, heuristic caught it")
+            result.temporal = True
 
         return result
 
@@ -235,6 +267,7 @@ class LLMTagGenerator:
         tags = data.get("tags", [])
         primary = data.get("primary", "")
         broad = bool(data.get("broad", False))
+        temporal = bool(data.get("temporal", False))
 
         if not tags:
             return TagResult(
@@ -273,6 +306,7 @@ class LLMTagGenerator:
             primary=primary,
             source="llm",
             broad=broad,
+            temporal=temporal,
             related_tags=related_tags,
         )
 

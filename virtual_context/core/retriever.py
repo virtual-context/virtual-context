@@ -123,6 +123,66 @@ class ContextRetriever:
             # but still mark broad so filter_history includes all turns
             retrieval_metadata["broad"] = True
 
+        # --- Temporal query branch ---
+        # Fetch segment summaries (Layer 1) sorted by creation time ASC.
+        # This preserves granular detail that merged tag summaries lose.
+        if tag_result.temporal:
+            temporal_tags = [
+                t for t in tag_result.tags + tag_result.related_tags
+                if t != "_general"
+            ]
+            if temporal_tags:
+                summaries = self.store.get_summaries_by_tags(
+                    tags=temporal_tags,
+                    min_overlap=1,
+                    limit=50,
+                )
+                # Sort by creation time ASC — earliest segments first
+                summaries.sort(key=lambda s: s.created_at)
+
+                token_budget = self.config.tag_context_max_tokens
+                selected_temporal: list[StoredSummary] = []
+                total_temporal_tokens = 0
+                for s in summaries:
+                    if total_temporal_tokens + s.summary_tokens > token_budget:
+                        break
+                    selected_temporal.append(s)
+                    total_temporal_tokens += s.summary_tokens
+
+                # Deep retrieval for top 3 earliest segments
+                full_detail: list[StoredSegment] = []
+                for s in selected_temporal[:3]:
+                    segment = self.store.get_segment(s.ref)
+                    if segment:
+                        full_detail.append(segment)
+
+                elapsed = time.monotonic() - start_time
+                return RetrievalResult(
+                    tags_matched=tag_result.tags,
+                    summaries=selected_temporal,
+                    full_detail=full_detail,
+                    total_tokens=total_temporal_tokens,
+                    temporal=True,
+                    broad=tag_result.broad,
+                    retrieval_metadata={
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                        "tags_from_message": tag_result.tags,
+                        "temporal": True,
+                        "segments_found": len(summaries),
+                        "summaries_returned": len(selected_temporal),
+                    },
+                    cost_report=RetrievalCostReport(
+                        tokens_retrieved=total_temporal_tokens,
+                        budget_fraction_used=(
+                            total_temporal_tokens / token_budget if token_budget > 0 else 0.0
+                        ),
+                        strategy_active="temporal",
+                        tags_queried=temporal_tags,
+                    ),
+                )
+            # No usable tags — fall through to normal retrieval
+            retrieval_metadata["temporal"] = True
+
         if tag_result.source == "fallback":
             # Tagging failed — fall back to working set tags from live index
             if self._turn_tag_index:
