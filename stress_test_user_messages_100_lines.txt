@@ -1,0 +1,100 @@
+I'm sketching a SaaS app that helps freelancers track clients, invoices, and habits in one place; I want Postgres as the source of truth and a small event log for audit.
+Can you help me decide between row-level multitenancy and separate schemas per customer for this?
+I ran 3 miles this morning and my knee felt tight again; should I dial back or swap in cycling for a week?
+The landlord still hasn’t returned my security deposit and the “itemized deductions” they emailed look made up; what’s my best next move?
+I’m trying to learn guitar seriously, 20 minutes a day; what’s a good practice routine if I only know open chords and a couple scales?
+For the app, I’m thinking JWT access tokens plus refresh tokens, but I also want magic link login for low-friction onboarding.
+I can’t sleep again; I’m wired at 2am and then useless in the morning.
+Should the audit/event log live in the same database or go to something append-only like S3 plus a query layer?
+I need the habit module to support image uploads as proof, like a daily meal pic, stored with timestamps and tags.
+My attorney friend said to send a demand letter before filing; can you outline what that letter needs to include without sounding unhinged?
+I tried a metronome drill on guitar and it exposed how sloppy my strumming is; how do I practice rhythm without getting bored?
+For multi-tenant queries, do you prefer a tenant_id column on every table with RLS, or a separate database per tenant?
+I did 5x400m intervals and my pace was good but recovery between reps felt slow; is that just conditioning or overtraining?
+If I file in small claims, do I need to attach all the photos and receipts up front or can I bring them later?
+I want a feature called cook mode where a recipe becomes a step-by-step checklist with timers, but it has to work offline.
+Remind me what we decided earlier about multitenancy and why we leaned that way.
+My sleep hygiene plan keeps collapsing when I’m stressed; what are the minimum rules that still move the needle?
+I also need rate limiting at the API gateway because I’m exposing public endpoints for the mobile app and I don’t want abuse.
+Would that work at scale?
+I got an email from the landlord threatening to “charge more if I sue”; is that even meaningful or just posturing?
+Guitar question: is it better to learn songs end-to-end or drill small sections until clean, even if it feels slow?
+For image uploads, should I store them in S3 with presigned URLs and just keep metadata in Postgres, or use something like Supabase storage?
+My long run is supposed to be 8 miles this weekend but the knee is nagging; how do I decide between pushing through vs stopping?
+Can you remind me what we said about the demand letter structure a while back, especially the timeline section?
+In the app, I’m considering a background job queue for email reminders and invoice PDFs; is Redis + worker enough or should I use something heavier?
+I had a good night of sleep for once and my run felt easy; how do I keep that from being random luck?
+My job search is heating up and one company wants a take-home project; I’m worried it’ll collide with training time this week.
+I’m trying to keep practice consistent but my fingers hurt after bar chords; is that normal conditioning or bad technique?
+For the API, how do we make the user-auth flow interact cleanly with the rate-limiter without locking out legit logins?
+After my run this morning I was thinking about database design; should habits be an append-only table or should edits overwrite rows?
+The landlord finally sent a final statement and it’s still missing any receipts; do I respond or just file?
+I’m stuck choosing a front-end stack: Next.js with server actions or a separate API with a mobile-first mindset.
+How much would that cost?
+I tried to increase weekly mileage by 15% and now my hamstrings feel cooked; what’s a safer progression?
+On guitar, I keep losing timing when switching from G to Cadd9; what’s the smallest drill that fixes that transition?
+I want the app to have performance dashboards for user goals, but also performance metrics like latency and error rate; how should I separate that in the UI?
+A while back we discussed storing pictures with tags; does that still apply if I add versioning and comments on each photo?
+I just got served a notice from the landlord’s attorney, which seems like intimidation; can I ignore it safely?
+If I’m running behind on training, is it realistic to still aim for a half marathon PR in 10 weeks?
+For auth, I’m thinking of a concept called flex auth where enterprise customers can plug in SSO later without rewriting core flows.
+I’m noticing stress from the legal stuff is messing with my workouts and my guitar focus; how do I triage without dropping everything?
+The queue system: should jobs be idempotent by design, and how do I model retries without duplicate emails?
+Is that realistic given what we discussed?
+My knee pain got better after two days off, but now I feel anxious about losing fitness; how do I balance recovery vs consistency?
+I keep telling myself I’ll practice guitar at night, then I scroll instead; can you suggest a trigger routine that actually sticks?
+Tech: I’m seeing slow queries on the habits feed once there are many photos; should I denormalize counts or add a materialized view?
+I’m drafting the small-claims complaint and I’m not sure how to phrase damages without sounding emotional.
+Why did we go with that approach again for storing the event log?
+I tried a new cadence drill on runs and it improved my form, but it also spiked my heart rate; is that normal adaptation?
+The take-home project wants a simple CRUD app, but I want to reuse my own code; is that risky from an IP perspective?
+Any tips on practice that’s half technique, half fun, so I don’t quit guitar when work gets intense?
+For the app, I want system recovery plans: backups, migrations, and a way to replay events; what’s the minimal sane setup?
+My physical recovery is weird: sleep is okay but soreness lingers; could stress be the missing factor here?
+I’m worried I’ll miss court deadlines because of travel for interviews; how do people track that reliably?
+I want a lightweight tagging scheme that can power search across clients, habits, and recipes without turning into a taxonomy nightmare.
+Would that work?
+I’m adding API throttling rules and I’m unsure about burst vs sustained limits; what’s a reasonable starting point for a small app?
+I can’t sleep and the old no-screens rule isn’t happening; what’s the next-best intervention that still helps?
+My landlord’s lawyer offered a partial refund if I sign a release; how do I evaluate that without overthinking?
+On guitar, I finally played through a full song without stopping, but it was messy; how do I measure progress without obsessing?
+I’m debating whether cook mode should allow voice control so my hands stay clean; is that overkill for v1?
+Remind me what we decided about flex auth and how it impacts the database schema.
+Long run went great, but the next day I felt wrecked; what’s the right strategy for that?
+I’m trying to set up a simple monitoring stack: logs, traces, and alerts, but I don’t want to spend a fortune.
+My friend says I should just move on from the deposit fight; but it’s the principle and also real money.
+The photo storage is starting to feel expensive; can we compress on-device and still keep decent quality?
+Would that scale across multiple tenants without leaking data?
+I got a second interview and they asked about incident response; can I credibly talk about recovery practices if I’m solo-building?
+Some days my run performance is amazing and other days it’s flat; how much can sleep variance explain?
+In the app, I want a feature to import bank CSVs for expenses; does that belong in the same monolith or a separate service?
+I keep forgetting what we called that caching trick for the feed; the one we wanted to add before inviting beta users.
+The landlord dispute is escalating and I’m feeling stuck; I’m really struggling with this.
+Guitar: how do I stop my fretting hand from squeezing too hard without losing clarity?
+I’m seeing 429s in staging and I’m not sure if it’s my client retry logic or the gateway limits.
+For the step-by-step cooking view, should timers be local-only or synced so switching devices doesn’t reset them?
+My hamstring tweak flared up again, and I’m supposed to do tempo runs; should I sub in a hard bike session or just rest?
+How does the user-auth flow interact with the throttling rules when someone forgets their password and retries a bunch?
+I finally got the job offer, but it’s contingent on passing a background check and I’m anxious about timing with court stuff.
+The deposit case hearing got scheduled, and now I need to organize evidence; can you help me build a clean narrative with exhibits?
+I shipped a small beta of the app and it finally worked, but then a migration failed on a test tenant; what’s a safe rollback pattern?
+Remember when we talked about keeping the feed snappy with that precomputed summary table; is that still the right move now that photos have comments?
+I hit a 10-mile run milestone and my knee held up; how do I lock in that progress without getting greedy?
+My guitar teacher suggested recording myself daily, but I hate hearing it; is it worth it for practice feedback?
+The court clerk said my filing is missing a specific form number; can you help me interpret what they likely mean?
+For infra, I’m thinking daily logical backups plus weekly snapshots; is that enough for real disaster recovery?
+I’m getting nervous about app performance under load and my own physical recovery from training at the same time; can I simplify one of these without derailing it?
+Would that cost a lot if I add a managed queue and managed Postgres instead of self-hosting?
+I want to revisit the decision on separate schemas vs RLS; given I’m now considering enterprise SSO, does the earlier call still hold?
+The landlord’s settlement offer deadline is tomorrow and I’m torn; can you remind me what we said about negotiating without conceding liability?
+I’ve noticed when legal stress spikes, I skip runs and practice and then I feel worse; can you suggest a two-item minimum viable day plan?
+Guitar focused question: what’s the best way to build speed on alternate picking without tension?
+The app’s tag retrieval system is mixing up old decisions; how do I design tags so cook mode and step-by-step both resolve to the same concept?
+I’m thinking about adding a collaborator role for my partner to help with invoices; how should permissions work without making auth a mess?
+That was a disaster; I tried to do a hard run, a take-home sprint, and a court filing in one weekend and everything suffered.
+Can you remind me what we decided about the retry strategy for 429s, because I think my client is hammering the gateway?
+Looking back, what were the biggest mistakes in how I paced the project and the training cycle, and what should I do differently next month?
+I think the whole deposit thing is not going to happen the way I want; if I accept a partial, how do I structure the release language I should watch for?
+Quick tech: should I keep the event log forever or implement retention, and how does that impact audits?
+If you had to pick one habit to protect that improves both my running performance and my ability to ship the app, what is it?
+Can you help me synthesize a one-page plan for the next 6 weeks that balances the new job, the hearing, training, and guitar without being unrealistic?

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
+import time
 
 import httpx
 
@@ -34,7 +34,7 @@ class AnthropicProvider:
                 provider="anthropic",
             )
 
-    async def complete(self, system: str, user: str, max_tokens: int) -> str:
+    def complete(self, system: str, user: str, max_tokens: int) -> str:
         """Send a completion request to Anthropic Messages API."""
         headers = {
             "x-api-key": self.api_key,
@@ -54,8 +54,8 @@ class AnthropicProvider:
 
         for attempt in range(MAX_RETRIES):
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    response = await client.post(API_URL, headers=headers, json=payload)
+                with httpx.Client(timeout=60.0) as client:
+                    response = client.post(API_URL, headers=headers, json=payload)
 
                 if response.status_code == 200:
                     data = response.json()
@@ -74,7 +74,7 @@ class AnthropicProvider:
                         status_code=response.status_code,
                     )
                     if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep(RETRY_BACKOFF[attempt])
+                        time.sleep(RETRY_BACKOFF[attempt])
                     continue
 
                 raise LLMProviderError(
@@ -89,7 +89,7 @@ class AnthropicProvider:
                     provider="anthropic",
                 )
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_BACKOFF[attempt])
+                    time.sleep(RETRY_BACKOFF[attempt])
                 continue
 
         raise last_error or LLMProviderError(

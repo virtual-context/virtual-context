@@ -1,0 +1,52 @@
+#main-layout {
+    height: 1fr;
+}
+
+#chat-area {
+    width: 70%;
+}
+
+#context-panel {
+    width: 30%;
+    border-left: solid $accent;
+    overflow-y: auto;
+}
+
+#chat-view {
+    height: 1fr;
+    border-bottom: solid $primary-background-lighten-2;
+}
+
+#input-box {
+    height: auto;
+    max-height: 8;
+    dock: bottom;
+    border: tall $accent;
+}
+
+#tag-panel {
+    height: auto;
+    max-height: 12;
+    border-bottom: dashed $primary-background-lighten-2;
+    padding: 1;
+}
+
+#budget-bar {
+    height: auto;
+    border-bottom: dashed $primary-background-lighten-2;
+    padding: 1;
+}
+
+#turn-list {
+    height: 1fr;
+    border-bottom: dashed $primary-background-lighten-2;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#compaction-log {
+    height: auto;
+    max-height: 6;
+    dock: bottom;
+    padding: 0 1;
+}

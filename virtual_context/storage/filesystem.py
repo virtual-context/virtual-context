@@ -1,4 +1,4 @@
-"""FilesystemStore: markdown files with YAML frontmatter + JSON index."""
+"""FilesystemStore: markdown files with YAML frontmatter + JSON index (tag-based)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import DomainStats, SegmentMetadata, StoredSegment, StoredSummary
+from ..types import SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -26,8 +26,8 @@ def _str_to_dt(s: str) -> datetime:
 def _segment_to_index_entry(seg: StoredSegment) -> dict:
     return {
         "ref": seg.ref,
-        "domain": seg.domain,
-        "secondary_domains": seg.secondary_domains,
+        "primary_tag": seg.primary_tag,
+        "tags": seg.tags,
         "summary_tokens": seg.summary_tokens,
         "full_tokens": seg.full_tokens,
         "created_at": _dt_to_str(seg.created_at),
@@ -43,8 +43,8 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
     frontmatter = {
         "ref": seg.ref,
         "session_id": seg.session_id,
-        "domain": seg.domain,
-        "secondary_domains": seg.secondary_domains,
+        "primary_tag": seg.primary_tag,
+        "tags": seg.tags,
         "summary_tokens": seg.summary_tokens,
         "full_tokens": seg.full_tokens,
         "created_at": _dt_to_str(seg.created_at),
@@ -142,8 +142,8 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
     return StoredSegment(
         ref=fm.get("ref", ref),
         session_id=fm.get("session_id", ""),
-        domain=fm.get("domain", "_general"),
-        secondary_domains=fm.get("secondary_domains", []),
+        primary_tag=fm.get("primary_tag", "_general"),
+        tags=fm.get("tags", []),
         summary=summary,
         summary_tokens=fm.get("summary_tokens", 0),
         full_text=full_text,
@@ -161,8 +161,8 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
 def _segment_to_summary(seg: StoredSegment) -> StoredSummary:
     return StoredSummary(
         ref=seg.ref,
-        domain=seg.domain,
-        secondary_domains=seg.secondary_domains,
+        primary_tag=seg.primary_tag,
+        tags=seg.tags,
         summary=seg.summary,
         summary_tokens=seg.summary_tokens,
         full_tokens=seg.full_tokens,
@@ -174,12 +174,13 @@ def _segment_to_summary(seg: StoredSegment) -> StoredSummary:
 
 
 class FilesystemStore(ContextStore):
-    """Store segments as markdown files organized by domain directory."""
+    """Store segments as markdown files organized by primary_tag directory."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self._index_path = self.root / "_index.json"
         self._index: dict[str, dict] = {}
+        self._aliases: dict[str, str] = {}
         self._ensure_root()
         self._load_index()
 
@@ -201,73 +202,88 @@ class FilesystemStore(ContextStore):
             json.dumps(list(self._index.values()), indent=2, default=str)
         )
 
-    def _segment_path(self, domain: str, ref: str) -> Path:
-        domain_dir = self.root / domain
-        domain_dir.mkdir(parents=True, exist_ok=True)
-        return domain_dir / f"seg-{ref}.md"
+    def _segment_path(self, primary_tag: str, ref: str) -> Path:
+        tag_dir = self.root / primary_tag
+        tag_dir.mkdir(parents=True, exist_ok=True)
+        return tag_dir / f"seg-{ref}.md"
 
-    async def store_segment(self, segment: StoredSegment) -> str:
-        path = self._segment_path(segment.domain, segment.ref)
+    def store_segment(self, segment: StoredSegment) -> str:
+        path = self._segment_path(segment.primary_tag, segment.ref)
         path.write_text(_segment_to_markdown(segment))
         self._index[segment.ref] = _segment_to_index_entry(segment)
         self._save_index()
         return segment.ref
 
-    async def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str) -> StoredSegment | None:
         entry = self._index.get(ref)
         if not entry:
             return None
-        domain = entry["domain"]
-        path = self._segment_path(domain, ref)
+        primary_tag = entry["primary_tag"]
+        path = self._segment_path(primary_tag, ref)
         if not path.is_file():
             return None
         return _markdown_to_segment(path.read_text(), ref)
 
-    async def get_summary(self, ref: str) -> StoredSummary | None:
-        seg = await self.get_segment(ref)
+    def get_summary(self, ref: str) -> StoredSummary | None:
+        seg = self.get_segment(ref)
         return _segment_to_summary(seg) if seg else None
 
-    async def get_summaries(
+    def get_summaries_by_tags(
         self,
-        domain: str | None = None,
+        tags: list[str],
+        min_overlap: int = 1,
         limit: int = 10,
         before: datetime | None = None,
         after: datetime | None = None,
     ) -> list[StoredSummary]:
-        entries = list(self._index.values())
+        if not tags:
+            return []
 
-        if domain:
-            entries = [e for e in entries if e["domain"] == domain]
-        if before:
-            entries = [e for e in entries if _str_to_dt(e["created_at"]) < before]
-        if after:
-            entries = [e for e in entries if _str_to_dt(e["created_at"]) > after]
+        tag_set = set(tags)
+        scored: list[tuple[int, dict]] = []
 
-        # Sort newest first
-        entries.sort(key=lambda e: e["created_at"], reverse=True)
-        entries = entries[:limit]
+        for entry in self._index.values():
+            entry_tags = set(entry.get("tags", []))
+            overlap = len(tag_set & entry_tags)
+            if overlap < min_overlap:
+                continue
+
+            created = _str_to_dt(entry["created_at"])
+            if before and created >= before:
+                continue
+            if after and created <= after:
+                continue
+
+            scored.append((overlap, entry))
+
+        # Sort by overlap desc, then created_at desc
+        scored.sort(key=lambda x: (x[0], x[1]["created_at"]), reverse=True)
+        scored = scored[:limit]
 
         results = []
-        for entry in entries:
-            seg = await self.get_segment(entry["ref"])
+        for _, entry in scored:
+            seg = self.get_segment(entry["ref"])
             if seg:
                 results.append(_segment_to_summary(seg))
         return results
 
-    async def search(
+    def search(
         self,
         query: str,
-        domains: list[str] | None = None,
+        tags: list[str] | None = None,
         limit: int = 5,
     ) -> list[StoredSummary]:
         """Keyword search against summary text and entities."""
         query_lower = query.lower()
         query_terms = query_lower.split()
+        tag_set = set(tags) if tags else None
 
         scored: list[tuple[float, dict]] = []
         for entry in self._index.values():
-            if domains and entry["domain"] not in domains:
-                continue
+            if tag_set:
+                entry_tags = set(entry.get("tags", []))
+                if not (tag_set & entry_tags):
+                    continue
 
             # Score: count matching terms in entities
             entities_text = " ".join(entry.get("entities", [])).lower()
@@ -276,12 +292,14 @@ class FilesystemStore(ContextStore):
             if score > 0:
                 scored.append((score, entry))
 
-        # Also check summaries for matches (load from disk)
+        # Also check summaries for matches
         if not scored:
             for entry in self._index.values():
-                if domains and entry["domain"] not in domains:
-                    continue
-                seg = await self.get_segment(entry["ref"])
+                if tag_set:
+                    entry_tags = set(entry.get("tags", []))
+                    if not (tag_set & entry_tags):
+                        continue
+                seg = self.get_segment(entry["ref"])
                 if seg and any(term in seg.summary.lower() for term in query_terms):
                     scored.append((1.0, entry))
 
@@ -289,43 +307,49 @@ class FilesystemStore(ContextStore):
 
         results = []
         for _, entry in scored[:limit]:
-            seg = await self.get_segment(entry["ref"])
+            seg = self.get_segment(entry["ref"])
             if seg:
                 results.append(_segment_to_summary(seg))
         return results
 
-    async def list_domains(self) -> list[DomainStats]:
-        domain_map: dict[str, DomainStats] = {}
+    def get_all_tags(self) -> list[TagStats]:
+        tag_map: dict[str, TagStats] = {}
 
         for entry in self._index.values():
-            domain = entry["domain"]
-            if domain not in domain_map:
-                domain_map[domain] = DomainStats(domain=domain)
+            for tag in entry.get("tags", []):
+                if tag not in tag_map:
+                    tag_map[tag] = TagStats(tag=tag)
 
-            stats = domain_map[domain]
-            stats.segment_count += 1
-            stats.total_full_tokens += entry.get("full_tokens", 0)
-            stats.total_summary_tokens += entry.get("summary_tokens", 0)
+                stats = tag_map[tag]
+                stats.usage_count += 1
+                stats.total_full_tokens += entry.get("full_tokens", 0)
+                stats.total_summary_tokens += entry.get("summary_tokens", 0)
 
-            created = _str_to_dt(entry["created_at"])
-            if stats.oldest_segment is None or created < stats.oldest_segment:
-                stats.oldest_segment = created
-            if stats.newest_segment is None or created > stats.newest_segment:
-                stats.newest_segment = created
+                created = _str_to_dt(entry["created_at"])
+                if stats.oldest_segment is None or created < stats.oldest_segment:
+                    stats.oldest_segment = created
+                if stats.newest_segment is None or created > stats.newest_segment:
+                    stats.newest_segment = created
 
-        return sorted(domain_map.values(), key=lambda s: s.segment_count, reverse=True)
+        return sorted(tag_map.values(), key=lambda s: s.usage_count, reverse=True)
 
-    async def delete_segment(self, ref: str) -> bool:
+    def get_tag_aliases(self) -> dict[str, str]:
+        return dict(self._aliases)
+
+    def set_tag_alias(self, alias: str, canonical: str) -> None:
+        self._aliases[alias] = canonical
+
+    def delete_segment(self, ref: str) -> bool:
         entry = self._index.pop(ref, None)
         if not entry:
             return False
-        path = self._segment_path(entry["domain"], ref)
+        path = self._segment_path(entry["primary_tag"], ref)
         if path.is_file():
             path.unlink()
         self._save_index()
         return True
 
-    async def cleanup(
+    def cleanup(
         self,
         max_age: timedelta | None = None,
         max_total_tokens: int | None = None,
@@ -340,7 +364,53 @@ class FilesystemStore(ContextStore):
                 if _str_to_dt(entry["created_at"]) < cutoff
             ]
             for ref in to_delete:
-                await self.delete_segment(ref)
+                self.delete_segment(ref)
                 deleted += 1
 
         return deleted
+
+    def save_tag_summary(self, tag_summary: TagSummary) -> None:
+        ts_dir = self.root / "_tag_summaries"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        path = ts_dir / f"{tag_summary.tag}.json"
+        data = {
+            "tag": tag_summary.tag,
+            "summary": tag_summary.summary,
+            "summary_tokens": tag_summary.summary_tokens,
+            "source_segment_refs": tag_summary.source_segment_refs,
+            "source_turn_numbers": tag_summary.source_turn_numbers,
+            "covers_through_turn": tag_summary.covers_through_turn,
+            "created_at": _dt_to_str(tag_summary.created_at),
+            "updated_at": _dt_to_str(tag_summary.updated_at),
+        }
+        path.write_text(json.dumps(data, indent=2))
+
+    def get_tag_summary(self, tag: str) -> TagSummary | None:
+        path = self.root / "_tag_summaries" / f"{tag}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        return TagSummary(
+            tag=data["tag"],
+            summary=data.get("summary", ""),
+            summary_tokens=data.get("summary_tokens", 0),
+            source_segment_refs=data.get("source_segment_refs", []),
+            source_turn_numbers=data.get("source_turn_numbers", []),
+            covers_through_turn=data.get("covers_through_turn", -1),
+            created_at=_str_to_dt(data["created_at"]) if "created_at" in data else datetime.now(timezone.utc),
+            updated_at=_str_to_dt(data["updated_at"]) if "updated_at" in data else datetime.now(timezone.utc),
+        )
+
+    def get_all_tag_summaries(self) -> list[TagSummary]:
+        ts_dir = self.root / "_tag_summaries"
+        if not ts_dir.is_dir():
+            return []
+        results: list[TagSummary] = []
+        for path in sorted(ts_dir.glob("*.json")):
+            ts = self.get_tag_summary(path.stem)
+            if ts:
+                results.append(ts)
+        return results

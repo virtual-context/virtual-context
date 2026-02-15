@@ -1,0 +1,13 @@
+{
+  "id": "virtual-context",
+  "name": "Virtual Context",
+  "description": "Domain-aware virtual memory for persistent context across long sessions",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "configPath": { "type": "string", "description": "Path to virtual-context.yaml" },
+      "pythonBin": { "type": "string", "default": "virtual-context" }
+    },
+    "additionalProperties": false
+  }
+}
