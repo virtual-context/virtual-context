@@ -513,3 +513,125 @@ def test_turn_list_selection_tracking():
     # Can't go past end
     tl.select_next()
     assert tl._selected == 11
+
+
+@pytest.mark.asyncio
+async def test_tag_panel_updates_after_turn_complete():
+    """BUG-002: Tag panel must update after on_turn_complete, not just inbound.
+
+    With fast providers (Haiku), the tag panel was showing inbound-only tags
+    because Static.update() didn't reliably trigger a repaint when called
+    from call_from_thread callbacks in quick succession.  The fix uses
+    render() override so the compositor always reads current data.
+    """
+    app = make_app()
+    fake_provider = FakeChatProvider(["Test response."])
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.provider = fake_provider
+
+        # Mock engine that returns distinct inbound vs turn-complete tags
+        class MockEngine:
+            def __init__(self):
+                self._turn_tag_index = MockIndex()
+                self.config = type("C", (), {"context_window": 10000})()
+
+            def on_message_inbound(self, msg, history):
+                from virtual_context.types import AssembledContext
+                ctx = AssembledContext()
+                ctx.matched_tags = ["inbound-tag"]
+                ctx.broad = False
+                ctx.temporal = False
+                return ctx
+
+            def filter_history(self, history, current_tags=None, broad=False, temporal=False):
+                return history
+
+            def on_turn_complete(self, history):
+                from virtual_context.types import TurnTagEntry
+                # Simulate engine tagging the user+assistant pair with richer tags
+                self._turn_tag_index.add(TurnTagEntry(
+                    turn_number=0,
+                    message_hash="abc",
+                    tags=["complete-tag-a", "complete-tag-b"],
+                    primary_tag="complete-tag-a",
+                ))
+                return None
+
+        class MockIndex:
+            def __init__(self):
+                self._entries = []
+
+            def add(self, entry):
+                self._entries.append(entry)
+
+            @property
+            def entries(self):
+                return self._entries
+
+        app.engine = MockEngine()
+
+        input_box = app.query_one("#input-box", InputBox)
+        input_box.focus()
+
+        await type_text(pilot, "hello")
+        await pilot.press("enter")
+        await pilot.pause(1.5)
+
+        # Turn should have the turn-complete tags (merged with inbound)
+        assert len(app._turns) == 1
+        turn_tags = app._turns[0].tags
+        assert "complete-tag-a" in turn_tags
+        assert "complete-tag-b" in turn_tags
+
+        # Tag panel should reflect the turn-complete tags, not just inbound
+        tag_panel = app.query_one("#tag-panel", TagPanel)
+        panel_tag_names = [name for name, _score in tag_panel._tags]
+        assert "complete-tag-a" in panel_tag_names, (
+            f"Tag panel should show turn-complete tags, got: {panel_tag_names}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_tag_panel_render_method():
+    """TagPanel.render() produces correct markup from stored data."""
+    tag_panel = TagPanel()
+    # Before any tags
+    assert "No tags yet" in tag_panel.render()
+
+    # After setting tags
+    tag_panel.update_tags([("database", 0.8), ("api", 0.3)])
+    rendered = tag_panel.render()
+    assert "database" in rendered
+    assert "api" in rendered
+    assert "green" in rendered  # 0.8 >= 0.7
+    assert "red" in rendered    # 0.3 < 0.4
+
+
+@pytest.mark.asyncio
+async def test_streaming_flag_reset_on_error():
+    """_streaming must reset even if _execute_turn throws (try/finally guard)."""
+    app = make_app()
+
+    class FailingProvider:
+        api_key = "fake"
+        model = "fake"
+        _call_count = 0
+
+        def stream_message(self, system, messages, max_tokens=4096):
+            self._call_count += 1
+            raise RuntimeError("Simulated API failure")
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.provider = FailingProvider()
+        app.engine = None
+
+        input_box = app.query_one("#input-box", InputBox)
+        input_box.focus()
+
+        await type_text(pilot, "hello")
+        await pilot.press("enter")
+        await pilot.pause(1.0)
+
+        # _streaming must be False so user can send another message
+        assert app._streaming is False
