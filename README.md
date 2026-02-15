@@ -4,7 +4,7 @@
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context is a different approach entirely. It treats LLM context the way an operating system treats RAM — as a managed memory hierarchy where nothing is lost, everything is compressed intelligently, and the right context is paged in exactly when needed.
+virtual-context is a different approach entirely. It treats LLM context the way an operating system treats RAM — tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Broad queries load everything. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion.
 
 ```
 Layer 0: Raw conversation turns              (active memory — in the context window)
