@@ -22,6 +22,7 @@ class TurnRecord:
     tags: list[str] = field(default_factory=list)
     primary_tag: str = "_general"
     broad: bool = False
+    temporal: bool = False
     input_tokens: int = 0
     turns_in_payload: int = 0
     api_payload: dict = field(default_factory=dict)
@@ -38,6 +39,7 @@ class TurnRecord:
             "tags": self.tags,
             "primary_tag": self.primary_tag,
             "broad": self.broad,
+            "temporal": self.temporal,
             "input_tokens": self.input_tokens,
             "turns_in_payload": self.turns_in_payload,
             "api_payload": self.api_payload,
