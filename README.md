@@ -352,7 +352,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 
 ### OpenClaw Plugin
 
-Drop-in plugin for OpenClaw-compatible agents. Hooks `before_context_send` (sync retrieval) and `agent_end` (fire-and-forget compaction) via CLI calls — no bridge server needed.
+Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pre`) and fire-and-forget compaction (`agent.post`) via CLI calls — no bridge server needed. Depends on the [plugin lifecycle hook architecture](https://github.com/openclaw/openclaw/pull/12082) currently in progress.
 
 ## Architecture
 
