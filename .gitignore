@@ -20,6 +20,13 @@ build/
 
 # Storage (runtime data)
 .virtualcontext/
+.virtualcontext-compact-test/
+
+# Stress test run outputs
+100run*.json
+runcount_*.json
+vc-session.json
+prompts-coding-agent.json
 
 # OS
 .DS_Store

@@ -1,59 +1,80 @@
-"""ContextStore abstract base class."""
+"""ContextStore abstract base class — tag-based storage interface."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import DomainStats, StoredSegment, StoredSummary
+from ..types import StoredSegment, StoredSummary, TagStats, TagSummary
 
 
 class ContextStore(ABC):
     """Pluggable storage backend for compacted conversation segments."""
 
     @abstractmethod
-    async def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(self, segment: StoredSegment) -> str:
         """Store a segment. Idempotent on ref (upsert). Returns ref."""
 
     @abstractmethod
-    async def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str) -> StoredSegment | None:
         """Retrieve full segment by ref. None if not found."""
 
     @abstractmethod
-    async def get_summary(self, ref: str) -> StoredSummary | None:
+    def get_summary(self, ref: str) -> StoredSummary | None:
         """Retrieve lightweight summary by ref. None if not found."""
 
     @abstractmethod
-    async def get_summaries(
+    def get_summaries_by_tags(
         self,
-        domain: str | None = None,
+        tags: list[str],
+        min_overlap: int = 1,
         limit: int = 10,
         before: datetime | None = None,
         after: datetime | None = None,
     ) -> list[StoredSummary]:
-        """Retrieve summaries, ordered by created_at DESC (newest first)."""
+        """Retrieve summaries matching tags by overlap count, newest first."""
 
     @abstractmethod
-    async def search(
+    def search(
         self,
         query: str,
-        domains: list[str] | None = None,
+        tags: list[str] | None = None,
         limit: int = 5,
     ) -> list[StoredSummary]:
         """Search summaries by keyword. Ordered by relevance."""
 
     @abstractmethod
-    async def list_domains(self) -> list[DomainStats]:
-        """List all domains with statistics."""
+    def get_all_tags(self) -> list[TagStats]:
+        """List all tags with statistics."""
 
     @abstractmethod
-    async def delete_segment(self, ref: str) -> bool:
+    def get_tag_aliases(self) -> dict[str, str]:
+        """Get all tag alias mappings."""
+
+    @abstractmethod
+    def set_tag_alias(self, alias: str, canonical: str) -> None:
+        """Register a tag alias mapping."""
+
+    @abstractmethod
+    def delete_segment(self, ref: str) -> bool:
         """Delete a segment by ref. Returns True if deleted."""
 
     @abstractmethod
-    async def cleanup(
+    def cleanup(
         self,
         max_age: timedelta | None = None,
         max_total_tokens: int | None = None,
     ) -> int:
         """Remove old/excess segments. Returns count deleted."""
+
+    @abstractmethod
+    def save_tag_summary(self, tag_summary: TagSummary) -> None:
+        """Store or update a tag summary. Upsert on tag name."""
+
+    @abstractmethod
+    def get_tag_summary(self, tag: str) -> TagSummary | None:
+        """Retrieve a tag summary by tag name. None if not found."""
+
+    @abstractmethod
+    def get_all_tag_summaries(self) -> list[TagSummary]:
+        """Retrieve all tag summaries, ordered by tag name."""

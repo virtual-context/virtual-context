@@ -1,64 +1,57 @@
-"""Tests for TopicSegmenter."""
+"""Tests for TopicSegmenter (tag-based)."""
 
 import pytest
 
-from virtual_context.classifiers.base import ClassifierPipeline
-from virtual_context.classifiers.keyword import KeywordClassifier
 from virtual_context.core.segmenter import TopicSegmenter
-from virtual_context.types import DomainDef, Message, SegmenterConfig
+from virtual_context.types import Message, SegmenterConfig, TagResult
+
+from conftest import MockTagGenerator
 
 
 @pytest.fixture
-def domains():
-    return [
-        DomainDef(name="legal", keywords=["court", "filing", "attorney", "motion", "case"]),
-        DomainDef(name="medical", keywords=["insulin", "medication", "doctor", "glucose", "blood"]),
-        DomainDef(name="_general"),
-    ]
+def tag_generator():
+    gen = MockTagGenerator(default_tag="legal", default_tags=["legal"])
+    gen.set_override("insulin", TagResult(tags=["medical"], primary="medical", source="mock"))
+    gen.set_override("glucose", TagResult(tags=["medical"], primary="medical", source="mock"))
+    gen.set_override("doctor", TagResult(tags=["medical"], primary="medical", source="mock"))
+    return gen
 
 
 @pytest.fixture
-async def segmenter(domains):
-    pipeline = ClassifierPipeline([KeywordClassifier()], min_confidence=0.3)
-    await pipeline.initialize(domains)
+def segmenter(tag_generator):
     return TopicSegmenter(
-        classifier_pipeline=pipeline,
-        config=SegmenterConfig(min_confidence=0.3),
-        domains=domains,
+        tag_generator=tag_generator,
+        config=SegmenterConfig(),
     )
 
 
-@pytest.mark.asyncio
-async def test_segment_single_domain(segmenter):
+def test_segment_single_tag(segmenter):
     messages = [
         Message(role="user", content="What's the court filing deadline?"),
         Message(role="assistant", content="The filing is due January 30."),
         Message(role="user", content="Has the attorney reviewed the motion?"),
         Message(role="assistant", content="Yes, the attorney approved the motion."),
     ]
-    segments = await segmenter.segment(messages)
+    segments = segmenter.segment(messages)
     assert len(segments) == 1
-    assert segments[0].domain == "legal"
+    assert segments[0].primary_tag == "legal"
     assert segments[0].turn_count == 2
 
 
-@pytest.mark.asyncio
-async def test_segment_two_domains(segmenter, mixed_messages):
-    segments = await segmenter.segment(mixed_messages)
+def test_segment_two_tags(segmenter, mixed_messages):
+    segments = segmenter.segment(mixed_messages)
     assert len(segments) >= 2
-    domains = {s.domain for s in segments}
-    assert "legal" in domains
-    assert "medical" in domains
+    tags = {s.primary_tag for s in segments}
+    assert "legal" in tags
+    assert "medical" in tags
 
 
-@pytest.mark.asyncio
-async def test_segment_empty(segmenter):
-    segments = await segmenter.segment([])
+def test_segment_empty(segmenter):
+    segments = segmenter.segment([])
     assert segments == []
 
 
-@pytest.mark.asyncio
-async def test_turn_pairing(segmenter):
+def test_turn_pairing(segmenter):
     messages = [
         Message(role="user", content="Hello"),
         Message(role="assistant", content="Hi"),
@@ -68,14 +61,24 @@ async def test_turn_pairing(segmenter):
     assert len(pairs[0].messages) == 2
 
 
-@pytest.mark.asyncio
-async def test_system_message_attachment(segmenter):
+def test_system_message_attachment(segmenter):
     messages = [
         Message(role="user", content="Hello"),
         Message(role="system", content="Tool result here"),
         Message(role="assistant", content="Hi"),
     ]
     pairs = segmenter._pair_turns(messages)
-    # system/tool attaches to the current pair
     assert len(pairs) == 1
     assert len(pairs[0].messages) == 3
+
+
+def test_segment_tags_union(segmenter):
+    """Tags from all turn pairs should be unioned in the segment."""
+    # All messages will get "legal" tag from mock
+    messages = [
+        Message(role="user", content="Court filing"),
+        Message(role="assistant", content="Done"),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1
+    assert "legal" in segments[0].tags

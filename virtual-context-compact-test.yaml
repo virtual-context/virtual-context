@@ -1,0 +1,159 @@
+version: "0.2"
+storage_root: ".virtualcontext-compact-test"
+context_window: 3000
+token_counter: "estimate"
+
+# ---------------------------------------------------------------------------
+# Tag Generator — Haiku tagger with detailed prompt
+# ---------------------------------------------------------------------------
+
+tag_generator:
+  type: "llm"
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tags: 10
+  min_tags: 5
+  prompt_mode: "detailed"
+  broad_patterns: []
+
+  keyword_fallback:
+    tag_keywords:
+      legal:
+        - court
+        - filing
+        - motion
+        - attorney
+        - legal
+        - case
+        - judge
+      medical:
+        - insulin
+        - medication
+        - doctor
+        - lab
+        - blood
+        - glucose
+      code:
+        - function
+        - bug
+        - deploy
+        - git
+        - API
+        - database
+        - error
+    tag_patterns:
+      legal:
+        - "\\bN\\.?J\\.?S\\.?A\\.?\\b"
+        - "\\b\\d{2}-cv-\\d+"
+      code:
+        - "\\bdef \\w+\\("
+        - "\\bclass \\w+[:(]"
+
+# ---------------------------------------------------------------------------
+# Tag Rules
+# ---------------------------------------------------------------------------
+
+tag_rules:
+  - match: "architecture*"
+    priority: 10
+    ttl_days: null
+  - match: "database*"
+    priority: 8
+    ttl_days: null
+  - match: "debug*"
+    priority: 7
+    ttl_days: 7
+  - match: "legal*"
+    priority: 9
+    ttl_days: null
+  - match: "medical*"
+    priority: 8
+    ttl_days: 90
+  - match: "*"
+    priority: 5
+    ttl_days: 30
+
+# ---------------------------------------------------------------------------
+# Compaction — low thresholds to trigger early with 3k window
+# ---------------------------------------------------------------------------
+
+compaction:
+  soft_threshold: 0.70        # ~2,100 tokens
+  hard_threshold: 0.85        # ~2,550 tokens
+  protected_recent_turns: 4   # lower than default 6 to leave room
+  overflow_buffer: 1.2
+  summary_ratio: 0.15
+  min_summary_tokens: 100
+  max_summary_tokens: 800
+  max_concurrent_summaries: 4
+
+# ---------------------------------------------------------------------------
+# Summarization — Ollama for compaction summaries
+# ---------------------------------------------------------------------------
+
+summarization:
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 500
+  temperature: 0.3
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+providers:
+  ollama:
+    type: "generic_openai"
+    base_url: "http://127.0.0.1:11434/v1"
+  anthropic:
+    type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
+    model: "claude-haiku-4-5-20251001"
+
+# ---------------------------------------------------------------------------
+# Storage — separate DB from main runs
+# ---------------------------------------------------------------------------
+
+storage:
+  backend: "sqlite"
+  sqlite:
+    path: ".virtualcontext-compact-test/store.db"
+  filesystem:
+    root: ".virtualcontext-compact-test/store"
+
+# ---------------------------------------------------------------------------
+# Assembly
+# ---------------------------------------------------------------------------
+
+assembly:
+  core_context_max_tokens: 500
+  tag_context_max_tokens: 1000
+  core_files: []
+
+# ---------------------------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------------------------
+
+retrieval:
+  skip_active_tags: true
+  active_tag_lookback: 4
+  strategy_config:
+    default:
+      min_overlap: 1
+      max_results: 5
+      max_budget_fraction: 0.25
+      include_related: true
+
+# ---------------------------------------------------------------------------
+# Cost Tracking
+# ---------------------------------------------------------------------------
+
+cost_tracking:
+  enabled: true
+  pricing:
+    ollama:
+      input_per_1k: 0.0
+      output_per_1k: 0.0
+    anthropic:
+      input_per_1k: 0.00025
+      output_per_1k: 0.00125
