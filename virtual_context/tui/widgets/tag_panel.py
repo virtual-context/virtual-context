@@ -6,7 +6,12 @@ from textual.widgets import Static
 
 
 class TagPanel(Static):
-    """Shows active tags with recency-based activity bars."""
+    """Shows active tags with recency-based activity bars.
+
+    Uses render() override instead of Static.update() so the compositor
+    always reads current data during frame rendering — more reliable when
+    updates arrive via call_from_thread from worker threads.
+    """
 
     DEFAULT_CSS = """
     TagPanel {
@@ -20,13 +25,11 @@ class TagPanel(Static):
 
     def update_tags(self, tags: list[tuple[str, float]]) -> None:
         self._tags = tags
-        self._render_tags()
-        self.refresh()
+        self.refresh(layout=True)
 
-    def _render_tags(self) -> None:
+    def render(self) -> str:
         if not self._tags:
-            self.update("[bold]ACTIVE TAGS[/bold]\n[dim]No tags yet[/dim]")
-            return
+            return "[bold]ACTIVE TAGS[/bold]\n[dim]No tags yet[/dim]"
 
         lines = ["[bold]ACTIVE TAGS[/bold]"]
         for tag, activity in self._tags:
@@ -39,4 +42,4 @@ class TagPanel(Static):
             bar = "█" * int(activity * 10) + "░" * (10 - int(activity * 10))
             lines.append(f"  [{color}]{bar}[/{color}] {tag}")
 
-        self.update("\n".join(lines))
+        return "\n".join(lines)

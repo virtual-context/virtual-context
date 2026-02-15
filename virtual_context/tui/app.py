@@ -165,14 +165,18 @@ class VChatApp(App):
     @work(thread=True)
     def _do_turn(self, user_message: str) -> None:
         """Background worker wrapper for interactive (non-replay) turns."""
-        self._execute_turn(user_message)
-        self._streaming = False
+        try:
+            self._execute_turn(user_message)
+        finally:
+            self._streaming = False
 
     @work(thread=True)
     def _do_compact_turn(self) -> None:
         """Background worker for /compact slash command."""
-        self._execute_compact()
-        self._streaming = False
+        try:
+            self._execute_compact()
+        finally:
+            self._streaming = False
 
     def _execute_compact(self) -> None:
         """Handle /compact slash command."""
