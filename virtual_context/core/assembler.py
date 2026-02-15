@@ -1,7 +1,8 @@
-"""ContextAssembler: build final context from core files + domain summaries + conversation."""
+"""ContextAssembler: build final context from core files + tag summaries + conversation."""
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 from typing import Callable
 
@@ -11,6 +12,7 @@ from ..types import (
     Message,
     RetrievalResult,
     StoredSummary,
+    TagPromptRule,
 )
 
 
@@ -19,7 +21,7 @@ class ContextAssembler:
 
     Assembly order (top to bottom in final prompt):
     1. [CORE CONTEXT] - always-on files (SOUL.md, USER.md, etc.)
-    2. [DOMAIN CONTEXT] - retrieved summaries in <virtual-context> tags
+    2. [TAG CONTEXT] - retrieved summaries in <virtual-context> tags
     3. [CONVERSATION HISTORY] - recent turns, most recent at bottom
     """
 
@@ -27,9 +29,11 @@ class ContextAssembler:
         self,
         config: AssemblerConfig,
         token_counter: Callable[[str], int] | None = None,
+        tag_rules: list[TagPromptRule] | None = None,
     ) -> None:
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
+        self.tag_rules = tag_rules or []
 
     def assemble(
         self,
@@ -37,85 +41,94 @@ class ContextAssembler:
         retrieval_result: RetrievalResult,
         conversation_history: list[Message],
         token_budget: int,
+        context_hint: str = "",
     ) -> AssembledContext:
         """Build final context within token budget."""
         core_budget = self.config.core_context_max_tokens
-        domain_budget = self.config.domain_context_max_tokens
+        tag_budget = self.config.tag_context_max_tokens
 
         # Truncate core context to budget
         core = self._truncate_core(core_context, core_budget)
         core_tokens = self.token_counter(core)
 
-        # Build domain sections
-        domain_sections: dict[str, str] = {}
-        domain_tokens = 0
+        # Context hint tokens
+        hint_tokens = self.token_counter(context_hint) if context_hint else 0
 
-        # Group summaries by domain
-        summaries_by_domain: dict[str, list[StoredSummary]] = {}
+        # Build tag sections
+        tag_sections: dict[str, str] = {}
+        tag_tokens = 0
+
+        # Group summaries by primary_tag
+        summaries_by_tag: dict[str, list[StoredSummary]] = {}
         for s in retrieval_result.summaries:
-            summaries_by_domain.setdefault(s.domain, []).append(s)
+            summaries_by_tag.setdefault(s.primary_tag, []).append(s)
 
-        # Sort domains by priority (higher priority first)
-        sorted_domains = sorted(
-            summaries_by_domain.keys(),
-            key=lambda d: self._domain_priority(d),
+        # Sort tags by priority (higher priority first)
+        sorted_tags = sorted(
+            summaries_by_tag.keys(),
+            key=lambda t: self._tag_priority(t),
             reverse=True,
         )
 
-        for domain in sorted_domains:
-            summaries = summaries_by_domain[domain]
-            section = self._format_domain_section(domain, summaries)
+        for tag in sorted_tags:
+            summaries = summaries_by_tag[tag]
+            section = self._format_tag_section(tag, summaries)
             section_tokens = self.token_counter(section)
 
-            if domain_tokens + section_tokens > domain_budget:
+            if tag_tokens + section_tokens > tag_budget:
                 break
 
-            domain_sections[domain] = section
-            domain_tokens += section_tokens
+            tag_sections[tag] = section
+            tag_tokens += section_tokens
 
         # Conversation budget = remaining tokens
-        conversation_budget = token_budget - core_tokens - domain_tokens
+        conversation_budget = token_budget - core_tokens - tag_tokens - hint_tokens
 
         # Trim conversation to budget
         trimmed = self._trim_conversation(conversation_history, conversation_budget)
         conv_tokens = sum(self.token_counter(m.content) for m in trimmed)
 
-        # Build prepend text (core + domain sections)
+        # Build prepend text (core + context hint + tag sections)
         prepend_parts: list[str] = []
         if core:
             prepend_parts.append(core)
-        for domain in sorted_domains:
-            if domain in domain_sections:
-                prepend_parts.append(domain_sections[domain])
+        if context_hint:
+            prepend_parts.append(context_hint)
+        for tag in sorted_tags:
+            if tag in tag_sections:
+                prepend_parts.append(tag_sections[tag])
 
         prepend_text = "\n\n".join(prepend_parts)
 
-        total_tokens = core_tokens + domain_tokens + conv_tokens
+        total_tokens = core_tokens + tag_tokens + conv_tokens
 
         return AssembledContext(
             core_context=core,
-            domain_sections=domain_sections,
+            tag_sections=tag_sections,
             conversation_history=trimmed,
             total_tokens=total_tokens,
             budget_breakdown={
                 "core": core_tokens,
-                "domain": domain_tokens,
+                "context_hint": hint_tokens,
+                "tags": tag_tokens,
                 "conversation": conv_tokens,
             },
             prepend_text=prepend_text,
         )
 
-    def _format_domain_section(self, domain: str, summaries: list[StoredSummary]) -> str:
-        """Format summaries for a domain as XML-tagged section."""
+    def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
+        """Format summaries for a tag as XML-tagged section."""
         if not summaries:
             return ""
 
         last_updated = max(s.end_timestamp for s in summaries)
+        all_tags = sorted({t for s in summaries for t in s.tags})
+        tags_attr = ", ".join(all_tags) if all_tags else tag
         summary_texts = [s.summary for s in summaries]
         body = "\n\n---\n\n".join(summary_texts)
 
         return (
-            f'<virtual-context domain="{domain}" segments="{len(summaries)}" '
+            f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}" '
             f'last_updated="{last_updated.isoformat()}">\n'
             f"{body}\n"
             f"</virtual-context>"
@@ -149,11 +162,11 @@ class ContextAssembler:
         max_chars = max_tokens * 4
         return core[:max_chars]
 
-    def _domain_priority(self, domain: str) -> int:
-        """Get priority for a domain from config."""
-        for cf in self.config.core_files:
-            if cf.get("domain") == domain:
-                return cf.get("priority", 5)
+    def _tag_priority(self, tag: str) -> int:
+        """Get priority for a tag from tag rules."""
+        for rule in self.tag_rules:
+            if fnmatch.fnmatch(tag, rule.match):
+                return rule.priority
         return 5
 
     def load_core_context(self, base_path: Path | None = None) -> str:

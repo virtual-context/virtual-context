@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Literal, Protocol, runtime_checkable
@@ -28,27 +27,81 @@ class TurnPair:
 
 
 # ---------------------------------------------------------------------------
-# Classification
+# Tag Generation (replaces Classification)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ClassificationResult:
-    domain: str
-    confidence: float  # 0.0 – 1.0
-    source: str  # "keyword", "embedding", "llm"
+class TagResult:
+    """Result of tagging a piece of text."""
+    tags: list[str]
+    primary: str
+    source: str  # "llm", "keyword", "fallback"
+    broad: bool = False  # True when query is vague/retrospective/overview
+    related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
+
+
+DEFAULT_BROAD_PATTERNS: list[str] = [
+    r"\bwhat did (?:you|we) (?:say|mention|discuss|talk about|decide)\b",
+    r"\bremind me (?:what|about|of)\b",
+    r"\blooking back at (?:everything|what|our)\b",
+    r"\b(?:summarize|recap) (?:what|everything|our|the)\b",
+    r"\bcan you (?:summarize|recap|review)\b",
+    r"\bwhat (?:have )?we (?:covered|discussed|talked about|decided)\b",
+    r"\b(?:you|we) (?:mentioned|discussed|said|talked about) (?:earlier|before|previously)\b",
+    r"\bgo (?:back over|back to|over) (?:what|everything)\b",
+    r"\beach of (?:these|the|our) (?:threads|topics|discussions|conversations|areas|subjects)\b",
+    r"\bacross (?:everything|all|the things) we(?:'ve)? (?:discussed|covered|talked about)\b",
+    r"\bfrom (?:everything|all) we(?:'ve)? (?:discussed|covered|talked about)\b",
+]
 
 
 @dataclass
-class DomainDef:
-    name: str
-    description: str = ""
-    keywords: list[str] = field(default_factory=list)
-    patterns: list[str] = field(default_factory=list)
+class TagGeneratorConfig:
+    """Configuration for the tag generator."""
+    type: str = "keyword"  # "llm" or "keyword"
+    provider: str = ""  # provider name for LLM-based tagging
+    model: str = ""
+    max_tags: int = 10
+    min_tags: int = 5
+    max_tokens: int = 8192  # LLM max_tokens
+    prompt_mode: str = "detailed"  # "detailed" (full rules+examples) or "compact" (minimal)
+    keyword_fallback: KeywordTagConfig | None = None
+    broad_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BROAD_PATTERNS))
+
+
+@dataclass
+class KeywordTagConfig:
+    """Keyword/regex-based tag configuration (deterministic fallback)."""
+    tag_keywords: dict[str, list[str]] = field(default_factory=dict)
+    tag_patterns: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class TurnTagEntry:
+    """Tag metadata for a single round trip, computed in real time."""
+    turn_number: int
+    message_hash: str              # sha256[:16] of user+assistant content
+    tags: list[str] = field(default_factory=list)
+    primary_tag: str = "_general"
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class TagPromptRule:
+    """Per-tag rules for priority, TTL, and custom summary prompts."""
+    match: str  # fnmatch pattern, e.g. "architecture*", "debug*"
+    ttl_days: int | None = None
     priority: int = 5
     summary_prompt: str | None = None
-    retrieval_limit: int = 3
-    retrieval_max_tokens: int = 5000
-    ttl_days: int | None = None
+
+
+@dataclass
+class StrategyConfig:
+    """Retrieval strategy configuration."""
+    min_overlap: int = 1
+    max_results: int = 10
+    max_budget_fraction: float = 0.25
+    include_related: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +117,7 @@ class ContextSnapshot:
     total_tokens: int
     budget_tokens: int
     turn_count: int
-    domains_in_context: list[str] = field(default_factory=list)
+    active_tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -81,16 +134,16 @@ class CompactionSignal:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DomainSegment:
+class TaggedSegment:
+    """A segment of conversation tagged with semantic tags."""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    domain: str = "_general"
-    secondary_domains: list[str] = field(default_factory=list)
+    primary_tag: str = "_general"
+    tags: list[str] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
     token_count: int = 0
     start_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     end_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     turn_count: int = 0
-    confidence: float = 0.0
 
 
 @dataclass
@@ -110,13 +163,14 @@ class SegmentMetadata:
 @dataclass
 class CompactionResult:
     segment_id: str
-    domain: str
-    summary: str
-    summary_tokens: int
-    original_tokens: int
-    compression_ratio: float
-    metadata: SegmentMetadata
-    full_text: str
+    primary_tag: str
+    tags: list[str] = field(default_factory=list)
+    summary: str = ""
+    summary_tokens: int = 0
+    original_tokens: int = 0
+    compression_ratio: float = 0.0
+    metadata: SegmentMetadata = field(default_factory=SegmentMetadata)
+    full_text: str = ""
     messages: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -125,9 +179,11 @@ class CompactionResult:
 class CompactionReport:
     segments_compacted: int
     tokens_freed: int
-    domains: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     results: list[CompactionResult] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    tag_summaries_built: int = 0
+    cover_tags: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +194,8 @@ class CompactionReport:
 class StoredSegment:
     ref: str = field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str = ""
-    domain: str = "_general"
-    secondary_domains: list[str] = field(default_factory=list)
+    primary_tag: str = "_general"
+    tags: list[str] = field(default_factory=list)
     summary: str = ""
     summary_tokens: int = 0
     full_text: str = ""
@@ -157,8 +213,8 @@ class StoredSegment:
 class StoredSummary:
     """Lightweight view: summary + metadata, no full text."""
     ref: str = ""
-    domain: str = "_general"
-    secondary_domains: list[str] = field(default_factory=list)
+    primary_tag: str = "_general"
+    tags: list[str] = field(default_factory=list)
     summary: str = ""
     summary_tokens: int = 0
     full_tokens: int = 0
@@ -169,9 +225,22 @@ class StoredSummary:
 
 
 @dataclass
-class DomainStats:
-    domain: str = ""
-    segment_count: int = 0
+class TagSummary:
+    """Layer-2 summary: one per cover tag, rolls up all segment summaries for that tag."""
+    tag: str
+    summary: str = ""
+    summary_tokens: int = 0
+    source_segment_refs: list[str] = field(default_factory=list)
+    source_turn_numbers: list[int] = field(default_factory=list)
+    covers_through_turn: int = -1  # highest turn number covered; -1 = never built
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class TagStats:
+    tag: str = ""
+    usage_count: int = 0
     total_full_tokens: int = 0
     total_summary_tokens: int = 0
     oldest_segment: datetime | None = None
@@ -183,12 +252,39 @@ class DomainStats:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class RetrievalCostReport:
+    """Per-retrieval cost metrics."""
+    tokens_retrieved: int = 0
+    budget_fraction_used: float = 0.0
+    strategy_active: str = "default"
+    tags_queried: list[str] = field(default_factory=list)
+    tags_skipped: list[str] = field(default_factory=list)
+
+
+@dataclass
 class RetrievalResult:
-    domains_matched: list[str] = field(default_factory=list)
+    tags_matched: list[str] = field(default_factory=list)
     summaries: list[StoredSummary] = field(default_factory=list)
     full_detail: list[StoredSegment] = field(default_factory=list)
     total_tokens: int = 0
     retrieval_metadata: dict = field(default_factory=dict)
+    cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
+    broad: bool = False  # True when the query was detected as broad/retrospective
+
+
+# ---------------------------------------------------------------------------
+# Cost Tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionCostSummary:
+    """Running session cost totals."""
+    total_retrievals: int = 0
+    total_compactions: int = 0
+    total_tag_generations: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +294,14 @@ class RetrievalResult:
 @dataclass
 class AssembledContext:
     core_context: str = ""
-    domain_sections: dict[str, str] = field(default_factory=dict)
+    tag_sections: dict[str, str] = field(default_factory=dict)
     conversation_history: list[Message] = field(default_factory=list)
     total_tokens: int = 0
     budget_breakdown: dict[str, int] = field(default_factory=dict)
     prepend_text: str = ""
+    matched_tags: list[str] = field(default_factory=list)
+    context_hint: str = ""  # Topic list injected post-compaction
+    broad: bool = False  # True when query is broad — include all history
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +317,7 @@ class LLMProviderError(Exception):
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    async def complete(self, system: str, user: str, max_tokens: int) -> str: ...
+    def complete(self, system: str, user: str, max_tokens: int) -> str: ...
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +334,7 @@ class MonitorConfig:
 
 @dataclass
 class SegmenterConfig:
-    min_confidence: float = 0.3
+    pass
 
 
 @dataclass
@@ -245,49 +344,59 @@ class CompactorConfig:
     max_summary_tokens: int = 2000
     max_concurrent_summaries: int = 4
     overflow_buffer: float = 1.2
+    llm_token_overhead: int = 8000  # extra tokens for thinking/reasoning overhead
 
 
 @dataclass
 class RetrieverConfig:
-    deep_retrieve_threshold: float = 0.8
-    skip_active_domains: bool = True
-    active_domain_lookback: int = 4
-    domain_context_max_tokens: int = 30_000
-    domains: list[DomainDef] = field(default_factory=list)
-    velocity_fallback: bool = True
-    velocity_lookback: int = 10  # turn pairs to look back
-    velocity_threshold: float = 0.3  # min concentration to trigger fallback
+    skip_active_tags: bool = True
+    active_tag_lookback: int = 4
+    tag_context_max_tokens: int = 30_000
+    strategy_configs: dict[str, StrategyConfig] = field(default_factory=lambda: {
+        "default": StrategyConfig()
+    })
+    anchorless_lookback: int = 6           # how many recent turns for working set
 
 
 @dataclass
 class AssemblerConfig:
     core_context_max_tokens: int = 18_000
-    domain_context_max_tokens: int = 30_000
+    tag_context_max_tokens: int = 30_000
     core_files: list[dict] = field(default_factory=list)
+    recent_turns_always_included: int = 3
+    context_hint_enabled: bool = True
+    context_hint_max_tokens: int = 200
 
 
 @dataclass
 class SummarizationConfig:
-    provider: str = "anthropic"
-    model: str = "claude-haiku-4-5"
+    provider: str = "ollama"
+    model: str = "qwen3:4b-instruct-2507-fp16"
     max_tokens: int = 1000
     temperature: float = 0.3
 
 
 @dataclass
 class StorageConfig:
-    backend: str = "filesystem"
+    backend: str = "sqlite"
     root: str = ".virtualcontext/store"
+    sqlite_path: str = ".virtualcontext/store.db"
+
+
+@dataclass
+class CostTrackingConfig:
+    enabled: bool = False
+    pricing: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
 class VirtualContextConfig:
-    version: str = "1.0"
+    version: str = "0.2"
     storage_root: str = ".virtualcontext"
     context_window: int = 120_000
     token_counter: str = "estimate"
-    domains: dict[str, DomainDef] = field(default_factory=dict)
-    classifier_pipeline: list[dict] = field(default_factory=list)
+    tag_generator: TagGeneratorConfig = field(default_factory=TagGeneratorConfig)
+    tag_rules: list[TagPromptRule] = field(default_factory=list)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
     compactor: CompactorConfig = field(default_factory=CompactorConfig)
@@ -295,5 +404,6 @@ class VirtualContextConfig:
     assembler: AssemblerConfig = field(default_factory=AssemblerConfig)
     summarization: SummarizationConfig = field(default_factory=SummarizationConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    cost_tracking: CostTrackingConfig = field(default_factory=CostTrackingConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))

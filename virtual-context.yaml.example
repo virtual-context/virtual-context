@@ -1,93 +1,117 @@
-version: "1.0"
+version: "0.2"
 storage_root: ".virtualcontext"
 context_window: 120000
 token_counter: "estimate"   # "estimate" | "tiktoken" | "callable:module.path:func"
 
-domains:
-  legal:
-    description: "Legal matters, court filings, case strategy, attorney communications"
-    keywords:
-      - court
-      - filing
-      - motion
-      - attorney
-      - legal
-      - case
-      - judge
-      - plaintiff
-      - defendant
-      - deposition
-      - settlement
-      - statute
-      - jurisdiction
-    patterns:
-      - "\\bN\\.?J\\.?S\\.?A\\.?\\b"
-      - "\\bR\\.?\\s*\\d+:\\d+"
-      - "\\b\\d{2}-cv-\\d+"
-    priority: 9
+# ---------------------------------------------------------------------------
+# Tag Generator — how conversation turns get semantic tags
+# ---------------------------------------------------------------------------
+# type: "llm" uses a local LLM (via Ollama or any OpenAI-compatible endpoint)
+# type: "keyword" uses deterministic keyword/regex matching (no LLM needed)
+#
+# When type is "llm", keyword_fallback provides a safety net if the LLM is
+# unavailable. Tags emerge from conversation content — no predefined domains.
+
+tag_generator:
+  type: "llm"
+  provider: "ollama"
+  model: "qwen3:4b-instruct-2507-fp16"
+  max_tags: 10
+  min_tags: 5
+  prompt_mode: "compact"          # "detailed" (full rules+examples) or "compact" (minimal)
+
+  # Deterministic broad-query detection — regex patterns that override the LLM
+  # when it misses a retrospective/recall query. Case-insensitive. Defaults are
+  # built-in; set this to extend or replace them.
+  # broad_patterns:
+  #   - "\\bwhat did (?:you|we) (?:say|mention|discuss|talk about|decide)\\b"
+  #   - "\\bremind me (?:what|about|of)\\b"
+  #   - "\\blooking back at (?:everything|what|our)\\b"
+  #   - "\\b(?:summarize|recap) (?:what|everything|our|the)\\b"
+  #   - "\\bcan you (?:summarize|recap|review)\\b"
+  #   - "\\bwhat (?:have )?we (?:covered|discussed|talked about|decided)\\b"
+  #   - "\\b(?:you|we) (?:mentioned|discussed|said|talked about) (?:earlier|before|previously)\\b"
+  #   - "\\bgo (?:back|over) (?:what|everything)\\b"
+
+  keyword_fallback:
+    tag_keywords:
+      legal:
+        - court
+        - filing
+        - motion
+        - attorney
+        - legal
+        - case
+        - judge
+      medical:
+        - insulin
+        - medication
+        - doctor
+        - lab
+        - blood
+        - glucose
+      code:
+        - function
+        - bug
+        - deploy
+        - git
+        - API
+        - database
+        - error
+    tag_patterns:
+      legal:
+        - "\\bN\\.?J\\.?S\\.?A\\.?\\b"
+        - "\\b\\d{2}-cv-\\d+"
+      code:
+        - "\\bdef \\w+\\("
+        - "\\bclass \\w+[:(]"
+
+# ---------------------------------------------------------------------------
+# Tag Rules — per-tag priority, TTL, and custom prompts
+# ---------------------------------------------------------------------------
+# match: fnmatch pattern against tag names
+# priority: higher = more important (affects assembly order)
+# ttl_days: null = never expire
+# summary_prompt: optional custom prompt for summarizing this tag's content
+
+tag_rules:
+  - match: "architecture*"
+    priority: 10
+    ttl_days: null
     summary_prompt: |
-      Summarize this legal discussion. Preserve case names, filing deadlines,
-      court orders, legal strategies, and opposing counsel positions.
-    retrieval_limit: 5
-    retrieval_max_tokens: 8000
+      Summarize architectural decisions, design patterns, and tradeoffs.
+      Preserve ADR numbers, component names, and rationale.
+
+  - match: "database*"
+    priority: 8
     ttl_days: null
 
-  medical:
-    description: "Health, medications, symptoms, lab results, doctor visits"
-    keywords:
-      - insulin
-      - medication
-      - doctor
-      - lab
-      - blood
-      - glucose
-      - prescription
-      - diagnosis
-      - symptoms
-      - appointment
+  - match: "debug*"
+    priority: 7
+    ttl_days: 7           # debugging context stales fast
+
+  - match: "legal*"
+    priority: 9
+    ttl_days: null
+    summary_prompt: |
+      Summarize legal discussion. Preserve case names, filing deadlines,
+      court orders, legal strategies, and opposing counsel positions.
+
+  - match: "medical*"
     priority: 8
-    retrieval_limit: 3
-    retrieval_max_tokens: 5000
     ttl_days: 90
 
-  code:
-    description: "Programming, software development, debugging"
-    keywords:
-      - code
-      - function
-      - bug
-      - deploy
-      - git
-      - API
-      - database
-      - server
-      - error
-      - debug
-    priority: 6
-    retrieval_limit: 4
-    retrieval_max_tokens: 6000
+  - match: "*"
+    priority: 5
     ttl_days: 30
 
-  _general:
-    description: "General conversation"
-    priority: 1
-    retrieval_limit: 2
-    retrieval_max_tokens: 2000
-    ttl_days: 14
-
-classifier:
-  min_confidence: 0.3
-  pipeline:
-    - type: keyword
-    # - type: embedding       # v0.2
-    #   model: "all-MiniLM-L6-v2"
-    # - type: llm             # v0.3
-    #   provider: "anthropic"
-    #   model: "claude-haiku-4-5"
+# ---------------------------------------------------------------------------
+# Compaction — threshold-based context management
+# ---------------------------------------------------------------------------
 
 compaction:
-  soft_threshold: 0.70
-  hard_threshold: 0.85
+  soft_threshold: 0.70        # proactive compaction
+  hard_threshold: 0.85        # mandatory blocking compaction
   protected_recent_turns: 6
   overflow_buffer: 1.2
   summary_ratio: 0.15
@@ -95,37 +119,79 @@ compaction:
   max_summary_tokens: 2000
   max_concurrent_summaries: 4
 
+# ---------------------------------------------------------------------------
+# Summarization — LLM used for compaction
+# ---------------------------------------------------------------------------
+
 summarization:
-  provider: "anthropic"
-  model: "claude-haiku-4-5"
+  provider: "ollama"
+  model: "qwen3:4b-instruct-2507-fp16"
   max_tokens: 1000
   temperature: 0.3
 
+# ---------------------------------------------------------------------------
+# Providers — LLM endpoint configurations
+# ---------------------------------------------------------------------------
+
 providers:
-  anthropic:
-    type: "anthropic"
-    api_key_env: "ANTHROPIC_API_KEY"
+  ollama:
+    type: "generic_openai"
+    base_url: "http://127.0.0.1:11434/v1"
+  # anthropic:
+  #   type: "anthropic"
+  #   api_key_env: "ANTHROPIC_API_KEY"
+
+# ---------------------------------------------------------------------------
+# Storage — where compacted segments are persisted
+# ---------------------------------------------------------------------------
 
 storage:
-  backend: "filesystem"
+  backend: "sqlite"           # "sqlite" (primary) or "filesystem" (debug)
+  sqlite:
+    path: ".virtualcontext/store.db"
   filesystem:
     root: ".virtualcontext/store"
 
+# ---------------------------------------------------------------------------
+# Assembly — how context is built for the LLM
+# ---------------------------------------------------------------------------
+
 assembly:
   core_context_max_tokens: 18000
-  domain_context_max_tokens: 30000
-  core_files:
-    - path: "SOUL.md"
-      priority: 10
-    - path: "USER.md"
-      priority: 9
-    - path: "MEMORY.md"
-      priority: 7
+  tag_context_max_tokens: 30000
+  context_hint_enabled: true        # Inject topic list into prompt post-compaction
+  context_hint_max_tokens: 200      # Token budget for topic list
+  core_files: []
+  # core_files:
+  #   - path: "SOUL.md"
+  #     priority: 10
+  #   - path: "USER.md"
+  #     priority: 9
+
+# ---------------------------------------------------------------------------
+# Retrieval — tag-overlap based context retrieval
+# ---------------------------------------------------------------------------
 
 retrieval:
-  deep_retrieve_threshold: 0.8
-  skip_active_domains: true
-  active_domain_lookback: 4
-  velocity_fallback: true       # fall back to high-velocity domains when no keyword match
-  velocity_lookback: 10         # turn pairs to analyze for velocity
-  velocity_threshold: 0.3       # min domain concentration to trigger fallback
+  skip_active_tags: true
+  active_tag_lookback: 4
+  strategy_config:
+    default:
+      min_overlap: 1          # minimum tag overlap to match
+      max_results: 10
+      max_budget_fraction: 0.25
+      include_related: true
+
+# ---------------------------------------------------------------------------
+# Cost Tracking — monitor token usage and estimated costs
+# ---------------------------------------------------------------------------
+
+cost_tracking:
+  enabled: true
+  pricing:
+    ollama:
+      input_per_1k: 0.0      # local = free
+      output_per_1k: 0.0
+    anthropic:
+      input_per_1k: 0.00025
+      output_per_1k: 0.00125

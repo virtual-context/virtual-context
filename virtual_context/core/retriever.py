@@ -1,19 +1,20 @@
-"""ContextRetriever: classify inbound message and fetch relevant domain summaries."""
+"""ContextRetriever: tag inbound message and fetch relevant summaries by tag overlap."""
 
 from __future__ import annotations
 
 import logging
+import math
 import time
-from collections import Counter
 
-from ..classifiers.base import ClassifierPipeline
-from ..core.store import ContextStore
+from .store import ContextStore
+from .tag_generator import TagGenerator
+from .turn_tag_index import TurnTagIndex
 from ..types import (
-    ClassificationResult,
-    DomainDef,
     Message,
+    RetrievalCostReport,
     RetrievalResult,
     RetrieverConfig,
+    StoredSegment,
     StoredSummary,
 )
 
@@ -21,168 +22,267 @@ logger = logging.getLogger(__name__)
 
 
 class ContextRetriever:
-    """Retrieve relevant domain summaries for an inbound message.
-
-    When the classifier can't match the inbound message to a domain (e.g. "What
-    do you think about that?"), falls back to domain velocity: the more the recent
-    conversation has concentrated on a domain, the more likely the next unkeyworded
-    message is about it too.
-    """
+    """Retrieve relevant summaries for an inbound message using tag overlap."""
 
     def __init__(
         self,
-        classifier_pipeline: ClassifierPipeline,
+        tag_generator: TagGenerator,
         store: ContextStore,
         config: RetrieverConfig,
+        turn_tag_index: TurnTagIndex | None = None,
     ) -> None:
-        self.classifier = classifier_pipeline
+        self.tag_generator = tag_generator
         self.store = store
         self.config = config
-        self._domain_defs = {d.name: d for d in config.domains}
+        self._turn_tag_index = turn_tag_index
 
-    async def retrieve(
+    def _compute_idf_weights(self) -> dict[str, float]:
+        """Compute IDF weights from tag usage counts in the store.
+
+        Returns a dict mapping tag → log(1 + total_segments / usage_count).
+        Rare tags get higher weights than common ones.
+        """
+        all_tags = self.store.get_all_tags()
+        if not all_tags:
+            return {}
+        total = sum(ts.usage_count for ts in all_tags)
+        if total == 0:
+            return {}
+        return {
+            ts.tag: math.log(1 + total / max(ts.usage_count, 1))
+            for ts in all_tags
+        }
+
+    def retrieve(
         self,
         message: str,
-        current_domains_in_context: list[str] | None = None,
-        conversation_history: list[Message] | None = None,
+        current_active_tags: list[str] | None = None,
+        current_utilization: float = 0.0,
     ) -> RetrievalResult:
-        """Classify inbound message, fetch relevant summaries from store.
+        """Tag inbound message, fetch relevant summaries by tag overlap.
 
-        If the classifier returns no confident domain match and velocity_fallback
-        is enabled, computes domain velocity from recent conversation and retrieves
-        summaries for high-velocity domains.
+        Args:
+            message: The inbound user message.
+            current_active_tags: Tags from recent conversation turns to skip.
+            current_utilization: Current context window usage ratio (0.0-1.0).
         """
         start_time = time.monotonic()
-        active_domains = set(current_domains_in_context or [])
+        active_tags = set(current_active_tags or [])
 
-        # Classify the inbound message
-        domains_list = list(self._domain_defs.values())
-        results = await self.classifier.classify(message, domains_list)
+        # Tag the inbound message (pass known tags so LLM reuses vocabulary)
+        store_tags = [ts.tag for ts in self.store.get_all_tags()]
+        tag_result = self.tag_generator.generate_tags(message, store_tags)
 
-        # Check if we got a real match or just _general fallback
-        real_matches = [r for r in results if r.domain != "_general"]
-        used_velocity = False
-        velocity_scores: dict[str, float] = {}
+        retrieval_metadata: dict = {}
 
-        if not real_matches and self.config.velocity_fallback and conversation_history:
-            # No keyword match — compute domain velocity from recent conversation
-            velocity_scores = await self._compute_velocity(conversation_history, domains_list)
-            # Convert high-velocity domains into synthetic classification results
-            for domain, velocity in sorted(velocity_scores.items(), key=lambda x: x[1], reverse=True):
-                if velocity >= self.config.velocity_threshold:
-                    results.append(ClassificationResult(
-                        domain=domain,
-                        confidence=velocity,  # velocity as confidence proxy
-                        source="velocity",
+        # --- Broad query branch ---
+        if tag_result.broad:
+            tag_summaries = self.store.get_all_tag_summaries()
+            if tag_summaries:
+                selected_broad: list[StoredSummary] = []
+                total_broad_tokens = 0
+                token_budget = self.config.tag_context_max_tokens
+
+                for ts in tag_summaries:
+                    if total_broad_tokens + ts.summary_tokens > token_budget:
+                        break
+                    selected_broad.append(StoredSummary(
+                        ref=f"tag-summary-{ts.tag}",
+                        primary_tag=ts.tag,
+                        tags=[ts.tag],
+                        summary=ts.summary,
+                        summary_tokens=ts.summary_tokens,
+                        created_at=ts.updated_at,
+                        start_timestamp=ts.created_at,
+                        end_timestamp=ts.updated_at,
                     ))
-                    used_velocity = True
+                    total_broad_tokens += ts.summary_tokens
 
-        matched_domains: list[str] = []
-        all_summaries: list[StoredSummary] = []
+                elapsed = time.monotonic() - start_time
+                return RetrievalResult(
+                    tags_matched=[ts.tag for ts in tag_summaries],
+                    summaries=selected_broad,
+                    total_tokens=total_broad_tokens,
+                    broad=True,
+                    retrieval_metadata={
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                        "tags_from_message": tag_result.tags,
+                        "broad": True,
+                        "tag_summaries_loaded": len(selected_broad),
+                    },
+                    cost_report=RetrievalCostReport(
+                        tokens_retrieved=total_broad_tokens,
+                        budget_fraction_used=(
+                            total_broad_tokens / token_budget if token_budget > 0 else 0.0
+                        ),
+                        strategy_active="broad",
+                        tags_queried=tag_result.tags,
+                    ),
+                )
+            # No tag summaries yet — fall through to normal retrieval
+            # but still mark broad so filter_history includes all turns
+            retrieval_metadata["broad"] = True
+
+        if tag_result.source == "fallback":
+            # Tagging failed — fall back to working set tags from live index
+            if self._turn_tag_index:
+                working_set = list(self._turn_tag_index.get_active_tags(
+                    lookback=self.config.anchorless_lookback
+                ))
+                query_tags = [t for t in working_set if t != "_general"]
+                retrieval_metadata["fallback"] = "working_set"
+            else:
+                query_tags = [t for t in tag_result.tags if t != "_general"]
+        else:
+            # Normal flow — filter out active tags (already in recent context)
+            query_tags = [
+                t for t in tag_result.tags
+                if not (self.config.skip_active_tags and t in active_tags)
+                and t != "_general"
+            ]
+
+        skipped_tags = [t for t in tag_result.tags if t in active_tags]
+
+        if not query_tags:
+            elapsed = time.monotonic() - start_time
+            return RetrievalResult(
+                tags_matched=[],
+                summaries=[],
+                total_tokens=0,
+                broad=tag_result.broad,
+                retrieval_metadata={
+                    "elapsed_ms": round(elapsed * 1000, 1),
+                    "tags_from_message": tag_result.tags,
+                    "tags_skipped_active": skipped_tags,
+                },
+                cost_report=RetrievalCostReport(
+                    tags_queried=[],
+                    tags_skipped=skipped_tags,
+                    strategy_active="default",
+                ),
+            )
+
+        # Determine strategy and budget
+        strategy = self.config.strategy_configs.get("default")
+        if strategy is None:
+            from ..types import StrategyConfig
+            strategy = StrategyConfig()
+
+        # Scale budget by utilization — as context fills, retrieve less
+        budget_fraction = strategy.max_budget_fraction
+        if current_utilization > 0.5:
+            scale = max(0.1, 1.0 - current_utilization)
+            budget_fraction *= scale
+
+        token_budget = int(self.config.tag_context_max_tokens * budget_fraction)
+
+        # Expand query with related tags from tagger
+        related_query_tags = [
+            t for t in tag_result.related_tags
+            if t not in set(query_tags) and t != "_general"
+        ]
+        expanded_tags = list(set(query_tags) | set(related_query_tags))
+
+        # Overfetch 3x for IDF re-ranking
+        overfetch_limit = strategy.max_results * 3
+        summaries = self.store.get_summaries_by_tags(
+            tags=expanded_tags,
+            min_overlap=strategy.min_overlap,
+            limit=overfetch_limit,
+        )
+
+        # IDF re-rank: score each result by weighted tag overlap
+        idf_weights = self._compute_idf_weights()
+        query_tag_set = set(query_tags)
+        related_tag_set = set(related_query_tags)
+
+        scored: list[tuple[float, StoredSummary]] = []
+        for summary in summaries:
+            summary_tag_set = set(summary.tags)
+            # Primary matches: full IDF weight
+            primary_score = sum(
+                idf_weights.get(t, 1.0) for t in query_tag_set & summary_tag_set
+            )
+            # Related matches: 0.5x IDF weight
+            related_score = 0.5 * sum(
+                idf_weights.get(t, 1.0) for t in related_tag_set & summary_tag_set
+            )
+            scored.append((primary_score + related_score, summary))
+
+        # Sort by score descending, take top max_results
+        scored.sort(key=lambda x: x[0], reverse=True)
+        ranked = [s for _, s in scored[:strategy.max_results]]
+
+        # Apply token budget
+        selected: list[StoredSummary] = []
         total_tokens = 0
-        global_budget = self.config.domain_context_max_tokens
+        for summary in ranked:
+            if total_tokens + summary.summary_tokens > token_budget:
+                break
+            selected.append(summary)
+            total_tokens += summary.summary_tokens
 
-        for result in results:
-            domain = result.domain
-
-            # Skip active domains already in recent conversation
-            if self.config.skip_active_domains and domain in active_domains:
-                logger.debug(f"Skipping active domain: {domain}")
-                continue
-
-            if domain == "_general":
-                continue
-
-            matched_domains.append(domain)
-
-            # Get per-domain config
-            domain_def = self._domain_defs.get(domain)
-            limit = domain_def.retrieval_limit if domain_def else 3
-            max_tokens = domain_def.retrieval_max_tokens if domain_def else 5000
-
-            # Fetch summaries from store
-            summaries = await self.store.get_summaries(domain=domain, limit=limit)
-
-            # Apply per-domain token budget
-            domain_tokens = 0
-            for summary in summaries:
-                if domain_tokens + summary.summary_tokens > max_tokens:
+        # FTS fallback: tag overlap missed — try full-text search on stored segments
+        # Convert tags to FTS query terms: "cook-mode" → "cook mode"
+        if not selected and expanded_tags:
+            fts_terms = " OR ".join(
+                f'"{tag.replace("-", " ")}"' for tag in expanded_tags
+            )
+            fts_results = self.store.search(
+                query=fts_terms,
+                limit=strategy.max_results,
+            )
+            for summary in fts_results:
+                if total_tokens + summary.summary_tokens > token_budget:
                     break
-                if total_tokens + summary.summary_tokens > global_budget:
-                    break
-                all_summaries.append(summary)
-                domain_tokens += summary.summary_tokens
+                selected.append(summary)
                 total_tokens += summary.summary_tokens
+            if fts_results:
+                retrieval_metadata["fts_fallback"] = True
+                logger.debug(
+                    "FTS fallback: tag overlap empty, text search found %d results",
+                    len(selected),
+                )
+
+        # Deep retrieval: fetch full segments when we have matches
+        full_detail: list[StoredSegment] = []
+        if selected:
+            for summary in selected[:3]:  # limit to top 3
+                segment = self.store.get_segment(summary.ref)
+                if segment:
+                    full_detail.append(segment)
+
+        # Collect matched tags (include related tag matches too)
+        expanded_set = set(expanded_tags)
+        matched_tags = list({tag for s in selected for tag in s.tags if tag in expanded_set})
 
         elapsed = time.monotonic() - start_time
 
+        retrieval_metadata.update({
+            "elapsed_ms": round(elapsed * 1000, 1),
+            "tags_from_message": tag_result.tags,
+            "tags_queried": query_tags,
+            "tags_skipped_active": skipped_tags,
+            "summaries_returned": len(selected),
+            "strategy": "default",
+            "budget_fraction": round(budget_fraction, 3),
+            "idf_reranked": bool(idf_weights),
+            "related_tags_used": related_query_tags,
+            "query_expanded": len(related_query_tags) > 0,
+        })
+
         return RetrievalResult(
-            domains_matched=matched_domains,
-            summaries=all_summaries,
-            full_detail=[],  # Deep retrieval deferred to v0.2
+            tags_matched=matched_tags,
+            summaries=selected,
+            full_detail=full_detail,
             total_tokens=total_tokens,
-            retrieval_metadata={
-                "elapsed_ms": round(elapsed * 1000, 1),
-                "domains_checked": len(results),
-                "domains_matched": len(matched_domains),
-                "domains_skipped_active": len(active_domains & {r.domain for r in results}),
-                "summaries_returned": len(all_summaries),
-                "used_velocity_fallback": used_velocity,
-                "velocity_scores": velocity_scores,
-            },
+            broad=tag_result.broad,
+            retrieval_metadata=retrieval_metadata,
+            cost_report=RetrievalCostReport(
+                tokens_retrieved=total_tokens,
+                budget_fraction_used=total_tokens / token_budget if token_budget > 0 else 0.0,
+                strategy_active="default",
+                tags_queried=query_tags,
+                tags_skipped=skipped_tags,
+            ),
         )
-
-    async def _compute_velocity(
-        self,
-        conversation_history: list[Message],
-        domains: list[DomainDef],
-    ) -> dict[str, float]:
-        """Compute domain velocity from recent conversation.
-
-        Looks at the last N turn pairs, classifies each, and returns
-        the concentration ratio per domain.
-
-        Returns:
-            {domain_name: velocity} where velocity = domain_turns / total_turns
-        """
-        lookback = self.config.velocity_lookback * 2  # messages, not turn pairs
-        recent = conversation_history[-lookback:] if len(conversation_history) > lookback else conversation_history
-
-        if not recent:
-            return {}
-
-        # Classify each turn pair in the lookback window
-        domain_counts: Counter[str] = Counter()
-        total_pairs = 0
-
-        # Walk through messages pairing user+assistant
-        i = 0
-        while i < len(recent):
-            # Collect one turn pair worth of text
-            pair_text_parts: list[str] = []
-
-            if recent[i].role == "user":
-                pair_text_parts.append(recent[i].content)
-                # Look for the assistant response
-                if i + 1 < len(recent) and recent[i + 1].role == "assistant":
-                    pair_text_parts.append(recent[i + 1].content)
-                    i += 2
-                else:
-                    i += 1
-            else:
-                pair_text_parts.append(recent[i].content)
-                i += 1
-
-            pair_text = " ".join(pair_text_parts)
-            pair_results = await self.classifier.classify(pair_text, domains)
-
-            # Count the primary domain (first result)
-            if pair_results and pair_results[0].domain != "_general":
-                domain_counts[pair_results[0].domain] += 1
-
-            total_pairs += 1
-
-        if total_pairs == 0:
-            return {}
-
-        return {domain: count / total_pairs for domain, count in domain_counts.items()}

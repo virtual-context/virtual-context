@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "virtual-context"
-version = "0.1.0"
+version = "0.2.0"
 description = "OS-style virtual memory for LLM session context management"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -18,16 +18,16 @@ dependencies = [
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.50"]
 embeddings = ["sentence-transformers>=3.0", "torch>=2.0"]
-sqlite = ["aiosqlite>=0.20"]
-vector = ["chromadb>=0.5"]
 tiktoken = ["tiktoken>=0.7"]
 bridge = ["uvicorn>=0.30", "fastapi>=0.115"]
+mcp = ["mcp>=1.0"]
+tui = ["textual>=3.0", "rich>=13.0"]
 all = [
-    "virtual-context[anthropic,openai,embeddings,sqlite,vector,tiktoken,bridge]",
+    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,tui]",
 ]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "ruff>=0.8",
 ]
 
@@ -39,5 +39,5 @@ target-version = "py311"
 line-length = 100
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["ollama: tests requiring a running Ollama instance with qwen3:4b-instruct-2507-fp16"]
