@@ -222,6 +222,7 @@ class VirtualContextEngine:
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
         assembled.broad = retrieval_result.broad
+        assembled.temporal = retrieval_result.temporal
 
         return assembled
 
@@ -389,12 +390,13 @@ class VirtualContextEngine:
         current_tags: list[str],
         recent_turns: int | None = None,
         broad: bool = False,
+        temporal: bool = False,
     ) -> list[Message]:
         """Filter conversation history by tag relevance.
 
-        When ``broad`` is True, all remaining turns are included without
-        tag-based filtering.  Pre-compaction the full history fits within the
-        context window; post-compaction old turns are already gone, so "all
+        When ``broad`` or ``temporal`` is True, all remaining turns are included
+        without tag-based filtering.  Pre-compaction the full history fits within
+        the context window; post-compaction old turns are already gone, so "all
         remaining" is bounded.
 
         Always includes the last ``recent_turns`` turn pairs.  For older turns,
@@ -415,9 +417,9 @@ class VirtualContextEngine:
         if total <= protected_count:
             return list(conversation_history)
 
-        # Broad query — include everything, but skip compacted messages
-        # (tag summaries from retriever replace them)
-        if broad:
+        # Broad or temporal query — include everything, but skip compacted messages
+        # (summaries from retriever replace them)
+        if broad or temporal:
             watermark = getattr(self, "_compacted_through", 0)
             if watermark > 0:
                 return list(conversation_history[watermark:])

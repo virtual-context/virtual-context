@@ -148,6 +148,7 @@ class HeadlessRunner:
                 self._conversation_history,
                 current_tags=assembled.matched_tags,
                 broad=assembled.broad,
+                temporal=assembled.temporal,
             )
             timing["filter_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         else:
@@ -209,6 +210,7 @@ class HeadlessRunner:
             assistant_message=assistant_text,
             assembled=assembled,
             broad=assembled.broad,
+            temporal=assembled.temporal,
             input_tokens=estimated_tokens,
             turns_in_payload=turns_in_payload,
             api_payload=api_payload,

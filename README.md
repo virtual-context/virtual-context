@@ -22,7 +22,7 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 |---|---|---|---|
 | **What gets kept** | Most recent N messages | Whatever embeds close to the query | Everything, at varying compression |
 | **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
-| **"What did we discuss?"** | Only recent context | Poor — query is too vague to embed | Broad query detection loads all summaries |
+| **"What did we discuss?"** | Only recent context | Poor — query is too vague to embed | Broad detection loads all summaries; temporal detection retrieves by time position |
 | **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
 | **Interpretability** | None | Opaque similarity scores | Visible tags, matched segments, budget breakdown |
 | **Latency** | Zero | Embedding computation per query | Subsecond with local models |
@@ -44,6 +44,7 @@ assembled = engine.on_message_inbound(
 # assembled.prepend_text → enriched system prompt with retrieved summaries
 # assembled.matched_tags → ["legal", "filing"]
 # assembled.broad → False (this is a specific query)
+# assembled.temporal → False (no time-position reference)
 
 # AFTER LLM responds — tag, index, compact if needed
 report = engine.on_turn_complete(messages)
@@ -67,6 +68,7 @@ Tag the message (LLM / keyword / embedding)
     ▼
 Retrieve matching summaries from store
     │  ├─ Broad query? → load ALL tag summaries (bounded post-compaction)
+    │  ├─ Temporal query? → load segment summaries sorted earliest-first (Layer 1)
     │  ├─ Query expansion: primary tags + related tags widen the search
     │  ├─ Overfetch 3x → IDF-weighted re-rank (rare tag matches score higher)
     │  ├─ FTS fallback: if tag overlap finds nothing, full-text search on stored segments
@@ -76,7 +78,7 @@ Retrieve matching summaries from store
 Assemble context within token budget
     │  ├─ Context hint: lightweight <context-topics> block (~50-200t)
     │  ├─ Tag sections: retrieved summaries ordered by tag priority
-    │  └─ Filtered history: unrelated older turns dropped, broad mode includes all
+    │  └─ Filtered history: unrelated older turns dropped, broad/temporal mode includes all
     │
     ▼
 LLM processes enriched context → produces response
@@ -116,6 +118,20 @@ These queries don't map cleanly to specific tags. The LLM tagger flags them as `
 - Post-compaction, broad queries are **bounded** — compacted messages are skipped (tag summaries replace them), preventing token blowout
 
 This eliminates the failure mode where the LLM says "I don't recall discussing that" about something from 50 turns ago.
+
+### Temporal Query Detection
+
+"Going back to the very beginning — what were the key decisions?" "What did we set up with tokens at the start?" "Something you said early on about indexing."
+
+These queries reference a *position in time*, not just a topic. The LLM tagger flags them as `temporal: true`, and the retriever switches to a different data path:
+
+- Instead of merged **tag summaries** (Layer 2), it fetches granular **segment summaries** (Layer 1)
+- Segments are sorted by creation time — **earliest first** — so foundational decisions surface before later refinements
+- Deep retrieval pulls full stored segment content for the top matches
+
+This solves a fundamental problem with summarization: when a tag like `project-structure` appears at turn 1, turn 57, and turn 71, a merged tag summary blends all three. A temporal query about "the very first thing we discussed" needs the turn-1 segment specifically — not the merged blob.
+
+Detection uses two layers (same pattern as broad): the LLM detects temporal intent, and deterministic regex patterns catch phrases the LLM misses (`"at the beginning"`, `"early on"`, `"the very first thing"`).
 
 ### Context Awareness Hints
 
@@ -311,7 +327,7 @@ A terminal chat interface with live context visualization:
 - **Tag panel** — current tag working set with activity levels
 - **Budget bar** — real-time token usage breakdown (core, tags, hint, conversation)
 - **Turn list** — every turn with its tags, navigable with Ctrl+B/F
-- **Turn inspector** (Ctrl+I) — full turn data: API payload, tags, assembled context, broad flag
+- **Turn inspector** (Ctrl+I) — full turn data: API payload, tags, assembled context, broad/temporal flags
 - **Brief mode** (Ctrl+T) — silently appends "answer in 2 lines" for faster iteration
 - **Manual compaction** — type `/compact` or press Ctrl+K
 - **Session export** (Ctrl+S) — saves full session to `vc-session.json` with all metadata
@@ -364,7 +380,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **TurnTagIndex** | `core/turn_tag_index.py` | Live per-turn tag index, velocity tracking, greedy set cover |
 | **TagGenerator** | `core/tag_generator.py` | LLM / keyword / embedding semantic tagging |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
-| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, broad queries, FTS fallback |
+| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, broad/temporal queries, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
@@ -402,13 +418,15 @@ Retry logic with exponential backoff on both.
 
 ## Stress-Tested
 
-virtual-context has been validated against 100-turn multi-topic conversations (SaaS architecture, guitar practice, legal disputes, running training — all interleaved) with a 3,000-token context window using Claude Haiku. Results:
+virtual-context has been validated against 100-turn adversarial conversations with deliberately overlapping domains (Flask IoT API, music studio, ML pipeline, cross-domain integration), vocabulary mismatches, ambiguous callbacks, and cross-domain synthesis queries — using a 3,000-token context window with Claude Haiku. Results:
 
-- **Cross-vocabulary recall**: "caching trick for the feed" at turn 71 correctly retrieves "materialized view" discussion from turn 46 despite zero primary tag overlap — related tag expansion bridges the vocabulary gap
-- **IDF-weighted precision**: "precomputed summary table" at turn 81 retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
-- **Broad query bounding**: retrospective queries like "what were the biggest mistakes" (turn 96) load all tag summaries but stay bounded at ~3,000 tokens post-compaction
-- **Context hints**: lightweight topic list (~50-200 tokens) gives the LLM awareness of stored topics post-compaction
-- **Compaction**: 4 compaction events across 100 turns, average 891 tokens per turn, peak 3,027 tokens
+- **Cross-vocabulary recall**: "caching trick for the feed" correctly retrieves "materialized view" despite zero primary tag overlap — related tag expansion bridges the vocabulary gap
+- **IDF-weighted precision**: "precomputed summary table" retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
+- **Ambiguous multi-match**: "what middleware pattern?" correctly identifies both auth and logging middleware across 4 overlapping domains; "plugins — Flask, audio, or ML?" correctly disambiguates
+- **Temporal recall**: "going back to the very beginning — what were the key decisions?" retrieves original Flask blueprint architecture from turn 1 via segment-level retrieval, even after 4 compaction events
+- **Broad query bounding**: "summary of everything we've discussed" loads 22 bundled tag summaries but stays bounded at ~2,900 tokens post-compaction
+- **Adversarial pass rate**: 89% on 28 deliberately adversarial prompts (vocabulary mismatches, ambiguous references, cross-domain synthesis, late vague recalls)
+- **Compaction**: 4 events across 100 turns, average 1,147 tokens per turn, peak 3,018 tokens
 - **Tag convergence**: vocabulary stabilizes within 10-15 turns via feedback loop
 
 ## Development

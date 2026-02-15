@@ -102,6 +102,7 @@ class TurnInspector(ModalScreen[None]):
             f"Tag: {t.primary_tag}  "
             f"Tags: {', '.join(t.tags)}  "
             f"Broad: {t.broad}  "
+            f"Temporal: {t.temporal}  "
             f"Tokens: {t.input_tokens:,}  "
             f"Bundled: {t.turns_in_payload}"
         )

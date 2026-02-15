@@ -37,6 +37,7 @@ class TagResult:
     primary: str
     source: str  # "llm", "keyword", "fallback"
     broad: bool = False  # True when query is vague/retrospective/overview
+    temporal: bool = False  # True when query references a time position ("first thing", "early on")
     related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
 
 
@@ -52,6 +53,22 @@ DEFAULT_BROAD_PATTERNS: list[str] = [
     r"\beach of (?:these|the|our) (?:threads|topics|discussions|conversations|areas|subjects)\b",
     r"\bacross (?:everything|all|the things) we(?:'ve)? (?:discussed|covered|talked about)\b",
     r"\bfrom (?:everything|all) we(?:'ve)? (?:discussed|covered|talked about)\b",
+    # BUG-007: catch "summary of everything" and "everything we've talked about"
+    r"\b(?:high-level )?summary of everything\b",
+    r"\beverything we(?:'ve)? (?:talked|discussed|covered|worked on)\b",
+    r"\b(?:complete|full) (?:checklist|list|summary) of (?:all|everything)\b",
+    r"\bgiven everything we(?:'ve)?\b",
+]
+
+DEFAULT_TEMPORAL_PATTERNS: list[str] = [
+    r"\b(?:the )?(?:very )?first (?:thing|topic|discussion|time|question)\b",
+    r"\bat the (?:very )?(?:beginning|start)\b",
+    r"\bearly (?:on|in our)\b",
+    r"\b(?:initially|originally) (?:we|you|i)\b",
+    r"\bgoing (?:all the )?way back\b",
+    r"\bwhen we (?:first|started)\b",
+    r"\bthe (?:very )?first thing we (?:discussed|talked about|covered)\b",
+    r"\bback to the (?:very )?(?:beginning|start|first)\b",
 ]
 
 
@@ -67,6 +84,7 @@ class TagGeneratorConfig:
     prompt_mode: str = "detailed"  # "detailed" (full rules+examples) or "compact" (minimal)
     keyword_fallback: KeywordTagConfig | None = None
     broad_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BROAD_PATTERNS))
+    temporal_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_TEMPORAL_PATTERNS))
 
 
 @dataclass
@@ -270,6 +288,7 @@ class RetrievalResult:
     retrieval_metadata: dict = field(default_factory=dict)
     cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
     broad: bool = False  # True when the query was detected as broad/retrospective
+    temporal: bool = False  # True when the query references a time position
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +321,7 @@ class AssembledContext:
     matched_tags: list[str] = field(default_factory=list)
     context_hint: str = ""  # Topic list injected post-compaction
     broad: bool = False  # True when query is broad — include all history
+    temporal: bool = False  # True when query references a time position
 
 
 # ---------------------------------------------------------------------------

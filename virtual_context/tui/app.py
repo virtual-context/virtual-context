@@ -256,6 +256,7 @@ class VChatApp(App):
                 self._conversation_history,
                 current_tags=assembled.matched_tags,
                 broad=assembled.broad,
+                temporal=assembled.temporal,
             )
         else:
             filtered = self._conversation_history
@@ -351,6 +352,7 @@ class VChatApp(App):
             tags=tags,
             primary_tag=primary_tag,
             broad=assembled.broad,
+            temporal=assembled.temporal,
             input_tokens=estimated_tokens,
             turns_in_payload=turns_in_payload,
             api_payload=api_payload,

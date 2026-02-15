@@ -117,7 +117,7 @@ class TestHeadlessWithEngine:
                 from virtual_context.types import AssembledContext
                 return AssembledContext()
 
-            def filter_history(self, history, current_tags=None, broad=False):
+            def filter_history(self, history, current_tags=None, broad=False, temporal=False):
                 self.filter_calls.append(current_tags)
                 return history
 
