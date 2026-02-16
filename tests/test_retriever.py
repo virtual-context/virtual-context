@@ -12,6 +12,7 @@ from virtual_context.types import (
     SegmentMetadata,
     StoredSegment,
     StrategyConfig,
+    TagGeneratorConfig,
     TagResult,
 )
 
@@ -199,3 +200,177 @@ def test_fts_fallback_not_used_when_tags_match(tmp_sqlite_db):
     assert len(result.summaries) > 0
     assert result.retrieval_metadata.get("fts_fallback") is None
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Inbound Matching (embedding-based vocabulary matching)
+# ---------------------------------------------------------------------------
+
+class TestInboundMatching:
+    """Test embedding-based inbound matching replaces LLM tagger for inbound."""
+
+    def _make_embed_fn(self):
+        """Fake embed function: returns a fixed vector per known string."""
+        # Simple deterministic embeddings for testing:
+        # Represent tags/text as one-hot-ish vectors for cosine similarity control
+        vectors = {
+            "electronics": [1.0, 0.0, 0.0, 0.0, 0.0],
+            "arduino":     [0.9, 0.1, 0.0, 0.0, 0.0],  # close to electronics
+            "planes":      [0.0, 1.0, 0.0, 0.0, 0.0],
+            "jiu-jitsu":   [0.0, 0.0, 1.0, 0.0, 0.0],
+            "cars":        [0.0, 0.0, 0.0, 1.0, 0.0],
+            "engineering": [0.3, 0.3, 0.0, 0.3, 0.1],  # cross-cutting
+            "design":      [0.2, 0.3, 0.0, 0.3, 0.2],  # cross-cutting
+            "craftsmanship": [0.1, 0.2, 0.2, 0.2, 0.3],  # very cross-cutting
+            "_general":    [0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+        # Text vectors — simulate what a real model would return
+        # Keys must be lowercase (embed fn lowercases input)
+        text_vectors = {
+            "tell me about arduino circuits": [0.95, 0.05, 0.0, 0.0, 0.0],  # very close to electronics
+            "i want to talk about planes": [0.05, 0.95, 0.0, 0.0, 0.0],  # very close to planes
+            "tell me about jjiujitu": [0.05, 0.0, 0.85, 0.0, 0.1],  # close to jiu-jitsu (typo!)
+            "summarize everything we discussed": [0.2, 0.2, 0.2, 0.2, 0.2],  # broad
+            "what did we first talk about": [0.2, 0.2, 0.2, 0.2, 0.2],  # temporal
+        }
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            result = []
+            for t in texts:
+                t_lower = t.lower()
+                if t_lower in vectors:
+                    result.append(vectors[t_lower])
+                elif t_lower in text_vectors:
+                    result.append(text_vectors[t_lower])
+                else:
+                    # Default: slight general bias
+                    result.append([0.1, 0.1, 0.1, 0.1, 0.6])
+            return result
+
+        return embed
+
+    def _make_retriever_with_inbound(self, db_path, populate_vocab=True):
+        """Build a retriever with an embedding-based inbound tagger."""
+        from virtual_context.core.embedding_tag_generator import EmbeddingTagGenerator
+        from virtual_context.core.turn_tag_index import TurnTagIndex
+        from virtual_context.types import TurnTagEntry
+
+        # Main tagger (LLM mock) for on_turn_complete
+        main_tagger = MockTagGenerator(default_tag="test", default_tags=["test"])
+
+        # Inbound tagger (embedding-based)
+        tag_gen_config = TagGeneratorConfig(max_tags=5, min_tags=1)
+        inbound = EmbeddingTagGenerator(
+            config=tag_gen_config,
+            similarity_threshold=0.3,
+            embed_fn=self._make_embed_fn(),
+        )
+
+        store = SQLiteStore(db_path=db_path)
+        turn_tag_index = TurnTagIndex()
+
+        # Pre-populate vocabulary (inbound matching needs existing tags to match against)
+        if populate_vocab:
+            turn_tag_index.append(TurnTagEntry(
+                turn_number=0, message_hash="h0",
+                tags=["electronics", "arduino"], primary_tag="electronics",
+            ))
+            turn_tag_index.append(TurnTagEntry(
+                turn_number=1, message_hash="h1",
+                tags=["planes", "engineering", "design"], primary_tag="planes",
+            ))
+            turn_tag_index.append(TurnTagEntry(
+                turn_number=2, message_hash="h2",
+                tags=["jiu-jitsu", "craftsmanship"], primary_tag="jiu-jitsu",
+            ))
+            turn_tag_index.append(TurnTagEntry(
+                turn_number=3, message_hash="h3",
+                tags=["cars", "design", "engineering"], primary_tag="cars",
+            ))
+
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            skip_active_tags=False,
+            strategy_configs={
+                "default": StrategyConfig(min_overlap=1, max_results=10),
+            },
+        )
+        retriever = ContextRetriever(
+            tag_generator=main_tagger,
+            store=store,
+            config=config,
+            turn_tag_index=turn_tag_index,
+            inbound_tagger=inbound,
+        )
+        return retriever, store, turn_tag_index
+
+    def test_electronics_does_not_return_planes(self, tmp_sqlite_db):
+        """Embedding match for 'arduino circuits' should NOT include 'planes'."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        result = retriever.retrieve("tell me about arduino circuits")
+        tags = result.retrieval_metadata.get("tags_from_message", [])
+
+        assert "electronics" in tags or "arduino" in tags
+        assert "planes" not in tags
+        store.close()
+
+    def test_topic_shift_detected(self, tmp_sqlite_db):
+        """Switching from electronics to planes should pick up planes tag."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        result = retriever.retrieve("I want to talk about planes")
+        tags = result.retrieval_metadata.get("tags_from_message", [])
+
+        assert "planes" in tags
+        assert "electronics" not in tags or tags.index("planes") < tags.index("electronics")
+        store.close()
+
+    def test_typo_handled_via_embedding(self, tmp_sqlite_db):
+        """Misspelled 'jjiujitu' should match 'jiu-jitsu' via embedding similarity."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        # Pre-populate vocabulary by passing existing tags
+        result = retriever.retrieve("tell me about jjiujitu")
+        tags = result.retrieval_metadata.get("tags_from_message", [])
+
+        assert "jiu-jitsu" in tags
+        store.close()
+
+    def test_broad_heuristic_applied(self, tmp_sqlite_db):
+        """Embedding tagger doesn't detect broad — heuristic should catch it."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        result = retriever.retrieve("summarize everything we discussed")
+        assert result.broad is True
+        store.close()
+
+    def test_temporal_heuristic_applied(self, tmp_sqlite_db):
+        """Embedding tagger doesn't detect temporal — heuristic should catch it."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        result = retriever.retrieve("what did we first talk about")
+        # "first talk about" matches temporal pattern
+        assert result.retrieval_metadata.get("tags_from_message") is not None
+        store.close()
+
+    def test_inbound_tagger_not_used_for_main_tagger(self, tmp_sqlite_db):
+        """The main tag_generator should not be affected by inbound_tagger."""
+        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
+
+        # The main tagger is a MockTagGenerator that always returns "test"
+        main_result = retriever.tag_generator.generate_tags("anything")
+        assert main_result.tags == ["test"]
+        store.close()
+
+    def test_empty_vocabulary_returns_general(self, tmp_sqlite_db):
+        """With no vocabulary, inbound matching returns _general (fallback)."""
+        retriever, store, _ = self._make_retriever_with_inbound(
+            tmp_sqlite_db, populate_vocab=False,
+        )
+
+        result = retriever.retrieve("tell me about arduino circuits")
+        tags = result.retrieval_metadata.get("tags_from_message", [])
+
+        assert tags == ["_general"]
+        store.close()

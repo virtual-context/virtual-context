@@ -303,6 +303,49 @@ def cmd_chat(args):
     )
 
 
+def cmd_proxy(args):
+    """Start HTTP proxy for LLM enrichment."""
+    try:
+        import uvicorn
+        from ..proxy import create_app
+    except ImportError:
+        print("Run: pip install virtual-context[bridge]", file=sys.stderr)
+        sys.exit(1)
+
+    # Suppress CancelledError tracebacks on shutdown.  Uvicorn force-cancels
+    # SSE streaming responses after the graceful-shutdown timeout, which
+    # triggers CancelledError inside Starlette internals.  This is expected
+    # and harmless — suppress the noisy traceback.
+    import asyncio
+    import logging as _logging
+
+    class _SuppressCancelled(_logging.Filter):
+        def filter(self, record: _logging.LogRecord) -> bool:
+            if record.exc_info:
+                exc_type = record.exc_info[0]
+                if exc_type is asyncio.CancelledError:
+                    return False
+            return True
+
+    class _SuppressDashboardAccess(_logging.Filter):
+        """Hide repetitive GET /dashboard/* access logs."""
+        def filter(self, record: _logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            if "GET /dashboard/" in msg and "200" in msg:
+                return False
+            return True
+
+    _logging.getLogger("uvicorn.error").addFilter(_SuppressCancelled())
+    _logging.getLogger("uvicorn.access").addFilter(_SuppressDashboardAccess())
+
+    app = create_app(upstream=args.upstream, config_path=args.config)
+    print(f"virtual-context proxy on {args.host}:{args.port} -> {args.upstream}")
+    uvicorn.run(
+        app, host=args.host, port=args.port, log_level="info",
+        timeout_graceful_shutdown=2,
+    )
+
+
 def cmd_retrieve(args):
     """Retrieve context for a message."""
     from ..engine import VirtualContextEngine
@@ -427,6 +470,15 @@ def main():
         help="Run replay without TUI (requires --replay)",
     )
 
+    # proxy
+    proxy_parser = subparsers.add_parser("proxy", help="Start HTTP proxy for LLM enrichment")
+    proxy_parser.add_argument(
+        "--upstream", "-u", required=True,
+        help="Upstream provider URL (e.g., https://api.anthropic.com)",
+    )
+    proxy_parser.add_argument("--port", "-p", type=int, default=5757)
+    proxy_parser.add_argument("--host", default="127.0.0.1")
+
     # config validate
     config_parser = subparsers.add_parser("config", help="Config operations")
     config_sub = config_parser.add_subparsers(dest="config_command")
@@ -458,6 +510,8 @@ def main():
         cmd_transform(args)
     elif args.command == "aliases":
         cmd_aliases(args)
+    elif args.command == "proxy":
+        cmd_proxy(args)
     elif args.command == "config":
         if args.config_command == "validate":
             cmd_config_validate(args)

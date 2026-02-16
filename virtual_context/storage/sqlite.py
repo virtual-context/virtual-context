@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..core.store import ContextStore
-from ..types import SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
 
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
+CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_segment_tags_tag ON segment_tags(tag);
 """
 
@@ -374,6 +375,50 @@ class SQLiteStore(ContextStore):
             for row in rows
         ]
 
+    def get_session_stats(self) -> list[SessionStats]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT s.session_id,
+                   COUNT(*) as segment_count,
+                   COALESCE(SUM(s.full_tokens), 0) as total_full_tokens,
+                   COALESCE(SUM(s.summary_tokens), 0) as total_summary_tokens,
+                   MIN(s.created_at) as oldest,
+                   MAX(s.created_at) as newest,
+                   s.compaction_model
+            FROM segments s
+            WHERE s.session_id != ''
+            GROUP BY s.session_id
+            ORDER BY newest DESC
+        """).fetchall()
+
+        results = []
+        for row in rows:
+            total_full = row["total_full_tokens"]
+            total_summary = row["total_summary_tokens"]
+            ratio = round(total_summary / total_full, 3) if total_full > 0 else 0.0
+
+            tag_rows = conn.execute("""
+                SELECT DISTINCT st.tag
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.session_id = ?
+                ORDER BY st.tag
+            """, (row["session_id"],)).fetchall()
+
+            results.append(SessionStats(
+                session_id=row["session_id"],
+                segment_count=row["segment_count"],
+                total_full_tokens=total_full,
+                total_summary_tokens=total_summary,
+                compression_ratio=ratio,
+                distinct_tags=[r["tag"] for r in tag_rows],
+                oldest_segment=_str_to_dt(row["oldest"]) if row["oldest"] else None,
+                newest_segment=_str_to_dt(row["newest"]) if row["newest"] else None,
+                compaction_model=row["compaction_model"] or "",
+            ))
+
+        return results
+
     def get_tag_aliases(self) -> dict[str, str]:
         conn = self._get_conn()
         rows = conn.execute("SELECT alias, canonical FROM tag_aliases").fetchall()
@@ -392,6 +437,15 @@ class SQLiteStore(ContextStore):
         cursor = conn.execute("DELETE FROM segments WHERE ref = ?", (ref,))
         conn.commit()
         return cursor.rowcount > 0
+
+    def delete_session(self, session_id: str) -> int:
+        """Delete all segments for a given session_id. Returns count deleted."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM segments WHERE session_id = ?", (session_id,),
+        )
+        conn.commit()
+        return cursor.rowcount
 
     def cleanup(
         self,

@@ -61,11 +61,14 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
             tag_patterns=keyword_raw.get("tag_patterns", {}),
         )
 
-    # Broad patterns: user-supplied list, or None to use defaults
+    # Pattern overrides: user-supplied list, or None to use defaults
+    pattern_kwargs: dict = {}
     broad_patterns_raw = raw.get("broad_patterns")
-    broad_kwargs: dict = {}
     if broad_patterns_raw is not None:
-        broad_kwargs["broad_patterns"] = list(broad_patterns_raw)
+        pattern_kwargs["broad_patterns"] = list(broad_patterns_raw)
+    temporal_patterns_raw = raw.get("temporal_patterns")
+    if temporal_patterns_raw is not None:
+        pattern_kwargs["temporal_patterns"] = list(temporal_patterns_raw)
 
     return TagGeneratorConfig(
         type=raw.get("type", "keyword"),
@@ -76,7 +79,10 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
         max_tokens=raw.get("max_tokens", 1000),
         prompt_mode=raw.get("prompt_mode", "detailed"),
         keyword_fallback=keyword_fallback,
-        **broad_kwargs,
+        disable_thinking=raw.get("disable_thinking", False),
+        broad_heuristic_enabled=raw.get("broad_heuristic_enabled", True),
+        temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", True),
+        **pattern_kwargs,
     )
 
 
@@ -177,6 +183,9 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         tag_context_max_tokens=assembler_config.tag_context_max_tokens,
         strategy_configs=strategy_configs,
         anchorless_lookback=retrieval_raw.get("anchorless_lookback", 6),
+        inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", "llm"),
+        embedding_model=retrieval_raw.get("embedding_model", "all-MiniLM-L6-v2"),
+        embedding_threshold=retrieval_raw.get("embedding_threshold", 0.3),
     )
 
     # Cost tracking

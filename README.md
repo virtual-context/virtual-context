@@ -4,7 +4,7 @@
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context is a different approach entirely. It treats LLM context the way an operating system treats RAM — tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Broad queries load everything. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion.
+virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM — tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Broad queries load everything. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture — learned the hard way in production — ensures the system can never hallucinate irrelevant topics into your context window.
 
 ```
 Layer 0: Raw conversation turns              (active memory — in the context window)
@@ -24,7 +24,7 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 | **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
 | **"What did we discuss?"** | Only recent context | Poor — query is too vague to embed | Broad detection loads all summaries; temporal detection retrieves by time position |
 | **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
-| **Interpretability** | None | Opaque similarity scores | Visible tags, matched segments, budget breakdown |
+| **Interpretability** | None | Opaque similarity scores | Visible tags, matched segments, budget breakdown per request |
 | **Latency** | Zero | Embedding computation per query | Subsecond with local models |
 
 ## How It Works
@@ -54,16 +54,23 @@ if report:
 
 Everything happens synchronously, in-process, in under a second with a local model. No external services, no background workers, no async complexity.
 
+Or skip the code entirely — the [HTTP proxy](#http-proxy) gives any LLM client virtual-context by changing one URL. No SDK integration, no code changes.
+
 ### The Full Pipeline
 
 ```
 User message arrives
     │
     ▼
-Tag the message (LLM / keyword / embedding)
-    │  ├─ Vocabulary feedback: known tags passed to tagger to prevent synonym drift
+Strip client envelope (OpenClaw metadata, channel headers, plugin markers)
+    │
+    ▼
+Inbound tagging — identify what this message is about
+    │  ├─ Proxy mode: embedding cosine similarity against existing tag vocabulary
+    │  │   (closed-set, deterministic, can't hallucinate novel tags)
+    │  ├─ Direct mode: LLM / keyword tagger with vocabulary feedback
     │  ├─ Tag canonicalization: "db" → "database", alias detection via edit distance
-    │  └─ Related tags generated: alternate terms for future recall
+    │  └─ Broad/temporal detection: regex + LLM flags for vague or time-referencing queries
     │
     ▼
 Retrieve matching summaries from store
@@ -77,14 +84,25 @@ Retrieve matching summaries from store
     ▼
 Assemble context within token budget
     │  ├─ Context hint: lightweight <context-topics> block (~50-200t)
-    │  ├─ Tag sections: retrieved summaries ordered by tag priority
-    │  └─ Filtered history: unrelated older turns dropped, broad/temporal mode includes all
+    │  └─ Tag sections: retrieved summaries ordered by tag priority
+    │
+    ▼
+Filter conversation history (proxy mode)
+    │  ├─ Drop turns whose tags don't overlap with inbound tags
+    │  ├─ Preserve tool chains atomically (tool_use ↔ tool_result never separated)
+    │  ├─ Protect recent turns (always kept regardless of tags)
+    │  └─ Broad/temporal queries skip filtering entirely
+    │
+    ▼
+Inject <virtual-context> block → forward enriched request to LLM
     │
     ▼
 LLM processes enriched context → produces response
     │
     ▼
-Tag the user+assistant pair → update TurnTagIndex
+Response tagging — LLM tags the full user+assistant pair (background thread)
+    │  ├─ Authoritative tags written to TurnTagIndex (vocabulary-building)
+    │  ├─ Related tags generated for cross-vocabulary retrieval
     │  └─ Compactor generates related_tags at write time (vocabulary bridging)
     │
     ▼
@@ -107,11 +125,23 @@ There are no predefined domains to configure. An LLM tagger reads each turn and 
 
 The same codebase handles legal briefs, medical notes, coding sessions, recipe planning, and marathon training — whatever the user talks about. Tag rules let you configure priority, TTL, and custom summary prompts per tag family using fnmatch patterns.
 
+### Two-Tagger Architecture
+
+This design was born from a production bug. The original system used a single LLM tagger for both inbound (before the LLM responds) and response (after) tagging. In a live OpenClaw deployment, a user message about *electronics* caused the LLM inbound tagger to hallucinate the tag `planes` — because `planes` existed in the active vocabulary and shared abstract secondary tags like `engineering` and `design`. That single hallucinated tag pulled 11 irrelevant history turns into the context window, contaminating the LLM's response with planes, guitars, and jiu-jitsu.
+
+The fix was architectural: split inbound and response tagging into two fundamentally different operations.
+
+**Inbound tagger** (embedding, runs before LLM responds) — Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. It cannot hallucinate `planes` for an electronics message because the embedding of "tell me about arduino circuits" is semantically far from `planes` and close to `electronics`. Deterministic, subsecond, zero LLM cost.
+
+**Response tagger** (LLM, runs after LLM responds) — Sees the full user+assistant pair and generates authoritative semantic tags. This is the creative, vocabulary-building pass — it invents new tags when new topics emerge, generates related tags for cross-vocabulary retrieval, and detects broad/temporal query intent. Runs in a background thread so it never blocks the next request.
+
+The inbound tagger drives retrieval and filtering (what stored context to inject, which history turns to keep). The response tagger drives the permanent record (what tags describe this turn for all future queries). Each tagger is optimized for its task: the inbound tagger prizes safety (never contaminate the context), the response tagger prizes richness (capture every nuance for future recall).
+
 ### Broad Query Detection
 
 "What did we discuss earlier?" "Can you summarize everything?" "What did you say about image storage?"
 
-These queries don't map cleanly to specific tags. The LLM tagger flags them as `broad: true`, and the system switches behavior:
+These queries don't map cleanly to specific tags. The tagger flags them as `broad: true`, and the system switches behavior:
 
 - The retriever loads **all** tag summaries instead of filtering by tag overlap
 - History filtering includes all remaining turns instead of dropping unrelated ones
@@ -123,7 +153,7 @@ This eliminates the failure mode where the LLM says "I don't recall discussing t
 
 "Going back to the very beginning — what were the key decisions?" "What did we set up with tokens at the start?" "Something you said early on about indexing."
 
-These queries reference a *position in time*, not just a topic. The LLM tagger flags them as `temporal: true`, and the retriever switches to a different data path:
+These queries reference a *position in time*, not just a topic. The tagger flags them as `temporal: true`, and the retriever switches to a different data path:
 
 - Instead of merged **tag summaries** (Layer 2), it fetches granular **segment summaries** (Layer 1)
 - Segments are sorted by creation time — **earliest first** — so foundational decisions surface before later refinements
@@ -213,6 +243,7 @@ Optional extras:
 
 ```bash
 pip install virtual-context[tui]         # interactive chat terminal
+pip install virtual-context[bridge]      # HTTP proxy (FastAPI + uvicorn)
 pip install virtual-context[embeddings]  # sentence-transformers tag generator
 pip install virtual-context[tiktoken]    # exact token counting
 pip install virtual-context[mcp]         # Model Context Protocol server
@@ -293,17 +324,18 @@ virtual-context init coding    # tuned for software development
 
 ## Three Tag Generators
 
-**LLM tagger** (recommended) — Uses any local model via Ollama, LM Studio, or vLLM. Generates rich semantic tags with broad query detection. Vocabulary feedback ensures convergence. Falls back to keyword tagger if the LLM is unavailable.
+**LLM tagger** (recommended for response tagging) — Uses any local model via Ollama, LM Studio, or vLLM. Generates rich semantic tags with broad/temporal query detection and related tag generation. Vocabulary feedback ensures convergence — the tagger sees all existing tags and reuses them instead of inventing synonyms. Falls back to keyword tagger if the LLM is unavailable. This is the creative, vocabulary-building tagger that runs after the LLM responds.
 
-**Keyword tagger** — Deterministic regex and keyword matching. Zero latency, zero cost, fully reproducible. Good for domains with well-defined vocabularies.
+**Keyword tagger** — Deterministic regex and keyword matching. Zero latency, zero cost, fully reproducible. Good for domains with well-defined vocabularies where you don't want LLM variability.
 
-**Embedding tagger** — Uses sentence-transformers to compute cosine similarity against a tag vocabulary. Middle ground between LLM accuracy and keyword speed.
+**Embedding tagger** (recommended for inbound tagging) — Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity against the existing tag vocabulary. Closed-set by design: it can only return tags that already exist, making it impossible to hallucinate novel tags that contaminate retrieval. Understands semantic relationships — "font-weight" matches `css`, "deadlift form" matches `fitness` — without needing exact keyword overlap.
 
 ## CLI
 
 ```bash
 virtual-context status                         # tag stats and token usage
 virtual-context tags                           # list all tags with counts
+virtual-context domains                        # all tags with turn counts and summaries
 virtual-context recall auth                    # retrieve stored summaries for a tag
 virtual-context compact -i msgs.json           # manual compaction from message file
 virtual-context retrieve -m "What about auth?" # tag + retrieve (JSON output)
@@ -311,6 +343,7 @@ virtual-context transform -m "What about auth?"# tag + retrieve + assemble
 virtual-context aliases list                   # show all tag aliases
 virtual-context aliases suggest                # auto-detect potential aliases
 virtual-context aliases add db database        # register alias manually
+virtual-context proxy -u https://api.anthropic.com  # start HTTP proxy
 virtual-context config validate                # check config syntax
 virtual-context cost-report                    # show session LLM usage
 ```
@@ -322,31 +355,134 @@ pip install virtual-context[tui]
 virtual-context chat --config virtual-context.yaml
 ```
 
-A terminal chat interface with live context visualization:
+A terminal chat interface with live context visualization — useful for development, testing, and seeing exactly what virtual-context does at each turn:
 
-- **Tag panel** — current tag working set with activity levels
+- **Tag panel** — current tag working set with activity levels, updated live as `on_turn_complete` processes each turn
 - **Budget bar** — real-time token usage breakdown (core, tags, hint, conversation)
 - **Turn list** — every turn with its tags, navigable with Ctrl+B/F
 - **Turn inspector** (Ctrl+I) — full turn data: API payload, tags, assembled context, broad/temporal flags
-- **Brief mode** (Ctrl+T) — silently appends "answer in 2 lines" for faster iteration
-- **Manual compaction** — type `/compact` or press Ctrl+K
+- **Brief mode** (Ctrl+T) — silently appends "answer in 2 lines" for faster iteration during testing
+- **Manual compaction** — type `/compact` or press Ctrl+K to trigger compaction on demand
 - **Session export** (Ctrl+S) — saves full session to `vc-session.json` with all metadata
 
 ### Headless Mode
 
-Run prompts through the full pipeline without a terminal UI:
+Run prompts through the full pipeline without a terminal UI — ideal for automated stress testing and regression validation:
 
 ```bash
 virtual-context chat --headless --replay prompts.txt
 ```
 
-Session JSON captures every turn and can be replayed to test behavior changes against recorded conversations:
+Session JSON captures every turn with tags, token counts, and timing. Replay a saved session to test behavior changes against recorded conversations:
 
 ```bash
 virtual-context chat --replay vc-session.json
 ```
 
 ## Integrations
+
+### HTTP Proxy
+
+```bash
+pip install virtual-context[bridge]
+```
+
+The fastest path to production. The proxy sits between any LLM client and an upstream provider, transparently enriching every request with virtual-context. The client just changes its `base_url` — no SDK integration, no code changes, no plugin required.
+
+```
+Client (any LLM app)       Proxy (localhost:5757)         Upstream (api.anthropic.com)
+     │                           │                                │
+     │  POST /v1/messages        │                                │
+     │  {messages: [...]}        │                                │
+     │ ─────────────────────────>│                                │
+     │                           │  1. Strip client envelope      │
+     │                           │  2. Inbound tag (embedding)    │
+     │                           │  3. Retrieve stored summaries  │
+     │                           │  4. Filter irrelevant history  │
+     │                           │  5. Inject <virtual-context>   │
+     │                           │  6. Forward enriched request   │
+     │                           │ ──────────────────────────────>│
+     │                           │                                │
+     │                           │<─── Stream SSE response ──────│
+     │<── Stream SSE response ───│                                │
+     │                           │  7. Capture assistant text     │
+     │                           │  8. Response tag (LLM)         │
+     │                           │  9. on_turn_complete           │
+     │                           │     (background thread)        │
+```
+
+Start the proxy:
+
+```bash
+# Anthropic upstream
+virtual-context -c virtual-context.yaml proxy --upstream https://api.anthropic.com
+
+# OpenAI upstream
+virtual-context -c virtual-context.yaml proxy --upstream https://api.openai.com --port 8080
+
+# Custom host/port
+virtual-context -c virtual-context.yaml proxy -u https://api.anthropic.com --host 0.0.0.0 --port 9090
+```
+
+Point your client at the proxy:
+
+```python
+# Python (anthropic SDK)
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:5757")
+
+# Python (openai SDK)
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:5757/v1")
+
+# curl
+curl http://127.0.0.1:5757/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "content-type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+**History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each via the LLM to bootstrap the TurnTagIndex. The tag vocabulary is immediately available for inbound matching on subsequent requests — no cold-start period after the first turn.
+
+**Tag-based history filtering.** Before forwarding to the upstream LLM, the proxy drops irrelevant history turns from the payload based on inbound tag overlap with the TurnTagIndex. A 90-message conversation about 5 different topics gets trimmed to only the turns relevant to the current question — reducing token usage and noise. Tool chains (`tool_use`/`tool_result`) are preserved atomically: the filter scans forward and backward to ensure every tool invocation stays paired with its result. Broad and temporal queries skip filtering entirely.
+
+**Format-agnostic.** The proxy auto-detects OpenAI vs Anthropic request format (by checking for a top-level `system` field or `claude` model prefix) and injects context accordingly — into `system` for Anthropic, into `messages[0]` for OpenAI.
+
+**Streaming with zero added latency.** SSE streams are forwarded to the client byte-for-byte as they arrive from upstream. Text deltas are accumulated in the background for `on_turn_complete` — the user sees no delay.
+
+**Error-resilient.** If the virtual-context engine fails (config error, tagger timeout, etc.), the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls — it's always transparent.
+
+**OpenClaw-aware.** Strips channel metadata (`[Telegram ... id:NNN]` headers, `[message_id: NNN]` footers, `System: [TIMESTAMP]` event lines, `[vc:prompt]` plugin markers) so the tagger sees clean conversational content. Handles consecutive user messages from Telegram batching gracefully.
+
+**Terminal logging.** Every proxy event is logged to stdout in real-time — no need to export dashboard data to debug what happened:
+
+```
+[INGEST] 43 turns in 45123ms (session=a1b2c3d4e5f6)
+[T44] POST anthropic stream=True tags=[css, design] msgs=52 dropped=25 ctx=312t input=8421t vc=89ms | help me with some css styling
+[T44] RESPONSE stream=True llm=3028ms total=3117ms chars=117
+[T44] COMPLETE 1204ms tags=[css, web-development, html] primary=css
+```
+
+**Single-session memory.** All requests through the proxy contribute to the same conversation history and store. The proxy remembers everything from prior requests — cross-session memory is the feature, not a bug.
+
+#### Live Dashboard
+
+The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dashboard` — a full operational view of what virtual-context is doing to every request.
+
+**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), broad/temporal flags, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
+
+**Turn inspector.** Click any request row to see the full picture: every message in the request with role labels, content block types (`text`, `tool_use`, `tool_result`, `thinking`), the raw text content, inbound tags vs response tags side by side, and the token budget breakdown showing how context was assembled.
+
+**Ingested history.** When the proxy bootstraps from a client's existing conversation, every ingested turn appears in its own grid with per-turn tags and message previews — so you can verify the tag vocabulary was built correctly from history.
+
+**Session stats.** Uptime, total requests processed, compaction events, total tokens freed, compression ratio, average VC overhead latency, and average upstream LLM latency.
+
+**Request capture.** A ring buffer stores the last 50 raw request bodies — the actual `messages` array sent to the upstream LLM. Inspect any captured request through the dashboard or export as JSON for offline analysis. Essential for diagnosing tagger accuracy: you can see exactly what text the embedding matcher evaluated.
+
+**Live updates.** SSE-powered — new events appear the instant they happen. No polling, no refresh.
+
+**JSON export.** Download the full session state (all events, all stats) as a single JSON file for offline analysis or bug reporting.
 
 ### MCP Server (Model Context Protocol)
 
@@ -376,9 +512,10 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| **Engine** | `engine.py` | Main orchestrator — `on_message_inbound()` and `on_turn_complete()` |
+| **Engine** | `engine.py` | Main orchestrator — `on_message_inbound()`, `on_turn_complete()`, `ingest_history()` |
 | **TurnTagIndex** | `core/turn_tag_index.py` | Live per-turn tag index, velocity tracking, greedy set cover |
-| **TagGenerator** | `core/tag_generator.py` | LLM / keyword / embedding semantic tagging |
+| **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback |
+| **EmbeddingTagGenerator** | `core/embedding_tag_generator.py` | Sentence-transformers cosine similarity against tag vocabulary |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
 | **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, broad/temporal queries, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
@@ -387,6 +524,9 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **Compactor** | `core/compactor.py` | LLM summarization + tag summary rollup, concurrent via ThreadPoolExecutor |
 | **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
+| **ProxyServer** | `proxy/server.py` | HTTP proxy — enrichment, filtering, history ingestion, envelope stripping |
+| **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats |
+| **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector + request capture ring buffer |
 
 ### Storage Backends
 
@@ -406,7 +546,9 @@ Retry logic with exponential backoff on both.
 
 ## Design Decisions
 
-**Sync-first.** Zero async/await. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model.
+**Sync-first.** Zero async/await in the engine. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model. The proxy uses FastAPI async for HTTP handling but calls the sync engine via `asyncio.to_thread`.
+
+**Two-tagger architecture.** Inbound tagging (before LLM responds) and response tagging (after) use different models optimized for different tasks. Inbound uses embedding cosine similarity — closed-set, deterministic, can't hallucinate novel tags. Response uses an LLM — creative, vocabulary-building, generates related tags. This separation was driven by a production bug where the LLM inbound tagger hallucinated `planes` for an electronics message, pulling irrelevant history via abstract cross-cutting tags like `engineering` and `craftsmanship`.
 
 **Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
 
@@ -416,9 +558,15 @@ Retry logic with exponential backoff on both.
 
 **Tag preservation.** During compaction, the LLM can add refined tags but never remove original ones. A segment tagged `[ux, recipes, frontend]` stays tagged with all three even after summarization, ensuring cross-topic retrieval always works.
 
+**Tool chain integrity.** The proxy's history filter preserves API-required message dependencies atomically. Every `tool_use` block in an assistant message is kept with its corresponding `tool_result`, and vice versa. Forward and backward scanning ensures multi-step tool chains are never broken, even when surrounding turns are filtered out.
+
 ## Stress-Tested
 
-virtual-context has been validated against 100-turn adversarial conversations with deliberately overlapping domains (Flask IoT API, music studio, ML pipeline, cross-domain integration), vocabulary mismatches, ambiguous callbacks, and cross-domain synthesis queries — using a 3,000-token context window with Claude Haiku. Results:
+virtual-context has been validated across multiple dimensions — adversarial prompt suites, production traffic, and deliberate edge cases.
+
+### Adversarial Prompt Suite
+
+100-turn conversations with deliberately overlapping domains (Flask IoT API, music studio, ML pipeline, cross-domain integration), vocabulary mismatches, ambiguous callbacks, and cross-domain synthesis queries — using a 3,000-token context window with Claude Haiku:
 
 - **Cross-vocabulary recall**: "caching trick for the feed" correctly retrieves "materialized view" despite zero primary tag overlap — related tag expansion bridges the vocabulary gap
 - **IDF-weighted precision**: "precomputed summary table" retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
@@ -429,6 +577,15 @@ virtual-context has been validated against 100-turn adversarial conversations wi
 - **Compaction**: 4 events across 100 turns, average 1,147 tokens per turn, peak 3,018 tokens
 - **Tag convergence**: vocabulary stabilizes within 10-15 turns via feedback loop
 
+### Production Validation
+
+The proxy has been validated in production with OpenClaw (Telegram bot) handling real multi-topic conversations:
+
+- **Consecutive user message batching**: Telegram sends multiple user messages in rapid succession — the proxy handles misaligned message sequences without losing history pairs
+- **Tool chain preservation**: 90-message conversations with interleaved `tool_use`/`tool_result` chains filtered from 52 messages down to 27 without breaking a single tool dependency
+- **Embedding inbound matching**: Live tag vocabularies of 40+ tags correctly matched — "help me with css styling" → `[css, design]`, "what about font-weight" → `[css]` via semantic similarity
+- **History ingestion**: 43 pre-existing conversation turns tagged and indexed in a single pass, vocabulary immediately available for subsequent requests
+
 ## Development
 
 ```bash
@@ -436,7 +593,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 275 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 489 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

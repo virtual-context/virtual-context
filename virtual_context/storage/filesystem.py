@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -26,6 +26,7 @@ def _str_to_dt(s: str) -> datetime:
 def _segment_to_index_entry(seg: StoredSegment) -> dict:
     return {
         "ref": seg.ref,
+        "session_id": seg.session_id,
         "primary_tag": seg.primary_tag,
         "tags": seg.tags,
         "summary_tokens": seg.summary_tokens,
@@ -332,6 +333,49 @@ class FilesystemStore(ContextStore):
                     stats.newest_segment = created
 
         return sorted(tag_map.values(), key=lambda s: s.usage_count, reverse=True)
+
+    def get_session_stats(self) -> list[SessionStats]:
+        session_map: dict[str, SessionStats] = {}
+
+        for entry in self._index.values():
+            sid = entry.get("session_id", "")
+            if not sid:
+                continue
+
+            if sid not in session_map:
+                session_map[sid] = SessionStats(session_id=sid)
+
+            stats = session_map[sid]
+            stats.segment_count += 1
+            stats.total_full_tokens += entry.get("full_tokens", 0)
+            stats.total_summary_tokens += entry.get("summary_tokens", 0)
+
+            created = _str_to_dt(entry["created_at"])
+            if stats.oldest_segment is None or created < stats.oldest_segment:
+                stats.oldest_segment = created
+            if stats.newest_segment is None or created > stats.newest_segment:
+                stats.newest_segment = created
+
+            model = entry.get("compaction_model", "")
+            if model:
+                stats.compaction_model = model
+
+            for tag in entry.get("tags", []):
+                if tag not in stats.distinct_tags:
+                    stats.distinct_tags.append(tag)
+
+        for stats in session_map.values():
+            if stats.total_full_tokens > 0:
+                stats.compression_ratio = round(
+                    stats.total_summary_tokens / stats.total_full_tokens, 3
+                )
+            stats.distinct_tags.sort()
+
+        return sorted(
+            session_map.values(),
+            key=lambda s: s.newest_segment or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
 
     def get_tag_aliases(self) -> dict[str, str]:
         return dict(self._aliases)

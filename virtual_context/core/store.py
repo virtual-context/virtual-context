@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
 
 
 class ContextStore(ABC):
@@ -46,6 +46,10 @@ class ContextStore(ABC):
     @abstractmethod
     def get_all_tags(self) -> list[TagStats]:
         """List all tags with statistics."""
+
+    @abstractmethod
+    def get_session_stats(self) -> list[SessionStats]:
+        """Return aggregate statistics grouped by session_id, newest first."""
 
     @abstractmethod
     def get_tag_aliases(self) -> dict[str, str]:

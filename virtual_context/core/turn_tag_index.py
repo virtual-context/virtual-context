@@ -44,6 +44,18 @@ class TurnTagIndex:
         time_span = (datetime.now(timezone.utc) - recent[0].timestamp).total_seconds() / 3600
         return len(recent) / max(time_span, 1.0)
 
+    def latest_meaningful_tags(self) -> TurnTagEntry | None:
+        """Return the most recent entry with real tags (not ``_general`` only).
+
+        Walks backwards through entries to find the last turn whose tags
+        contain at least one non-``_general`` tag.  Used to propagate topic
+        continuity to ultra-short messages during history ingestion.
+        """
+        for entry in reversed(self.entries):
+            if any(t != "_general" for t in entry.tags):
+                return entry
+        return None
+
     def compute_cover_set(self, exclude_tags: set[str] | None = None) -> list[str]:
         """Greedy set cover: find minimum tags to touch every indexed turn.
 

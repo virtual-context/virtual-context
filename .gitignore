@@ -28,5 +28,8 @@ runcount_*.json
 vc-session.json
 prompts-coding-agent.json
 
+# Config files with API keys
+virtual-context-openrouter.yaml
+
 # OS
 .DS_Store

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 
 from .store import ContextStore
-from .tag_generator import TagGenerator
+from .tag_generator import TagGenerator, detect_broad_heuristic, detect_temporal_heuristic
 from .turn_tag_index import TurnTagIndex
 from ..types import (
+    DEFAULT_BROAD_PATTERNS,
+    DEFAULT_TEMPORAL_PATTERNS,
     Message,
     RetrievalCostReport,
     RetrievalResult,
@@ -30,11 +33,16 @@ class ContextRetriever:
         store: ContextStore,
         config: RetrieverConfig,
         turn_tag_index: TurnTagIndex | None = None,
+        inbound_tagger: TagGenerator | None = None,
     ) -> None:
         self.tag_generator = tag_generator
         self.store = store
         self.config = config
         self._turn_tag_index = turn_tag_index
+        self._inbound_tagger = inbound_tagger
+        # Pre-compile heuristic patterns for embedding-based inbound tagger
+        self._broad_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_BROAD_PATTERNS]
+        self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
 
     def _compute_idf_weights(self) -> dict[str, float]:
         """Compute IDF weights from tag usage counts in the store.
@@ -69,9 +77,25 @@ class ContextRetriever:
         start_time = time.monotonic()
         active_tags = set(current_active_tags or [])
 
-        # Tag the inbound message (pass known tags so LLM reuses vocabulary)
+        # Tag the inbound message
         store_tags = [ts.tag for ts in self.store.get_all_tags()]
-        tag_result = self.tag_generator.generate_tags(message, store_tags)
+        if self._inbound_tagger is not None:
+            # Embedding-based: match against existing vocabulary (no hallucination)
+            # Pass both store tags and live TurnTagIndex tags as vocabulary
+            vocab_tags = list(set(store_tags))
+            if self._turn_tag_index:
+                vocab_tags = list(set(vocab_tags) | self._turn_tag_index.get_active_tags())
+            tag_result = self._inbound_tagger.generate_tags(message, vocab_tags)
+            # Apply broad/temporal heuristics (embedding tagger doesn't detect these)
+            if not tag_result.broad:
+                tag_result.broad = detect_broad_heuristic(message, self._broad_patterns)
+            if not tag_result.temporal:
+                tag_result.temporal = detect_temporal_heuristic(message, self._temporal_patterns)
+            logger.debug("Inbound embedding match: tags=%s broad=%s temporal=%s",
+                         tag_result.tags, tag_result.broad, tag_result.temporal)
+        else:
+            # LLM-based: open-ended tag generation (pass known tags for reuse)
+            tag_result = self.tag_generator.generate_tags(message, store_tags)
 
         retrieval_metadata: dict = {}
 

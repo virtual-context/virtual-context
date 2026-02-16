@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from virtual_context.storage.sqlite import SQLiteStore
-from virtual_context.types import SegmentMetadata, StoredSegment, TagSummary
+from virtual_context.types import SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagSummary
 
 
 @pytest.fixture
@@ -241,3 +241,105 @@ class TestSQLiteStore:
         assert len(all_ts) == 2
         tags = {ts.tag for ts in all_ts}
         assert tags == {"legal", "medical"}
+
+
+class TestGetSessionStats:
+    def test_empty_store(self, store):
+        result = store.get_session_stats()
+        assert result == []
+
+    def test_single_session(self, store):
+        store.store_segment(_make_segment(ref="r1", tags=["legal", "court"]))
+        store.store_segment(_make_segment(ref="r2", tags=["medical"]))
+
+        stats = store.get_session_stats()
+        assert len(stats) == 1
+        assert stats[0].session_id == "session-1"
+        assert stats[0].segment_count == 2
+
+    def test_two_sessions_grouped(self, store):
+        seg1 = _make_segment(ref="r1", tags=["legal"])
+        store.store_segment(seg1)
+
+        seg2 = _make_segment(ref="r2", tags=["medical"])
+        seg2.session_id = "session-2"
+        store.store_segment(seg2)
+
+        seg3 = _make_segment(ref="r3", tags=["court"])
+        seg3.session_id = "session-2"
+        store.store_segment(seg3)
+
+        stats = store.get_session_stats()
+        assert len(stats) == 2
+
+        by_id = {s.session_id: s for s in stats}
+        assert by_id["session-1"].segment_count == 1
+        assert by_id["session-2"].segment_count == 2
+
+    def test_token_aggregation(self, store):
+        seg1 = _make_segment(ref="r1", tags=["legal"])
+        seg1.full_tokens = 1000
+        seg1.summary_tokens = 250
+        store.store_segment(seg1)
+
+        seg2 = _make_segment(ref="r2", tags=["medical"])
+        seg2.full_tokens = 3000
+        seg2.summary_tokens = 750
+        store.store_segment(seg2)
+
+        stats = store.get_session_stats()
+        assert len(stats) == 1
+        assert stats[0].total_full_tokens == 4000
+        assert stats[0].total_summary_tokens == 1000
+        assert stats[0].compression_ratio == 0.25
+
+    def test_distinct_tags(self, store):
+        store.store_segment(_make_segment(ref="r1", tags=["legal", "court"]))
+        store.store_segment(_make_segment(ref="r2", tags=["legal", "medical"]))
+
+        stats = store.get_session_stats()
+        assert len(stats) == 1
+        tags = stats[0].distinct_tags
+        assert sorted(tags) == ["court", "legal", "medical"]
+
+    def test_sorted_newest_first(self, store):
+        early = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        late = datetime(2026, 1, 20, tzinfo=timezone.utc)
+
+        seg1 = _make_segment(ref="r1", tags=["legal"], created_at=early)
+        seg1.session_id = "old-session"
+        store.store_segment(seg1)
+
+        seg2 = _make_segment(ref="r2", tags=["legal"], created_at=late)
+        seg2.session_id = "new-session"
+        store.store_segment(seg2)
+
+        stats = store.get_session_stats()
+        assert len(stats) == 2
+        assert stats[0].session_id == "new-session"
+        assert stats[1].session_id == "old-session"
+
+    def test_empty_session_id_excluded(self, store):
+        seg = _make_segment(ref="r1", tags=["legal"])
+        seg.session_id = ""
+        store.store_segment(seg)
+
+        stats = store.get_session_stats()
+        assert len(stats) == 0
+
+    def test_compaction_model_preserved(self, store):
+        store.store_segment(_make_segment(ref="r1", tags=["legal"]))
+
+        stats = store.get_session_stats()
+        assert stats[0].compaction_model == "qwen3:4b-instruct-2507-fp16"
+
+    def test_time_range(self, store):
+        early = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        late = datetime(2026, 1, 20, tzinfo=timezone.utc)
+
+        store.store_segment(_make_segment(ref="r1", tags=["a"], created_at=early))
+        store.store_segment(_make_segment(ref="r2", tags=["b"], created_at=late))
+
+        stats = store.get_session_stats()
+        assert stats[0].oldest_segment == early
+        assert stats[0].newest_segment == late
