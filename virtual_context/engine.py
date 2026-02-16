@@ -28,6 +28,7 @@ from .types import (
     RetrievalResult,
     SessionCostSummary,
     StoredSegment,
+    TagResult,
     TurnTagEntry,
     VirtualContextConfig,
 )
@@ -117,11 +118,31 @@ class VirtualContextEngine:
         )
 
     def _init_retriever(self) -> None:
+        inbound_tagger = None
+        if self.config.retriever.inbound_tagger_type == "embedding":
+            inbound_tagger = self._build_inbound_embedding_tagger()
+
         self._retriever = ContextRetriever(
             tag_generator=self._tag_generator,
             store=self._store,
             config=self.config.retriever,
             turn_tag_index=self._turn_tag_index,
+            inbound_tagger=inbound_tagger,
+        )
+
+    def _build_inbound_embedding_tagger(self) -> TagGenerator:
+        """Build an EmbeddingTagGenerator for inbound vocabulary matching."""
+        from .core.embedding_tag_generator import EmbeddingTagGenerator
+
+        logger.info(
+            "Using embedding-based inbound matching (model=%s, threshold=%.2f)",
+            self.config.retriever.embedding_model,
+            self.config.retriever.embedding_threshold,
+        )
+        return EmbeddingTagGenerator(
+            config=self.config.tag_generator,
+            model_name=self.config.retriever.embedding_model,
+            similarity_threshold=self.config.retriever.embedding_threshold,
         )
 
     def _init_compactor(self) -> None:
@@ -528,7 +549,12 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
     ) -> CompactionReport | None:
-        """Trigger manual compaction regardless of thresholds."""
+        """Trigger manual compaction regardless of thresholds.
+
+        Uses the same pipeline as on_turn_complete: respects the compaction
+        watermark, protected recent turns, advances the watermark, stores
+        segments, and rebuilds tag summaries for affected tags.
+        """
         if self._compactor is None:
             logger.warning("No LLM provider configured for compaction")
             return None
@@ -536,9 +562,28 @@ class VirtualContextEngine:
         if not conversation_history:
             return None
 
-        segments = self._segmenter.segment(conversation_history)
+        # Select messages to compact (same logic as on_turn_complete)
+        protected_turns = self.config.monitor.protected_recent_turns
+        protected_count = protected_turns * 2
+
+        if len(conversation_history) <= protected_count:
+            logger.info("Not enough messages outside protected zone to compact")
+            return None
+
+        compact_messages = conversation_history[self._compacted_through:-protected_count]
+
+        if not compact_messages:
+            return None
+
+        # Segment and compact (turn_offset maps pair indices to global turn numbers)
+        turn_offset = self._compacted_through // 2
+        segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
         results = self._compactor.compact(segments)
 
+        # Advance watermark past compacted messages
+        self._compacted_through += len(compact_messages)
+
+        # Store compacted segments
         for result in results:
             stored = StoredSegment(
                 ref=result.segment_id,
@@ -561,12 +606,121 @@ class VirtualContextEngine:
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
 
-        return CompactionReport(
+        # Build/update tag summaries — only for tags in newly compacted segments
+        tag_summaries_built = 0
+        cover_tags: list[str] = []
+        if results:
+            compacted_tags = {tag for r in results for tag in r.tags}
+            cover_tags = [
+                t for t in self._turn_tag_index.compute_cover_set()
+                if t in compacted_tags
+            ]
+            if cover_tags:
+                tag_to_summaries: dict[str, list] = {}
+                for tag in cover_tags:
+                    summaries = self._store.get_summaries_by_tags(
+                        tags=[tag], min_overlap=1, limit=50
+                    )
+                    if summaries:
+                        tag_to_summaries[tag] = summaries
+
+                tag_to_turns: dict[str, list[int]] = {}
+                for entry in self._turn_tag_index.entries:
+                    for tag in entry.tags:
+                        if tag in cover_tags:
+                            tag_to_turns.setdefault(tag, []).append(entry.turn_number)
+
+                existing_tag_summaries = {}
+                for tag in cover_tags:
+                    ts = self._store.get_tag_summary(tag)
+                    if ts:
+                        existing_tag_summaries[tag] = ts
+
+                if self._turn_tag_index.entries:
+                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
+
+                    new_tag_summaries = self._compactor.compact_tag_summaries(
+                        cover_tags=cover_tags,
+                        tag_to_summaries=tag_to_summaries,
+                        tag_to_turns=tag_to_turns,
+                        existing_tag_summaries=existing_tag_summaries,
+                        max_turn=max_turn,
+                    )
+
+                    for ts in new_tag_summaries:
+                        self._store.save_tag_summary(ts)
+                    tag_summaries_built = len(new_tag_summaries)
+
+        report = CompactionReport(
             segments_compacted=len(results),
             tokens_freed=tokens_freed,
             tags=tags,
             results=results,
+            tag_summaries_built=tag_summaries_built,
+            cover_tags=cover_tags,
         )
+
+        # Enforce TTL from tag rules
+        if self.config.tag_rules:
+            min_ttl = min(
+                (r.ttl_days for r in self.config.tag_rules if r.ttl_days is not None),
+                default=None,
+            )
+            if min_ttl is not None:
+                from datetime import timedelta
+                self._store.cleanup(max_age=timedelta(days=min_ttl))
+
+        return report
+
+    def ingest_history(self, history_pairs: list[Message]) -> int:
+        """Bootstrap TurnTagIndex from pre-existing conversation history.
+
+        Tags each user+assistant pair and appends entries to the live index.
+        Does NOT trigger compaction — the next on_turn_complete() handles that.
+
+        Args:
+            history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
+
+        Returns:
+            Number of turns ingested.
+        """
+        store_tags = [ts.tag for ts in self._store.get_all_tags()]
+        ingested = 0
+
+        # Minimum combined length to justify an LLM tagger call.
+        # Very short exchanges ("?", "ok", emoji-only) produce noise tags;
+        # tag them as "casual" without burning a tagger round-trip.
+        _MIN_TAGGABLE_CHARS = 20
+
+        for i in range(0, len(history_pairs) - 1, 2):
+            user_msg = history_pairs[i]
+            asst_msg = history_pairs[i + 1]
+            combined_text = f"{user_msg.content} {asst_msg.content}"
+
+            if len(user_msg.content.strip()) < _MIN_TAGGABLE_CHARS:
+                # Inherit tags from the most recent meaningful turn
+                prev = self._turn_tag_index.latest_meaningful_tags()
+                tag_result = TagResult(
+                    tags=list(prev.tags) if prev else ["_general"],
+                    primary=prev.primary_tag if prev else "_general",
+                    source="inherited",
+                )
+            else:
+                tag_result = self._tag_generator.generate_tags(combined_text, store_tags)
+            self._turn_tag_index.append(TurnTagEntry(
+                turn_number=len(self._turn_tag_index.entries),
+                message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
+                tags=tag_result.tags,
+                primary_tag=tag_result.primary,
+            ))
+            ingested += 1
+
+            # Refresh store tags every 10 turns so new tags influence later tagging
+            if ingested % 10 == 0:
+                store_tags = [ts.tag for ts in self._store.get_all_tags()]
+
+        logger.info("Ingested %d historical turns into TurnTagIndex", ingested)
+        return ingested
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
         """Retrieve relevant context for a message without assembling."""

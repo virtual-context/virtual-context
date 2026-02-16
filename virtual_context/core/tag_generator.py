@@ -76,6 +76,22 @@ Rules:
   to these same concepts later (e.g. if tagging a discussion about "materialized views",
   related_tags might include "caching", "precomputed", "feed-optimization").
   These help future recall when the user uses different vocabulary.
+- Messages may contain channel metadata (e.g. "[Telegram NAME ...]", "[WhatsApp ...]",
+  "[Discord ...]", "[message_id: NNN]", timestamps, sender info). Ignore all metadata
+  formatting — tag only the actual conversational content within the message.
+- Do NOT generate tags about the communication medium or message format itself
+  (e.g. "messaging", "threading", "chat", "texting", "communication", "conversation").
+  These describe HOW the conversation happens, not WHAT it is about. Tag only the
+  substantive topics being discussed.
+- For very short or trivial messages (greetings, reactions, single-word responses,
+  emoji), return only the tags that genuinely apply — it is acceptable to return
+  fewer than {min_tags} tags when the content does not warrant more.
+- Tag the concrete subject being discussed, not the conversational framing.
+  "What do you think of trees?" → tag "trees" or "nature", NOT "introspection"
+  or "cognition". The question format ("what do you think", "how do you feel",
+  "tell me about") is framing — the subject is what matters for retrieval.
+  Even if the assistant's response is philosophical or reflective, always include
+  at least one tag for the concrete noun or topic the user asked about.
 - Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - The "primary" tag is the single most relevant tag
 - No markdown fences, no extra text
@@ -89,6 +105,10 @@ Rules:
 - Reuse existing tags when the topic matches. Create new tags only for genuinely new topics.
 - Set "broad" to true for vague/broad/retrospective/recall queries, false otherwise.
 - Set "temporal" to true when the query references a time position ("the first thing", "at the beginning", "early on").
+- Ignore channel metadata in messages (e.g. "[Telegram ...]", "[message_id: NNN]"). Tag only actual content.
+- Do NOT generate tags about the communication medium itself (e.g. "messaging", "threading", "chat"). Tag substantive topics only.
+- For very short/trivial messages, return fewer than {min_tags} tags if the content does not warrant more.
+- Tag the concrete subject, not conversational framing. "What do you think of trees?" → "trees", NOT "introspection".
 - Generate 2-5 related_tags: alternate words for future recall.
 - Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - No markdown fences, no extra text
@@ -164,6 +184,10 @@ class LLMTagGenerator:
             max_tags=self.config.max_tags,
         )
 
+        # Disable thinking mode for models that support it (e.g. qwen3)
+        if self.config.disable_thinking:
+            prompt = "/no_think\n" + prompt
+
         try:
             response = self.llm.complete(
                 system=system,
@@ -180,12 +204,12 @@ class LLMTagGenerator:
             )
 
         # Deterministic override: catch broad queries the LLM missed
-        if not result.broad and detect_broad_heuristic(text, self._broad_patterns):
+        if self.config.broad_heuristic_enabled and not result.broad and detect_broad_heuristic(text, self._broad_patterns):
             logger.debug("Broad heuristic override: LLM missed broad, heuristic caught it")
             result.broad = True
 
         # Deterministic override: catch temporal queries the LLM missed
-        if not result.temporal and detect_temporal_heuristic(text, self._temporal_patterns):
+        if self.config.temporal_heuristic_enabled and not result.temporal and detect_temporal_heuristic(text, self._temporal_patterns):
             logger.debug("Temporal heuristic override: LLM missed temporal, heuristic caught it")
             result.temporal = True
 

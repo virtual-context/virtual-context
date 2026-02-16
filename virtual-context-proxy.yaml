@@ -1,0 +1,150 @@
+version: "0.2"
+
+# =====================================================================================
+# PROXY CONFIG — tuned for real-world use with OpenClaw / any LLM client
+# =====================================================================================
+# Fully cloud-based: Haiku for both tagging and summarization. No Ollama dependency.
+#
+# Usage:
+#   ANTHROPIC_API_KEY=... virtual-context -c virtual-context-proxy.yaml proxy --upstream https://api.anthropic.com
+
+storage_root: ".virtualcontext"
+context_window: 120000
+token_counter: "estimate"
+
+# =====================================================================================
+# TAG GENERATOR — Haiku for accurate semantic tagging
+# =====================================================================================
+
+tag_generator:
+  type: "llm"
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tags: 10
+  min_tags: 5
+  prompt_mode: "detailed"
+
+  # Haiku handles broad/temporal detection natively — disable regex overrides
+  broad_patterns: []
+  temporal_patterns: []
+
+  keyword_fallback:
+    tag_keywords:
+      code:
+        - function
+        - bug
+        - deploy
+        - git
+        - API
+        - database
+        - error
+        - refactor
+        - test
+    tag_patterns:
+      code:
+        - "\\bdef \\w+\\("
+        - "\\bclass \\w+[:(]"
+        - "\\bfunction\\s+\\w+\\("
+
+# =====================================================================================
+# TAG RULES
+# =====================================================================================
+
+tag_rules:
+  - match: "architecture*"
+    priority: 10
+    ttl_days: null
+
+  - match: "database*"
+    priority: 8
+    ttl_days: null
+
+  - match: "debug*"
+    priority: 7
+    ttl_days: 7
+
+  - match: "*"
+    priority: 5
+    ttl_days: 30
+
+# =====================================================================================
+# COMPACTION
+# =====================================================================================
+
+compaction:
+  soft_threshold: 0.70
+  hard_threshold: 0.85
+  protected_recent_turns: 6
+  overflow_buffer: 1.2
+  summary_ratio: 0.15
+  min_summary_tokens: 200
+  max_summary_tokens: 2000
+  max_concurrent_summaries: 4
+
+# =====================================================================================
+# SUMMARIZATION — Haiku (no Ollama dependency, fast, cheap)
+# =====================================================================================
+
+summarization:
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 1000
+  temperature: 0.3
+
+# =====================================================================================
+# PROVIDERS
+# =====================================================================================
+
+providers:
+  anthropic:
+    type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
+    model: "claude-haiku-4-5-20251001"
+
+# =====================================================================================
+# STORAGE
+# =====================================================================================
+
+storage:
+  backend: "sqlite"
+  sqlite:
+    path: ".virtualcontext/store.db"
+
+# =====================================================================================
+# ASSEMBLY
+# =====================================================================================
+
+assembly:
+  core_context_max_tokens: 18000
+  tag_context_max_tokens: 30000
+  context_hint_enabled: true
+  context_hint_max_tokens: 200
+  core_files: []
+
+# =====================================================================================
+# RETRIEVAL
+# =====================================================================================
+
+retrieval:
+  skip_active_tags: true
+  active_tag_lookback: 4
+  inbound_tagger_type: "embedding"   # embedding-based vocabulary matching (no LLM call)
+  # embedding_model: "all-MiniLM-L6-v2"  # default
+  # embedding_threshold: 0.3              # default
+  strategy_config:
+    default:
+      min_overlap: 1
+      max_results: 10
+      max_budget_fraction: 0.25
+      include_related: true
+
+# =====================================================================================
+# COST TRACKING
+# =====================================================================================
+
+cost_tracking:
+  enabled: true
+  pricing:
+    anthropic:
+      input_per_1k: 0.00025
+      output_per_1k: 0.00125

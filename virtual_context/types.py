@@ -85,6 +85,9 @@ class TagGeneratorConfig:
     keyword_fallback: KeywordTagConfig | None = None
     broad_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BROAD_PATTERNS))
     temporal_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_TEMPORAL_PATTERNS))
+    broad_heuristic_enabled: bool = True
+    temporal_heuristic_enabled: bool = True
+    disable_thinking: bool = False  # Prepend /no_think to prompts (for qwen3 models)
 
 
 @dataclass
@@ -265,6 +268,20 @@ class TagStats:
     newest_segment: datetime | None = None
 
 
+@dataclass
+class SessionStats:
+    """Aggregate statistics for a single engine session."""
+    session_id: str = ""
+    segment_count: int = 0
+    total_full_tokens: int = 0
+    total_summary_tokens: int = 0
+    compression_ratio: float = 0.0
+    distinct_tags: list[str] = field(default_factory=list)
+    oldest_segment: datetime | None = None
+    newest_segment: datetime | None = None
+    compaction_model: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
@@ -376,6 +393,9 @@ class RetrieverConfig:
         "default": StrategyConfig()
     })
     anchorless_lookback: int = 6           # how many recent turns for working set
+    inbound_tagger_type: str = "llm"       # "llm" (default) or "embedding"
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_threshold: float = 0.3
 
 
 @dataclass

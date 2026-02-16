@@ -1,16 +1,29 @@
 version: "0.2"
+
+# =====================================================================================
+# HAIKU TAGGER CONFIG
+# =====================================================================================
+# Purpose: Uses Anthropic Haiku for tagging (high accuracy) with local Ollama for
+# summarization (free, runs in background). Best of both worlds — accurate semantic
+# tagging from a cloud model, zero-cost summarization from a local model.
+#
+# Usage:
+#   virtual-context -c virtual-context-haiku-tagger.yaml chat --headless --replay prompts100.txt
+#
+# Key differences from the main config:
+#   - Tagger uses Anthropic Haiku instead of local Ollama
+#   - Heuristic broad/temporal detection disabled — Haiku handles these natively
+#   - Summarizer still uses local Ollama qwen3:4b (free, quality sufficient for summaries)
+
 storage_root: ".virtualcontext"
 context_window: 120000
 token_counter: "estimate"   # "estimate" | "tiktoken" | "callable:module.path:func"
 
-# ---------------------------------------------------------------------------
-# Tag Generator — how conversation turns get semantic tags
-# ---------------------------------------------------------------------------
-# type: "llm" uses a local LLM (via Ollama or any OpenAI-compatible endpoint)
-# type: "keyword" uses deterministic keyword/regex matching (no LLM needed)
-#
-# When type is "llm", keyword_fallback provides a safety net if the LLM is
-# unavailable. Tags emerge from conversation content — no predefined domains.
+# =====================================================================================
+# TAG GENERATOR — Anthropic Haiku for high-quality tagging
+# =====================================================================================
+# Haiku provides reliable broad/temporal detection, accurate tag reuse, and clean JSON
+# output. Since it handles these natively, regex heuristic overrides are disabled.
 
 tag_generator:
   type: "llm"
@@ -18,12 +31,15 @@ tag_generator:
   model: "claude-haiku-4-5-20251001"
   max_tags: 10
   min_tags: 5
-  prompt_mode: "detailed"
+  prompt_mode: "detailed"     # full rules with broad/temporal detection guidance
 
-  # Disable heuristic override — Haiku is capable enough to handle broad detection
-  # via the detailed prompt alone. Keep heuristic for local/small models.
+  # Heuristics disabled — Haiku detects broad/temporal natively via the detailed prompt.
+  # Set to [] to disable; omit or set to null to use built-in defaults.
   broad_patterns: []
+  temporal_patterns: []
 
+  # keyword_fallback: Used when the LLM is unavailable. Maps keywords and regex patterns
+  # to tags for deterministic fallback tagging.
   keyword_fallback:
     tag_keywords:
       legal:
@@ -57,13 +73,14 @@ tag_generator:
         - "\\bdef \\w+\\("
         - "\\bclass \\w+[:(]"
 
-# ---------------------------------------------------------------------------
-# Tag Rules — per-tag priority, TTL, and custom prompts
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# TAG RULES — per-tag priority, TTL, and custom summarization prompts
+# =====================================================================================
+# Controls assembly order (higher priority = included first) and auto-expiration.
 # match: fnmatch pattern against tag names
-# priority: higher = more important (affects assembly order)
-# ttl_days: null = never expire
-# summary_prompt: optional custom prompt for summarizing this tag's content
+# priority: 1-10 scale, higher = assembled first when budget is tight
+# ttl_days: auto-delete stored segments after N days (null = never expire)
+# summary_prompt: custom LLM prompt for summarizing this tag's segments
 
 tag_rules:
   - match: "architecture*"
@@ -92,27 +109,29 @@ tag_rules:
     priority: 8
     ttl_days: 90
 
-  - match: "*"
+  - match: "*"            # catch-all for unmatched tags
     priority: 5
     ttl_days: 30
 
-# ---------------------------------------------------------------------------
-# Compaction — threshold-based context management
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# COMPACTION — standard thresholds for 120k window
+# =====================================================================================
 
 compaction:
-  soft_threshold: 0.70        # proactive compaction
-  hard_threshold: 0.85        # mandatory blocking compaction
-  protected_recent_turns: 6
+  soft_threshold: 0.70        # proactive compaction at ~84k tokens
+  hard_threshold: 0.85        # mandatory blocking compaction at ~102k tokens
+  protected_recent_turns: 6   # recent turns never compacted
   overflow_buffer: 1.2
   summary_ratio: 0.15
   min_summary_tokens: 200
   max_summary_tokens: 2000
   max_concurrent_summaries: 4
 
-# ---------------------------------------------------------------------------
-# Summarization — LLM used for compaction
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# SUMMARIZATION — local Ollama for free compaction summaries
+# =====================================================================================
+# Summarization is less latency-sensitive (runs in a background thread), so using a
+# local model keeps costs at zero while providing sufficient quality.
 
 summarization:
   provider: "ollama"
@@ -120,9 +139,9 @@ summarization:
   max_tokens: 1000
   temperature: 0.3
 
-# ---------------------------------------------------------------------------
-# Providers — LLM endpoint configurations
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# PROVIDERS
+# =====================================================================================
 
 providers:
   ollama:
@@ -130,27 +149,27 @@ providers:
     base_url: "http://127.0.0.1:11434/v1"
   anthropic:
     type: "anthropic"
-    api_key_env: "ANTHROPIC_API_KEY"
+    api_key_env: "ANTHROPIC_API_KEY"   # reads API key from this environment variable
     model: "claude-haiku-4-5-20251001"
 
-# ---------------------------------------------------------------------------
-# Storage — where compacted segments are persisted
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# STORAGE
+# =====================================================================================
 
 storage:
-  backend: "sqlite"           # "sqlite" (primary) or "filesystem" (debug)
+  backend: "sqlite"           # "sqlite" (recommended) or "filesystem" (human-readable debug)
   sqlite:
     path: ".virtualcontext/store.db"
   filesystem:
     root: ".virtualcontext/store"
 
-# ---------------------------------------------------------------------------
-# Assembly — how context is built for the LLM
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# ASSEMBLY — how retrieved context is built for the LLM
+# =====================================================================================
 
 assembly:
-  core_context_max_tokens: 18000
-  tag_context_max_tokens: 30000
+  core_context_max_tokens: 18000   # budget for always-included files (SOUL.md, etc.)
+  tag_context_max_tokens: 30000    # budget for retrieved tag summaries
   core_files: []
   # core_files:
   #   - path: "SOUL.md"
@@ -158,30 +177,30 @@ assembly:
   #   - path: "USER.md"
   #     priority: 9
 
-# ---------------------------------------------------------------------------
-# Retrieval — tag-overlap based context retrieval
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# RETRIEVAL — tag-overlap based context retrieval
+# =====================================================================================
 
 retrieval:
-  skip_active_tags: true
-  active_tag_lookback: 4
+  skip_active_tags: true       # don't retrieve tags already in the active conversation
+  active_tag_lookback: 4       # how many recent turns to check for "active" tags
   strategy_config:
     default:
-      min_overlap: 1          # minimum tag overlap to match
+      min_overlap: 1           # minimum tag overlap to consider a match
       max_results: 10
       max_budget_fraction: 0.25
-      include_related: true
+      include_related: true    # bridges vocabulary mismatches via related_tags
 
-# ---------------------------------------------------------------------------
-# Cost Tracking — monitor token usage and estimated costs
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# COST TRACKING
+# =====================================================================================
 
 cost_tracking:
   enabled: true
   pricing:
     ollama:
-      input_per_1k: 0.0      # local = free
+      input_per_1k: 0.0       # local models = free
       output_per_1k: 0.0
     anthropic:
-      input_per_1k: 0.00025
+      input_per_1k: 0.00025   # Haiku pricing
       output_per_1k: 0.00125

@@ -1,11 +1,30 @@
 version: "0.2"
+
+# =====================================================================================
+# COMPACTION STRESS TEST CONFIG
+# =====================================================================================
+# Purpose: Forces compaction to trigger early and often by using a tiny 3k token window.
+# Used for validating compaction logic, segment summarization, and post-compaction retrieval.
+#
+# Usage:
+#   virtual-context -c virtual-context-compact-test.yaml chat --headless --replay prompts100.txt
+#
+# Key differences from the main config:
+#   - 3k context window (vs 120k) — compaction fires every ~5 turns
+#   - Separate storage at .virtualcontext-compact-test/ — won't pollute main data
+#   - Both tagger and summarizer use Anthropic Haiku — fast, accurate, no local GPU needed
+#   - Heuristic broad/temporal detection disabled — Haiku handles these natively
+#   - Lower assembly budgets to fit the tiny window
+
 storage_root: ".virtualcontext-compact-test"
 context_window: 3000
 token_counter: "estimate"
 
-# ---------------------------------------------------------------------------
-# Tag Generator — Haiku tagger with detailed prompt
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# TAG GENERATOR — Haiku tagger with detailed prompt
+# =====================================================================================
+# Uses Anthropic Haiku for high-quality tagging. Haiku reliably detects broad and temporal
+# queries via its detailed prompt, so regex heuristic overrides are disabled (empty lists).
 
 tag_generator:
   type: "llm"
@@ -14,8 +33,13 @@ tag_generator:
   max_tags: 10
   min_tags: 5
   prompt_mode: "detailed"
-  broad_patterns: []
 
+  # Heuristics disabled — Haiku detects broad/temporal natively via the detailed prompt.
+  broad_heuristic_enabled: false
+  temporal_heuristic_enabled: false
+
+  # keyword_fallback: Used when the LLM is unavailable. Maps keywords and regex patterns
+  # to tags for deterministic fallback tagging.
   keyword_fallback:
     tag_keywords:
       legal:
@@ -49,9 +73,13 @@ tag_generator:
         - "\\bdef \\w+\\("
         - "\\bclass \\w+[:(]"
 
-# ---------------------------------------------------------------------------
-# Tag Rules
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# TAG RULES — per-tag priority and TTL
+# =====================================================================================
+# Controls assembly order (higher priority = included first) and auto-expiration.
+# match: fnmatch pattern against tag names
+# priority: 1-10 scale, higher = assembled first when budget is tight
+# ttl_days: auto-delete stored segments after N days (null = never expire)
 
 tag_rules:
   - match: "architecture*"
@@ -69,27 +97,33 @@ tag_rules:
   - match: "medical*"
     priority: 8
     ttl_days: 90
-  - match: "*"
+  - match: "*"            # catch-all for unmatched tags
     priority: 5
     ttl_days: 30
 
-# ---------------------------------------------------------------------------
-# Compaction — low thresholds to trigger early with 3k window
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# COMPACTION — tuned for 3k window stress testing
+# =====================================================================================
+# With a 3k window:
+#   soft_threshold 0.70 = compaction starts at ~2,100 tokens
+#   hard_threshold 0.85 = mandatory compaction at ~2,550 tokens
+# protected_recent_turns is 4 (not 6) to leave room for summaries in the tiny window.
 
 compaction:
-  soft_threshold: 0.70        # ~2,100 tokens
-  hard_threshold: 0.85        # ~2,550 tokens
-  protected_recent_turns: 4   # lower than default 6 to leave room
+  soft_threshold: 0.70
+  hard_threshold: 0.85
+  protected_recent_turns: 4    # lower than default 6 to fit in 3k window
   overflow_buffer: 1.2
   summary_ratio: 0.15
-  min_summary_tokens: 100
-  max_summary_tokens: 800
+  min_summary_tokens: 100      # lower than default 200 — short summaries for tiny window
+  max_summary_tokens: 800      # lower than default 2000
   max_concurrent_summaries: 4
 
-# ---------------------------------------------------------------------------
-# Summarization — Ollama for compaction summaries
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# SUMMARIZATION — Haiku for compaction summaries
+# =====================================================================================
+# Uses Haiku for both tagging and summarization in this config. Summarization runs in a
+# background thread, so latency is less critical than quality.
 
 summarization:
   provider: "anthropic"
@@ -97,9 +131,9 @@ summarization:
   max_tokens: 500
   temperature: 0.3
 
-# ---------------------------------------------------------------------------
-# Providers
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# PROVIDERS
+# =====================================================================================
 
 providers:
   ollama:
@@ -107,12 +141,13 @@ providers:
     base_url: "http://127.0.0.1:11434/v1"
   anthropic:
     type: "anthropic"
-    api_key_env: "ANTHROPIC_API_KEY"
+    api_key_env: "ANTHROPIC_API_KEY"   # reads API key from this environment variable
     model: "claude-haiku-4-5-20251001"
 
-# ---------------------------------------------------------------------------
-# Storage — separate DB from main runs
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# STORAGE — isolated from main runs
+# =====================================================================================
+# Separate DB so stress test data doesn't pollute the main storage.
 
 storage:
   backend: "sqlite"
@@ -121,18 +156,21 @@ storage:
   filesystem:
     root: ".virtualcontext-compact-test/store"
 
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# ASSEMBLY — small budgets for 3k window
+# =====================================================================================
+# With only 3k tokens total, assembly budgets must be small.
+# core_context: 500 tokens for always-included files
+# tag_context: 1000 tokens for retrieved tag summaries
 
 assembly:
   core_context_max_tokens: 500
   tag_context_max_tokens: 1000
   core_files: []
 
-# ---------------------------------------------------------------------------
-# Retrieval
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# RETRIEVAL
+# =====================================================================================
 
 retrieval:
   skip_active_tags: true
@@ -140,20 +178,20 @@ retrieval:
   strategy_config:
     default:
       min_overlap: 1
-      max_results: 5
+      max_results: 5           # fewer results than default 10 — fits the tiny window
       max_budget_fraction: 0.25
-      include_related: true
+      include_related: true    # bridges vocabulary mismatches via related_tags
 
-# ---------------------------------------------------------------------------
-# Cost Tracking
-# ---------------------------------------------------------------------------
+# =====================================================================================
+# COST TRACKING
+# =====================================================================================
 
 cost_tracking:
   enabled: true
   pricing:
     ollama:
-      input_per_1k: 0.0
+      input_per_1k: 0.0       # local models = free
       output_per_1k: 0.0
     anthropic:
-      input_per_1k: 0.00025
+      input_per_1k: 0.00025   # Haiku pricing
       output_per_1k: 0.00125
