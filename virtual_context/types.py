@@ -87,6 +87,8 @@ class TagGeneratorConfig:
     temporal_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_TEMPORAL_PATTERNS))
     broad_heuristic_enabled: bool = True
     temporal_heuristic_enabled: bool = True
+    context_lookback_pairs: int = 5  # Number of recent turn pairs to feed as context to tagger
+    context_bleed_threshold: float = 0.1  # Embedding similarity gate: skip context below this (0 = disabled)
     disable_thinking: bool = False  # Prepend /no_think to prompts (for qwen3 models)
 
 

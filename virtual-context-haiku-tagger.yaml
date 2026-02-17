@@ -134,8 +134,8 @@ compaction:
 # local model keeps costs at zero while providing sufficient quality.
 
 summarization:
-  provider: "ollama"
-  model: "qwen3:4b-instruct-2507-fp16"
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
   max_tokens: 1000
   temperature: 0.3
 

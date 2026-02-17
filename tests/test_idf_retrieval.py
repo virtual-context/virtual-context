@@ -93,6 +93,7 @@ class TestIDFRanking:
 
         return _make_store_with_segments(db_path, segments)
 
+    @pytest.mark.regression("BUG-006")
     def test_idf_ranks_rare_tags_higher(self, tmp_sqlite_db):
         """Segment with rare tag 'postgres' should rank above distractors
         that only have common tags like 'database'."""
@@ -123,6 +124,7 @@ class TestIDFRanking:
         assert result.retrieval_metadata.get("idf_reranked") is True
         store.close()
 
+    @pytest.mark.regression("BUG-006")
     def test_idf_with_rare_query_tag_promotes_target(self, tmp_sqlite_db):
         """When query includes rare tag 'postgres', target segment should rank first."""
         store = self._build_bug006_store(tmp_sqlite_db)
@@ -221,6 +223,7 @@ class TestRelatedTagExpansion:
         ]
         return _make_store_with_segments(db_path, segments)
 
+    @pytest.mark.regression("BUG-005")
     def test_write_time_related_tags_enable_retrieval(self, tmp_sqlite_db):
         """Write-time related tags (materialized-view) bridge the vocabulary gap."""
         store = self._build_bug005_store(tmp_sqlite_db)

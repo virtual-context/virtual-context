@@ -34,6 +34,19 @@ tag_generator:
   max_tags: 10                          # upper bound on tags per exchange
   min_tags: 5                           # lower bound — encourages richer tagging
 
+  # context_lookback_pairs: Number of recent turn pairs to include as context when
+  # tagging short/ambiguous messages (e.g. "of course", "yes", "?"). Helps the tagger
+  # infer the correct topic from surrounding conversation. Set to 0 to disable.
+  context_lookback_pairs: 5
+
+  # context_bleed_threshold: Embedding similarity gate that prevents stale context
+  # from a previous topic from bleeding into the tagger when the conversation shifts.
+  # Compares the current turn against the most recent context pair using cosine
+  # similarity. Below this threshold → topic shift → context is skipped.
+  # Set to 0 to disable the gate. Requires sentence-transformers (pip install
+  # virtual-context[embeddings]); degrades gracefully to no gating if not installed.
+  context_bleed_threshold: 0.1
+
   # prompt_mode: Controls how much instruction the LLM receives for tagging.
   #   "detailed" — full rules, examples, broad/temporal detection guidance (~600 tokens)
   #   "compact"  — minimal rules (~200 tokens), better for models with small context

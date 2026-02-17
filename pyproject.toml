@@ -28,6 +28,7 @@ all = [
 dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",
     "ruff>=0.8",
 ]
 
@@ -40,4 +41,10 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["ollama: tests requiring a running Ollama instance with qwen3:4b-instruct-2507-fp16"]
+addopts = "--ignore=tests/ollama --ignore=tests/haiku -m 'not slow'"
+markers = [
+    "ollama: tests requiring a running Ollama instance with qwen3:4b-instruct-2507-fp16",
+    "haiku: tests requiring ANTHROPIC_API_KEY for Haiku integration",
+    "regression: regression test for a specific bug ID (e.g., regression('BUG-004'))",
+    "slow: tests that take >1s (TUI, full engine integration)",
+]

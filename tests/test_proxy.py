@@ -22,6 +22,7 @@ from virtual_context.proxy.server import (
     _strip_vc_prompt,
     create_app,
 )
+from virtual_context.config import load_config
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import AssembledContext, Message, TagResult, TurnTagEntry
@@ -121,6 +122,20 @@ class TestExtractUserMessage:
             ]},
         ]}
         assert _extract_user_message(body) == "Actual question"
+
+    @pytest.mark.regression("PROXY-005")
+    def test_tool_result_only_returns_empty(self):
+        """When last user message is pure tool_result, returns empty string."""
+        body = {"messages": [
+            {"role": "user", "content": "Search for pandas docs"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"q": "pandas"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "search results here"},
+            ]},
+        ]}
+        assert _extract_user_message(body) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +240,7 @@ class TestStripOpenclawEnvelope:
         text = "some content\n[message_id: 8663]"
         assert _strip_openclaw_envelope(text) == "some content"
 
+    @pytest.mark.regression("PROXY-003")
     def test_strips_full_envelope(self):
         """Full OpenClaw message: [vc:prompt] + channel header + content + footer."""
         text = (
@@ -339,6 +355,7 @@ class TestStripOpenclawEnvelope:
         result = _extract_message_text(msg)
         assert result == "the real content"
 
+    @pytest.mark.regression("PROXY-003")
     def test_history_pairs_strip_envelope(self):
         """Historical user messages get full envelope stripped."""
         body = {"messages": [
@@ -887,6 +904,80 @@ class TestHandleStreaming:
         # Check that the conversation history has the assistant message
         # (engine.on_turn_complete would be called via state.fire_turn_complete)
 
+    @pytest.mark.regression("PROXY-005")
+    def test_streaming_tool_result_preserves_sse(self, test_client):
+        """Tool-result turn (no text) should stream SSE, not fall to JSON passthrough.
+
+        Regression for PROXY-005: when client sends a tool_result message,
+        _extract_user_message() returns "". Before the fix, this fell through to
+        _passthrough_bytes() which returned application/json — breaking SSE clients.
+        """
+        client, engine = test_client
+
+        sse_events = (
+            b"event: message_start\r\n"
+            b"data: {\"type\":\"message_start\"}\r\n"
+            b"\r\n"
+            b"event: content_block_start\r\n"
+            b"data: {\"type\":\"content_block_start\",\"index\":0,"
+            b"\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n"
+            b"\r\n"
+            b"event: content_block_delta\r\n"
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,"
+            b"\"delta\":{\"type\":\"text_delta\",\"text\":\"Based on the search results...\"}}\r\n"
+            b"\r\n"
+            b"event: message_stop\r\n"
+            b"data: {\"type\":\"message_stop\"}\r\n"
+            b"\r\n"
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_events
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3",
+                        "system": "test",
+                        "stream": True,
+                        "messages": [
+                            {"role": "user", "content": "Search for pandas docs"},
+                            {"role": "assistant", "content": [
+                                {"type": "tool_use", "id": "toolu_01", "name": "web_search",
+                                 "input": {"query": "pandas documentation"}},
+                            ]},
+                            {"role": "user", "content": [
+                                {"type": "tool_result", "tool_use_id": "toolu_01",
+                                 "content": "pandas is a data analysis library..."},
+                            ]},
+                        ],
+                    },
+                )
+
+                # Must be SSE, not JSON
+                assert resp.status_code == 200
+                ct = resp.headers.get("content-type", "")
+                assert "text/event-stream" in ct, (
+                    f"Expected text/event-stream, got {ct!r} — "
+                    "tool_result turn fell through to JSON passthrough"
+                )
+
+                # Raw SSE bytes forwarded
+                assert b"content_block_delta" in resp.content
+                assert b"Based on the search results" in resp.content
+
+                # Engine enrichment should NOT have been called
+                engine.on_message_inbound.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # _extract_history_pairs
@@ -982,6 +1073,7 @@ class TestExtractHistoryPairs:
         assert pairs[4].content == "Q3"
         assert pairs[5].content == "A3"
 
+    @pytest.mark.regression("PROXY-001")
     def test_consecutive_user_messages_at_end(self):
         """OpenClaw batches multiple Telegram messages as consecutive user turns.
 
@@ -1005,6 +1097,7 @@ class TestExtractHistoryPairs:
         assert pairs[2].content == "Q2"
         assert pairs[3].content == "A2"
 
+    @pytest.mark.regression("PROXY-001")
     def test_consecutive_user_messages_mid_conversation(self):
         """Consecutive user messages in the middle should be skipped,
         but pairs on both sides should be extracted."""
@@ -1146,15 +1239,20 @@ class TestProxyStateIngestion:
 
 
 class TestEngineIngestHistory:
-    def test_ingest_five_pairs(self):
-        """5 pairs -> 5 TurnTagEntry entries with sequential turn numbers."""
+    def _make_mock_engine(self):
+        """Create a mock engine with the config attributes needed by ingest_history."""
         engine = MagicMock()
-
-        # Build a real TurnTagIndex
         from virtual_context.core.turn_tag_index import TurnTagIndex
         engine._turn_tag_index = TurnTagIndex()
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
+        engine.config.tag_generator.context_lookback_pairs = 5
+        engine.config.tag_generator.context_bleed_threshold = 0
+        return engine
+
+    def test_ingest_five_pairs(self):
+        """5 pairs -> 5 TurnTagEntry entries with sequential turn numbers."""
+        engine = self._make_mock_engine()
 
         # Tag generator returns predictable results
         tag_results = [
@@ -1186,11 +1284,7 @@ class TestEngineIngestHistory:
         assert engine._turn_tag_index.entries[4].primary_tag == "deploy"
 
     def test_ingest_empty_returns_zero(self):
-        engine = MagicMock()
-        from virtual_context.core.turn_tag_index import TurnTagIndex
-        engine._turn_tag_index = TurnTagIndex()
-        engine._store = MagicMock()
-        engine._store.get_all_tags.return_value = []
+        engine = self._make_mock_engine()
         engine._tag_generator = MagicMock()
 
         from virtual_context.engine import VirtualContextEngine
@@ -1201,11 +1295,7 @@ class TestEngineIngestHistory:
 
     def test_ingest_refreshes_store_tags(self):
         """Store tags are refreshed every 10 turns."""
-        engine = MagicMock()
-        from virtual_context.core.turn_tag_index import TurnTagIndex
-        engine._turn_tag_index = TurnTagIndex()
-        engine._store = MagicMock()
-        engine._store.get_all_tags.return_value = []
+        engine = self._make_mock_engine()
         engine._tag_generator = MagicMock()
         engine._tag_generator.generate_tags.return_value = TagResult(
             tags=["tag"], primary="tag", source="keyword"
@@ -1384,6 +1474,7 @@ class TestFilterBodyMessages:
         msgs = filtered["messages"]
         assert len(msgs) == 5  # 2 protected pairs * 2 + current user
 
+    @pytest.mark.regression("BUG-007")
     def test_broad_keeps_everything(self):
         """Broad queries keep all turns."""
         body = self._build_body(5)
@@ -1400,6 +1491,7 @@ class TestFilterBodyMessages:
         assert dropped == 0
         assert filtered is body  # unchanged
 
+    @pytest.mark.regression("BUG-008")
     def test_temporal_keeps_everything(self):
         """Temporal queries keep all turns."""
         body = self._build_body(3)
@@ -1426,6 +1518,7 @@ class TestFilterBodyMessages:
         msgs = filtered["messages"]
         assert len(msgs) == 5  # 2 pairs * 2 + current user
 
+    @pytest.mark.regression("PROXY-002")
     def test_no_index_entries_skips_filtering(self):
         """If TurnTagIndex is empty, no filtering occurs."""
         body = self._build_body(5)
@@ -1491,6 +1584,7 @@ class TestFilterBodyMessages:
         # 2 protected pairs * 2 + current user = 5
         assert len(msgs) == 5
 
+    @pytest.mark.regression("PROXY-004")
     def test_tool_use_keeps_tool_result_pair(self):
         """If an assistant uses tool_use, the next pair (tool_result) must also be kept."""
         body = {
@@ -1535,6 +1629,7 @@ class TestFilterBodyMessages:
         # 3 kept pairs * 2 + current user = 7
         assert len(msgs) == 7
 
+    @pytest.mark.regression("PROXY-004")
     def test_tool_result_keeps_preceding_tool_use_pair(self):
         """If we keep a pair with tool_result, the preceding pair must also be kept."""
         body = {
@@ -1566,4 +1661,56 @@ class TestFilterBodyMessages:
         )
         # All 3 pairs kept (pair 0 force-kept due to tool chain)
         assert dropped == 0
+
+
+# ---------------------------------------------------------------------------
+# Dashboard settings tests
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardSettings:
+    """Tests for /dashboard/settings GET and PUT with context_lookback_pairs."""
+
+    @pytest.fixture
+    def settings_client(self, tmp_path):
+        """Create a real-engine app for dashboard settings testing."""
+        from starlette.testclient import TestClient
+        db_path = str(tmp_path / "store.db")
+        with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
+            real_config = load_config(config_dict={
+                "context_window": 10000,
+                "storage_root": str(tmp_path),
+                "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+                "tag_generator": {"type": "keyword", "context_lookback_pairs": 5},
+            })
+            engine = MagicMock()
+            engine.config = real_config
+            engine.on_message_inbound.return_value = AssembledContext()
+            engine.on_turn_complete.return_value = None
+            MockEngine.return_value = engine
+            app = create_app(upstream="http://fake:9999", config_path=None)
+        with TestClient(app) as client:
+            yield client
+
+    def test_context_lookback_pairs_in_settings(self, settings_client):
+        """GET /dashboard/settings should include context_lookback_pairs in tagging section."""
+        resp = settings_client.get("/dashboard/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "tagging" in data
+        assert "context_lookback_pairs" in data["tagging"]
+        assert data["tagging"]["context_lookback_pairs"] == 5
+
+    def test_context_lookback_pairs_update(self, settings_client):
+        """PUT /dashboard/settings should update context_lookback_pairs."""
+        resp = settings_client.put(
+            "/dashboard/settings",
+            json={"tagging": {"context_lookback_pairs": 3}},
+        )
+        assert resp.status_code == 200
+
+        resp = settings_client.get("/dashboard/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["tagging"]["context_lookback_pairs"] == 3
 

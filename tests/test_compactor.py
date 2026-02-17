@@ -57,6 +57,7 @@ def test_compact_preserves_metadata(compactor, legal_segment):
     assert results[0].metadata.key_decisions == ["decision1"]
 
 
+@pytest.mark.regression("BUG-004")
 def test_compact_refined_tags(compactor, legal_segment):
     results = compactor.compact([legal_segment])
     assert "test-tag" in results[0].tags  # From mock LLM response
@@ -173,6 +174,7 @@ def test_compact_tag_summaries_builds(mock_llm):
     assert len(mock_llm.calls) == 1
 
 
+@pytest.mark.regression("BUG-003")
 def test_compact_tag_summaries_skips_fresh(mock_llm):
     """compact_tag_summaries skips tags where existing summary is fresh."""
     from virtual_context.types import StoredSummary, TagSummary

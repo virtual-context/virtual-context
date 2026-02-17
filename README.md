@@ -101,6 +101,9 @@ LLM processes enriched context → produces response
     │
     ▼
 Response tagging — LLM tags the full user+assistant pair (background thread)
+    │  ├─ Context lookback: feed N recent pairs as tagger context for short/ambiguous messages
+    │  ├─ Context bleed gate: embedding similarity blocks stale context on topic shifts
+    │  ├─ Retry on _general: if tagger returns only _general, retry with expanded context
     │  ├─ Authoritative tags written to TurnTagIndex (vocabulary-building)
     │  ├─ Related tags generated for cross-vocabulary retrieval
     │  └─ Compactor generates related_tags at write time (vocabulary bridging)
@@ -593,7 +596,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 489 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 499 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

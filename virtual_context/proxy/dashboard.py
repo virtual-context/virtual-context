@@ -51,6 +51,8 @@ def _build_settings_response(cfg) -> dict:
             "max_summary_tokens": cfg.compactor.max_summary_tokens,
         },
         "tagging": {
+            "context_lookback_pairs": cfg.tag_generator.context_lookback_pairs,
+            "context_bleed_threshold": cfg.tag_generator.context_bleed_threshold,
             "broad_heuristic_enabled": cfg.tag_generator.broad_heuristic_enabled,
             "temporal_heuristic_enabled": cfg.tag_generator.temporal_heuristic_enabled,
         },
@@ -399,46 +401,56 @@ def register_dashboard_routes(
                 {"error": "Engine not initialized"}, status_code=503,
             )
 
-        # Wait for any pending on_turn_complete to finish
-        await asyncio.to_thread(state.wait_for_complete)
+        # Reject if compaction is already running
+        if not state._compaction_lock.acquire(blocking=False):
+            return JSONResponse(
+                {"status": "busy", "message": "Compaction already in progress"},
+                status_code=409,
+            )
 
-        # Run compaction in a thread (accesses engine internals)
-        report = await asyncio.to_thread(
-            state.engine.compact_manual, state.conversation_history
-        )
+        try:
+            # Wait for any pending on_turn_complete to finish
+            await asyncio.to_thread(state.wait_for_complete)
 
-        if report is None:
+            # Run compaction in a thread (accesses engine internals)
+            report = await asyncio.to_thread(
+                state.engine.compact_manual, state.conversation_history
+            )
+
+            if report is None:
+                return JSONResponse({
+                    "status": "no_action",
+                    "message": "Nothing to compact (not enough messages outside protected zone)",
+                })
+
+            # Emit compaction event so the dashboard updates live
+            if metrics:
+                turn = len(state.conversation_history) // 2 - 1
+                original_tokens = sum(r.original_tokens for r in report.results)
+                summary_tokens = sum(r.summary_tokens for r in report.results)
+                metrics.record({
+                    "type": "compaction",
+                    "turn": turn,
+                    "segments": report.segments_compacted,
+                    "tokens_freed": report.tokens_freed,
+                    "original_tokens": original_tokens,
+                    "summary_tokens": summary_tokens,
+                    "tags": report.tags,
+                    "tag_summaries_built": report.tag_summaries_built,
+                    "compacted_through": getattr(
+                        state.engine, "_compacted_through", 0
+                    ),
+                })
+
             return JSONResponse({
-                "status": "no_action",
-                "message": "Nothing to compact (not enough messages outside protected zone)",
-            })
-
-        # Emit compaction event so the dashboard updates live
-        if metrics:
-            turn = len(state.conversation_history) // 2 - 1
-            original_tokens = sum(r.original_tokens for r in report.results)
-            summary_tokens = sum(r.summary_tokens for r in report.results)
-            metrics.record({
-                "type": "compaction",
-                "turn": turn,
+                "status": "compacted",
                 "segments": report.segments_compacted,
                 "tokens_freed": report.tokens_freed,
-                "original_tokens": original_tokens,
-                "summary_tokens": summary_tokens,
                 "tags": report.tags,
                 "tag_summaries_built": report.tag_summaries_built,
-                "compacted_through": getattr(
-                    state.engine, "_compacted_through", 0
-                ),
             })
-
-        return JSONResponse({
-            "status": "compacted",
-            "segments": report.segments_compacted,
-            "tokens_freed": report.tokens_freed,
-            "tags": report.tags,
-            "tag_summaries_built": report.tag_summaries_built,
-        })
+        finally:
+            state._compaction_lock.release()
 
     # -------------------------------------------------------------------
     # Settings endpoints
@@ -474,6 +486,8 @@ def register_dashboard_routes(
             ("compaction", "protected_recent_turns"): (cfg.monitor, "protected_recent_turns", int),
             ("compaction", "min_summary_tokens"): (cfg.compactor, "min_summary_tokens", int),
             ("compaction", "max_summary_tokens"): (cfg.compactor, "max_summary_tokens", int),
+            ("tagging", "context_lookback_pairs"): (cfg.tag_generator, "context_lookback_pairs", int),
+            ("tagging", "context_bleed_threshold"): (cfg.tag_generator, "context_bleed_threshold", float),
             ("tagging", "broad_heuristic_enabled"): (cfg.tag_generator, "broad_heuristic_enabled", bool),
             ("tagging", "temporal_heuristic_enabled"): (cfg.tag_generator, "temporal_heuristic_enabled", bool),
             ("retrieval", "active_tag_lookback"): (cfg.retriever, "active_tag_lookback", int),
@@ -876,7 +890,7 @@ _DASHBOARD_HTML = """\
   .store-info { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
 
   /* Request log table */
-  .log-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .log-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
   .log-table th {
     text-align: left; padding: 6px 8px; color: var(--text-dim);
     border-bottom: 1px solid var(--border); font-weight: 500;
@@ -1656,9 +1670,9 @@ _DASHBOARD_HTML = """\
       $('store-info').textContent = data.store_tag_count + ' tags in store';
     }
 
-    // Fill ingested history turns (newest first, same as live requests)
+    // Fill ingested history turns (iterate oldest-first so prepend produces newest-at-top)
     var ingested = data.ingested_turns || [];
-    for (var ii = ingested.length - 1; ii >= 0; ii--) addIngestedRow(ingested[ii]);
+    for (var ii = 0; ii < ingested.length; ii++) addIngestedRow(ingested[ii]);
     // Fill request log (prepended = newest at top)
     (data.recent_requests || []).forEach(r => addRequestRow(r));
     // Fill response timing
@@ -1912,7 +1926,9 @@ _DASHBOARD_HTML = """\
     fetch('/dashboard/compact', {method: 'POST'})
       .then(function(r) { return r.json().then(function(d) { return {status: r.status, data: d}; }); })
       .then(function(res) {
-        if (res.status >= 400) {
+        if (res.status === 409) {
+          btn.textContent = 'Already compacting...';
+        } else if (res.status >= 400) {
           btn.textContent = res.data.error || 'Error';
         } else if (res.data.status === 'no_action') {
           btn.textContent = 'Nothing to compact';

@@ -35,6 +35,18 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+_EMBED_NOT_LOADED = object()  # sentinel for lazy embed function loading
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
 
 class VirtualContextEngine:
     """Main orchestrator: two entry points for inbound messages and turn completion.
@@ -69,6 +81,7 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_cost_tracker()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
+        self._embed_fn = _EMBED_NOT_LOADED  # lazy-loaded for context bleed gate
 
     def _init_canonicalizer(self) -> None:
         """Initialize the tag canonicalizer with store aliases."""
@@ -212,11 +225,20 @@ class VirtualContextEngine:
         )
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
 
+        # Build context for inbound tagger
+        n_context = self.config.tag_generator.context_lookback_pairs
+        # For inbound, the current message is not yet in history — no need to exclude
+        context = self._get_recent_context(
+            conversation_history, n_context, exclude_last=0,
+        )
+
         # Retrieve relevant tag summaries
         retrieval_result = self._retriever.retrieve(
             message=message,
             current_active_tags=active_tags,
             current_utilization=utilization,
+            post_compaction=(self._compacted_through > 0),
+            context_turns=context,
         )
 
         # Build context awareness hint (post-compaction only)
@@ -240,6 +262,33 @@ class VirtualContextEngine:
         message_tags = retrieval_result.retrieval_metadata.get(
             "tags_from_message", retrieval_result.tags_matched
         )
+
+        # Retry with expanded context if only _general was produced
+        if message_tags == ["_general"]:
+            expanded = self._get_recent_context(
+                conversation_history, n_context * 2, exclude_last=0,
+            )
+            if expanded:
+                retry_result = self._retriever.retrieve(
+                    message=message,
+                    current_active_tags=active_tags,
+                    current_utilization=utilization,
+                    post_compaction=(self._compacted_through > 0),
+                    context_turns=expanded,
+                )
+                retry_tags = retry_result.retrieval_metadata.get(
+                    "tags_from_message", retry_result.tags_matched
+                )
+                if retry_tags != ["_general"]:
+                    message_tags = retry_tags
+                    retrieval_result = retry_result
+
+        # Final fallback: inherit from most recent meaningful turn in the index
+        if message_tags == ["_general"]:
+            prev = self._turn_tag_index.latest_meaningful_tags()
+            if prev:
+                message_tags = list(prev.tags)
+
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
         assembled.broad = retrieval_result.broad
@@ -257,7 +306,35 @@ class VirtualContextEngine:
         if latest_pair:
             combined_text = " ".join(m.content for m in latest_pair)
             store_tags = [ts.tag for ts in self._store.get_all_tags()]
-            tag_result = self._tag_generator.generate_tags(combined_text, store_tags)
+            n_context = self.config.tag_generator.context_lookback_pairs
+            context = self._get_recent_context(
+                conversation_history, n_context, current_text=combined_text,
+            )
+            tag_result = self._tag_generator.generate_tags(
+                combined_text, store_tags, context_turns=context,
+            )
+
+            # Retry with expanded context if only _general was produced
+            if tag_result.tags == ["_general"]:
+                expanded = self._get_recent_context(
+                    conversation_history, n_context * 2,
+                    current_text=combined_text,
+                )
+                if expanded:
+                    tag_result = self._tag_generator.generate_tags(
+                        combined_text, store_tags, context_turns=expanded,
+                    )
+
+            # Final fallback: inherit from most recent meaningful turn
+            if tag_result.tags == ["_general"]:
+                prev = self._turn_tag_index.latest_meaningful_tags()
+                if prev:
+                    tag_result = TagResult(
+                        tags=list(prev.tags),
+                        primary=prev.primary_tag,
+                        source="inherited",
+                    )
+
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=len(self._turn_tag_index.entries),
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
@@ -545,6 +622,113 @@ class VirtualContextEngine:
                 return [history[i-1], history[i]]
         return None
 
+    def _get_embed_fn(self):
+        """Lazy-load the embedding function for the context bleed gate.
+
+        Returns a callable that takes a list of strings and returns a list of
+        float vectors, or ``None`` if sentence-transformers is not installed.
+        """
+        if self._embed_fn is _EMBED_NOT_LOADED:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                model_name = self.config.retriever.embedding_model
+                model = SentenceTransformer(model_name)
+
+                def embed(texts: list[str]) -> list[list[float]]:
+                    return model.encode(texts, convert_to_numpy=True).tolist()
+
+                self._embed_fn = embed
+            except ImportError:
+                logger.debug(
+                    "sentence-transformers not installed, context bleed gate disabled"
+                )
+                self._embed_fn = None
+        return self._embed_fn
+
+    def _context_is_relevant(
+        self, current_text: str, context_pairs: list[str],
+    ) -> bool:
+        """Check if current turn is semantically similar to the most recent context pair.
+
+        Compares the current turn's combined text against the last user+assistant
+        pair in the collected context using embedding cosine similarity.
+        Returns ``True`` (pass context) when similarity >= threshold, or when
+        embeddings are unavailable (graceful degradation).
+        """
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return True
+
+        # Compare against the most recent pair in context
+        if len(context_pairs) >= 2:
+            recent = context_pairs[-2] + " " + context_pairs[-1]
+        else:
+            recent = " ".join(context_pairs)
+
+        embeddings = embed_fn([current_text[:2000], recent[:2000]])
+        sim = _cosine_sim(embeddings[0], embeddings[1])
+        threshold = self.config.tag_generator.context_bleed_threshold
+
+        logger.debug("Context bleed gate: sim=%.3f threshold=%.3f", sim, threshold)
+        return sim >= threshold
+
+    def _get_recent_context(
+        self, history: list[Message], n_pairs: int, exclude_last: int = 2,
+        current_text: str | None = None,
+    ) -> list[str] | None:
+        """Collect up to *n_pairs* recent user+assistant text strings.
+
+        Walks backward from the end of *history* (skipping the last
+        *exclude_last* messages which are the current turn) and returns
+        alternating user/assistant content strings.
+
+        When *current_text* is provided and ``context_bleed_threshold > 0``,
+        an embedding similarity gate checks whether the current turn is
+        semantically related to the most recent context pair.  If the
+        similarity is below the threshold (topic shift), context is skipped
+        to prevent stale tags from bleeding across topics (BUG-010).
+
+        Returns ``None`` when no context is available or when the gate blocks.
+        """
+        # Messages available for context (before the current turn)
+        if exclude_last > 0 and len(history) > exclude_last:
+            avail = history[:-exclude_last]
+        elif exclude_last == 0:
+            avail = list(history)
+        else:
+            avail = []
+        if not avail:
+            return None
+
+        pairs: list[str] = []
+        # Walk backward collecting user+assistant pairs
+        i = len(avail) - 1
+        collected = 0
+        while i >= 1 and collected < n_pairs:
+            if avail[i].role == "assistant" and avail[i - 1].role == "user":
+                # Prepend so order is chronological
+                pairs.insert(0, avail[i].content)
+                pairs.insert(0, avail[i - 1].content)
+                collected += 1
+                i -= 2
+            else:
+                i -= 1
+
+        if not pairs:
+            return None
+
+        # Context bleed gate (BUG-010): skip context on topic shift
+        if (
+            current_text
+            and self.config.tag_generator.context_bleed_threshold > 0
+            and not self._context_is_relevant(current_text, pairs)
+        ):
+            logger.debug("Context bleed gate: topic shift detected, skipping context")
+            return None
+
+        return pairs
+
     def compact_manual(
         self,
         conversation_history: list[Message],
@@ -686,27 +870,66 @@ class VirtualContextEngine:
         """
         store_tags = [ts.tag for ts in self._store.get_all_tags()]
         ingested = 0
-
-        # Minimum combined length to justify an LLM tagger call.
-        # Very short exchanges ("?", "ok", emoji-only) produce noise tags;
-        # tag them as "casual" without burning a tagger round-trip.
-        _MIN_TAGGABLE_CHARS = 20
+        n_context = self.config.tag_generator.context_lookback_pairs
 
         for i in range(0, len(history_pairs) - 1, 2):
             user_msg = history_pairs[i]
             asst_msg = history_pairs[i + 1]
             combined_text = f"{user_msg.content} {asst_msg.content}"
 
-            if len(user_msg.content.strip()) < _MIN_TAGGABLE_CHARS:
-                # Inherit tags from the most recent meaningful turn
+            # Build context from preceding pairs in the flat history
+            context: list[str] | None = None
+            if i >= 2:
+                ctx_pairs: list[str] = []
+                start = max(0, i - n_context * 2)
+                for j in range(start, i, 2):
+                    if j + 1 < len(history_pairs):
+                        ctx_pairs.append(history_pairs[j].content)
+                        ctx_pairs.append(history_pairs[j + 1].content)
+                context = ctx_pairs if ctx_pairs else None
+
+            # Context bleed gate (BUG-010): skip stale context on topic shift
+            if (
+                context
+                and self.config.tag_generator.context_bleed_threshold > 0
+                and not self._context_is_relevant(combined_text, context)
+            ):
+                context = None
+
+            tag_result = self._tag_generator.generate_tags(
+                combined_text, store_tags, context_turns=context,
+            )
+
+            # Retry with expanded context on _general
+            if tag_result.tags == ["_general"] and i >= 2:
+                expanded_start = max(0, i - n_context * 4)
+                expanded_ctx: list[str] = []
+                for j in range(expanded_start, i, 2):
+                    if j + 1 < len(history_pairs):
+                        expanded_ctx.append(history_pairs[j].content)
+                        expanded_ctx.append(history_pairs[j + 1].content)
+                # Gate expanded context too
+                if (
+                    expanded_ctx
+                    and self.config.tag_generator.context_bleed_threshold > 0
+                    and not self._context_is_relevant(combined_text, expanded_ctx)
+                ):
+                    expanded_ctx = []
+                if expanded_ctx:
+                    tag_result = self._tag_generator.generate_tags(
+                        combined_text, store_tags, context_turns=expanded_ctx,
+                    )
+
+            # Final fallback: inherit from most recent meaningful turn
+            if tag_result.tags == ["_general"]:
                 prev = self._turn_tag_index.latest_meaningful_tags()
-                tag_result = TagResult(
-                    tags=list(prev.tags) if prev else ["_general"],
-                    primary=prev.primary_tag if prev else "_general",
-                    source="inherited",
-                )
-            else:
-                tag_result = self._tag_generator.generate_tags(combined_text, store_tags)
+                if prev:
+                    tag_result = TagResult(
+                        tags=list(prev.tags),
+                        primary=prev.primary_tag,
+                        source="inherited",
+                    )
+
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=len(self._turn_tag_index.entries),
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],

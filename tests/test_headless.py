@@ -99,6 +99,7 @@ class TestHeadlessBriefMode:
 
 
 class TestHeadlessWithEngine:
+    @pytest.mark.regression("BUG-001")
     def test_engine_methods_called(self, tmp_path):
         """Verify engine integration points are exercised."""
         runner = _make_runner(["ok"])
