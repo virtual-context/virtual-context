@@ -156,8 +156,9 @@ class MockTagGenerator:
         """Set a tag result override for text containing keyword."""
         self._overrides[keyword] = result
 
-    def generate_tags(self, text: str, existing_tags: list[str] | None = None) -> TagResult:
+    def generate_tags(self, text: str, existing_tags: list[str] | None = None, **kwargs) -> TagResult:
         self.calls.append(text)
+        self.last_kwargs = kwargs
         # Check overrides
         for keyword, result in self._overrides.items():
             if keyword.lower() in text.lower():

@@ -79,6 +79,7 @@ class TestFilterHistoryBroad:
         filtered = engine.filter_history(history, current_tags=["legal"], broad=True)
         assert len(filtered) == len(history)
 
+    @pytest.mark.regression("BUG-003")
     def test_broad_true_skips_compacted_post_compaction(self, tmp_path):
         """Post-compaction, broad=True skips compacted messages."""
         engine = self._make_engine_with_index(tmp_path)
@@ -139,6 +140,7 @@ class TestBroadRetrieval:
         yield store
         store.close()
 
+    @pytest.mark.regression("BUG-007")
     def test_broad_retrieval_loads_tag_summaries(self, store_with_tag_summaries):
         """Broad query should load all tag summaries."""
         tag_gen = MockTagGenerator(default_tag="broad-query")

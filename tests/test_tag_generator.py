@@ -172,6 +172,7 @@ class TestBroadHeuristic:
     def test_not_broad(self, patterns, text):
         assert detect_broad_heuristic(text, patterns) is False, f"Should NOT detect as broad: {text!r}"
 
+    @pytest.mark.regression("BUG-007")
     def test_llm_broad_miss_overridden(self):
         """LLM returns broad=false, heuristic overrides to true (the T45 bug)."""
         provider = MockLLMProvider(
@@ -297,6 +298,56 @@ class TestRelatedTagsParsing:
 
         result = generator.generate_tags("database design")
         assert result.related_tags == []
+
+
+class TestContextLookback:
+    """Test that context_turns are injected into the tagger prompt."""
+
+    def test_context_turns_in_prompt(self):
+        """When context_turns is provided, the prompt should contain a context section."""
+        provider = MockLLMProvider(
+            response='{"tags": ["database"], "primary": "database"}'
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(llm_provider=provider, config=config)
+
+        context = [
+            "How do I optimize the users table query?",
+            "Add an index on the email column and use EXPLAIN ANALYZE.",
+        ]
+        generator.generate_tags("of course", context_turns=context)
+
+        # Check the prompt sent to the LLM
+        assert len(provider.calls) == 1
+        prompt = provider.calls[0]["user"]
+        assert "Recent conversation context:" in prompt
+        assert "optimize the users table" in prompt
+
+    def test_no_context_turns_no_section(self):
+        """When context_turns is not provided, no context section in prompt."""
+        provider = MockLLMProvider(
+            response='{"tags": ["database"], "primary": "database"}'
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(llm_provider=provider, config=config)
+
+        generator.generate_tags("How do I optimize queries?")
+
+        prompt = provider.calls[0]["user"]
+        assert "Recent conversation context:" not in prompt
+
+    def test_context_turns_none_backward_compat(self):
+        """context_turns=None is identical to omitting it."""
+        provider = MockLLMProvider(
+            response='{"tags": ["database"], "primary": "database"}'
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(llm_provider=provider, config=config)
+
+        generator.generate_tags("test", context_turns=None)
+
+        prompt = provider.calls[0]["user"]
+        assert "Recent conversation context:" not in prompt
 
 
 class TestBuildTagGenerator:

@@ -61,11 +61,41 @@ class ContextRetriever:
             for ts in all_tags
         }
 
+    def _load_all_tag_summaries(self, token_budget: int) -> tuple[list[StoredSummary], int]:
+        """Load all tag summaries within *token_budget*.
+
+        Returns ``(selected_summaries, total_tokens)``.  Used by the broad
+        retrieval branch and the post-compaction summary floor.
+        """
+        tag_summaries = self.store.get_all_tag_summaries()
+        if not tag_summaries:
+            return [], 0
+
+        selected: list[StoredSummary] = []
+        total_tokens = 0
+        for ts in tag_summaries:
+            if total_tokens + ts.summary_tokens > token_budget:
+                break
+            selected.append(StoredSummary(
+                ref=f"tag-summary-{ts.tag}",
+                primary_tag=ts.tag,
+                tags=[ts.tag],
+                summary=ts.summary,
+                summary_tokens=ts.summary_tokens,
+                created_at=ts.updated_at,
+                start_timestamp=ts.created_at,
+                end_timestamp=ts.updated_at,
+            ))
+            total_tokens += ts.summary_tokens
+        return selected, total_tokens
+
     def retrieve(
         self,
         message: str,
         current_active_tags: list[str] | None = None,
         current_utilization: float = 0.0,
+        post_compaction: bool = False,
+        context_turns: list[str] | None = None,
     ) -> RetrievalResult:
         """Tag inbound message, fetch relevant summaries by tag overlap.
 
@@ -73,6 +103,7 @@ class ContextRetriever:
             message: The inbound user message.
             current_active_tags: Tags from recent conversation turns to skip.
             current_utilization: Current context window usage ratio (0.0-1.0).
+            context_turns: Recent user/assistant text for context-aware tagging.
         """
         start_time = time.monotonic()
         active_tags = set(current_active_tags or [])
@@ -81,11 +112,16 @@ class ContextRetriever:
         store_tags = [ts.tag for ts in self.store.get_all_tags()]
         if self._inbound_tagger is not None:
             # Embedding-based: match against existing vocabulary (no hallucination)
-            # Pass both store tags and live TurnTagIndex tags as vocabulary
+            # Pass both store tags and ALL TurnTagIndex tags as vocabulary.
+            # Note: get_active_tags(lookback=4) would only return recent tags —
+            # the inbound tagger needs the full vocabulary to match any topic.
             vocab_tags = list(set(store_tags))
             if self._turn_tag_index:
-                vocab_tags = list(set(vocab_tags) | self._turn_tag_index.get_active_tags())
-            tag_result = self._inbound_tagger.generate_tags(message, vocab_tags)
+                all_index_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
+                vocab_tags = list(set(vocab_tags) | all_index_tags)
+            tag_result = self._inbound_tagger.generate_tags(
+                message, vocab_tags, context_turns=context_turns,
+            )
             # Apply broad/temporal heuristics (embedding tagger doesn't detect these)
             if not tag_result.broad:
                 tag_result.broad = detect_broad_heuristic(message, self._broad_patterns)
@@ -95,34 +131,19 @@ class ContextRetriever:
                          tag_result.tags, tag_result.broad, tag_result.temporal)
         else:
             # LLM-based: open-ended tag generation (pass known tags for reuse)
-            tag_result = self.tag_generator.generate_tags(message, store_tags)
+            tag_result = self.tag_generator.generate_tags(
+                message, store_tags, context_turns=context_turns,
+            )
 
         retrieval_metadata: dict = {}
 
         # --- Broad query branch ---
         if tag_result.broad:
-            tag_summaries = self.store.get_all_tag_summaries()
-            if tag_summaries:
-                selected_broad: list[StoredSummary] = []
-                total_broad_tokens = 0
-                token_budget = self.config.tag_context_max_tokens
-
-                for ts in tag_summaries:
-                    if total_broad_tokens + ts.summary_tokens > token_budget:
-                        break
-                    selected_broad.append(StoredSummary(
-                        ref=f"tag-summary-{ts.tag}",
-                        primary_tag=ts.tag,
-                        tags=[ts.tag],
-                        summary=ts.summary,
-                        summary_tokens=ts.summary_tokens,
-                        created_at=ts.updated_at,
-                        start_timestamp=ts.created_at,
-                        end_timestamp=ts.updated_at,
-                    ))
-                    total_broad_tokens += ts.summary_tokens
-
+            token_budget = self.config.tag_context_max_tokens
+            selected_broad, total_broad_tokens = self._load_all_tag_summaries(token_budget)
+            if selected_broad:
                 elapsed = time.monotonic() - start_time
+                tag_summaries = self.store.get_all_tag_summaries()
                 return RetrievalResult(
                     tags_matched=[ts.tag for ts in tag_summaries],
                     summaries=selected_broad,
@@ -228,6 +249,30 @@ class ContextRetriever:
         skipped_tags = [t for t in tag_result.tags if t in active_tags]
 
         if not query_tags:
+            # Summary floor: post-compaction, no query tags — inject all tag summaries
+            if post_compaction:
+                token_budget = self.config.tag_context_max_tokens
+                floor_summaries, floor_tokens = self._load_all_tag_summaries(token_budget)
+                if floor_summaries:
+                    elapsed = time.monotonic() - start_time
+                    return RetrievalResult(
+                        tags_matched=[],
+                        summaries=floor_summaries,
+                        total_tokens=floor_tokens,
+                        broad=tag_result.broad,
+                        retrieval_metadata={
+                            "elapsed_ms": round(elapsed * 1000, 1),
+                            "tags_from_message": tag_result.tags,
+                            "tags_skipped_active": skipped_tags,
+                            "summary_floor": True,
+                        },
+                        cost_report=RetrievalCostReport(
+                            tags_queried=[],
+                            tags_skipped=skipped_tags,
+                            strategy_active="summary_floor",
+                        ),
+                    )
+
             elapsed = time.monotonic() - start_time
             return RetrievalResult(
                 tags_matched=[],
@@ -327,6 +372,12 @@ class ContextRetriever:
                     "FTS fallback: tag overlap empty, text search found %d results",
                     len(selected),
                 )
+
+        # Summary floor: post-compaction, no results — inject all tag summaries
+        if not selected and post_compaction:
+            selected, total_tokens = self._load_all_tag_summaries(token_budget)
+            if selected:
+                retrieval_metadata["summary_floor"] = True
 
         # Deep retrieval: fetch full segments when we have matches
         full_detail: list[StoredSegment] = []

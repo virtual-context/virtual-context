@@ -79,6 +79,8 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
         max_tokens=raw.get("max_tokens", 1000),
         prompt_mode=raw.get("prompt_mode", "detailed"),
         keyword_fallback=keyword_fallback,
+        context_lookback_pairs=raw.get("context_lookback_pairs", 5),
+        context_bleed_threshold=raw.get("context_bleed_threshold", 0.1),
         disable_thinking=raw.get("disable_thinking", False),
         broad_heuristic_enabled=raw.get("broad_heuristic_enabled", True),
         temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", True),

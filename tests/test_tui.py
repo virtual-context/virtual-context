@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = [pytest.mark.slow]
+
 from conftest import FakeChatProvider
 from virtual_context.tui.app import VChatApp
 from virtual_context.tui.widgets.budget_bar import BudgetBar
@@ -515,6 +517,7 @@ def test_turn_list_selection_tracking():
     assert tl._selected == 11
 
 
+@pytest.mark.regression("BUG-002")
 @pytest.mark.asyncio
 async def test_tag_panel_updates_after_turn_complete():
     """BUG-002: Tag panel must update after on_turn_complete, not just inbound.

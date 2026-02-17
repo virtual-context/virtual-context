@@ -70,6 +70,7 @@ class ProxyState:
         self._pending_complete: Future | None = None
         self._ingested_sessions: set[str] = set()
         self._ingestion_lock = threading.Lock()
+        self._compaction_lock = threading.Lock()
 
     def wait_for_complete(self) -> None:
         """Block until the pending on_turn_complete finishes."""
@@ -716,10 +717,26 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
 
         api_format = _detect_api_format(body)
         user_message = _extract_user_message(body)
+        is_streaming = body.get("stream", False)
+
+        import datetime as _dt
+        _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        _msg_count = len(body.get("messages", []))
+        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming}")
 
         if not user_message:
-            # Can't extract user message — forward unmodified
-            return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
+            # Tool-result or non-text turn — skip VC enrichment but
+            # preserve streaming so the client SDK doesn't break.
+            if is_streaming:
+                return await _handle_streaming(
+                    client, url, fwd_headers, body, api_format, state,
+                    metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                )
+            else:
+                return await _handle_non_streaming(
+                    client, url, fwd_headers, body, api_format, state,
+                    metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                )
 
         # Enrich with virtual-context
         prepend_text = ""
@@ -758,6 +775,7 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 logger.error("Engine error (forwarding unmodified): %s", e)
 
         # Filter irrelevant history turns from the request body
+        _pre_filter_body = body  # preserve for request capture
         turns_dropped = 0
         _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
         if _real_tags and state:
@@ -860,9 +878,9 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             f"vc={overhead_ms}ms | {user_message[:60]}"
         )
 
-        # Capture raw request body for dashboard inspection
+        # Capture pre-filter request body for dashboard inspection
         metrics.capture_request(
-            turn, body, api_format,
+            turn, _pre_filter_body, api_format,
             inbound_tags=assembled.matched_tags if assembled else [],
         )
 

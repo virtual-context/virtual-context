@@ -53,7 +53,8 @@ class EmbeddingTagGenerator:
         return embed
 
     def generate_tags(
-        self, text: str, existing_tags: list[str] | None = None
+        self, text: str, existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
     ) -> TagResult:
         """Generate tags by embedding text and comparing against tag embeddings."""
         # Ensure we have tag embeddings for existing tags

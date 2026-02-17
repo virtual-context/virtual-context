@@ -14,6 +14,7 @@ from virtual_context.types import (
     StrategyConfig,
     TagGeneratorConfig,
     TagResult,
+    TagSummary,
 )
 
 from conftest import MockTagGenerator
@@ -230,6 +231,7 @@ class TestInboundMatching:
             "tell me about arduino circuits": [0.95, 0.05, 0.0, 0.0, 0.0],  # very close to electronics
             "i want to talk about planes": [0.05, 0.95, 0.0, 0.0, 0.0],  # very close to planes
             "tell me about jjiujitu": [0.05, 0.0, 0.85, 0.0, 0.1],  # close to jiu-jitsu (typo!)
+            "tell me about cars please": [0.0, 0.05, 0.0, 0.9, 0.05],  # close to cars
             "summarize everything we discussed": [0.2, 0.2, 0.2, 0.2, 0.2],  # broad
             "what did we first talk about": [0.2, 0.2, 0.2, 0.2, 0.2],  # temporal
         }
@@ -337,6 +339,7 @@ class TestInboundMatching:
         assert "jiu-jitsu" in tags
         store.close()
 
+    @pytest.mark.regression("BUG-007")
     def test_broad_heuristic_applied(self, tmp_sqlite_db):
         """Embedding tagger doesn't detect broad — heuristic should catch it."""
         retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
@@ -345,6 +348,7 @@ class TestInboundMatching:
         assert result.broad is True
         store.close()
 
+    @pytest.mark.regression("BUG-008")
     def test_temporal_heuristic_applied(self, tmp_sqlite_db):
         """Embedding tagger doesn't detect temporal — heuristic should catch it."""
         retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
@@ -373,4 +377,167 @@ class TestInboundMatching:
         tags = result.retrieval_metadata.get("tags_from_message", [])
 
         assert tags == ["_general"]
+        store.close()
+
+    @pytest.mark.regression("BUG-009")
+    def test_early_tag_visible_after_many_turns(self, tmp_sqlite_db):
+        """Tags from early turns must remain in inbound vocabulary after >4 later turns.
+
+        BUG-009: Retriever passed get_active_tags(lookback=4) as the inbound
+        tagger vocabulary, so tags older than 4 turns were invisible. After
+        history ingestion of 47 turns, the embedding tagger could only match
+        against the last 4 turns' tags — everything else returned _general.
+        """
+        from virtual_context.core.embedding_tag_generator import EmbeddingTagGenerator
+        from virtual_context.core.turn_tag_index import TurnTagIndex
+        from virtual_context.types import TurnTagEntry
+
+        main_tagger = MockTagGenerator(default_tag="test", default_tags=["test"])
+        tag_gen_config = TagGeneratorConfig(max_tags=5, min_tags=1)
+        inbound = EmbeddingTagGenerator(
+            config=tag_gen_config,
+            similarity_threshold=0.3,
+            embed_fn=self._make_embed_fn(),
+        )
+
+        store = SQLiteStore(db_path=tmp_sqlite_db)
+        turn_tag_index = TurnTagIndex()
+
+        # "cars" at turn 0 — the target early tag
+        turn_tag_index.append(TurnTagEntry(
+            turn_number=0, message_hash="h0",
+            tags=["cars", "design"], primary_tag="cars",
+        ))
+        # 10 filler turns with unrelated tags — pushes "cars" well outside lookback=4
+        for i in range(1, 11):
+            turn_tag_index.append(TurnTagEntry(
+                turn_number=i, message_hash=f"h{i}",
+                tags=["planes", "engineering"], primary_tag="planes",
+            ))
+
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            skip_active_tags=False,
+            strategy_configs={"default": StrategyConfig(min_overlap=1, max_results=10)},
+        )
+        retriever = ContextRetriever(
+            tag_generator=main_tagger,
+            store=store,
+            config=config,
+            turn_tag_index=turn_tag_index,
+            inbound_tagger=inbound,
+        )
+
+        # "cars" is 10 turns back — must still be in vocabulary
+        result = retriever.retrieve("tell me about cars please")
+        tags = result.retrieval_metadata.get("tags_from_message", [])
+
+        assert "cars" in tags, (
+            f"Expected 'cars' in vocabulary but got {tags}. "
+            "Inbound tagger must see ALL TurnTagIndex tags, not just recent lookback."
+        )
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Summary Floor (post-compaction fallback)
+# ---------------------------------------------------------------------------
+
+class TestSummaryFloor:
+    """Post-compaction summary floor: inject tag summaries when retrieval is empty."""
+
+    def _make_retriever_with_tag_summaries(self, db_path):
+        """Build a retriever whose tagger always returns _general, with tag summaries in the store."""
+        from virtual_context.types import TagSummary
+
+        tag_gen = MockTagGenerator(default_tag="_general", default_tags=["_general"])
+        tag_gen.set_override("_general", TagResult(tags=["_general"], primary="_general", source="fallback"))
+
+        store = SQLiteStore(db_path=db_path)
+
+        # Populate tag summaries (what compaction would produce)
+        now = datetime.now(timezone.utc)
+        store.save_tag_summary(TagSummary(
+            tag="authentication",
+            summary="JWT setup with RS256 signing and 1-hour expiry. Refresh token rotation.",
+            summary_tokens=25,
+            source_turn_numbers=[0, 1],
+            created_at=now,
+            updated_at=now,
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="cooking",
+            summary="Aglio e olio recipe. Homemade tomato sauce with San Marzano tomatoes.",
+            summary_tokens=20,
+            source_turn_numbers=[2, 3],
+            created_at=now,
+            updated_at=now,
+        ))
+
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            strategy_configs={"default": StrategyConfig()},
+        )
+        retriever = ContextRetriever(
+            tag_generator=tag_gen,
+            store=store,
+            config=config,
+        )
+        return retriever, store
+
+    def test_floor_activates_post_compaction(self, tmp_sqlite_db):
+        """post_compaction=True + empty query tags → tag summaries returned."""
+        retriever, store = self._make_retriever_with_tag_summaries(tmp_sqlite_db)
+
+        result = retriever.retrieve("go back to that earlier thing", post_compaction=True)
+
+        assert len(result.summaries) == 2
+        assert result.total_tokens > 0
+        assert result.retrieval_metadata.get("summary_floor") is True
+        store.close()
+
+    def test_floor_inactive_pre_compaction(self, tmp_sqlite_db):
+        """post_compaction=False + empty query tags → no summaries (existing behavior)."""
+        retriever, store = self._make_retriever_with_tag_summaries(tmp_sqlite_db)
+
+        result = retriever.retrieve("go back to that earlier thing", post_compaction=False)
+
+        assert len(result.summaries) == 0
+        assert result.total_tokens == 0
+        assert result.retrieval_metadata.get("summary_floor") is None
+        store.close()
+
+    def test_floor_skipped_when_normal_retrieval_succeeds(self, tmp_sqlite_db):
+        """Specific tags + post_compaction=True → normal results, no floor."""
+        tag_gen = MockTagGenerator(default_tag="legal", default_tags=["legal"])
+        store = SQLiteStore(db_path=tmp_sqlite_db)
+
+        now = datetime.now(timezone.utc)
+        store.store_segment(StoredSegment(
+            ref="legal-1",
+            primary_tag="legal",
+            tags=["legal"],
+            summary="Court filing deadline discussion.",
+            summary_tokens=15,
+            full_tokens=80,
+            metadata=SegmentMetadata(entities=[]),
+            created_at=now,
+            start_timestamp=now,
+            end_timestamp=now,
+        ))
+
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            strategy_configs={"default": StrategyConfig()},
+        )
+        retriever = ContextRetriever(
+            tag_generator=tag_gen,
+            store=store,
+            config=config,
+        )
+
+        result = retriever.retrieve("Tell me about the court case", post_compaction=True)
+
+        assert len(result.summaries) > 0
+        assert result.retrieval_metadata.get("summary_floor") is None
         store.close()

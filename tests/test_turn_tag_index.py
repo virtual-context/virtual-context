@@ -70,6 +70,7 @@ class TestTurnTagIndex:
                 covered_turns.add(entry.turn_number)
         assert covered_turns == {0, 1, 2}
 
+    @pytest.mark.regression("PROXY-002")
     def test_compute_cover_set_excludes_general(self):
         index = TurnTagIndex()
         index.append(TurnTagEntry(turn_number=0, message_hash="a", tags=["_general", "database"], primary_tag="database"))
@@ -93,6 +94,7 @@ class TestTurnTagIndex:
         index = TurnTagIndex()
         assert index.compute_cover_set() == []
 
+    @pytest.mark.regression("PROXY-002")
     def test_compute_cover_set_only_general(self):
         """When all turns have only _general, cover should be empty."""
         index = TurnTagIndex()

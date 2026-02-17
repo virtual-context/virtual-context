@@ -23,9 +23,14 @@ You are a semantic tagger for conversation segments. Given a piece of conversati
 generate {min_tags}-{max_tags} short, lowercase tags that capture the key topics.
 
 Rules:
-- Prefer single-word atomic tags ("database", "teeth", "dating", "fitness").
-  Use a hyphenated two-word tag only when the single word is genuinely ambiguous
-  (e.g. "machine-learning" because "machine" alone is unclear).
+- Prefer specific tags over generic ones. A good tag should narrow down WHICH
+  conversation this came from, not just what broad category it falls into.
+  Single-word tags are fine when already specific ("database", "teeth", "fitness").
+  But when a single word is too broad and could match many unrelated conversations,
+  qualify it with a hyphenated compound: "reservation-timing" not "timing",
+  "cycle-tracking" not "tracking", "transit-schedule" not "schedule".
+  Ask yourself: "Would this tag match conversations about completely different topics?"
+  If yes, make it more specific.
 - When the text genuinely discusses a topic already covered by an existing tag, reuse
   that tag instead of inventing a synonym (e.g. use "teeth" not "dental"
   if "teeth" already exists and the text is about teeth).
@@ -79,9 +84,10 @@ Rules:
 - Messages may contain channel metadata (e.g. "[Telegram NAME ...]", "[WhatsApp ...]",
   "[Discord ...]", "[message_id: NNN]", timestamps, sender info). Ignore all metadata
   formatting — tag only the actual conversational content within the message.
-- Do NOT generate tags about the communication medium or message format itself
-  (e.g. "messaging", "threading", "chat", "texting", "communication", "conversation").
-  These describe HOW the conversation happens, not WHAT it is about. Tag only the
+- Do NOT generate tags about the communication medium, channel, group, or server
+  (e.g. "messaging", "threading", "chat", "telegram-group",
+  "discord-server", "slack-channel", "texting", "communication", "conversation").
+  These describe WHERE or HOW the conversation happens, not WHAT it is about. Tag only the
   substantive topics being discussed.
 - For very short or trivial messages (greetings, reactions, single-word responses,
   emoji), return only the tags that genuinely apply — it is acceptable to return
@@ -123,7 +129,8 @@ TAG_GENERATOR_PROMPTS = {
 @runtime_checkable
 class TagGenerator(Protocol):
     def generate_tags(
-        self, text: str, existing_tags: list[str] | None = None
+        self, text: str, existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
     ) -> TagResult: ...
 
 
@@ -171,10 +178,11 @@ class LLMTagGenerator:
         self._temporal_patterns = _compile_broad_patterns(config.temporal_patterns)
 
     def generate_tags(
-        self, text: str, existing_tags: list[str] | None = None
+        self, text: str, existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
     ) -> TagResult:
         """Generate semantic tags for the given text."""
-        prompt = self._build_prompt(text, existing_tags)
+        prompt = self._build_prompt(text, existing_tags, context_turns=context_turns)
 
         prompt_template = TAG_GENERATOR_PROMPTS.get(
             self.config.prompt_mode, TAG_GENERATOR_PROMPT_DETAILED
@@ -215,7 +223,7 @@ class LLMTagGenerator:
 
         return result
 
-    def _build_prompt(self, text: str, existing_tags: list[str] | None = None) -> str:
+    def _build_prompt(self, text: str, existing_tags: list[str] | None = None, context_turns: list[str] | None = None) -> str:
         """Build the tagging prompt with vocabulary hint.
 
         Splits tags into recent session tags (highest reuse priority) and
@@ -245,6 +253,16 @@ class LLMTagGenerator:
             )
         if extra_store:
             parts.append(f"Other known tags: {', '.join(extra_store)}")
+
+        # Inject recent conversation context when provided
+        if context_turns:
+            parts.append("")
+            parts.append("Recent conversation context:")
+            for j in range(0, len(context_turns) - 1, 2):
+                parts.append(f"User: {context_turns[j]}")
+                if j + 1 < len(context_turns):
+                    parts.append(f"Assistant: {context_turns[j + 1]}")
+            parts.append("")
 
         parts.append(f"Tag this conversation (return {self.config.min_tags}-{self.config.max_tags} tags):")
         parts.append("")
@@ -382,7 +400,8 @@ class KeywordTagGenerator:
                     logger.warning(f"Invalid regex pattern for tag '{tag}': {pattern}")
 
     def generate_tags(
-        self, text: str, existing_tags: list[str] | None = None
+        self, text: str, existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
     ) -> TagResult:
         """Generate tags from keyword/pattern matching."""
         text_lower = text.lower()

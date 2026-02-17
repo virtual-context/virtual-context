@@ -317,6 +317,7 @@ class FakeChatProvider:
             yield word + " "
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_tui_workflow_payload_filtering():
     """Full TUI workflow: send multi-topic messages and verify
