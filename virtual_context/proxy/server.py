@@ -35,11 +35,13 @@ from .metrics import ProxyMetrics
 logger = logging.getLogger(__name__)
 
 _VC_PROMPT_MARKER = "[vc:prompt]\n"
+# MemOS preamble: starts with "# Role", ends with this delimiter line (zero-width spaces)
+_MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
 
 # OpenClaw envelope patterns — consistent across all channels
 _VC_USER_RE = re.compile(r"^\[vc:user\](.*?)\[/vc:user\]", re.DOTALL)
 _SYSTEM_EVENT_RE = re.compile(r"^(?:System:\s*\[[^\]]*\][^\n]*\n+)+")
-_CHANNEL_HEADER_RE = re.compile(r"^\[[A-Z][a-zA-Z]*\s[^\]]*\bid:\d+\b[^\]]*\]\s*")
+_CHANNEL_HEADER_RE = re.compile(r"^\[[A-Z][a-zA-Z]*\s[^\]]*\bid:-?\d+\b[^\]]*\]\s*")
 _MESSAGE_ID_RE = re.compile(r"\n?\[message_id:\s*\d+\]\s*$")
 
 _HOP_BY_HOP = frozenset({
@@ -296,6 +298,12 @@ def _strip_openclaw_envelope(text: str) -> str:
     # 1. Strip [vc:prompt] marker and any trailing whitespace
     if text.startswith(_VC_PROMPT_MARKER):
         text = text[len(_VC_PROMPT_MARKER):].lstrip()
+
+    # 1b. Strip MemOS preamble: "# Role ... user原始query：" → keep only content after delimiter
+    if text.startswith("# Role"):
+        idx = text.find(_MEMOS_QUERY_DELIM)
+        if idx != -1:
+            text = text[idx + len(_MEMOS_QUERY_DELIM):].lstrip()
 
     # 2. Handle [vc:user]...[/vc:user] — inner content is already clean
     m = _VC_USER_RE.match(text)

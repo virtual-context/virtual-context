@@ -29,7 +29,16 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 
 ## How It Works
 
-Two hooks into your LLM pipeline. That's it.
+Two hooks into your LLM pipeline. Pick whichever integration fits:
+
+**Option A — HTTP Proxy (zero code changes).** Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently — inbound tagging, retrieval, history filtering, response tagging, compaction. Works with any client that speaks OpenAI or Anthropic API format. Includes a [live dashboard](#live-dashboard) for real-time monitoring and tuning.
+
+```bash
+virtual-context proxy --upstream https://api.anthropic.com
+# Then change your client's base_url to http://127.0.0.1:5757
+```
+
+**Option B — Python SDK.** Two function calls wrap your existing LLM pipeline:
 
 ```python
 from virtual_context import VirtualContextEngine, Message
@@ -54,8 +63,6 @@ if report:
 
 Everything happens synchronously, in-process, in under a second with a local model. No external services, no background workers, no async complexity.
 
-Or skip the code entirely — the [HTTP proxy](#http-proxy) gives any LLM client virtual-context by changing one URL. No SDK integration, no code changes.
-
 ### The Full Pipeline
 
 ```
@@ -66,9 +73,9 @@ Strip client envelope (OpenClaw metadata, channel headers, plugin markers)
     │
     ▼
 Inbound tagging — identify what this message is about
-    │  ├─ Proxy mode: embedding cosine similarity against existing tag vocabulary
+    │  ├─ Embedding tagger (recommended): cosine similarity against existing tag vocabulary
     │  │   (closed-set, deterministic, can't hallucinate novel tags)
-    │  ├─ Direct mode: LLM / keyword tagger with vocabulary feedback
+    │  ├─ LLM / keyword tagger: alternative with vocabulary feedback
     │  ├─ Tag canonicalization: "db" → "database", alias detection via edit distance
     │  └─ Broad/temporal detection: regex + LLM flags for vague or time-referencing queries
     │
@@ -87,7 +94,7 @@ Assemble context within token budget
     │  └─ Tag sections: retrieved summaries ordered by tag priority
     │
     ▼
-Filter conversation history (proxy mode)
+Filter conversation history
     │  ├─ Drop turns whose tags don't overlap with inbound tags
     │  ├─ Preserve tool chains atomically (tool_use ↔ tool_result never separated)
     │  ├─ Protect recent turns (always kept regardless of tags)
@@ -390,29 +397,7 @@ virtual-context chat --replay vc-session.json
 pip install virtual-context[bridge]
 ```
 
-The fastest path to production. The proxy sits between any LLM client and an upstream provider, transparently enriching every request with virtual-context. The client just changes its `base_url` — no SDK integration, no code changes, no plugin required.
-
-```
-Client (any LLM app)       Proxy (localhost:5757)         Upstream (api.anthropic.com)
-     │                           │                                │
-     │  POST /v1/messages        │                                │
-     │  {messages: [...]}        │                                │
-     │ ─────────────────────────>│                                │
-     │                           │  1. Strip client envelope      │
-     │                           │  2. Inbound tag (embedding)    │
-     │                           │  3. Retrieve stored summaries  │
-     │                           │  4. Filter irrelevant history  │
-     │                           │  5. Inject <virtual-context>   │
-     │                           │  6. Forward enriched request   │
-     │                           │ ──────────────────────────────>│
-     │                           │                                │
-     │                           │<─── Stream SSE response ──────│
-     │<── Stream SSE response ───│                                │
-     │                           │  7. Capture assistant text     │
-     │                           │  8. Response tag (LLM)         │
-     │                           │  9. on_turn_complete           │
-     │                           │     (background thread)        │
-```
+The fastest path to production. The proxy sits between any LLM client and an upstream provider, running the full virtual-context pipeline on every request. The client just changes its `base_url` — no SDK integration, no code changes, no plugin required.
 
 Start the proxy:
 
@@ -446,19 +431,17 @@ curl http://127.0.0.1:5757/v1/messages \
   -d '{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-**History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each via the LLM to bootstrap the TurnTagIndex. The tag vocabulary is immediately available for inbound matching on subsequent requests — no cold-start period after the first turn.
+**History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period — the tag vocabulary is immediately available for inbound matching.
 
-**Tag-based history filtering.** Before forwarding to the upstream LLM, the proxy drops irrelevant history turns from the payload based on inbound tag overlap with the TurnTagIndex. A 90-message conversation about 5 different topics gets trimmed to only the turns relevant to the current question — reducing token usage and noise. Tool chains (`tool_use`/`tool_result`) are preserved atomically: the filter scans forward and backward to ensure every tool invocation stays paired with its result. Broad and temporal queries skip filtering entirely.
+**Format-agnostic.** Auto-detects OpenAI vs Anthropic request format and injects context accordingly — into `system` for Anthropic, into `messages[0]` for OpenAI.
 
-**Format-agnostic.** The proxy auto-detects OpenAI vs Anthropic request format (by checking for a top-level `system` field or `claude` model prefix) and injects context accordingly — into `system` for Anthropic, into `messages[0]` for OpenAI.
+**Streaming with zero added latency.** SSE streams are forwarded byte-for-byte as they arrive from upstream. Text deltas are accumulated in the background for response tagging — the user sees no delay.
 
-**Streaming with zero added latency.** SSE streams are forwarded to the client byte-for-byte as they arrive from upstream. Text deltas are accumulated in the background for `on_turn_complete` — the user sees no delay.
+**Error-resilient.** If the engine fails (config error, tagger timeout, etc.), the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls.
 
-**Error-resilient.** If the virtual-context engine fails (config error, tagger timeout, etc.), the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls — it's always transparent.
+**Envelope stripping.** Strips client metadata (channel headers, message footers, event lines, plugin markers) so the tagger sees clean conversational content. Handles consecutive user messages from Telegram-style batching gracefully.
 
-**OpenClaw-aware.** Strips channel metadata (`[Telegram ... id:NNN]` headers, `[message_id: NNN]` footers, `System: [TIMESTAMP]` event lines, `[vc:prompt]` plugin markers) so the tagger sees clean conversational content. Handles consecutive user messages from Telegram batching gracefully.
-
-**Terminal logging.** Every proxy event is logged to stdout in real-time — no need to export dashboard data to debug what happened:
+**Terminal logging.** Every event is logged to stdout in real-time:
 
 ```
 [INGEST] 43 turns in 45123ms (session=a1b2c3d4e5f6)
@@ -466,8 +449,6 @@ curl http://127.0.0.1:5757/v1/messages \
 [T44] RESPONSE stream=True llm=3028ms total=3117ms chars=117
 [T44] COMPLETE 1204ms tags=[css, web-development, html] primary=css
 ```
-
-**Single-session memory.** All requests through the proxy contribute to the same conversation history and store. The proxy remembers everything from prior requests — cross-session memory is the feature, not a bug.
 
 #### Live Dashboard
 
@@ -551,7 +532,7 @@ Retry logic with exponential backoff on both.
 
 **Sync-first.** Zero async/await in the engine. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model. The proxy uses FastAPI async for HTTP handling but calls the sync engine via `asyncio.to_thread`.
 
-**Two-tagger architecture.** Inbound tagging (before LLM responds) and response tagging (after) use different models optimized for different tasks. Inbound uses embedding cosine similarity — closed-set, deterministic, can't hallucinate novel tags. Response uses an LLM — creative, vocabulary-building, generates related tags. This separation was driven by a production bug where the LLM inbound tagger hallucinated `planes` for an electronics message, pulling irrelevant history via abstract cross-cutting tags like `engineering` and `craftsmanship`.
+**Two-tagger architecture.** Inbound tagging (before the LLM responds) and response tagging (after) use different models optimized for different tasks. The recommended configuration uses embedding cosine similarity for inbound — closed-set, deterministic, can't hallucinate novel tags — and an LLM for response — creative, vocabulary-building, generates related tags. This separation was driven by a production bug where the LLM inbound tagger hallucinated `planes` for an electronics message, pulling irrelevant history via abstract cross-cutting tags like `engineering` and `craftsmanship`.
 
 **Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
 
@@ -561,7 +542,7 @@ Retry logic with exponential backoff on both.
 
 **Tag preservation.** During compaction, the LLM can add refined tags but never remove original ones. A segment tagged `[ux, recipes, frontend]` stays tagged with all three even after summarization, ensuring cross-topic retrieval always works.
 
-**Tool chain integrity.** The proxy's history filter preserves API-required message dependencies atomically. Every `tool_use` block in an assistant message is kept with its corresponding `tool_result`, and vice versa. Forward and backward scanning ensures multi-step tool chains are never broken, even when surrounding turns are filtered out.
+**Tool chain integrity.** The history filter preserves API-required message dependencies atomically. Every `tool_use` block in an assistant message is kept with its corresponding `tool_result`, and vice versa. Forward and backward scanning ensures multi-step tool chains are never broken, even when surrounding turns are filtered out.
 
 ## Stress-Tested
 
