@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import EngineStateSnapshot, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import DepthLevel, EngineStateSnapshot, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -82,6 +82,15 @@ class ContextStore(ABC):
     @abstractmethod
     def get_all_tag_summaries(self) -> list[TagSummary]:
         """Retrieve all tag summaries, ordered by tag name."""
+
+    @abstractmethod
+    def get_segments_by_tags(
+        self,
+        tags: list[str],
+        min_overlap: int = 1,
+        limit: int = 20,
+    ) -> list[StoredSegment]:
+        """Retrieve full segments (including full_text) matching tags by overlap."""
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         """Persist engine state (TurnTagIndex + watermark). Upsert by session_id."""

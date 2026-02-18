@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Callable, Literal, Protocol, runtime_checkable
 
 
@@ -137,6 +138,7 @@ class EngineStateSnapshot:
     turn_count: int  # len(conversation_history) // 2
     saved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
+    working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
 
 
 @dataclass
@@ -356,6 +358,36 @@ class SessionCostSummary:
 
 
 # ---------------------------------------------------------------------------
+# Paging (Virtual Memory Depth Control)
+# ---------------------------------------------------------------------------
+
+class DepthLevel(str, Enum):
+    """Depth at which a topic's content is injected into the context window."""
+    NONE = "none"           # listed in hint only, nothing injected
+    SUMMARY = "summary"     # tag summary (~200t per tag) — default
+    SEGMENTS = "segments"   # individual segment summaries (~2,000t per tag)
+    FULL = "full"           # StoredSegment.full_text (~8,000t+ per tag)
+
+
+@dataclass
+class WorkingSetEntry:
+    """Per-tag depth state in the paging working set."""
+    tag: str
+    depth: DepthLevel = DepthLevel.SUMMARY
+    tokens: int = 0             # current token cost at this depth
+    last_accessed_turn: int = 0 # for LRU eviction
+
+
+@dataclass
+class PagingConfig:
+    """Configuration for virtual memory paging."""
+    enabled: bool = False
+    mode: str = "auto"          # "auto" | "supervised" | "autonomous"
+    auto_promote: bool = True   # auto-expand on strong retrieval match
+    auto_evict: bool = True     # auto-collapse coldest when over budget
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
@@ -483,6 +515,7 @@ class VirtualContextConfig:
     summarization: SummarizationConfig = field(default_factory=SummarizationConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     cost_tracking: CostTrackingConfig = field(default_factory=CostTrackingConfig)
+    paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..core.store import ContextStore
-from ..types import EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry
+from ..types import DepthLevel, EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -531,6 +531,34 @@ class SQLiteStore(ContextStore):
             for row in rows
         ]
 
+    def get_segments_by_tags(
+        self,
+        tags: list[str],
+        min_overlap: int = 1,
+        limit: int = 20,
+    ) -> list[StoredSegment]:
+        if not tags:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" * len(tags))
+        query = f"""
+            SELECT s.*, COUNT(st.tag) as overlap_count
+            FROM segments s
+            JOIN segment_tags st ON s.ref = st.segment_ref
+            WHERE st.tag IN ({placeholders})
+            GROUP BY s.ref
+            HAVING overlap_count >= ?
+            ORDER BY overlap_count DESC, s.created_at DESC
+            LIMIT ?
+        """
+        params: list = list(tags) + [min_overlap, limit]
+        rows = conn.execute(query, params).fetchall()
+        results = []
+        for row in rows:
+            seg_tags = self._get_tags_for_ref(row["ref"])
+            results.append(_row_to_segment(row, seg_tags))
+        return results
+
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         conn = self._get_conn()
         entries_json = json.dumps([
@@ -543,10 +571,19 @@ class SQLiteStore(ContextStore):
             }
             for e in state.turn_tag_entries
         ])
-        # Include split_processed_tags in the entries JSON blob
+        # Include split_processed_tags and working_set in the entries JSON blob
         state_blob = json.dumps({
             "turn_tag_entries": json.loads(entries_json),
             "split_processed_tags": state.split_processed_tags,
+            "working_set": [
+                {
+                    "tag": ws.tag,
+                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                    "tokens": ws.tokens,
+                    "last_accessed_turn": ws.last_accessed_turn,
+                }
+                for ws in state.working_set
+            ],
         })
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
@@ -574,9 +611,11 @@ class SQLiteStore(ContextStore):
         if isinstance(raw, dict):
             entries_raw = raw.get("turn_tag_entries", [])
             split_processed_tags = raw.get("split_processed_tags", [])
+            working_set_raw = raw.get("working_set", [])
         else:
             entries_raw = raw
             split_processed_tags = []
+            working_set_raw = []
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -587,6 +626,15 @@ class SQLiteStore(ContextStore):
             )
             for e in entries_raw
         ]
+        working_set = [
+            WorkingSetEntry(
+                tag=ws["tag"],
+                depth=DepthLevel(ws["depth"]),
+                tokens=ws.get("tokens", 0),
+                last_accessed_turn=ws.get("last_accessed_turn", 0),
+            )
+            for ws in working_set_raw
+        ]
         return EngineStateSnapshot(
             session_id=row["session_id"],
             compacted_through=row["compacted_through"],
@@ -594,6 +642,7 @@ class SQLiteStore(ContextStore):
             turn_count=row["turn_count"],
             saved_at=_str_to_dt(row["saved_at"]),
             split_processed_tags=split_processed_tags,
+            working_set=working_set,
         )
 
     def close(self) -> None:

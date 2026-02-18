@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry
+from ..types import DepthLevel, EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -459,6 +459,29 @@ class FilesystemStore(ContextStore):
                 results.append(ts)
         return results
 
+    def get_segments_by_tags(
+        self,
+        tags: list[str],
+        min_overlap: int = 1,
+        limit: int = 20,
+    ) -> list[StoredSegment]:
+        if not tags:
+            return []
+        tag_set = set(tags)
+        scored: list[tuple[int, str]] = []
+        for ref, entry in self._index.items():
+            entry_tags = set(entry.get("tags", []))
+            overlap = len(tag_set & entry_tags)
+            if overlap >= min_overlap:
+                scored.append((overlap, ref))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results: list[StoredSegment] = []
+        for _, ref in scored[:limit]:
+            seg = self.get_segment(ref)
+            if seg:
+                results.append(seg)
+        return results
+
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         state_dir = self.root / "_engine_state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -479,6 +502,15 @@ class FilesystemStore(ContextStore):
                 for e in state.turn_tag_entries
             ],
             "split_processed_tags": state.split_processed_tags,
+            "working_set": [
+                {
+                    "tag": ws.tag,
+                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                    "tokens": ws.tokens,
+                    "last_accessed_turn": ws.last_accessed_turn,
+                }
+                for ws in state.working_set
+            ],
         }
         path.write_text(json.dumps(data, indent=2))
 
@@ -500,6 +532,15 @@ class FilesystemStore(ContextStore):
             )
             for e in data.get("turn_tag_entries", [])
         ]
+        working_set = [
+            WorkingSetEntry(
+                tag=ws["tag"],
+                depth=DepthLevel(ws["depth"]),
+                tokens=ws.get("tokens", 0),
+                last_accessed_turn=ws.get("last_accessed_turn", 0),
+            )
+            for ws in data.get("working_set", [])
+        ]
         return EngineStateSnapshot(
             session_id=data["session_id"],
             compacted_through=data.get("compacted_through", 0),
@@ -507,4 +548,5 @@ class FilesystemStore(ContextStore):
             turn_count=data.get("turn_count", 0),
             saved_at=_str_to_dt(data["saved_at"]) if "saved_at" in data else datetime.now(timezone.utc),
             split_processed_tags=data.get("split_processed_tags", []),
+            working_set=working_set,
         )
