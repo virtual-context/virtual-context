@@ -15,6 +15,7 @@ from .types import (
     CostTrackingConfig,
     KeywordTagConfig,
     MonitorConfig,
+    PagingConfig,
     ProxyConfig,
     RetrieverConfig,
     SegmenterConfig,
@@ -219,6 +220,15 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         request_log_max_files=proxy_raw.get("request_log_max_files", 50),
     )
 
+    # Paging settings
+    paging_raw = raw.get("paging", {})
+    paging_config = PagingConfig(
+        enabled=paging_raw.get("enabled", False),
+        mode=paging_raw.get("mode", "auto"),
+        auto_promote=paging_raw.get("auto_promote", True),
+        auto_evict=paging_raw.get("auto_evict", True),
+    )
+
     return VirtualContextConfig(
         version=raw.get("version", "0.2"),
         storage_root=storage_root,
@@ -234,6 +244,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         summarization=summarization,
         storage=storage_config,
         cost_tracking=cost_tracking,
+        paging=paging_config,
         proxy=proxy_config,
         providers=raw.get("providers", {}),
     )
@@ -290,6 +301,13 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append(
             f"storage.backend must be 'sqlite' or 'filesystem', "
             f"got '{config.storage.backend}'"
+        )
+
+    # Paging mode
+    if config.paging.mode not in ("auto", "supervised", "autonomous"):
+        errors.append(
+            f"paging.mode must be 'auto', 'supervised', or 'autonomous', "
+            f"got '{config.paging.mode}'"
         )
 
     # Check that summarization provider exists in providers

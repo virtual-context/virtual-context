@@ -9,10 +9,13 @@ from typing import Callable
 from ..types import (
     AssembledContext,
     AssemblerConfig,
+    DepthLevel,
     Message,
     RetrievalResult,
+    StoredSegment,
     StoredSummary,
     TagPromptRule,
+    WorkingSetEntry,
 )
 
 
@@ -42,8 +45,18 @@ class ContextAssembler:
         conversation_history: list[Message],
         token_budget: int,
         context_hint: str = "",
+        working_set: dict[str, WorkingSetEntry] | None = None,
+        full_segments: dict[str, list[StoredSegment]] | None = None,
     ) -> AssembledContext:
-        """Build final context within token budget."""
+        """Build final context within token budget.
+
+        When working_set is provided, tags are served at their working set depth:
+        - NONE: skip (hint only)
+        - SUMMARY: tag summary (current default)
+        - SEGMENTS: individual segment summaries
+        - FULL: StoredSegment.full_text
+        When working_set is None, all tags served as SUMMARY (backward compat).
+        """
         core_budget = self.config.core_context_max_tokens
         tag_budget = self.config.tag_context_max_tokens
 
@@ -63,6 +76,12 @@ class ContextAssembler:
         for s in retrieval_result.summaries:
             summaries_by_tag.setdefault(s.primary_tag, []).append(s)
 
+        # Also collect tags from full_segments that might not be in summaries
+        if full_segments:
+            for tag in full_segments:
+                if tag not in summaries_by_tag:
+                    summaries_by_tag[tag] = []
+
         # Sort tags by priority (higher priority first)
         sorted_tags = sorted(
             summaries_by_tag.keys(),
@@ -71,8 +90,25 @@ class ContextAssembler:
         )
 
         for tag in sorted_tags:
-            summaries = summaries_by_tag[tag]
-            section = self._format_tag_section(tag, summaries)
+            # Determine depth for this tag
+            depth = DepthLevel.SUMMARY
+            if working_set and tag in working_set:
+                depth = working_set[tag].depth
+
+            if depth == DepthLevel.NONE:
+                continue
+
+            if depth == DepthLevel.FULL and full_segments and tag in full_segments:
+                section = self._format_full_section(tag, full_segments[tag])
+            elif depth == DepthLevel.SEGMENTS and full_segments and tag in full_segments:
+                section = self._format_segments_section(tag, full_segments[tag])
+            else:
+                # SUMMARY depth or fallback
+                summaries = summaries_by_tag.get(tag, [])
+                if not summaries:
+                    continue
+                section = self._format_tag_section(tag, summaries)
+
             section_tokens = self.token_counter(section)
 
             if tag_tokens + section_tokens > tag_budget:
@@ -117,7 +153,7 @@ class ContextAssembler:
         )
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
-        """Format summaries for a tag as XML-tagged section."""
+        """Format summaries for a tag as XML-tagged section (SUMMARY depth)."""
         if not summaries:
             return ""
 
@@ -133,6 +169,41 @@ class ContextAssembler:
             f"{body}\n"
             f"</virtual-context>"
         )
+
+    def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
+        """Format individual segment summaries (SEGMENTS depth)."""
+        if not segments:
+            return ""
+
+        parts: list[str] = []
+        for seg in segments:
+            all_tags = sorted(seg.tags) if seg.tags else [tag]
+            tags_attr = ", ".join(all_tags)
+            parts.append(
+                f'<virtual-context tags="{tags_attr}" depth="segments" '
+                f'ref="{seg.ref}" created="{seg.created_at.isoformat()}">\n'
+                f"{seg.summary}\n"
+                f"</virtual-context>"
+            )
+        return "\n\n".join(parts)
+
+    def _format_full_section(self, tag: str, segments: list[StoredSegment]) -> str:
+        """Format full original text (FULL depth)."""
+        if not segments:
+            return ""
+
+        parts: list[str] = []
+        for seg in segments:
+            all_tags = sorted(seg.tags) if seg.tags else [tag]
+            tags_attr = ", ".join(all_tags)
+            text = seg.full_text if seg.full_text else seg.summary
+            parts.append(
+                f'<virtual-context tags="{tags_attr}" depth="full" '
+                f'ref="{seg.ref}" created="{seg.created_at.isoformat()}">\n'
+                f"{text}\n"
+                f"</virtual-context>"
+            )
+        return "\n\n".join(parts)
 
     def _trim_conversation(self, history: list[Message], budget: int) -> list[Message]:
         """Keep most recent messages that fit within budget."""

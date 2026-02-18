@@ -90,6 +90,44 @@ def compact_context(
 
 
 @mcp.tool()
+def expand_topic(tag: str, depth: str = "full") -> str:
+    """Expand a topic to see more detail from prior conversation.
+
+    When a tag summary doesn't have enough detail, expand it to see
+    individual segment summaries or the full original conversation text.
+
+    Args:
+        tag: The topic tag to expand (from the context-topics list).
+        depth: Target depth level: "segments" (individual summaries) or "full" (original text).
+
+    Returns:
+        JSON with expansion result including tokens added and any evicted topics.
+    """
+    engine = _get_engine()
+    result = engine.expand_topic(tag, depth)
+    return json.dumps(result)
+
+
+@mcp.tool()
+def collapse_topic(tag: str, depth: str = "summary") -> str:
+    """Collapse a topic back to a lighter representation to free context budget.
+
+    Use this to make room for expanding other topics, or when you no longer
+    need full detail on a topic.
+
+    Args:
+        tag: The topic tag to collapse.
+        depth: Target depth: "summary" (brief overview) or "none" (remove from context entirely).
+
+    Returns:
+        JSON with collapse result including tokens freed.
+    """
+    engine = _get_engine()
+    result = engine.collapse_topic(tag, depth)
+    return json.dumps(result)
+
+
+@mcp.tool()
 def domain_status() -> str:
     """Show statistics for all stored tags/domains.
 

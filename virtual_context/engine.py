@@ -24,6 +24,7 @@ from .types import (
     AssembledContext,
     CompactionReport,
     CompactionResult,
+    DepthLevel,
     EngineStateSnapshot,
     Message,
     RetrievalResult,
@@ -35,6 +36,7 @@ from .types import (
     TagSummary,
     TurnTagEntry,
     VirtualContextConfig,
+    WorkingSetEntry,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,7 @@ class VirtualContextEngine:
         self._embed_fn = _EMBED_NOT_LOADED  # lazy-loaded for context bleed gate
         self._split_processed_tags: set[str] = set()
         self._last_split_result: SplitResult | None = None
+        self._working_set: dict[str, "WorkingSetEntry"] = {}  # paging: tag → depth state
 
         # Restore persisted state if available
         self._load_persisted_state()
@@ -214,10 +217,13 @@ class VirtualContextEngine:
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
         self._split_processed_tags = set(saved.split_processed_tags)
+        # Restore paging working set (backward-compatible: old snapshots have empty list)
+        self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
         logger.info(
-            "Restored engine state: session=%s, compacted_through=%d, turns=%d, split_processed=%d",
+            "Restored engine state: session=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.session_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
+            len(self._working_set),
         )
 
     def _save_state(self, conversation_history: list[Message]) -> None:
@@ -229,6 +235,7 @@ class VirtualContextEngine:
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=len(conversation_history) // 2,
                 split_processed_tags=sorted(self._split_processed_tags),
+                working_set=list(self._working_set.values()),
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
@@ -301,6 +308,23 @@ class VirtualContextEngine:
         # Load core context
         core_context = self._assembler.load_core_context()
 
+        # Paging: load content at working set depth levels
+        ws_param = None
+        full_segments_param = None
+        if self.config.paging.enabled and self._working_set:
+            ws_param = self._working_set
+            # Load full segments for tags at SEGMENTS or FULL depth
+            full_segments_param = {}
+            for tag, entry in self._working_set.items():
+                if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
+                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+                    if segs:
+                        full_segments_param[tag] = segs
+                # Update last_accessed_turn for tags matched by current query
+                query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
+                if tag in query_tags:
+                    entry.last_accessed_turn = len(self._turn_tag_index.entries)
+
         # Assemble enriched context
         assembled = self._assembler.assemble(
             core_context=core_context,
@@ -308,6 +332,8 @@ class VirtualContextEngine:
             conversation_history=conversation_history,
             token_budget=self.config.context_window,
             context_hint=context_hint,
+            working_set=ws_param,
+            full_segments=full_segments_param,
         )
 
         # Expose the message's own tags for downstream use (e.g. history filtering).
@@ -777,11 +803,14 @@ class VirtualContextEngine:
         return list(self._turn_tag_index.get_active_tags(lookback=lookback))
 
     def _build_context_hint(self) -> str:
-        """Build a lightweight topic list for post-compaction prompts.
+        """Build a topic list for post-compaction prompts.
 
-        Returns an XML block listing stored topics with turn counts so the LLM
-        knows what prior context is available.  Returns empty string if
-        compaction hasn't occurred or the feature is disabled.
+        When paging is enabled, builds a richer hint with depth info and budget.
+        Mode determines detail level:
+        - supervised: topic list with depth, "call expand_topic for detail"
+        - autonomous: full budget dashboard with token costs
+
+        Returns empty string if compaction hasn't occurred or the feature is disabled.
         """
         if not self.config.assembler.context_hint_enabled:
             return ""
@@ -792,38 +821,110 @@ class VirtualContextEngine:
         if not tag_summaries:
             return ""
 
-        lines: list[str] = []
-        for ts in tag_summaries:
-            turn_count = len(ts.source_turn_numbers)
-            # First ~60 chars of summary as description
-            desc = ts.summary[:60].rstrip()
-            if len(ts.summary) > 60:
-                desc += "..."
-            lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
+        # Determine paging mode
+        paging_enabled = self.config.paging.enabled
+        paging_mode = self._resolve_paging_mode() if paging_enabled else None
 
-        body = "\n".join(lines)
-        hint = (
-            "<context-topics>\n"
-            "Prior conversation topics available for recall:\n"
-            f"{body}\n"
-            "</context-topics>"
-        )
+        lines: list[str] = []
+
+        if paging_enabled and paging_mode == "autonomous":
+            # Autonomous: full budget dashboard
+            budget = self.config.assembler.tag_context_max_tokens
+            used = sum(ws.tokens for ws in self._working_set.values())
+            for ts in tag_summaries:
+                ws = self._working_set.get(ts.tag)
+                depth = ws.depth.value if ws else "none"
+                current_t = ws.tokens if ws else 0
+                full_t = self._calculate_depth_tokens(ts.tag, DepthLevel.FULL)
+                last_turn = ws.last_accessed_turn if ws else 0
+                lines.append(
+                    f"- {ts.tag} (depth: {depth}, current: {current_t}t, "
+                    f"full: {full_t}t, last_turn: {last_turn})"
+                )
+            body = "\n".join(lines)
+            hint = (
+                f'<context-topics budget="{budget}" used="{used}" available="{budget - used}">\n'
+                f"{body}\n\n"
+                f"Tools: expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
+                f"</context-topics>"
+            )
+        elif paging_enabled and paging_mode == "supervised":
+            # Supervised: topic list with depth info
+            for ts in tag_summaries:
+                ws = self._working_set.get(ts.tag)
+                depth = ws.depth.value if ws else "none"
+                tokens = ws.tokens if ws else 0
+                desc = ts.summary[:60].rstrip()
+                if len(ts.summary) > 60:
+                    desc += "..."
+                lines.append(f"- {ts.tag} ({depth}, {tokens}t): {desc}")
+            body = "\n".join(lines)
+            hint = (
+                "<context-topics>\n"
+                "Prior conversation topics (call expand_topic to see full detail):\n"
+                f"{body}\n"
+                "</context-topics>"
+            )
+        else:
+            # Default (no paging): simple topic list
+            for ts in tag_summaries:
+                turn_count = len(ts.source_turn_numbers)
+                desc = ts.summary[:60].rstrip()
+                if len(ts.summary) > 60:
+                    desc += "..."
+                lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
+            body = "\n".join(lines)
+            hint = (
+                "<context-topics>\n"
+                "Prior conversation topics available for recall:\n"
+                f"{body}\n"
+                "</context-topics>"
+            )
 
         # Truncate to budget
         max_tokens = self.config.assembler.context_hint_max_tokens
         if self._token_counter(hint) > max_tokens:
-            # Trim lines from the end until within budget
             while lines and self._token_counter(hint) > max_tokens:
                 lines.pop()
                 body = "\n".join(lines)
-                hint = (
-                    "<context-topics>\n"
-                    "Prior conversation topics available for recall:\n"
-                    f"{body}\n"
-                    "</context-topics>"
-                )
+                if paging_enabled and paging_mode == "autonomous":
+                    budget = self.config.assembler.tag_context_max_tokens
+                    used = sum(ws.tokens for ws in self._working_set.values())
+                    hint = (
+                        f'<context-topics budget="{budget}" used="{used}" available="{budget - used}">\n'
+                        f"{body}\n\n"
+                        f"Tools: expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
+                        f"</context-topics>"
+                    )
+                elif paging_enabled and paging_mode == "supervised":
+                    hint = (
+                        "<context-topics>\n"
+                        "Prior conversation topics (call expand_topic to see full detail):\n"
+                        f"{body}\n"
+                        "</context-topics>"
+                    )
+                else:
+                    hint = (
+                        "<context-topics>\n"
+                        "Prior conversation topics available for recall:\n"
+                        f"{body}\n"
+                        "</context-topics>"
+                    )
 
         return hint
+
+    def _resolve_paging_mode(self, model_name: str = "") -> str:
+        """Resolve paging mode from config. 'auto' maps model name to mode."""
+        mode = self.config.paging.mode
+        if mode != "auto":
+            return mode
+        # Auto: map model families to delegation levels
+        model = model_name.lower()
+        autonomous_patterns = ["opus", "sonnet", "gpt-4", "gpt4", "claude-3.5"]
+        for pattern in autonomous_patterns:
+            if pattern in model:
+                return "autonomous"
+        return "supervised"  # safe default
 
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
         """Extract the most recent user+assistant pair."""
@@ -1192,6 +1293,172 @@ class VirtualContextEngine:
             token_budget=budget or self.config.context_window,
         )
         return assembled.prepend_text
+
+    # ------------------------------------------------------------------
+    # Paging API: expand / collapse / working set
+    # ------------------------------------------------------------------
+
+    def expand_topic(self, tag: str, depth: str = "full") -> dict:
+        """Expand a topic to deeper detail in the working set.
+
+        Returns dict with tag, depth, tokens_added, tokens_evicted, evicted_tags.
+        """
+        if not self.config.paging.enabled:
+            return {"error": "paging not enabled"}
+
+        try:
+            target_depth = DepthLevel(depth)
+        except ValueError:
+            return {"error": f"invalid depth: {depth}"}
+
+        if target_depth == DepthLevel.NONE:
+            return self.collapse_topic(tag, "none")
+
+        # Calculate token cost at target depth
+        tokens_at_depth = self._calculate_depth_tokens(tag, target_depth)
+        if tokens_at_depth == 0:
+            return {"error": f"no stored content for tag: {tag}"}
+
+        # Current working set total
+        current_total = sum(ws.tokens for ws in self._working_set.values())
+        current_tag_tokens = self._working_set[tag].tokens if tag in self._working_set else 0
+        delta = tokens_at_depth - current_tag_tokens
+        budget = self.config.assembler.tag_context_max_tokens
+
+        # Auto-evict if over budget
+        evicted_tags: list[str] = []
+        tokens_evicted = 0
+        if self.config.paging.auto_evict and current_total + delta > budget:
+            evicted_tags, tokens_evicted = self._auto_evict(
+                needed=current_total + delta - budget,
+                exclude_tag=tag,
+            )
+
+        # Check if expansion fits after eviction
+        new_total = current_total + delta - tokens_evicted
+        if new_total > budget:
+            return {
+                "error": "insufficient budget",
+                "tag": tag,
+                "needed": tokens_at_depth,
+                "available": budget - (current_total - current_tag_tokens - tokens_evicted),
+            }
+
+        # Update working set
+        turn = max((ws.last_accessed_turn for ws in self._working_set.values()), default=0)
+        self._working_set[tag] = WorkingSetEntry(
+            tag=tag,
+            depth=target_depth,
+            tokens=tokens_at_depth,
+            last_accessed_turn=turn + 1,
+        )
+
+        return {
+            "tag": tag,
+            "depth": target_depth.value,
+            "tokens_added": delta,
+            "tokens_evicted": tokens_evicted,
+            "evicted_tags": evicted_tags,
+        }
+
+    def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
+        """Collapse a topic to shallower detail. Returns freed tokens."""
+        if not self.config.paging.enabled:
+            return {"error": "paging not enabled"}
+
+        try:
+            target_depth = DepthLevel(depth)
+        except ValueError:
+            return {"error": f"invalid depth: {depth}"}
+
+        if tag not in self._working_set:
+            return {"tag": tag, "depth": target_depth.value, "tokens_freed": 0}
+
+        old_tokens = self._working_set[tag].tokens
+
+        if target_depth == DepthLevel.NONE:
+            del self._working_set[tag]
+            return {"tag": tag, "depth": "none", "tokens_freed": old_tokens}
+
+        new_tokens = self._calculate_depth_tokens(tag, target_depth)
+        self._working_set[tag].depth = target_depth
+        self._working_set[tag].tokens = new_tokens
+
+        return {
+            "tag": tag,
+            "depth": target_depth.value,
+            "tokens_freed": max(0, old_tokens - new_tokens),
+        }
+
+    def get_working_set_summary(self) -> dict:
+        """Return current working set with budget info."""
+        budget = self.config.assembler.tag_context_max_tokens
+        used = sum(ws.tokens for ws in self._working_set.values())
+        entries = [
+            {
+                "tag": ws.tag,
+                "depth": ws.depth.value,
+                "tokens": ws.tokens,
+                "last_accessed_turn": ws.last_accessed_turn,
+            }
+            for ws in sorted(self._working_set.values(), key=lambda w: w.last_accessed_turn, reverse=True)
+        ]
+        return {
+            "budget": budget,
+            "used": used,
+            "available": budget - used,
+            "entries": entries,
+        }
+
+    def _calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
+        """Calculate token cost for a tag at a given depth level."""
+        if depth == DepthLevel.NONE:
+            return 0
+
+        if depth == DepthLevel.SUMMARY:
+            ts = self._store.get_tag_summary(tag)
+            return ts.summary_tokens if ts else 0
+
+        # SEGMENTS or FULL: need stored segments
+        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+        if not segments:
+            return 0
+
+        if depth == DepthLevel.SEGMENTS:
+            return sum(s.summary_tokens for s in segments)
+        else:  # FULL
+            return sum(s.full_tokens or self._token_counter(s.full_text) for s in segments)
+
+    def _auto_evict(self, needed: int, exclude_tag: str = "") -> tuple[list[str], int]:
+        """Auto-evict coldest topics to free `needed` tokens.
+
+        Returns (evicted_tag_names, total_tokens_freed).
+        """
+        # Sort by last_accessed_turn ascending (coldest first)
+        candidates = sorted(
+            ((tag, ws) for tag, ws in self._working_set.items() if tag != exclude_tag),
+            key=lambda x: x[1].last_accessed_turn,
+        )
+
+        evicted: list[str] = []
+        freed = 0
+        for tag, ws in candidates:
+            if freed >= needed:
+                break
+            # Collapse to SUMMARY (not NONE) to keep minimum context
+            summary_tokens = self._calculate_depth_tokens(tag, DepthLevel.SUMMARY)
+            delta = ws.tokens - summary_tokens
+            if delta <= 0:
+                # Already at summary or less, remove entirely
+                freed += ws.tokens
+                del self._working_set[tag]
+            else:
+                freed += delta
+                self._working_set[tag].depth = DepthLevel.SUMMARY
+                self._working_set[tag].tokens = summary_tokens
+            evicted.append(tag)
+
+        return evicted, freed
 
     def get_cost_report(self) -> SessionCostSummary:
         """Return current session cost summary."""
