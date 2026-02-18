@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.png" alt="virtual-context" width="100%">
+</p>
+
 # virtual-context
 
 **Your LLM never forgets. Even in a 500-turn conversation.**

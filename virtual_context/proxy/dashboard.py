@@ -9,13 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from ..tui.state import load_replay_prompts
 from ..types import Message, StrategyConfig
@@ -90,9 +91,26 @@ def register_dashboard_routes(
 ) -> None:
     """Register ``/dashboard`` and ``/dashboard/events`` routes."""
 
+    _static_dir = Path(__file__).parent / "static"
+
     @app.get("/dashboard")
     async def dashboard_page():
         return HTMLResponse(get_dashboard_html())
+
+    @app.get("/dashboard/static/{filename}")
+    async def dashboard_static(filename: str):
+        filepath = _static_dir / filename
+        if not filepath.is_file() or ".." in filename:
+            return Response(status_code=404)
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return Response(content=filepath.read_bytes(), media_type=media_type)
+
+    @app.get("/favicon.ico")
+    async def favicon_ico():
+        filepath = _static_dir / "favicon.ico"
+        if not filepath.is_file():
+            return Response(status_code=404)
+        return Response(content=filepath.read_bytes(), media_type="image/x-icon")
 
     @app.get("/dashboard/events")
     async def dashboard_events(request: Request):
@@ -843,6 +861,13 @@ _DASHBOARD_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>virtual-context proxy</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="/dashboard/static/favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/dashboard/static/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/dashboard/static/android-chrome-192x192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/dashboard/static/android-chrome-512x512.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/dashboard/static/apple-touch-icon.png">
+<link rel="manifest" href="/dashboard/static/site.webmanifest">
 <style>
   :root {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
