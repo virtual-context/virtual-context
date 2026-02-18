@@ -71,17 +71,21 @@ class ProxyMetrics:
                 r.get("input_tokens", 0) for r in requests
             )
 
-            # Baseline simulation: naive system with compaction at window limit
-            # System prompt is sent every turn by any system — use latest estimate
+            # Raw baseline: sum of raw_input_tokens from request events.
+            # This is the true cost a naive system would incur by forwarding
+            # the full unfiltered payload each turn.
+            total_raw_baseline = sum(
+                r.get("raw_input_tokens", 0) for r in requests
+            )
+
+            # Fallback: accumulated turn-pair baseline (for headless mode
+            # where raw_input_tokens is not available on request events)
             system_tokens_per_turn = 0
             if requests:
                 system_tokens_per_turn = requests[-1].get("system_tokens", 0)
-
-            # Bootstrap baseline from ingested history
             baseline_history_tokens = 0
             for ing in ingestions:
                 baseline_history_tokens += ing.get("baseline_history_tokens", 0)
-
             cumulative_baseline = 0
             for tc in turn_completes:
                 tpt = tc.get("turn_pair_tokens", 0)
@@ -93,7 +97,12 @@ class ProxyMetrics:
                         round(compactable * self.BASELINE_RATIO) + protected
                     )
                 cumulative_baseline += system_tokens_per_turn + baseline_history_tokens
-            total_baseline_input = cumulative_baseline
+
+            # Prefer raw baseline (accurate for proxy mode) over accumulated
+            total_baseline_input = (
+                total_raw_baseline if total_raw_baseline > 0
+                else cumulative_baseline
+            )
 
             return {
                 "type": "snapshot",
@@ -129,6 +138,8 @@ class ProxyMetrics:
         api_format: str,
         *,
         inbound_tags: list[str] | None = None,
+        session_id: str = "",
+        passthrough: bool = False,
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
         with self._lock:
@@ -143,6 +154,8 @@ class ProxyMetrics:
                 "message_count": len(body.get("messages", [])),
                 "inbound_tags": inbound_tags or [],
                 "response_tags": [],
+                "session_id": session_id,
+                "passthrough": passthrough,
             })
 
     def update_request_tags(
@@ -173,4 +186,5 @@ class ProxyMetrics:
                 "api_format": r["api_format"],
                 "model": r["model"],
                 "message_count": r["message_count"],
+                "session_id": r.get("session_id", ""),
             } for r in self._request_bodies]

@@ -2,6 +2,8 @@
 
 **Your LLM never forgets. Even in a 500-turn conversation.**
 
+virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules — each compensating for the others' blind spots — to maintain a living, compressed memory of unbounded conversations.
+
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
 virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM — tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Broad queries load everything. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture — learned the hard way in production — ensures the system can never hallucinate irrelevant topics into your context window.
@@ -69,7 +71,18 @@ Everything happens synchronously, in-process, in under a second with a local mod
 User message arrives
     │
     ▼
+Session routing (proxy mode)
+    │  ├─ Extract session ID from <!-- vc:session=UUID --> markers in assistant messages
+    │  ├─ Route to existing session or load persisted state from store
+    │  ├─ No marker? → reuse default session (first request) or create new
+    │  └─ Strip session markers before forwarding to upstream
+    │
+    ▼
 Strip client envelope (OpenClaw metadata, channel headers, plugin markers)
+    │
+    ▼
+History ingestion (first request only)
+    │  └─ Extract and tag all prior user+assistant pairs → bootstrap TurnTagIndex
     │
     ▼
 Inbound tagging — identify what this message is about
@@ -107,6 +120,11 @@ Inject <virtual-context> block → forward enriched request to LLM
 LLM processes enriched context → produces response
     │
     ▼
+Inject session marker into response (proxy mode)
+    │  ├─ Streaming: emit final SSE delta with <!-- vc:session=UUID -->
+    │  └─ Non-streaming: append marker to last text content block
+    │
+    ▼
 Response tagging — LLM tags the full user+assistant pair (background thread)
     │  ├─ Context lookback: feed N recent pairs as tagger context for short/ambiguous messages
     │  ├─ Context bleed gate: embedding similarity blocks stale context on topic shifts
@@ -125,6 +143,9 @@ Segment by tag → summarize each segment (concurrent, ThreadPoolExecutor)
     │
     ▼
 Compute greedy set cover → build/update per-tag summaries (Layer 2)
+    │
+    ▼
+Persist engine state (TurnTagIndex + compaction watermark → store)
 ```
 
 ## Key Capabilities
@@ -215,6 +236,38 @@ virtual-context aliases suggest    # auto-detect potential aliases
 virtual-context aliases add db database
 ```
 
+### Automatic Tag Refinement
+
+When a tag appears on too many turns (crossing configurable frequency thresholds), it loses discriminative power — proxy filtering keeps all matching turns, pulling unrelated history. virtual-context detects these overly-broad tags and automatically refines them.
+
+An LLM pass examines all turns under the broad tag and determines whether they span distinct sub-topics. If they do, the tag is split into specific compound sub-tags. If the content is genuinely uniform (one topic that happens to be frequent), a tag summary is built instead. Each tag is only processed once — the result is persisted so split analysis doesn't re-trigger.
+
+**Production example** (143-turn OpenClaw session):
+
+`reservation-request` appeared on 43/143 turns (30.1%) — spanning platform debugging, availability searches, browser session management, and general booking discussion. The splitter broke it into four sub-tags:
+
+| Sub-tag | Turns | Content |
+|---------|-------|---------|
+| `reservation-platform-troubleshooting` | 11 | Debugging OpenTable/Resy platform issues |
+| `reservation-availability-search` | 5 | Checking time slots and availability |
+| `reservation-browser-access` | 4 | Getting logged-in browser sessions |
+| `reservation-general` | 20 | General booking coordination |
+
+`troubleshooting` appeared on 34/143 turns (23.8%) — spanning browser connectivity issues, restaurant lookups, booking platform interaction, and credential access. Split into `browser-connection-troubleshooting` (11), `restaurant-lookup-troubleshooting` (7), `booking-platform-troubleshooting` (7), `credential-access-troubleshooting` (7).
+
+This is the second emergent property of the system. Vocabulary convergence (the first) naturally collapses synonyms into canonical tags. Tag splitting pushes unrelated concepts apart. Together they create a two-sided pressure — convergence pulls related concepts together, splitting pushes unrelated concepts apart — and the vocabulary evolves toward maximum discriminative power without manual curation.
+
+Split tags are registered as aliases via TagCanonicalizer, so historical queries against the old tag still resolve. New sub-tags enter the vocabulary feedback loop immediately. The splitter never reuses existing tag names (which would cause cascading splits) — it always creates new compound tags.
+
+```yaml
+tag_generator:
+  tag_splitting:
+    enabled: true
+    frequency_threshold: 15       # min absolute turn count
+    frequency_pct_threshold: 0.15  # min fraction of total turns
+    max_splits_per_turn: 1        # max tags to split per on_turn_complete cycle
+```
+
 ### Cross-Vocabulary Retrieval
 
 Users don't use the same words every time. A discussion about "materialized views for feed performance" at turn 46 might be recalled as "that caching trick for the feed" at turn 71. Pure tag overlap finds nothing — the vocabularies are completely disjoint.
@@ -282,6 +335,10 @@ tag_generator:
     tag_keywords:
       legal: [court, filing, motion, attorney]
       code: [function, bug, deploy, API, database]
+  tag_splitting:                              # auto-refine overly-broad tags
+    enabled: true
+    frequency_threshold: 15                   # min absolute turn count
+    frequency_pct_threshold: 0.15             # min fraction of total turns
 
 # Per-tag behavior: priority, expiration, custom summary prompts
 tag_rules:
@@ -431,6 +488,8 @@ curl http://127.0.0.1:5757/v1/messages \
   -d '{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+**Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. Client SDKs store this as part of the message. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state (TurnTagIndex + compaction watermark) from the store — no re-ingestion needed. Multiple concurrent conversations are routed independently via a session registry.
+
 **History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period — the tag vocabulary is immediately available for inbound matching.
 
 **Format-agnostic.** Auto-detects OpenAI vs Anthropic request format and injects context accordingly — into `system` for Anthropic, into `messages[0]` for OpenAI.
@@ -508,7 +567,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **Compactor** | `core/compactor.py` | LLM summarization + tag summary rollup, concurrent via ThreadPoolExecutor |
 | **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
-| **ProxyServer** | `proxy/server.py` | HTTP proxy — enrichment, filtering, history ingestion, envelope stripping |
+| **ProxyServer** | `proxy/server.py` | HTTP proxy — enrichment, filtering, history ingestion, session continuity |
 | **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats |
 | **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector + request capture ring buffer |
 
@@ -577,7 +636,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 499 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 530 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

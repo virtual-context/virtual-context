@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import enum
 import logging
 import re
 import sys
@@ -27,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
-from ..types import Message
+from ..types import Message, SplitResult
 
 from .dashboard import register_dashboard_routes
 from .metrics import ProxyMetrics
@@ -37,6 +38,9 @@ logger = logging.getLogger(__name__)
 _VC_PROMPT_MARKER = "[vc:prompt]\n"
 # MemOS preamble: starts with "# Role", ends with this delimiter line (zero-width spaces)
 _MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
+
+# Session marker: injected into assistant responses, extracted from inbound history
+_VC_SESSION_RE = re.compile(r"<!-- vc:session=([a-f0-9-]+) -->")
 
 # OpenClaw envelope patterns — consistent across all channels
 _VC_USER_RE = re.compile(r"^\[vc:user\](.*?)\[/vc:user\]", re.DOTALL)
@@ -49,6 +53,24 @@ _HOP_BY_HOP = frozenset({
     "proxy-authenticate", "proxy-authorization", "te", "trailers",
     "upgrade", "content-length",
 })
+
+
+# ---------------------------------------------------------------------------
+# SessionState — state machine for non-blocking ingestion
+# ---------------------------------------------------------------------------
+
+class SessionState(enum.Enum):
+    PASSTHROUGH = "passthrough"  # forwarding without enrichment (ingestion pending/running)
+    INGESTING = "ingesting"     # background thread tagging historical turns
+    ACTIVE = "active"           # normal enrichment mode
+
+
+class _IngestionCancelled(Exception):
+    """Raised inside progress callback to abort a running ingestion."""
+    def __init__(self, done: int, total: int) -> None:
+        self.done = done
+        self.total = total
+        super().__init__(f"Cancelled at {done}/{total}")
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +95,105 @@ class ProxyState:
         self._ingested_sessions: set[str] = set()
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
+        # State machine for non-blocking ingestion
+        self._state = SessionState.ACTIVE
+        self._latest_body: dict | None = None
+        self._ingestion_progress: tuple[int, int] = (0, 0)
+        self._manual_passthrough = False
+        self._ingestion_thread: threading.Thread | None = None
+        self._ingestion_cancel = threading.Event()
+        # Initial snapshot: captured at first ingestion start for growth tracking
+        self._initial_turns: int | None = None
+        self._initial_tag_count: int | None = None
+        # Payload size tracking (KB + tokens)
+        self._initial_payload_kb: float | None = None
+        self._last_payload_kb: float = 0.0
+        self._last_enriched_payload_kb: float = 0.0
+        self._initial_payload_tokens: int | None = None
+        self._last_payload_tokens: int = 0
+        self._last_enriched_payload_tokens: int = 0
+
+    @property
+    def session_state(self) -> SessionState:
+        """Current session state, accounting for manual passthrough override."""
+        if self._manual_passthrough:
+            return SessionState.PASSTHROUGH
+        return self._state
+
+    def set_manual_passthrough(self, enabled: bool) -> None:
+        """Toggle manual passthrough mode from the dashboard."""
+        self._manual_passthrough = enabled
+
+    def _transition_to(self, new_state: SessionState) -> None:
+        """Update internal state and emit a metric event."""
+        old = self._state
+        self._state = new_state
+        if self.metrics and old != new_state:
+            self.metrics.record({
+                "type": "session_state_change",
+                "from": old.value,
+                "to": new_state.value,
+                "session_id": self.engine.config.session_id,
+            })
+        logger.info(
+            "Session %s: %s → %s",
+            self.engine.config.session_id[:12], old.value, new_state.value,
+        )
+
+    def live_snapshot(self) -> dict:
+        """Build a snapshot dict of this session's live state for the dashboard."""
+        engine = self.engine
+        idx = engine._turn_tag_index
+
+        # KB stats: tag summaries
+        tag_summary_count = 0
+        tag_summary_tokens = 0
+        try:
+            summaries = engine._store.get_all_tag_summaries()
+            tag_summary_count = len(summaries)
+            tag_summary_tokens = sum(ts.summary_tokens for ts in summaries)
+        except Exception:
+            pass
+
+        # Estimate history size in tokens (chars / 4)
+        history_tokens = 0
+        for m in self.conversation_history:
+            history_tokens += len(m.content) // 4
+
+        context_window = engine.config.monitor.context_window
+        utilization_pct = round(history_tokens / context_window * 100, 1) if context_window > 0 else 0
+
+        # Distinct tag count from TurnTagIndex
+        all_tags: set[str] = set()
+        for entry in idx.entries:
+            all_tags.update(entry.tags)
+        all_tags.discard("_general")
+
+        snap = {
+            "session_id": engine.config.session_id,
+            "turn_count": len(self.conversation_history) // 2,
+            "compacted_through": getattr(engine, "_compacted_through", 0),
+            "tag_count": len(idx.entries),
+            "distinct_tags": len(all_tags),
+            "active_tags": list(idx.get_active_tags(lookback=6)),
+            "session_state": self.session_state.value,
+            "ingestion_progress": list(self._ingestion_progress),
+            "manual_passthrough": self._manual_passthrough,
+            "context_window": context_window,
+            "history_tokens": history_tokens,
+            "utilization_pct": utilization_pct,
+            "tag_summary_count": tag_summary_count,
+            "tag_summary_tokens": tag_summary_tokens,
+            "initial_turns": self._initial_turns,
+            "initial_tag_count": self._initial_tag_count,
+            "initial_payload_kb": self._initial_payload_kb,
+            "last_payload_kb": self._last_payload_kb,
+            "last_enriched_payload_kb": self._last_enriched_payload_kb,
+            "initial_payload_tokens": self._initial_payload_tokens,
+            "last_payload_tokens": self._last_payload_tokens,
+            "last_enriched_payload_tokens": self._last_enriched_payload_tokens,
+        }
+        return snap
 
     def wait_for_complete(self) -> None:
         """Block until the pending on_turn_complete finishes."""
@@ -144,7 +265,32 @@ class ProxyState:
                     "active_tags": active_tags,
                     "store_tag_count": len(self.engine._store.get_all_tags()),
                     "turn_pair_tokens": turn_pair_tokens,
+                    "session_id": session_id,
                 })
+
+                # Emit tag split event if splitting occurred
+                split_result = getattr(self.engine, '_last_split_result', None)
+                if isinstance(split_result, SplitResult):
+                    if split_result.splittable:
+                        new_tags = list(split_result.groups.keys())
+                        print(
+                            f"[T{turn}] SPLIT \"{split_result.tag}\" → "
+                            f"{new_tags} ({sum(len(v) for v in split_result.groups.values())} turns)"
+                        )
+                    else:
+                        print(
+                            f"[T{turn}] SUMMARIZED \"{split_result.tag}\" "
+                            f"(unsplittable: {split_result.reason})"
+                        )
+                    self.metrics.record({
+                        "type": "tag_split",
+                        "turn": turn,
+                        "tag": split_result.tag,
+                        "splittable": split_result.splittable,
+                        "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
+                        "session_id": session_id,
+                    })
+                    self.engine._last_split_result = None  # consume
 
                 # Emit compaction event if compaction occurred
                 if report is not None:
@@ -166,11 +312,11 @@ class ProxyState:
                         "compacted_through": getattr(
                             self.engine, "_compacted_through", 0
                         ),
+                        "session_id": session_id,
                     })
         except Exception as e:
             logger.error("on_turn_complete error: %s", e, exc_info=True)
 
-    @property
     def _history_ingested(self) -> bool:
         """Whether the current session's history has been ingested."""
         return self.engine.config.session_id in self._ingested_sessions
@@ -221,6 +367,7 @@ class ProxyState:
                         "primary_tag": entry.primary_tag if entry else "",
                         "message_preview": preview,
                         "turn_pair_tokens": tpt,
+                        "session_id": session_id,
                     })
                 self.metrics.record({
                     "type": "history_ingestion",
@@ -231,8 +378,404 @@ class ProxyState:
                     "baseline_history_tokens": baseline_history_tokens,
                 })
 
+    # ------------------------------------------------------------------
+    # Non-blocking ingestion (background thread)
+    # ------------------------------------------------------------------
+
+    def start_ingestion_if_needed(self, history_pairs: list[Message]) -> None:
+        """Start non-blocking history ingestion in a background thread.
+
+        Returns immediately — the session stays in INGESTING while the
+        background thread tags historical turns.  If called while ingestion
+        is already running, cancels the old thread and resumes from the
+        last tagged turn (PROXY-013).
+        """
+        session_id = self.engine.config.session_id
+        if session_id in self._ingested_sessions:
+            return
+        with self._ingestion_lock:
+            if session_id in self._ingested_sessions:
+                return
+
+            if not history_pairs:
+                self._ingested_sessions.add(session_id)
+                return
+
+            # Skip if persisted TurnTagIndex already covers history
+            existing_turns = len(self.engine._turn_tag_index.entries)
+            needed_turns = len(history_pairs) // 2
+            if existing_turns >= needed_turns:
+                self._ingested_sessions.add(session_id)
+                logger.info(
+                    "Skipping ingestion: persisted index (%d) covers history (%d)",
+                    existing_turns, needed_turns,
+                )
+                return
+
+            # ---- PROXY-013: cancel-and-resume if already running ----
+            if (
+                self._ingestion_thread is not None
+                and self._ingestion_thread.is_alive()
+            ):
+                done, total = self._ingestion_progress
+                logger.info(
+                    "Cancelling running ingestion at turn %d/%d "
+                    "(new request has %d pairs)",
+                    done, total, needed_turns,
+                )
+                self._ingestion_cancel.set()
+                self._ingestion_thread.join(timeout=5.0)
+                if self._ingestion_thread.is_alive():
+                    logger.warning("Old ingestion thread did not exit in 5s")
+                # Reset cancel event for the new thread
+                self._ingestion_cancel.clear()
+
+                # Re-read existing_turns AFTER old thread stopped —
+                # the thread may have appended one more entry between
+                # the last callback and the cancel taking effect.
+                existing_turns = len(self.engine._turn_tag_index.entries)
+
+                print(
+                    f"[INGEST] Cancel at T{done}/{total}, "
+                    f"resuming from T{existing_turns} "
+                    f"(session={session_id[:12]})"
+                )
+
+                # Verify hash at handoff point
+                self._verify_handoff_hash(history_pairs, existing_turns)
+
+                # Slice to remaining pairs only
+                history_pairs = list(history_pairs[existing_turns * 2:])
+                if not history_pairs:
+                    self._ingested_sessions.add(session_id)
+                    self._transition_to(SessionState.ACTIVE)
+                    return
+                needed_turns = len(history_pairs) // 2 + existing_turns
+
+            total = needed_turns
+            self._ingestion_progress = (existing_turns, total)
+
+            # Capture initial snapshot once (first ingestion start only)
+            if self._initial_turns is None:
+                self._initial_turns = existing_turns
+                self._initial_tag_count = len(self.engine._turn_tag_index.entries)
+
+            self._transition_to(SessionState.INGESTING)
+
+            # Separate daemon thread (not the _pool) so on_turn_complete
+            # can use the pool once we transition to ACTIVE.
+            self._ingestion_thread = threading.Thread(
+                target=self._run_ingestion_with_catchup,
+                args=(list(history_pairs),),
+                daemon=True,
+                name="vc-ingest",
+            )
+            self._ingestion_thread.start()
+
+    def _verify_handoff_hash(
+        self, new_pairs: list[Message], handoff_turn: int,
+    ) -> None:
+        """Verify the last tagged turn matches the same content in new history.
+
+        Logs a warning if the hash doesn't match — indicates potential data
+        loss or history divergence between requests.
+        """
+        import hashlib as _hl
+        if handoff_turn <= 0:
+            return
+        prev_turn = handoff_turn - 1
+        entry = self.engine._turn_tag_index.get_tags_for_turn(prev_turn)
+        if entry is None:
+            return
+        pair_idx = prev_turn * 2
+        if pair_idx + 1 >= len(new_pairs):
+            logger.warning(
+                "Handoff verification: turn %d not in new history "
+                "(new history has %d pairs) — potential data loss",
+                prev_turn, len(new_pairs) // 2,
+            )
+            return
+        combined = f"{new_pairs[pair_idx].content} {new_pairs[pair_idx + 1].content}"
+        new_hash = _hl.sha256(combined.encode()).hexdigest()[:16]
+        if new_hash != entry.message_hash:
+            logger.warning(
+                "Handoff hash MISMATCH at turn %d: "
+                "indexed=%s new=%s — history may have diverged",
+                prev_turn, entry.message_hash, new_hash,
+            )
+            print(
+                f"[INGEST] WARNING: hash mismatch at T{prev_turn} "
+                f"(indexed={entry.message_hash} vs new={new_hash})"
+            )
+        else:
+            logger.info(
+                "Handoff hash verified at turn %d: %s",
+                prev_turn, new_hash,
+            )
+
+    def _run_ingestion_with_catchup(self, initial_pairs: list[Message]) -> None:
+        """Background thread: ingest initial pairs, then catch up any gap."""
+        session_id = self.engine.config.session_id
+        cancelled = False
+        try:
+            # Phase 1: tag all initial history
+            self._ingest_pairs_with_progress(initial_pairs)
+
+            # Phase 2: catch-up loop — tag any turns that arrived during ingestion
+            for _ in range(10):  # bounded to avoid infinite loops
+                if self._ingestion_cancel.is_set():
+                    break
+                latest = self._latest_body
+                if latest is None:
+                    break
+                latest_pairs = _extract_history_pairs(latest)
+                needed = len(latest_pairs) // 2
+                have = len(self.engine._turn_tag_index.entries)
+                if needed <= have:
+                    break
+                # Tag the gap
+                gap_pairs = latest_pairs[have * 2:]
+                if not gap_pairs:
+                    break
+                logger.info(
+                    "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
+                    len(gap_pairs) // 2, have, needed,
+                )
+                self._ingest_pairs_with_progress(gap_pairs)
+
+        except _IngestionCancelled as e:
+            # New request is taking over — exit cleanly without
+            # transitioning to ACTIVE or marking as ingested.
+            # NOTE: Python's finally block runs even after return,
+            # so we use a flag to skip the finalization actions.
+            cancelled = True
+            logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
+        except Exception as e:
+            logger.error("Ingestion error: %s", e, exc_info=True)
+        finally:
+            if not cancelled:
+                self._ingested_sessions.add(session_id)
+                self._transition_to(SessionState.ACTIVE)
+
+    def _ingest_pairs_with_progress(self, pairs: list[Message]) -> None:
+        """Call engine.ingest_history with a progress callback that emits events.
+
+        Raises ``_IngestionCancelled`` if ``_ingestion_cancel`` is set.
+        """
+        session_id = self.engine.config.session_id
+        t0 = time.monotonic()
+        baseline_history_tokens = 0
+
+        def on_progress(done: int, total: int, entry) -> None:
+            nonlocal baseline_history_tokens
+            # Check cancellation before updating progress
+            if self._ingestion_cancel.is_set():
+                raise _IngestionCancelled(done, total)
+            self._ingestion_progress = (done, total)
+            if self.metrics:
+                # Find the pair for this turn to compute preview + tokens
+                turn_num = entry.turn_number
+                pair_idx = turn_num * 2
+                preview = ""
+                tpt = 0
+                if pair_idx < len(pairs):
+                    raw_content = pairs[pair_idx].content
+                    preview = _strip_openclaw_envelope(raw_content)[:60]
+                    if pair_idx + 1 < len(pairs):
+                        pair_chars = len(pairs[pair_idx].content) + len(pairs[pair_idx + 1].content)
+                        tpt = pair_chars // 4
+                        baseline_history_tokens += tpt
+                self.metrics.record({
+                    "type": "ingested_turn",
+                    "turn": turn_num,
+                    "tags": entry.tags if entry else [],
+                    "primary_tag": entry.primary_tag if entry else "",
+                    "message_preview": preview,
+                    "turn_pair_tokens": tpt,
+                    "session_id": session_id,
+                    "done": done,
+                    "total": total,
+                })
+
+        turns = self.engine.ingest_history(pairs, progress_callback=on_progress)
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+
+        print(
+            f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
+            f"(session={session_id[:12]})"
+        )
+        logger.info(
+            "History ingestion: %d turns in %dms (session=%s)",
+            turns, int(elapsed_ms), session_id[:12],
+        )
+
+        if self.metrics:
+            self.metrics.record({
+                "type": "history_ingestion",
+                "turns_ingested": turns,
+                "pairs_received": len(pairs) // 2,
+                "elapsed_ms": elapsed_ms,
+                "session_id": session_id,
+                "baseline_history_tokens": baseline_history_tokens,
+            })
+
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# SessionRegistry — multi-session routing
+# ---------------------------------------------------------------------------
+
+class SessionRegistry:
+    """Manages multiple concurrent ProxyState instances, one per session.
+
+    Routing priority:
+    1. Session marker (``<!-- vc:session=UUID -->``) in assistant messages
+    2. Content fingerprint — hash of first N user messages in the request body
+    3. Fallback — create a new session
+
+    Future: ``X-VC-Session`` request header overrides all (requires client changes).
+    """
+
+    _FINGERPRINT_SAMPLE_SIZE = 5  # first N user messages to hash
+
+    def __init__(
+        self,
+        config_path: str | None,
+        upstream: str,
+        metrics: ProxyMetrics,
+    ) -> None:
+        self._config_path = config_path
+        self._upstream = upstream
+        self._metrics = metrics
+        self._sessions: dict[str, ProxyState] = {}
+        self._fingerprints: dict[str, str] = {}  # fingerprint → session_id
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _compute_fingerprint(body: dict) -> str:
+        """Stable conversation fingerprint from the first N user messages.
+
+        Takes the first ``_FINGERPRINT_SAMPLE_SIZE`` user messages (raw text
+        including envelopes for maximum uniqueness), concatenates them, and
+        returns a truncated SHA-256 hex digest.  The sample is stable as
+        conversations grow because only the earliest messages are used.
+        """
+        messages = body.get("messages", [])
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        sample = user_msgs[:SessionRegistry._FINGERPRINT_SAMPLE_SIZE]
+        if not sample:
+            return ""
+
+        texts: list[str] = []
+        for m in sample:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+        combined = "\n".join(texts)
+        if not combined.strip():
+            return ""
+
+        import hashlib
+        return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+    def get_or_create(
+        self,
+        session_id: str | None,
+        *,
+        body: dict | None = None,
+    ) -> tuple[ProxyState, bool]:
+        """Look up or create a ProxyState for the given session ID.
+
+        Returns (state, is_new).
+
+        Routing priority: marker (session_id) > content fingerprint >
+        claim unclaimed session > create new session.
+        """
+        # Fast path: session marker found and session already in memory
+        if session_id and session_id in self._sessions:
+            return self._sessions[session_id], False
+
+        # Compute fingerprint once (reused in lock path)
+        fp = ""
+        if session_id is None and body is not None:
+            fp = self._compute_fingerprint(body)
+            # Fast path: fingerprint match
+            if fp and fp in self._fingerprints:
+                matched_sid = self._fingerprints[fp]
+                if matched_sid in self._sessions:
+                    return self._sessions[matched_sid], False
+
+        with self._lock:
+            # Double-check after acquiring lock
+            if session_id and session_id in self._sessions:
+                return self._sessions[session_id], False
+
+            if fp and fp in self._fingerprints:
+                matched_sid = self._fingerprints[fp]
+                if matched_sid in self._sessions:
+                    return self._sessions[matched_sid], False
+
+            # No marker, no fingerprint match — claim an unclaimed session
+            # if one exists.  This handles the startup case: create_app makes
+            # a default session before any request arrives.  The first
+            # conversation claims it; a second distinct conversation creates
+            # a new session.
+            if session_id is None and fp:
+                claimed_sids = set(self._fingerprints.values())
+                for sid, st in self._sessions.items():
+                    if sid not in claimed_sids:
+                        self._fingerprints[fp] = sid
+                        logger.info(
+                            "Session claimed: %s (fp=%s, total=%d)",
+                            sid[:12], fp[:8], len(self._sessions),
+                        )
+                        return st, False
+
+            # Create a new engine instance
+            engine = VirtualContextEngine(config_path=self._config_path)
+
+            if session_id:
+                # Override the auto-generated session_id so load_engine_state
+                # can find the persisted state for this session.
+                engine.config.session_id = session_id
+                # Trigger state reload (engine.__init__ already called
+                # _load_persisted_state but with the wrong session_id).
+                engine._load_persisted_state()
+
+            actual_id = engine.config.session_id
+            state = ProxyState(
+                engine, metrics=self._metrics, upstream=self._upstream,
+            )
+            self._sessions[actual_id] = state
+
+            # Record fingerprint → session mapping
+            if fp:
+                self._fingerprints[fp] = actual_id
+
+            logger.info(
+                "Session %s: %s (fp=%s, total=%d)",
+                "resumed" if session_id else "created",
+                actual_id[:12],
+                fp[:8] if fp else "none",
+                len(self._sessions),
+            )
+            return state, True
+
+    @property
+    def session_count(self) -> int:
+        return len(self._sessions)
+
+    def shutdown_all(self) -> None:
+        """Shut down all session states."""
+        for state in self._sessions.values():
+            state.shutdown()
+        self._sessions.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +863,76 @@ def _strip_openclaw_envelope(text: str) -> str:
     text = _MESSAGE_ID_RE.sub("", text)
 
     return text.strip()
+
+
+def _extract_session_id(body: dict) -> str | None:
+    """Scan assistant messages for vc:session marker. Returns UUID or None.
+
+    Searches backward (most recent assistant message first) for the marker.
+    """
+    for msg in reversed(body.get("messages", [])):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            m = _VC_SESSION_RE.search(content)
+            if m:
+                return m.group(1)
+        elif isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    m = _VC_SESSION_RE.search(block.get("text", ""))
+                    if m:
+                        return m.group(1)
+    return None
+
+
+def _strip_session_markers(body: dict) -> dict:
+    """Strip vc:session markers from all assistant messages in the request body.
+
+    Returns a shallow copy of body with markers removed from assistant content.
+    The LLM should never see stale session markers.
+    """
+    messages = body.get("messages")
+    if not messages:
+        return body
+
+    modified = False
+    new_messages = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            new_messages.append(msg)
+            continue
+
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            cleaned = _VC_SESSION_RE.sub("", content).rstrip()
+            if cleaned != content:
+                msg = dict(msg)
+                msg["content"] = cleaned
+                modified = True
+        elif isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    cleaned = _VC_SESSION_RE.sub("", text).rstrip()
+                    if cleaned != text:
+                        block = dict(block)
+                        block["text"] = cleaned
+                        modified = True
+                new_blocks.append(block)
+            if modified:
+                msg = dict(msg)
+                msg["content"] = new_blocks
+        new_messages.append(msg)
+
+    if not modified:
+        return body
+
+    body = dict(body)
+    body["messages"] = new_messages
+    return body
 
 
 def _extract_user_message(body: dict) -> str:
@@ -618,6 +1231,31 @@ def _has_tool_result(msg: dict) -> bool:
     return False
 
 
+def _inject_session_marker(response_body: dict, marker: str, api_format: str) -> dict:
+    """Append session marker text to the last text content block in a non-streaming response."""
+    import copy as _copy
+    response_body = _copy.deepcopy(response_body)
+
+    if api_format == "openai":
+        choices = response_body.get("choices", [])
+        if choices:
+            msg = choices[0].get("message", {})
+            existing = msg.get("content", "") or ""
+            msg["content"] = existing + marker
+    else:
+        # Anthropic: append to last text content block
+        content = response_body.get("content", [])
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = (block.get("text", "") or "") + marker
+                break
+        else:
+            # No text block found — add one
+            content.append({"type": "text", "text": marker})
+
+    return response_body
+
+
 def _extract_delta_text(data: dict, api_format: str) -> str:
     """Extract text delta from a streaming SSE event payload."""
     if api_format == "openai":
@@ -665,13 +1303,25 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
     """
     upstream = upstream.rstrip("/")
 
-    # Initialize engine
+    # Initialize engine + session registry
+    registry: SessionRegistry | None = None
+    default_state: ProxyState | None = None
     try:
         engine = VirtualContextEngine(config_path=config_path)
         metrics = ProxyMetrics(
             context_window=engine.config.monitor.context_window,
         )
-        state = ProxyState(engine, metrics=metrics, upstream=upstream)
+        # Create the default session (used by dashboard and first requests)
+        default_state = ProxyState(engine, metrics=metrics, upstream=upstream)
+
+        # Build registry and pre-register the default session
+        registry = SessionRegistry(
+            config_path=config_path,
+            upstream=upstream,
+            metrics=metrics,
+        )
+        registry._sessions[engine.config.session_id] = default_state
+
         logger.info(
             "Engine ready — session_id=%s, window=%d, storage=%s",
             engine.config.session_id,
@@ -681,23 +1331,59 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
     except Exception as e:
         print(f"Engine init failed: {e}", file=sys.stderr)
         metrics = ProxyMetrics()
-        state = None
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
     shutdown_event = asyncio.Event()
+
+    # --------------- Raw request log setup ---------------
+    import os as _os
+    from pathlib import Path as _Path
+
+    _request_log_dir: _Path | None = None
+    _request_log_max: int = 50
+
+    if default_state:
+        try:
+            from ..types import ProxyConfig as _ProxyConfig
+            proxy_cfg = default_state.engine.config.proxy
+            if isinstance(proxy_cfg, _ProxyConfig):
+                _request_log_dir = _Path(proxy_cfg.request_log_dir)
+                _request_log_max = proxy_cfg.request_log_max_files
+
+                _request_log_dir.mkdir(parents=True, exist_ok=True)
+
+                # Prune old files on startup — keep only the newest N triplets
+                # (each request produces .request.json + .response.json + .session.json)
+                existing = sorted(
+                    _request_log_dir.glob("*.json"),
+                    key=lambda p: p.stat().st_mtime,
+                )
+                keep_files = _request_log_max * 3  # request + response + session per turn
+                if len(existing) > keep_files:
+                    for stale in existing[: len(existing) - keep_files]:
+                        stale.unlink(missing_ok=True)
+                    pruned = len(existing) - keep_files
+                    print(f"Request log: pruned {pruned} old files, kept {keep_files} in {_request_log_dir}")
+                else:
+                    print(f"Request log: {len(existing)} existing files in {_request_log_dir}")
+        except Exception:
+            pass  # engine may be a mock in tests
+
+    _log_seq = 0  # monotonic counter for filenames
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
         shutdown_event.set()
         await client.aclose()
-        if state:
-            state.shutdown()
+        if registry:
+            registry.shutdown_all()
 
     app = FastAPI(title="virtual-context proxy", lifespan=lifespan)
 
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed
-    register_dashboard_routes(app, metrics, state, shutdown_event)
+    # Dashboard uses the default state for settings and config access
+    register_dashboard_routes(app, metrics, default_state, shutdown_event, registry=registry)
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     async def catch_all(request: Request, path: str):
@@ -713,6 +1399,23 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         if not body_bytes:
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
+        # --- Raw request log: dump entire payload before any processing ---
+        nonlocal _log_seq
+        _response_log_path: _Path | None = None
+        _session_log_path: _Path | None = None
+        if _request_log_dir and body_bytes:
+            _log_seq += 1
+            import datetime as _dt_log
+            ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            _log_prefix = f"{_log_seq:06d}_{ts}_{path.replace('/', '_')}"
+            req_log = _request_log_dir / f"{_log_prefix}.request.json"
+            _response_log_path = _request_log_dir / f"{_log_prefix}.response.json"
+            _session_log_path = _request_log_dir / f"{_log_prefix}.session.json"
+            try:
+                req_log.write_bytes(body_bytes)
+            except Exception:
+                pass  # never let logging break the request
+
         import json as _json
         try:
             body = _json.loads(body_bytes)
@@ -723,30 +1426,168 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         if not isinstance(body.get("messages"), list):
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
+        # Extract session ID from markers before stripping them
+        inbound_session_id = _extract_session_id(body)
+
+        # Strip session markers from assistant messages before any processing.
+        # The LLM should never see stale markers.
+        body = _strip_session_markers(body)
+
+        # Route to the correct session
+        state: ProxyState | None = None
+        if registry:
+            state, is_new = registry.get_or_create(
+                inbound_session_id, body=body,
+            )
+
         api_format = _detect_api_format(body)
         user_message = _extract_user_message(body)
         is_streaming = body.get("stream", False)
 
+        # Track payload size for dashboard (KB + rough token estimate)
+        _payload_kb = round(len(body_bytes) / 1024, 1)
+        _payload_tok = 0
+        for _m in body.get("messages", []):
+            _c = _m.get("content", "")
+            _payload_tok += len(_c) // 4 if isinstance(_c, str) else sum(
+                len(b.get("text", "")) // 4 for b in _c if isinstance(b, dict)
+            )
+        _sys_raw = body.get("system", "")
+        if isinstance(_sys_raw, str):
+            _payload_tok += len(_sys_raw) // 4
+        elif isinstance(_sys_raw, list):
+            _payload_tok += sum(
+                len(b.get("text", "")) // 4 for b in _sys_raw if isinstance(b, dict)
+            )
+        if state:
+            state._last_payload_kb = _payload_kb
+            state._last_payload_tokens = _payload_tok
+            if state._initial_payload_kb is None:
+                state._initial_payload_kb = _payload_kb
+                state._initial_payload_tokens = _payload_tok
+
         import datetime as _dt
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         _msg_count = len(body.get("messages", []))
-        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming}")
+        _sid = state.engine.config.session_id[:12] if state else "none"
+        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming} session={_sid} payload={_payload_kb}KB")
 
         if not user_message:
             # Tool-result or non-text turn — skip VC enrichment but
             # preserve streaming so the client SDK doesn't break.
+            _skip_sid = state.engine.config.session_id if state else ""
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
                     metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                    session_id=_skip_sid, response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
                     metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                    session_id=_skip_sid, response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
                 )
 
-        # Enrich with virtual-context
+        # ---------------------------------------------------------------
+        # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
+        # ---------------------------------------------------------------
+        if state:
+            current_state = state.session_state
+
+            # Fresh session starts ACTIVE but may need ingestion — check and
+            # redirect to passthrough path if there's history to ingest.
+            if (
+                current_state == SessionState.ACTIVE
+                and state.engine.config.session_id not in state._ingested_sessions
+            ):
+                history_pairs = _extract_history_pairs(body)
+                needed = len(history_pairs) // 2
+                existing = len(state.engine._turn_tag_index.entries)
+                if needed > 0 and existing < needed:
+                    current_state = SessionState.PASSTHROUGH
+
+            if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
+                # Store latest body for catch-up loop
+                state._latest_body = body
+
+                # On first request: kick off non-blocking ingestion
+                if not state._history_ingested():
+                    history_pairs = _extract_history_pairs(body)
+                    if history_pairs:
+                        state.conversation_history = list(history_pairs)
+                    await asyncio.to_thread(
+                        state.start_ingestion_if_needed, history_pairs,
+                    )
+
+                state.conversation_history.append(
+                    Message(role="user", content=user_message)
+                )
+
+                _session_id = state.engine.config.session_id
+                turn = len(state.conversation_history) // 2
+
+                # Record passthrough request event
+                metrics.record({
+                    "type": "request",
+                    "turn": turn,
+                    "message_preview": user_message[:60],
+                    "api_format": api_format,
+                    "streaming": is_streaming,
+                    "tags": [],
+                    "broad": False,
+                    "temporal": False,
+                    "context_tokens": 0,
+                    "budget": {},
+                    "history_len": len(state.conversation_history),
+                    "compacted_through": 0,
+                    "wait_ms": 0,
+                    "inbound_ms": 0,
+                    "overhead_ms": 0,
+                    "total_turns": turn,
+                    "filtered_turns": turn,
+                    "input_tokens": 0,
+                    "raw_input_tokens": 0,
+                    "system_tokens": 0,
+                    "turns_dropped": 0,
+                    "session_id": _session_id,
+                    "passthrough": True,
+                })
+
+                metrics.capture_request(
+                    turn, body, api_format,
+                    session_id=_session_id,
+                    passthrough=True,
+                )
+
+                print(
+                    f"[T{turn}] PASSTHROUGH {api_format} "
+                    f"stream={is_streaming} state={current_state.value} "
+                    f"| {user_message[:60]}"
+                )
+
+                if is_streaming:
+                    return await _handle_streaming(
+                        client, url, fwd_headers, body, api_format, state,
+                        metrics=metrics, turn=turn,
+                        session_id=_session_id,
+                        passthrough=True, response_log_path=_response_log_path,
+                        session_log_path=_session_log_path,
+                    )
+                else:
+                    return await _handle_non_streaming(
+                        client, url, fwd_headers, body, api_format, state,
+                        metrics=metrics, turn=turn,
+                        session_id=_session_id,
+                        passthrough=True, response_log_path=_response_log_path,
+                        session_log_path=_session_log_path,
+                    )
+
+        # ---------------------------------------------------------------
+        # ACTIVE path: full enrichment
+        # ---------------------------------------------------------------
         prepend_text = ""
         assembled = None
         wait_ms = 0.0
@@ -756,15 +1597,6 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 t0 = time.monotonic()
                 await asyncio.to_thread(state.wait_for_complete)
                 wait_ms = round((time.monotonic() - t0) * 1000, 1)
-
-                # Bootstrap from client's pre-existing history on first request
-                if not state._history_ingested:
-                    history_pairs = _extract_history_pairs(body)
-                    if history_pairs:
-                        state.conversation_history = list(history_pairs)
-                        await asyncio.to_thread(
-                            state.ingest_if_needed, history_pairs
-                        )
 
                 state.conversation_history.append(
                     Message(role="user", content=user_message)
@@ -798,6 +1630,11 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             )
 
         enriched_body = _inject_context(body, prepend_text, api_format)
+
+        # Track enriched payload size
+        import json as _json2
+        if state:
+            state._last_enriched_payload_kb = round(len(_json2.dumps(enriched_body)) / 1024, 1)
 
         is_streaming = body.get("stream", False)
 
@@ -839,11 +1676,35 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             )
         input_tokens = _input_text_len // 4
 
+        # Estimate raw (pre-filter) input tokens — the baseline cost of sending
+        # the full unfiltered payload.  Uses _pre_filter_body so it reflects
+        # what a naive system without VC would actually send upstream.
+        _raw_text_len = 0
+        for msg in _pre_filter_body.get("messages", []):
+            c = msg.get("content", "")
+            _raw_text_len += len(c) if isinstance(c, str) else sum(
+                len(b.get("text", "")) for b in c if isinstance(b, dict)
+            )
+        _raw_sys = _pre_filter_body.get("system", "")
+        if isinstance(_raw_sys, str):
+            _raw_text_len += len(_raw_sys)
+        elif isinstance(_raw_sys, list):
+            _raw_text_len += sum(
+                len(b.get("text", "")) for b in _raw_sys if isinstance(b, dict)
+            )
+        raw_input_tokens = _raw_text_len // 4
+
+        # Track enriched payload tokens for dashboard
+        # (raw payload tokens already set earlier alongside KB tracking)
+        if state:
+            state._last_enriched_payload_tokens = input_tokens
+
         # Record request event
         turn = len(state.conversation_history) // 2 if state else 0
         context_tokens = len(prepend_text) // 4 if prepend_text else 0
         total_turns = len(state.conversation_history) // 2 if state else 0
         overhead_ms = round(wait_ms + inbound_ms, 1)
+        _session_id = state.engine.config.session_id if state else ""
         metrics.record({
             "type": "request",
             "turn": turn,
@@ -865,8 +1726,10 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             "total_turns": total_turns,
             "filtered_turns": total_turns - turns_dropped,
             "input_tokens": input_tokens,
+            "raw_input_tokens": raw_input_tokens,
             "system_tokens": system_tokens,
             "turns_dropped": turns_dropped,
+            "session_id": _session_id,
         })
 
         # Log request to terminal for debugging
@@ -890,17 +1753,22 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         metrics.capture_request(
             turn, _pre_filter_body, api_format,
             inbound_tags=assembled.matched_tags if assembled else [],
+            session_id=_session_id,
         )
 
         if is_streaming:
             return await _handle_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
+                session_id=_session_id, response_log_path=_response_log_path,
+                session_log_path=_session_log_path,
             )
         else:
             return await _handle_non_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
+                session_id=_session_id, response_log_path=_response_log_path,
+                session_log_path=_session_log_path,
             )
 
     return app
@@ -937,6 +1805,100 @@ async def _passthrough_bytes(
     )
 
 
+def _dump_session_state(
+    state: "ProxyState",
+    session_log_path: object,
+) -> None:
+    """Write full proxy memory dump to disk alongside request/response logs.
+
+    Includes TurnTagIndex, tag summaries, aliases, session metadata,
+    and compaction state — everything needed to reconstruct the proxy's
+    understanding of the conversation at this point in time.
+    """
+    import json as _json_dump
+    try:
+        engine = state.engine
+        idx = engine._turn_tag_index
+
+        # TurnTagIndex entries
+        entries = []
+        for e in idx.entries:
+            entries.append({
+                "turn": e.turn_number,
+                "tags": e.tags,
+                "primary_tag": e.primary_tag,
+                "message_hash": e.message_hash,
+                "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            })
+
+        # Tag counts (how many turns per tag)
+        tag_counts: dict[str, int] = {}
+        for e in idx.entries:
+            for t in e.tags:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+
+        # Tag summaries from store
+        tag_summaries = []
+        try:
+            for ts in engine._store.get_all_tag_summaries():
+                tag_summaries.append({
+                    "tag": ts.tag,
+                    "summary": ts.summary,
+                    "summary_tokens": ts.summary_tokens,
+                    "source_turn_numbers": ts.source_turn_numbers,
+                    "covers_through_turn": ts.covers_through_turn,
+                })
+        except Exception:
+            pass
+
+        # Tag aliases
+        aliases: dict[str, str] = {}
+        try:
+            aliases = engine._store.get_tag_aliases()
+        except Exception:
+            pass
+
+        # Tag stats from store
+        tag_stats = []
+        try:
+            for st in engine._store.get_all_tags():
+                tag_stats.append({
+                    "tag": st.tag,
+                    "usage_count": st.usage_count,
+                    "total_full_tokens": st.total_full_tokens,
+                    "total_summary_tokens": st.total_summary_tokens,
+                })
+        except Exception:
+            pass
+
+        # Split processed tags
+        split_tags = list(getattr(engine, "_split_processed_tags", set()))
+
+        dump = {
+            "session_id": engine.config.session_id,
+            "session_state": state._state.value if hasattr(state._state, "value") else str(state._state),
+            "turn_count": len(state.conversation_history) // 2,
+            "compacted_through": getattr(engine, "_compacted_through", 0),
+            "turn_tag_index": entries,
+            "tag_counts": dict(sorted(tag_counts.items(), key=lambda x: -x[1])),
+            "tag_summaries": tag_summaries,
+            "tag_aliases": aliases,
+            "tag_stats": tag_stats,
+            "split_processed_tags": split_tags,
+            "conversation_history": [
+                {"role": m.role, "content": m.content[:500]}
+                for m in state.conversation_history
+            ],
+        }
+
+        session_log_path.write_text(
+            _json_dump.dumps(dump, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # never let session dump break the request
+
+
 async def _handle_streaming(
     client: httpx.AsyncClient,
     url: str,
@@ -948,6 +1910,10 @@ async def _handle_streaming(
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
     overhead_ms: float = 0.0,
+    session_id: str = "",
+    passthrough: bool = False,
+    response_log_path: object | None = None,
+    session_log_path: object | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -982,6 +1948,7 @@ async def _handle_streaming(
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
                 "error": True,
+                "session_id": session_id,
             })
         print(
             f"[T{turn}] ERROR {upstream.status_code} "
@@ -1004,13 +1971,16 @@ async def _handle_streaming(
 
     async def stream_generator():
         text_chunks: list[str] = []
+        raw_events: list[str] = []
         line_buf = ""
         try:
             async for raw_chunk in upstream.aiter_bytes():
                 yield raw_chunk  # forward raw bytes unchanged
 
-                # Side-channel: parse for text accumulation
-                line_buf += raw_chunk.decode("utf-8", errors="replace")
+                # Side-channel: parse for text accumulation + log capture
+                decoded = raw_chunk.decode("utf-8", errors="replace")
+                raw_events.append(decoded)
+                line_buf += decoded
                 while "\n" in line_buf:
                     line, line_buf = line_buf.split("\n", 1)
                     line = line.rstrip("\r")
@@ -1035,6 +2005,7 @@ async def _handle_streaming(
                     "upstream_ms": upstream_ms,
                     "total_ms": round(overhead_ms + upstream_ms, 1),
                     "streaming": True,
+                    "session_id": session_id,
                 })
             assistant_text = "".join(text_chunks)
             print(
@@ -1043,11 +2014,48 @@ async def _handle_streaming(
                 f"total={int(round(overhead_ms + upstream_ms))}ms "
                 f"chars={len(assistant_text)}"
             )
+
+            # Log assembled response
+            if response_log_path:
+                try:
+                    response_log_path.write_text(
+                        _json.dumps({
+                            "streaming": True,
+                            "assistant_text": assistant_text,
+                            "upstream_ms": upstream_ms,
+                            "raw_events": "".join(raw_events),
+                        }, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text)
                 )
-                state.fire_turn_complete(list(state.conversation_history))
+                if not passthrough:
+                    state.fire_turn_complete(list(state.conversation_history))
+
+                # Inject session marker as a final SSE delta so the client SDK
+                # accumulates it into the stored assistant message.
+                _marker_sid = state.engine.config.session_id
+                marker = f"\n<!-- vc:session={_marker_sid} -->"
+                if api_format == "anthropic":
+                    marker_event = _json.dumps({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": marker},
+                    })
+                    yield f"event: content_block_delta\ndata: {marker_event}\n\n".encode()
+                else:
+                    marker_event = _json.dumps({
+                        "choices": [{"index": 0, "delta": {"content": marker}}],
+                    })
+                    yield f"data: {marker_event}\n\n".encode()
+
+            # Session state dump (after response + history update)
+            if session_log_path and state:
+                _dump_session_state(state, session_log_path)
 
     return StreamingResponse(
         stream_generator(),
@@ -1067,6 +2075,10 @@ async def _handle_non_streaming(
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
     overhead_ms: float = 0.0,
+    session_id: str = "",
+    passthrough: bool = False,
+    response_log_path: object | None = None,
+    session_log_path: object | None = None,
 ) -> JSONResponse:
     """Forward JSON response, parse assistant text, fire on_turn_complete."""
     t_upstream = time.monotonic()
@@ -1084,7 +2096,13 @@ async def _handle_non_streaming(
         state.conversation_history.append(
             Message(role="assistant", content=assistant_text)
         )
-        state.fire_turn_complete(list(state.conversation_history))
+        if not passthrough:
+            state.fire_turn_complete(list(state.conversation_history))
+
+        # Inject session marker into the response body so the client stores it
+        session_id = state.engine.config.session_id
+        marker = f"\n<!-- vc:session={session_id} -->"
+        response_body = _inject_session_marker(response_body, marker, api_format)
 
     if metrics:
         metrics.record({
@@ -1093,7 +2111,23 @@ async def _handle_non_streaming(
             "upstream_ms": upstream_ms,
             "total_ms": round(overhead_ms + upstream_ms, 1),
             "streaming": False,
+            "session_id": session_id,
         })
+
+    # Log response
+    if response_log_path:
+        try:
+            import json as _json_log
+            response_log_path.write_text(
+                _json_log.dumps(response_body, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    # Session state dump
+    if session_log_path and state:
+        _dump_session_state(state, session_log_path)
 
     # Forward response headers (filter hop-by-hop)
     resp_headers = _forward_headers(dict(resp.headers))

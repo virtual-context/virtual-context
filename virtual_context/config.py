@@ -15,6 +15,7 @@ from .types import (
     CostTrackingConfig,
     KeywordTagConfig,
     MonitorConfig,
+    ProxyConfig,
     RetrieverConfig,
     SegmenterConfig,
     StorageConfig,
@@ -22,6 +23,7 @@ from .types import (
     SummarizationConfig,
     TagGeneratorConfig,
     TagPromptRule,
+    TagSplittingConfig,
     VirtualContextConfig,
 )
 
@@ -70,6 +72,15 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
     if temporal_patterns_raw is not None:
         pattern_kwargs["temporal_patterns"] = list(temporal_patterns_raw)
 
+    # Tag splitting config
+    split_raw = raw.get("tag_splitting", {})
+    tag_splitting = TagSplittingConfig(
+        enabled=split_raw.get("enabled", False),
+        frequency_threshold=split_raw.get("frequency_threshold", 15),
+        frequency_pct_threshold=split_raw.get("frequency_pct_threshold", 0.15),
+        max_splits_per_turn=split_raw.get("max_splits_per_turn", 1),
+    )
+
     return TagGeneratorConfig(
         type=raw.get("type", "keyword"),
         provider=raw.get("provider", ""),
@@ -84,6 +95,7 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
         disable_thinking=raw.get("disable_thinking", False),
         broad_heuristic_enabled=raw.get("broad_heuristic_enabled", True),
         temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", True),
+        tag_splitting=tag_splitting,
         **pattern_kwargs,
     )
 
@@ -197,6 +209,16 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         pricing=cost_raw.get("pricing", {}),
     )
 
+    # Proxy settings
+    proxy_raw = raw.get("proxy", {})
+    proxy_config = ProxyConfig(
+        request_log_dir=proxy_raw.get(
+            "request_log_dir",
+            os.path.join(storage_root, "request_log"),
+        ),
+        request_log_max_files=proxy_raw.get("request_log_max_files", 50),
+    )
+
     return VirtualContextConfig(
         version=raw.get("version", "0.2"),
         storage_root=storage_root,
@@ -212,6 +234,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         summarization=summarization,
         storage=storage_config,
         cost_tracking=cost_tracking,
+        proxy=proxy_config,
         providers=raw.get("providers", {}),
     )
 

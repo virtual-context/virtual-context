@@ -140,6 +140,49 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_proxy.py::TestExtractUserMessage::test_tool_result_only_returns_empty`
 
+### PROXY-014 — Third request during ingestion silently ignored (cancel-and-resume breaks)
+
+- **Symptom**: Turns 1→2 cancel-and-resume works fine. Turn 3 (while ingestion still running) does nothing — progress bar stops, no new ingestion starts.
+- **Root cause**: `_run_ingestion_with_catchup`'s `finally` block unconditionally runs `_ingested_sessions.add()` and `_transition_to(ACTIVE)`, even when `_IngestionCancelled` is caught. Python's `finally` always executes after `return` in `except`. Turn 3's fast path sees session as already ingested.
+- **Fix**: Added `cancelled` flag; `finally` block only marks as ingested when `not cancelled`.
+- **Tests**:
+  - `test_proxy.py::TestSessionStateMachine::test_third_call_during_ingestion_cancels_second`
+
+### PROXY-013 — Duplicate ingestion thread on second request during INGESTING
+
+- **Symptom**: Second request during background ingestion spawns a duplicate thread that re-ingests from turn 0, causing progress bar to jump backwards and doubling Haiku API calls
+- **Root cause**: `start_ingestion_if_needed` only checked `_ingested_sessions` (set after completion), not whether a thread was already running
+- **Fix**: Track `_ingestion_thread` + `_ingestion_cancel` event. Cancel old thread, join, re-read turn count after join, verify hash at handoff, resume from last tagged turn.
+- **Tests**:
+  - `test_proxy.py::TestSessionStateMachine::test_second_call_during_ingestion_does_not_restart`
+
+### PROXY-010 — Different conversations merged into same session
+
+- **Symptom**: Two different Telegram chats (private + group) routed to the same proxy session, cross-contaminating TurnTagIndex and conversation history
+- **Root cause**: `SessionRegistry.get_or_create()` returned the first existing session for any request without a `<!-- vc:session -->` marker
+- **Fix**: Content fingerprint routing — hash first 5 user messages to distinguish conversations. Priority: marker > fingerprint > claim unclaimed > new session.
+- **Tests**:
+  - `test_proxy.py::TestContentFingerprintRouting::test_different_conversations_get_different_sessions`
+  - `test_proxy.py::TestContentFingerprintRouting::test_same_conversation_reuses_session_via_fingerprint`
+  - `test_proxy.py::TestContentFingerprintRouting::test_marker_takes_priority_over_fingerprint`
+
+### BUG-011 — Tag splitter parser rejects string turn numbers from LLM
+
+- **Symptom**: Tag split always returns "Fewer than 2 valid groups" even when LLM returns a valid split — effectively disabling the entire tag splitting feature
+- **Root cause**: Haiku returns turn numbers as `"T9"` strings (matching the `[T9]` format in the prompt) or plain string digits `"9"`. The parser only accepted `int`/`float` types via `isinstance(n, (int, float))`, silently dropping all string values
+- **Fix**: (1) Parser now handles `str` values — strips `T`/`t` prefix and converts to int. (2) Prompt now explicitly instructs `IMPORTANT: Turn numbers must be plain integers (e.g., 9, 13, 20), NOT strings like "T9".`
+- **Tests**:
+  - `test_tag_splitter.py::TestTagSplitter::test_string_turn_numbers_with_t_prefix`
+  - `test_tag_splitter.py::TestTagSplitter::test_string_turn_numbers_plain_digits`
+
+### BUG-012 — Tag splitter collects empty/wrong text for turns in proxy history
+
+- **Symptom**: 50% of turns sent to the split LLM prompt had empty text (`[T9] `) or contained MemOS preamble content (`# Role\nYou are an intelligent assistant...`) instead of actual user messages. LLM still managed reasonable splits from the turns that had content, but accuracy was degraded.
+- **Root cause**: `_collect_turn_text()` used `turn_number * 2` to index into the conversation history, assuming strict user/assistant alternation. In proxy mode, OpenClaw injects MemOS preamble user messages before the real content, creating consecutive user messages that break the indexing.
+- **Fix**: New `_extract_turn_pairs()` helper walks the history and pairs the last user message before each assistant response, handling consecutive user messages correctly. Both `_collect_turn_text()` and `_build_broad_tag_summary()` now use this pair-based approach instead of blind index math.
+- **Tests**:
+  - `test_tag_splitter.py::TestEngineTagSplitting::test_collect_turn_text_with_preamble_messages`
+
 ---
 
 ## By Test File
@@ -155,4 +198,5 @@ Use `pytest -m regression` to run all regression tests.
 | `test_retriever.py` | BUG-007, BUG-008, BUG-009 |
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
-| `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005 |
+| `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014 |
+| `test_tag_splitter.py` | BUG-011, BUG-012 |

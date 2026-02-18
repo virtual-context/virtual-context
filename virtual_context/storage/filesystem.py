@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -458,3 +458,53 @@ class FilesystemStore(ContextStore):
             if ts:
                 results.append(ts)
         return results
+
+    def save_engine_state(self, state: EngineStateSnapshot) -> None:
+        state_dir = self.root / "_engine_state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path = state_dir / f"{state.session_id}.json"
+        data = {
+            "session_id": state.session_id,
+            "compacted_through": state.compacted_through,
+            "turn_count": state.turn_count,
+            "saved_at": _dt_to_str(state.saved_at),
+            "turn_tag_entries": [
+                {
+                    "turn_number": e.turn_number,
+                    "message_hash": e.message_hash,
+                    "tags": e.tags,
+                    "primary_tag": e.primary_tag,
+                    "timestamp": _dt_to_str(e.timestamp),
+                }
+                for e in state.turn_tag_entries
+            ],
+            "split_processed_tags": state.split_processed_tags,
+        }
+        path.write_text(json.dumps(data, indent=2))
+
+    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+        path = self.root / "_engine_state" / f"{session_id}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        entries = [
+            TurnTagEntry(
+                turn_number=e["turn_number"],
+                message_hash=e["message_hash"],
+                tags=e["tags"],
+                primary_tag=e["primary_tag"],
+                timestamp=_str_to_dt(e["timestamp"]),
+            )
+            for e in data.get("turn_tag_entries", [])
+        ]
+        return EngineStateSnapshot(
+            session_id=data["session_id"],
+            compacted_through=data.get("compacted_through", 0),
+            turn_tag_entries=entries,
+            turn_count=data.get("turn_count", 0),
+            saved_at=_str_to_dt(data["saved_at"]) if "saved_at" in data else datetime.now(timezone.utc),
+            split_processed_tags=data.get("split_processed_tags", []),
+        )

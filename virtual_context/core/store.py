@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import EngineStateSnapshot, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
 
 
 class ContextStore(ABC):
@@ -82,3 +82,9 @@ class ContextStore(ABC):
     @abstractmethod
     def get_all_tag_summaries(self) -> list[TagSummary]:
         """Retrieve all tag summaries, ordered by tag name."""
+
+    def save_engine_state(self, state: EngineStateSnapshot) -> None:
+        """Persist engine state (TurnTagIndex + watermark). Upsert by session_id."""
+
+    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+        """Load persisted engine state for a session. None if not found."""

@@ -85,6 +85,8 @@ def register_dashboard_routes(
     metrics: "ProxyMetrics",
     state: "ProxyState | None",
     shutdown_event: asyncio.Event | None = None,
+    *,
+    registry: "object | None" = None,
 ) -> None:
     """Register ``/dashboard`` and ``/dashboard/events`` routes."""
 
@@ -114,6 +116,16 @@ def register_dashboard_routes(
                         snap["current_session_id"] = engine.config.session_id
                     except Exception:
                         pass
+
+                # Add live sessions from registry
+                live_sessions = []
+                if registry and hasattr(registry, "_sessions"):
+                    for sid, s in registry._sessions.items():
+                        try:
+                            live_sessions.append(s.live_snapshot())
+                        except Exception:
+                            pass
+                snap["live_sessions"] = live_sessions
 
                 yield f"data: {json.dumps(snap)}\n\n"
 
@@ -206,6 +218,35 @@ def register_dashboard_routes(
         deleted = await asyncio.to_thread(store.delete_session, session_id)
         logger.info("Deleted session %s: %d segments removed", session_id, deleted)
         return JSONResponse({"deleted": deleted})
+
+    @app.get("/dashboard/sessions/live")
+    async def dashboard_sessions_live():
+        """Return real-time session data from the registry (not the store)."""
+        live_sessions = []
+        if registry and hasattr(registry, "_sessions"):
+            for sid, s in registry._sessions.items():
+                try:
+                    live_sessions.append(s.live_snapshot())
+                except Exception:
+                    pass
+        return JSONResponse(live_sessions)
+
+    @app.post("/dashboard/sessions/{session_id}/passthrough")
+    async def dashboard_toggle_passthrough(session_id: str, request: Request):
+        """Toggle manual passthrough mode for a session."""
+        if not registry or not hasattr(registry, "_sessions"):
+            return JSONResponse(
+                {"error": "No registry"}, status_code=503,
+            )
+        s = registry._sessions.get(session_id)
+        if not s:
+            return JSONResponse(
+                {"error": "Session not found"}, status_code=404,
+            )
+        body = await request.json()
+        enabled = body.get("enabled", False)
+        s.set_manual_passthrough(enabled)
+        return JSONResponse({"ok": True})
 
     # -----------------------------------------------------------------------
     # Session export
@@ -890,7 +931,7 @@ _DASHBOARD_HTML = """\
   .store-info { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
 
   /* Request log table */
-  .log-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+  .log-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; table-layout: fixed; }
   .log-table th {
     text-align: left; padding: 6px 8px; color: var(--text-dim);
     border-bottom: 1px solid var(--border); font-weight: 500;
@@ -933,26 +974,42 @@ _DASHBOARD_HTML = """\
   .session-list { max-height: 280px; overflow-y: auto; }
   .session-card {
     background: var(--bg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 10px 12px; margin-bottom: 8px;
+    border-radius: 4px; padding: 8px 10px; margin-bottom: 8px;
   }
   .session-card:last-child { margin-bottom: 0; }
   .session-card.current { border-color: var(--green); }
   .session-card .session-header {
     display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 6px;
+    margin-bottom: 4px; gap: 8px;
   }
-  .session-card .session-id { font-size: 11px; color: var(--accent); }
+  .session-card .session-id { font-size: 11px; color: var(--accent); font-family: monospace; word-break: break-all; flex: 1; }
+  .session-card .session-header-right {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+  }
   .session-card .session-badge {
     background: var(--green); color: #fff; border-radius: 3px;
     padding: 1px 6px; font-size: 10px; font-weight: 600;
   }
-  .session-card .session-stats {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
-    font-size: 11px;
+  .session-card .metrics-grid {
+    display: grid; grid-template-columns: auto 1fr auto 1fr auto 1fr auto 1fr;
+    gap: 1px 0; font-size: 11px; margin-top: 4px;
   }
-  .session-card .session-stats .label { color: var(--text-dim); }
-  .session-card .session-stats .val { color: var(--text); font-weight: 600; }
-  .session-card .session-tags { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .session-card .metrics-grid .ml { text-align: right; color: var(--text-dim); padding: 1px 6px 1px 4px; white-space: nowrap; }
+  .session-card .metrics-grid .mv { text-align: left; font-weight: 600; padding: 1px 8px 1px 0; white-space: nowrap; }
+  .session-card .metrics-grid .mv.green { color: var(--green); }
+  .session-card .metrics-grid .mv.yellow { color: var(--yellow); }
+  .session-card .metrics-grid .mv.red { color: var(--red); }
+  .session-card .util-bar {
+    grid-column: 1 / -1; height: 6px; background: var(--bg-lighter);
+    border-radius: 3px; overflow: hidden; margin: 1px 0;
+  }
+  .session-card .util-bar .util-fill {
+    height: 100%; background: var(--green); border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+  .session-card .util-bar .util-fill.warn { background: var(--yellow); }
+  .session-card .util-bar .util-fill.danger { background: var(--red); }
+  .session-card .session-tags { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px; }
   .session-card .session-tags .tag { font-size: 10px; padding: 1px 5px; }
   .session-time { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
   .session-delete {
@@ -961,6 +1018,40 @@ _DASHBOARD_HTML = """\
     cursor: pointer; font-family: inherit;
   }
   .session-delete:hover { background: var(--red); color: #fff; }
+
+  /* Session state badges */
+  .state-badge {
+    border-radius: 3px; padding: 1px 6px; font-size: 10px; font-weight: 600;
+    display: inline-block;
+  }
+  .state-badge.passthrough { background: var(--yellow); color: #000; }
+  .state-badge.ingesting { background: var(--yellow); color: #000; }
+  .state-badge.active { background: var(--green); color: #fff; }
+
+  /* Ingestion progress bar */
+  .ingestion-progress {
+    height: 3px; background: var(--border); border-radius: 2px;
+    margin-top: 4px; overflow: hidden;
+  }
+  .ingestion-progress-fill {
+    height: 100%; background: var(--yellow); transition: width 0.3s;
+  }
+
+  /* Passthrough row in request log */
+  .passthrough-row { opacity: 0.45; }
+  .passthrough-row:hover { opacity: 0.7; }
+  .passthrough-badge {
+    background: var(--yellow); color: #000; border-radius: 3px;
+    padding: 1px 5px; font-size: 9px; font-weight: 600;
+  }
+
+  /* Passthrough toggle button */
+  .passthrough-toggle {
+    background: transparent; border: 1px solid var(--accent); color: var(--accent);
+    border-radius: 3px; padding: 1px 6px; font-size: 10px; font-weight: 600;
+    cursor: pointer; font-family: inherit; margin-left: 6px;
+  }
+  .passthrough-toggle:hover { background: var(--accent); color: #000; }
 
   /* Replay panel */
   .replay-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
@@ -1120,6 +1211,31 @@ _DASHBOARD_HTML = """\
   }
   .help-content dt:first-child { margin-top: 0; }
   .help-content dd { margin: 1px 0 0 12px; }
+
+  /* Session column */
+  .session-cell { font-family: monospace; font-size: 11px; color: var(--text-dim); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px; }
+  .session-cell:hover { color: var(--accent); }
+  .live-badge { background: var(--green); color: #000; font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+  #session-filter { padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; }
+  #session-filter code { color: var(--accent); }
+
+  /* Grid: resizable columns */
+  .log-table th { position: relative; user-select: none; }
+  .col-resize { position: absolute; right: 0; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 11; }
+  .col-resize:hover, .col-resize.active { background: var(--accent); }
+
+  /* Grid: draggable columns */
+  .log-table th[draggable] { cursor: grab; }
+  .log-table th.dragging { opacity: 0.4; }
+  .log-table th.drag-over { box-shadow: inset 2px 0 0 var(--accent); }
+
+  /* Grid: column toggle menu */
+  .col-toggle-btn { background: none; border: 1px solid var(--border); color: var(--text-dim); padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; margin-left: 6px; }
+  .col-toggle-btn:hover { color: var(--text); border-color: var(--text-dim); }
+  .col-menu { position: absolute; right: 0; top: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 6px 0; z-index: 100; min-width: 160px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+  .col-menu label { display: block; padding: 4px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .col-menu label:hover { background: var(--bg); }
+  .col-menu input[type="checkbox"] { margin-right: 6px; }
 
   @media (max-width: 700px) {
     .stats { grid-template-columns: repeat(3, 1fr); }
@@ -1293,23 +1409,28 @@ _DASHBOARD_HTML = """\
 </div>
 
 <div class="panel">
-  <div class="section-header"><h2>Request Log</h2><button class="help-btn" data-help="reqlog" onclick="toggleHelp(this)">?</button></div>
+  <div class="section-header" style="position:relative"><h2>Request Log</h2><button class="help-btn" data-help="reqlog" onclick="toggleHelp(this)">?</button><button class="col-toggle-btn" onclick="toggleColMenu(this)">Cols</button><button class="col-toggle-btn" onclick="if(gridManager)gridManager.resetDefaults()">Reset</button></div>
   <div class="help-content" data-help-for="reqlog" style="display:none">
     <p>Chronological log of every LLM request processed by the proxy (newest first, max 200 rows). Each row shows one conversation turn from the moment the user message arrives through context injection.</p>
     <dl>
       <dt>T#</dt><dd>Turn number (0-indexed). Corresponds to the conversation turn in the session.</dd>
+      <dt>Session</dt><dd>Short prefix of the session UUID this request belongs to. Click to filter the log to just that session. Multiple sessions appear when the proxy serves concurrent conversations.</dd>
       <dt>Tags</dt><dd>Semantic tags assigned to this turn by the tagger, or a <strong style="color:var(--purple)">BROAD</strong> / <strong style="color:var(--orange)">TEMPORAL</strong> badge if the query was detected as broad or temporal. Tags update after on_turn_complete finishes.</dd>
       <dt>Message</dt><dd>Preview of the user message (first 50 characters).</dd>
       <dt>Payload</dt><dd>How many turns were included in the LLM payload after tag-based filtering (filtered/total).</dd>
       <dt>Tokens</dt><dd>Estimated total input tokens sent to the upstream provider for this request (system prompt + enriched messages).</dd>
-      <dt>Base</dt><dd>Estimated baseline input tokens a naive system would have sent for this turn (system prompt + full raw history, compacting at 30% when hitting the context window). Appears after on_turn_complete finishes. Compare with Tokens to see per-turn savings.</dd>
+      <dt>Base</dt><dd>Estimated baseline input tokens a naive system would have sent for this turn — the full unfiltered request payload (all messages + system prompt) before VC filtering. Compare with Tokens to see per-turn savings from VC's selective history filtering.</dd>
       <dt>Injected</dt><dd>Number of tokens of retrieved virtual-context summaries injected into this request.</dd>
       <dt>Timing</dt><dd>Three-part breakdown: <strong>VC</strong> = virtual-context overhead (wait + inbound), <strong>LLM</strong> = upstream API round-trip, <strong>Total</strong> = end-to-end. LLM and Total appear once the upstream response completes.</dd>
     </dl>
   </div>
+  <div id="session-filter" style="display:none; margin-bottom:8px; color:var(--text-dim)">
+    Showing session: <code id="session-filter-id"></code>
+    <a href="#" onclick="clearSessionFilter();return false" style="margin-left:8px;color:var(--accent)">show all</a>
+  </div>
   <div class="log-scroll" id="log-scroll">
-    <table class="log-table">
-      <thead><tr><th>T#</th><th>Inbound Tags</th><th>Response Tags</th><th>Message</th><th>Payload</th><th>Tokens</th><th>Base</th><th>Injected</th><th>VC</th><th>LLM</th><th>Total</th><th></th></tr></thead>
+    <table class="log-table" id="log-table">
+      <thead><tr><th>T#</th><th>Session</th><th>Inbound Tags</th><th>Response Tags</th><th>Message</th><th>Payload</th><th>Tokens</th><th>Base</th><th>Injected</th><th>VC</th><th>LLM</th><th>Total</th><th></th></tr></thead>
       <tbody id="log-body"></tbody>
     </table>
   </div>
@@ -1385,6 +1506,9 @@ _DASHBOARD_HTML = """\
   let cumActualInput = 0, cumBaselineInput = 0, baselineHistoryTokens = 0;
   let latestSystemTokens = 0;
   const BASELINE_RATIO = 0.30;
+  let activeSessionFilter = null;
+  let liveSessions = [];
+  let gridManager = null;
 
   const logScroll = $('log-scroll');
   logScroll.addEventListener('scroll', () => {
@@ -1492,14 +1616,20 @@ _DASHBOARD_HTML = """\
     return (tags || []).join(', ');
   }
 
+  function rowId(sessionId, turn) {
+    return 'req-' + (sessionId || '').substring(0, 8) + '-' + turn;
+  }
+
   function addRequestRow(evt) {
     const body = $('log-body');
     const tr = document.createElement('tr');
-    tr.className = 'flash';
-    tr.id = 'req-' + evt.turn;
+    tr.className = evt.passthrough ? 'passthrough-row' : 'flash';
+    var sid = evt.session_id || '';
+    tr.id = rowId(sid, evt.turn);
+    tr.dataset.session = sid;
     if (evt.broad) tr.dataset.broad = '1';
     if (evt.temporal) tr.dataset.temporal = '1';
-    const tagStr = buildTagCell(evt.tags, evt.broad, evt.temporal);
+    const tagStr = evt.passthrough ? '<span class="passthrough-badge">PASSTHROUGH</span>' : buildTagCell(evt.tags, evt.broad, evt.temporal);
     const preview = (evt.message_preview || '').substring(0, 50);
     const vcMs = evt.overhead_ms !== undefined ? evt.overhead_ms : Math.round((evt.wait_ms || 0) + (evt.inbound_ms || 0));
     // Payload: filtered/total turns
@@ -1510,23 +1640,27 @@ _DASHBOARD_HTML = """\
       payload = String(evt.total_turns);
     }
     const tokens = evt.input_tokens ? fmtNum(evt.input_tokens) + 't' : '\\u2014';
+    const rawBaseline = evt.raw_input_tokens ? fmtNum(evt.raw_input_tokens) + 't' : '';
     const injected = fmtNum(evt.context_tokens || 0) + 't';
     tr.innerHTML =
       '<td>' + (evt.turn ?? '') + '</td>' +
+      '<td class="session-cell" title="' + sid + '" onclick="filterBySession(\\'' + sid + '\\');return false">' + sid + '</td>' +
       '<td class="tags-cell">' + tagStr + '</td>' +
       '<td class="tags-cell resp-tags"></td>' +
       '<td class="msg-cell" title="' + preview.replace(/"/g,'&quot;') + '">' + preview + '</td>' +
       '<td>' + payload + '</td>' +
       '<td>' + tokens + '</td>' +
-      '<td class="baseline-cell timing-pending">\\u2014</td>' +
+      '<td class="baseline-cell' + (rawBaseline ? '' : ' timing-pending') + '">' + (rawBaseline || '\\u2014') + '</td>' +
       '<td>' + injected + '</td>' +
       '<td class="timing-vc">' + fmtTime(vcMs) + '</td>' +
       '<td class="timing-llm timing-pending">\\u2014</td>' +
       '<td class="timing-total timing-pending">\\u2014</td>' +
       '<td><a href="#" onclick="inspectRequest(' + evt.turn + ');return false" style="color:var(--accent);font-size:11px">inspect</a></td>';
+    if (gridManager) gridManager.reorderNewRow(tr);
     body.insertBefore(tr, body.firstChild);
     // Keep max 200 rows
     while (body.children.length > 200) body.removeChild(body.lastChild);
+    if (activeSessionFilter && sid !== activeSessionFilter) tr.style.display = 'none';
     if (autoScroll) logScroll.scrollTop = 0;
   }
 
@@ -1534,7 +1668,9 @@ _DASHBOARD_HTML = """\
     const body = $('log-body');
     const tr = document.createElement('tr');
     tr.className = 'ingested-row';
-    tr.id = 'req-' + evt.turn;
+    var sid = evt.session_id || '';
+    tr.id = rowId(sid, evt.turn);
+    tr.dataset.session = sid;
     const preview = (evt.message_preview || '').substring(0, 50);
     // Tags go in response column (generated from user+assistant pair)
     var tagHtml = '';
@@ -1547,18 +1683,22 @@ _DASHBOARD_HTML = """\
     }
     tr.innerHTML =
       '<td>' + (evt.turn ?? '') + '</td>' +
+      '<td class="session-cell" title="' + sid + '" onclick="filterBySession(\\'' + sid + '\\');return false">' + sid + '</td>' +
       '<td class="tags-cell"><span class="ingested-badge">HISTORY</span></td>' +
-      '<td class="tags-cell">' + tagHtml + '</td>' +
+      '<td class="tags-cell resp-tags">' + tagHtml + '</td>' +
       '<td class="msg-cell" title="' + preview.replace(/"/g,'&quot;') + '">' + preview + '</td>' +
       '<td></td><td></td><td class="baseline-cell"></td><td></td>' +
       '<td></td><td></td><td></td><td></td>';
+    if (gridManager) gridManager.reorderNewRow(tr);
     body.insertBefore(tr, body.firstChild);
+    if (activeSessionFilter && sid !== activeSessionFilter) tr.style.display = 'none';
   }
 
   let lastSessionFetchTurn = -1;
 
   function fillResponseTags(row, tags, primaryTag) {
-    const respCell = row.children[2];
+    const respCell = row.querySelector('.resp-tags');
+    if (!respCell) return;
     respCell.innerHTML = (tags || []).join(', ');
     if (primaryTag) {
       respCell.innerHTML = '<strong>' + primaryTag + '</strong>' +
@@ -1567,13 +1707,15 @@ _DASHBOARD_HTML = """\
   }
 
   function handleTurnComplete(evt) {
-    const row = $('req-' + evt.turn);
+    const row = $(rowId(evt.session_id, evt.turn));
     if (row) {
       fillResponseTags(row, evt.tags, evt.primary_tag);
       row.className = 'flash';
     }
     totalTurns = Math.max(totalTurns, evt.turn + 1);
-    // Baseline simulation: system prompt + growing history per turn
+    // Baseline accumulation from turn_pair_tokens (fallback for headless mode).
+    // In proxy mode the request event provides raw_input_tokens which is more
+    // accurate — check whether the baseline cell was already filled.
     const tpt = evt.turn_pair_tokens || 0;
     baselineHistoryTokens += tpt;
     if (baselineHistoryTokens > contextWindow) {
@@ -1581,12 +1723,14 @@ _DASHBOARD_HTML = """\
       const compactable = Math.max(0, baselineHistoryTokens - prot);
       baselineHistoryTokens = Math.round(compactable * BASELINE_RATIO) + prot;
     }
-    cumBaselineInput += latestSystemTokens + baselineHistoryTokens;
-    // Update baseline cell in grid row
+    // Only accumulate turn-pair baseline + update cell if raw baseline wasn't
+    // already provided by the request event (cell still shows timing-pending).
     if (row) {
       const baseCell = row.querySelector('.baseline-cell');
-      if (baseCell) {
-        baseCell.textContent = fmtNum(latestSystemTokens + baselineHistoryTokens) + 't';
+      if (baseCell && baseCell.classList.contains('timing-pending')) {
+        const fallbackBaseline = latestSystemTokens + baselineHistoryTokens;
+        cumBaselineInput += fallbackBaseline;
+        baseCell.textContent = fmtNum(fallbackBaseline) + 't';
         baseCell.classList.remove('timing-pending');
       }
     }
@@ -1605,7 +1749,7 @@ _DASHBOARD_HTML = """\
   }
 
   function handleResponse(evt) {
-    const row = $('req-' + evt.turn);
+    const row = $(rowId(evt.session_id, evt.turn));
     if (!row) return;
     const llmCell = row.querySelector('.timing-llm');
     const totalCell = row.querySelector('.timing-total');
@@ -1660,6 +1804,8 @@ _DASHBOARD_HTML = """\
       latestSystemTokens = data.recent_requests[data.recent_requests.length - 1].system_tokens || 0;
     }
 
+    liveSessions = data.live_sessions || [];
+
     updateStats();
     updatePipeline();
     updateMemory();
@@ -1683,9 +1829,10 @@ _DASHBOARD_HTML = """\
       if (h.baseline_history_tokens) snapBaselineHist = h.baseline_history_tokens;
       handleHistoryIngestion(h);
     });
-    // Process turn_completes: fill response tags + accumulate baseline on top of ingested
+    // Process turn_completes: fill response tags + fallback baseline for cells
+    // not already populated by raw_input_tokens from the request event.
     (data.turn_completes || []).forEach(function(tc) {
-      var row = $('req-' + tc.turn);
+      var row = $(rowId(tc.session_id, tc.turn));
       if (row && tc.tags && tc.tags.length) {
         fillResponseTags(row, tc.tags, tc.primary_tag);
       }
@@ -1696,9 +1843,10 @@ _DASHBOARD_HTML = """\
         var compactable = Math.max(0, snapBaselineHist - prot);
         snapBaselineHist = Math.round(compactable * BASELINE_RATIO) + prot;
       }
+      // Only fill baseline cell if raw_input_tokens didn't already fill it
       if (row) {
         var baseCell = row.querySelector('.baseline-cell');
-        if (baseCell) {
+        if (baseCell && baseCell.classList.contains('timing-pending')) {
           baseCell.textContent = fmtNum(latestSystemTokens + snapBaselineHist) + 't';
           baseCell.classList.remove('timing-pending');
         }
@@ -1710,48 +1858,189 @@ _DASHBOARD_HTML = """\
   }
 
   // Sessions
+  var storedSessions = [];
+
   function fetchSessions() {
     fetch('/dashboard/sessions')
       .then(r => r.json())
-      .then(data => renderSessions(data.sessions))
+      .then(data => {
+        storedSessions = data.sessions || [];
+        renderSessionsPanel();
+      })
       .catch(() => {});
   }
 
-  function renderSessions(sessions) {
-    const list = $('session-list');
-    if (!sessions || sessions.length === 0) {
-      list.innerHTML = '<span class="empty-state">no sessions with stored segments yet</span>';
+  function fetchLiveSessions() {
+    fetch('/dashboard/sessions/live')
+      .then(r => r.json())
+      .then(data => {
+        liveSessions = data || [];
+        renderSessionsPanel();
+      })
+      .catch(() => {});
+  }
+
+  function renderSessionsPanel() {
+    var list = $('session-list');
+    var storedMap = {};
+    (storedSessions || []).forEach(function(s) { storedMap[s.session_id] = s; });
+    var liveMap = {};
+    (liveSessions || []).forEach(function(s) { liveMap[s.session_id] = s; });
+
+    // Merge: all live sessions + stored-only sessions
+    var allIds = [];
+    var seen = {};
+    (liveSessions || []).forEach(function(s) {
+      if (!seen[s.session_id]) { allIds.push(s.session_id); seen[s.session_id] = true; }
+    });
+    (storedSessions || []).forEach(function(s) {
+      if (!seen[s.session_id]) { allIds.push(s.session_id); seen[s.session_id] = true; }
+    });
+
+    if (allIds.length === 0) {
+      list.innerHTML = '<span class="empty-state">no sessions yet</span>';
       return;
     }
-    list.innerHTML = sessions.map(s => {
-      const idShort = s.session_id;
-      const ratio = s.compression_ratio > 0 ? Math.round(s.compression_ratio * 100) + '%' : '--';
-      const freed = s.total_full_tokens - s.total_summary_tokens;
-      const tagHtml = (s.distinct_tags || []).slice(0, 8).map(
-        t => '<span class="tag">' + t + '</span>'
-      ).join('');
-      const more = (s.distinct_tags || []).length > 8
-        ? '<span class="tag">+' + ((s.distinct_tags || []).length - 8) + '</span>' : '';
-      const oldest = s.oldest_segment ? new Date(s.oldest_segment).toLocaleString() : '--';
-      const newest = s.newest_segment ? new Date(s.newest_segment).toLocaleString() : '--';
-      const delBtn = s.is_current ? '' :
-        '<button class="session-delete" onclick="deleteSession(\\'' + s.session_id + '\\')">Delete</button>';
-      return '<div class="session-card' + (s.is_current ? ' current' : '') + '">' +
+
+    list.innerHTML = allIds.map(function(sid) {
+      var live = liveMap[sid];
+      var stored = storedMap[sid];
+      var isCurrent = stored ? stored.is_current : !!live;
+      var isLiveOnly = live && !stored;
+
+      var html = '<div class="session-card' + (isCurrent ? ' current' : '') +
+        '" style="cursor:pointer" onclick="filterBySession(\\'' + sid + '\\')">' +
         '<div class="session-header">' +
-          '<span class="session-id">' + idShort + '</span>' +
-          (s.is_current ? '<span class="session-badge">CURRENT</span>' : '') +
-          delBtn +
-        '</div>' +
-        '<div class="session-stats">' +
-          '<div><span class="label">Segments</span><br><span class="val">' + s.segment_count + '</span></div>' +
-          '<div><span class="label">Full Tokens</span><br><span class="val">' + fmtNum(s.total_full_tokens) + '</span></div>' +
-          '<div><span class="label">Compression</span><br><span class="val">' + ratio + '</span></div>' +
-          '<div><span class="label">Freed</span><br><span class="val">' + fmtNum(freed) + 't</span></div>' +
-        '</div>' +
-        '<div class="session-tags">' + tagHtml + more + '</div>' +
-        '<div class="session-time">' + oldest + ' \\u2192 ' + newest + '</div>' +
-        (s.compaction_model ? '<div class="session-time">model: ' + s.compaction_model + '</div>' : '') +
-      '</div>';
+          '<span class="session-id">' + sid + '</span>' +
+          '<div class="session-header-right">';
+
+      if (live && live.session_state) {
+        var st = live.session_state;
+        var stLabel = st.toUpperCase();
+        html += '<span class="state-badge ' + st + '">' + stLabel + '</span>';
+        var toggleLabel = live.manual_passthrough ? 'Enable VC' : 'Disable VC';
+        html += '<button class="passthrough-toggle" onclick="event.stopPropagation();togglePassthrough(\\'' + sid + '\\',' + !live.manual_passthrough + ')">' + toggleLabel + '</button>';
+      } else if (isLiveOnly) {
+        html += '<span class="live-badge">LIVE</span>';
+      } else if (isCurrent) {
+        html += '<span class="session-badge">CURRENT</span>';
+      }
+
+      if (stored && !isCurrent) {
+        html += '<button class="session-delete" onclick="event.stopPropagation();deleteSession(\\'' + sid + '\\')">Delete</button>';
+      }
+      html += '</div></div>';
+
+      // Ingestion progress bar
+      if (live && live.session_state === 'ingesting' && live.ingestion_progress) {
+        var done = live.ingestion_progress[0] || 0;
+        var total = live.ingestion_progress[1] || 1;
+        var pct = Math.round((done / total) * 100);
+        html += '<div class="ingestion-progress"><div class="ingestion-progress-fill" style="width:' + pct + '%"></div></div>';
+        html += '<div class="ingestion-progress-label" style="font-size:10px;color:var(--text-dim);margin-top:2px">Ingesting: ' + done + '/' + total + ' (' + pct + '%)</div>';
+      }
+
+      // Metrics grid — 4 label/value columns, labels right-aligned, values left-aligned
+      function fmtTokens(t) {
+        if (t >= 10000) return Math.round(t / 1000) + 'k';
+        if (t >= 1000) return (t / 1000).toFixed(1) + 'k';
+        return t + '';
+      }
+      function fmtKB(kb) {
+        if (kb === null || kb === undefined) return '--';
+        if (kb >= 1024) return (kb / 1024).toFixed(1) + 'MB';
+        return kb.toFixed(1) + 'KB';
+      }
+      function fmtPayload(kb, tokens) {
+        var s = fmtKB(kb);
+        if (tokens) s += ' / ' + fmtTokens(tokens) + 't';
+        return s;
+      }
+      function mc(label, val, cls) {
+        var valCls = cls ? ' ' + cls : '';
+        return '<span class="ml">' + label + '</span><span class="mv' + valCls + '">' + val + '</span>';
+      }
+      // empty pair to fill unused grid slots
+      function me() { return '<span class="ml"></span><span class="mv"></span>'; }
+
+      html += '<div class="metrics-grid">';
+
+      if (live) {
+        var initT = live.initial_turns != null ? live.initial_turns : '--';
+        var initTags = live.initial_tag_count != null ? live.initial_tag_count : '--';
+        // Row 1: turns, tags, compacted, distinct
+        html += mc('Turns', initT + '\\u2192' + live.turn_count);
+        html += mc('Tags', initTags + '\\u2192' + live.tag_count);
+        html += mc('Compacted', 'T' + Math.floor(live.compacted_through / 2));
+        html += mc('Distinct', (live.distinct_tags || 0));
+
+        // Row 2: window, history, utilization, segments/summaries
+        var cw = live.context_window || 0;
+        var ht = live.history_tokens || 0;
+        var utilPct = live.utilization_pct || 0;
+        var utilClass = utilPct > 85 ? 'red' : (utilPct > 60 ? 'yellow' : 'green');
+        var barClass = utilPct > 85 ? 'danger' : (utilPct > 60 ? 'warn' : '');
+        html += mc('Window', fmtTokens(cw) + 't');
+        html += mc('History', fmtTokens(ht) + 't');
+        html += mc('Util', utilPct + '%', utilClass);
+        if (stored) {
+          html += mc('Segments', stored.segment_count);
+        } else if ((live.tag_summary_count || 0) > 0) {
+          html += mc('Summaries', live.tag_summary_count + ' (' + fmtTokens(live.tag_summary_tokens || 0) + 't)');
+        } else {
+          html += me();
+        }
+
+        // Util bar (full width)
+        html += '<div class="util-bar"><div class="util-fill ' + barClass + '" style="width:' + Math.min(utilPct, 100) + '%"></div></div>';
+
+        // Row 3: payload sizes with token counts
+        html += mc('Initial', fmtPayload(live.initial_payload_kb, live.initial_payload_tokens));
+        html += mc('Last Raw', fmtPayload(live.last_payload_kb, live.last_payload_tokens));
+        html += mc('Enriched', fmtPayload(live.last_enriched_payload_kb, live.last_enriched_payload_tokens));
+        if (stored && (live.tag_summary_count || 0) > 0) {
+          html += mc('Summaries', live.tag_summary_count + ' (' + fmtTokens(live.tag_summary_tokens || 0) + 't)');
+        } else {
+          html += me();
+        }
+
+      } else if (stored) {
+        // Stored-only session
+        html += mc('Segments', stored.segment_count);
+        var ratio = stored.compression_ratio > 0 ? Math.round(stored.compression_ratio * 100) + '%' : '--';
+        var freed = stored.total_full_tokens - stored.total_summary_tokens;
+        html += mc('Compression', ratio);
+        html += mc('Freed', fmtNum(freed) + 't');
+        html += me();
+      }
+
+      html += '</div>';
+
+      // Active tags for live sessions
+      if (live && live.active_tags && live.active_tags.length) {
+        html += '<div class="session-tags">';
+        live.active_tags.slice(0, 8).forEach(function(t) {
+          html += '<span class="tag">' + t + '</span>';
+        });
+        if (live.active_tags.length > 8) html += '<span class="tag">+' + (live.active_tags.length - 8) + '</span>';
+        html += '</div>';
+      } else if (stored && stored.distinct_tags) {
+        var tagHtml = (stored.distinct_tags || []).slice(0, 8).map(
+          function(t) { return '<span class="tag">' + t + '</span>'; }
+        ).join('');
+        var more = (stored.distinct_tags || []).length > 8
+          ? '<span class="tag">+' + ((stored.distinct_tags || []).length - 8) + '</span>' : '';
+        html += '<div class="session-tags">' + tagHtml + more + '</div>';
+      }
+
+      if (stored) {
+        var oldest = stored.oldest_segment ? new Date(stored.oldest_segment).toLocaleString() : '--';
+        var newest = stored.newest_segment ? new Date(stored.newest_segment).toLocaleString() : '--';
+        html += '<div class="session-time">' + oldest + ' \\u2192 ' + newest + '</div>';
+      }
+
+      html += '</div>';
+      return html;
     }).join('');
   }
 
@@ -1801,6 +2090,29 @@ _DASHBOARD_HTML = """\
     }
   }
 
+  var _ingestionFetchPending = false;
+  function updateIngestionProgress(evt) {
+    if (!evt.done || !evt.total) return;
+    var done = evt.done, total = evt.total;
+    var pct = Math.round((done / total) * 100);
+    // Update progress bar fill if it exists in the DOM
+    var fills = document.querySelectorAll('.ingestion-progress-fill');
+    if (fills.length === 0 && !_ingestionFetchPending) {
+      // Progress bar not rendered yet — fetch live sessions to create it
+      _ingestionFetchPending = true;
+      fetchLiveSessions();
+      setTimeout(function() { _ingestionFetchPending = false; }, 1000);
+      return;
+    }
+    fills.forEach(function(el) { el.style.width = pct + '%'; });
+    // Update text label below progress bar
+    var labels = document.querySelectorAll('.ingestion-progress-label');
+    labels.forEach(function(el) { el.textContent = 'Ingesting: ' + done + '/' + total + ' (' + pct + '%)'; });
+    // Update header ingestion status too
+    var hdr = $('ingestion-status');
+    if (hdr) hdr.textContent = 'Ingesting: ' + done + '/' + total + ' (' + pct + '%)';
+  }
+
   function handleReplayProgress(data) {
     const pct = data.total > 0 ? Math.round((data.turn / data.total) * 100) : 0;
     $('replay-fill').style.width = pct + '%';
@@ -1829,6 +2141,273 @@ _DASHBOARD_HTML = """\
     updateSavings();
   }
 
+  // Session filter
+  window.filterBySession = function(sessionId) {
+    if (!sessionId) return;
+    activeSessionFilter = sessionId;
+    $('session-filter').style.display = '';
+    $('session-filter-id').textContent = sessionId;
+    var rows = $('log-body').children;
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].style.display = (rows[i].dataset.session === sessionId) ? '' : 'none';
+    }
+  };
+
+  window.clearSessionFilter = function() {
+    activeSessionFilter = null;
+    $('session-filter').style.display = 'none';
+    var rows = $('log-body').children;
+    for (var i = 0; i < rows.length; i++) rows[i].style.display = '';
+  };
+
+  // GridManager: resizable, draggable, toggleable columns
+  function GridManager(tableId, storageKey) {
+    this.table = document.getElementById(tableId);
+    if (!this.table) return;
+    this.storageKey = storageKey;
+    this.thead = this.table.querySelector('thead tr');
+    this.colCount = this.thead.children.length;
+    this.order = [];
+    this.widths = {};
+    this.hidden = [];
+    for (var i = 0; i < this.colCount; i++) this.order.push(i);
+    this._loadState();
+    this._initColgroup();
+    this._initResize();
+    this._initDrag();
+    this._applyHidden();
+  }
+
+  GridManager.prototype._loadState = function() {
+    try {
+      var raw = localStorage.getItem(this.storageKey);
+      if (!raw) return;
+      var s = JSON.parse(raw);
+      if (s.order && s.order.length === this.colCount) this.order = s.order;
+      if (s.widths) this.widths = s.widths;
+      if (s.hidden) this.hidden = s.hidden;
+      // Apply saved column order
+      if (s.order && s.order.length === this.colCount) this._reorderAll();
+    } catch(e) {}
+  };
+
+  GridManager.prototype._saveState = function() {
+    try {
+      localStorage.setItem(this.storageKey, JSON.stringify({
+        order: this.order, widths: this.widths, hidden: this.hidden
+      }));
+    } catch(e) {}
+  };
+
+  GridManager.prototype._initColgroup = function() {
+    var cg = document.createElement('colgroup');
+    for (var i = 0; i < this.colCount; i++) {
+      var col = document.createElement('col');
+      if (this.widths[i]) col.style.width = this.widths[i] + 'px';
+      cg.appendChild(col);
+    }
+    this.table.insertBefore(cg, this.table.firstChild);
+    this.colgroup = cg;
+  };
+
+  GridManager.prototype._initResize = function() {
+    var self = this;
+    var ths = this.thead.children;
+    for (var i = 0; i < ths.length - 1; i++) { // skip last col (actions)
+      var handle = document.createElement('div');
+      handle.className = 'col-resize';
+      handle.dataset.col = String(i);
+      ths[i].appendChild(handle);
+      handle.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var colIdx = parseInt(this.dataset.col);
+        var startX = e.clientX;
+        var col = self.colgroup.children[colIdx];
+        var startW = col.offsetWidth || ths[colIdx].offsetWidth;
+        this.classList.add('active');
+        var hnd = this;
+        function onMove(ev) {
+          var w = Math.max(40, startW + (ev.clientX - startX));
+          col.style.width = w + 'px';
+        }
+        function onUp() {
+          hnd.classList.remove('active');
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          var finalW = parseInt(col.style.width) || 40;
+          self.widths[colIdx] = finalW;
+          self._saveState();
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    }
+  };
+
+  GridManager.prototype._initDrag = function() {
+    var self = this;
+    var ths = this.thead.children;
+    for (var i = 0; i < ths.length; i++) {
+      ths[i].setAttribute('draggable', 'true');
+      ths[i].dataset.logicalCol = String(i);
+      ths[i].addEventListener('dragstart', function(e) {
+        if (e.target.classList.contains('col-resize')) { e.preventDefault(); return; }
+        e.dataTransfer.setData('text/plain', this.dataset.logicalCol);
+        this.classList.add('dragging');
+      });
+      ths[i].addEventListener('dragend', function() {
+        this.classList.remove('dragging');
+        var allTh = self.thead.children;
+        for (var j = 0; j < allTh.length; j++) allTh[j].classList.remove('drag-over');
+      });
+      ths[i].addEventListener('dragover', function(e) { e.preventDefault(); this.classList.add('drag-over'); });
+      ths[i].addEventListener('dragleave', function() { this.classList.remove('drag-over'); });
+      ths[i].addEventListener('drop', function(e) {
+        e.preventDefault();
+        this.classList.remove('drag-over');
+        var fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+        var toIdx = parseInt(this.dataset.logicalCol);
+        if (fromIdx === toIdx || isNaN(fromIdx) || isNaN(toIdx)) return;
+        // Reorder in self.order
+        var orderFrom = self.order.indexOf(fromIdx);
+        var orderTo = self.order.indexOf(toIdx);
+        if (orderFrom < 0 || orderTo < 0) return;
+        self.order.splice(orderFrom, 1);
+        if (orderFrom < orderTo) orderTo--;
+        self.order.splice(orderTo, 0, fromIdx);
+        self._reorderAll();
+        self._saveState();
+      });
+    }
+  };
+
+  GridManager.prototype._reorderAll = function() {
+    var rows = this.table.querySelectorAll('tr');
+    for (var r = 0; r < rows.length; r++) {
+      this._reorderRow(rows[r]);
+    }
+    // Reorder colgroup
+    if (this.colgroup) {
+      var cols = Array.from(this.colgroup.children);
+      var frag = document.createDocumentFragment();
+      for (var i = 0; i < this.order.length; i++) {
+        if (cols[this.order[i]]) frag.appendChild(cols[this.order[i]]);
+      }
+      this.colgroup.innerHTML = '';
+      this.colgroup.appendChild(frag);
+    }
+  };
+
+  GridManager.prototype._reorderRow = function(tr) {
+    var cells = Array.from(tr.children);
+    if (cells.length !== this.colCount) return;
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < this.order.length; i++) {
+      if (cells[this.order[i]]) frag.appendChild(cells[this.order[i]]);
+    }
+    tr.innerHTML = '';
+    tr.appendChild(frag);
+  };
+
+  GridManager.prototype.reorderNewRow = function(tr) {
+    // Check if order is default
+    var isDefault = true;
+    for (var i = 0; i < this.order.length; i++) {
+      if (this.order[i] !== i) { isDefault = false; break; }
+    }
+    if (!isDefault) this._reorderRow(tr);
+    // Apply hidden
+    this._applyHiddenToRow(tr);
+  };
+
+  GridManager.prototype._applyHidden = function() {
+    var rows = this.table.querySelectorAll('tr');
+    for (var r = 0; r < rows.length; r++) this._applyHiddenToRow(rows[r]);
+  };
+
+  GridManager.prototype._applyHiddenToRow = function(tr) {
+    var cells = tr.children;
+    for (var c = 0; c < cells.length; c++) {
+      var logIdx = this.order[c];
+      if (logIdx !== undefined && this.hidden.indexOf(logIdx) >= 0) {
+        cells[c].style.display = 'none';
+      } else {
+        cells[c].style.display = '';
+      }
+    }
+  };
+
+  GridManager.prototype.toggleColumn = function(logicalIdx) {
+    var pos = this.hidden.indexOf(logicalIdx);
+    if (pos >= 0) {
+      this.hidden.splice(pos, 1);
+    } else {
+      this.hidden.push(logicalIdx);
+    }
+    this._applyHidden();
+    this._saveState();
+  };
+
+  GridManager.prototype.isHidden = function(logicalIdx) {
+    return this.hidden.indexOf(logicalIdx) >= 0;
+  };
+
+  GridManager.prototype.resetDefaults = function() {
+    this.order = [];
+    for (var i = 0; i < this.colCount; i++) this.order.push(i);
+    this.widths = {};
+    this.hidden = [];
+    // Reset colgroup widths
+    if (this.colgroup) {
+      var cols = this.colgroup.children;
+      for (var c = 0; c < cols.length; c++) cols[c].style.width = '';
+    }
+    this._reorderAll();
+    this._applyHidden();
+    try { localStorage.removeItem(this.storageKey); } catch(e) {}
+  };
+
+  // Column toggle menu
+  window.toggleColMenu = function(btn) {
+    var existing = document.querySelector('.col-menu');
+    if (existing) { existing.remove(); return; }
+    if (!gridManager) return;
+    var menu = document.createElement('div');
+    menu.className = 'col-menu';
+    var headers = gridManager.thead.children;
+    var names = [];
+    for (var i = 0; i < headers.length; i++) {
+      names.push(headers[i].textContent.replace(/[\\n]/g, '').trim() || 'Col ' + i);
+    }
+    // Use logical indices (original order)
+    for (var li = 0; li < gridManager.colCount; li++) {
+      var label = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !gridManager.isHidden(li);
+      if (li === 0) { cb.disabled = true; cb.checked = true; } // T# always visible
+      cb.dataset.logicalCol = String(li);
+      cb.addEventListener('change', function() {
+        gridManager.toggleColumn(parseInt(this.dataset.logicalCol));
+      });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(names[li] || 'Col ' + li));
+      menu.appendChild(label);
+    }
+    btn.parentElement.style.position = 'relative';
+    btn.parentElement.appendChild(menu);
+    // Close on outside click
+    setTimeout(function() {
+      document.addEventListener('click', function closer(e) {
+        if (!menu.contains(e.target) && e.target !== btn) {
+          menu.remove();
+          document.removeEventListener('click', closer);
+        }
+      });
+    }, 0);
+  };
+
   // SSE connection
   function connect() {
     $('conn-status').textContent = 'connecting...';
@@ -1855,6 +2434,7 @@ _DASHBOARD_HTML = """\
         contextSum += data.context_tokens || 0;
         totalContextInjected += data.context_tokens || 0;
         cumActualInput += data.input_tokens || 0;
+        if (data.raw_input_tokens) cumBaselineInput += data.raw_input_tokens;
         latestSystemTokens = data.system_tokens || latestSystemTokens;
         historyLen = data.history_len || historyLen;
         compactedThrough = data.compacted_through || compactedThrough;
@@ -1878,8 +2458,11 @@ _DASHBOARD_HTML = """\
         fetchSessions();
       } else if (data.type === 'ingested_turn') {
         addIngestedRow(data);
+        updateIngestionProgress(data);
       } else if (data.type === 'history_ingestion') {
         handleHistoryIngestion(data);
+      } else if (data.type === 'session_state_change') {
+        fetchLiveSessions();
       } else if (data.type === 'replay_progress') {
         handleReplayProgress(data);
       } else if (data.type === 'replay_done') {
@@ -1889,11 +2472,22 @@ _DASHBOARD_HTML = """\
   }
 
   window.deleteSession = function(sid) {
-    if (!confirm('Delete all stored segments for session ' + sid.substring(0, 12) + '...?')) return;
+    if (!confirm('Delete all stored segments for session ' + sid + '?')) return;
     fetch('/dashboard/sessions/' + sid, {method: 'DELETE'})
       .then(r => r.json())
       .then(data => { fetchSessions(); })
       .catch(() => {});
+  };
+
+  window.togglePassthrough = function(sid, enabled) {
+    fetch('/dashboard/sessions/' + sid + '/passthrough', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: enabled}),
+    })
+    .then(r => r.json())
+    .then(() => { fetchLiveSessions(); })
+    .catch(() => {});
   };
 
   window.shutdownProxy = function() {
@@ -2292,10 +2886,15 @@ _DASHBOARD_HTML = """\
     });
   };
 
+  // Initialize grid manager
+  gridManager = new GridManager('log-table', 'vc-grid-request-log');
+
   // Tick uptime every second
   setInterval(updateStats, 1000);
   // Refresh sessions periodically (catches compaction results even if events missed)
   setInterval(fetchSessions, 15000);
+  // Refresh live sessions periodically
+  setInterval(fetchLiveSessions, 10000);
   connect();
 })();
 </script>

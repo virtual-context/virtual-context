@@ -56,6 +56,35 @@ class TurnTagIndex:
                 return entry
         return None
 
+    def replace_tag(self, old_tag: str, turn_to_new_tags: dict[int, list[str]]) -> int:
+        """Replace old_tag with new sub-tags in matching entries.
+
+        Args:
+            old_tag: Tag to remove from entries.
+            turn_to_new_tags: {turn_number: [replacement_tags]}.
+
+        Returns:
+            Number of entries modified.
+        """
+        modified = 0
+        for entry in self.entries:
+            if old_tag in entry.tags:
+                new_tags = turn_to_new_tags.get(entry.turn_number)
+                if new_tags:
+                    entry.tags = [t for t in entry.tags if t != old_tag] + new_tags
+                    if entry.primary_tag == old_tag:
+                        entry.primary_tag = new_tags[0]
+                    modified += 1
+        return modified
+
+    def get_tag_counts(self) -> dict[str, int]:
+        """Return {tag: turn_count} for all tags in the index."""
+        counts: dict[str, int] = {}
+        for entry in self.entries:
+            for tag in entry.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        return counts
+
     def compute_cover_set(self, exclude_tags: set[str] | None = None) -> list[str]:
         """Greedy set cover: find minimum tags to touch every indexed turn.
 
