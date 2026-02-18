@@ -26,6 +26,8 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 | **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
 | **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | Broad detection loads all summaries; temporal detection retrieves by time position |
 | **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
+| **Content exceeds window** | Truncate or fail | Chunk and lose coherence | Collapse cold topics to make room, page in what's needed |
+| **Bidirectional control** | None | None (append-only) | Expand topics to full detail, collapse back to summaries, within fixed budget |
 | **Interpretability** | None | Opaque similarity scores | Visible tags, matched segments, budget breakdown per request |
 | **Latency** | Zero | Embedding computation per query | Subsecond with local models |
 
@@ -209,6 +211,25 @@ Prior conversation topics available for recall:
 ```
 
 This costs ~50-200 tokens and enables a natural drill-down loop: the user asks a broad question, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval.
+
+### Virtual Memory Paging
+
+RAG retrieves content and appends it to the context window. It never frees space from what's already there. When a 100k document needs to enter a 120k window that already has 60k of conversation history, RAG has three options: truncate (lossy), error (useless), or chunk (every chunking approach either costs extra user turns, loses cross-chunk coherence, or both). Nobody touches the existing 60k. It sits there, potentially full of stale context from 30 turns ago that nobody needs anymore.
+
+virtual-context treats the context window as managed memory. The three-layer compression hierarchy (raw turns, segment summaries, tag summaries) already stores data at every depth level. Paging makes this hierarchy bidirectional: topics can be expanded to full original detail or collapsed back to summaries, and the working set reshapes itself around whatever the user needs right now.
+
+```
+Tag summaries  <------->  Segment summaries  <------->  Full stored text
+     ^                          ^                            ^
+  collapse                   default                      expand
+  (~200t)                  (~2,000t)                   (~8,000t+)
+```
+
+When the LLM needs more detail on a topic ("What was the exact sourdough timing?"), it expands that topic from summary to full text. When budget pressure hits, cold topics are automatically collapsed. A 100k document enters the window by collapsing 60k of stale conversation to 8k of summaries, freeing 52k. The working set (a per-session map of which topics are loaded at which depth) persists across turns, so expansion decisions are stateful: recipes stays expanded until explicitly collapsed or evicted by budget pressure.
+
+**Model-tiered delegation.** Not all LLMs are equally capable of managing their own context. Weaker models (Haiku, small open-source) get a simplified topic list and can request expansions, but virtual-context handles all eviction decisions silently. Stronger models (Opus, Sonnet, GPT-4) see a full budget dashboard with token costs per topic, available budget, and depth levels, making explicit trade-off decisions. In both modes, virtual-context enforces budget constraints and falls back to automatic management when the LLM doesn't manage. The LLM drives, virtual-context enforces, like `madvise()` hints with kernel enforcement.
+
+**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `expand_topic` and `collapse_topic` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
 ### Three-Layer Memory Hierarchy
 
@@ -540,6 +561,8 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Tool | `recall_context` | Tag + retrieve + assemble context for a message |
 | Tool | `compact_context` | Trigger compaction on a message history |
 | Tool | `domain_status` | All tags with stats |
+| Tool | `expand_topic` | Expand a topic to segment or full detail depth |
+| Tool | `collapse_topic` | Collapse a topic back to summary or none |
 | Resource | `virtualcontext://domains` | List all tags |
 | Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
 | Prompt | `recall` | Suggest context retrieval for a topic |
