@@ -166,6 +166,21 @@ Use `pytest -m regression` to run all regression tests.
   - `test_proxy.py::TestContentFingerprintRouting::test_same_conversation_reuses_session_via_fingerprint`
   - `test_proxy.py::TestContentFingerprintRouting::test_marker_takes_priority_over_fingerprint`
 
+### BUG-013 — Empty turns produce phantom tag occurrences
+
+- **Symptom**: Tool-use turns with no text content still got tagged via context lookback, inflating TurnTagIndex
+- **Root cause**: No empty-content guard in `ingest_history()` or `on_turn_complete()`
+- **Fix**: Skip tagging when both user and assistant content are empty; use pair index for turn_number
+- **Tests**:
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_empty_pair_not_tagged`
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_whitespace_only_pair_not_tagged`
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_empty_user_nonempty_assistant_still_tagged`
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_nonempty_user_empty_assistant_still_tagged`
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_multiple_consecutive_empty_turns_skipped`
+  - `test_empty_turn_skip.py::TestIngestHistorySkipsEmptyTurns::test_ingested_count_excludes_skipped`
+  - `test_empty_turn_skip.py::TestOnTurnCompleteSkipsEmptyTurns::test_empty_latest_pair_not_tagged`
+  - `test_empty_turn_skip.py::TestOnTurnCompleteSkipsEmptyTurns::test_nonempty_latest_pair_still_tagged`
+
 ### BUG-011 — Tag splitter parser rejects string turn numbers from LLM
 
 - **Symptom**: Tag split always returns "Fewer than 2 valid groups" even when LLM returns a valid split — effectively disabling the entire tag splitting feature
@@ -199,4 +214,5 @@ Use `pytest -m regression` to run all regression tests.
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
 | `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014 |
+| `test_empty_turn_skip.py` | BUG-013 |
 | `test_tag_splitter.py` | BUG-011, BUG-012 |
