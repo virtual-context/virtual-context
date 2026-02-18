@@ -198,6 +198,27 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_tag_splitter.py::TestEngineTagSplitting::test_collect_turn_text_with_preamble_messages`
 
+### BUG-014 — Broad query + FULL-depth working set = incomplete overview
+
+- **Symptom**: Broad queries ("summarize everything") only show 1-2 expanded topics when those tags are at FULL depth in paging working set, missing 15+ other topic summaries
+- **Root cause**: Paging depth override consumes the tag budget before broad overview summaries can render; assembler's budget check terminates early
+- **Fix**: TBD — flatten working set to SUMMARY depth on broad queries
+- **Tests**: None yet (open)
+
+### BUG-015 — Temporal chronological ordering lost by paging depth override
+
+- **Symptom**: Temporal queries ("what did we first discuss?") lose time ordering when tags are at FULL depth in paging working set
+- **Root cause**: Assembler overrides temporal retriever's chronologically-sorted summaries with unordered full_segments from working set
+- **Fix**: TBD — skip working set depth override for temporal result tags
+- **Tests**: None yet (open)
+
+### BUG-016 — Working set segment loading runs unconditionally on every inbound
+
+- **Symptom**: Full segment DB reads for all FULL-depth working set tags happen on every inbound, even when retriever chose broad/temporal path where segments won't be used
+- **Root cause**: Paging segment loading block doesn't check retrieval_result.broad/temporal
+- **Fix**: TBD — gate segment loading on retrieval branch
+- **Tests**: None yet (open)
+
 ---
 
 ## By Test File
