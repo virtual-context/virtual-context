@@ -359,6 +359,12 @@ class VirtualContextEngine:
         latest_pair = self._get_latest_turn_pair(conversation_history)
         if latest_pair:
             combined_text = " ".join(m.content for m in latest_pair)
+
+            # BUG-013: Skip empty turns (tool_use/tool_result with no text)
+            if not combined_text.strip():
+                latest_pair = None
+
+        if latest_pair:
             store_tags = [ts.tag for ts in self._store.get_all_tags()]
             n_context = self.config.tag_generator.context_lookback_pairs
             context = self._get_recent_context(
@@ -1088,6 +1094,12 @@ class VirtualContextEngine:
         for i in range(0, len(history_pairs) - 1, 2):
             user_msg = history_pairs[i]
             asst_msg = history_pairs[i + 1]
+
+            # BUG-013: Skip empty turns (tool_use/tool_result with no text)
+            if not user_msg.content.strip() and not asst_msg.content.strip():
+                logger.debug("Skipping empty turn at pair index %d", i // 2)
+                continue
+
             combined_text = f"{user_msg.content} {asst_msg.content}"
 
             # Build context from preceding pairs in the flat history
@@ -1144,7 +1156,7 @@ class VirtualContextEngine:
                     )
 
             entry = TurnTagEntry(
-                turn_number=len(self._turn_tag_index.entries),
+                turn_number=i // 2,
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
