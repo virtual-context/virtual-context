@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..core.store import ContextStore
-from ..types import SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary
+from ..types import EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -59,6 +59,14 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS engine_state (
+    session_id TEXT PRIMARY KEY,
+    compacted_through INTEGER NOT NULL,
+    turn_count INTEGER NOT NULL,
+    turn_tag_entries TEXT NOT NULL,
+    saved_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
@@ -522,6 +530,71 @@ class SQLiteStore(ContextStore):
             )
             for row in rows
         ]
+
+    def save_engine_state(self, state: EngineStateSnapshot) -> None:
+        conn = self._get_conn()
+        entries_json = json.dumps([
+            {
+                "turn_number": e.turn_number,
+                "message_hash": e.message_hash,
+                "tags": e.tags,
+                "primary_tag": e.primary_tag,
+                "timestamp": _dt_to_str(e.timestamp),
+            }
+            for e in state.turn_tag_entries
+        ])
+        # Include split_processed_tags in the entries JSON blob
+        state_blob = json.dumps({
+            "turn_tag_entries": json.loads(entries_json),
+            "split_processed_tags": state.split_processed_tags,
+        })
+        conn.execute(
+            """INSERT OR REPLACE INTO engine_state
+            (session_id, compacted_through, turn_count, turn_tag_entries, saved_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                state.session_id,
+                state.compacted_through,
+                state.turn_count,
+                state_blob,
+                _dt_to_str(state.saved_at),
+            ),
+        )
+        conn.commit()
+
+    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM engine_state WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return None
+        raw = json.loads(row["turn_tag_entries"])
+        # Support both old format (list of entries) and new format (dict with split_processed_tags)
+        if isinstance(raw, dict):
+            entries_raw = raw.get("turn_tag_entries", [])
+            split_processed_tags = raw.get("split_processed_tags", [])
+        else:
+            entries_raw = raw
+            split_processed_tags = []
+        entries = [
+            TurnTagEntry(
+                turn_number=e["turn_number"],
+                message_hash=e["message_hash"],
+                tags=e["tags"],
+                primary_tag=e["primary_tag"],
+                timestamp=_str_to_dt(e["timestamp"]),
+            )
+            for e in entries_raw
+        ]
+        return EngineStateSnapshot(
+            session_id=row["session_id"],
+            compacted_through=row["compacted_through"],
+            turn_tag_entries=entries,
+            turn_count=row["turn_count"],
+            saved_at=_str_to_dt(row["saved_at"]),
+            split_processed_tags=split_processed_tags,
+        )
 
     def close(self) -> None:
         if self._conn:

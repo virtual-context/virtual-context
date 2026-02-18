@@ -24,11 +24,15 @@ from .types import (
     AssembledContext,
     CompactionReport,
     CompactionResult,
+    EngineStateSnapshot,
     Message,
     RetrievalResult,
     SessionCostSummary,
+    SplitResult,
     StoredSegment,
+    StoredSummary,
     TagResult,
+    TagSummary,
     TurnTagEntry,
     VirtualContextConfig,
 )
@@ -79,9 +83,15 @@ class VirtualContextEngine:
         self._init_assembler()
         self._init_retriever()
         self._init_compactor()
+        self._init_tag_splitter()
         self._init_cost_tracker()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
         self._embed_fn = _EMBED_NOT_LOADED  # lazy-loaded for context bleed gate
+        self._split_processed_tags: set[str] = set()
+        self._last_split_result: SplitResult | None = None
+
+        # Restore persisted state if available
+        self._load_persisted_state()
 
     def _init_canonicalizer(self) -> None:
         """Initialize the tag canonicalizer with store aliases."""
@@ -176,8 +186,52 @@ class VirtualContextEngine:
                 tag_rules=self.config.tag_rules,
             )
 
+    def _init_tag_splitter(self) -> None:
+        """Initialize tag splitter if enabled in config."""
+        self._tag_splitter = None
+        cfg = self.config.tag_generator.tag_splitting
+        if cfg.enabled and self._llm_provider:
+            from .core.tag_splitter import TagSplitter
+            self._tag_splitter = TagSplitter(
+                llm=self._llm_provider,
+                config=cfg,
+            )
+
     def _init_cost_tracker(self) -> None:
         self._cost_tracker = CostTracker(config=self.config.cost_tracking)
+
+    def _load_persisted_state(self) -> None:
+        """Restore TurnTagIndex and compaction watermark from store if available."""
+        try:
+            saved = self._store.load_engine_state(self.config.session_id)
+        except Exception:
+            return
+        if not saved:
+            return
+        self.config.session_id = saved.session_id
+        self._compacted_through = saved.compacted_through
+        self._turn_tag_index = TurnTagIndex()
+        for entry in saved.turn_tag_entries:
+            self._turn_tag_index.append(entry)
+        self._split_processed_tags = set(saved.split_processed_tags)
+        logger.info(
+            "Restored engine state: session=%s, compacted_through=%d, turns=%d, split_processed=%d",
+            saved.session_id[:12], saved.compacted_through,
+            len(saved.turn_tag_entries), len(saved.split_processed_tags),
+        )
+
+    def _save_state(self, conversation_history: list[Message]) -> None:
+        """Persist current engine state to store."""
+        try:
+            self._store.save_engine_state(EngineStateSnapshot(
+                session_id=self.config.session_id,
+                compacted_through=self._compacted_through,
+                turn_tag_entries=list(self._turn_tag_index.entries),
+                turn_count=len(conversation_history) // 2,
+                split_processed_tags=sorted(self._split_processed_tags),
+            ))
+        except Exception as e:
+            logger.error("Failed to save engine state: %s", e)
 
     def _build_provider(self, provider_name: str, provider_config: dict):
         """Build an LLM provider from config."""
@@ -342,6 +396,10 @@ class VirtualContextEngine:
                 primary_tag=tag_result.primary,
             ))
 
+        # Check for overly-broad tags needing splitting
+        if self._tag_splitter:
+            self._check_and_split_broad_tags(conversation_history)
+
         # Build snapshot (only count un-compacted messages)
         snapshot = self._monitor.build_snapshot(
             conversation_history[self._compacted_through:]
@@ -351,6 +409,7 @@ class VirtualContextEngine:
         signal = self._monitor.check(snapshot)
 
         if signal is None:
+            self._save_state(conversation_history)
             return None
 
         if self._compactor is None:
@@ -480,7 +539,154 @@ class VirtualContextEngine:
                 from datetime import timedelta
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
 
+        self._save_state(conversation_history)
         return report
+
+    def _check_and_split_broad_tags(
+        self, conversation_history: list[Message],
+    ) -> SplitResult | None:
+        """Check for overly-broad tags and split or summarize them."""
+        if not self._tag_splitter:
+            return None
+
+        cfg = self.config.tag_generator.tag_splitting
+        tag_counts = self._turn_tag_index.get_tag_counts()
+        total_turns = len(self._turn_tag_index.entries)
+
+        if total_turns == 0:
+            return None
+
+        # Find candidates: above both thresholds, not already processed
+        candidates = [
+            (tag, count) for tag, count in tag_counts.items()
+            if tag != "_general"
+            and tag not in self._split_processed_tags
+            and count >= cfg.frequency_threshold
+            and count / total_turns >= cfg.frequency_pct_threshold
+        ]
+
+        if not candidates:
+            return None
+
+        # Pick highest-frequency first
+        candidates.sort(key=lambda x: -x[1])
+        tag, count = candidates[0]
+
+        # Collect turn content
+        turn_contents = self._collect_turn_text(tag, conversation_history)
+        if not turn_contents:
+            self._split_processed_tags.add(tag)
+            return None
+
+        existing_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
+        result = self._tag_splitter.split(tag, turn_contents, existing_tags, total_turns)
+
+        if result.splittable:
+            # Apply split to TurnTagIndex
+            turn_to_new: dict[int, list[str]] = {}
+            for new_tag, turn_numbers in result.groups.items():
+                for tn in turn_numbers:
+                    turn_to_new.setdefault(tn, []).append(new_tag)
+            self._turn_tag_index.replace_tag(tag, turn_to_new)
+
+            # Register alias so old tag queries still resolve
+            if self._canonicalizer:
+                first_new = next(iter(result.groups))
+                self._canonicalizer.register_alias(tag, first_new)
+
+            # Update tagger vocabulary
+            if hasattr(self._tag_generator, '_tag_vocabulary'):
+                self._tag_generator._tag_vocabulary.pop(tag, None)
+                for new_tag, turns in result.groups.items():
+                    self._tag_generator._tag_vocabulary[new_tag] = len(turns)
+
+            logger.info(
+                "Split '%s' (%d turns) → %s",
+                tag, count, list(result.groups.keys()),
+            )
+        else:
+            # Fallback: build tag summary from raw turn text
+            self._build_broad_tag_summary(tag, conversation_history)
+            logger.info(
+                "Tag '%s' unsplittable (%s), built summary", tag, result.reason,
+            )
+
+        self._split_processed_tags.add(tag)
+        self._last_split_result = result
+        return result
+
+    @staticmethod
+    def _extract_turn_pairs(history: list[Message]) -> list[tuple[str, str]]:
+        """Extract user→assistant turn pairs from history, handling non-alternating messages.
+
+        Returns list of (user_text, assistant_text) tuples. Skips preamble-only
+        user messages (e.g., MemOS '# Role' injections) and handles consecutive
+        user messages by using the last user message before each assistant response.
+        """
+        pairs: list[tuple[str, str]] = []
+        last_user_text = ""
+        for msg in history:
+            if msg.role == "user":
+                last_user_text = msg.content
+            elif msg.role == "assistant" and last_user_text:
+                pairs.append((last_user_text, msg.content))
+                last_user_text = ""
+        return pairs
+
+    def _collect_turn_text(
+        self, tag: str, history: list[Message],
+    ) -> list[tuple[int, str]]:
+        """Collect truncated user text for turns tagged with the given tag."""
+        pairs = self._extract_turn_pairs(history)
+        result = []
+        for entry in self._turn_tag_index.entries:
+            if tag in entry.tags:
+                if entry.turn_number < len(pairs):
+                    text = pairs[entry.turn_number][0][:200]
+                    result.append((entry.turn_number, text))
+        return result
+
+    def _build_broad_tag_summary(
+        self, tag: str, history: list[Message],
+    ) -> None:
+        """Build a tag summary directly from raw turn text for unsplittable broad tags."""
+        if not self._compactor:
+            return
+
+        pairs = self._extract_turn_pairs(history)
+        texts = []
+        turn_numbers = []
+        for entry in self._turn_tag_index.entries:
+            if tag in entry.tags:
+                if entry.turn_number < len(pairs):
+                    user_text, assistant_text = pairs[entry.turn_number]
+                    texts.append(
+                        f"User: {user_text[:300]}\n"
+                        f"Assistant: {assistant_text[:300]}"
+                    )
+                    turn_numbers.append(entry.turn_number)
+
+        if not texts:
+            return
+
+        combined = "\n\n---\n\n".join(texts)
+        max_turn = max(turn_numbers) if turn_numbers else 0
+
+        synthetic = [StoredSummary(
+            ref=f"broad-{tag}",
+            tags=[tag],
+            summary=combined[:4000],
+            summary_tokens=len(combined[:4000]) // 4,
+        )]
+        summaries = self._compactor.compact_tag_summaries(
+            cover_tags=[tag],
+            tag_to_summaries={tag: synthetic},
+            tag_to_turns={tag: turn_numbers},
+            existing_tag_summaries={},
+            max_turn=max_turn,
+        )
+        for ts in summaries:
+            self._store.save_tag_summary(ts)
 
     def filter_history(
         self,
@@ -854,9 +1060,14 @@ class VirtualContextEngine:
                 from datetime import timedelta
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
 
+        self._save_state(conversation_history)
         return report
 
-    def ingest_history(self, history_pairs: list[Message]) -> int:
+    def ingest_history(
+        self,
+        history_pairs: list[Message],
+        progress_callback: callable | None = None,
+    ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
         Tags each user+assistant pair and appends entries to the live index.
@@ -864,6 +1075,8 @@ class VirtualContextEngine:
 
         Args:
             history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
+            progress_callback: Optional ``(done, total, entry)`` called after
+                each turn is ingested.  Used by the proxy for live progress.
 
         Returns:
             Number of turns ingested.
@@ -930,13 +1143,18 @@ class VirtualContextEngine:
                         source="inherited",
                     )
 
-            self._turn_tag_index.append(TurnTagEntry(
+            entry = TurnTagEntry(
                 turn_number=len(self._turn_tag_index.entries),
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
-            ))
+            )
+            self._turn_tag_index.append(entry)
             ingested += 1
+
+            if progress_callback:
+                total = len(history_pairs) // 2
+                progress_callback(ingested, total, entry)
 
             # Refresh store tags every 10 turns so new tags influence later tagging
             if ingested % 10 == 0:

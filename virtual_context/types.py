@@ -73,6 +73,24 @@ DEFAULT_TEMPORAL_PATTERNS: list[str] = [
 
 
 @dataclass
+class SplitResult:
+    """Result of analyzing a broad tag for splitting."""
+    tag: str                           # the broad tag that was analyzed
+    splittable: bool
+    groups: dict[str, list[int]] = field(default_factory=dict)  # new_tag → [turn_numbers]
+    reason: str = ""                   # if not splittable
+
+
+@dataclass
+class TagSplittingConfig:
+    """Configuration for automatic splitting of overly-broad tags."""
+    enabled: bool = False
+    frequency_threshold: int = 15       # min absolute turn count to trigger
+    frequency_pct_threshold: float = 0.15  # min relative frequency (count/total)
+    max_splits_per_turn: int = 1        # max tags to attempt per on_turn_complete
+
+
+@dataclass
 class TagGeneratorConfig:
     """Configuration for the tag generator."""
     type: str = "keyword"  # "llm" or "keyword"
@@ -90,6 +108,7 @@ class TagGeneratorConfig:
     context_lookback_pairs: int = 5  # Number of recent turn pairs to feed as context to tagger
     context_bleed_threshold: float = 0.1  # Embedding similarity gate: skip context below this (0 = disabled)
     disable_thinking: bool = False  # Prepend /no_think to prompts (for qwen3 models)
+    tag_splitting: TagSplittingConfig = field(default_factory=TagSplittingConfig)
 
 
 @dataclass
@@ -107,6 +126,17 @@ class TurnTagEntry:
     tags: list[str] = field(default_factory=list)
     primary_tag: str = "_general"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class EngineStateSnapshot:
+    """Serializable snapshot of engine state for persistence across restarts."""
+    session_id: str
+    compacted_through: int
+    turn_tag_entries: list[TurnTagEntry]
+    turn_count: int  # len(conversation_history) // 2
+    saved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
 
 
 @dataclass
@@ -432,6 +462,12 @@ class CostTrackingConfig:
 
 
 @dataclass
+class ProxyConfig:
+    request_log_dir: str = ".virtualcontext/request_log"
+    request_log_max_files: int = 50
+
+
+@dataclass
 class VirtualContextConfig:
     version: str = "0.2"
     storage_root: str = ".virtualcontext"
@@ -447,5 +483,6 @@ class VirtualContextConfig:
     summarization: SummarizationConfig = field(default_factory=SummarizationConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     cost_tracking: CostTrackingConfig = field(default_factory=CostTrackingConfig)
+    proxy: ProxyConfig = field(default_factory=ProxyConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
