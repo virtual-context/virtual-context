@@ -549,6 +549,7 @@ class FilesystemStore(ContextStore):
                 }
                 for ws in state.working_set
             ],
+            "trailing_fingerprint": state.trailing_fingerprint,
         }
         path.write_text(json.dumps(data, indent=2))
 
@@ -581,6 +582,7 @@ class FilesystemStore(ContextStore):
             saved_at=_str_to_dt(data["saved_at"]) if "saved_at" in data else datetime.now(timezone.utc),
             split_processed_tags=data.get("split_processed_tags", []),
             working_set=working_set,
+            trailing_fingerprint=data.get("trailing_fingerprint", ""),
         )
 
     def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
@@ -615,3 +617,19 @@ class FilesystemStore(ContextStore):
             return self._parse_engine_state_data(candidates[0][2])
         except (KeyError, ValueError):
             return None
+
+    def list_engine_state_fingerprints(self) -> dict[str, str]:
+        """Return {trailing_fingerprint: session_id} for all persisted sessions."""
+        state_dir = self.root / "_engine_state"
+        if not state_dir.is_dir():
+            return {}
+        result: dict[str, str] = {}
+        for path in state_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                fp = data.get("trailing_fingerprint", "")
+                if fp:
+                    result[fp] = data["session_id"]
+            except (json.JSONDecodeError, OSError, KeyError):
+                continue
+        return result

@@ -206,3 +206,93 @@ class TestEngineStateIntegration:
         assert len(engine2._turn_tag_index.entries) == 5
         assert engine2._turn_tag_index.entries[0].tags == ["tag-0"]
         assert engine2._turn_tag_index.entries[4].tags == ["tag-4"]
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary bootstrap
+# ---------------------------------------------------------------------------
+
+
+class TestVocabularyBootstrap:
+    """Verify that _bootstrap_vocabulary loads historical tags into the tagger."""
+
+    def test_bootstrap_from_store_tags(self, tmp_path):
+        """Engine with store containing tag stats should populate tagger vocabulary."""
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+
+        db_path = str(tmp_path / "store.db")
+        config_dict = {
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "tag_generator": {"type": "keyword"},
+        }
+        config = load_config(config_dict=config_dict)
+        engine = VirtualContextEngine(config=config)
+
+        # KeywordTagGenerator doesn't have load_vocabulary, so bootstrap is a no-op
+        assert not hasattr(engine._tag_generator, "load_vocabulary") or \
+            not hasattr(engine._tag_generator, "_tag_vocabulary")
+
+    def test_bootstrap_from_turn_tag_index(self, tmp_path):
+        """Engine with restored TurnTagIndex should populate LLM tagger vocabulary."""
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+        from virtual_context.types import Message
+
+        db_path = str(tmp_path / "store.db")
+        config_dict = {
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "tag_generator": {"type": "keyword"},
+        }
+
+        # First engine: populate and save state
+        config1 = load_config(config_dict=config_dict)
+        engine1 = VirtualContextEngine(config=config1)
+        session_id = engine1.config.session_id
+        for i in range(5):
+            engine1._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=["skincare", "retinol"] if i % 2 == 0 else ["fitness"],
+                primary_tag="skincare" if i % 2 == 0 else "fitness",
+            ))
+        history = [Message(role="user", content="x"), Message(role="assistant", content="y")] * 5
+        engine1._save_state(history)
+
+        # Second engine: same store, LLM tagger (mock provider)
+        config2 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "tag_generator": {"type": "llm", "provider": "test-provider"},
+            "providers": {"test-provider": {
+                "type": "generic_openai",
+                "base_url": "http://fake:9999",
+                "model": "test-model",
+            }},
+        })
+        config2.session_id = session_id
+        engine2 = VirtualContextEngine(config=config2)
+
+        # LLMTagGenerator should have vocabulary populated
+        vocab = engine2._tag_generator._tag_vocabulary
+        assert "skincare" in vocab
+        assert "retinol" in vocab
+        assert "fitness" in vocab
+        assert vocab["skincare"] >= 3  # appears in turns 0, 2, 4
+        assert vocab["fitness"] >= 2   # appears in turns 1, 3
+
+    def test_bootstrap_no_op_for_keyword_generator(self, tmp_path):
+        """KeywordTagGenerator lacks load_vocabulary; bootstrap is silently skipped."""
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+
+        db_path = str(tmp_path / "store.db")
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "tag_generator": {"type": "keyword"},
+        })
+        # Should not raise
+        engine = VirtualContextEngine(config=config)

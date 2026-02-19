@@ -88,6 +88,7 @@ def register_dashboard_routes(
     shutdown_event: asyncio.Event | None = None,
     *,
     registry: "object | None" = None,
+    instance_label: str = "",
 ) -> None:
     """Register ``/dashboard`` and ``/dashboard/events`` routes."""
 
@@ -144,6 +145,9 @@ def register_dashboard_routes(
                         except Exception:
                             pass
                 snap["live_sessions"] = live_sessions
+
+                if instance_label:
+                    snap["instance_label"] = instance_label
 
                 yield f"data: {json.dumps(snap)}\n\n"
 
@@ -522,7 +526,10 @@ def register_dashboard_routes(
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
-        return JSONResponse(_build_settings_response(state.engine.config))
+        resp = _build_settings_response(state.engine.config)
+        if instance_label:
+            resp["instance_label"] = instance_label
+        return JSONResponse(resp)
 
     @app.put("/dashboard/settings")
     async def dashboard_settings_put(request: Request):

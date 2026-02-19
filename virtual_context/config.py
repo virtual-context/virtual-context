@@ -17,6 +17,7 @@ from .types import (
     MonitorConfig,
     PagingConfig,
     ProxyConfig,
+    ProxyInstanceConfig,
     RetrieverConfig,
     SegmenterConfig,
     StorageConfig,
@@ -212,6 +213,16 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
 
     # Proxy settings
     proxy_raw = raw.get("proxy", {})
+    instances_raw = proxy_raw.get("instances", [])
+    instances = [
+        ProxyInstanceConfig(
+            port=inst.get("port", 5757),
+            upstream=inst.get("upstream", ""),
+            label=inst.get("label", ""),
+            host=inst.get("host", "127.0.0.1"),
+        )
+        for inst in instances_raw
+    ]
     proxy_config = ProxyConfig(
         request_log_dir=proxy_raw.get(
             "request_log_dir",
@@ -219,6 +230,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         ),
         request_log_max_files=proxy_raw.get("request_log_max_files", 50),
         upstream_context_limit=proxy_raw.get("upstream_context_limit", 200_000),
+        instances=instances,
     )
 
     # Paging settings
@@ -311,6 +323,21 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append(
             "paging.autonomous_models must be a list of model-name substrings"
         )
+
+    # Proxy instances validation
+    seen_ports: dict[str, int] = {}  # "host:port" -> index
+    for i, inst in enumerate(config.proxy.instances):
+        if not inst.upstream:
+            errors.append(
+                f"proxy.instances[{i}].upstream is required"
+            )
+        key = f"{inst.host}:{inst.port}"
+        if key in seen_ports:
+            errors.append(
+                f"proxy.instances[{i}] duplicates {key} "
+                f"(same as instances[{seen_ports[key]}])"
+            )
+        seen_ports[key] = i
 
     # Check that summarization provider exists in providers
     if config.providers and config.summarization.provider not in config.providers:

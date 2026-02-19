@@ -422,7 +422,7 @@
 
 <header>
   <div class="dot"></div>
-  <h1>virtual-context proxy</h1>
+  <h1>virtual-context proxy<span id="instance-label" style="color:var(--text-dim);font-weight:400;font-size:13px"></span></h1>
   <span class="status" id="conn-status">connecting...</span>
   <span class="status" id="ingestion-status" style="margin-left:8px;color:var(--accent)"></span>
   <button class="shutdown-btn" style="border-color:var(--accent);color:var(--accent)" onclick="exportSession()">Export</button>
@@ -546,13 +546,16 @@
       <div class="value" id="sv-avg-ctx">0</div>
       <div class="savings-detail">enrichment per turn</div>
     </div>
+    <div class="savings-metric">
+      <div class="label">Last Compaction</div>
+      <div class="value" id="sv-last-compact">--</div>
+      <div class="savings-detail" id="sv-last-compact-detail">no compactions yet</div>
+    </div>
   </div>
   <table class="cost-table" id="cost-table">
-    <thead><tr><th>Model Tier</th><th>$/MTok</th><th>Baseline</th><th>VC</th><th>Saved</th><th>%</th></tr></thead>
-    <tbody>
-      <tr><td>Haiku-class</td><td>$0.25</td><td id="cost-haiku-base">--</td><td id="cost-haiku-vc">--</td><td class="saved" id="cost-haiku">--</td><td class="saved" id="cost-haiku-pct">--</td></tr>
-      <tr><td>Sonnet-class</td><td>$3.00</td><td id="cost-sonnet-base">--</td><td id="cost-sonnet-vc">--</td><td class="saved" id="cost-sonnet">--</td><td class="saved" id="cost-sonnet-pct">--</td></tr>
-      <tr><td>Opus-class</td><td>$15.00</td><td id="cost-opus-base">--</td><td id="cost-opus-vc">--</td><td class="saved" id="cost-opus">--</td><td class="saved" id="cost-opus-pct">--</td></tr>
+    <thead><tr><th>Model</th><th>$/MTok</th><th>Baseline</th><th>VC</th><th>Saved</th><th>%</th></tr></thead>
+    <tbody id="cost-table-body">
+      <tr id="cost-row-placeholder"><td colspan="6" style="color:var(--text-dim)">awaiting first request</td></tr>
     </tbody>
   </table>
 </div>
@@ -584,7 +587,7 @@
 </div>
 
 <div class="panel">
-  <div class="section-header" style="position:relative"><h2>Request Log</h2><button class="help-btn" data-help="reqlog" onclick="toggleHelp(this)">?</button><button class="col-toggle-btn" onclick="toggleColMenu(this)">Cols</button><button class="col-toggle-btn" onclick="if(gridManager)gridManager.resetDefaults()">Reset</button></div>
+  <div class="section-header" style="position:relative"><h2>Request Log</h2><button class="help-btn" data-help="reqlog" onclick="toggleHelp(this)">?</button><button class="col-toggle-btn" id="unit-toggle" onclick="toggleUnits()">kt</button><button class="col-toggle-btn" onclick="toggleColMenu(this)">Cols</button><button class="col-toggle-btn" onclick="if(gridManager)gridManager.resetDefaults()">Reset</button></div>
   <div class="help-content" data-help-for="reqlog" style="display:none">
     <p>Chronological log of every LLM request processed by the proxy (newest first, max 200 rows). Each row shows one conversation turn from the moment the user message arrives through context injection.</p>
     <dl>
@@ -699,6 +702,31 @@
   let activeSessionFilter = null;
   let liveSessions = [];
   let gridManager = null;
+  let unitMode = 'kt'; // 'kt' or '$'
+  let lastCompactionEvt = null;
+
+  // Per-model pricing ($/MTok input)
+  // $/MTok input — from https://docs.anthropic.com/en/docs/about-claude/pricing
+  const MODEL_PRICING = {
+    "claude-3-haiku-20240307": 0.25,
+    "claude-haiku-4-5-20251001": 1.00,
+    "claude-3-5-haiku-20241022": 0.80,
+    "claude-3-5-sonnet-20241022": 3.00,
+    "claude-sonnet-4-5-20250929": 3.00,
+    "claude-sonnet-4-6-20250929": 3.00,
+    "claude-opus-4-20250514": 15.00,
+    "claude-opus-4-1-20250414": 15.00,
+    "claude-opus-4-5-20260715": 5.00,
+    "claude-opus-4-6-20260618": 5.00,
+  };
+  function getModelRate(model) { return MODEL_PRICING[model] || 3.00; }
+  function shortModelName(model) {
+    if (!model) return 'unknown';
+    const m = model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+    return m.length > 20 ? m.substring(0, 20) : m;
+  }
+  // Track per-model tokens: { model: { actual: N, baseline: N } }
+  let modelTokens = {};
 
   const logScroll = $('log-scroll');
   logScroll.addEventListener('scroll', () => {
@@ -715,6 +743,35 @@
     return h + 'h ' + m + 'm';
   }
   function fmtNum(n) { return n >= 1000 ? (n/1000).toFixed(1) + 'k' : String(n); }
+  function fmtDollar(tokens, model) {
+    const rate = getModelRate(model);
+    const cost = (tokens / 1_000_000) * rate;
+    return cost < 0.001 ? '<$0.001' : '$' + cost.toFixed(3);
+  }
+  function fmtTokenCell(tokens, model) {
+    if (unitMode === '$') return fmtDollar(tokens, model);
+    return fmtNum(tokens) + 't';
+  }
+  function toggleUnits() {
+    unitMode = unitMode === 'kt' ? '$' : 'kt';
+    $('unit-toggle').textContent = unitMode;
+    // Walk all rows and re-render token cells
+    const rows = $('log-body').querySelectorAll('tr');
+    rows.forEach(function(tr) {
+      const inp = parseInt(tr.dataset.inputTokens) || 0;
+      const raw = parseInt(tr.dataset.rawTokens) || 0;
+      const ctx = parseInt(tr.dataset.contextTokens) || 0;
+      const model = tr.dataset.model || '';
+      const cells = tr.querySelectorAll('.token-cell');
+      if (cells.length >= 3) {
+        cells[0].textContent = inp ? fmtTokenCell(inp, model) : '\u2014';
+        if (!cells[1].classList.contains('timing-pending')) {
+          cells[1].textContent = raw ? fmtTokenCell(raw, model) : '\u2014';
+        }
+        cells[2].textContent = fmtTokenCell(ctx, model);
+      }
+    });
+  }
   function fmtTime(ms) {
     if (ms === undefined || ms === null) return '\u2014';
     if (ms < 1000) return Math.round(ms) + 'ms';
@@ -770,23 +827,56 @@
     $('sv-injected').textContent = fmtNum(totalContextInjected) + 't';
     $('sv-avg-ctx').textContent = totalRequests > 0 ? fmtNum(Math.round(totalContextInjected / totalRequests)) + 't' : '0';
 
-    // Estimated dollar costs: baseline vs actual vs saved
-    const baseM = cumBaselineInput / 1_000_000;
-    const actualM = cumActualInput / 1_000_000;
-    const savedTokens = Math.max(0, cumBaselineInput - cumActualInput);
-    const savedM = savedTokens / 1_000_000;
-    const pctSaved = cumBaselineInput > 0 ? Math.round((savedTokens / cumBaselineInput) * 100) : 0;
-    const tiers = [
-      {key: 'haiku', rate: 0.25},
-      {key: 'sonnet', rate: 3.00},
-      {key: 'opus', rate: 15.00},
-    ];
-    for (const t of tiers) {
-      const hasData = cumBaselineInput > 0 && cumActualInput > 0;
-      $('cost-' + t.key + '-base').textContent = hasData ? '$' + (baseM * t.rate).toFixed(4) : '--';
-      $('cost-' + t.key + '-vc').textContent = hasData ? '$' + (actualM * t.rate).toFixed(4) : '--';
-      $('cost-' + t.key).textContent = hasData ? '$' + (savedM * t.rate).toFixed(4) : '--';
-      $('cost-' + t.key + '-pct').textContent = hasData ? pctSaved + '%' : '--';
+    // Model-based cost table: one row per model actually used
+    const tbody = $('cost-table-body');
+    const models = Object.keys(modelTokens);
+    if (models.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-dim)">awaiting first request</td></tr>';
+    } else {
+      tbody.innerHTML = '';
+      let totalBaseCost = 0, totalVcCost = 0;
+      for (const model of models) {
+        const mt = modelTokens[model];
+        const rate = getModelRate(model);
+        const baseM = mt.baseline / 1_000_000;
+        const actualM = mt.actual / 1_000_000;
+        const savedM = Math.max(0, baseM - actualM);
+        const pct = mt.baseline > 0 ? Math.round((Math.max(0, mt.baseline - mt.actual) / mt.baseline) * 100) : 0;
+        totalBaseCost += baseM * rate;
+        totalVcCost += actualM * rate;
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td title="' + model + '">' + shortModelName(model) + '</td>' +
+          '<td>$' + rate.toFixed(2) + '</td>' +
+          '<td>$' + (baseM * rate).toFixed(4) + '</td>' +
+          '<td>$' + (actualM * rate).toFixed(4) + '</td>' +
+          '<td class="saved">$' + (savedM * rate).toFixed(4) + '</td>' +
+          '<td class="saved">' + pct + '%</td>';
+        tbody.appendChild(tr);
+      }
+      // Total row if multiple models
+      if (models.length > 1) {
+        const totalSaved = Math.max(0, totalBaseCost - totalVcCost);
+        const totalPct = totalBaseCost > 0 ? Math.round((totalSaved / totalBaseCost) * 100) : 0;
+        const tr = document.createElement('tr');
+        tr.style.borderTop = '2px solid var(--border)';
+        tr.style.fontWeight = '600';
+        tr.innerHTML =
+          '<td>Total</td><td></td>' +
+          '<td>$' + totalBaseCost.toFixed(4) + '</td>' +
+          '<td>$' + totalVcCost.toFixed(4) + '</td>' +
+          '<td class="saved">$' + totalSaved.toFixed(4) + '</td>' +
+          '<td class="saved">' + totalPct + '%</td>';
+        tbody.appendChild(tr);
+      }
+    }
+
+    // Update last compaction stat
+    if (lastCompactionEvt) {
+      $('sv-last-compact').textContent = 'T' + lastCompactionEvt.turn;
+      $('sv-last-compact-detail').textContent =
+        (lastCompactionEvt.segments || 0) + ' segments, ' +
+        fmtNum(lastCompactionEvt.tokens_freed || 0) + 't freed';
     }
   }
 
@@ -820,6 +910,11 @@
     tr.dataset.session = sid;
     if (evt.broad) tr.dataset.broad = '1';
     if (evt.temporal) tr.dataset.temporal = '1';
+    // Store raw values for kt/$ toggle
+    tr.dataset.inputTokens = evt.input_tokens || 0;
+    tr.dataset.rawTokens = evt.raw_input_tokens || 0;
+    tr.dataset.contextTokens = evt.context_tokens || 0;
+    tr.dataset.model = evt.model || '';
     const tagStr = evt.passthrough ? '<span class="passthrough-badge">PASSTHROUGH</span>' : buildTagCell(evt.tags, evt.broad, evt.temporal);
     const preview = (evt.message_preview || '').substring(0, 50);
     const vcMs = evt.overhead_ms !== undefined ? evt.overhead_ms : Math.round((evt.wait_ms || 0) + (evt.inbound_ms || 0));
@@ -830,25 +925,32 @@
     } else if (evt.total_turns !== undefined) {
       payload = String(evt.total_turns);
     }
-    const tokens = evt.input_tokens ? fmtNum(evt.input_tokens) + 't' : '\u2014';
-    const rawBaseline = evt.raw_input_tokens ? fmtNum(evt.raw_input_tokens) + 't' : '';
-    const injected = fmtNum(evt.context_tokens || 0) + 't';
+    const tokens = evt.input_tokens ? fmtTokenCell(evt.input_tokens, evt.model) : '\u2014';
+    const rawBaseline = evt.raw_input_tokens ? fmtTokenCell(evt.raw_input_tokens, evt.model) : '';
+    const injected = fmtTokenCell(evt.context_tokens || 0, evt.model);
+    const modelTip = evt.model ? ' title="' + evt.model + '"' : '';
     tr.innerHTML =
-      '<td>' + (evt.turn ?? '') + '</td>' +
+      '<td' + modelTip + '>' + (evt.turn ?? '') + '</td>' +
       '<td class="session-cell" title="' + sid + '" onclick="filterBySession(\'' + sid + '\');return false">' + sid + '</td>' +
       '<td class="tags-cell">' + tagStr + '</td>' +
       '<td class="tags-cell resp-tags"></td>' +
       '<td class="msg-cell" title="' + preview.replace(/"/g,'&quot;') + '">' + preview + '</td>' +
       '<td>' + payload + '</td>' +
-      '<td>' + tokens + '</td>' +
-      '<td class="baseline-cell' + (rawBaseline ? '' : ' timing-pending') + '">' + (rawBaseline || '\u2014') + '</td>' +
-      '<td>' + injected + '</td>' +
+      '<td class="token-cell">' + tokens + '</td>' +
+      '<td class="baseline-cell token-cell' + (rawBaseline ? '' : ' timing-pending') + '">' + (rawBaseline || '\u2014') + '</td>' +
+      '<td class="token-cell">' + injected + '</td>' +
       '<td class="timing-vc">' + fmtTime(vcMs) + '</td>' +
       '<td class="timing-llm timing-pending">\u2014</td>' +
       '<td class="timing-total timing-pending">\u2014</td>' +
       '<td><a href="#" onclick="inspectRequest(' + evt.turn + ');return false" style="color:var(--accent);font-size:11px">inspect</a></td>';
     if (gridManager) gridManager.reorderNewRow(tr);
     body.insertBefore(tr, body.firstChild);
+    // Track per-model tokens for cost table
+    if (evt.model && evt.input_tokens) {
+      if (!modelTokens[evt.model]) modelTokens[evt.model] = { actual: 0, baseline: 0 };
+      modelTokens[evt.model].actual += evt.input_tokens;
+      if (evt.raw_input_tokens) modelTokens[evt.model].baseline += evt.raw_input_tokens;
+    }
     // Keep max 200 rows
     while (body.children.length > 200) body.removeChild(body.lastChild);
     if (activeSessionFilter && sid !== activeSessionFilter) tr.style.display = 'none';
@@ -968,7 +1070,9 @@
       ' tag summaries \u00b7 watermark ' + (evt.compacted_through || 0) + '</div>';
     list.insertBefore(div, list.firstChild);
     compactedThrough = evt.compacted_through || compactedThrough;
+    lastCompactionEvt = evt;
     updateMemory();
+    updateSavings();
   }
 
   function addToolIntercept(evt) {
@@ -1010,6 +1114,28 @@
     }
 
     liveSessions = data.live_sessions || [];
+
+    // Instance label (multi-instance mode)
+    if (data.instance_label) {
+      $('instance-label').textContent = ' [' + data.instance_label + ']';
+      document.title = 'vc proxy [' + data.instance_label + ']';
+    }
+
+    // Rebuild per-model token tracking from snapshot
+    modelTokens = {};
+    (data.recent_requests || []).forEach(function(r) {
+      if (r.model && r.input_tokens) {
+        if (!modelTokens[r.model]) modelTokens[r.model] = { actual: 0, baseline: 0 };
+        modelTokens[r.model].actual += r.input_tokens;
+        if (r.raw_input_tokens) modelTokens[r.model].baseline += r.raw_input_tokens;
+      }
+    });
+
+    // Restore last compaction event from snapshot
+    var snapCompactions = data.compactions || [];
+    if (snapCompactions.length > 0) {
+      lastCompactionEvt = snapCompactions[snapCompactions.length - 1];
+    }
 
     updateStats();
     updatePipeline();

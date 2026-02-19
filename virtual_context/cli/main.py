@@ -338,12 +338,36 @@ def cmd_proxy(args):
     _logging.getLogger("uvicorn.error").addFilter(_SuppressCancelled())
     _logging.getLogger("uvicorn.access").addFilter(_SuppressDashboardAccess())
 
-    app = create_app(upstream=args.upstream, config_path=args.config)
-    print(f"virtual-context proxy on {args.host}:{args.port} -> {args.upstream}")
-    uvicorn.run(
-        app, host=args.host, port=args.port, log_level="info",
-        timeout_graceful_shutdown=2,
-    )
+    # Check if multi-instance mode is configured
+    from ..config import load_config as _load_config
+    _cfg = _load_config(config_path=args.config)
+    instances = _cfg.proxy.instances
+
+    if instances:
+        # Multi-instance mode: ignore --upstream/--port/--host CLI args
+        from ..proxy.multi import run_multi_instance
+
+        print(f"Multi-instance proxy ({len(instances)} listeners):")
+        asyncio.run(run_multi_instance(
+            instances=instances,
+            config_path=args.config,
+        ))
+    else:
+        # Single-instance mode: --upstream is required
+        if not args.upstream:
+            print(
+                "Error: --upstream is required in single-instance mode "
+                "(or configure proxy.instances in config)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        app = create_app(upstream=args.upstream, config_path=args.config)
+        print(f"virtual-context proxy on {args.host}:{args.port} -> {args.upstream}")
+        uvicorn.run(
+            app, host=args.host, port=args.port, log_level="info",
+            timeout_graceful_shutdown=2,
+        )
 
 
 def cmd_retrieve(args):
@@ -473,8 +497,9 @@ def main():
     # proxy
     proxy_parser = subparsers.add_parser("proxy", help="Start HTTP proxy for LLM enrichment")
     proxy_parser.add_argument(
-        "--upstream", "-u", required=True,
-        help="Upstream provider URL (e.g., https://api.anthropic.com)",
+        "--upstream", "-u", default=None,
+        help="Upstream provider URL (e.g., https://api.anthropic.com). "
+             "Required for single-instance mode; ignored when proxy.instances is configured.",
     )
     proxy_parser.add_argument("--port", "-p", type=int, default=5757)
     proxy_parser.add_argument("--host", default="127.0.0.1")

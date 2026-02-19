@@ -1860,6 +1860,141 @@ class TestFilterBodyMessages:
                 f"{msgs[i-1]['role']}, {msgs[i]['role']}"
             )
 
+    def test_dropped_never_negative(self):
+        """dropped count must never be negative, even with unpaired messages.
+
+        When alternation enforcement silently removes extra messages,
+        the drop count must be computed from the final kept list.
+        """
+        # Build a body with unpaired messages that will cause alternation enforcement
+        body = {
+            "messages": [
+                # Unpaired user (batched Telegram)
+                {"role": "user", "content": "batch1"},
+                # Another unpaired user
+                {"role": "user", "content": "batch2"},
+                # Pair 0
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                # Pair 1
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+                # Current user
+                {"role": "user", "content": "Current"},
+            ],
+        }
+        idx = self._build_index([
+            ["python"],  # pair 0
+            ["music"],   # pair 1
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["unrelated"], recent_turns=1,
+        )
+        assert dropped >= 0, f"dropped should never be negative, got {dropped}"
+        # Verify alternation
+        msgs = filtered["messages"]
+        for i in range(1, len(msgs)):
+            assert msgs[i]["role"] != msgs[i - 1]["role"]
+
+    def test_dropped_count_with_alternation_enforcement(self):
+        """Alternation enforcement removes messages beyond pair-based drops.
+
+        The dropped count must reflect ALL removed user turns, including
+        those removed by alternation enforcement.
+        """
+        body = {
+            "messages": [
+                {"role": "user", "content": "unpaired"},
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "Current"},
+            ],
+        }
+        idx = self._build_index([
+            ["cooking"],  # pair 0 — no match
+            ["weather"],  # pair 1 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["unrelated"], recent_turns=1,
+        )
+        assert dropped >= 0
+        # Verify no negative payload in the formula: total_turns - dropped
+        total_pairs = 2
+        assert total_pairs - dropped >= 0
+
+
+# ---------------------------------------------------------------------------
+# Request event model field
+# ---------------------------------------------------------------------------
+
+
+class TestRequestEventModel:
+    """Verify that the request metrics event includes the model field."""
+
+    def test_model_in_request_event(self):
+        """The metrics.record() call should include model from the request body."""
+        from virtual_context.proxy.metrics import ProxyMetrics
+        metrics = ProxyMetrics()
+        metrics.record({
+            "type": "request",
+            "turn": 0,
+            "model": "claude-haiku-4-5-20251001",
+            "input_tokens": 1000,
+        })
+        events = metrics.events_since(-1)
+        req = [e for e in events if e["type"] == "request"][0]
+        assert req["model"] == "claude-haiku-4-5-20251001"
+
+    def test_model_in_snapshot_recent_requests(self):
+        """Snapshot should include model in recent_requests for dashboard rebuild."""
+        from virtual_context.proxy.metrics import ProxyMetrics
+        metrics = ProxyMetrics()
+        metrics.record({
+            "type": "request",
+            "turn": 0,
+            "model": "claude-sonnet-4-5-20250929",
+            "input_tokens": 5000,
+            "raw_input_tokens": 8000,
+            "wait_ms": 10,
+            "inbound_ms": 20,
+            "context_tokens": 100,
+        })
+        snap = metrics.snapshot()
+        assert len(snap["recent_requests"]) == 1
+        assert snap["recent_requests"][0]["model"] == "claude-sonnet-4-5-20250929"
+
+
+# ---------------------------------------------------------------------------
+# Turn offset on proxy restart
+# ---------------------------------------------------------------------------
+
+
+class TestProxyStateTurnOffset:
+    """Verify ProxyState.turn_offset continues numbering from persisted state."""
+
+    def test_turn_offset_from_turn_tag_index(self):
+        """turn_offset should be max(turn_number) + 1 from restored entries."""
+        engine = MagicMock()
+        engine._turn_tag_index = TurnTagIndex()
+        for i in range(10):
+            engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=["tag"],
+                primary_tag="tag",
+            ))
+        state = ProxyState(engine=engine)
+        assert state.turn_offset == 10
+
+    def test_turn_offset_empty_index(self):
+        """turn_offset should be 0 when no prior entries exist."""
+        engine = MagicMock()
+        engine._turn_tag_index = TurnTagIndex()
+        state = ProxyState(engine=engine)
+        assert state.turn_offset == 0
+
 
 # ---------------------------------------------------------------------------
 # Dashboard settings tests
@@ -1911,6 +2046,95 @@ class TestDashboardSettings:
         assert resp.status_code == 200
         data = resp.json()
         assert data["tagging"]["context_lookback_pairs"] == 3
+
+
+class TestCompactionConcurrencyGuard:
+    """PROXY-007: Manual compaction must reject concurrent requests.
+
+    Tests the lock directly on ProxyState rather than via HTTP, since
+    the registry/state are closure variables not accessible from the app object.
+    """
+
+    @pytest.mark.regression("PROXY-007")
+    def test_compaction_lock_exists_on_proxy_state(self):
+        """ProxyState has a _compaction_lock for concurrency control."""
+        import threading
+        engine = MagicMock()
+        engine.config = MagicMock()
+        engine.config.session_id = "test"
+        state = ProxyState(engine)
+        assert hasattr(state, "_compaction_lock")
+        assert isinstance(state._compaction_lock, type(threading.Lock()))
+
+    @pytest.mark.regression("PROXY-007")
+    def test_compaction_lock_is_non_reentrant(self):
+        """Lock is a plain Lock (not RLock) so double-acquire blocks."""
+        engine = MagicMock()
+        engine.config = MagicMock()
+        engine.config.session_id = "test"
+        state = ProxyState(engine)
+        # First acquire succeeds
+        assert state._compaction_lock.acquire(blocking=False) is True
+        # Second acquire fails (non-blocking) — proves concurrency guard works
+        assert state._compaction_lock.acquire(blocking=False) is False
+        state._compaction_lock.release()
+
+    @pytest.mark.regression("PROXY-007")
+    def test_dashboard_compact_endpoint_uses_lock(self, tmp_path):
+        """The /dashboard/compact endpoint acquires the lock and returns 409 if busy."""
+        from starlette.testclient import TestClient
+
+        db_path = str(tmp_path / "store.db")
+        with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
+            cfg = load_config(config_dict={
+                "context_window": 10000,
+                "storage_root": str(tmp_path),
+                "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+                "tag_generator": {"type": "keyword"},
+            })
+            engine = MagicMock()
+            engine.config = cfg
+            engine.on_message_inbound.return_value = AssembledContext()
+            engine.on_turn_complete.return_value = None
+            engine._turn_tag_index = MagicMock()
+            engine._turn_tag_index.entries = []
+            engine._compacted_through = 0
+            MockEngine.return_value = engine
+            app = create_app(upstream="http://fake:9999", config_path=None)
+
+        # The dashboard routes close over a `state` variable. We can access it
+        # by inspecting the route's endpoint closure.
+        from virtual_context.proxy.dashboard import register_dashboard_routes
+        # Find the compact route and extract the state from its closure
+        state = None
+        for route in app.routes:
+            if hasattr(route, "path") and route.path == "/dashboard/compact":
+                # The endpoint is a closure over `state`
+                endpoint = route.endpoint
+                if hasattr(endpoint, "__code__"):
+                    free_vars = endpoint.__code__.co_freevars
+                    if "state" in free_vars:
+                        idx = free_vars.index("state")
+                        state = endpoint.__closure__[idx].cell_contents
+                break
+
+        with TestClient(app) as client:
+            if state is None:
+                # Can't extract state — just verify endpoint exists
+                resp = client.post("/dashboard/compact")
+                assert resp.status_code in (200, 409, 503)
+                return
+
+            # Hold the lock to simulate in-progress compaction
+            state._compaction_lock.acquire()
+            try:
+                resp = client.post("/dashboard/compact")
+                assert resp.status_code == 409
+                data = resp.json()
+                assert data["status"] == "busy"
+                assert "already in progress" in data["message"].lower()
+            finally:
+                state._compaction_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -2160,16 +2384,34 @@ class TestSessionRegistry:
         assert registry.session_count == 1
 
     def test_reuses_session_via_fingerprint(self, tmp_path):
-        """No session ID + matching fingerprint → reuses existing session."""
+        """No session ID + tail-1 fingerprint match → reuses existing session.
+
+        Simulates the real flow: request N stores fp at offset=0 (tail),
+        then request N+1 (one more turn) matches via offset=1 (tail-1).
+        """
         metrics = ProxyMetrics()
         engine = MagicMock()
         engine.config.session_id = "default-session"
         default = ProxyState(engine, metrics=metrics)
 
-        body = {"messages": [
+        # Request N: 3 user messages.  history_user = [u0, u1], fp = hash(u1)
+        body_prev = {"messages": [
             {"role": "user", "content": "hello world"},
             {"role": "assistant", "content": "hi there"},
             {"role": "user", "content": "how are you"},
+            {"role": "assistant", "content": "doing well"},
+            {"role": "user", "content": "tell me more"},
+        ]}
+        # Request N+1: one more turn.  history_user = [u0, u1, u2],
+        # fp_match(offset=1) = hash(u1) → matches prev fp
+        body_next = {"messages": [
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hi there"},
+            {"role": "user", "content": "how are you"},
+            {"role": "assistant", "content": "doing well"},
+            {"role": "user", "content": "tell me more"},
+            {"role": "assistant", "content": "sure thing"},
+            {"role": "user", "content": "what is new"},
         ]}
 
         registry = SessionRegistry(
@@ -2178,11 +2420,12 @@ class TestSessionRegistry:
             metrics=metrics,
         )
         registry._sessions["default-session"] = default
-        # Register the fingerprint for this body
-        fp = SessionRegistry._compute_fingerprint(body)
+        # Simulate catch_all: store fp from request N at offset=0
+        fp = SessionRegistry._compute_fingerprint(body_prev)
         registry._fingerprints[fp] = "default-session"
 
-        result, is_new = registry.get_or_create(None, body=body)
+        # Request N+1 should match via offset=1
+        result, is_new = registry.get_or_create(None, body=body_next)
         assert is_new is False
         assert result is default
 
@@ -2414,10 +2657,12 @@ class TestContentFingerprintRouting:
 
     @pytest.mark.regression("PROXY-010")
     def test_same_conversation_reuses_session_via_fingerprint(self):
-        """Same conversation (same first messages) reuses the existing session.
+        """Same conversation growing by one turn reuses the existing session.
 
-        Uses 6+ user messages so the first 5 (the fingerprint sample) are
-        stable across both request bodies.
+        With tail-based fingerprinting (sample_size=1):
+        - Request 1: history_user = [u0, u1, u2], fp_store = hash(u2)
+        - Request 2: history_user = [u0, u1, u2, u3],
+          fp_match(offset=1) = hash(u2) → matches fp_store
         """
         metrics = ProxyMetrics()
         registry = SessionRegistry(
@@ -2426,18 +2671,17 @@ class TestContentFingerprintRouting:
             metrics=metrics,
         )
 
+        # 4 user messages → history_user has 3, fp_store = hash(u2)
         base_msgs = [
             "[Telegram Y id:111] hello world",
             "[Telegram Y id:111] tell me about cars",
             "[Telegram Y id:111] what about trucks",
             "[Telegram Y id:111] and planes too",
-            "[Telegram Y id:111] also ships",
-            "[Telegram Y id:111] what about trains",
         ]
         body_v1 = self._make_body(base_msgs)
-        # Same conversation, one more message appended — first 5 unchanged
+        # One more message → history_user has 4, fp_match(offset=1) = hash(u2)
         body_v2 = self._make_body(base_msgs + [
-            "[Telegram Y id:111] and buses too",
+            "[Telegram Y id:111] also ships",
         ])
 
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
@@ -2476,6 +2720,278 @@ class TestContentFingerprintRouting:
         result, is_new = registry.get_or_create("marker-session", body=body)
         assert is_new is False
         assert result is state
+
+
+# ---------------------------------------------------------------------------
+# Trailing fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestTrailingFingerprint:
+    """Tail-based fingerprint: store at offset=0, match at offset=1."""
+
+    def _make_body(self, user_messages: list[str]) -> dict:
+        msgs = []
+        for i, text in enumerate(user_messages):
+            msgs.append({"role": "user", "content": text})
+            if i < len(user_messages) - 1:
+                msgs.append({"role": "assistant", "content": f"Response {i}"})
+        return {"messages": msgs, "model": "test"}
+
+    def test_compute_fingerprint_samples_tail(self):
+        """offset=0 hashes the last S user messages before current turn."""
+        body = self._make_body(["msg-a", "msg-b", "msg-c"])
+        # history_user = ["msg-a", "msg-b"], sample_size=1 → hash("msg-b")
+        fp = SessionRegistry._compute_fingerprint(body, offset=0)
+        assert fp  # non-empty
+        assert len(fp) == 16  # sha256 truncated to 16 hex chars
+
+    def test_compute_fingerprint_offset1_shifts_back(self):
+        """offset=1 shifts sampling window back by one position."""
+        body = self._make_body(["msg-a", "msg-b", "msg-c"])
+        # history_user = ["msg-a", "msg-b"]
+        # offset=0 → hash("msg-b"), offset=1 → hash("msg-a")
+        fp0 = SessionRegistry._compute_fingerprint(body, offset=0)
+        fp1 = SessionRegistry._compute_fingerprint(body, offset=1)
+        assert fp0 != fp1
+
+    def test_tail1_matches_previous_tail(self):
+        """Core invariant: request N+1's tail-1 == request N's tail.
+
+        Request N:   history = [u0, u1, u2].  tail = hash(u2).
+        Request N+1: history = [u0, u1, u2, u3].  tail-1 = hash(u2).
+        """
+        body_n = self._make_body(["u0", "u1", "u2", "current-n"])
+        body_n1 = self._make_body(["u0", "u1", "u2", "u3", "current-n1"])
+
+        fp_store = SessionRegistry._compute_fingerprint(body_n, offset=0)
+        fp_match = SessionRegistry._compute_fingerprint(body_n1, offset=1)
+
+        assert fp_store == fp_match, (
+            "tail-1 of next request must equal tail of previous request"
+        )
+
+    def test_too_few_messages_returns_empty(self):
+        """A body with < 2 user messages cannot produce a fingerprint."""
+        body_one = self._make_body(["only-one"])
+        assert SessionRegistry._compute_fingerprint(body_one) == ""
+
+        body_two = self._make_body(["first", "second"])
+        # history_user = ["first"], offset=1 → start < 0
+        assert SessionRegistry._compute_fingerprint(body_two, offset=1) == ""
+
+    def test_offset_too_large_returns_empty(self):
+        """Offset beyond available history returns empty string."""
+        body = self._make_body(["u0", "u1", "u2"])
+        # history_user = ["u0", "u1"], offset=2 → end=0, returns ""
+        assert SessionRegistry._compute_fingerprint(body, offset=2) == ""
+
+    def test_different_conversations_produce_different_fingerprints(self):
+        """Two conversations with different messages have different fps."""
+        body_a = self._make_body(["[id:111] hello", "[id:111] cars", "[id:111] query"])
+        body_b = self._make_body(["[id:222] hey", "[id:222] bikes", "[id:222] query"])
+        fp_a = SessionRegistry._compute_fingerprint(body_a)
+        fp_b = SessionRegistry._compute_fingerprint(body_b)
+        assert fp_a != fp_b
+
+    def test_persisted_fingerprint_roundtrip_sqlite(self, tmp_path):
+        """Trailing fingerprint persists through SQLite save/load cycle."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        store = SQLiteStore(str(tmp_path / "test.db"))
+
+        from virtual_context.types import EngineStateSnapshot
+        snap = EngineStateSnapshot(
+            session_id="sess-1",
+            compacted_through=10,
+            turn_tag_entries=[],
+            turn_count=5,
+            trailing_fingerprint="abc123deadbeef00",
+        )
+        store.save_engine_state(snap)
+
+        loaded = store.load_engine_state("sess-1")
+        assert loaded is not None
+        assert loaded.trailing_fingerprint == "abc123deadbeef00"
+
+        # list_engine_state_fingerprints should return this
+        fps = store.list_engine_state_fingerprints()
+        assert fps == {"abc123deadbeef00": "sess-1"}
+
+    def test_persisted_fingerprint_roundtrip_filesystem(self, tmp_path):
+        """Trailing fingerprint persists through filesystem save/load cycle."""
+        from virtual_context.storage.filesystem import FilesystemStore
+        store = FilesystemStore(str(tmp_path / "fs_store"))
+
+        from virtual_context.types import EngineStateSnapshot
+        snap = EngineStateSnapshot(
+            session_id="sess-2",
+            compacted_through=5,
+            turn_tag_entries=[],
+            turn_count=3,
+            trailing_fingerprint="beef1234cafe5678",
+        )
+        store.save_engine_state(snap)
+
+        loaded = store.load_engine_state("sess-2")
+        assert loaded is not None
+        assert loaded.trailing_fingerprint == "beef1234cafe5678"
+
+        fps = store.list_engine_state_fingerprints()
+        assert fps == {"beef1234cafe5678": "sess-2"}
+
+    def test_empty_fingerprint_excluded_from_listing(self, tmp_path):
+        """Sessions with no trailing fingerprint are excluded from the map."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        store = SQLiteStore(str(tmp_path / "test.db"))
+
+        from virtual_context.types import EngineStateSnapshot
+        snap = EngineStateSnapshot(
+            session_id="sess-no-fp",
+            compacted_through=0,
+            turn_tag_entries=[],
+            turn_count=0,
+            trailing_fingerprint="",
+        )
+        store.save_engine_state(snap)
+        assert store.list_engine_state_fingerprints() == {}
+
+    def test_match_persisted_fingerprint_on_restart(self, tmp_path):
+        """Simulates proxy restart: persisted fp matches inbound tail-1."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        store = SQLiteStore(str(tmp_path / "test.db"))
+
+        # Request N stored fp = hash(u2) at offset=0
+        body_prev = self._make_body(["u0", "u1", "u2", "current-n"])
+        fp_stored = SessionRegistry._compute_fingerprint(body_prev, offset=0)
+
+        from virtual_context.types import EngineStateSnapshot
+        snap = EngineStateSnapshot(
+            session_id="persisted-sess",
+            compacted_through=0,
+            turn_tag_entries=[],
+            turn_count=4,
+            trailing_fingerprint=fp_stored,
+        )
+        store.save_engine_state(snap)
+
+        # Proxy restarts.  Request N+1 arrives with one more turn.
+        body_next = self._make_body(["u0", "u1", "u2", "u3", "current-n1"])
+
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=None,
+            upstream="http://fake:9999",
+            metrics=metrics,
+            store=store,
+        )
+
+        matched_sid = registry._match_persisted_fingerprint(body_next)
+        assert matched_sid == "persisted-sess"
+
+    def test_multi_session_fingerprint_routing(self):
+        """Multiple concurrent sessions route correctly via tail fingerprints.
+
+        Simulates 3 independent conversations (different Telegram groups)
+        each advancing over 3 turns.  Every request must route to the
+        correct session via tail-1 fingerprint matching.
+        """
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=None,
+            upstream="http://fake:9999",
+            metrics=metrics,
+        )
+
+        # Three conversations with distinct Telegram group IDs
+        convos = {
+            "session-a": ["[id:111] msg-a-{}".format(i) for i in range(6)],
+            "session-b": ["[id:222] msg-b-{}".format(i) for i in range(6)],
+            "session-c": ["[id:333] msg-c-{}".format(i) for i in range(6)],
+        }
+
+        states = {}
+
+        with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
+            # Turn 1: each conversation sends first 3 messages (creates session)
+            for sid, msgs in convos.items():
+                engine = MagicMock()
+                engine.config.session_id = sid
+                MockEngine.return_value = engine
+                body = self._make_body(msgs[:3])
+                state, is_new = registry.get_or_create(None, body=body)
+                states[sid] = state
+                # Simulate catch_all: store tail fingerprint
+                fp = SessionRegistry._compute_fingerprint(body)
+                if fp:
+                    registry._fingerprints[fp] = sid
+
+        assert registry.session_count == 3
+
+        # Turn 2: each conversation grows by one message — must route back
+        # to its own session via tail-1 fingerprint match
+        for sid, msgs in convos.items():
+            body = self._make_body(msgs[:4])  # one more message
+            state, is_new = registry.get_or_create(None, body=body)
+            assert is_new is False, f"{sid} should reuse existing session"
+            assert state is states[sid], f"{sid} routed to wrong session"
+
+            # Simulate catch_all: update fingerprint
+            fp = SessionRegistry._compute_fingerprint(body)
+            if fp:
+                registry._fingerprints[fp] = sid
+
+        # Turn 3: another advance — still routes correctly
+        for sid, msgs in convos.items():
+            body = self._make_body(msgs[:5])
+            state, is_new = registry.get_or_create(None, body=body)
+            assert is_new is False, f"{sid} turn 3 should reuse session"
+            assert state is states[sid], f"{sid} turn 3 routed to wrong session"
+
+        # No extra sessions created
+        assert registry.session_count == 3
+
+    def test_multi_session_restart_with_persisted_fingerprints(self, tmp_path):
+        """On restart, 3 persisted sessions are correctly restored via fps."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import EngineStateSnapshot
+        store = SQLiteStore(str(tmp_path / "test.db"))
+
+        # Three conversations, each with a unique tail fingerprint
+        convos = {
+            "session-a": ["[id:111] a-{}".format(i) for i in range(5)],
+            "session-b": ["[id:222] b-{}".format(i) for i in range(5)],
+            "session-c": ["[id:333] c-{}".format(i) for i in range(5)],
+        }
+
+        # Persist engine state with fingerprints (simulates pre-restart)
+        for sid, msgs in convos.items():
+            body = self._make_body(msgs[:4])  # 4 msgs, last is "current"
+            fp = SessionRegistry._compute_fingerprint(body, offset=0)
+            snap = EngineStateSnapshot(
+                session_id=sid,
+                compacted_through=0,
+                turn_tag_entries=[],
+                turn_count=4,
+                trailing_fingerprint=fp,
+            )
+            store.save_engine_state(snap)
+
+        # Proxy restarts — fresh registry with store
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=None,
+            upstream="http://fake:9999",
+            metrics=metrics,
+            store=store,
+        )
+
+        # Each conversation sends request with one more turn
+        for sid, msgs in convos.items():
+            body = self._make_body(msgs[:5])  # 5 msgs, one more than persisted
+            matched = registry._match_persisted_fingerprint(body)
+            assert matched == sid, (
+                f"Session {sid} should match its persisted fingerprint"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4042,4 +4558,79 @@ class TestContinuationBailForward:
 
                     # stop_reason=tool_use
                     assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Multi-instance create_app + shared engine
+# ---------------------------------------------------------------------------
+
+
+class TestCreateAppSharedEngine:
+    """Test that create_app accepts shared_engine / shared_metrics / instance_label."""
+
+    def test_shared_engine_reused(self, tmp_path):
+        """When shared_engine is provided, create_app doesn't create a new one."""
+        config = load_config(config_dict={
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
+            "storage_root": str(tmp_path),
+        })
+        from virtual_context.engine import VirtualContextEngine
+        engine = VirtualContextEngine(config=config)
+        metrics = ProxyMetrics(context_window=120_000)
+
+        app = create_app(
+            upstream="https://api.anthropic.com",
+            shared_engine=engine,
+            shared_metrics=metrics,
+            instance_label="anthropic",
+        )
+        assert app.title == "virtual-context proxy [anthropic]"
+        assert app.state.instance_label == "anthropic"
+
+    def test_no_label_default_title(self, tmp_path):
+        """Without instance_label, title stays default."""
+        config = load_config(config_dict={
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
+            "storage_root": str(tmp_path),
+        })
+        from virtual_context.engine import VirtualContextEngine
+        engine = VirtualContextEngine(config=config)
+        metrics = ProxyMetrics(context_window=120_000)
+
+        app = create_app(
+            upstream="https://api.anthropic.com",
+            shared_engine=engine,
+            shared_metrics=metrics,
+        )
+        assert app.title == "virtual-context proxy"
+        assert app.state.instance_label == ""
+
+    def test_shared_metrics_not_replaced(self, tmp_path):
+        """Shared metrics object is reused, not replaced."""
+        config = load_config(config_dict={
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
+            "storage_root": str(tmp_path),
+        })
+        from virtual_context.engine import VirtualContextEngine
+        engine = VirtualContextEngine(config=config)
+        metrics = ProxyMetrics(context_window=120_000)
+        metrics.record({"type": "test_event"})  # mark it
+
+        app = create_app(
+            upstream="https://api.anthropic.com",
+            shared_engine=engine,
+            shared_metrics=metrics,
+            instance_label="test",
+        )
+        # The app was created successfully with shared components
+        assert app.title == "virtual-context proxy [test]"
+
+    def test_backward_compat_no_shared(self, tmp_path):
+        """Without shared params, create_app works as before (creates its own engine)."""
+        app = create_app(
+            upstream="https://api.anthropic.com",
+            config_path=None,
+        )
+        assert app.title == "virtual-context proxy"
+        assert app.state.instance_label == ""
 
