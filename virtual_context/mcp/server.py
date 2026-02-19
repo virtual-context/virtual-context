@@ -91,10 +91,11 @@ def compact_context(
 
 @mcp.tool()
 def expand_topic(tag: str, depth: str = "full") -> str:
-    """Expand a topic to see more detail from prior conversation.
+    """Zoom into a topic you can already see in the context-topics list.
 
-    When a tag summary doesn't have enough detail, expand it to see
-    individual segment summaries or the full original conversation text.
+    Use when a topic summary mentions the area you need but lacks detail.
+    Requires knowing which tag to expand. For specific facts when you
+    don't know which topic holds them, use find_quote instead.
 
     Args:
         tag: The topic tag to expand (from the context-topics list).
@@ -110,10 +111,10 @@ def expand_topic(tag: str, depth: str = "full") -> str:
 
 @mcp.tool()
 def collapse_topic(tag: str, depth: str = "summary") -> str:
-    """Collapse a topic back to a lighter representation to free context budget.
+    """Collapse an expanded topic back to its summary to free context budget.
 
-    Use this to make room for expanding other topics, or when you no longer
-    need full detail on a topic.
+    Use after you've retrieved what you need from an expanded topic,
+    or to make room before expanding a different one.
 
     Args:
         tag: The topic tag to collapse.
@@ -124,6 +125,29 @@ def collapse_topic(tag: str, depth: str = "summary") -> str:
     """
     engine = _get_engine()
     result = engine.collapse_topic(tag, depth)
+    return json.dumps(result)
+
+
+@mcp.tool()
+def find_quote(query: str, max_results: int = 5) -> str:
+    """Search the full original conversation text for a specific word, phrase, or detail.
+
+    Use this as your first tool when the user asks about a specific fact — a
+    name, number, dosage, recommendation, date, or decision — especially when
+    no topic summary mentions it or you don't know which topic it falls under.
+    Bypasses tags entirely and searches raw text, so it finds content even
+    when it's filed under an unexpected topic.
+
+    Args:
+        query: Word or phrase to search for. Use distinctive terms, e.g.
+            'magnesium glycinate' not 'supplement'.
+        max_results: Maximum number of results (default 5).
+
+    Returns:
+        JSON with matching excerpts, their topics, and segment references.
+    """
+    engine = _get_engine()
+    result = engine.find_quote(query, max_results=max_results)
     return json.dumps(result)
 
 

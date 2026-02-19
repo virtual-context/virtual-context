@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..core.store import ContextStore
-from ..types import DepthLevel, EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -97,6 +97,28 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
 END;
 """
 
+FTS_FULLTEXT_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts_full USING fts5(
+    ref UNINDEXED,
+    full_text,
+    content='segments',
+    content_rowid='rowid'
+);
+"""
+
+FTS_FULLTEXT_TRIGGER_SQL = """\
+CREATE TRIGGER IF NOT EXISTS segments_ft_ai AFTER INSERT ON segments BEGIN
+    INSERT INTO segments_fts_full(rowid, ref, full_text) VALUES (new.rowid, new.ref, new.full_text);
+END;
+CREATE TRIGGER IF NOT EXISTS segments_ft_ad AFTER DELETE ON segments BEGIN
+    INSERT INTO segments_fts_full(segments_fts_full, rowid, ref, full_text) VALUES('delete', old.rowid, old.ref, old.full_text);
+END;
+CREATE TRIGGER IF NOT EXISTS segments_ft_au AFTER UPDATE ON segments BEGIN
+    INSERT INTO segments_fts_full(segments_fts_full, rowid, ref, full_text) VALUES('delete', old.rowid, old.ref, old.full_text);
+    INSERT INTO segments_fts_full(rowid, ref, full_text) VALUES (new.rowid, new.ref, new.full_text);
+END;
+"""
+
 
 def _dt_to_str(dt: datetime) -> str:
     return dt.isoformat()
@@ -158,6 +180,21 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
     )
 
 
+def _extract_excerpt(text: str, query: str, context_chars: int = 200) -> str:
+    """Extract text around the first occurrence of query."""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        return text[:context_chars * 2]
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(query) + context_chars)
+    excerpt = text[start:end]
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(text):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
 class SQLiteStore(ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
@@ -183,6 +220,24 @@ class SQLiteStore(ContextStore):
             conn.executescript(FTS_TRIGGER_SQL)
         except sqlite3.OperationalError:
             pass  # FTS5 not available, search will fall back
+        # FTS full-text index (searches full_text column, separate from summary FTS)
+        try:
+            conn.executescript(FTS_FULLTEXT_SQL)
+            conn.executescript(FTS_FULLTEXT_TRIGGER_SQL)
+            # Backfill: populate from existing segments not yet indexed
+            count = conn.execute("SELECT COUNT(*) FROM segments_fts_full").fetchone()[0]
+            if count == 0:
+                conn.execute("""
+                    INSERT INTO segments_fts_full(rowid, ref, full_text)
+                    SELECT rowid, ref, full_text FROM segments WHERE full_text != ''
+                """)
+        except sqlite3.OperationalError:
+            pass
+        # Migrations: add columns that didn't exist in earlier schema versions
+        try:
+            conn.execute("ALTER TABLE tag_summaries ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         conn.commit()
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
@@ -356,6 +411,55 @@ class SQLiteStore(ContextStore):
             results.append(_row_to_summary(row, seg_tags))
         return results
 
+    def search_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[QuoteResult]:
+        conn = self._get_conn()
+        results: list[QuoteResult] = []
+
+        # Try FTS5 first (with snippet extraction)
+        try:
+            rows = conn.execute(
+                """SELECT fts.ref, s.primary_tag,
+                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 40)
+                   FROM segments_fts_full fts
+                   JOIN segments s ON s.ref = fts.ref
+                   WHERE segments_fts_full MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                [query, limit],
+            ).fetchall()
+            for row in rows:
+                results.append(QuoteResult(
+                    text=row[2],
+                    tag=row[1],
+                    segment_ref=row[0],
+                    tags=self._get_tags_for_ref(row[0]),
+                ))
+            return results
+        except sqlite3.OperationalError:
+            pass
+
+        # Fallback: LIKE search on full_text with manual excerpt
+        like_query = f"%{query}%"
+        rows = conn.execute(
+            """SELECT ref, primary_tag, full_text FROM segments
+               WHERE full_text LIKE ?
+               LIMIT ?""",
+            [like_query, limit],
+        ).fetchall()
+        for row in rows:
+            excerpt = _extract_excerpt(row[2], query, context_chars=200)
+            results.append(QuoteResult(
+                text=excerpt,
+                tag=row[1],
+                segment_ref=row[0],
+                tags=self._get_tags_for_ref(row[0]),
+            ))
+        return results
+
     def get_all_tags(self) -> list[TagStats]:
         conn = self._get_conn()
         rows = conn.execute("""
@@ -478,12 +582,13 @@ class SQLiteStore(ContextStore):
         conn = self._get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO tag_summaries
-            (tag, summary, summary_tokens, source_segment_refs, source_turn_numbers,
-             covers_through_turn, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (tag, summary, description, summary_tokens, source_segment_refs,
+             source_turn_numbers, covers_through_turn, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 tag_summary.tag,
                 tag_summary.summary,
+                tag_summary.description,
                 tag_summary.summary_tokens,
                 json.dumps(tag_summary.source_segment_refs),
                 json.dumps(tag_summary.source_turn_numbers),
@@ -501,9 +606,16 @@ class SQLiteStore(ContextStore):
         ).fetchone()
         if not row:
             return None
+        # Backward compat: description column may not exist in old rows
+        desc = ""
+        try:
+            desc = row["description"]
+        except (IndexError, KeyError):
+            pass
         return TagSummary(
             tag=row["tag"],
             summary=row["summary"],
+            description=desc,
             summary_tokens=row["summary_tokens"],
             source_segment_refs=json.loads(row["source_segment_refs"]),
             source_turn_numbers=json.loads(row["source_turn_numbers"]),
@@ -517,19 +629,25 @@ class SQLiteStore(ContextStore):
         rows = conn.execute(
             "SELECT * FROM tag_summaries ORDER BY tag"
         ).fetchall()
-        return [
-            TagSummary(
+        results: list[TagSummary] = []
+        for row in rows:
+            desc = ""
+            try:
+                desc = row["description"]
+            except (IndexError, KeyError):
+                pass
+            results.append(TagSummary(
                 tag=row["tag"],
                 summary=row["summary"],
+                description=desc,
                 summary_tokens=row["summary_tokens"],
                 source_segment_refs=json.loads(row["source_segment_refs"]),
                 source_turn_numbers=json.loads(row["source_turn_numbers"]),
                 covers_through_turn=row["covers_through_turn"],
                 created_at=_str_to_dt(row["created_at"]),
                 updated_at=_str_to_dt(row["updated_at"]),
-            )
-            for row in rows
-        ]
+            ))
+        return results
 
     def get_segments_by_tags(
         self,
@@ -599,13 +717,8 @@ class SQLiteStore(ContextStore):
         )
         conn.commit()
 
-    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM engine_state WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        if not row:
-            return None
+    def _parse_engine_state_row(self, row) -> EngineStateSnapshot:
+        """Parse a SQLite row into an EngineStateSnapshot."""
         raw = json.loads(row["turn_tag_entries"])
         # Support both old format (list of entries) and new format (dict with split_processed_tags)
         if isinstance(raw, dict):
@@ -644,6 +757,24 @@ class SQLiteStore(ContextStore):
             split_processed_tags=split_processed_tags,
             working_set=working_set,
         )
+
+    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM engine_state WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return self._parse_engine_state_row(row)
+
+    def load_latest_engine_state(self) -> EngineStateSnapshot | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM engine_state ORDER BY compacted_through DESC, saved_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        return self._parse_engine_state_row(row)
 
     def close(self) -> None:
         if self._conn:

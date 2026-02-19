@@ -16,8 +16,16 @@ version: "0.2"
 #   - Summarizer still uses local Ollama qwen3:4b (free, quality sufficient for summaries)
 
 storage_root: ".virtualcontext"
-context_window: 120000
+context_window: 5000
 token_counter: "estimate"   # "estimate" | "tiktoken" | "callable:module.path:func"
+
+paging:
+  enabled: true
+  autonomous_models:
+    - opus
+    - sonnet
+    - gpt-4
+    - gpt-4o
 
 # =====================================================================================
 # TAG GENERATOR — Anthropic Haiku for high-quality tagging
@@ -170,6 +178,8 @@ storage:
 assembly:
   core_context_max_tokens: 18000   # budget for always-included files (SOUL.md, etc.)
   tag_context_max_tokens: 30000    # budget for retrieved tag summaries
+  context_hint_enabled: true
+  context_hint_max_tokens: 2000
   core_files: []
   # core_files:
   #   - path: "SOUL.md"

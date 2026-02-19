@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import DepthLevel, EngineStateSnapshot, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -84,6 +84,17 @@ class ContextStore(ABC):
         """Retrieve all tag summaries, ordered by tag name."""
 
     @abstractmethod
+    def search_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[QuoteResult]:
+        """Search full_text across all segments.
+
+        Returns QuoteResult objects with excerpts (~200 chars context around match).
+        """
+
+    @abstractmethod
     def get_segments_by_tags(
         self,
         tags: list[str],
@@ -97,3 +108,6 @@ class ContextStore(ABC):
 
     def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
         """Load persisted engine state for a session. None if not found."""
+
+    def load_latest_engine_state(self) -> EngineStateSnapshot | None:
+        """Load the most recently saved engine state (any session). None if empty."""

@@ -207,3 +207,89 @@ def test_compact_tag_summaries_skips_fresh(mock_llm):
     )
     assert len(result) == 0  # Nothing to build
     assert len(mock_llm.calls) == 0  # No LLM calls
+
+
+# ---------------------------------------------------------------------------
+# TagSummary.description extraction
+# ---------------------------------------------------------------------------
+
+
+class TestTagSummaryDescription:
+    """Tests for TagSummary.description field populated from rollup LLM response."""
+
+    def test_description_extracted_from_rollup_response(self):
+        """Mock LLM returns JSON with description — verify TagSummary.description is set."""
+        from virtual_context.types import StoredSummary, TagSummary
+
+        mock_llm = MockLLMProvider(
+            response=(
+                '{"summary": "Cycle tracking discussion", '
+                '"description": "Sania\'s cycle tracking via Mira", '
+                '"entities": ["Sania", "Mira"], '
+                '"key_decisions": ["use Mira device"], '
+                '"action_items": []}'
+            )
+        )
+        compactor = DomainCompactor(
+            llm_provider=mock_llm,
+            config=CompactorConfig(),
+        )
+
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        summaries = [
+            StoredSummary(
+                ref="seg-1", primary_tag="cycle-tracking",
+                tags=["cycle-tracking"],
+                summary="Discussed Mira device for cycle tracking",
+                summary_tokens=30,
+                created_at=now, start_timestamp=now, end_timestamp=now,
+            ),
+        ]
+
+        result = compactor.compact_tag_summaries(
+            cover_tags=["cycle-tracking"],
+            tag_to_summaries={"cycle-tracking": summaries},
+            tag_to_turns={"cycle-tracking": [0, 1, 2]},
+            existing_tag_summaries={},
+            max_turn=5,
+        )
+        assert len(result) == 1
+        assert result[0].description == "Sania's cycle tracking via Mira"
+
+    def test_description_fallback_when_omitted(self):
+        """Mock LLM returns JSON without description key — verify description == ''."""
+        from virtual_context.types import StoredSummary, TagSummary
+
+        mock_llm = MockLLMProvider(
+            response=(
+                '{"summary": "Legal case discussion", '
+                '"entities": ["Judge Smith"], '
+                '"key_decisions": ["file motion"], '
+                '"action_items": []}'
+            )
+        )
+        compactor = DomainCompactor(
+            llm_provider=mock_llm,
+            config=CompactorConfig(),
+        )
+
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        summaries = [
+            StoredSummary(
+                ref="seg-1", primary_tag="legal",
+                tags=["legal"],
+                summary="Case discussion",
+                summary_tokens=20,
+                created_at=now, start_timestamp=now, end_timestamp=now,
+            ),
+        ]
+
+        result = compactor.compact_tag_summaries(
+            cover_tags=["legal"],
+            tag_to_summaries={"legal": summaries},
+            tag_to_turns={"legal": [0, 1]},
+            existing_tag_summaries={},
+            max_turn=5,
+        )
+        assert len(result) == 1
+        assert result[0].description == ""

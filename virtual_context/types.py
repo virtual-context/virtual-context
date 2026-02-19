@@ -280,10 +280,21 @@ class StoredSummary:
 
 
 @dataclass
+class QuoteResult:
+    """A passage found by full-text search."""
+    text: str          # matching excerpt with surrounding context
+    tag: str           # primary_tag of the segment
+    segment_ref: str   # segment reference for drill-down
+    tags: list[str] = field(default_factory=list)  # all tags on the segment
+    score: float = 0.0 # FTS5 rank or match quality
+
+
+@dataclass
 class TagSummary:
     """Layer-2 summary: one per cover tag, rolls up all segment summaries for that tag."""
     tag: str
     summary: str = ""
+    description: str = ""  # 1-line tag description (~15-20 words) for enriched context hints
     summary_tokens: int = 0
     source_segment_refs: list[str] = field(default_factory=list)
     source_turn_numbers: list[int] = field(default_factory=list)
@@ -380,9 +391,19 @@ class WorkingSetEntry:
 
 @dataclass
 class PagingConfig:
-    """Configuration for virtual memory paging."""
+    """Configuration for virtual memory paging.
+
+    ``autonomous_models`` lists model-name substrings (case-insensitive) that
+    are trusted to manage their own context via tool calls.  When the request's
+    model matches any entry, the proxy injects ``vc_expand_topic`` /
+    ``vc_collapse_topic`` tools and a budget dashboard.  Models that don't
+    match run in *supervised* mode: VC manages paging silently via
+    ``auto_promote`` / ``auto_evict``.
+    """
     enabled: bool = False
-    mode: str = "auto"          # "auto" | "supervised" | "autonomous"
+    autonomous_models: list[str] = field(default_factory=lambda: [
+        "opus", "sonnet", "gpt-4", "gpt-4o",
+    ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
 
@@ -469,7 +490,7 @@ class AssemblerConfig:
     core_files: list[dict] = field(default_factory=list)
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
-    context_hint_max_tokens: int = 200
+    context_hint_max_tokens: int = 2000
 
 
 @dataclass
@@ -497,6 +518,7 @@ class CostTrackingConfig:
 class ProxyConfig:
     request_log_dir: str = ".virtualcontext/request_log"
     request_log_max_files: int = 50
+    upstream_context_limit: int = 200_000  # max tokens the upstream model accepts
 
 
 @dataclass

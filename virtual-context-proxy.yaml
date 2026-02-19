@@ -12,6 +12,14 @@ storage_root: ".virtualcontext"
 context_window: 120000
 token_counter: "estimate"
 
+paging:
+  enabled: true
+  autonomous_models:
+    - opus
+    - sonnet
+    - gpt-4
+    - gpt-4o
+
 # =====================================================================================
 # TAG GENERATOR — Haiku for accurate semantic tagging
 # =====================================================================================

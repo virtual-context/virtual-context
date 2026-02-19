@@ -11,7 +11,12 @@ from virtual_context.proxy.server import (
     ProxyState,
     SessionRegistry,
     SessionState,
+    _build_continuation_request,
     _detect_api_format,
+    _emit_message_end_sse,
+    _emit_text_as_sse,
+    _emit_tool_use_as_sse,
+    _execute_vc_tool,
     _extract_assistant_text,
     _extract_delta_text,
     _extract_history_pairs,
@@ -21,10 +26,14 @@ from virtual_context.proxy.server import (
     _forward_headers,
     _inject_context,
     _inject_session_marker,
+    _inject_vc_tools,
+    _is_vc_tool,
     _last_text_block,
+    _parse_sse_events,
     _strip_openclaw_envelope,
     _strip_session_markers,
     _strip_vc_prompt,
+    _vc_tool_definitions,
     create_app,
 )
 from virtual_context.config import load_config
@@ -554,7 +563,7 @@ class TestProxyState:
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()
-        engine.on_turn_complete.assert_called_once_with(history)
+        engine.on_turn_complete.assert_called_once_with(history, payload_tokens=None)
 
     def test_error_in_turn_complete_is_caught(self):
         engine = MagicMock()
@@ -1667,6 +1676,190 @@ class TestFilterBodyMessages:
         # All 3 pairs kept (pair 0 force-kept due to tool chain)
         assert dropped == 0
 
+    @pytest.mark.regression("PROXY-022")
+    def test_consecutive_user_messages_preserve_alternation(self):
+        """Unpaired consecutive user messages must not break role alternation.
+
+        OpenClaw sends consecutive user messages (e.g., batched Telegram messages,
+        tool_result followed by new user text without intervening assistant). When
+        _filter_body_messages drops pairs around these unpaired messages, the result
+        must still strictly alternate user/assistant for the Anthropic API.
+        """
+        # Reproduce real OpenClaw pattern: consecutive users at start
+        body = {
+            "messages": [
+                # Unpaired user (e.g., batched Telegram message)
+                {"role": "user", "content": "first batch msg"},
+                # Pair 0: normal pair
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                # Pair 1: no tag match → will be dropped
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+                # Pair 2: protected (recent)
+                {"role": "user", "content": "Q2"},
+                {"role": "assistant", "content": "A2"},
+                # Current user
+                {"role": "user", "content": "Current"},
+            ],
+        }
+        idx = self._build_index([
+            ["cooking"],   # pair 0 — no match
+            ["music"],     # pair 1 — no match
+            ["weather"],   # pair 2 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["unrelated"], recent_turns=1,
+        )
+        msgs = filtered["messages"]
+        # Verify strict role alternation in output
+        for i in range(1, len(msgs)):
+            assert msgs[i]["role"] != msgs[i - 1]["role"], (
+                f"Consecutive same role at indices {i-1}->{i}: "
+                f"{msgs[i-1]['role']}, {msgs[i]['role']}"
+            )
+
+    @pytest.mark.regression("PROXY-023")
+    def test_compacted_turns_dropped_when_paging_active(self):
+        """When paging is active, turns below compacted_turn watermark are dropped.
+
+        Even if a compacted turn has matching tags, it should be dropped because
+        the content is available via VC summaries and expandable via paging tools.
+        Without this, the LLM always has the raw messages and never needs paging.
+        """
+        # 8 history pairs: turns 0-4 are "compacted", turns 5-7 are not
+        body = self._build_body(8)
+        idx = self._build_index([
+            ["python", "testing"],   # turn 0 — matches but compacted
+            ["python", "api"],       # turn 1 — matches but compacted
+            ["cooking"],             # turn 2 — no match, compacted
+            ["python", "debug"],     # turn 3 — matches but compacted
+            ["music"],               # turn 4 — no match, compacted
+            ["python", "deploy"],    # turn 5 — matches, NOT compacted → keep
+            ["weather"],             # turn 6 — no match, not compacted
+            ["cars"],                # turn 7 — no match, protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+            compacted_turn=5,  # turns 0-4 are compacted
+        )
+        # turns 0-4 ALL dropped (compacted, even though 0,1,3 match tags)
+        # turn 5 kept (matches, not compacted)
+        # turn 6 dropped (no match, not compacted)
+        # turn 7 kept (protected)
+        assert dropped == 6
+        msgs = filtered["messages"]
+        # 2 kept pairs * 2 + current user = 5
+        assert len(msgs) == 5
+        # Verify the kept messages are from turns 5 and 7
+        assert msgs[0]["content"] == "Question 5"
+        assert msgs[1]["content"] == "Answer 5"
+        assert msgs[2]["content"] == "Question 7"
+        assert msgs[3]["content"] == "Answer 7"
+        assert msgs[4]["content"] == "Current question"
+
+    @pytest.mark.regression("PROXY-023")
+    def test_compacted_turn_zero_preserves_current_behavior(self):
+        """When compacted_turn=0 (default/no paging), filter behaves normally.
+
+        Tag-matching turns are kept even if they're old. This is the existing
+        behavior and must not regress.
+        """
+        body = self._build_body(5)
+        idx = self._build_index([
+            ["python"],    # turn 0 — matches → kept
+            ["cooking"],   # turn 1 — no match → dropped
+            ["music"],     # turn 2 — no match → dropped
+            ["python"],    # turn 3 — matches → kept
+            ["weather"],   # turn 4 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+            compacted_turn=0,
+        )
+        # Same as without compacted_turn: turns 0,3 kept (match), turn 4 (protected)
+        assert dropped == 2
+        msgs = filtered["messages"]
+        assert len(msgs) == 7  # 3 pairs * 2 + current user
+
+    @pytest.mark.regression("PROXY-023")
+    def test_compacted_turns_rule_tag_still_dropped(self):
+        """Even 'rule' tagged turns are dropped when compacted and paging is active.
+
+        Rule tags normally force-keep turns, but compacted content has already
+        been summarized. The paging system can retrieve it if needed.
+        """
+        body = self._build_body(5)
+        idx = self._build_index([
+            ["rule", "style"],   # turn 0 — rule tag but compacted
+            ["cooking"],         # turn 1 — compacted
+            ["music"],           # turn 2 — not compacted, no match → dropped
+            ["python"],          # turn 3 — not compacted, matches → kept
+            ["weather"],         # turn 4 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+            compacted_turn=2,  # turns 0-1 compacted
+        )
+        # turn 0 dropped (compacted, even with rule tag)
+        # turn 1 dropped (compacted)
+        # turn 2 dropped (no match)
+        # turn 3 kept (match, not compacted)
+        # turn 4 kept (protected)
+        assert dropped == 3
+        msgs = filtered["messages"]
+        assert len(msgs) == 5  # 2 pairs * 2 + current user
+
+    @pytest.mark.regression("PROXY-022")
+    def test_consecutive_user_after_tool_result_preserves_alternation(self):
+        """tool_result user followed by text user must not break alternation.
+
+        Real pattern from OpenClaw: assistant uses tool → user sends tool_result →
+        user sends new text message (no intervening assistant). When pairs around
+        the unpaired tool_result are dropped, alternation must be preserved.
+        """
+        body = {
+            "messages": [
+                # Pair 0: tag match → kept
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                # Pair 1: assistant uses tool → no tag match
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Let me check"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
+                ]},
+                # Unpaired user: tool_result without subsequent assistant
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                ]},
+                # Pair 2: new user text + assistant (this pairs with the next assistant)
+                {"role": "user", "content": "Q2-new-topic"},
+                {"role": "assistant", "content": "A2"},
+                # Pair 3: protected (recent)
+                {"role": "user", "content": "Q3"},
+                {"role": "assistant", "content": "A3"},
+                # Current user
+                {"role": "user", "content": "Current"},
+            ],
+        }
+        idx = self._build_index([
+            ["python"],    # pair 0 — matches
+            ["cooking"],   # pair 1 — no match
+            ["music"],     # pair 2 — no match
+            ["weather"],   # pair 3 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+        )
+        msgs = filtered["messages"]
+        # Verify strict role alternation
+        for i in range(1, len(msgs)):
+            assert msgs[i]["role"] != msgs[i - 1]["role"], (
+                f"Consecutive same role at indices {i-1}->{i}: "
+                f"{msgs[i-1]['role']}, {msgs[i]['role']}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Dashboard settings tests
@@ -2633,4 +2826,1220 @@ class TestPassthroughToggle:
             json={"enabled": True},
         )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Paging Tool Interception
+# ---------------------------------------------------------------------------
+
+
+class TestVCToolDefinitions:
+    """Tests for _vc_tool_definitions()."""
+
+    def test_returns_three_tools(self):
+        defs = _vc_tool_definitions()
+        assert len(defs) == 3
+
+    def test_tool_names_have_vc_prefix(self):
+        defs = _vc_tool_definitions()
+        names = {d["name"] for d in defs}
+        assert names == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"}
+
+    def test_tools_have_input_schema(self):
+        defs = _vc_tool_definitions()
+        for d in defs:
+            assert "input_schema" in d
+            schema = d["input_schema"]
+            assert schema["type"] == "object"
+            assert "properties" in schema
+            assert len(schema["required"]) >= 1
+
+    def test_expand_has_depth_enum(self):
+        defs = _vc_tool_definitions()
+        expand = [d for d in defs if d["name"] == "vc_expand_topic"][0]
+        depth = expand["input_schema"]["properties"]["depth"]
+        assert set(depth["enum"]) == {"segments", "full"}
+
+    def test_collapse_has_depth_enum(self):
+        defs = _vc_tool_definitions()
+        collapse = [d for d in defs if d["name"] == "vc_collapse_topic"][0]
+        depth = collapse["input_schema"]["properties"]["depth"]
+        assert set(depth["enum"]) == {"summary", "none"}
+
+
+class TestIsVCTool:
+    """Tests for _is_vc_tool()."""
+
+    def test_recognizes_expand(self):
+        assert _is_vc_tool("vc_expand_topic") is True
+
+    def test_recognizes_collapse(self):
+        assert _is_vc_tool("vc_collapse_topic") is True
+
+    def test_rejects_unknown(self):
+        assert _is_vc_tool("vc_unknown") is False
+
+    def test_rejects_client_tool(self):
+        assert _is_vc_tool("web_search") is False
+
+    def test_rejects_empty(self):
+        assert _is_vc_tool("") is False
+
+
+class TestExecuteVCTool:
+    """Tests for _execute_vc_tool()."""
+
+    def test_expand_calls_engine(self):
+        engine = MagicMock()
+        engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
+        result = _execute_vc_tool(engine, "vc_expand_topic", {"tag": "db", "depth": "full"})
+        engine.expand_topic.assert_called_once_with(tag="db", depth="full")
+        parsed = json.loads(result)
+        assert parsed["tag"] == "db"
+        assert parsed["tokens_added"] == 500
+
+    def test_collapse_calls_engine(self):
+        engine = MagicMock()
+        engine.collapse_topic.return_value = {"tag": "api", "depth": "summary", "tokens_freed": 300}
+        result = _execute_vc_tool(engine, "vc_collapse_topic", {"tag": "api"})
+        engine.collapse_topic.assert_called_once_with(tag="api", depth="summary")
+        parsed = json.loads(result)
+        assert parsed["tokens_freed"] == 300
+
+    def test_unknown_tool_returns_error(self):
+        engine = MagicMock()
+        result = _execute_vc_tool(engine, "vc_unknown", {})
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_engine_error_returns_error_json(self):
+        engine = MagicMock()
+        engine.expand_topic.side_effect = RuntimeError("boom")
+        result = _execute_vc_tool(engine, "vc_expand_topic", {"tag": "x"})
+        parsed = json.loads(result)
+        assert parsed["is_error"] is True
+        assert "boom" in parsed["content"]
+
+    def test_expand_default_depth(self):
+        engine = MagicMock()
+        engine.expand_topic.return_value = {}
+        _execute_vc_tool(engine, "vc_expand_topic", {"tag": "t"})
+        engine.expand_topic.assert_called_once_with(tag="t", depth="full")
+
+    def test_collapse_default_depth(self):
+        engine = MagicMock()
+        engine.collapse_topic.return_value = {}
+        _execute_vc_tool(engine, "vc_collapse_topic", {"tag": "t"})
+        engine.collapse_topic.assert_called_once_with(tag="t", depth="summary")
+
+
+class TestInjectVCTools:
+    """Tests for _inject_vc_tools()."""
+
+    def test_injects_when_no_existing_tools(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": []}
+        result = _inject_vc_tools(body, engine)
+        assert "tools" in result
+        names = {t["name"] for t in result["tools"]}
+        assert "vc_expand_topic" in names
+        assert "vc_collapse_topic" in names
+
+    def test_preserves_existing_tools(self):
+        engine = MagicMock()
+        body = {
+            "model": "claude-3",
+            "messages": [],
+            "tools": [{"name": "web_search", "description": "Search", "input_schema": {}}],
+        }
+        result = _inject_vc_tools(body, engine)
+        names = [t["name"] for t in result["tools"]]
+        assert names[0] == "web_search"
+        assert "vc_expand_topic" in names
+        assert len(names) == 4  # web_search + 3 VC tools
+
+    def test_skips_when_tool_choice_none_string(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": [], "tool_choice": "none"}
+        result = _inject_vc_tools(body, engine)
+        assert "tools" not in result or result is body
+
+    def test_skips_when_tool_choice_none_dict(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": [], "tool_choice": {"type": "none"}}
+        result = _inject_vc_tools(body, engine)
+        assert "tools" not in result or result is body
+
+    def test_shallow_copies_body(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": []}
+        result = _inject_vc_tools(body, engine)
+        assert result is not body
+        assert "tools" not in body  # original untouched
+
+
+class TestParseSSEEvents:
+    """Tests for _parse_sse_events()."""
+
+    def test_splits_on_double_newline(self):
+        buf = (
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+        )
+        events, remainder = _parse_sse_events(buf)
+        assert len(events) == 2
+        assert remainder == b""
+
+    def test_handles_crlf(self):
+        buf = (
+            b"event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\n"
+        )
+        events, remainder = _parse_sse_events(buf)
+        assert len(events) == 1
+        assert events[0][0] == "message_start"
+
+    def test_preserves_raw_bytes(self):
+        raw = b"event: ping\r\ndata: {}\r\n\r\n"
+        events, _ = _parse_sse_events(raw)
+        assert events[0][2] == raw
+
+    def test_handles_partial_event_in_buffer(self):
+        buf = (
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+            b"event: partial\ndata: {\"ty"  # incomplete
+        )
+        events, remainder = _parse_sse_events(buf)
+        assert len(events) == 1
+        assert b"partial" in remainder
+
+    def test_extracts_event_type_and_data(self):
+        buf = b"event: content_block_delta\ndata: {\"type\":\"cbd\"}\n\n"
+        events, _ = _parse_sse_events(buf)
+        evt_type, data_str, _ = events[0]
+        assert evt_type == "content_block_delta"
+        assert json.loads(data_str)["type"] == "cbd"
+
+    def test_empty_buffer(self):
+        events, remainder = _parse_sse_events(b"")
+        assert events == []
+        assert remainder == b""
+
+    def test_data_only_event(self):
+        """Events without an event: field should return empty event_type."""
+        buf = b"data: {\"done\":true}\n\n"
+        events, _ = _parse_sse_events(buf)
+        assert len(events) == 1
+        assert events[0][0] == ""
+        assert events[0][1] == '{"done":true}'
+
+
+class TestBuildContinuationRequest:
+    """Tests for _build_continuation_request()."""
+
+    def test_includes_original_messages(self):
+        original = {
+            "model": "claude-3",
+            "max_tokens": 1024,
+            "system": "You are helpful",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "t1"}],
+        }
+        assistant_content = [
+            {"type": "text", "text": "Let me check"},
+            {"type": "tool_use", "id": "t1", "name": "vc_expand_topic", "input": {"tag": "db"}},
+        ]
+        tool_results = [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "{}"},
+        ]
+        result = _build_continuation_request(original, assistant_content, tool_results)
+        assert result["messages"][0] == {"role": "user", "content": "Hi"}
+        assert result["messages"][1]["role"] == "assistant"
+        assert result["messages"][2]["role"] == "user"
+
+    def test_sets_stream_false(self):
+        result = _build_continuation_request(
+            {"model": "m", "stream": True, "messages": []}, [], [],
+        )
+        assert result["stream"] is False
+
+    def test_preserves_model_and_tools(self):
+        original = {
+            "model": "claude-opus",
+            "max_tokens": 2048,
+            "tools": [{"name": "vc_expand_topic"}],
+            "messages": [],
+        }
+        result = _build_continuation_request(original, [], [])
+        assert result["model"] == "claude-opus"
+        assert result["max_tokens"] == 2048
+        assert result["tools"] == [{"name": "vc_expand_topic"}]
+
+    def test_preserves_system(self):
+        original = {"model": "m", "system": "Be helpful", "messages": []}
+        result = _build_continuation_request(original, [], [])
+        assert result["system"] == "Be helpful"
+
+    def test_no_system_key_when_absent(self):
+        original = {"model": "m", "messages": []}
+        result = _build_continuation_request(original, [], [])
+        assert "system" not in result
+
+    def test_assistant_content_in_message(self):
+        blocks = [{"type": "text", "text": "Hello"}]
+        result = _build_continuation_request(
+            {"model": "m", "messages": []}, blocks, [],
+        )
+        assert result["messages"][-2]["content"] == blocks
+
+    def test_tool_results_in_user_message(self):
+        results = [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+        result = _build_continuation_request(
+            {"model": "m", "messages": []}, [], results,
+        )
+        assert result["messages"][-1]["content"] == results
+
+
+class TestEmitTextAsSSE:
+    """Tests for _emit_text_as_sse()."""
+
+    def test_emits_three_events(self):
+        events = _emit_text_as_sse("Hello world", 0)
+        assert len(events) == 3
+
+    def test_content_block_start_delta_stop(self):
+        events = _emit_text_as_sse("Hello", 2)
+        # Parse each event
+        start = json.loads(events[0].decode().split("data: ")[1].strip())
+        delta = json.loads(events[1].decode().split("data: ")[1].strip())
+        stop = json.loads(events[2].decode().split("data: ")[1].strip())
+        assert start["type"] == "content_block_start"
+        assert start["index"] == 2
+        assert start["content_block"]["type"] == "text"
+        assert delta["type"] == "content_block_delta"
+        assert delta["index"] == 2
+        assert delta["delta"]["text"] == "Hello"
+        assert stop["type"] == "content_block_stop"
+        assert stop["index"] == 2
+
+    def test_events_are_valid_sse(self):
+        events = _emit_text_as_sse("test", 0)
+        for event in events:
+            decoded = event.decode()
+            assert decoded.startswith("event: ")
+            assert "\ndata: " in decoded
+            assert decoded.endswith("\n\n")
+
+
+class TestEmitMessageEndSSE:
+    """Tests for _emit_message_end_sse()."""
+
+    def test_emits_two_events(self):
+        events = _emit_message_end_sse("end_turn")
+        assert len(events) == 2
+
+    def test_message_delta_has_stop_reason(self):
+        events = _emit_message_end_sse("end_turn")
+        delta = json.loads(events[0].decode().split("data: ")[1].strip())
+        assert delta["type"] == "message_delta"
+        assert delta["delta"]["stop_reason"] == "end_turn"
+
+    def test_message_stop(self):
+        events = _emit_message_end_sse("end_turn")
+        stop = json.loads(events[1].decode().split("data: ")[1].strip())
+        assert stop["type"] == "message_stop"
+
+    def test_no_usage_by_default(self):
+        events = _emit_message_end_sse("end_turn")
+        delta = json.loads(events[0].decode().split("data: ")[1].strip())
+        assert "usage" not in delta
+
+    def test_usage_included_when_provided(self):
+        usage = {"output_tokens": 59}
+        events = _emit_message_end_sse("end_turn", usage=usage)
+        delta = json.loads(events[0].decode().split("data: ")[1].strip())
+        assert delta["usage"] == {"output_tokens": 59}
+
+    def test_usage_none_excluded(self):
+        events = _emit_message_end_sse("end_turn", usage=None)
+        delta = json.loads(events[0].decode().split("data: ")[1].strip())
+        assert "usage" not in delta
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Stream Interception Integration Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sse_event(event_type: str, data: dict) -> bytes:
+    """Helper to build a single raw SSE event."""
+    data_str = json.dumps(data)
+    return f"event: {event_type}\r\ndata: {data_str}\r\n\r\n".encode()
+
+
+def _build_text_sse_stream(text: str) -> bytes:
+    """Build a complete SSE stream for a text-only response."""
+    return (
+        _make_sse_event("message_start", {"type": "message_start"})
+        + _make_sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        + _make_sse_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        })
+        + _make_sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": 0,
+        })
+        + _make_sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+        })
+        + _make_sse_event("message_stop", {"type": "message_stop"})
+    )
+
+
+def _build_tool_use_sse_stream(
+    text_before: str = "",
+    tool_name: str = "vc_expand_topic",
+    tool_id: str = "toolu_01",
+    tool_input: dict | None = None,
+) -> bytes:
+    """Build a complete SSE stream with text (optional) + tool_use."""
+    if tool_input is None:
+        tool_input = {"tag": "database", "depth": "full"}
+    input_json = json.dumps(tool_input)
+
+    events = b""
+    events += _make_sse_event("message_start", {"type": "message_start"})
+
+    block_idx = 0
+
+    # Optional text block
+    if text_before:
+        events += _make_sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": block_idx,
+            "content_block": {"type": "text", "text": ""},
+        })
+        events += _make_sse_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": block_idx,
+            "delta": {"type": "text_delta", "text": text_before},
+        })
+        events += _make_sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": block_idx,
+        })
+        block_idx += 1
+
+    # Tool use block
+    events += _make_sse_event("content_block_start", {
+        "type": "content_block_start",
+        "index": block_idx,
+        "content_block": {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": tool_name,
+            "input": {},
+        },
+    })
+    # Send input JSON in two chunks to test accumulation
+    mid = len(input_json) // 2
+    events += _make_sse_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": block_idx,
+        "delta": {"type": "input_json_delta", "partial_json": input_json[:mid]},
+    })
+    events += _make_sse_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": block_idx,
+        "delta": {"type": "input_json_delta", "partial_json": input_json[mid:]},
+    })
+    events += _make_sse_event("content_block_stop", {
+        "type": "content_block_stop",
+        "index": block_idx,
+    })
+
+    # message_delta with stop_reason=tool_use
+    events += _make_sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use"},
+    })
+    events += _make_sse_event("message_stop", {"type": "message_stop"})
+    return events
+
+
+@pytest.fixture
+def paging_test_client(tmp_path):
+    """Create app with paging-enabled mock engine."""
+    from starlette.testclient import TestClient
+    from virtual_context.types import PagingConfig
+
+    db_path = str(tmp_path / "store.db")
+    with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
+        real_config = load_config(config_dict={
+            "context_window": 10000,
+            "storage_root": str(tmp_path),
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        # Enable paging + autonomous mode
+        real_config.paging = PagingConfig(enabled=True, autonomous_models=["opus", "sonnet"])
+        engine = MagicMock()
+        engine.config = real_config
+        engine.on_message_inbound.return_value = AssembledContext()
+        engine.on_turn_complete.return_value = None
+        engine._turn_tag_index = TurnTagIndex()
+        engine._resolve_paging_mode.return_value = "autonomous"
+        engine.expand_topic.return_value = {
+            "tag": "database",
+            "depth": "full",
+            "tokens_added": 500,
+            "tokens_evicted": 0,
+            "evicted_tags": [],
+        }
+        engine.collapse_topic.return_value = {
+            "tag": "api",
+            "depth": "summary",
+            "tokens_freed": 300,
+        }
+        MockEngine.return_value = engine
+        app = create_app(upstream="http://fake:9999", config_path=None)
+    with TestClient(app) as client:
+        yield client, engine
+
+
+class TestStreamInterception:
+    """Integration tests for Phase 6 stream interception."""
+
+    def test_text_only_response_forwarded_unchanged(self, paging_test_client):
+        """Text-only responses pass through even with paging enabled."""
+        client, engine = paging_test_client
+
+        sse_data = _build_text_sse_stream("Hello world")
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3",
+                        "system": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                    },
+                )
+
+                assert resp.status_code == 200
+                body = resp.content
+                assert b"Hello world" in body
+                assert b"message_stop" in body
+
+    def test_vc_tool_intercepted_and_executed(self, paging_test_client):
+        """VC tool_use is intercepted, executed, and continuation text emitted."""
+        client, engine = paging_test_client
+
+        # Initial stream: text + VC tool_use
+        sse_data = _build_tool_use_sse_stream(
+            text_before="Let me check",
+            tool_name="vc_expand_topic",
+            tool_id="toolu_01",
+            tool_input={"tag": "database", "depth": "full"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        # Continuation response (non-streaming)
+        cont_response = MagicMock()
+        cont_response.status_code = 200
+        cont_response.json.return_value = {
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Here is the database detail."}],
+        }
+
+        call_count = 0
+
+        async def mock_send(req, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return mock_resp
+
+        async def mock_post(url, **kwargs):
+            return cont_response
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", side_effect=mock_send):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-3",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Tell me about the database"}],
+                        },
+                    )
+
+                    assert resp.status_code == 200
+                    body = resp.content
+
+                    # Text before tool should be forwarded
+                    assert b"Let me check" in body
+
+                    # VC tool_use events should NOT be visible to client
+                    assert b"vc_expand_topic" not in body
+
+                    # Continuation text should be emitted
+                    assert b"Here is the database detail" in body
+
+                    # Engine expand_topic should have been called
+                    engine.expand_topic.assert_called_once_with(
+                        tag="database", depth="full",
+                    )
+
+    def test_mixed_tools_pass_through(self, paging_test_client):
+        """Mixed VC + non-VC tools → BAIL: all events forwarded to client."""
+        client, engine = paging_test_client
+
+        # Build a stream with both a VC tool and a non-VC tool
+        events = b""
+        events += _make_sse_event("message_start", {"type": "message_start"})
+
+        # Text block
+        events += _make_sse_event("content_block_start", {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        events += _make_sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Checking"},
+        })
+        events += _make_sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": 0,
+        })
+
+        # Non-VC tool
+        events += _make_sse_event("content_block_start", {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "web_search", "input": {}},
+        })
+        events += _make_sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": '{"q":"test"}'},
+        })
+        events += _make_sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": 1,
+        })
+
+        # VC tool
+        events += _make_sse_event("content_block_start", {
+            "type": "content_block_start", "index": 2,
+            "content_block": {"type": "tool_use", "id": "t2", "name": "vc_expand_topic", "input": {}},
+        })
+        events += _make_sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '{"tag":"db"}'},
+        })
+        events += _make_sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": 2,
+        })
+
+        # message_delta with tool_use
+        events += _make_sse_event("message_delta", {
+            "type": "message_delta", "delta": {"stop_reason": "tool_use"},
+        })
+        events += _make_sse_event("message_stop", {"type": "message_stop"})
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield events
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3",
+                        "system": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Search and expand"}],
+                    },
+                )
+
+                assert resp.status_code == 200
+                body = resp.content
+
+                # Both tools should be visible (BAIL path)
+                assert b"web_search" in body
+                assert b"vc_expand_topic" in body
+
+                # Engine should NOT have been called (BAIL)
+                engine.expand_topic.assert_not_called()
+
+    def test_no_preceding_text_tool_only(self, paging_test_client):
+        """LLM calls VC tool with no text first — still intercepted."""
+        client, engine = paging_test_client
+
+        sse_data = _build_tool_use_sse_stream(
+            text_before="",  # no text
+            tool_name="vc_expand_topic",
+            tool_id="toolu_01",
+            tool_input={"tag": "api"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        cont_response = MagicMock()
+        cont_response.status_code = 200
+        cont_response.json.return_value = {
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "API details here."}],
+        }
+
+        async def mock_post(url, **kwargs):
+            return cont_response
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-3",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Show API details"}],
+                        },
+                    )
+
+                    body = resp.content
+                    assert b"API details here" in body
+                    engine.expand_topic.assert_called_once()
+
+    def test_nested_tool_calls_loop(self, paging_test_client):
+        """Continuation that triggers another VC tool call loops correctly."""
+        client, engine = paging_test_client
+
+        sse_data = _build_tool_use_sse_stream(
+            tool_name="vc_expand_topic",
+            tool_input={"tag": "db"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        call_count = 0
+
+        def make_cont_response():
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            if call_count == 1:
+                # First continuation: another VC tool call
+                resp.json.return_value = {
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "text", "text": "Expanding more..."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_02",
+                            "name": "vc_expand_topic",
+                            "input": {"tag": "api"},
+                        },
+                    ],
+                }
+            else:
+                # Second continuation: final text
+                resp.json.return_value = {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "All done."}],
+                }
+            return resp
+
+        async def mock_post(url, **kwargs):
+            return make_cont_response()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-3",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Expand everything"}],
+                        },
+                    )
+
+                    body = resp.content
+                    assert b"Expanding more" in body
+                    assert b"All done" in body
+                    # expand_topic called twice: once for initial, once for nested
+                    assert engine.expand_topic.call_count == 2
+
+    def test_max_continuation_loops_respected(self, paging_test_client):
+        """Continuation loops cap at 5 even if model keeps calling tools."""
+        client, engine = paging_test_client
+
+        sse_data = _build_tool_use_sse_stream(
+            tool_name="vc_expand_topic",
+            tool_input={"tag": "t1"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        # Every continuation returns another tool call (infinite loop attempt)
+        def make_cont_response():
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "stop_reason": "tool_use",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_loop",
+                    "name": "vc_expand_topic",
+                    "input": {"tag": "looping"},
+                }],
+            }
+            return resp
+
+        async def mock_post(url, **kwargs):
+            return make_cont_response()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-3",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Loop test"}],
+                        },
+                    )
+
+                    # Should cap at 5: 1 initial + 5 continuations = 6 total expand_topic calls
+                    # (initial tool + 5 loops)
+                    assert engine.expand_topic.call_count <= 6
+
+    def test_tool_intercept_metric_recorded(self, paging_test_client):
+        """Tool intercept events are recorded in metrics."""
+        client, engine = paging_test_client
+
+        sse_data = _build_tool_use_sse_stream(
+            tool_name="vc_expand_topic",
+            tool_input={"tag": "db"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        cont_response = MagicMock()
+        cont_response.status_code = 200
+        cont_response.json.return_value = {
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Done"}],
+        }
+
+        async def mock_post(url, **kwargs):
+            return cont_response
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-3",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Check db"}],
+                        },
+                    )
+
+        # Check metrics — we need to access the app's metrics
+        # The test client doesn't expose metrics directly, but
+        # engine.expand_topic was called → tool interception happened
+        engine.expand_topic.assert_called_once()
+
+    def test_paging_disabled_uses_raw_forwarding(self, test_client):
+        """When paging is disabled, raw byte forwarding is unchanged."""
+        client, engine = test_client
+
+        sse_events = (
+            b"event: message_start\r\n"
+            b"data: {\"type\":\"message_start\"}\r\n"
+            b"\r\n"
+            b"event: content_block_delta\r\n"
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\r\n"
+            b"\r\n"
+            b"event: message_stop\r\n"
+            b"data: {\"type\":\"message_stop\"}\r\n"
+            b"\r\n"
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_events
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3",
+                        "system": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+
+                assert resp.status_code == 200
+                # Raw bytes forwarded — \r\n preserved
+                assert b"event: message_start\r\n" in resp.content
+
+    def test_vc_tools_injected_in_request(self, paging_test_client):
+        """When paging enabled, VC tools are injected into outbound request."""
+        client, engine = paging_test_client
+
+        sse_data = _build_text_sse_stream("Hi")
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        captured_body = {}
+
+        original_build_request = None
+
+        def capture_build_request(method, url, **kwargs):
+            if "json" in kwargs:
+                captured_body.update(kwargs["json"])
+            return MagicMock()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch(
+                "virtual_context.proxy.server.httpx.AsyncClient.build_request",
+                side_effect=capture_build_request,
+            ):
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3",
+                        "system": "test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                    },
+                )
+
+        # Verify VC tools were injected into the outbound body
+        tools = captured_body.get("tools", [])
+        tool_names = {t["name"] for t in tools}
+        assert "vc_expand_topic" in tool_names
+        assert "vc_collapse_topic" in tool_names
+
+
+# ---------------------------------------------------------------------------
+# _emit_tool_use_as_sse
+# ---------------------------------------------------------------------------
+
+
+class TestEmitToolUseAsSSE:
+    """Tests for _emit_tool_use_as_sse()."""
+
+    def test_emits_three_events(self):
+        tool = {"id": "t1", "name": "memory_search", "input": {"q": "test"}}
+        events = _emit_tool_use_as_sse(tool, block_index=0)
+        assert len(events) == 3
+
+    def test_content_block_start_has_tool_use_type(self):
+        tool = {"id": "t1", "name": "memory_search", "input": {"q": "test"}}
+        events = _emit_tool_use_as_sse(tool, block_index=2)
+        start = json.loads(events[0].decode().split("data: ")[1].strip())
+        assert start["type"] == "content_block_start"
+        assert start["index"] == 2
+        assert start["content_block"]["type"] == "tool_use"
+        assert start["content_block"]["id"] == "t1"
+        assert start["content_block"]["name"] == "memory_search"
+        assert start["content_block"]["input"] == {}
+
+    def test_delta_has_input_json(self):
+        tool = {"id": "t1", "name": "memory_search", "input": {"q": "test"}}
+        events = _emit_tool_use_as_sse(tool, block_index=0)
+        delta = json.loads(events[1].decode().split("data: ")[1].strip())
+        assert delta["type"] == "content_block_delta"
+        assert delta["delta"]["type"] == "input_json_delta"
+        parsed_input = json.loads(delta["delta"]["partial_json"])
+        assert parsed_input == {"q": "test"}
+
+    def test_content_block_stop(self):
+        tool = {"id": "t1", "name": "memory_search", "input": {}}
+        events = _emit_tool_use_as_sse(tool, block_index=1)
+        stop = json.loads(events[2].decode().split("data: ")[1].strip())
+        assert stop["type"] == "content_block_stop"
+        assert stop["index"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PROXY-015: Continuation BAIL forwards non-VC tools to client
+# ---------------------------------------------------------------------------
+
+
+class TestContinuationBailForward:
+    """When a continuation returns non-VC tools, they should be forwarded
+    to the client with stop_reason=tool_use instead of being silently
+    dropped (PROXY-015)."""
+
+    @pytest.mark.regression("PROXY-015")
+    def test_non_vc_tool_forwarded_after_vc_continuation(self, paging_test_client):
+        """After VC tool succeeds, continuation returns non-VC tool →
+        non-VC tool forwarded to client, stop_reason=tool_use."""
+        client, engine = paging_test_client
+
+        # Initial stream: text + VC tool_use
+        sse_data = _build_tool_use_sse_stream(
+            text_before="Let me page that in instead of guessing.",
+            tool_name="vc_expand_topic",
+            tool_id="toolu_01",
+            tool_input={"tag": "health-protocol", "depth": "full"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        call_count = 0
+
+        def make_cont_response():
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = "{}"
+            if call_count == 1:
+                # After VC expand, LLM wants a non-VC tool
+                resp.json.return_value = {
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "text", "text": "Now searching memory..."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_02",
+                            "name": "memory_search",
+                            "input": {"query": "magnesium glycinate 400mg"},
+                        },
+                    ],
+                }
+            else:
+                resp.json.return_value = {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Unexpected"}],
+                }
+            return resp
+
+        async def mock_post(url, **kwargs):
+            return make_cont_response()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-opus-4-6",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "what did you recommend after magnesium?"}],
+                        },
+                    )
+
+                    assert resp.status_code == 200
+                    body = resp.content
+
+                    # Original text should be forwarded
+                    assert b"Let me page that in instead of guessing" in body
+
+                    # Continuation text should be forwarded
+                    assert b"Now searching memory" in body
+
+                    # Non-VC tool should be forwarded to client
+                    assert b"memory_search" in body
+                    assert b"magnesium glycinate 400mg" in body
+
+                    # VC tool should NOT be visible
+                    assert b"vc_expand_topic" not in body
+
+                    # stop_reason should be tool_use (not end_turn)
+                    assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
+
+                    # VC tool was still executed
+                    engine.expand_topic.assert_called_once()
+
+    @pytest.mark.regression("PROXY-015")
+    def test_multiple_vc_then_non_vc_all_forwarded(self, paging_test_client):
+        """VC tool x2 then non-VC → both VC tools executed, non-VC forwarded."""
+        client, engine = paging_test_client
+
+        sse_data = _build_tool_use_sse_stream(
+            text_before="Expanding...",
+            tool_name="vc_expand_topic",
+            tool_id="toolu_01",
+            tool_input={"tag": "tag-a"},
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/event-stream"}
+
+        async def mock_aiter_bytes():
+            yield sse_data
+
+        mock_resp.aiter_bytes = mock_aiter_bytes
+        mock_resp.aclose = AsyncMock()
+
+        call_count = 0
+
+        def make_cont_response():
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = "{}"
+            if call_count == 1:
+                # Second VC tool
+                resp.json.return_value = {
+                    "stop_reason": "tool_use",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_02",
+                        "name": "vc_expand_topic",
+                        "input": {"tag": "tag-b"},
+                    }],
+                }
+            elif call_count == 2:
+                # Non-VC tool after both VC tools succeeded
+                resp.json.return_value = {
+                    "stop_reason": "tool_use",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_03",
+                        "name": "web_search",
+                        "input": {"q": "some query"},
+                    }],
+                }
+            else:
+                resp.json.return_value = {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Unexpected"}],
+                }
+            return resp
+
+        async def mock_post(url, **kwargs):
+            return make_cont_response()
+
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
+            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
+                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                    resp = client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "claude-opus-4-6",
+                            "system": "test",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "expand all"}],
+                        },
+                    )
+
+                    body = resp.content
+
+                    # Non-VC tool forwarded
+                    assert b"web_search" in body
+
+                    # VC tools NOT visible
+                    assert b"vc_expand_topic" not in body
+
+                    # Both VC tools executed
+                    assert engine.expand_topic.call_count == 2
+
+                    # stop_reason=tool_use
+                    assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
 

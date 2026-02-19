@@ -185,7 +185,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         core_files=assembly_raw.get("core_files", []),
         recent_turns_always_included=assembly_raw.get("recent_turns_always_included", 3),
         context_hint_enabled=assembly_raw.get("context_hint_enabled", True),
-        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 200),
+        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 500),
     )
 
     # Retrieval
@@ -218,13 +218,16 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
             os.path.join(storage_root, "request_log"),
         ),
         request_log_max_files=proxy_raw.get("request_log_max_files", 50),
+        upstream_context_limit=proxy_raw.get("upstream_context_limit", 200_000),
     )
 
     # Paging settings
     paging_raw = raw.get("paging", {})
     paging_config = PagingConfig(
         enabled=paging_raw.get("enabled", False),
-        mode=paging_raw.get("mode", "auto"),
+        autonomous_models=paging_raw.get("autonomous_models", [
+            "opus", "sonnet", "gpt-4", "gpt-4o",
+        ]),
         auto_promote=paging_raw.get("auto_promote", True),
         auto_evict=paging_raw.get("auto_evict", True),
     )
@@ -303,11 +306,10 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             f"got '{config.storage.backend}'"
         )
 
-    # Paging mode
-    if config.paging.mode not in ("auto", "supervised", "autonomous"):
+    # Paging autonomous_models
+    if not isinstance(config.paging.autonomous_models, list):
         errors.append(
-            f"paging.mode must be 'auto', 'supervised', or 'autonomous', "
-            f"got '{config.paging.mode}'"
+            "paging.autonomous_models must be a list of model-name substrings"
         )
 
     # Check that summarization provider exists in providers

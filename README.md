@@ -214,7 +214,7 @@ Prior conversation topics available for recall:
 </context-topics>
 ```
 
-This costs ~50-200 tokens and enables a natural drill-down loop: the user asks a broad question, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval.
+This costs ~50-200 tokens and enables a natural drill-down loop: the user asks a broad question, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `find_quote` for specific facts (names, numbers, decisions), `expand_topic` for deeper understanding of a listed topic, and `collapse_topic` to free budget.
 
 ### Virtual Memory Paging
 
@@ -233,7 +233,9 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Model-tiered delegation.** Not all LLMs are equally capable of managing their own context. Weaker models (Haiku, small open-source) get a simplified topic list and can request expansions, but virtual-context handles all eviction decisions silently. Stronger models (Opus, Sonnet, GPT-4) see a full budget dashboard with token costs per topic, available budget, and depth levels, making explicit trade-off decisions. In both modes, virtual-context enforces budget constraints and falls back to automatic management when the LLM doesn't manage. The LLM drives, virtual-context enforces, like `madvise()` hints with kernel enforcement.
 
-**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `expand_topic` and `collapse_topic` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
+**Full-text search.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches the raw stored conversation text directly, bypassing tags entirely. Results include the matching excerpt plus all tags on the segment, so the LLM can chain into `expand_topic` for broader context. This is the escape hatch for the fundamental limitation of any tag-based system: content that exists in storage but is tagged under the wrong domain.
+
+**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `expand_topic`, `collapse_topic`, and `find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `find_quote` → discover tag → `expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
 ### Three-Layer Memory Hierarchy
 
@@ -567,6 +569,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Tool | `domain_status` | All tags with stats |
 | Tool | `expand_topic` | Expand a topic to segment or full detail depth |
 | Tool | `collapse_topic` | Collapse a topic back to summary or none |
+| Tool | `find_quote` | Full-text search across all stored conversation text |
 | Resource | `virtualcontext://domains` | List all tags |
 | Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
 | Prompt | `recall` | Suggest context retrieval for a topic |
@@ -600,7 +603,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 ### Storage Backends
 
-**SQLiteStore**: Primary backend. FTS5 full-text search, tag-overlap queries via junction table, tag aliases, tag summaries. Single file, no external dependencies.
+**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries. Single file, no external dependencies.
 
 **FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly.
 
@@ -663,7 +666,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 530 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 766 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

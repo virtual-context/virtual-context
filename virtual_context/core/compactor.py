@@ -29,6 +29,10 @@ preserves all key decisions, action items, entities, names, dates, and numbers.
 Keep the chronological progression. The summary should be comprehensive enough
 that someone could resume the conversation from it.
 
+Also provide a "description": a single line (max 20 words) capturing who is
+involved, what is being discussed, and the most distinctive detail. This will
+be shown as a topic label in a compact topic list.
+
 Target length: {target_tokens} tokens or fewer.
 
 Segment summaries:
@@ -37,6 +41,7 @@ Segment summaries:
 Respond with JSON:
 {{
   "summary": "...",
+  "description": "1-line topic label, max 20 words",
   "entities": ["..."],
   "key_decisions": ["..."],
   "action_items": ["..."]
@@ -417,9 +422,11 @@ class DomainCompactor:
             parsed = {"summary": combined[:4000]}
 
         summary_text = parsed.get("summary", "")
+        description = parsed.get("description", "")
         return TagSummary(
             tag=tag,
             summary=summary_text,
+            description=description,
             summary_tokens=self.token_counter(summary_text),
             source_segment_refs=[s.ref for s in summaries],
             source_turn_numbers=sorted(set(turn_numbers)),

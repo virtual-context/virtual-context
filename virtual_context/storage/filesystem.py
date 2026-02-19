@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import DepthLevel, EngineStateSnapshot, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -174,6 +174,21 @@ def _segment_to_summary(seg: StoredSegment) -> StoredSummary:
     )
 
 
+def _extract_excerpt(text: str, query: str, context_chars: int = 200) -> str:
+    """Extract text around the first occurrence of query."""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        return text[:context_chars * 2]
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(query) + context_chars)
+    excerpt = text[start:end]
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(text):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
 class FilesystemStore(ContextStore):
     """Store segments as markdown files organized by primary_tag directory."""
 
@@ -313,6 +328,27 @@ class FilesystemStore(ContextStore):
                 results.append(_segment_to_summary(seg))
         return results
 
+    def search_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[QuoteResult]:
+        query_lower = query.lower()
+        results: list[QuoteResult] = []
+        for entry in self._index.values():
+            seg = self.get_segment(entry["ref"])
+            if seg and query_lower in seg.full_text.lower():
+                excerpt = _extract_excerpt(seg.full_text, query)
+                results.append(QuoteResult(
+                    text=excerpt,
+                    tag=seg.primary_tag,
+                    segment_ref=seg.ref,
+                    tags=seg.tags,
+                ))
+                if len(results) >= limit:
+                    break
+        return results
+
     def get_all_tags(self) -> list[TagStats]:
         tag_map: dict[str, TagStats] = {}
 
@@ -420,6 +456,7 @@ class FilesystemStore(ContextStore):
         data = {
             "tag": tag_summary.tag,
             "summary": tag_summary.summary,
+            "description": tag_summary.description,
             "summary_tokens": tag_summary.summary_tokens,
             "source_segment_refs": tag_summary.source_segment_refs,
             "source_turn_numbers": tag_summary.source_turn_numbers,
@@ -440,6 +477,7 @@ class FilesystemStore(ContextStore):
         return TagSummary(
             tag=data["tag"],
             summary=data.get("summary", ""),
+            description=data.get("description", ""),
             summary_tokens=data.get("summary_tokens", 0),
             source_segment_refs=data.get("source_segment_refs", []),
             source_turn_numbers=data.get("source_turn_numbers", []),
@@ -514,14 +552,8 @@ class FilesystemStore(ContextStore):
         }
         path.write_text(json.dumps(data, indent=2))
 
-    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
-        path = self.root / "_engine_state" / f"{session_id}.json"
-        if not path.is_file():
-            return None
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return None
+    def _parse_engine_state_data(self, data: dict) -> EngineStateSnapshot:
+        """Parse a JSON dict into an EngineStateSnapshot."""
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -550,3 +582,36 @@ class FilesystemStore(ContextStore):
             split_processed_tags=data.get("split_processed_tags", []),
             working_set=working_set,
         )
+
+    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+        path = self.root / "_engine_state" / f"{session_id}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        return self._parse_engine_state_data(data)
+
+    def load_latest_engine_state(self) -> EngineStateSnapshot | None:
+        state_dir = self.root / "_engine_state"
+        if not state_dir.is_dir():
+            return None
+        # Parse all state files and pick the one with most progress
+        candidates: list[tuple[int, str, dict]] = []
+        for path in state_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                ct = data.get("compacted_through", 0)
+                saved = data.get("saved_at", "")
+                candidates.append((ct, saved, data))
+            except (json.JSONDecodeError, OSError):
+                continue
+        if not candidates:
+            return None
+        # Highest compacted_through first, then most recent saved_at
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        try:
+            return self._parse_engine_state_data(candidates[0][2])
+        except (KeyError, ValueError):
+            return None

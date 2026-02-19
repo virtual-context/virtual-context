@@ -166,6 +166,15 @@ Use `pytest -m regression` to run all regression tests.
   - `test_proxy.py::TestContentFingerprintRouting::test_same_conversation_reuses_session_via_fingerprint`
   - `test_proxy.py::TestContentFingerprintRouting::test_marker_takes_priority_over_fingerprint`
 
+### PROXY-021 — Compaction monitor uses stripped history tokens instead of client payload tokens
+
+- **Symptom**: Compaction never triggers in proxy mode. Monitor sees 13.6% utilization (16k stripped tokens) while actual client payload is 68.4% (82k tokens) of 120k context window.
+- **Root cause**: `monitor.build_snapshot()` counted tokens from envelope-stripped `conversation_history` instead of the real client payload
+- **Fix**: Added `payload_tokens` override to `build_snapshot()`, `on_turn_complete()`, and `fire_turn_complete()`. Proxy passes `_last_payload_tokens` at all call sites.
+- **Tests**:
+  - `test_monitor.py::test_build_snapshot_payload_token_override`
+  - `test_monitor.py::test_engine_on_turn_complete_payload_tokens`
+
 ### BUG-013 — Empty turns produce phantom tag occurrences
 
 - **Symptom**: Tool-use turns with no text content still got tagged via context lookback, inflating TurnTagIndex
@@ -219,6 +228,49 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: TBD — gate segment loading on retrieval branch
 - **Tests**: None yet (open)
 
+### PROXY-022 — Consecutive same-role messages break alternation after filtering
+
+- **Symptom**: Second message after ingestion crashes with Anthropic API error about role alternation
+- **Root cause**: OpenClaw sends consecutive same-role messages (batched Telegram, tool_result + new user text). `_filter_body_messages` kept them as "unpaired" but when surrounding pairs were dropped, output had consecutive same-role entries
+- **Fix**: Post-filter alternation enforcement pass — skip any message that repeats the previous role
+- **Tests**:
+  - `test_proxy.py::TestFilterBodyMessages::test_consecutive_user_messages_preserve_alternation`
+  - `test_proxy.py::TestFilterBodyMessages::test_consecutive_user_after_tool_result_preserves_alternation`
+
+### PROXY-023 — Filter keeps compacted messages when paging active, defeating tool interception
+
+- **Symptom**: LLM never calls `vc_expand_topic` because `_filter_body_messages` keeps tag-relevant raw messages even when compacted. LLM reads detail from raw messages, paging tools are dead code.
+- **Root cause**: Filter has no awareness of compaction watermark. Compacted turns with matching tags are retained alongside their VC summaries.
+- **Fix**: Added `compacted_turn` param to `_filter_body_messages`. When > 0, pairs below watermark are unconditionally dropped. Call site passes `_compacted_through // 2` when `paging.enabled and _compacted_through > 0`.
+- **Tests**:
+  - `test_proxy.py::TestFilterBodyMessages::test_compacted_turns_dropped_when_paging_active`
+  - `test_proxy.py::TestFilterBodyMessages::test_compacted_turn_zero_preserves_current_behavior`
+  - `test_proxy.py::TestFilterBodyMessages::test_compacted_turns_rule_tag_still_dropped`
+
+### PROXY-024 — Context-topics list truncates expanded tags, LLM can't discover paging tools
+
+- **Symptom**: LLM sees fragrance summary but doesn't call `vc_expand_topic` — the tag isn't in the `<context-topics>` list due to truncation at 200 tokens. Only first 9 alphabetical tags survive.
+- **Root cause**: `_build_context_hint()` builds flat alphabetical list of all ~80 tags, truncates from end. Verbose format (~30t/tag) means only 7-9 tags fit in 200t budget. Tags at summary depth scattered alphabetically, get truncated like depth:none tags.
+- **Fix**: Two-tier compact format: expanded tags first (detailed), available tags as comma-separated list. Truncation drops available entries first. Default budget bumped 200→500.
+- **Tests**:
+  - `test_paging.py::TestContextHintModes::test_autonomous_hint_expanded_tags_listed_first`
+  - `test_paging.py::TestContextHintModes::test_autonomous_hint_compact_format_fits_more_tags`
+  - `test_paging.py::TestContextHintModes::test_autonomous_hint_truncation_drops_none_first`
+  - `test_paging.py::TestContextHintModes::test_supervised_hint_compact_format`
+
+### PROXY-015 — Continuation BAIL silently drops non-VC tools, leaving user with stub response
+
+- **Symptom**: LLM says "Let me page that in instead of guessing." then calls `vc_expand_topic` (intercepted successfully), then tries `memory_search` (client tool). Proxy BAILs: emits `message_end` with `stop_reason=end_turn`, drops the non-VC tool. Client sees only the stub text, no answer.
+- **Root cause**: Continuation loop's break path (line 2698) silently discards non-VC tool_use blocks and always emits `stop_reason=end_turn`, giving the client no indication that a tool call is pending.
+- **Fix**: Forward non-VC tool_use blocks to client as SSE events and emit `stop_reason=tool_use` so the client can execute them and continue the conversation.
+- **Tests**:
+  - `test_proxy.py::TestContinuationBailForward::test_non_vc_tool_forwarded_after_vc_continuation`
+  - `test_proxy.py::TestContinuationBailForward::test_multiple_vc_then_non_vc_all_forwarded`
+  - `test_proxy.py::TestEmitToolUseAsSSE::test_emits_three_events`
+  - `test_proxy.py::TestEmitToolUseAsSSE::test_content_block_start_has_tool_use_type`
+  - `test_proxy.py::TestEmitToolUseAsSSE::test_delta_has_input_json`
+  - `test_proxy.py::TestEmitToolUseAsSSE::test_content_block_stop`
+
 ---
 
 ## By Test File
@@ -234,6 +286,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_retriever.py` | BUG-007, BUG-008, BUG-009 |
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
-| `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014 |
+| `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
+| `test_paging.py` | PROXY-024 |
+| `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |
 | `test_tag_splitter.py` | BUG-011, BUG-012 |
