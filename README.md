@@ -39,7 +39,7 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 
 Two hooks into your LLM pipeline. Pick whichever integration fits:
 
-**Option A: HTTP Proxy (zero code changes).** Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently (inbound tagging, retrieval, history filtering, response tagging, compaction). Works with any client that speaks OpenAI or Anthropic API format. Includes a [live dashboard](#live-dashboard) for real-time monitoring and tuning.
+**Option A: HTTP Proxy (zero code changes).** Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently (inbound tagging, retrieval, history filtering, response tagging, compaction). Works with any client that speaks OpenAI, Anthropic, or Gemini API format. Includes a [live dashboard](#live-dashboard) for real-time monitoring and tuning.
 
 ```bash
 virtual-context proxy --upstream https://api.anthropic.com
@@ -437,7 +437,8 @@ virtual-context transform -m "What about auth?"# tag + retrieve + assemble
 virtual-context aliases list                   # show all tag aliases
 virtual-context aliases suggest                # auto-detect potential aliases
 virtual-context aliases add db database        # register alias manually
-virtual-context proxy -u https://api.anthropic.com  # start HTTP proxy
+virtual-context proxy -u https://api.anthropic.com  # single-instance proxy
+virtual-context proxy                               # multi-instance (from config)
 virtual-context config validate                # check config syntax
 virtual-context cost-report                    # show session LLM usage
 ```
@@ -496,6 +497,30 @@ virtual-context -c virtual-context.yaml proxy --upstream https://api.openai.com 
 virtual-context -c virtual-context.yaml proxy -u https://api.anthropic.com --host 0.0.0.0 --port 9090
 ```
 
+**Multi-instance mode.** Run multiple proxy listeners on different ports, each forwarding to a different upstream provider, sharing a single engine and store. Configure in YAML instead of CLI flags:
+
+```yaml
+proxy:
+  instances:
+    - port: 5757
+      upstream: https://api.anthropic.com
+      label: anthropic
+    - port: 5758
+      upstream: https://api.openai.com/v1
+      label: openai
+    - port: 5760
+      upstream: https://generativelanguage.googleapis.com
+      label: gemini
+```
+
+```bash
+virtual-context -c virtual-context.yaml proxy
+# No --upstream needed; instances are read from config
+# Each port gets its own dashboard showing the instance label
+```
+
+All instances share the same `VirtualContextEngine`, `ProxyMetrics`, and storage backend. Tags and summaries built from conversations on one port are available for retrieval on all others.
+
 Point your client at the proxy:
 
 ```python
@@ -519,7 +544,7 @@ curl http://127.0.0.1:5757/v1/messages \
 
 **History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period; the tag vocabulary is immediately available for inbound matching.
 
-**Format-agnostic.** Auto-detects OpenAI vs Anthropic request format and injects context accordingly: into `system` for Anthropic, into `messages[0]` for OpenAI.
+**Format-agnostic.** Auto-detects Anthropic, OpenAI, and Gemini request formats via a `PayloadFormat` strategy pattern and injects context accordingly: into `system` for Anthropic, into `messages[0]` for OpenAI, into `system_instruction.parts` for Gemini. Paging tool interception works across Anthropic and Gemini formats (`tool_use`/`tool_result` and `functionCall`/`functionResponse` respectively).
 
 **Streaming with zero added latency.** SSE streams are forwarded byte-for-byte as they arrive from upstream. Text deltas are accumulated in the background for response tagging. The user sees no delay.
 
@@ -597,7 +622,9 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **Compactor** | `core/compactor.py` | LLM summarization + tag summary rollup, concurrent via ThreadPoolExecutor |
 | **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
+| **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
 | **ProxyServer** | `proxy/server.py` | HTTP proxy: enrichment, filtering, history ingestion, session continuity |
+| **MultiInstance** | `proxy/multi.py` | Multi-instance launcher: N uvicorn listeners sharing one engine/store |
 | **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats |
 | **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector + request capture ring buffer |
 
@@ -666,7 +693,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 766 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 911 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 
