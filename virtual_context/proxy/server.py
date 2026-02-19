@@ -201,18 +201,28 @@ class ProxyState:
             self._pending_complete.result()
             self._pending_complete = None
 
-    def fire_turn_complete(self, history_snapshot: list[Message]) -> None:
+    def fire_turn_complete(
+        self,
+        history_snapshot: list[Message],
+        payload_tokens: int | None = None,
+    ) -> None:
         """Submit on_turn_complete to background thread."""
         self._pending_complete = self._pool.submit(
-            self._run_turn_complete, history_snapshot
+            self._run_turn_complete, history_snapshot, payload_tokens,
         )
 
-    def _run_turn_complete(self, history: list[Message]) -> None:
+    def _run_turn_complete(
+        self,
+        history: list[Message],
+        payload_tokens: int | None = None,
+    ) -> None:
         t0 = time.monotonic()
         turn = len(history) // 2 - 1
         session_id = self.engine.config.session_id
         try:
-            report = self.engine.on_turn_complete(history)
+            report = self.engine.on_turn_complete(
+                history, payload_tokens=payload_tokens,
+            )
 
             complete_ms = round((time.monotonic() - t0) * 1000, 1)
             entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
@@ -1062,12 +1072,17 @@ def _filter_body_messages(
     recent_turns: int = 3,
     broad: bool = False,
     temporal: bool = False,
+    compacted_turn: int = 0,
 ) -> tuple[dict, int]:
     """Filter request body messages to remove irrelevant history turns.
 
     Operates on the raw API body, preserving original message format
     (content blocks, metadata, etc.).  Uses the TurnTagIndex to decide
     which user+assistant pairs to keep based on tag overlap.
+
+    When *compacted_turn* > 0 (paging active), pairs whose turn index is
+    below the watermark are unconditionally dropped — their content lives
+    in VC summaries and is retrievable via ``vc_expand_topic``.
 
     Returns (filtered_body, turns_dropped).
     """
@@ -1127,6 +1142,11 @@ def _filter_body_messages(
     for pair_idx, (u_idx, a_idx) in enumerate(pairs):
         if pair_idx >= total_pairs - protected:
             keep_pair[pair_idx] = True
+        elif compacted_turn > 0 and pair_idx < compacted_turn:
+            # PROXY-023: paging active — compacted turns are dropped
+            # unconditionally. Their content is in VC summaries and
+            # retrievable via vc_expand_topic.
+            keep_pair[pair_idx] = False
         else:
             entry = turn_tag_index.get_tags_for_turn(pair_idx)
             if entry is None:
@@ -1199,6 +1219,19 @@ def _filter_body_messages(
 
     if current_user:
         kept.append(current_user)
+
+    # PROXY-022: Enforce strict role alternation.
+    # OpenClaw can send consecutive same-role messages (batched Telegram messages,
+    # tool_result followed by new user text without intervening assistant). When
+    # we drop pairs around these "unpaired" messages the result can have
+    # consecutive same-role entries, which the Anthropic API rejects.
+    # Fix: walk the kept list and drop any message that repeats the previous role.
+    alternating: list[dict] = []
+    for msg in kept:
+        if alternating and msg.get("role") == alternating[-1].get("role"):
+            continue  # skip — would create consecutive same-role
+        alternating.append(msg)
+    kept = alternating
 
     dropped = dropped // 2  # convert message drops to pair drops
     if dropped == 0:
@@ -1308,11 +1341,42 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
     default_state: ProxyState | None = None
     try:
         engine = VirtualContextEngine(config_path=config_path)
+
+        # Lossless restart: if engine has no persisted state for its
+        # auto-generated session_id, try loading the most recent session.
+        # This avoids re-ingestion on proxy restart.
+        if (
+            hasattr(engine, '_store')
+            and hasattr(engine._store, 'load_latest_engine_state')
+            and not engine._turn_tag_index.entries
+        ):
+            try:
+                latest = engine._store.load_latest_engine_state()
+                if (
+                    latest
+                    and isinstance(getattr(latest, 'turn_tag_entries', None), list)
+                    and latest.turn_tag_entries
+                ):
+                    engine.config.session_id = latest.session_id
+                    engine._load_persisted_state()
+                    print(
+                        f"Lossless restart: restored session {latest.session_id[:12]} "
+                        f"({len(latest.turn_tag_entries)} turns, compacted={latest.compacted_through})",
+                        flush=True,
+                    )
+            except Exception as _e:
+                print(f"Lossless restart failed: {_e}", flush=True)
+
         metrics = ProxyMetrics(
             context_window=engine.config.monitor.context_window,
         )
         # Create the default session (used by dashboard and first requests)
         default_state = ProxyState(engine, metrics=metrics, upstream=upstream)
+
+        # If lossless restart recovered state, mark session as already ingested
+        # so the proxy doesn't re-ingest history on first request.
+        if engine._turn_tag_index.entries:
+            default_state._ingested_sessions.add(engine.config.session_id)
 
         # Build registry and pre-register the default session
         registry = SessionRegistry(
@@ -1352,20 +1416,22 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
 
                 _request_log_dir.mkdir(parents=True, exist_ok=True)
 
-                # Prune old files on startup — keep only the newest N triplets
-                # (each request produces .request.json + .response.json + .session.json)
+                # Prune old files on startup — keep only the newest N sets
+                # (each request produces up to 6 files: 1-inbound, 2-to-llm,
+                # 3-from-llm, 4-to-client, session, plus continuation files)
                 existing = sorted(
-                    _request_log_dir.glob("*.json"),
+                    list(_request_log_dir.glob("*.json"))
+                    + list(_request_log_dir.glob("*.txt")),
                     key=lambda p: p.stat().st_mtime,
                 )
-                keep_files = _request_log_max * 3  # request + response + session per turn
+                keep_files = _request_log_max * 6
                 if len(existing) > keep_files:
                     for stale in existing[: len(existing) - keep_files]:
                         stale.unlink(missing_ok=True)
                     pruned = len(existing) - keep_files
-                    print(f"Request log: pruned {pruned} old files, kept {keep_files} in {_request_log_dir}")
+                    print(f"Request log: pruned {pruned} old files, kept {keep_files} in {_request_log_dir}", flush=True)
                 else:
-                    print(f"Request log: {len(existing)} existing files in {_request_log_dir}")
+                    print(f"Request log: {len(existing)} existing files in {_request_log_dir}", flush=True)
         except Exception:
             pass  # engine may be a mock in tests
 
@@ -1403,13 +1469,15 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         nonlocal _log_seq
         _response_log_path: _Path | None = None
         _session_log_path: _Path | None = None
+        _log_prefix = ""
         if _request_log_dir and body_bytes:
             _log_seq += 1
             import datetime as _dt_log
             ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             _log_prefix = f"{_log_seq:06d}_{ts}_{path.replace('/', '_')}"
-            req_log = _request_log_dir / f"{_log_prefix}.request.json"
-            _response_log_path = _request_log_dir / f"{_log_prefix}.response.json"
+            # 1-inbound: raw request from client
+            req_log = _request_log_dir / f"{_log_prefix}.1-inbound.json"
+            _response_log_path = _request_log_dir / f"{_log_prefix}.3-from-llm.json"
             _session_log_path = _request_log_dir / f"{_log_prefix}.session.json"
             try:
                 req_log.write_bytes(body_bytes)
@@ -1489,6 +1557,7 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                     metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
                     session_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
+                    request_log_dir=_request_log_dir, log_prefix=_log_prefix,
                 )
 
         # ---------------------------------------------------------------
@@ -1583,6 +1652,7 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                         session_id=_session_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
+                        request_log_dir=_request_log_dir, log_prefix=_log_prefix,
                     )
 
         # ---------------------------------------------------------------
@@ -1602,11 +1672,23 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                     Message(role="user", content=user_message)
                 )
 
+                # Compute available headroom for VC context injection
+                _available_for_vc: int | None = None
+                try:
+                    _upstream_limit = int(state.engine.config.proxy.upstream_context_limit)
+                    _output_budget = body.get("max_tokens", 4096)
+                    _overhead = 5000  # tools, XML wrappers, safety margin
+                    _available_for_vc = max(0, _upstream_limit - _payload_tok - _output_budget - _overhead)
+                except (TypeError, ValueError, AttributeError):
+                    pass  # headroom unknown — assembler uses default budget
+
                 t1 = time.monotonic()
                 assembled = await asyncio.to_thread(
                     state.engine.on_message_inbound,
                     user_message,
                     state.conversation_history,
+                    body.get("model", ""),
+                    max_context_tokens=_available_for_vc,
                 )
                 inbound_ms = round((time.monotonic() - t1) * 1000, 1)
 
@@ -1620,6 +1702,14 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
         if _real_tags and state:
             recent = state.engine.config.assembler.recent_turns_always_included
+            # PROXY-023: when paging is active, drop compacted turns so the
+            # LLM relies on VC summaries + vc_expand_topic for old content.
+            _ct = 0
+            if (
+                state.engine.config.paging.enabled
+                and state.engine._compacted_through > 0
+            ):
+                _ct = state.engine._compacted_through // 2
             body, turns_dropped = _filter_body_messages(
                 body,
                 state.engine._turn_tag_index,
@@ -1627,14 +1717,41 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 recent_turns=recent,
                 broad=assembled.broad,
                 temporal=assembled.temporal,
+                compacted_turn=_ct,
             )
 
         enriched_body = _inject_context(body, prepend_text, api_format)
+
+        # Inject VC paging tools for autonomous mode (Anthropic only)
+        paging_enabled = False
+        if (
+            state
+            and api_format == "anthropic"
+            and state.engine.config.paging.enabled
+        ):
+            _paging_mode = state.engine._resolve_paging_mode(
+                enriched_body.get("model", ""),
+            )
+            if _paging_mode == "autonomous":
+                enriched_body = _inject_vc_tools(enriched_body, state.engine)
+                paging_enabled = True
+                _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
+                print(f"[PAGING] Tools injected: {_vc_names} (total tools: {len(enriched_body.get('tools', []))})")
+            else:
+                print(f"[PAGING] Mode={_paging_mode} for model={enriched_body.get('model', '?')} — tools NOT injected")
 
         # Track enriched payload size
         import json as _json2
         if state:
             state._last_enriched_payload_kb = round(len(_json2.dumps(enriched_body)) / 1024, 1)
+
+        # 2-to-llm: enriched body sent to the LLM (after filtering + context + tools)
+        if _request_log_dir and _log_prefix:
+            try:
+                _to_llm_log = _request_log_dir / f"{_log_prefix}.2-to-llm.json"
+                _to_llm_log.write_text(_json2.dumps(enriched_body, default=str))
+            except Exception:
+                pass
 
         is_streaming = body.get("stream", False)
 
@@ -1762,6 +1879,9 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
                 session_id=_session_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
+                paging_enabled=paging_enabled,
+                request_log_dir=_request_log_dir,
+                log_prefix=_log_prefix if _request_log_dir else "",
             )
         else:
             return await _handle_non_streaming(
@@ -1769,6 +1889,7 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
                 session_id=_session_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
+                request_log_dir=_request_log_dir, log_prefix=_log_prefix,
             )
 
     return app
@@ -1874,6 +1995,18 @@ def _dump_session_state(
         # Split processed tags
         split_tags = list(getattr(engine, "_split_processed_tags", set()))
 
+        # Working set (paging state)
+        working_set_dump: list[dict] = []
+        ws = getattr(engine, "_working_set", None)
+        if ws:
+            for tag, entry in ws.items():
+                working_set_dump.append({
+                    "tag": tag,
+                    "depth": entry.depth.value if hasattr(entry.depth, "value") else str(entry.depth),
+                    "tokens": entry.tokens,
+                    "last_accessed_turn": entry.last_accessed_turn,
+                })
+
         dump = {
             "session_id": engine.config.session_id,
             "session_state": state._state.value if hasattr(state._state, "value") else str(state._state),
@@ -1885,6 +2018,7 @@ def _dump_session_state(
             "tag_aliases": aliases,
             "tag_stats": tag_stats,
             "split_processed_tags": split_tags,
+            "working_set": working_set_dump,
             "conversation_history": [
                 {"role": m.role, "content": m.content[:500]}
                 for m in state.conversation_history
@@ -1897,6 +2031,299 @@ def _dump_session_state(
         )
     except Exception:
         pass  # never let session dump break the request
+
+
+# ---------------------------------------------------------------------------
+# Paging tool interception helpers (Phase 6)
+# ---------------------------------------------------------------------------
+
+_VC_TOOL_NAMES = frozenset({"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"})
+
+
+def _vc_tool_definitions() -> list[dict]:
+    """Return Anthropic tool definitions for VC context tools."""
+    return [
+        {
+            "name": "vc_expand_topic",
+            "description": (
+                "Zoom into a topic you can already see in the context-topics list. "
+                "Use when a topic summary mentions the area you need but lacks "
+                "detail — e.g. it says 'discussed supplements' but you need the "
+                "specific dosage. Requires knowing which tag to expand. "
+                "For specific facts when you don't know which topic holds them, "
+                "use vc_find_quote instead."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "Topic tag from the context-topics list to expand.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["segments", "full"],
+                        "description": (
+                            "Target depth: 'segments' for individual summaries, "
+                            "'full' for original conversation text."
+                        ),
+                    },
+                },
+                "required": ["tag"],
+            },
+        },
+        {
+            "name": "vc_collapse_topic",
+            "description": (
+                "Collapse an expanded topic back to its summary to free context "
+                "budget. Use after you've retrieved what you need from an expanded "
+                "topic, or to make room before expanding a different one."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "Topic tag to collapse.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["summary", "none"],
+                        "description": (
+                            "Target depth: 'summary' for brief overview, "
+                            "'none' to remove from context entirely."
+                        ),
+                    },
+                },
+                "required": ["tag"],
+            },
+        },
+        {
+            "name": "vc_find_quote",
+            "description": (
+                "Search the full original conversation text for a specific word, "
+                "phrase, or detail. Use this as your first tool when the user asks "
+                "about a specific fact — a name, number, dosage, recommendation, "
+                "date, or decision — especially when no topic summary mentions it "
+                "or you don't know which topic it falls under. This bypasses tags "
+                "entirely and searches raw text, so it finds content even when "
+                "it's filed under an unexpected topic."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The word or phrase to search for. Use the most specific and "
+                            "distinctive terms — e.g. 'magnesium glycinate' rather than "
+                            "'supplement', or 'reservation 7pm' rather than 'dinner'."
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    ]
+
+
+def _is_vc_tool(name: str) -> bool:
+    """Return True if *name* is a known VC paging tool."""
+    return name in _VC_TOOL_NAMES
+
+
+def _execute_vc_tool(
+    engine: "VirtualContextEngine", name: str, tool_input: dict,
+) -> str:
+    """Execute a VC paging tool and return a JSON result string."""
+    import json as _json
+    try:
+        if name == "vc_expand_topic":
+            result = engine.expand_topic(
+                tag=tool_input.get("tag", ""),
+                depth=tool_input.get("depth", "full"),
+            )
+        elif name == "vc_collapse_topic":
+            result = engine.collapse_topic(
+                tag=tool_input.get("tag", ""),
+                depth=tool_input.get("depth", "summary"),
+            )
+        elif name == "vc_find_quote":
+            result = engine.find_quote(
+                query=tool_input.get("query", ""),
+                max_results=tool_input.get("max_results", 5),
+            )
+        else:
+            result = {"error": f"unknown VC tool: {name}"}
+        return _json.dumps(result)
+    except Exception as e:
+        return _json.dumps({"is_error": True, "content": str(e)})
+
+
+def _inject_vc_tools(body: dict, engine: "VirtualContextEngine") -> dict:
+    """Append VC paging tool definitions to the request body's tools array.
+
+    Shallow-copies *body*.  Skips if ``tool_choice`` is ``"none"``.
+    """
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") == "none":
+        return body
+    if tc == "none":
+        return body
+    body = dict(body)  # shallow copy
+    tools = list(body.get("tools") or [])
+    tools.extend(_vc_tool_definitions())
+    body["tools"] = tools
+    return body
+
+
+def _parse_sse_events(
+    buf: bytes,
+) -> tuple[list[tuple[str, str, bytes]], bytes]:
+    """Split a byte buffer into complete SSE events.
+
+    Returns ``(events, remainder)`` where each event is
+    ``(event_type, data_str, raw_bytes)``.  Handles both ``\\r\\n\\r\\n``
+    and ``\\n\\n`` event boundaries.
+    """
+    events: list[tuple[str, str, bytes]] = []
+    while True:
+        idx_rn = buf.find(b"\r\n\r\n")
+        idx_n = buf.find(b"\n\n")
+        if idx_rn == -1 and idx_n == -1:
+            break
+        # Use whichever boundary comes first
+        if idx_rn != -1 and (idx_n == -1 or idx_rn <= idx_n):
+            end = idx_rn + 4
+        else:
+            end = idx_n + 2
+
+        raw_event = buf[:end]
+        buf = buf[end:]
+
+        decoded = raw_event.decode("utf-8", errors="replace")
+        event_type = ""
+        data_str = ""
+        for line in decoded.split("\n"):
+            line = line.rstrip("\r")
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+            elif line.startswith("data: "):
+                data_str = line[6:]
+
+        events.append((event_type, data_str, raw_event))
+
+    return events, buf
+
+
+def _build_continuation_request(
+    original_body: dict,
+    assistant_content: list[dict],
+    tool_results: list[dict],
+) -> dict:
+    """Build a non-streaming continuation request after VC tool execution.
+
+    Appends an assistant message (with text + tool_use blocks) and a
+    user message (with tool_result blocks) to the original messages.
+    """
+    body: dict = {
+        "model": original_body.get("model"),
+        "max_tokens": original_body.get("max_tokens", 4096),
+        "stream": False,
+        "messages": list(original_body.get("messages", [])),
+    }
+    if "system" in original_body:
+        body["system"] = original_body["system"]
+    if "tools" in original_body:
+        body["tools"] = original_body["tools"]
+    body["messages"].append({"role": "assistant", "content": assistant_content})
+    body["messages"].append({"role": "user", "content": tool_results})
+    return body
+
+
+def _emit_text_as_sse(text: str, block_index: int) -> list[bytes]:
+    """Convert *text* into Anthropic SSE events at *block_index*."""
+    import json as _json
+    events: list[bytes] = []
+    start = _json.dumps({
+        "type": "content_block_start",
+        "index": block_index,
+        "content_block": {"type": "text", "text": ""},
+    })
+    events.append(f"event: content_block_start\ndata: {start}\n\n".encode())
+
+    delta = _json.dumps({
+        "type": "content_block_delta",
+        "index": block_index,
+        "delta": {"type": "text_delta", "text": text},
+    })
+    events.append(f"event: content_block_delta\ndata: {delta}\n\n".encode())
+
+    stop = _json.dumps({
+        "type": "content_block_stop",
+        "index": block_index,
+    })
+    events.append(f"event: content_block_stop\ndata: {stop}\n\n".encode())
+    return events
+
+
+def _emit_tool_use_as_sse(
+    tool: dict, block_index: int,
+) -> list[bytes]:
+    """Convert a tool_use content block into Anthropic SSE events."""
+    import json as _json
+    events: list[bytes] = []
+    start = _json.dumps({
+        "type": "content_block_start",
+        "index": block_index,
+        "content_block": {
+            "type": "tool_use",
+            "id": tool.get("id", ""),
+            "name": tool.get("name", ""),
+            "input": {},
+        },
+    })
+    events.append(f"event: content_block_start\ndata: {start}\n\n".encode())
+
+    input_str = _json.dumps(tool.get("input", {}))
+    delta = _json.dumps({
+        "type": "content_block_delta",
+        "index": block_index,
+        "delta": {"type": "input_json_delta", "partial_json": input_str},
+    })
+    events.append(f"event: content_block_delta\ndata: {delta}\n\n".encode())
+
+    stop = _json.dumps({
+        "type": "content_block_stop",
+        "index": block_index,
+    })
+    events.append(f"event: content_block_stop\ndata: {stop}\n\n".encode())
+    return events
+
+
+def _emit_message_end_sse(
+    stop_reason: str = "end_turn",
+    usage: dict | None = None,
+) -> list[bytes]:
+    """Emit ``message_delta`` and ``message_stop`` SSE events."""
+    import json as _json
+    events: list[bytes] = []
+    md_payload: dict = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason},
+    }
+    if usage:
+        md_payload["usage"] = usage
+    md = _json.dumps(md_payload)
+    events.append(f"event: message_delta\ndata: {md}\n\n".encode())
+
+    ms = _json.dumps({"type": "message_stop"})
+    events.append(f"event: message_stop\ndata: {ms}\n\n".encode())
+    return events
 
 
 async def _handle_streaming(
@@ -1914,6 +2341,9 @@ async def _handle_streaming(
     passthrough: bool = False,
     response_log_path: object | None = None,
     session_log_path: object | None = None,
+    paging_enabled: bool = False,
+    request_log_dir: object | None = None,
+    log_prefix: str = "",
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -1921,10 +2351,17 @@ async def _handle_streaming(
     The Node.js Anthropic SDK is strict about SSE formatting — decoding
     and re-encoding via ``aiter_lines()`` can break its parser.
 
+    When *paging_enabled* is True, uses event-level forwarding: parses SSE
+    events individually, forwards text events immediately, suppresses VC
+    tool_use events, executes them locally, sends non-streaming continuations,
+    and emits the continuation text as SSE back to the client.
+
     Non-2xx upstream responses (rate limits, overloads) are returned as
     JSON errors instead of broken SSE streams.
     """
     import json as _json
+
+    _MAX_CONTINUATION_LOOPS = 5
 
     headers = dict(headers)
     headers.pop("accept-encoding", None)
@@ -1969,9 +2406,395 @@ async def _handle_streaming(
     resp_headers.setdefault("cache-control", "no-cache")
     resp_headers.setdefault("x-accel-buffering", "no")
 
-    async def stream_generator():
+    # ----- shared post-stream processing -----
+    def _post_stream(text_chunks, raw_events):
+        """Return (assistant_text, upstream_ms) and handle side-effects."""
+        nonlocal t_upstream
+        upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
+        if metrics:
+            metrics.record({
+                "type": "response",
+                "turn": turn,
+                "upstream_ms": upstream_ms,
+                "total_ms": round(overhead_ms + upstream_ms, 1),
+                "streaming": True,
+                "session_id": session_id,
+            })
+        assistant_text = "".join(text_chunks)
+        print(
+            f"[T{turn}] RESPONSE stream={True} "
+            f"llm={int(upstream_ms)}ms "
+            f"total={int(round(overhead_ms + upstream_ms))}ms "
+            f"chars={len(assistant_text)}"
+        )
+        if response_log_path:
+            try:
+                response_log_path.write_text(
+                    _json.dumps({
+                        "streaming": True,
+                        "assistant_text": assistant_text,
+                        "upstream_ms": upstream_ms,
+                        "raw_events": "".join(raw_events),
+                    }, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return assistant_text, upstream_ms
+
+    async def _inner_stream():
         text_chunks: list[str] = []
         raw_events: list[str] = []
+
+        # ---------------------------------------------------------------
+        # Paging path: event-level forwarding with VC tool interception
+        # ---------------------------------------------------------------
+        if paging_enabled:
+            buf = b""
+            vc_tools: list[dict] = []          # [{id, name, input}]
+            non_vc_tools: list[dict] = []      # [{id, name}]
+            all_content_blocks: list[dict] = []  # for continuation
+            forwarded_block_count = 0
+            suppressing = False
+            current_vc_tool: dict | None = None
+            current_text_parts: list[str] = []
+            suppressed_raw: list[bytes] = []
+            need_continuation = False
+
+            try:
+                async for raw_chunk in upstream.aiter_bytes():
+                    raw_events.append(
+                        raw_chunk.decode("utf-8", errors="replace"),
+                    )
+                    buf += raw_chunk
+                    events, buf = _parse_sse_events(buf)
+
+                    for _evt_type, data_str, raw_bytes in events:
+                        if not data_str or data_str.strip() == "[DONE]":
+                            yield raw_bytes
+                            continue
+
+                        try:
+                            data = _json.loads(data_str)
+                        except _json.JSONDecodeError:
+                            yield raw_bytes
+                            continue
+
+                        dtype = data.get("type", "")
+
+                        # -- content_block_start --
+                        if dtype == "content_block_start":
+                            block = data.get("content_block", {})
+                            btype = block.get("type", "")
+                            if (
+                                btype == "tool_use"
+                                and _is_vc_tool(block.get("name", ""))
+                            ):
+                                suppressing = True
+                                current_vc_tool = {
+                                    "id": block["id"],
+                                    "name": block["name"],
+                                    "input_parts": [],
+                                }
+                                suppressed_raw.append(raw_bytes)
+                                continue
+                            elif btype == "tool_use":
+                                non_vc_tools.append({
+                                    "id": block["id"],
+                                    "name": block["name"],
+                                })
+                            elif btype == "text":
+                                current_text_parts = []
+
+                        # -- content_block_delta --
+                        elif dtype == "content_block_delta":
+                            if suppressing:
+                                delta = data.get("delta", {})
+                                if delta.get("type") == "input_json_delta":
+                                    current_vc_tool["input_parts"].append(
+                                        delta.get("partial_json", ""),
+                                    )
+                                suppressed_raw.append(raw_bytes)
+                                continue
+                            else:
+                                dt = _extract_delta_text(data, "anthropic")
+                                if dt:
+                                    text_chunks.append(dt)
+                                    current_text_parts.append(dt)
+
+                        # -- content_block_stop --
+                        elif dtype == "content_block_stop":
+                            if suppressing:
+                                if current_vc_tool:
+                                    input_str = "".join(
+                                        current_vc_tool["input_parts"],
+                                    )
+                                    try:
+                                        parsed_input = _json.loads(input_str)
+                                    except _json.JSONDecodeError:
+                                        parsed_input = {}
+                                    vc_tools.append({
+                                        "id": current_vc_tool["id"],
+                                        "name": current_vc_tool["name"],
+                                        "input": parsed_input,
+                                    })
+                                    all_content_blocks.append({
+                                        "type": "tool_use",
+                                        "id": current_vc_tool["id"],
+                                        "name": current_vc_tool["name"],
+                                        "input": parsed_input,
+                                    })
+                                    current_vc_tool = None
+                                suppressing = False
+                                suppressed_raw.append(raw_bytes)
+                                continue
+                            else:
+                                # Finalize text block
+                                if current_text_parts:
+                                    all_content_blocks.append({
+                                        "type": "text",
+                                        "text": "".join(current_text_parts),
+                                    })
+                                    current_text_parts = []
+                                    forwarded_block_count += 1
+
+                        # -- message_delta --
+                        elif dtype == "message_delta":
+                            sr = data.get("delta", {}).get("stop_reason")
+                            if sr == "tool_use" and vc_tools:
+                                if non_vc_tools:
+                                    # BAIL: mixed VC + non-VC tools
+                                    logger.warning(
+                                        "Mixed VC + non-VC tools in "
+                                        "response — passing all through",
+                                    )
+                                    for s in suppressed_raw:
+                                        yield s
+                                    suppressed_raw.clear()
+                                    vc_tools.clear()
+                                    need_continuation = False
+                                else:
+                                    # All VC — suppress, handle after
+                                    # message_stop
+                                    need_continuation = True
+                                    suppressed_raw.append(raw_bytes)
+                                    continue
+
+                        # -- message_stop --
+                        elif dtype == "message_stop":
+                            if need_continuation:
+                                suppressed_raw.append(raw_bytes)
+                                continue
+
+                        # Default: forward event to client
+                        yield raw_bytes
+            finally:
+                await upstream.aclose()
+
+            # --- Continuation phase ---
+            if need_continuation and vc_tools and state:
+                cont_body: dict | None = None
+                cont_data: dict | None = None
+                loop_content_blocks: list[dict] = []
+
+                for loop_i in range(_MAX_CONTINUATION_LOOPS):
+                    # Execute VC tools
+                    tool_results: list[dict] = []
+                    for tool in vc_tools:
+                        t_tool = time.monotonic()
+                        result_str = _execute_vc_tool(
+                            state.engine,
+                            tool["name"],
+                            tool["input"],
+                        )
+                        tool_ms = round(
+                            (time.monotonic() - t_tool) * 1000, 1,
+                        )
+                        if metrics:
+                            metrics.record({
+                                "type": "tool_intercept",
+                                "turn": turn,
+                                "tool_name": tool["name"],
+                                "tool_input": tool["input"],
+                                "result": result_str[:200],
+                                "duration_ms": tool_ms,
+                                "continuation_count": loop_i + 1,
+                                "session_id": session_id,
+                            })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool["id"],
+                            "content": result_str,
+                        })
+
+                    # Re-assemble context with updated working set
+                    # so the LLM sees the expanded content in this
+                    # turn (not deferred to next turn).
+                    new_prepend = state.engine.reassemble_context()
+                    reassembled_body = _inject_context(
+                        body, new_prepend, api_format,
+                    ) if new_prepend else body
+
+                    # Build or extend continuation request
+                    if cont_body is None:
+                        cont_body = _build_continuation_request(
+                            reassembled_body,
+                            all_content_blocks,
+                            tool_results,
+                        )
+                    else:
+                        # Update system prompt with re-assembled context
+                        if new_prepend and "system" in reassembled_body:
+                            cont_body["system"] = reassembled_body["system"]
+                        cont_body["messages"].append({
+                            "role": "assistant",
+                            "content": loop_content_blocks,
+                        })
+                        cont_body["messages"].append({
+                            "role": "user",
+                            "content": tool_results,
+                        })
+
+                    # Send non-streaming continuation
+                    cont_resp = await client.post(
+                        url, headers=headers, json=cont_body,
+                    )
+
+                    # Log continuation request/response to disk
+                    if request_log_dir and log_prefix:
+                        _cn = loop_i + 1
+                        try:
+                            from pathlib import Path as _CPath
+                            _cdir = _CPath(request_log_dir)
+                            _cdir.joinpath(
+                                f"{log_prefix}.continuation-{_cn}.request.json"
+                            ).write_text(
+                                _json.dumps(cont_body, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            _cdir.joinpath(
+                                f"{log_prefix}.continuation-{_cn}.response.json"
+                            ).write_text(
+                                cont_resp.text, encoding="utf-8",
+                            )
+                        except Exception:
+                            pass  # never let logging break the request
+
+                    if cont_resp.status_code >= 300:
+                        logger.error(
+                            "Continuation failed: %d",
+                            cont_resp.status_code,
+                        )
+                        break
+
+                    cont_data = cont_resp.json()
+                    stop_reason = cont_data.get("stop_reason", "end_turn")
+                    content = cont_data.get("content", [])
+                    loop_content_blocks = content
+
+                    # Emit text blocks as SSE
+                    text_blocks = [
+                        b for b in content if b.get("type") == "text"
+                    ]
+                    tool_blocks = [
+                        b for b in content if b.get("type") == "tool_use"
+                    ]
+                    vc_next = [
+                        b for b in tool_blocks
+                        if _is_vc_tool(b.get("name", ""))
+                    ]
+
+                    for tb in text_blocks:
+                        t = tb.get("text", "")
+                        if t:
+                            text_chunks.append(t)
+                            for sse_evt in _emit_text_as_sse(
+                                t, forwarded_block_count,
+                            ):
+                                yield sse_evt
+                            forwarded_block_count += 1
+
+                    # More VC-only tool calls → loop
+                    if (
+                        stop_reason == "tool_use"
+                        and vc_next
+                        and all(
+                            _is_vc_tool(b.get("name", ""))
+                            for b in tool_blocks
+                        )
+                    ):
+                        vc_tools = [
+                            {
+                                "id": b["id"],
+                                "name": b["name"],
+                                "input": b.get("input", {}),
+                            }
+                            for b in vc_next
+                        ]
+                        continue
+
+                    # Done — forward any non-VC tools to client
+                    non_vc_in_cont = [
+                        b for b in tool_blocks
+                        if not _is_vc_tool(b.get("name", ""))
+                    ]
+                    if non_vc_in_cont:
+                        for nvc in non_vc_in_cont:
+                            for sse_evt in _emit_tool_use_as_sse(
+                                nvc, forwarded_block_count,
+                            ):
+                                yield sse_evt
+                            forwarded_block_count += 1
+                    break
+
+                # Emit message end events
+                cont_usage = cont_data.get("usage") if cont_data else None
+                cont_stop = "end_turn"
+                if cont_data:
+                    # If the LLM stopped for tool_use and we forwarded
+                    # non-VC tools, tell the client so it handles them.
+                    raw_stop = cont_data.get("stop_reason", "end_turn")
+                    non_vc_forwarded = any(
+                        b.get("type") == "tool_use"
+                        and not _is_vc_tool(b.get("name", ""))
+                        for b in cont_data.get("content", [])
+                    )
+                    if raw_stop == "tool_use" and non_vc_forwarded:
+                        cont_stop = "tool_use"
+                for sse_evt in _emit_message_end_sse(cont_stop, usage=cont_usage):
+                    yield sse_evt
+
+            # Post-stream processing
+            assistant_text, _ = _post_stream(text_chunks, raw_events)
+            if state and assistant_text:
+                state.conversation_history.append(
+                    Message(role="assistant", content=assistant_text),
+                )
+                if not passthrough:
+                    state.fire_turn_complete(
+                        list(state.conversation_history),
+                        payload_tokens=state._last_payload_tokens or None,
+                    )
+                _marker_sid = state.engine.config.session_id
+                marker = f"\n<!-- vc:session={_marker_sid} -->"
+                marker_event = _json.dumps({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": marker},
+                })
+                yield (
+                    f"event: content_block_delta\n"
+                    f"data: {marker_event}\n\n"
+                ).encode()
+
+            if session_log_path and state:
+                _dump_session_state(state, session_log_path)
+
+            return  # exit — don't fall through to raw-byte path
+
+        # ---------------------------------------------------------------
+        # Non-paging path: raw-byte forwarding (unchanged)
+        # ---------------------------------------------------------------
         line_buf = ""
         try:
             async for raw_chunk in upstream.aiter_bytes():
@@ -1997,44 +2820,16 @@ async def _handle_streaming(
                             pass
         finally:
             await upstream.aclose()
-            upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
-            if metrics:
-                metrics.record({
-                    "type": "response",
-                    "turn": turn,
-                    "upstream_ms": upstream_ms,
-                    "total_ms": round(overhead_ms + upstream_ms, 1),
-                    "streaming": True,
-                    "session_id": session_id,
-                })
-            assistant_text = "".join(text_chunks)
-            print(
-                f"[T{turn}] RESPONSE stream={True} "
-                f"llm={int(upstream_ms)}ms "
-                f"total={int(round(overhead_ms + upstream_ms))}ms "
-                f"chars={len(assistant_text)}"
-            )
-
-            # Log assembled response
-            if response_log_path:
-                try:
-                    response_log_path.write_text(
-                        _json.dumps({
-                            "streaming": True,
-                            "assistant_text": assistant_text,
-                            "upstream_ms": upstream_ms,
-                            "raw_events": "".join(raw_events),
-                        }, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
+            assistant_text, _ = _post_stream(text_chunks, raw_events)
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text)
                 )
                 if not passthrough:
-                    state.fire_turn_complete(list(state.conversation_history))
+                    state.fire_turn_complete(
+                        list(state.conversation_history),
+                        payload_tokens=state._last_payload_tokens or None,
+                    )
 
                 # Inject session marker as a final SSE delta so the client SDK
                 # accumulates it into the stored assistant message.
@@ -2056,6 +2851,22 @@ async def _handle_streaming(
             # Session state dump (after response + history update)
             if session_log_path and state:
                 _dump_session_state(state, session_log_path)
+
+    async def stream_generator():
+        """Wrapper that captures all bytes sent to the client."""
+        client_chunks: list[bytes] = []
+        async for chunk in _inner_stream():
+            client_chunks.append(chunk)
+            yield chunk
+        # 4-to-client: log everything sent back to the client
+        if request_log_dir and log_prefix:
+            try:
+                from pathlib import Path as _P4
+                _P4(request_log_dir).joinpath(
+                    f"{log_prefix}.4-to-client.txt",
+                ).write_bytes(b"".join(client_chunks))
+            except Exception:
+                pass
 
     return StreamingResponse(
         stream_generator(),
@@ -2079,8 +2890,11 @@ async def _handle_non_streaming(
     passthrough: bool = False,
     response_log_path: object | None = None,
     session_log_path: object | None = None,
+    request_log_dir: object | None = None,
+    log_prefix: str = "",
 ) -> JSONResponse:
     """Forward JSON response, parse assistant text, fire on_turn_complete."""
+    import json as _json_ns
     t_upstream = time.monotonic()
     resp = await client.request("POST", url, headers=headers, json=body)
     upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
@@ -2090,6 +2904,19 @@ async def _handle_non_streaming(
     except Exception:
         return JSONResponse(content=resp.text, status_code=resp.status_code)
 
+    # 3-from-llm: raw upstream response before any modification
+    if request_log_dir and log_prefix:
+        try:
+            from pathlib import Path as _P3
+            _P3(request_log_dir).joinpath(
+                f"{log_prefix}.3-from-llm.json",
+            ).write_text(
+                _json_ns.dumps(response_body, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     # Extract and record assistant text
     assistant_text = _extract_assistant_text(response_body, api_format)
     if state and assistant_text:
@@ -2097,7 +2924,10 @@ async def _handle_non_streaming(
             Message(role="assistant", content=assistant_text)
         )
         if not passthrough:
-            state.fire_turn_complete(list(state.conversation_history))
+            state.fire_turn_complete(
+                list(state.conversation_history),
+                payload_tokens=state._last_payload_tokens or None,
+            )
 
         # Inject session marker into the response body so the client stores it
         session_id = state.engine.config.session_id
@@ -2114,16 +2944,12 @@ async def _handle_non_streaming(
             "session_id": session_id,
         })
 
-    # Log response
-    if response_log_path:
-        try:
-            import json as _json_log
-            response_log_path.write_text(
-                _json_log.dumps(response_body, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
+    print(
+        f"[T{turn}] RESPONSE stream=False "
+        f"llm={int(upstream_ms)}ms "
+        f"total={int(round(overhead_ms + upstream_ms))}ms "
+        f"chars={len(assistant_text or '')}"
+    )
 
     # Session state dump
     if session_log_path and state:
@@ -2131,6 +2957,19 @@ async def _handle_non_streaming(
 
     # Forward response headers (filter hop-by-hop)
     resp_headers = _forward_headers(dict(resp.headers))
+
+    # 4-to-client: response body after session marker injection
+    if request_log_dir and log_prefix:
+        try:
+            from pathlib import Path as _P4c
+            _P4c(request_log_dir).joinpath(
+                f"{log_prefix}.4-to-client.json",
+            ).write_text(
+                _json_ns.dumps(response_body, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     return JSONResponse(
         content=response_body,

@@ -76,13 +76,24 @@ class ContextMonitor:
         core_tokens: int = 0,
         domain_tokens: int = 0,
         system_tokens: int = 0,
+        payload_tokens: int | None = None,
     ) -> ContextSnapshot:
-        """Build a ContextSnapshot from conversation history."""
-        conv_text = " ".join(
-            m.content if hasattr(m, "content") else str(m)
-            for m in conversation_history
-        )
-        conv_tokens = self.token_counter(conv_text)
+        """Build a ContextSnapshot from conversation history.
+
+        When *payload_tokens* is provided (proxy mode), it overrides the token
+        count derived from *conversation_history*.  The proxy's internal history
+        contains envelope-stripped text that can be 5x smaller than the actual
+        client payload — using the real payload size ensures compaction triggers
+        at the correct threshold.
+        """
+        if payload_tokens is not None:
+            conv_tokens = payload_tokens
+        else:
+            conv_text = " ".join(
+                m.content if hasattr(m, "content") else str(m)
+                for m in conversation_history
+            )
+            conv_tokens = self.token_counter(conv_text)
 
         total = system_tokens + core_tokens + domain_tokens + conv_tokens
 

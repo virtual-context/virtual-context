@@ -50,6 +50,7 @@ class ProxyMetrics:
             ingestions = [e for e in self._events if e.get("type") == "history_ingestion"]
             responses = [e for e in self._events if e.get("type") == "response"]
             ingested_turns = [e for e in self._events if e.get("type") == "ingested_turn"]
+            tool_intercepts = [e for e in self._events if e.get("type") == "tool_intercept"]
 
             wait_values = [r["wait_ms"] for r in requests if "wait_ms" in r]
             inbound_values = [r["inbound_ms"] for r in requests if "inbound_ms" in r]
@@ -129,6 +130,8 @@ class ProxyMetrics:
                 "total_turns_ingested": sum(
                     e.get("turns_ingested", 0) for e in ingestions
                 ),
+                "tool_intercepts": list(tool_intercepts),
+                "total_tool_intercepts": len(tool_intercepts),
             }
 
     def capture_request(

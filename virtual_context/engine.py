@@ -270,6 +270,8 @@ class VirtualContextEngine:
         self,
         message: str,
         conversation_history: list[Message],
+        model_name: str = "",
+        max_context_tokens: int | None = None,
     ) -> AssembledContext:
         """Before sending to LLM: tag, retrieve, assemble enriched context."""
         # Determine active tags from recent tag results
@@ -303,7 +305,8 @@ class VirtualContextEngine:
         )
 
         # Build context awareness hint (post-compaction only)
-        context_hint = self._build_context_hint()
+        _paging_mode = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
+        context_hint = self._build_context_hint(paging_mode=_paging_mode)
 
         # Load core context
         core_context = self._assembler.load_core_context()
@@ -334,6 +337,7 @@ class VirtualContextEngine:
             context_hint=context_hint,
             working_set=ws_param,
             full_segments=full_segments_param,
+            max_context_tokens=max_context_tokens,
         )
 
         # Expose the message's own tags for downstream use (e.g. history filtering).
@@ -374,13 +378,24 @@ class VirtualContextEngine:
         assembled.broad = retrieval_result.broad
         assembled.temporal = retrieval_result.temporal
 
+        # Cache for reassemble_context() — used after paging tool execution
+        self._last_retrieval_result = retrieval_result
+        self._last_conversation_history = conversation_history
+        self._last_model_name = model_name
+
         return assembled
 
     def on_turn_complete(
         self,
         conversation_history: list[Message],
+        payload_tokens: int | None = None,
     ) -> CompactionReport | None:
-        """After LLM responds: check thresholds, compact if needed."""
+        """After LLM responds: check thresholds, compact if needed.
+
+        *payload_tokens* (proxy mode): actual client payload token count.
+        Overrides the stripped conversation_history token count in the
+        compaction monitor so thresholds trigger at the right level.
+        """
         # Tag the latest round trip
         latest_pair = self._get_latest_turn_pair(conversation_history)
         if latest_pair:
@@ -434,7 +449,8 @@ class VirtualContextEngine:
 
         # Build snapshot (only count un-compacted messages)
         snapshot = self._monitor.build_snapshot(
-            conversation_history[self._compacted_through:]
+            conversation_history[self._compacted_through:],
+            payload_tokens=payload_tokens,
         )
 
         # Check thresholds
@@ -802,8 +818,12 @@ class VirtualContextEngine:
         lookback = self.config.retriever.active_tag_lookback
         return list(self._turn_tag_index.get_active_tags(lookback=lookback))
 
-    def _build_context_hint(self) -> str:
+    def _build_context_hint(self, paging_mode: str | None = None) -> str:
         """Build a topic list for post-compaction prompts.
+
+        *paging_mode* overrides the resolved mode (``"autonomous"`` or
+        ``"supervised"``).  The proxy passes this from the per-request model
+        check; headless/MCP callers omit it and the method resolves from config.
 
         When paging is enabled, builds a richer hint with depth info and budget.
         Mode determines detail level:
@@ -823,108 +843,194 @@ class VirtualContextEngine:
 
         # Determine paging mode
         paging_enabled = self.config.paging.enabled
-        paging_mode = self._resolve_paging_mode() if paging_enabled else None
-
-        lines: list[str] = []
+        if paging_mode is None and paging_enabled:
+            paging_mode = self._resolve_paging_mode()
 
         if paging_enabled and paging_mode == "autonomous":
-            # Autonomous: full budget dashboard
-            budget = self.config.assembler.tag_context_max_tokens
-            used = sum(ws.tokens for ws in self._working_set.values())
-            for ts in tag_summaries:
-                ws = self._working_set.get(ts.tag)
-                depth = ws.depth.value if ws else "none"
-                current_t = ws.tokens if ws else 0
+            hint = self._build_autonomous_hint(tag_summaries)
+        elif paging_enabled and paging_mode == "supervised":
+            hint = self._build_supervised_hint(tag_summaries)
+        else:
+            hint = self._build_default_hint(tag_summaries)
+
+        return hint
+
+    def _build_autonomous_hint(self, tag_summaries: list) -> str:
+        """Build compact autonomous paging hint with two-tier layout.
+
+        Expanded tags (in working set) listed first with full metadata.
+        Available tags (depth:none) listed compactly below.
+        Truncation drops available tags first, preserving expanded tags.
+        """
+        budget = self.config.assembler.tag_context_max_tokens
+        used = sum(ws.tokens for ws in self._working_set.values())
+        max_tokens = self.config.assembler.context_hint_max_tokens
+
+        # Partition into expanded (in working set) vs available (depth:none)
+        expanded_lines: list[str] = []
+        available_entries: list[str] = []
+        for ts in tag_summaries:
+            ws = self._working_set.get(ts.tag)
+            if ws and ws.depth != DepthLevel.NONE:
                 full_t = self._calculate_depth_tokens(ts.tag, DepthLevel.FULL)
-                last_turn = ws.last_accessed_turn if ws else 0
-                lines.append(
-                    f"- {ts.tag} (depth: {depth}, current: {current_t}t, "
-                    f"full: {full_t}t, last_turn: {last_turn})"
+                desc_part = f" — {ts.description}" if ts.description else ""
+                expanded_lines.append(
+                    f"  {ts.tag}: {ws.depth.value} {ws.tokens}t"
+                    f" \u2192 {full_t}t full{desc_part}"
                 )
-            body = "\n".join(lines)
-            hint = (
-                f'<context-topics budget="{budget}" used="{used}" available="{budget - used}">\n'
+            else:
+                full_t = self._calculate_depth_tokens(ts.tag, DepthLevel.FULL)
+                entry = ts.tag
+                if full_t > 0:
+                    entry += f"({full_t}t)"
+                if ts.description:
+                    entry += f" — {ts.description}"
+                available_entries.append(entry)
+
+        def _assemble(exp_lines: list[str], avail: list[str]) -> str:
+            parts: list[str] = []
+            if exp_lines:
+                parts.append("[in context \u2014 expand for full detail]")
+                parts.extend(exp_lines)
+            if avail:
+                if exp_lines:
+                    parts.append("")
+                parts.append(
+                    "[available] " + ", ".join(avail)
+                )
+            body = "\n".join(parts)
+            return (
+                f'<context-topics budget="{budget}" used="{used}"'
+                f' available="{budget - used}">\n'
+                f"RULE: These are compressed topic summaries, not the full conversation.\n"
+                f"- For specific facts (names, numbers, dosages, decisions): "
+                f"use vc_find_quote first — it searches the raw text across all topics.\n"
+                f"- For deeper understanding of a topic you can see below: "
+                f"use vc_expand_topic to load the full detail.\n"
+                f"- To free budget after expanding: use vc_collapse_topic.\n"
+                f"- Never claim you don't remember without searching first.\n\n"
                 f"{body}\n\n"
-                f"Tools: expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
+                f"Tools: find_quote(query) | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
                 f"</context-topics>"
             )
-        elif paging_enabled and paging_mode == "supervised":
-            # Supervised: topic list with depth info
-            for ts in tag_summaries:
-                ws = self._working_set.get(ts.tag)
-                depth = ws.depth.value if ws else "none"
-                tokens = ws.tokens if ws else 0
-                desc = ts.summary[:60].rstrip()
-                if len(ts.summary) > 60:
+
+        hint = _assemble(expanded_lines, available_entries)
+
+        # Truncate: drop available entries first, then expanded lines
+        if self._token_counter(hint) > max_tokens:
+            while available_entries and self._token_counter(hint) > max_tokens:
+                available_entries.pop()
+                hint = _assemble(expanded_lines, available_entries)
+            while expanded_lines and self._token_counter(hint) > max_tokens:
+                expanded_lines.pop()
+                hint = _assemble(expanded_lines, available_entries)
+
+        return hint
+
+    def _build_supervised_hint(self, tag_summaries: list) -> str:
+        """Build compact supervised paging hint.
+
+        Expanded tags first with depth info, available tags as compact list.
+        """
+        max_tokens = self.config.assembler.context_hint_max_tokens
+
+        expanded_lines: list[str] = []
+        available_entries: list[str] = []
+        for ts in tag_summaries:
+            ws = self._working_set.get(ts.tag)
+            if ws and ws.depth != DepthLevel.NONE:
+                desc = ts.description or ts.summary[:60].rstrip()
+                if not ts.description and len(ts.summary) > 60:
                     desc += "..."
-                lines.append(f"- {ts.tag} ({depth}, {tokens}t): {desc}")
-            body = "\n".join(lines)
-            hint = (
+                expanded_lines.append(
+                    f"  {ts.tag} ({ws.depth.value}, {ws.tokens}t): {desc}"
+                )
+            else:
+                entry = ts.tag
+                if ts.description:
+                    entry += f" — {ts.description}"
+                available_entries.append(entry)
+
+        def _assemble(exp_lines: list[str], avail: list[str]) -> str:
+            parts: list[str] = []
+            if exp_lines:
+                parts.append("[in context]")
+                parts.extend(exp_lines)
+            if avail:
+                if exp_lines:
+                    parts.append("")
+                parts.append("[available] " + ", ".join(avail))
+            body = "\n".join(parts)
+            return (
                 "<context-topics>\n"
-                "Prior conversation topics (call expand_topic to see full detail):\n"
-                f"{body}\n"
-                "</context-topics>"
-            )
-        else:
-            # Default (no paging): simple topic list
-            for ts in tag_summaries:
-                turn_count = len(ts.source_turn_numbers)
-                desc = ts.summary[:60].rstrip()
-                if len(ts.summary) > 60:
-                    desc += "..."
-                lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
-            body = "\n".join(lines)
-            hint = (
-                "<context-topics>\n"
-                "Prior conversation topics available for recall:\n"
+                "RULE: These are compressed topic summaries, not the full conversation.\n"
+                "- For specific facts (names, numbers, dosages, decisions): "
+                "use vc_find_quote first — it searches the raw text across all topics.\n"
+                "- For deeper understanding of a topic you can see below: "
+                "use vc_expand_topic to load the full detail.\n"
+                "- To free budget after expanding: use vc_collapse_topic.\n"
+                "- Never claim you don't remember without searching first.\n\n"
                 f"{body}\n"
                 "</context-topics>"
             )
 
-        # Truncate to budget
+        hint = _assemble(expanded_lines, available_entries)
+
+        if self._token_counter(hint) > max_tokens:
+            while available_entries and self._token_counter(hint) > max_tokens:
+                available_entries.pop()
+                hint = _assemble(expanded_lines, available_entries)
+            while expanded_lines and self._token_counter(hint) > max_tokens:
+                expanded_lines.pop()
+                hint = _assemble(expanded_lines, available_entries)
+
+        return hint
+
+    def _build_default_hint(self, tag_summaries: list) -> str:
+        """Build simple topic list (no paging)."""
         max_tokens = self.config.assembler.context_hint_max_tokens
+
+        lines: list[str] = []
+        for ts in tag_summaries:
+            turn_count = len(ts.source_turn_numbers)
+            desc = ts.description or ts.summary[:60].rstrip()
+            if not ts.description and len(ts.summary) > 60:
+                desc += "..."
+            lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
+
+        body = "\n".join(lines)
+        hint = (
+            "<context-topics>\n"
+            "Prior conversation topics available for recall:\n"
+            f"{body}\n"
+            "</context-topics>"
+        )
+
         if self._token_counter(hint) > max_tokens:
             while lines and self._token_counter(hint) > max_tokens:
                 lines.pop()
                 body = "\n".join(lines)
-                if paging_enabled and paging_mode == "autonomous":
-                    budget = self.config.assembler.tag_context_max_tokens
-                    used = sum(ws.tokens for ws in self._working_set.values())
-                    hint = (
-                        f'<context-topics budget="{budget}" used="{used}" available="{budget - used}">\n'
-                        f"{body}\n\n"
-                        f"Tools: expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
-                        f"</context-topics>"
-                    )
-                elif paging_enabled and paging_mode == "supervised":
-                    hint = (
-                        "<context-topics>\n"
-                        "Prior conversation topics (call expand_topic to see full detail):\n"
-                        f"{body}\n"
-                        "</context-topics>"
-                    )
-                else:
-                    hint = (
-                        "<context-topics>\n"
-                        "Prior conversation topics available for recall:\n"
-                        f"{body}\n"
-                        "</context-topics>"
-                    )
+                hint = (
+                    "<context-topics>\n"
+                    "Prior conversation topics available for recall:\n"
+                    f"{body}\n"
+                    "</context-topics>"
+                )
 
         return hint
 
     def _resolve_paging_mode(self, model_name: str = "") -> str:
-        """Resolve paging mode from config. 'auto' maps model name to mode."""
-        mode = self.config.paging.mode
-        if mode != "auto":
-            return mode
-        # Auto: map model families to delegation levels
+        """Check if *model_name* matches any ``autonomous_models`` entry.
+
+        Returns ``"autonomous"`` if the model is trusted to page itself
+        (tools + budget dashboard injected), ``"supervised"`` otherwise
+        (VC manages paging silently via auto_promote / auto_evict).
+        """
         model = model_name.lower()
-        autonomous_patterns = ["opus", "sonnet", "gpt-4", "gpt4", "claude-3.5"]
-        for pattern in autonomous_patterns:
-            if pattern in model:
+        for pattern in self.config.paging.autonomous_models:
+            if pattern.lower() in model:
                 return "autonomous"
-        return "supervised"  # safe default
+        return "supervised"
 
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
         """Extract the most recent user+assistant pair."""
@@ -1294,6 +1400,50 @@ class VirtualContextEngine:
         )
         return assembled.prepend_text
 
+    def reassemble_context(self) -> str:
+        """Re-assemble context with the current working set.
+
+        Call after ``expand_topic()`` / ``collapse_topic()`` to get an
+        updated ``prepend_text`` that reflects the new depth levels.
+        Reuses the retrieval result from the most recent
+        ``on_message_inbound()`` call — no re-tagging or re-retrieval.
+
+        Returns the updated prepend_text, or "" if no prior inbound call.
+        """
+        rr = getattr(self, "_last_retrieval_result", None)
+        history = getattr(self, "_last_conversation_history", None)
+        if rr is None:
+            return ""
+
+        model_name = getattr(self, "_last_model_name", "")
+        _pm = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
+        context_hint = self._build_context_hint(paging_mode=_pm)
+        core_context = self._assembler.load_core_context()
+
+        ws_param = None
+        full_segments_param = None
+        if self.config.paging.enabled and self._working_set:
+            ws_param = self._working_set
+            full_segments_param = {}
+            for tag, entry in self._working_set.items():
+                if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
+                    segs = self._store.get_segments_by_tags(
+                        tags=[tag], min_overlap=1, limit=50,
+                    )
+                    if segs:
+                        full_segments_param[tag] = segs
+
+        assembled = self._assembler.assemble(
+            core_context=core_context,
+            retrieval_result=rr,
+            conversation_history=history or [],
+            token_budget=self.config.context_window,
+            context_hint=context_hint,
+            working_set=ws_param,
+            full_segments=full_segments_param,
+        )
+        return assembled.prepend_text
+
     # ------------------------------------------------------------------
     # Paging API: expand / collapse / working set
     # ------------------------------------------------------------------
@@ -1459,6 +1609,45 @@ class VirtualContextEngine:
             evicted.append(tag)
 
         return evicted, freed
+
+    def find_quote(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> dict:
+        """Search stored conversation text for a specific phrase or keyword.
+
+        Searches across all segments' full_text regardless of tags.
+        Returns matching excerpts with context.  Works even when paging
+        is disabled — this is a pure search tool with no working-set side effects.
+        """
+        if not query.strip():
+            return {"error": "empty query"}
+
+        results = self._store.search_full_text(query, limit=max_results)
+
+        if not results:
+            return {
+                "query": query,
+                "found": False,
+                "results": [],
+                "message": f"No matches for '{query}' in stored conversation history.",
+            }
+
+        formatted = []
+        for qr in results:
+            formatted.append({
+                "excerpt": qr.text,
+                "topic": qr.tag,
+                "tags": qr.tags,
+                "segment_ref": qr.segment_ref,
+            })
+
+        return {
+            "query": query,
+            "found": True,
+            "results": formatted,
+        }
 
     def get_cost_report(self) -> SessionCostSummary:
         """Return current session cost summary."""

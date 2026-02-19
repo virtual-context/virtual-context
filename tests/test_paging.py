@@ -74,14 +74,14 @@ class TestPagingConfig:
     def test_defaults(self):
         cfg = PagingConfig()
         assert cfg.enabled is False
-        assert cfg.mode == "auto"
+        assert cfg.autonomous_models == ["opus", "sonnet", "gpt-4", "gpt-4o"]
         assert cfg.auto_promote is True
         assert cfg.auto_evict is True
 
     def test_custom_values(self):
-        cfg = PagingConfig(enabled=True, mode="autonomous", auto_evict=False)
+        cfg = PagingConfig(enabled=True, autonomous_models=["opus"], auto_evict=False)
         assert cfg.enabled is True
-        assert cfg.mode == "autonomous"
+        assert cfg.autonomous_models == ["opus"]
         assert cfg.auto_evict is False
 
 
@@ -269,6 +269,107 @@ class TestAssemblerPagingDepths:
         assert 'depth="full"' in result.tag_sections["api"]
 
 
+class TestAssemblerHeadroom:
+    """Tests for max_context_tokens headroom-aware assembly."""
+
+    def _make_assembler(self, tag_budget=30_000, core_budget=18_000):
+        return ContextAssembler(
+            config=AssemblerConfig(
+                tag_context_max_tokens=tag_budget,
+                core_context_max_tokens=core_budget,
+            ),
+            token_counter=lambda text: len(text) // 4,
+        )
+
+    def _make_retrieval_result(self, tags_and_summaries):
+        """Create RetrievalResult with multiple StoredSummary objects."""
+        summaries = []
+        for tag, text in tags_and_summaries:
+            summaries.append(StoredSummary(
+                ref=f"seg-{tag}",
+                primary_tag=tag,
+                tags=[tag],
+                summary=text,
+                summary_tokens=len(text) // 4,
+                created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+                end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            ))
+        return RetrievalResult(
+            tags_matched=[s.primary_tag for s in summaries],
+            summaries=summaries,
+        )
+
+    def test_assembler_headroom_caps_tag_budget(self):
+        """With max_context_tokens=5000, tag sections are capped by available headroom."""
+        asm = self._make_assembler(tag_budget=30_000, core_budget=18_000)
+        # Create many summaries with substantial text
+        tags_and_summaries = [
+            (f"topic-{i}", f"Summary text for topic {i}. " * 50)
+            for i in range(10)
+        ]
+        result = asm.assemble(
+            core_context="Core context text.",
+            retrieval_result=self._make_retrieval_result(tags_and_summaries),
+            conversation_history=[],
+            token_budget=100_000,
+            context_hint="<context-topics>hint text</context-topics>",
+            max_context_tokens=200,  # Very tight headroom
+        )
+        # With only 200 tokens total and core + hint eating most of it,
+        # tag_sections should be severely limited or empty
+        total_tag_tokens = sum(
+            len(section) // 4 for section in result.tag_sections.values()
+        )
+        # Core text is "Core context text." = ~5 tokens
+        # Hint is ~10 tokens
+        # So available for tags is 200 - 5 - 10 = 185 tokens max
+        assert total_tag_tokens <= 200  # Must be within headroom
+
+    def test_assembler_headroom_none_uses_default(self):
+        """With max_context_tokens=None, normal tag_budget applies."""
+        asm = self._make_assembler(tag_budget=30_000)
+        tags_and_summaries = [
+            ("database", "Database schema design with PostgreSQL."),
+            ("api", "REST API design patterns discussed."),
+        ]
+        result = asm.assemble(
+            core_context="",
+            retrieval_result=self._make_retrieval_result(tags_and_summaries),
+            conversation_history=[],
+            token_budget=100_000,
+            max_context_tokens=None,
+        )
+        # Both tags should be present since 30k budget is plenty
+        assert len(result.tag_sections) == 2
+        assert "database" in result.tag_sections
+        assert "api" in result.tag_sections
+
+    def test_assembler_headroom_zero_hint_only(self):
+        """With max_context_tokens equal to core+hint, tag budget is 0 but hint is present."""
+        asm = self._make_assembler(tag_budget=30_000, core_budget=18_000)
+        core = "Core context."  # ~3 tokens with //4
+        hint = "<context-topics>Topics here</context-topics>"  # ~10 tokens with //4
+        core_tokens = len(core) // 4
+        hint_tokens = len(hint) // 4
+        headroom = core_tokens + hint_tokens  # exactly enough for core + hint
+
+        tags_and_summaries = [
+            ("database", "Database schema design."),
+        ]
+        result = asm.assemble(
+            core_context=core,
+            retrieval_result=self._make_retrieval_result(tags_and_summaries),
+            conversation_history=[],
+            token_budget=100_000,
+            context_hint=hint,
+            max_context_tokens=headroom,
+        )
+        # Tag sections should be empty (0 budget for tags)
+        assert len(result.tag_sections) == 0
+        # But the hint should still be in prepend_text
+        assert "Topics here" in result.prepend_text
+
+
 class TestStoreSQLiteGetSegments:
     """Test get_segments_by_tags on SQLite store."""
 
@@ -351,7 +452,7 @@ class TestStoreFilesystemGetSegments:
 class TestEnginePagingAPI:
     """Test engine paging API with a real engine using keyword tagger."""
 
-    def _make_engine(self, tmp_path, paging_enabled=True, paging_mode="supervised",
+    def _make_engine(self, tmp_path, paging_enabled=True, autonomous_models=None,
                      auto_evict=True, tag_budget=1000):
         from virtual_context.engine import VirtualContextEngine
         cfg = VirtualContextConfig(
@@ -361,7 +462,7 @@ class TestEnginePagingAPI:
             ),
             paging=PagingConfig(
                 enabled=paging_enabled,
-                mode=paging_mode,
+                autonomous_models=autonomous_models or [],
                 auto_evict=auto_evict,
             ),
             assembler=AssemblerConfig(tag_context_max_tokens=tag_budget),
@@ -623,7 +724,7 @@ class TestPagingConfigParsing:
     def test_default_config(self):
         cfg = _build_config({})
         assert cfg.paging.enabled is False
-        assert cfg.paging.mode == "auto"
+        assert cfg.paging.autonomous_models == ["opus", "sonnet", "gpt-4", "gpt-4o"]
         assert cfg.paging.auto_promote is True
         assert cfg.paging.auto_evict is True
 
@@ -631,82 +732,85 @@ class TestPagingConfigParsing:
         cfg = _build_config({
             "paging": {
                 "enabled": True,
-                "mode": "autonomous",
+                "autonomous_models": ["opus"],
                 "auto_promote": False,
                 "auto_evict": False,
             }
         })
         assert cfg.paging.enabled is True
-        assert cfg.paging.mode == "autonomous"
+        assert cfg.paging.autonomous_models == ["opus"]
         assert cfg.paging.auto_promote is False
         assert cfg.paging.auto_evict is False
 
-    def test_paging_mode_validation(self):
+    def test_autonomous_models_validation(self):
         from virtual_context.config import validate_config
-        cfg = _build_config({"paging": {"mode": "invalid_mode"}})
+        cfg = _build_config({"paging": {"autonomous_models": "not-a-list"}})
         errors = validate_config(cfg)
-        mode_errors = [e for e in errors if "paging.mode" in e]
-        assert len(mode_errors) == 1
+        model_errors = [e for e in errors if "autonomous_models" in e]
+        assert len(model_errors) == 1
 
 
 class TestResolvePagingMode:
-    """Test _resolve_paging_mode model-name mapping."""
+    """Test _resolve_paging_mode with autonomous_models list."""
 
-    def _make_engine(self, tmp_path, mode="auto"):
+    def _make_engine(self, tmp_path, autonomous_models=None):
         from virtual_context.engine import VirtualContextEngine
         cfg = VirtualContextConfig(
             storage=__import__("virtual_context.types", fromlist=["StorageConfig"]).StorageConfig(
                 backend="sqlite",
                 sqlite_path=str(tmp_path / "test.db"),
             ),
-            paging=PagingConfig(enabled=True, mode=mode),
+            paging=PagingConfig(
+                enabled=True,
+                autonomous_models=autonomous_models if autonomous_models is not None else [],
+            ),
         )
         return VirtualContextEngine(config=cfg)
 
-    def test_explicit_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="supervised")
-        assert engine._resolve_paging_mode() == "supervised"
+    def test_empty_list_always_supervised(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=[])
+        assert engine._resolve_paging_mode("claude-opus-4") == "supervised"
 
-    def test_explicit_autonomous(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="autonomous")
-        assert engine._resolve_paging_mode() == "autonomous"
-
-    def test_auto_opus_is_autonomous(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_opus_matches(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
         assert engine._resolve_paging_mode("claude-opus-4") == "autonomous"
 
-    def test_auto_sonnet_is_autonomous(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_sonnet_matches(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
         assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
-    def test_auto_gpt4_is_autonomous(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_gpt4_matches(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["gpt-4"])
         assert engine._resolve_paging_mode("gpt-4-turbo") == "autonomous"
 
-    def test_auto_haiku_is_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_haiku_not_in_list(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
         assert engine._resolve_paging_mode("claude-haiku-3") == "supervised"
 
-    def test_auto_unknown_is_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_unknown_model_supervised(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
         assert engine._resolve_paging_mode("qwen3:4b") == "supervised"
 
-    def test_auto_empty_string_is_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, mode="auto")
+    def test_empty_model_name_supervised(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
         assert engine._resolve_paging_mode("") == "supervised"
+
+    def test_case_insensitive(self, tmp_path):
+        engine = self._make_engine(tmp_path, autonomous_models=["Sonnet"])
+        assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
 
 class TestContextHintModes:
     """Test _build_context_hint with different paging modes."""
 
-    def _make_engine(self, tmp_path, paging_enabled=False, mode="auto"):
+    def _make_engine(self, tmp_path, paging_enabled=False):
         from virtual_context.engine import VirtualContextEngine
         cfg = VirtualContextConfig(
             storage=__import__("virtual_context.types", fromlist=["StorageConfig"]).StorageConfig(
                 backend="sqlite",
                 sqlite_path=str(tmp_path / "test.db"),
             ),
-            paging=PagingConfig(enabled=paging_enabled, mode=mode),
+            paging=PagingConfig(enabled=paging_enabled),
             assembler=AssemblerConfig(
                 context_hint_enabled=True,
                 context_hint_max_tokens=500,
@@ -736,27 +840,164 @@ class TestContextHintModes:
         assert "expand_topic" not in hint
 
     def test_supervised_hint(self, tmp_path):
-        engine = self._make_engine(tmp_path, paging_enabled=True, mode="supervised")
+        engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint()
+        hint = engine._build_context_hint(paging_mode="supervised")
         assert "expand_topic" in hint
         assert "api" in hint
 
     def test_autonomous_hint_has_budget(self, tmp_path):
-        engine = self._make_engine(tmp_path, paging_enabled=True, mode="autonomous")
+        engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "auth")
-        hint = engine._build_context_hint()
+        hint = engine._build_context_hint(paging_mode="autonomous")
         assert "budget=" in hint
         assert "available=" in hint
         assert "expand_topic" in hint
         assert "collapse_topic" in hint
 
     def test_hint_empty_before_compaction(self, tmp_path):
-        engine = self._make_engine(tmp_path, paging_enabled=True, mode="supervised")
+        engine = self._make_engine(tmp_path, paging_enabled=True)
         engine._compacted_through = 0  # no compaction yet
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint()
+        hint = engine._build_context_hint(paging_mode="supervised")
         assert hint == ""
+
+    @pytest.mark.regression("PROXY-024")
+    def test_autonomous_hint_expanded_tags_listed_first(self, tmp_path):
+        """Tags at summary depth (in working set) must appear before depth:none tags."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        # Seed 30 tags alphabetically — a-tag-01 through a-tag-30
+        for i in range(1, 31):
+            self._seed_tag_summary(engine, f"a-tag-{i:02d}")
+        # Put z-fragrance in working set at summary depth
+        self._seed_tag_summary(engine, "z-fragrance")
+        engine._working_set["z-fragrance"] = WorkingSetEntry(
+            tag="z-fragrance", depth=DepthLevel.SUMMARY,
+            tokens=200, last_accessed_turn=5,
+        )
+        hint = engine._build_context_hint(paging_mode="autonomous")
+        # z-fragrance should appear despite being last alphabetically
+        assert "z-fragrance" in hint
+        # And it should appear BEFORE the depth:none tags
+        zf_pos = hint.index("z-fragrance")
+        # At least one a-tag should also appear — check a-tag-01
+        if "a-tag-01" in hint:
+            at_pos = hint.index("a-tag-01")
+            assert zf_pos < at_pos, "Expanded tag must appear before depth:none tags"
+
+    @pytest.mark.regression("PROXY-024")
+    def test_autonomous_hint_compact_format_fits_more_tags(self, tmp_path):
+        """With compact format, 50+ tags should fit in 500 token budget."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        # Seed 50 tags
+        for i in range(50):
+            self._seed_tag_summary(engine, f"topic-{i:03d}")
+        hint = engine._build_context_hint(paging_mode="autonomous")
+        # Count how many topic- tags appear in the hint
+        count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
+        # With compact format, we should fit significantly more than 9
+        assert count >= 25, f"Only {count}/50 tags fit — compact format not working"
+
+    @pytest.mark.regression("PROXY-024")
+    def test_autonomous_hint_truncation_drops_none_first(self, tmp_path):
+        """When truncating, depth:none tags are dropped before expanded tags."""
+        from virtual_context.engine import VirtualContextEngine
+        cfg = VirtualContextConfig(
+            storage=__import__("virtual_context.types", fromlist=["StorageConfig"]).StorageConfig(
+                backend="sqlite",
+                sqlite_path=str(tmp_path / "test.db"),
+            ),
+            paging=PagingConfig(enabled=True),
+            assembler=AssemblerConfig(
+                context_hint_enabled=True,
+                context_hint_max_tokens=200,  # Very tight budget
+                tag_context_max_tokens=10_000,
+            ),
+        )
+        engine = VirtualContextEngine(config=cfg)
+        engine._compacted_through = 4
+        # Seed 80 tags at depth:none
+        for i in range(80):
+            self._seed_tag_summary(engine, f"filler-{i:03d}")
+        # Put 3 tags in working set at summary depth
+        for name in ["fragrance-selection", "karak-chai", "whales"]:
+            self._seed_tag_summary(engine, name)
+            engine._working_set[name] = WorkingSetEntry(
+                tag=name, depth=DepthLevel.SUMMARY,
+                tokens=100, last_accessed_turn=5,
+            )
+        hint = engine._build_context_hint(paging_mode="autonomous")
+        # All 3 expanded tags MUST survive truncation
+        assert "fragrance-selection" in hint
+        assert "karak-chai" in hint
+        assert "whales" in hint
+
+    @pytest.mark.regression("PROXY-024")
+    def test_supervised_hint_compact_format(self, tmp_path):
+        """Supervised mode also uses compact format."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        for i in range(50):
+            self._seed_tag_summary(engine, f"topic-{i:03d}")
+        hint = engine._build_context_hint(paging_mode="supervised")
+        count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
+        assert count >= 25, f"Only {count}/50 tags fit in supervised mode"
+
+    def test_autonomous_hint_includes_description(self, tmp_path):
+        """Autonomous hint includes ts.description when available."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        engine._store.save_tag_summary(TagSummary(
+            tag="cycle-tracking",
+            summary="Discussed Mira device for cycle tracking.",
+            description="Sania's cycle tracking via Mira",
+            summary_tokens=30,
+            source_turn_numbers=[0, 1, 2],
+        ))
+        hint = engine._build_context_hint(paging_mode="autonomous")
+        assert "Sania's cycle tracking via Mira" in hint
+
+    def test_autonomous_hint_omits_description_when_empty(self, tmp_path):
+        """Autonomous hint does not include ' — ' when description is empty."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        engine._store.save_tag_summary(TagSummary(
+            tag="database",
+            summary="Database discussion.",
+            description="",
+            summary_tokens=20,
+            source_turn_numbers=[0, 1],
+        ))
+        hint = engine._build_context_hint(paging_mode="autonomous")
+        assert "database" in hint
+        # The " — " separator should not appear since description is empty
+        # The tag should appear without a trailing description
+        db_line = [line for line in hint.split("\n") if "database" in line][0]
+        assert " — " not in db_line
+
+    def test_supervised_hint_includes_description(self, tmp_path):
+        """Supervised hint includes ts.description for available tags."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        engine._store.save_tag_summary(TagSummary(
+            tag="meal-planning",
+            summary="Discussed weekly meal prep and grocery lists.",
+            description="Weekly meal prep and grocery optimization",
+            summary_tokens=25,
+            source_turn_numbers=[0, 1, 2],
+        ))
+        hint = engine._build_context_hint(paging_mode="supervised")
+        assert "Weekly meal prep and grocery optimization" in hint
+
+    def test_default_hint_uses_description(self, tmp_path):
+        """Default hint (no paging) uses ts.description when available."""
+        engine = self._make_engine(tmp_path, paging_enabled=False)
+        engine._store.save_tag_summary(TagSummary(
+            tag="fitness",
+            summary="Running program with interval training and heart rate zones discussed at length.",
+            description="Interval training and HR zone programming",
+            summary_tokens=30,
+            source_turn_numbers=[0, 1, 2, 3],
+        ))
+        hint = engine._build_context_hint()
+        # Default hint uses description when available instead of summary[:60]
+        assert "Interval training and HR zone programming" in hint
 
 
 # ---------------------------------------------------------------------------
@@ -882,3 +1123,92 @@ class TestPagingStatePersistence:
         assert "db" in engine2._working_set
         assert engine2._working_set["db"].depth == DepthLevel.FULL
         assert engine2._working_set["db"].tokens > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: reassemble_context
+# ---------------------------------------------------------------------------
+
+
+class TestReassembleContext:
+    """Tests for engine.reassemble_context()."""
+
+    def _make_engine(self, tmp_path):
+        """Create a paging-enabled engine with stored content."""
+        cfg = load_config(config_dict={
+            "context_window": 50000,
+            "storage_root": str(tmp_path),
+            "storage": {
+                "backend": "sqlite",
+                "sqlite": {"path": str(tmp_path / "store.db")},
+            },
+            "tag_generator": {"type": "keyword"},
+            "paging": {"enabled": True, "autonomous_models": ["opus", "sonnet"]},
+            "assembly": {"context_hint_enabled": True},
+        })
+        from virtual_context.engine import VirtualContextEngine
+        engine = VirtualContextEngine(config=cfg)
+
+        # Populate store with a tag summary + segments
+        engine._store.save_tag_summary(TagSummary(
+            tag="database",
+            summary="Discussed PostgreSQL schema design and indexing.",
+            summary_tokens=30,
+        ))
+        engine._store.store_segment(StoredSegment(
+            ref="seg1",
+            primary_tag="database",
+            tags=["database"],
+            summary="PostgreSQL schema discussion.",
+            summary_tokens=20,
+            full_text="User asked about database indexing. Assistant explained B-tree indexes.",
+            full_tokens=50,
+        ))
+
+        # Simulate post-compaction state so context hint is generated
+        engine._compacted_through = 2
+        engine._turn_tag_index.append(TurnTagEntry(
+            turn_number=1, message_hash="abc123", tags=["database"], primary_tag="database",
+        ))
+
+        return engine
+
+    def test_returns_empty_before_any_inbound(self, tmp_path):
+        """Before on_message_inbound, reassemble returns empty."""
+        engine = self._make_engine(tmp_path)
+        assert engine.reassemble_context() == ""
+
+    def test_returns_content_after_inbound(self, tmp_path):
+        """After on_message_inbound, reassemble returns prepend_text."""
+        engine = self._make_engine(tmp_path)
+        history = [
+            Message(role="user", content="Tell me about databases"),
+            Message(role="assistant", content="Sure, PostgreSQL..."),
+        ]
+        assembled = engine.on_message_inbound("What about indexing?", history)
+        assert assembled.prepend_text  # has content
+
+        text = engine.reassemble_context()
+        assert text  # also has content
+        assert "database" in text.lower() or "PostgreSQL" in text.lower()
+
+    def test_reflects_expanded_depth(self, tmp_path):
+        """After expand_topic, reassemble includes expanded content."""
+        engine = self._make_engine(tmp_path)
+        history = [
+            Message(role="user", content="Tell me about databases"),
+            Message(role="assistant", content="Sure, PostgreSQL..."),
+        ]
+        engine.on_message_inbound("What about indexing?", history)
+
+        # Working set starts at SUMMARY depth
+        initial = engine.reassemble_context()
+
+        # Expand to FULL
+        engine.expand_topic("database", "full")
+
+        # Re-assemble should now include full text
+        expanded = engine.reassemble_context()
+        assert "B-tree indexes" in expanded  # full_text content
+        # Initial (summary) should NOT have had the full text
+        assert "B-tree indexes" not in initial

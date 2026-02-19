@@ -730,7 +730,7 @@ class TestDashboardSettings:
         assert data["assembly"]["tag_context_max_tokens"] == 30_000
         assert data["assembly"]["recent_turns_always_included"] == 3
         assert data["assembly"]["context_hint_enabled"] is True
-        assert data["assembly"]["context_hint_max_tokens"] == 200
+        assert data["assembly"]["context_hint_max_tokens"] == 2000
         # Summarization defaults
         assert data["summarization"]["temperature"] == 0.3
 

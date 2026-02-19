@@ -9,6 +9,25 @@ storage_root: ".virtualcontext"
 # include. Set this to match your model's actual context limit.
 context_window: 120000
 
+# paging: Virtual memory paging — lets the LLM manage its own context budget.
+# When enabled, VC injects expand/collapse tools into API requests so the LLM can
+# page in detail about compacted topics or free budget by collapsing others.
+# Requires context_hint_enabled: true in assembly so the LLM sees the topic list.
+#
+# autonomous_models: Model-name substrings (case-insensitive) for models trusted to
+#   page themselves via tool calls. These get vc_expand_topic/vc_collapse_topic tools
+#   and a budget dashboard in the context hint. Models NOT matching any entry run in
+#   supervised mode — VC pages silently via auto_promote/auto_evict.
+paging:
+  enabled: true
+  autonomous_models:
+    - opus
+    - sonnet
+    - gpt-4
+    - gpt-4o
+  auto_promote: true
+  auto_evict: true
+
 # token_counter: How tokens are counted.
 #   "estimate"  — fast, no dependencies (chars / 4)
 #   "tiktoken"  — accurate, requires `pip install tiktoken`

@@ -243,6 +243,139 @@ class TestSQLiteStore:
         assert tags == {"legal", "medical"}
 
 
+class TestTagSummaryDescriptionSQLite:
+    """Tests for TagSummary.description persistence in SQLite store."""
+
+    def test_tag_summary_description_persisted_sqlite(self, store):
+        """Save TagSummary with description, load it, verify description preserved."""
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        ts = TagSummary(
+            tag="cycle-tracking",
+            summary="Discussed Mira device for cycle tracking.",
+            description="Sania's cycle tracking via Mira",
+            summary_tokens=30,
+            source_segment_refs=["seg-1"],
+            source_turn_numbers=[0, 1, 2],
+            covers_through_turn=5,
+            created_at=now,
+            updated_at=now,
+        )
+        store.save_tag_summary(ts)
+
+        retrieved = store.get_tag_summary("cycle-tracking")
+        assert retrieved is not None
+        assert retrieved.description == "Sania's cycle tracking via Mira"
+
+        # Also verify via get_all_tag_summaries
+        all_ts = store.get_all_tag_summaries()
+        match = [t for t in all_ts if t.tag == "cycle-tracking"]
+        assert len(match) == 1
+        assert match[0].description == "Sania's cycle tracking via Mira"
+
+    def test_tag_summary_description_backward_compat_sqlite(self, store):
+        """Insert old-format row without description value, verify loads with description=''."""
+        import sqlite3
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+
+        # First save normally to ensure the table and column exist
+        ts = TagSummary(
+            tag="placeholder",
+            summary="placeholder",
+            summary_tokens=5,
+            created_at=now,
+            updated_at=now,
+        )
+        store.save_tag_summary(ts)
+
+        # Now insert a row with default description (empty string)
+        # This simulates a row created before the description column was added
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO tag_summaries
+            (tag, summary, summary_tokens, source_segment_refs,
+             source_turn_numbers, covers_through_turn, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "old-tag",
+                "Old summary without description",
+                20,
+                "[]",
+                "[0, 1]",
+                3,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+
+        retrieved = store.get_tag_summary("old-tag")
+        assert retrieved is not None
+        assert retrieved.description == ""
+
+
+class TestTagSummaryDescriptionFilesystem:
+    """Tests for TagSummary.description persistence in filesystem store."""
+
+    def _make_store(self, tmp_path):
+        from virtual_context.storage.filesystem import FilesystemStore
+        return FilesystemStore(root=str(tmp_path / "store"))
+
+    def test_tag_summary_description_persisted_filesystem(self, tmp_path):
+        """Save TagSummary with description via filesystem, verify it loads back."""
+        store = self._make_store(tmp_path)
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        ts = TagSummary(
+            tag="meal-planning",
+            summary="Weekly meal prep discussion.",
+            description="Weekly meal prep and grocery optimization",
+            summary_tokens=25,
+            source_segment_refs=["seg-1", "seg-2"],
+            source_turn_numbers=[0, 1, 2],
+            covers_through_turn=5,
+            created_at=now,
+            updated_at=now,
+        )
+        store.save_tag_summary(ts)
+
+        retrieved = store.get_tag_summary("meal-planning")
+        assert retrieved is not None
+        assert retrieved.description == "Weekly meal prep and grocery optimization"
+
+        # Also verify via get_all_tag_summaries
+        all_ts = store.get_all_tag_summaries()
+        match = [t for t in all_ts if t.tag == "meal-planning"]
+        assert len(match) == 1
+        assert match[0].description == "Weekly meal prep and grocery optimization"
+
+    def test_tag_summary_description_backward_compat_filesystem(self, tmp_path):
+        """Write JSON without description key, verify loads with description=''."""
+        import json
+        from pathlib import Path
+        from virtual_context.storage.filesystem import FilesystemStore
+
+        store = self._make_store(tmp_path)
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+
+        # Manually write a JSON file without the "description" key
+        ts_dir = Path(str(tmp_path / "store")) / "_tag_summaries"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        old_data = {
+            "tag": "legacy-tag",
+            "summary": "Old format summary without description field",
+            "summary_tokens": 20,
+            "source_segment_refs": ["seg-old"],
+            "source_turn_numbers": [0, 1],
+            "covers_through_turn": 3,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        (ts_dir / "legacy-tag.json").write_text(json.dumps(old_data, indent=2))
+
+        retrieved = store.get_tag_summary("legacy-tag")
+        assert retrieved is not None
+        assert retrieved.description == ""
+
+
 class TestGetSessionStats:
     def test_empty_store(self, store):
         result = store.get_session_stats()

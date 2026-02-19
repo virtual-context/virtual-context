@@ -47,6 +47,7 @@ class ContextAssembler:
         context_hint: str = "",
         working_set: dict[str, WorkingSetEntry] | None = None,
         full_segments: dict[str, list[StoredSegment]] | None = None,
+        max_context_tokens: int | None = None,
     ) -> AssembledContext:
         """Build final context within token budget.
 
@@ -56,6 +57,10 @@ class ContextAssembler:
         - SEGMENTS: individual segment summaries
         - FULL: StoredSegment.full_text
         When working_set is None, all tags served as SUMMARY (backward compat).
+
+        max_context_tokens: If set, caps the total VC context (core + hint + tags)
+        to fit within available headroom. Used by proxy to prevent exceeding
+        the upstream model's context limit.
         """
         core_budget = self.config.core_context_max_tokens
         tag_budget = self.config.tag_context_max_tokens
@@ -66,6 +71,12 @@ class ContextAssembler:
 
         # Context hint tokens
         hint_tokens = self.token_counter(context_hint) if context_hint else 0
+
+        # Headroom cap: if max_context_tokens is set, reduce tag budget so
+        # total VC context (core + hint + tags) fits within available headroom.
+        if max_context_tokens is not None:
+            available_for_tags = max_context_tokens - core_tokens - hint_tokens
+            tag_budget = max(0, min(tag_budget, available_for_tags))
 
         # Build tag sections
         tag_sections: dict[str, str] = {}
