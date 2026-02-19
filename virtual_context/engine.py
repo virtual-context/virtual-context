@@ -92,9 +92,11 @@ class VirtualContextEngine:
         self._split_processed_tags: set[str] = set()
         self._last_split_result: SplitResult | None = None
         self._working_set: dict[str, "WorkingSetEntry"] = {}  # paging: tag → depth state
+        self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
 
         # Restore persisted state if available
         self._load_persisted_state()
+        self._bootstrap_vocabulary()
 
     def _init_canonicalizer(self) -> None:
         """Initialize the tag canonicalizer with store aliases."""
@@ -219,12 +221,46 @@ class VirtualContextEngine:
         self._split_processed_tags = set(saved.split_processed_tags)
         # Restore paging working set (backward-compatible: old snapshots have empty list)
         self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
+        self._trailing_fingerprint = saved.trailing_fingerprint
         logger.info(
             "Restored engine state: session=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.session_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
             len(self._working_set),
         )
+
+    def _bootstrap_vocabulary(self) -> None:
+        """Load historical tag frequencies into the tagger's vocabulary.
+
+        Called once at init after ``_load_persisted_state()``.  Populates the
+        LLM tagger's vocabulary from two sources:
+
+        1. **Store tags** — cross-session tag statistics (``get_all_tags()``).
+        2. **TurnTagIndex** — restored session entries (higher priority).
+
+        Without this, a freshly-started engine invents novel tags instead of
+        reusing the established vocabulary (e.g. "ai-memory" instead of
+        "skincare" for skincare-related content).
+        """
+        if not hasattr(self._tag_generator, "load_vocabulary"):
+            return  # KeywordTagGenerator doesn't have this
+
+        tag_counts: dict[str, int] = {}
+
+        # Store tags (cross-session)
+        for ts in self._store.get_all_tags():
+            tag_counts[ts.tag] = ts.usage_count
+
+        # TurnTagIndex (restored session, higher priority)
+        for tag, count in self._turn_tag_index.get_tag_counts().items():
+            tag_counts[tag] = max(tag_counts.get(tag, 0), count)
+
+        if tag_counts:
+            self._tag_generator.load_vocabulary(tag_counts)
+            logger.info(
+                "Bootstrapped tagger vocabulary: %d tags from store + index",
+                len(tag_counts),
+            )
 
     def _save_state(self, conversation_history: list[Message]) -> None:
         """Persist current engine state to store."""
@@ -236,6 +272,7 @@ class VirtualContextEngine:
                 turn_count=len(conversation_history) // 2,
                 split_processed_tags=sorted(self._split_processed_tags),
                 working_set=list(self._working_set.values()),
+                trailing_fingerprint=self._trailing_fingerprint,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
@@ -312,9 +349,15 @@ class VirtualContextEngine:
         core_context = self._assembler.load_core_context()
 
         # Paging: load content at working set depth levels
+        # BUG-014/015/016: broad and temporal queries bypass working set depth.
+        # Broad = overview (all tags at SUMMARY). Temporal = chronological order
+        # from retriever (working set would override with unsorted full_segments).
+        # The working set itself is NOT modified — it applies again on the next
+        # normal query.
         ws_param = None
         full_segments_param = None
-        if self.config.paging.enabled and self._working_set:
+        _bypass_ws = retrieval_result.broad or retrieval_result.temporal
+        if self.config.paging.enabled and self._working_set and not _bypass_ws:
             ws_param = self._working_set
             # Load full segments for tags at SEGMENTS or FULL depth
             full_segments_param = {}

@@ -111,3 +111,10 @@ class ContextStore(ABC):
 
     def load_latest_engine_state(self) -> EngineStateSnapshot | None:
         """Load the most recently saved engine state (any session). None if empty."""
+
+    def list_engine_state_fingerprints(self) -> dict[str, str]:
+        """Return {trailing_fingerprint: session_id} for all persisted sessions.
+
+        Used by SessionRegistry on restart to match inbound requests to
+        existing sessions when session markers are unavailable.
+        """

@@ -689,7 +689,8 @@ class SQLiteStore(ContextStore):
             }
             for e in state.turn_tag_entries
         ])
-        # Include split_processed_tags and working_set in the entries JSON blob
+        # Include split_processed_tags, working_set, and trailing_fingerprint
+        # in the entries JSON blob (avoids schema migrations)
         state_blob = json.dumps({
             "turn_tag_entries": json.loads(entries_json),
             "split_processed_tags": state.split_processed_tags,
@@ -702,6 +703,7 @@ class SQLiteStore(ContextStore):
                 }
                 for ws in state.working_set
             ],
+            "trailing_fingerprint": state.trailing_fingerprint,
         })
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
@@ -725,10 +727,12 @@ class SQLiteStore(ContextStore):
             entries_raw = raw.get("turn_tag_entries", [])
             split_processed_tags = raw.get("split_processed_tags", [])
             working_set_raw = raw.get("working_set", [])
+            trailing_fingerprint = raw.get("trailing_fingerprint", "")
         else:
             entries_raw = raw
             split_processed_tags = []
             working_set_raw = []
+            trailing_fingerprint = ""
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -756,6 +760,7 @@ class SQLiteStore(ContextStore):
             saved_at=_str_to_dt(row["saved_at"]),
             split_processed_tags=split_processed_tags,
             working_set=working_set,
+            trailing_fingerprint=trailing_fingerprint,
         )
 
     def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
@@ -775,6 +780,20 @@ class SQLiteStore(ContextStore):
         if not row:
             return None
         return self._parse_engine_state_row(row)
+
+    def list_engine_state_fingerprints(self) -> dict[str, str]:
+        """Return {trailing_fingerprint: session_id} for all persisted sessions."""
+        conn = self._get_conn()
+        result: dict[str, str] = {}
+        for row in conn.execute("SELECT session_id, turn_tag_entries FROM engine_state").fetchall():
+            try:
+                raw = json.loads(row["turn_tag_entries"])
+                fp = raw.get("trailing_fingerprint", "") if isinstance(raw, dict) else ""
+                if fp:
+                    result[fp] = row["session_id"]
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return result
 
     def close(self) -> None:
         if self._conn:

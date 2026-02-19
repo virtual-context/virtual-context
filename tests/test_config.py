@@ -158,3 +158,75 @@ class TestValidateConfig:
         config.storage.backend = "redis"
         errors = validate_config(config)
         assert any("storage.backend" in e for e in errors)
+
+
+class TestMultiInstanceConfig:
+    """Phase 5: proxy.instances config parsing and validation."""
+
+    def test_no_instances_default(self):
+        config = load_config(config_dict={})
+        assert config.proxy.instances == []
+
+    def test_parse_instances(self):
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com", "label": "anthropic"},
+                    {"port": 5758, "upstream": "https://api.openai.com/v1", "label": "openai"},
+                    {"port": 5760, "upstream": "https://generativelanguage.googleapis.com", "label": "gemini", "host": "0.0.0.0"},
+                ],
+            },
+        })
+        assert len(config.proxy.instances) == 3
+        assert config.proxy.instances[0].port == 5757
+        assert config.proxy.instances[0].upstream == "https://api.anthropic.com"
+        assert config.proxy.instances[0].label == "anthropic"
+        assert config.proxy.instances[0].host == "127.0.0.1"  # default
+        assert config.proxy.instances[2].host == "0.0.0.0"
+
+    def test_instance_defaults(self):
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [{"upstream": "https://api.anthropic.com"}],
+            },
+        })
+        inst = config.proxy.instances[0]
+        assert inst.port == 5757
+        assert inst.label == ""
+        assert inst.host == "127.0.0.1"
+
+    def test_validate_missing_upstream(self):
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "label": "broken"},
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert any("upstream is required" in e for e in errors)
+
+    def test_validate_duplicate_ports(self):
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com"},
+                    {"port": 5757, "upstream": "https://api.openai.com/v1"},
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert any("duplicates" in e for e in errors)
+
+    def test_validate_same_port_different_host(self):
+        """Same port on different hosts is fine."""
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com", "host": "127.0.0.1"},
+                    {"port": 5757, "upstream": "https://api.openai.com/v1", "host": "0.0.0.0"},
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert not any("duplicates" in e for e in errors)

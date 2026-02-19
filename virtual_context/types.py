@@ -139,6 +139,7 @@ class EngineStateSnapshot:
     saved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
     working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
+    trailing_fingerprint: str = ""  # hash of last N user messages for session matching on restart
 
 
 @dataclass
@@ -515,10 +516,20 @@ class CostTrackingConfig:
 
 
 @dataclass
+class ProxyInstanceConfig:
+    """Configuration for a single proxy listener instance."""
+    port: int = 5757
+    upstream: str = ""
+    label: str = ""
+    host: str = "127.0.0.1"
+
+
+@dataclass
 class ProxyConfig:
     request_log_dir: str = ".virtualcontext/request_log"
     request_log_max_files: int = 50
     upstream_context_limit: int = 200_000  # max tokens the upstream model accepts
+    instances: list[ProxyInstanceConfig] = field(default_factory=list)
 
 
 @dataclass

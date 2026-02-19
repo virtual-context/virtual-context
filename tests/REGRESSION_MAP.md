@@ -211,22 +211,29 @@ Use `pytest -m regression` to run all regression tests.
 
 - **Symptom**: Broad queries ("summarize everything") only show 1-2 expanded topics when those tags are at FULL depth in paging working set, missing 15+ other topic summaries
 - **Root cause**: Paging depth override consumes the tag budget before broad overview summaries can render; assembler's budget check terminates early
-- **Fix**: TBD — flatten working set to SUMMARY depth on broad queries
-- **Tests**: None yet (open)
+- **Fix**: `_bypass_ws` gate in `engine.py on_message_inbound()` — when `retrieval_result.broad or .temporal`, pass `ws_param=None` and `full_segments_param=None` to assembler. Working set preserved for next normal query.
+- **Tests**:
+  - `test_paging.py::TestBroadBypassesWorkingSet::test_broad_query_gets_all_summaries_despite_expanded_tags`
+  - `test_paging.py::TestBroadBypassesWorkingSet::test_broad_query_does_not_render_full_depth`
+  - `test_paging.py::TestBroadBypassesWorkingSet::test_working_set_preserved_after_broad_query`
 
 ### BUG-015 — Temporal chronological ordering lost by paging depth override
 
 - **Symptom**: Temporal queries ("what did we first discuss?") lose time ordering when tags are at FULL depth in paging working set
 - **Root cause**: Assembler overrides temporal retriever's chronologically-sorted summaries with unordered full_segments from working set
-- **Fix**: TBD — skip working set depth override for temporal result tags
-- **Tests**: None yet (open)
+- **Fix**: Same `_bypass_ws` gate as BUG-014
+- **Tests**:
+  - `test_paging.py::TestTemporalBypassesWorkingSet::test_temporal_query_ignores_working_set_depth`
 
 ### BUG-016 — Working set segment loading runs unconditionally on every inbound
 
 - **Symptom**: Full segment DB reads for all FULL-depth working set tags happen on every inbound, even when retriever chose broad/temporal path where segments won't be used
 - **Root cause**: Paging segment loading block doesn't check retrieval_result.broad/temporal
-- **Fix**: TBD — gate segment loading on retrieval branch
-- **Tests**: None yet (open)
+- **Fix**: Same `_bypass_ws` gate — segment loading skipped entirely for broad/temporal
+- **Tests**:
+  - `test_paging.py::TestSegmentLoadingGate::test_broad_query_skips_segment_loading`
+  - `test_paging.py::TestSegmentLoadingGate::test_temporal_query_skips_segment_loading`
+  - `test_paging.py::TestSegmentLoadingGate::test_normal_query_still_loads_segments`
 
 ### PROXY-022 — Consecutive same-role messages break alternation after filtering
 
@@ -257,6 +264,16 @@ Use `pytest -m regression` to run all regression tests.
   - `test_paging.py::TestContextHintModes::test_autonomous_hint_compact_format_fits_more_tags`
   - `test_paging.py::TestContextHintModes::test_autonomous_hint_truncation_drops_none_first`
   - `test_paging.py::TestContextHintModes::test_supervised_hint_compact_format`
+
+### PROXY-007 — Manual compaction has no concurrency guard
+
+- **Symptom**: Double-clicking "Compact Now" produces duplicate segments from the same messages
+- **Root cause**: No lock on `compact_manual()`. Concurrent calls read the same `_compacted_through` watermark.
+- **Fix**: `_compaction_lock = threading.Lock()` on ProxyState, non-blocking acquire in dashboard endpoint, 409 Conflict if busy, JS button disabled during flight
+- **Tests**:
+  - `test_proxy.py::TestCompactionConcurrencyGuard::test_compaction_lock_exists_on_proxy_state`
+  - `test_proxy.py::TestCompactionConcurrencyGuard::test_compaction_lock_is_non_reentrant`
+  - `test_proxy.py::TestCompactionConcurrencyGuard::test_dashboard_compact_endpoint_uses_lock`
 
 ### PROXY-015 — Continuation BAIL silently drops non-VC tools, leaving user with stub response
 

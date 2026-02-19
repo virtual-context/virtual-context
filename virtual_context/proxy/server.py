@@ -31,6 +31,13 @@ from ..core.turn_tag_index import TurnTagIndex
 from ..types import Message, SplitResult
 
 from .dashboard import register_dashboard_routes
+from .formats import (
+    PayloadFormat,
+    detect_format,
+    get_format,
+    _strip_openclaw_envelope as _strip_openclaw_envelope_fmt,
+    _last_text_block as _last_text_block_fmt,
+)
 from .metrics import ProxyMetrics
 
 logger = logging.getLogger(__name__)
@@ -112,6 +119,23 @@ class ProxyState:
         self._initial_payload_tokens: int | None = None
         self._last_payload_tokens: int = 0
         self._last_enriched_payload_tokens: int = 0
+
+    @property
+    def turn_offset(self) -> int:
+        """Starting turn number from persisted engine state.
+
+        When the proxy restarts, conversation_history is empty but the
+        TurnTagIndex may have been restored from the store.  Use the
+        highest indexed turn + 1 as the offset so turn numbering
+        continues from the previous session.
+        """
+        try:
+            entries = self.engine._turn_tag_index.entries
+            if entries and len(entries) > 0:
+                return max(e.turn_number for e in entries) + 1
+        except (TypeError, AttributeError):
+            pass
+        return 0
 
     @property
     def session_state(self) -> SessionState:
@@ -642,19 +666,26 @@ class SessionRegistry:
 
     Routing priority:
     1. Session marker (``<!-- vc:session=UUID -->``) in assistant messages
-    2. Content fingerprint — hash of first N user messages in the request body
-    3. Fallback — create a new session
+    2. Trailing fingerprint — hash of last N user messages (before current
+       turn) in the request body, matched against in-memory or persisted
+       fingerprints from previous sessions
+    3. Fallback — claim unclaimed session or create new
+
+    Trailing fingerprints survive client-side compaction (which rewrites
+    early messages) because they sample from the tail of the history.
 
     Future: ``X-VC-Session`` request header overrides all (requires client changes).
     """
 
-    _FINGERPRINT_SAMPLE_SIZE = 5  # first N user messages to hash
+    _FINGERPRINT_SAMPLE_SIZE = 1  # last N user messages to hash
 
     def __init__(
         self,
         config_path: str | None,
         upstream: str,
         metrics: ProxyMetrics,
+        *,
+        store: "Store | None" = None,
     ) -> None:
         self._config_path = config_path
         self._upstream = upstream
@@ -662,37 +693,97 @@ class SessionRegistry:
         self._sessions: dict[str, ProxyState] = {}
         self._fingerprints: dict[str, str] = {}  # fingerprint → session_id
         self._lock = threading.Lock()
+        self._store = store  # for loading persisted fingerprints on restart
 
     @staticmethod
-    def _compute_fingerprint(body: dict) -> str:
-        """Stable conversation fingerprint from the first N user messages.
+    def _msg_text(msg: dict) -> str:
+        """Extract plain text from a message content (str or content blocks)."""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return ""
 
-        Takes the first ``_FINGERPRINT_SAMPLE_SIZE`` user messages (raw text
-        including envelopes for maximum uniqueness), concatenates them, and
-        returns a truncated SHA-256 hex digest.  The sample is stable as
-        conversations grow because only the earliest messages are used.
+    @staticmethod
+    def _compute_fingerprint(body: dict, offset: int = 0) -> str:
+        """Trailing conversation fingerprint from the last N user messages.
+
+        Hashes ``_FINGERPRINT_SAMPLE_SIZE`` (S) user messages sampled from
+        the tail of the history (excluding the current turn).
+
+        The ``offset`` parameter shifts the sampling window back from the
+        tail.  Two conventions:
+
+        - **offset=0** (store): hash the last S history messages.
+          Used in ``catch_all`` to persist the fingerprint after each turn.
+        - **offset=1** (match): hash S messages ending one position before
+          the tail.  Used in ``get_or_create`` and restart matching.
+
+        Why offset=1 matches offset=0 from the previous request:
+
+        Request N  has history [u0 … u49].  Store fp = hash(u49).
+        Request N+1 has history [u0 … u49, u50].  Match fp = hash(u49).
+        The Nth message from the tail of request N+1 is the (N-1)th from
+        request N — the tail is stable, only the tip grows.
         """
         messages = body.get("messages", [])
         user_msgs = [m for m in messages if m.get("role") == "user"]
-        sample = user_msgs[:SessionRegistry._FINGERPRINT_SAMPLE_SIZE]
+
+        # Exclude the current turn (last user message)
+        if len(user_msgs) < 2:
+            return ""
+        history_user = user_msgs[:-1]  # all except current turn
+
+        n = SessionRegistry._FINGERPRINT_SAMPLE_SIZE
+        # Apply offset: shift window back by `offset` positions
+        end = len(history_user) - offset
+        start = end - n
+        if start < 0 or end <= 0:
+            return ""
+        sample = history_user[start:end]
         if not sample:
             return ""
 
-        texts: list[str] = []
-        for m in sample:
-            content = m.get("content", "")
-            if isinstance(content, str):
-                texts.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        texts.append(block.get("text", ""))
+        texts = [SessionRegistry._msg_text(m) for m in sample]
         combined = "\n".join(texts)
         if not combined.strip():
             return ""
 
         import hashlib
         return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+    def _match_persisted_fingerprint(self, body: dict) -> str | None:
+        """Match inbound request against persisted session fingerprints.
+
+        Compares the request's tail-1 fingerprint (offset=1) against stored
+        tail fingerprints (offset=0).  The one-turn shift between the last
+        save and the next inbound request is exactly bridged by offset=1.
+
+        Returns the matched session_id, or None.
+        """
+        if not self._store:
+            return None
+        try:
+            persisted = self._store.list_engine_state_fingerprints()
+            if not isinstance(persisted, dict) or not persisted:
+                return None
+        except Exception:
+            return None
+
+        fp = self._compute_fingerprint(body, offset=1)
+        if fp and fp in persisted:
+            matched = persisted[fp]
+            if isinstance(matched, str) and matched:
+                logger.info(
+                    "Persisted fingerprint match: fp=%s → session=%s",
+                    fp[:8], matched[:12],
+                )
+                return matched
+        return None
 
     def get_or_create(
         self,
@@ -704,20 +795,26 @@ class SessionRegistry:
 
         Returns (state, is_new).
 
-        Routing priority: marker (session_id) > content fingerprint >
-        claim unclaimed session > create new session.
+        Routing priority: marker (session_id) > in-memory fingerprint >
+        persisted fingerprint > claim unclaimed session > create new session.
         """
         # Fast path: session marker found and session already in memory
         if session_id and session_id in self._sessions:
             return self._sessions[session_id], False
 
-        # Compute fingerprint once (reused in lock path)
-        fp = ""
+        # Compute tail-1 fingerprint for matching (offset=1).
+        # The incoming request's tail-1 matches the previous request's tail
+        # because the conversation grew by exactly one turn.  catch_all
+        # stores each request's tail (offset=0) in _fingerprints, so the
+        # match here uses offset=1 to align with the stored value.
+        fp_match = ""  # offset=1 — for matching against stored tail
+        fp_store = ""  # offset=0 — saved in _fingerprints after session created
         if session_id is None and body is not None:
-            fp = self._compute_fingerprint(body)
-            # Fast path: fingerprint match
-            if fp and fp in self._fingerprints:
-                matched_sid = self._fingerprints[fp]
+            fp_match = self._compute_fingerprint(body, offset=1)
+            fp_store = self._compute_fingerprint(body)
+            # Fast path: in-memory fingerprint match
+            if fp_match and fp_match in self._fingerprints:
+                matched_sid = self._fingerprints[fp_match]
                 if matched_sid in self._sessions:
                     return self._sessions[matched_sid], False
 
@@ -726,24 +823,34 @@ class SessionRegistry:
             if session_id and session_id in self._sessions:
                 return self._sessions[session_id], False
 
-            if fp and fp in self._fingerprints:
-                matched_sid = self._fingerprints[fp]
+            if fp_match and fp_match in self._fingerprints:
+                matched_sid = self._fingerprints[fp_match]
                 if matched_sid in self._sessions:
                     return self._sessions[matched_sid], False
+
+            # Check persisted fingerprints (survives proxy restart +
+            # client-side compaction that destroys session markers)
+            if session_id is None and body is not None:
+                persisted_sid = self._match_persisted_fingerprint(body)
+                if persisted_sid:
+                    session_id = persisted_sid
 
             # No marker, no fingerprint match — claim an unclaimed session
             # if one exists.  This handles the startup case: create_app makes
             # a default session before any request arrives.  The first
             # conversation claims it; a second distinct conversation creates
             # a new session.
-            if session_id is None and fp:
+            if session_id is None:
                 claimed_sids = set(self._fingerprints.values())
                 for sid, st in self._sessions.items():
                     if sid not in claimed_sids:
-                        self._fingerprints[fp] = sid
+                        if fp_store:
+                            self._fingerprints[fp_store] = sid
                         logger.info(
                             "Session claimed: %s (fp=%s, total=%d)",
-                            sid[:12], fp[:8], len(self._sessions),
+                            sid[:12],
+                            fp_store[:8] if fp_store else "none",
+                            len(self._sessions),
                         )
                         return st, False
 
@@ -757,6 +864,7 @@ class SessionRegistry:
                 # Trigger state reload (engine.__init__ already called
                 # _load_persisted_state but with the wrong session_id).
                 engine._load_persisted_state()
+                engine._bootstrap_vocabulary()
 
             actual_id = engine.config.session_id
             state = ProxyState(
@@ -764,15 +872,15 @@ class SessionRegistry:
             )
             self._sessions[actual_id] = state
 
-            # Record fingerprint → session mapping
-            if fp:
-                self._fingerprints[fp] = actual_id
+            # Record fingerprint → session mapping (offset=0 = tail)
+            if fp_store:
+                self._fingerprints[fp_store] = actual_id
 
             logger.info(
                 "Session %s: %s (fp=%s, total=%d)",
                 "resumed" if session_id else "created",
                 actual_id[:12],
-                fp[:8] if fp else "none",
+                fp_store[:8] if fp_store else "none",
                 len(self._sessions),
             )
             return state, True
@@ -793,17 +901,12 @@ class SessionRegistry:
 # ---------------------------------------------------------------------------
 
 def _detect_api_format(body: dict) -> str:
-    """Detect whether this is an Anthropic or OpenAI request.
+    """Detect whether this is an Anthropic, OpenAI, or Gemini request.
 
-    Anthropic requests have a top-level "system" field and/or a model name
-    starting with "claude". OpenAI is the default.
+    Delegates to ``detect_format()`` and returns the format name string
+    for backward compatibility.
     """
-    if "system" in body:
-        return "anthropic"
-    model = body.get("model", "")
-    if isinstance(model, str) and model.startswith("claude"):
-        return "anthropic"
-    return "openai"
+    return detect_format(body).name
 
 
 def _last_text_block(content: list) -> str:
@@ -878,182 +981,56 @@ def _strip_openclaw_envelope(text: str) -> str:
 def _extract_session_id(body: dict) -> str | None:
     """Scan assistant messages for vc:session marker. Returns UUID or None.
 
-    Searches backward (most recent assistant message first) for the marker.
+    Delegates to the detected ``PayloadFormat``.
     """
-    for msg in reversed(body.get("messages", [])):
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            m = _VC_SESSION_RE.search(content)
-            if m:
-                return m.group(1)
-        elif isinstance(content, list):
-            for block in reversed(content):
-                if isinstance(block, dict) and block.get("type") == "text":
-                    m = _VC_SESSION_RE.search(block.get("text", ""))
-                    if m:
-                        return m.group(1)
-    return None
+    fmt = detect_format(body)
+    return fmt.extract_session_id(body)
 
 
 def _strip_session_markers(body: dict) -> dict:
     """Strip vc:session markers from all assistant messages in the request body.
 
-    Returns a shallow copy of body with markers removed from assistant content.
-    The LLM should never see stale session markers.
+    Delegates to the detected ``PayloadFormat``.
     """
-    messages = body.get("messages")
-    if not messages:
-        return body
-
-    modified = False
-    new_messages = []
-    for msg in messages:
-        if msg.get("role") != "assistant":
-            new_messages.append(msg)
-            continue
-
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            cleaned = _VC_SESSION_RE.sub("", content).rstrip()
-            if cleaned != content:
-                msg = dict(msg)
-                msg["content"] = cleaned
-                modified = True
-        elif isinstance(content, list):
-            new_blocks = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    cleaned = _VC_SESSION_RE.sub("", text).rstrip()
-                    if cleaned != text:
-                        block = dict(block)
-                        block["text"] = cleaned
-                        modified = True
-                new_blocks.append(block)
-            if modified:
-                msg = dict(msg)
-                msg["content"] = new_blocks
-        new_messages.append(msg)
-
-    if not modified:
-        return body
-
-    body = dict(body)
-    body["messages"] = new_messages
-    return body
+    fmt = detect_format(body)
+    return fmt.strip_session_markers(body)
 
 
 def _extract_user_message(body: dict) -> str:
     """Extract the last user message text from a request body.
 
-    Strips OpenClaw envelope metadata (channel headers, message footers,
-    system events, plugin markers) and applies last-text-block extraction
-    for content-block arrays.
+    Delegates to the detected ``PayloadFormat``.
     """
-    messages = body.get("messages", [])
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            return _strip_openclaw_envelope(content)
-        if isinstance(content, list):
-            return _strip_openclaw_envelope(_last_text_block(content))
-    return ""
+    fmt = detect_format(body)
+    return fmt.extract_user_message(body)
 
 
 def _extract_message_text(msg: dict) -> str:
     """Extract text from a single message dict (string or content blocks).
 
     Strips OpenClaw envelope metadata, then uses last-text-block for arrays.
+    Uses AnthropicFormat as default (works for both Anthropic and OpenAI
+    since they share the same content structure).
     """
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        return _strip_openclaw_envelope(content)
-    if isinstance(content, list):
-        return _strip_openclaw_envelope(_last_text_block(content))
-    return ""
+    # Both Anthropic and OpenAI share the same message structure
+    return get_format("anthropic").extract_message_text(msg)
 
 
 def _extract_history_pairs(body: dict) -> list[Message]:
     """Extract complete user+assistant pairs from request history.
 
-    Filters out system messages, drops the last user message (current turn),
-    and drops trailing unpaired messages. Returns a flat list:
-    [user_0, asst_0, user_1, asst_1, ...]
+    Delegates to the detected ``PayloadFormat``.
     """
-    messages = body.get("messages", [])
-
-    # Filter to user/assistant only
-    chat_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
-
-    if not chat_msgs:
-        return []
-
-    # Drop the last user message (that's the current turn being sent to the LLM)
-    if chat_msgs and chat_msgs[-1].get("role") == "user":
-        chat_msgs = chat_msgs[:-1]
-
-    if not chat_msgs:
-        return []
-
-    # Walk from start, collecting complete user+assistant pairs.
-    # Skips misaligned messages (consecutive users, trailing unpaired, etc.).
-    pairs: list[Message] = []
-    i = 0
-    while i + 1 < len(chat_msgs):
-        if (chat_msgs[i].get("role") == "user"
-                and chat_msgs[i + 1].get("role") == "assistant"):
-            pairs.append(Message(
-                role="user",
-                content=_extract_message_text(chat_msgs[i]),
-            ))
-            pairs.append(Message(
-                role="assistant",
-                content=_extract_message_text(chat_msgs[i + 1]),
-            ))
-            i += 2
-        else:
-            # Skip misaligned messages
-            i += 1
-    return pairs
+    fmt = detect_format(body)
+    return fmt.extract_history_pairs(body)
 
 
 def _inject_context(body: dict, prepend_text: str, api_format: str) -> dict:
-    """Inject <virtual-context> block into a shallow-copied request body.
+    """Inject <virtual-context> block into a deep-copied request body.
 
-    Does not mutate the original body.
+    Delegates to the appropriate ``PayloadFormat`` based on *api_format*.
     """
-    if not prepend_text:
-        return body
-
-    body = copy.deepcopy(body)
-    context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
-
-    if api_format == "anthropic":
-        existing = body.get("system", "")
-        # Anthropic system can be a string or list of content blocks
-        if isinstance(existing, list):
-            # Prepend as a text block
-            body["system"] = [{"type": "text", "text": context_block}] + existing
-        else:
-            body["system"] = f"{context_block}\n\n{existing}" if existing else context_block
-    else:
-        # OpenAI: system message in messages array
-        messages = body.get("messages", [])
-        if messages and messages[0].get("role") == "system":
-            existing = messages[0].get("content", "")
-            messages[0] = dict(messages[0])
-            messages[0]["content"] = (
-                f"{context_block}\n\n{existing}" if existing else context_block
-            )
-        else:
-            messages.insert(0, {"role": "system", "content": context_block})
-        body["messages"] = messages
-
-    return body
+    return get_format(api_format).inject_context(body, prepend_text)
 
 
 def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -1073,6 +1050,7 @@ def _filter_body_messages(
     broad: bool = False,
     temporal: bool = False,
     compacted_turn: int = 0,
+    fmt: PayloadFormat | None = None,
 ) -> tuple[dict, int]:
     """Filter request body messages to remove irrelevant history turns.
 
@@ -1086,7 +1064,18 @@ def _filter_body_messages(
 
     Returns (filtered_body, turns_dropped).
     """
-    messages = body.get("messages", [])
+    if fmt is None:
+        fmt = detect_format(body)
+
+    # Determine message key and assistant role based on format
+    if fmt.name == "gemini":
+        _msg_key = "contents"
+        _asst_role = "model"
+    else:
+        _msg_key = "messages"
+        _asst_role = "assistant"
+
+    messages = body.get(_msg_key, [])
     if not messages:
         return body, 0
 
@@ -1117,7 +1106,7 @@ def _filter_body_messages(
     i = 0
     while i + 1 < len(chat_msgs):
         if (chat_msgs[i].get("role") == "user"
-                and chat_msgs[i + 1].get("role") == "assistant"):
+                and chat_msgs[i + 1].get("role") == _asst_role):
             pairs.append((i, i + 1))
             paired_indices.add(i)
             paired_indices.add(i + 1)
@@ -1191,7 +1180,7 @@ def _filter_body_messages(
             if msg_idx not in keep_msg:
                 continue
             msg = chat_msgs[msg_idx]
-            if msg.get("role") == "assistant" and _has_tool_use(msg):
+            if msg.get("role") == _asst_role and _has_tool_use(msg):
                 # Keep all following messages until we find the tool_result
                 for j in range(msg_idx + 1, len(chat_msgs)):
                     if j not in keep_msg:
@@ -1205,17 +1194,14 @@ def _filter_body_messages(
                     if j not in keep_msg:
                         keep_msg.add(j)
                         changed = True
-                    if chat_msgs[j].get("role") == "assistant" and _has_tool_use(chat_msgs[j]):
+                    if chat_msgs[j].get("role") == _asst_role and _has_tool_use(chat_msgs[j]):
                         break
 
     # Build filtered message list preserving original order
     kept: list[dict] = list(prefix)
-    dropped = 0
     for msg_idx in range(len(chat_msgs)):
         if msg_idx in keep_msg:
             kept.append(chat_msgs[msg_idx])
-        elif msg_idx in paired_indices:
-            dropped += 1  # only count paired message drops (half a pair = 0.5 turn)
 
     if current_user:
         kept.append(current_user)
@@ -1233,12 +1219,17 @@ def _filter_body_messages(
         alternating.append(msg)
     kept = alternating
 
-    dropped = dropped // 2  # convert message drops to pair drops
+    # Compute drops from final kept list (not incremental tracking, which
+    # undercounts when alternation enforcement removes additional messages).
+    kept_user_count = sum(1 for m in kept if m.get("role") == "user")
+    if current_user:
+        kept_user_count -= 1  # exclude current turn from pair count
+    dropped = max(0, total_pairs - kept_user_count)
     if dropped == 0:
         return body, 0
 
     body = dict(body)
-    body["messages"] = kept
+    body[_msg_key] = kept
     return body, dropped
 
 
@@ -1265,74 +1256,49 @@ def _has_tool_result(msg: dict) -> bool:
 
 
 def _inject_session_marker(response_body: dict, marker: str, api_format: str) -> dict:
-    """Append session marker text to the last text content block in a non-streaming response."""
-    import copy as _copy
-    response_body = _copy.deepcopy(response_body)
+    """Append session marker text to the last text content block in a non-streaming response.
 
-    if api_format == "openai":
-        choices = response_body.get("choices", [])
-        if choices:
-            msg = choices[0].get("message", {})
-            existing = msg.get("content", "") or ""
-            msg["content"] = existing + marker
-    else:
-        # Anthropic: append to last text content block
-        content = response_body.get("content", [])
-        for block in reversed(content):
-            if isinstance(block, dict) and block.get("type") == "text":
-                block["text"] = (block.get("text", "") or "") + marker
-                break
-        else:
-            # No text block found — add one
-            content.append({"type": "text", "text": marker})
-
-    return response_body
+    Delegates to the appropriate ``PayloadFormat``.
+    """
+    return get_format(api_format).inject_session_marker(response_body, marker)
 
 
 def _extract_delta_text(data: dict, api_format: str) -> str:
-    """Extract text delta from a streaming SSE event payload."""
-    if api_format == "openai":
-        choices = data.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            return delta.get("content", "") or ""
-    else:
-        # Anthropic: content_block_delta event
-        event_type = data.get("type", "")
-        if event_type == "content_block_delta":
-            delta = data.get("delta", {})
-            return delta.get("text", "") or ""
-    return ""
+    """Extract text delta from a streaming SSE event payload.
+
+    Delegates to the appropriate ``PayloadFormat``.
+    """
+    return get_format(api_format).extract_delta_text(data)
 
 
 def _extract_assistant_text(response_body: dict, api_format: str) -> str:
     """Extract assistant text from a non-streaming response.
 
-    Uses last-text-block extraction for Anthropic format to skip
-    thinking/reasoning blocks that precede the actual response.
+    Delegates to the appropriate ``PayloadFormat``.
     """
-    if api_format == "openai":
-        choices = response_body.get("choices", [])
-        if choices:
-            message = choices[0].get("message", {})
-            return message.get("content", "") or ""
-    else:
-        # Anthropic: last text block (skips thinking blocks)
-        content = response_body.get("content", [])
-        return _last_text_block(content)
-    return ""
+    return get_format(api_format).extract_assistant_text(response_body)
 
 
 # ---------------------------------------------------------------------------
 # create_app
 # ---------------------------------------------------------------------------
 
-def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
+def create_app(
+    upstream: str,
+    config_path: str | None = None,
+    *,
+    shared_engine: VirtualContextEngine | None = None,
+    shared_metrics: ProxyMetrics | None = None,
+    instance_label: str = "",
+) -> FastAPI:
     """Create the FastAPI proxy application.
 
     Args:
         upstream: Upstream provider base URL (e.g. https://api.anthropic.com).
         config_path: Path to virtual-context config file.
+        shared_engine: Reuse an existing engine (multi-instance mode).
+        shared_metrics: Reuse an existing metrics collector (multi-instance mode).
+        instance_label: Human-readable label for this instance (e.g. "anthropic").
     """
     upstream = upstream.rstrip("/")
 
@@ -1340,36 +1306,42 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
     registry: SessionRegistry | None = None
     default_state: ProxyState | None = None
     try:
-        engine = VirtualContextEngine(config_path=config_path)
+        if shared_engine is not None:
+            engine = shared_engine
+        else:
+            engine = VirtualContextEngine(config_path=config_path)
 
-        # Lossless restart: if engine has no persisted state for its
-        # auto-generated session_id, try loading the most recent session.
-        # This avoids re-ingestion on proxy restart.
-        if (
-            hasattr(engine, '_store')
-            and hasattr(engine._store, 'load_latest_engine_state')
-            and not engine._turn_tag_index.entries
-        ):
-            try:
-                latest = engine._store.load_latest_engine_state()
-                if (
-                    latest
-                    and isinstance(getattr(latest, 'turn_tag_entries', None), list)
-                    and latest.turn_tag_entries
-                ):
-                    engine.config.session_id = latest.session_id
-                    engine._load_persisted_state()
-                    print(
-                        f"Lossless restart: restored session {latest.session_id[:12]} "
-                        f"({len(latest.turn_tag_entries)} turns, compacted={latest.compacted_through})",
-                        flush=True,
-                    )
-            except Exception as _e:
-                print(f"Lossless restart failed: {_e}", flush=True)
+            # Lossless restart: if engine has no persisted state for its
+            # auto-generated session_id, try loading the most recent session.
+            # This avoids re-ingestion on proxy restart.
+            if (
+                hasattr(engine, '_store')
+                and hasattr(engine._store, 'load_latest_engine_state')
+                and not engine._turn_tag_index.entries
+            ):
+                try:
+                    latest = engine._store.load_latest_engine_state()
+                    if (
+                        latest
+                        and isinstance(getattr(latest, 'turn_tag_entries', None), list)
+                        and latest.turn_tag_entries
+                    ):
+                        engine.config.session_id = latest.session_id
+                        engine._load_persisted_state()
+                        print(
+                            f"Lossless restart: restored session {latest.session_id[:12]} "
+                            f"({len(latest.turn_tag_entries)} turns, compacted={latest.compacted_through})",
+                            flush=True,
+                        )
+                except Exception as _e:
+                    print(f"Lossless restart failed: {_e}", flush=True)
 
-        metrics = ProxyMetrics(
-            context_window=engine.config.monitor.context_window,
-        )
+        if shared_metrics is not None:
+            metrics = shared_metrics
+        else:
+            metrics = ProxyMetrics(
+                context_window=engine.config.monitor.context_window,
+            )
         # Create the default session (used by dashboard and first requests)
         default_state = ProxyState(engine, metrics=metrics, upstream=upstream)
 
@@ -1383,18 +1355,20 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             config_path=config_path,
             upstream=upstream,
             metrics=metrics,
+            store=engine._store,
         )
         registry._sessions[engine.config.session_id] = default_state
 
         logger.info(
-            "Engine ready — session_id=%s, window=%d, storage=%s",
+            "Engine ready — session_id=%s, window=%d, storage=%s%s",
             engine.config.session_id,
             engine.config.monitor.context_window,
             engine.config.storage.backend,
+            f", label={instance_label}" if instance_label else "",
         )
     except Exception as e:
         print(f"Engine init failed: {e}", file=sys.stderr)
-        metrics = ProxyMetrics()
+        metrics = shared_metrics or ProxyMetrics()
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
     shutdown_event = asyncio.Event()
@@ -1445,11 +1419,18 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         if registry:
             registry.shutdown_all()
 
-    app = FastAPI(title="virtual-context proxy", lifespan=lifespan)
+    _app_title = "virtual-context proxy"
+    if instance_label:
+        _app_title += f" [{instance_label}]"
+    app = FastAPI(title=_app_title, lifespan=lifespan)
+    app.state.instance_label = instance_label
 
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed
     # Dashboard uses the default state for settings and config access
-    register_dashboard_routes(app, metrics, default_state, shutdown_event, registry=registry)
+    register_dashboard_routes(
+        app, metrics, default_state, shutdown_event,
+        registry=registry, instance_label=instance_label,
+    )
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     async def catch_all(request: Request, path: str):
@@ -1490,8 +1471,9 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         except _json.JSONDecodeError:
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
-        # Only intercept if it has a messages array (chat completion)
-        if not isinstance(body.get("messages"), list):
+        # Only intercept if it has a messages/contents array (chat completion)
+        fmt = detect_format(body)
+        if not fmt.has_messages(body):
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
         # Extract session ID from markers before stripping them
@@ -1507,26 +1489,21 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             state, is_new = registry.get_or_create(
                 inbound_session_id, body=body,
             )
+            # Update trailing fingerprint on the engine so it gets persisted
+            # with the next _save_state() call (inside on_turn_complete).
+            if state:
+                fp = SessionRegistry._compute_fingerprint(body)
+                if fp:
+                    state.engine._trailing_fingerprint = fp
+                    registry._fingerprints[fp] = state.engine.config.session_id
 
-        api_format = _detect_api_format(body)
-        user_message = _extract_user_message(body)
+        api_format = fmt.name
+        user_message = fmt.extract_user_message(body)
         is_streaming = body.get("stream", False)
 
         # Track payload size for dashboard (KB + rough token estimate)
         _payload_kb = round(len(body_bytes) / 1024, 1)
-        _payload_tok = 0
-        for _m in body.get("messages", []):
-            _c = _m.get("content", "")
-            _payload_tok += len(_c) // 4 if isinstance(_c, str) else sum(
-                len(b.get("text", "")) // 4 for b in _c if isinstance(b, dict)
-            )
-        _sys_raw = body.get("system", "")
-        if isinstance(_sys_raw, str):
-            _payload_tok += len(_sys_raw) // 4
-        elif isinstance(_sys_raw, list):
-            _payload_tok += sum(
-                len(b.get("text", "")) // 4 for b in _sys_raw if isinstance(b, dict)
-            )
+        _payload_tok = fmt.estimate_payload_tokens(body)
         if state:
             state._last_payload_kb = _payload_kb
             state._last_payload_tokens = _payload_tok
@@ -1547,14 +1524,14 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                    metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
                     session_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=len(state.conversation_history) // 2 if state else 0,
+                    metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
                     session_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_request_log_dir, log_prefix=_log_prefix,
@@ -1596,7 +1573,7 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 )
 
                 _session_id = state.engine.config.session_id
-                turn = len(state.conversation_history) // 2
+                turn = state.turn_offset + len(state.conversation_history) // 2
 
                 # Record passthrough request event
                 metrics.record({
@@ -1718,15 +1695,16 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
                 broad=assembled.broad,
                 temporal=assembled.temporal,
                 compacted_turn=_ct,
+                fmt=fmt,
             )
 
         enriched_body = _inject_context(body, prepend_text, api_format)
 
-        # Inject VC paging tools for autonomous mode (Anthropic only)
+        # Inject VC paging tools for autonomous mode (formats that support it)
         paging_enabled = False
         if (
             state
-            and api_format == "anthropic"
+            and fmt.supports_tool_interception
             and state.engine.config.paging.enabled
         ):
             _paging_mode = state.engine._resolve_paging_mode(
@@ -1756,60 +1734,15 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
         is_streaming = body.get("stream", False)
 
         # Estimate system prompt tokens from original body (before VC enrichment)
-        _sys_len = 0
-        if api_format == "anthropic":
-            _sys_orig = body.get("system", "")
-            if isinstance(_sys_orig, str):
-                _sys_len = len(_sys_orig)
-            elif isinstance(_sys_orig, list):
-                _sys_len = sum(
-                    len(b.get("text", "")) for b in _sys_orig
-                    if isinstance(b, dict)
-                )
-        else:
-            # OpenAI: system message is messages[0] with role=system
-            msgs = body.get("messages", [])
-            if msgs and msgs[0].get("role") == "system":
-                sc = msgs[0].get("content", "")
-                _sys_len = len(sc) if isinstance(sc, str) else sum(
-                    len(b.get("text", "")) for b in sc
-                    if isinstance(b, dict)
-                )
-        system_tokens = _sys_len // 4
+        system_tokens = fmt._estimate_system_tokens(body)
 
         # Estimate input tokens from enriched body
-        _input_text_len = 0
-        for msg in enriched_body.get("messages", []):
-            c = msg.get("content", "")
-            _input_text_len += len(c) if isinstance(c, str) else sum(
-                len(b.get("text", "")) for b in c if isinstance(b, dict)
-            )
-        sys_c = enriched_body.get("system", "")
-        if isinstance(sys_c, str):
-            _input_text_len += len(sys_c)
-        elif isinstance(sys_c, list):
-            _input_text_len += sum(
-                len(b.get("text", "")) for b in sys_c if isinstance(b, dict)
-            )
-        input_tokens = _input_text_len // 4
+        input_tokens = fmt.estimate_payload_tokens(enriched_body)
 
         # Estimate raw (pre-filter) input tokens — the baseline cost of sending
         # the full unfiltered payload.  Uses _pre_filter_body so it reflects
         # what a naive system without VC would actually send upstream.
-        _raw_text_len = 0
-        for msg in _pre_filter_body.get("messages", []):
-            c = msg.get("content", "")
-            _raw_text_len += len(c) if isinstance(c, str) else sum(
-                len(b.get("text", "")) for b in c if isinstance(b, dict)
-            )
-        _raw_sys = _pre_filter_body.get("system", "")
-        if isinstance(_raw_sys, str):
-            _raw_text_len += len(_raw_sys)
-        elif isinstance(_raw_sys, list):
-            _raw_text_len += sum(
-                len(b.get("text", "")) for b in _raw_sys if isinstance(b, dict)
-            )
-        raw_input_tokens = _raw_text_len // 4
+        raw_input_tokens = fmt.estimate_payload_tokens(_pre_filter_body)
 
         # Track enriched payload tokens for dashboard
         # (raw payload tokens already set earlier alongside KB tracking)
@@ -1817,14 +1750,15 @@ def create_app(upstream: str, config_path: str | None = None) -> FastAPI:
             state._last_enriched_payload_tokens = input_tokens
 
         # Record request event
-        turn = len(state.conversation_history) // 2 if state else 0
+        turn = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
         context_tokens = len(prepend_text) // 4 if prepend_text else 0
-        total_turns = len(state.conversation_history) // 2 if state else 0
+        total_turns = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
         overhead_ms = round(wait_ms + inbound_ms, 1)
         _session_id = state.engine.config.session_id if state else ""
         metrics.record({
             "type": "request",
             "turn": turn,
+            "model": body.get("model", ""),
             "message_preview": user_message[:60],
             "api_format": api_format,
             "streaming": is_streaming,
@@ -2167,18 +2101,10 @@ def _execute_vc_tool(
 def _inject_vc_tools(body: dict, engine: "VirtualContextEngine") -> dict:
     """Append VC paging tool definitions to the request body's tools array.
 
-    Shallow-copies *body*.  Skips if ``tool_choice`` is ``"none"``.
+    Delegates to the detected ``PayloadFormat`` for format-specific injection.
     """
-    tc = body.get("tool_choice")
-    if isinstance(tc, dict) and tc.get("type") == "none":
-        return body
-    if tc == "none":
-        return body
-    body = dict(body)  # shallow copy
-    tools = list(body.get("tools") or [])
-    tools.extend(_vc_tool_definitions())
-    body["tools"] = tools
-    return body
+    fmt = detect_format(body)
+    return fmt.inject_tools(body, _vc_tool_definitions())
 
 
 def _parse_sse_events(
@@ -2227,22 +2153,10 @@ def _build_continuation_request(
 ) -> dict:
     """Build a non-streaming continuation request after VC tool execution.
 
-    Appends an assistant message (with text + tool_use blocks) and a
-    user message (with tool_result blocks) to the original messages.
+    Delegates to the detected PayloadFormat for format-specific message structure.
     """
-    body: dict = {
-        "model": original_body.get("model"),
-        "max_tokens": original_body.get("max_tokens", 4096),
-        "stream": False,
-        "messages": list(original_body.get("messages", [])),
-    }
-    if "system" in original_body:
-        body["system"] = original_body["system"]
-    if "tools" in original_body:
-        body["tools"] = original_body["tools"]
-    body["messages"].append({"role": "assistant", "content": assistant_content})
-    body["messages"].append({"role": "user", "content": tool_results})
-    return body
+    fmt = detect_format(original_body)
+    return fmt.build_continuation_request(original_body, assistant_content, tool_results)
 
 
 def _emit_text_as_sse(text: str, block_index: int) -> list[bytes]:
@@ -2776,16 +2690,8 @@ async def _handle_streaming(
                         payload_tokens=state._last_payload_tokens or None,
                     )
                 _marker_sid = state.engine.config.session_id
-                marker = f"\n<!-- vc:session={_marker_sid} -->"
-                marker_event = _json.dumps({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": marker},
-                })
-                yield (
-                    f"event: content_block_delta\n"
-                    f"data: {marker_event}\n\n"
-                ).encode()
+                _fmt = get_format(api_format)
+                yield _fmt.emit_session_marker_sse(_marker_sid)
 
             if session_log_path and state:
                 _dump_session_state(state, session_log_path)
@@ -2834,19 +2740,8 @@ async def _handle_streaming(
                 # Inject session marker as a final SSE delta so the client SDK
                 # accumulates it into the stored assistant message.
                 _marker_sid = state.engine.config.session_id
-                marker = f"\n<!-- vc:session={_marker_sid} -->"
-                if api_format == "anthropic":
-                    marker_event = _json.dumps({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": marker},
-                    })
-                    yield f"event: content_block_delta\ndata: {marker_event}\n\n".encode()
-                else:
-                    marker_event = _json.dumps({
-                        "choices": [{"index": 0, "delta": {"content": marker}}],
-                    })
-                    yield f"data: {marker_event}\n\n".encode()
+                _fmt = get_format(api_format)
+                yield _fmt.emit_session_marker_sse(_marker_sid)
 
             # Session state dump (after response + history update)
             if session_log_path and state:
