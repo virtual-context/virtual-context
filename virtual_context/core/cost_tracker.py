@@ -35,7 +35,14 @@ class CostTracker:
 
     def _update_cost(self, input_tokens: int, output_tokens: int, provider: str) -> None:
         """Update estimated cost based on pricing config."""
+        # Exact match first, then substring match (e.g. "haiku" in "claude-haiku-4-5-20251001")
         pricing = self.config.pricing.get(provider, {})
+        if not pricing:
+            provider_lower = provider.lower()
+            for key, val in self.config.pricing.items():
+                if key.lower() in provider_lower:
+                    pricing = val
+                    break
         input_rate = pricing.get("input_per_1k", 0.0)
         output_rate = pricing.get("output_per_1k", 0.0)
         self._summary.estimated_cost_usd += (

@@ -288,6 +288,23 @@ Use `pytest -m regression` to run all regression tests.
   - `test_proxy.py::TestEmitToolUseAsSSE::test_delta_has_input_json`
   - `test_proxy.py::TestEmitToolUseAsSSE::test_content_block_stop`
 
+### BUG-017 — Tool loop exhausts max_loops with empty text
+
+- **Symptom**: LongMemEval Q1 returns empty hypothesis despite 364 output tokens. Model called `vc_find_quote` repeatedly without finding matches, exhausted max_loops without producing text.
+- **Root cause**: `run_tool_loop()` `for/else` clause didn't force text generation on max_loops exhaustion. All output tokens were tool_use blocks.
+- **Fix**: After exhausting max_loops with empty text, execute last pending tools, send one final continuation with `tools` stripped to force text output.
+- **Tests**:
+  - `test_tool_loop.py::TestRunToolLoop::test_forced_text_after_max_loops_exhausted`
+
+### BUG-018 — Context turns pollute inbound tagger post-compaction
+
+- **Symptom**: LongMemEval benchmark — question about "antique items" generates `meal-prep` tags because last haystack turns were about food. 3/7 questions affected.
+- **Root cause**: `on_message_inbound()` passes recent conversation turns as context to the tagger. Post-compaction, these are unrelated to the query and overwhelm the question text in the tagger prompt.
+- **Fix**: Skip `context_turns` when `_compacted_through > 0`. Also skip the `_general` context-expansion retry post-compaction.
+- **Tests**:
+  - `test_broad_query.py::TestContextTurnsPostCompaction::test_no_context_turns_post_compaction`
+  - `test_broad_query.py::TestContextTurnsPostCompaction::test_context_turns_passed_pre_compaction`
+
 ---
 
 ## By Test File

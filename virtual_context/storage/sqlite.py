@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..core.store import ContextStore
-from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS engine_state (
     turn_count INTEGER NOT NULL,
     turn_tag_entries TEXT NOT NULL,
     saved_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS segment_chunks (
+    segment_ref TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    PRIMARY KEY (segment_ref, chunk_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
@@ -149,6 +157,7 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
             action_items=metadata_raw.get("action_items", []),
             date_references=metadata_raw.get("date_references", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            session_date=metadata_raw.get("session_date", ""),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -173,6 +182,7 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
             action_items=metadata_raw.get("action_items", []),
             date_references=metadata_raw.get("date_references", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            session_date=metadata_raw.get("session_date", ""),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -233,6 +243,15 @@ class SQLiteStore(ContextStore):
                 """)
         except sqlite3.OperationalError:
             pass
+        # Cascade delete chunk embeddings when parent segment is deleted
+        try:
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS segments_chunks_ad AFTER DELETE ON segments BEGIN
+                    DELETE FROM segment_chunks WHERE segment_ref = old.ref;
+                END;
+            """)
+        except sqlite3.OperationalError:
+            pass
         # Migrations: add columns that didn't exist in earlier schema versions
         try:
             conn.execute("ALTER TABLE tag_summaries ADD COLUMN description TEXT NOT NULL DEFAULT ''")
@@ -250,13 +269,16 @@ class SQLiteStore(ContextStore):
 
     def store_segment(self, segment: StoredSegment) -> str:
         conn = self._get_conn()
-        metadata_json = json.dumps({
+        metadata_dict = {
             "entities": segment.metadata.entities,
             "key_decisions": segment.metadata.key_decisions,
             "action_items": segment.metadata.action_items,
             "date_references": segment.metadata.date_references,
             "turn_count": segment.metadata.turn_count,
-        })
+        }
+        if segment.metadata.session_date:
+            metadata_dict["session_date"] = segment.metadata.session_date
+        metadata_json = json.dumps(metadata_dict)
 
         conn.execute(
             """INSERT OR REPLACE INTO segments
@@ -422,8 +444,8 @@ class SQLiteStore(ContextStore):
         # Try FTS5 first (with snippet extraction)
         try:
             rows = conn.execute(
-                """SELECT fts.ref, s.primary_tag,
-                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 40)
+                """SELECT fts.ref, s.primary_tag, s.metadata_json,
+                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 100)
                    FROM segments_fts_full fts
                    JOIN segments s ON s.ref = fts.ref
                    WHERE segments_fts_full MATCH ?
@@ -432,11 +454,14 @@ class SQLiteStore(ContextStore):
                 [query, limit],
             ).fetchall()
             for row in rows:
+                meta = json.loads(row[2]) if row[2] else {}
                 results.append(QuoteResult(
-                    text=row[2],
+                    text=row[3],
                     tag=row[1],
                     segment_ref=row[0],
                     tags=self._get_tags_for_ref(row[0]),
+                    match_type="fts",
+                    session_date=meta.get("session_date", ""),
                 ))
             return results
         except sqlite3.OperationalError:
@@ -445,18 +470,21 @@ class SQLiteStore(ContextStore):
         # Fallback: LIKE search on full_text with manual excerpt
         like_query = f"%{query}%"
         rows = conn.execute(
-            """SELECT ref, primary_tag, full_text FROM segments
+            """SELECT ref, primary_tag, full_text, metadata_json FROM segments
                WHERE full_text LIKE ?
                LIMIT ?""",
             [like_query, limit],
         ).fetchall()
         for row in rows:
             excerpt = _extract_excerpt(row[2], query, context_chars=200)
+            meta = json.loads(row[3]) if row[3] else {}
             results.append(QuoteResult(
                 text=excerpt,
                 tag=row[1],
                 segment_ref=row[0],
                 tags=self._get_tags_for_ref(row[0]),
+                match_type="like",
+                session_date=meta.get("session_date", ""),
             ))
         return results
 
@@ -677,6 +705,31 @@ class SQLiteStore(ContextStore):
             results.append(_row_to_segment(row, seg_tags))
         return results
 
+    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+        conn = self._get_conn()
+        conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
+        for chunk in chunks:
+            conn.execute(
+                "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
+                (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
+            )
+        conn.commit()
+
+    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT segment_ref, chunk_index, text, embedding_json FROM segment_chunks ORDER BY segment_ref, chunk_index"
+        ).fetchall()
+        return [
+            ChunkEmbedding(
+                segment_ref=row[0],
+                chunk_index=row[1],
+                text=row[2],
+                embedding=json.loads(row[3]),
+            )
+            for row in rows
+        ]
+
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         conn = self._get_conn()
         entries_json = json.dumps([
@@ -686,6 +739,7 @@ class SQLiteStore(ContextStore):
                 "tags": e.tags,
                 "primary_tag": e.primary_tag,
                 "timestamp": _dt_to_str(e.timestamp),
+                "session_date": e.session_date,
             }
             for e in state.turn_tag_entries
         ])
@@ -740,6 +794,7 @@ class SQLiteStore(ContextStore):
                 tags=e["tags"],
                 primary_tag=e["primary_tag"],
                 timestamp=_str_to_dt(e["timestamp"]),
+                session_date=e.get("session_date", ""),
             )
             for e in entries_raw
         ]

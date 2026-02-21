@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -59,6 +59,8 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
         "date_references": seg.metadata.date_references,
         "turn_count": seg.metadata.turn_count,
     }
+    if seg.metadata.session_date:
+        frontmatter["session_date"] = seg.metadata.session_date
 
     lines = ["---"]
     lines.append(yaml.dump(frontmatter, default_flow_style=False).strip())
@@ -138,6 +140,7 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
         action_items=fm.get("action_items", []),
         date_references=fm.get("date_references", []),
         turn_count=fm.get("turn_count", 0),
+        session_date=fm.get("session_date", ""),
     )
 
     return StoredSegment(
@@ -344,6 +347,8 @@ class FilesystemStore(ContextStore):
                     tag=seg.primary_tag,
                     segment_ref=seg.ref,
                     tags=seg.tags,
+                    match_type="like",
+                    session_date=seg.metadata.session_date,
                 ))
                 if len(results) >= limit:
                     break
@@ -520,6 +525,40 @@ class FilesystemStore(ContextStore):
                 results.append(seg)
         return results
 
+    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+        embed_dir = self.root / "_embeddings"
+        embed_dir.mkdir(parents=True, exist_ok=True)
+        path = embed_dir / f"{segment_ref}.json"
+        data = [
+            {
+                "segment_ref": c.segment_ref,
+                "chunk_index": c.chunk_index,
+                "text": c.text,
+                "embedding": c.embedding,
+            }
+            for c in chunks
+        ]
+        path.write_text(json.dumps(data, indent=2))
+
+    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+        embed_dir = self.root / "_embeddings"
+        if not embed_dir.is_dir():
+            return []
+        results: list[ChunkEmbedding] = []
+        for path in sorted(embed_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            for item in data:
+                results.append(ChunkEmbedding(
+                    segment_ref=item["segment_ref"],
+                    chunk_index=item["chunk_index"],
+                    text=item["text"],
+                    embedding=item["embedding"],
+                ))
+        return results
+
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         state_dir = self.root / "_engine_state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -536,6 +575,7 @@ class FilesystemStore(ContextStore):
                     "tags": e.tags,
                     "primary_tag": e.primary_tag,
                     "timestamp": _dt_to_str(e.timestamp),
+                    "session_date": e.session_date,
                 }
                 for e in state.turn_tag_entries
             ],
@@ -562,6 +602,7 @@ class FilesystemStore(ContextStore):
                 tags=e["tags"],
                 primary_tag=e["primary_tag"],
                 timestamp=_str_to_dt(e["timestamp"]),
+                session_date=e.get("session_date", ""),
             )
             for e in data.get("turn_tag_entries", [])
         ]

@@ -273,3 +273,89 @@ class TestContextHint:
         engine = self._make_engine(tmp_path)
         engine._compacted_through = 10
         assert engine._build_context_hint() == ""
+
+
+class TestContextTurnsPostCompaction:
+    """BUG-018: Post-compaction, context_turns should not be passed to the
+    retriever. Recent conversation topic bleeds into the tagger prompt,
+    generating tags for the recent topic instead of the actual query.
+
+    Example: question asks about 'antique items inherited' but last haystack
+    turns were about food → tagger generates 'meal-prep' tags.
+    """
+
+    @pytest.fixture
+    def engine_with_compaction(self, tmp_path):
+        from virtual_context.config import load_config
+        from virtual_context.engine import VirtualContextEngine
+
+        config = load_config(config_dict={
+            "context_window": 50000,
+            "storage_root": str(tmp_path),
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "store.db")}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine = VirtualContextEngine(config=config)
+        return engine
+
+    @pytest.mark.regression("BUG-018")
+    def test_no_context_turns_post_compaction(self, engine_with_compaction):
+        """After compaction, retriever should receive context_turns=None."""
+        from unittest.mock import patch
+
+        engine = engine_with_compaction
+        engine._compacted_through = 10  # simulate compaction occurred
+
+        # History with recent food-related turns (would pollute tagger)
+        history = [
+            Message(role="user", content="What's a good plant-based chili recipe?"),
+            Message(role="assistant", content="Here's a great bulk-cooking chili with black beans..."),
+            Message(role="user", content="Can I make it with tofu instead?"),
+            Message(role="assistant", content="Absolutely! Crumbled firm tofu works great."),
+        ] * 3  # 12 messages
+
+        captured_kwargs = {}
+        original_retrieve = engine._retriever.retrieve
+
+        def spy_retrieve(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_retrieve(*args, **kwargs)
+
+        with patch.object(engine._retriever, "retrieve", side_effect=spy_retrieve):
+            engine.on_message_inbound(
+                "How many antique items did I inherit from my family?",
+                history,
+            )
+
+        assert captured_kwargs.get("context_turns") is None, (
+            "Post-compaction, context_turns should be None to prevent "
+            "recent conversation topic from polluting inbound tagger"
+        )
+
+    @pytest.mark.regression("BUG-018")
+    def test_context_turns_passed_pre_compaction(self, engine_with_compaction):
+        """Before compaction, context_turns should still be passed."""
+        from unittest.mock import patch
+
+        engine = engine_with_compaction
+        # _compacted_through defaults to 0 (no compaction)
+
+        history = [
+            Message(role="user", content="Tell me about chili recipes"),
+            Message(role="assistant", content="Here's a great recipe..."),
+        ]
+
+        captured_kwargs = {}
+        original_retrieve = engine._retriever.retrieve
+
+        def spy_retrieve(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_retrieve(*args, **kwargs)
+
+        with patch.object(engine._retriever, "retrieve", side_effect=spy_retrieve):
+            engine.on_message_inbound("What about vegetarian options?", history)
+
+        # Pre-compaction, context_turns should be provided
+        assert captured_kwargs.get("context_turns") is not None, (
+            "Pre-compaction, context_turns should be passed for disambiguation"
+        )

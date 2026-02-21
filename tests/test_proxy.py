@@ -16,7 +16,6 @@ from virtual_context.proxy.server import (
     _emit_message_end_sse,
     _emit_text_as_sse,
     _emit_tool_use_as_sse,
-    _execute_vc_tool,
     _extract_assistant_text,
     _extract_delta_text,
     _extract_history_pairs,
@@ -27,13 +26,11 @@ from virtual_context.proxy.server import (
     _inject_context,
     _inject_session_marker,
     _inject_vc_tools,
-    _is_vc_tool,
     _last_text_block,
     _parse_sse_events,
     _strip_openclaw_envelope,
     _strip_session_markers,
     _strip_vc_prompt,
-    _vc_tool_definitions,
     create_app,
 )
 from virtual_context.config import load_config
@@ -3347,106 +3344,6 @@ class TestPassthroughToggle:
 # ---------------------------------------------------------------------------
 # Phase 6: Paging Tool Interception
 # ---------------------------------------------------------------------------
-
-
-class TestVCToolDefinitions:
-    """Tests for _vc_tool_definitions()."""
-
-    def test_returns_three_tools(self):
-        defs = _vc_tool_definitions()
-        assert len(defs) == 3
-
-    def test_tool_names_have_vc_prefix(self):
-        defs = _vc_tool_definitions()
-        names = {d["name"] for d in defs}
-        assert names == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"}
-
-    def test_tools_have_input_schema(self):
-        defs = _vc_tool_definitions()
-        for d in defs:
-            assert "input_schema" in d
-            schema = d["input_schema"]
-            assert schema["type"] == "object"
-            assert "properties" in schema
-            assert len(schema["required"]) >= 1
-
-    def test_expand_has_depth_enum(self):
-        defs = _vc_tool_definitions()
-        expand = [d for d in defs if d["name"] == "vc_expand_topic"][0]
-        depth = expand["input_schema"]["properties"]["depth"]
-        assert set(depth["enum"]) == {"segments", "full"}
-
-    def test_collapse_has_depth_enum(self):
-        defs = _vc_tool_definitions()
-        collapse = [d for d in defs if d["name"] == "vc_collapse_topic"][0]
-        depth = collapse["input_schema"]["properties"]["depth"]
-        assert set(depth["enum"]) == {"summary", "none"}
-
-
-class TestIsVCTool:
-    """Tests for _is_vc_tool()."""
-
-    def test_recognizes_expand(self):
-        assert _is_vc_tool("vc_expand_topic") is True
-
-    def test_recognizes_collapse(self):
-        assert _is_vc_tool("vc_collapse_topic") is True
-
-    def test_rejects_unknown(self):
-        assert _is_vc_tool("vc_unknown") is False
-
-    def test_rejects_client_tool(self):
-        assert _is_vc_tool("web_search") is False
-
-    def test_rejects_empty(self):
-        assert _is_vc_tool("") is False
-
-
-class TestExecuteVCTool:
-    """Tests for _execute_vc_tool()."""
-
-    def test_expand_calls_engine(self):
-        engine = MagicMock()
-        engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
-        result = _execute_vc_tool(engine, "vc_expand_topic", {"tag": "db", "depth": "full"})
-        engine.expand_topic.assert_called_once_with(tag="db", depth="full")
-        parsed = json.loads(result)
-        assert parsed["tag"] == "db"
-        assert parsed["tokens_added"] == 500
-
-    def test_collapse_calls_engine(self):
-        engine = MagicMock()
-        engine.collapse_topic.return_value = {"tag": "api", "depth": "summary", "tokens_freed": 300}
-        result = _execute_vc_tool(engine, "vc_collapse_topic", {"tag": "api"})
-        engine.collapse_topic.assert_called_once_with(tag="api", depth="summary")
-        parsed = json.loads(result)
-        assert parsed["tokens_freed"] == 300
-
-    def test_unknown_tool_returns_error(self):
-        engine = MagicMock()
-        result = _execute_vc_tool(engine, "vc_unknown", {})
-        parsed = json.loads(result)
-        assert "error" in parsed
-
-    def test_engine_error_returns_error_json(self):
-        engine = MagicMock()
-        engine.expand_topic.side_effect = RuntimeError("boom")
-        result = _execute_vc_tool(engine, "vc_expand_topic", {"tag": "x"})
-        parsed = json.loads(result)
-        assert parsed["is_error"] is True
-        assert "boom" in parsed["content"]
-
-    def test_expand_default_depth(self):
-        engine = MagicMock()
-        engine.expand_topic.return_value = {}
-        _execute_vc_tool(engine, "vc_expand_topic", {"tag": "t"})
-        engine.expand_topic.assert_called_once_with(tag="t", depth="full")
-
-    def test_collapse_default_depth(self):
-        engine = MagicMock()
-        engine.collapse_topic.return_value = {}
-        _execute_vc_tool(engine, "vc_collapse_topic", {"tag": "t"})
-        engine.collapse_topic.assert_called_once_with(tag="t", depth="summary")
 
 
 class TestInjectVCTools:

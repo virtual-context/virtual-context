@@ -168,10 +168,22 @@ class ContextAssembler:
         if not summaries:
             return ""
 
+        # Sort chronologically so reader sees old → new progression
+        summaries = sorted(summaries, key=lambda s: s.start_timestamp)
+
         last_updated = max(s.end_timestamp for s in summaries)
         all_tags = sorted({t for s in summaries for t in s.tags})
         tags_attr = ", ".join(all_tags) if all_tags else tag
-        summary_texts = [s.summary for s in summaries]
+
+        # Prefix each summary with its session date when available
+        summary_texts: list[str] = []
+        for s in summaries:
+            session = s.metadata.session_date
+            if session:
+                summary_texts.append(f"[{session}]\n{s.summary}")
+            else:
+                summary_texts.append(s.summary)
+
         body = "\n\n---\n\n".join(summary_texts)
 
         return (
@@ -190,9 +202,10 @@ class ContextAssembler:
         for seg in segments:
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
+            session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
             parts.append(
                 f'<virtual-context tags="{tags_attr}" depth="segments" '
-                f'ref="{seg.ref}" created="{seg.created_at.isoformat()}">\n'
+                f'ref="{seg.ref}"{session_attr} created="{seg.created_at.isoformat()}">\n'
                 f"{seg.summary}\n"
                 f"</virtual-context>"
             )
@@ -208,9 +221,10 @@ class ContextAssembler:
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
             text = seg.full_text if seg.full_text else seg.summary
+            session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
             parts.append(
                 f'<virtual-context tags="{tags_attr}" depth="full" '
-                f'ref="{seg.ref}" created="{seg.created_at.isoformat()}">\n'
+                f'ref="{seg.ref}"{session_attr} created="{seg.created_at.isoformat()}">\n'
                 f"{text}\n"
                 f"</virtual-context>"
             )

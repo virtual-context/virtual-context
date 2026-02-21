@@ -249,7 +249,7 @@ class TestEngineFindQuote:
         assert result["found"] is True
         assert len(result["results"]) == 1
         assert result["results"][0]["topic"] == "health"
-        assert result["results"][0]["tags"] == ["health", "supplements"]
+        assert "tags" not in result["results"][0]  # tags removed to avoid sub-tag noise
         assert "magnesium" in result["results"][0]["excerpt"].lower()
 
     def test_find_quote_miss(self, tmp_path):
@@ -309,30 +309,30 @@ class TestEngineFindQuote:
 
 class TestProxyFindQuoteTool:
     def test_vc_tool_names_includes_find_quote(self):
-        from virtual_context.proxy.server import _VC_TOOL_NAMES
-        assert "vc_find_quote" in _VC_TOOL_NAMES
+        from virtual_context.core.tool_loop import VC_TOOL_NAMES
+        assert "vc_find_quote" in VC_TOOL_NAMES
 
     def test_is_vc_tool_find_quote(self):
-        from virtual_context.proxy.server import _is_vc_tool
-        assert _is_vc_tool("vc_find_quote") is True
+        from virtual_context.core.tool_loop import is_vc_tool
+        assert is_vc_tool("vc_find_quote") is True
 
     def test_tool_definitions_include_find_quote(self):
-        from virtual_context.proxy.server import _vc_tool_definitions
-        tools = _vc_tool_definitions()
+        from virtual_context.core.tool_loop import vc_tool_definitions
+        tools = vc_tool_definitions()
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
         assert len(tools) == 3  # expand, collapse, find_quote
 
     def test_find_quote_tool_schema(self):
-        from virtual_context.proxy.server import _vc_tool_definitions
-        tools = _vc_tool_definitions()
+        from virtual_context.core.tool_loop import vc_tool_definitions
+        tools = vc_tool_definitions()
         fq = next(t for t in tools if t["name"] == "vc_find_quote")
         assert "query" in fq["input_schema"]["properties"]
         assert "max_results" in fq["input_schema"]["properties"]
         assert fq["input_schema"]["required"] == ["query"]
 
     def test_execute_vc_tool_dispatches_find_quote(self):
-        from virtual_context.proxy.server import _execute_vc_tool
+        from virtual_context.core.tool_loop import execute_vc_tool
         engine = MagicMock()
         engine.find_quote.return_value = {
             "query": "magnesium",
@@ -340,17 +340,17 @@ class TestProxyFindQuoteTool:
             "results": [{"excerpt": "found it", "topic": "health", "segment_ref": "seg-1"}],
         }
 
-        result_str = _execute_vc_tool(engine, "vc_find_quote", {"query": "magnesium"})
+        result_str = execute_vc_tool(engine, "vc_find_quote", {"query": "magnesium"})
         engine.find_quote.assert_called_once_with(query="magnesium", max_results=5)
         result = json.loads(result_str)
         assert result["found"] is True
 
     def test_execute_vc_tool_find_quote_with_max_results(self):
-        from virtual_context.proxy.server import _execute_vc_tool
+        from virtual_context.core.tool_loop import execute_vc_tool
         engine = MagicMock()
         engine.find_quote.return_value = {"found": False, "results": []}
 
-        _execute_vc_tool(engine, "vc_find_quote", {"query": "test", "max_results": 3})
+        execute_vc_tool(engine, "vc_find_quote", {"query": "test", "max_results": 3})
         engine.find_quote.assert_called_once_with(query="test", max_results=3)
 
 

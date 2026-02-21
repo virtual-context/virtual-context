@@ -29,6 +29,7 @@ class GenericOpenAIProvider:
         self.model = model
         self.temperature = temperature
         self.api_key = api_key
+        self.last_usage: dict = {}  # populated after each complete() call
 
     def complete(self, system: str, user: str, max_tokens: int) -> str:
         """Send a chat completion request."""
@@ -56,6 +57,7 @@ class GenericOpenAIProvider:
 
                 if response.status_code == 200:
                     data = response.json()
+                    self.last_usage = data.get("usage", {})
                     choices = data.get("choices", [])
                     if choices:
                         return choices[0].get("message", {}).get("content", "")

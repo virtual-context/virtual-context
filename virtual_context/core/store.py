@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import DepthLevel, EngineStateSnapshot, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -102,6 +102,13 @@ class ContextStore(ABC):
         limit: int = 20,
     ) -> list[StoredSegment]:
         """Retrieve full segments (including full_text) matching tags by overlap."""
+
+    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+        """Store embedding vectors for text chunks of a segment. Idempotent (replaces)."""
+
+    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+        """Retrieve all stored chunk embeddings. Returns empty list if none."""
+        return []
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         """Persist engine state (TurnTagIndex + watermark). Upsert by session_id."""

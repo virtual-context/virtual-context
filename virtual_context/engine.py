@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 
 from .config import load_config
@@ -22,18 +23,22 @@ from .storage.sqlite import SQLiteStore
 from .token_counter import create_token_counter
 from .types import (
     AssembledContext,
+    ChunkEmbedding,
     CompactionReport,
     CompactionResult,
     DepthLevel,
     EngineStateSnapshot,
     Message,
+    QuoteResult,
     RetrievalResult,
+    SegmentMetadata,
     SessionCostSummary,
     SplitResult,
     StoredSegment,
     StoredSummary,
     TagResult,
     TagSummary,
+    ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
     WorkingSetEntry,
@@ -42,6 +47,7 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 _EMBED_NOT_LOADED = object()  # sentinel for lazy embed function loading
+_SESSION_HEADER_RE = re.compile(r'\[Session from ([^\]]+)\]')
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -52,6 +58,57 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def _chunk_segment_text(full_text: str, max_words: int = 250, min_words: int = 20) -> list[str]:
+    """Split segment full_text into overlapping chunks for embedding.
+
+    Splits on double-newline (message boundaries), merges tiny chunks,
+    and applies sliding window with overlap for oversized chunks.
+    """
+    if not full_text or not full_text.strip():
+        return []
+
+    # Split on message boundaries
+    paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return []
+
+    # Merge tiny paragraphs
+    merged: list[str] = []
+    buffer = ""
+    for para in paragraphs:
+        if buffer:
+            candidate = buffer + "\n\n" + para
+        else:
+            candidate = para
+        if len(candidate.split()) <= max_words:
+            buffer = candidate
+        else:
+            if buffer:
+                merged.append(buffer)
+            buffer = para
+    if buffer:
+        merged.append(buffer)
+
+    # Split oversized chunks with sliding window
+    chunks: list[str] = []
+    overlap_words = 30
+    for chunk in merged:
+        words = chunk.split()
+        if len(words) <= max_words:
+            chunks.append(chunk)
+        else:
+            start = 0
+            while start < len(words):
+                end = min(start + max_words, len(words))
+                chunks.append(" ".join(words[start:end]))
+                if end >= len(words):
+                    break
+                start += max_words - overlap_words
+
+    # Filter fragments that are too small
+    return [c for c in chunks if len(c.split()) >= min_words]
 
 
 class VirtualContextEngine:
@@ -78,6 +135,7 @@ class VirtualContextEngine:
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
         self._init_store()
+        self._init_cost_tracker()
         self._init_canonicalizer()
         self._init_tag_generator()
         self._init_monitor()
@@ -86,7 +144,6 @@ class VirtualContextEngine:
         self._init_retriever()
         self._init_compactor()
         self._init_tag_splitter()
-        self._init_cost_tracker()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
         self._embed_fn = _EMBED_NOT_LOADED  # lazy-loaded for context bleed gate
         self._split_processed_tags: set[str] = set()
@@ -96,6 +153,10 @@ class VirtualContextEngine:
 
         # Restore persisted state if available
         self._load_persisted_state()
+        # Re-sync segmenter's index reference — _load_persisted_state replaces
+        # self._turn_tag_index with a new object, but the segmenter was initialized
+        # with the old (empty) one.
+        self._segmenter._turn_tag_index = self._turn_tag_index
         self._bootstrap_vocabulary()
 
     def _init_canonicalizer(self) -> None:
@@ -114,7 +175,9 @@ class VirtualContextEngine:
             llm_provider = self._build_provider(provider_name, provider_config)
 
         self._tag_generator: TagGenerator = build_tag_generator(
-            self.config.tag_generator, llm_provider, canonicalizer=self._canonicalizer
+            self.config.tag_generator, llm_provider,
+            canonicalizer=self._canonicalizer, cost_tracker=self._cost_tracker,
+            embed_fn_factory=self._get_embed_fn,
         )
 
     def _init_store(self) -> None:
@@ -189,6 +252,7 @@ class VirtualContextEngine:
                 token_counter=self._token_counter,
                 model_name=self.config.summarization.model,
                 tag_rules=self.config.tag_rules,
+                cost_tracker=self._cost_tracker,
             )
 
     def _init_tag_splitter(self) -> None:
@@ -204,6 +268,56 @@ class VirtualContextEngine:
 
     def _init_cost_tracker(self) -> None:
         self._cost_tracker = CostTracker(config=self.config.cost_tracking)
+
+    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch → DB after each batch
+
+    def _compact_and_store(
+        self, segments: list, compact_messages_len: int,
+    ) -> list[CompactionResult]:
+        """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
+        batch immediately so results are visible in the DB incrementally."""
+        all_results: list[CompactionResult] = []
+        batch_size = self._COMPACT_BATCH_SIZE
+
+        for start in range(0, len(segments), batch_size):
+            batch = segments[start:start + batch_size]
+            batch_num = start // batch_size + 1
+            total_batches = (len(segments) + batch_size - 1) // batch_size
+            logger.info(
+                "Compacting batch %d/%d (%d segments)...",
+                batch_num, total_batches, len(batch),
+            )
+            results = self._compactor.compact(batch)
+            # Store each result to DB right away
+            for i, result in enumerate(results):
+                stored = StoredSegment(
+                    ref=result.segment_id,
+                    session_id=self.config.session_id,
+                    primary_tag=result.primary_tag,
+                    tags=result.tags,
+                    summary=result.summary,
+                    summary_tokens=result.summary_tokens,
+                    full_text=result.full_text,
+                    full_tokens=result.original_tokens,
+                    messages=result.messages,
+                    metadata=result.metadata,
+                    compaction_model=self._compactor.model_name,
+                    compression_ratio=result.compression_ratio,
+                    start_timestamp=result.timestamp,
+                    end_timestamp=result.timestamp,
+                )
+                self._store.store_segment(stored)
+                self._embed_and_store_chunks(stored)
+                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
+                logger.info(
+                    "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
+                    start + i + 1, len(segments), result.primary_tag,
+                    session_date or 'none',
+                    result.original_tokens, result.summary_tokens,
+                )
+            all_results.extend(results)
+
+        return all_results
 
     def _load_persisted_state(self) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available."""
@@ -327,10 +441,16 @@ class VirtualContextEngine:
 
         # Build context for inbound tagger
         n_context = self.config.tag_generator.context_lookback_pairs
-        # For inbound, the current message is not yet in history — no need to exclude
-        context = self._get_recent_context(
-            conversation_history, n_context, exclude_last=0,
-        )
+        # Post-compaction: skip context_turns — recent conversation topic would
+        # bias the tagger against retrieving historical (compacted) topics.
+        # Tag purely on question text + store vocabulary instead.
+        if self._compacted_through > 0:
+            context = None
+        else:
+            # For inbound, the current message is not yet in history — no need to exclude
+            context = self._get_recent_context(
+                conversation_history, n_context, exclude_last=0,
+            )
 
         # Retrieve relevant tag summaries
         retrieval_result = self._retriever.retrieve(
@@ -391,7 +511,8 @@ class VirtualContextEngine:
         )
 
         # Retry with expanded context if only _general was produced
-        if message_tags == ["_general"]:
+        # Skip post-compaction: context_turns would just pollute (BUG-018)
+        if message_tags == ["_general"] and self._compacted_through == 0:
             expanded = self._get_recent_context(
                 conversation_history, n_context * 2, exclude_last=0,
             )
@@ -400,7 +521,7 @@ class VirtualContextEngine:
                     message=message,
                     current_active_tags=active_tags,
                     current_utilization=utilization,
-                    post_compaction=(self._compacted_through > 0),
+                    post_compaction=False,
                     context_turns=expanded,
                 )
                 retry_tags = retry_result.retrieval_metadata.get(
@@ -532,33 +653,17 @@ class VirtualContextEngine:
         if not compact_messages:
             return None
 
-        # Segment and compact (turn_offset maps pair indices to global turn numbers)
+        # Segment and compact in batches (results stored to DB incrementally)
         turn_offset = self._compacted_through // 2
         segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
-        results = self._compactor.compact(segments)
+        logger.info(
+            "Segmented %d messages into %d segments (watermark=%d)",
+            len(compact_messages), len(segments), self._compacted_through,
+        )
+        results = self._compact_and_store(segments, len(compact_messages))
 
         # Advance watermark past compacted messages
         self._compacted_through += len(compact_messages)
-
-        # Store compacted segments and track tags
-        for result in results:
-            stored = StoredSegment(
-                ref=result.segment_id,
-                session_id=self.config.session_id,
-                primary_tag=result.primary_tag,
-                tags=result.tags,
-                summary=result.summary,
-                summary_tokens=result.summary_tokens,
-                full_text=result.full_text,
-                full_tokens=result.original_tokens,
-                messages=result.messages,
-                metadata=result.metadata,
-                compaction_model=self._compactor.model_name,
-                compression_ratio=result.compression_ratio,
-                start_timestamp=result.timestamp,
-                end_timestamp=result.timestamp,
-            )
-            self._store.store_segment(stored)
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
@@ -947,11 +1052,14 @@ class VirtualContextEngine:
                 f' available="{budget - used}">\n'
                 f"RULE: These are compressed topic summaries, not the full conversation.\n"
                 f"- For specific facts (names, numbers, dosages, decisions): "
-                f"use vc_find_quote first — it searches the raw text across all topics.\n"
-                f"- For deeper understanding of a topic you can see below: "
-                f"use vc_expand_topic to load the full detail.\n"
+                f"use vc_find_quote — it searches raw text across all topics.\n"
+                f"- For broad questions (summarize, put together, plan, walk me through, itinerary): "
+                f"use vc_expand_topic to load full conversation detail before answering.\n"
+                f"- For deeper understanding of a topic: "
+                f"use vc_expand_topic to load the full conversation text.\n"
                 f"- To free budget after expanding: use vc_collapse_topic.\n"
-                f"- Never claim you don't remember without searching first.\n\n"
+                f"- Never claim you don't remember without searching first.\n"
+                f"- Never give a vague answer when you could expand a topic for specifics.\n\n"
                 f"{body}\n\n"
                 f"Tools: find_quote(query) | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
                 f"</context-topics>"
@@ -1008,11 +1116,14 @@ class VirtualContextEngine:
                 "<context-topics>\n"
                 "RULE: These are compressed topic summaries, not the full conversation.\n"
                 "- For specific facts (names, numbers, dosages, decisions): "
-                "use vc_find_quote first — it searches the raw text across all topics.\n"
-                "- For deeper understanding of a topic you can see below: "
-                "use vc_expand_topic to load the full detail.\n"
+                "use vc_find_quote — it searches raw text across all topics.\n"
+                "- For broad questions (summarize, put together, plan, walk me through, itinerary): "
+                "use vc_expand_topic to load full conversation detail before answering.\n"
+                "- For deeper understanding of a topic: "
+                "use vc_expand_topic to load the full conversation text.\n"
                 "- To free budget after expanding: use vc_collapse_topic.\n"
-                "- Never claim you don't remember without searching first.\n\n"
+                "- Never claim you don't remember without searching first.\n"
+                "- Never give a vague answer when you could expand a topic for specifics.\n\n"
                 f"{body}\n"
                 "</context-topics>"
             )
@@ -1092,13 +1203,32 @@ class VirtualContextEngine:
         """
         if self._embed_fn is _EMBED_NOT_LOADED:
             try:
+                import os
+                import sys
+
                 from sentence_transformers import SentenceTransformer
 
                 model_name = self.config.retriever.embedding_model
-                model = SentenceTransformer(model_name)
+
+                # Suppress progress bar output during model loading.
+                # When running in subprocess environments (e.g. benchmark Task
+                # agents), stderr may be a pipe that can break — causing
+                # BrokenPipeError that propagates out of model loading.
+                old_stderr = sys.stderr
+                try:
+                    sys.stderr = open(os.devnull, "w")
+                    model = SentenceTransformer(model_name)
+                finally:
+                    try:
+                        sys.stderr.close()
+                    except Exception:
+                        pass
+                    sys.stderr = old_stderr
 
                 def embed(texts: list[str]) -> list[list[float]]:
-                    return model.encode(texts, convert_to_numpy=True).tolist()
+                    return model.encode(
+                        texts, convert_to_numpy=True, show_progress_bar=False,
+                    ).tolist()
 
                 self._embed_fn = embed
             except ImportError:
@@ -1106,7 +1236,126 @@ class VirtualContextEngine:
                     "sentence-transformers not installed, context bleed gate disabled"
                 )
                 self._embed_fn = None
+            except Exception:
+                logger.debug(
+                    "Failed to load embedding model, semantic search disabled",
+                    exc_info=True,
+                )
+                self._embed_fn = None
         return self._embed_fn
+
+    def _embed_and_store_chunks(self, stored: "StoredSegment") -> None:
+        """Chunk a segment's full_text, embed, and store vectors."""
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return
+        chunks = _chunk_segment_text(stored.full_text)
+        if not chunks:
+            return
+        try:
+            vectors = embed_fn(chunks)
+        except Exception:
+            logger.debug("Failed to embed chunks for %s", stored.ref)
+            return
+        chunk_embeddings = [
+            ChunkEmbedding(
+                segment_ref=stored.ref,
+                chunk_index=i,
+                text=text,
+                embedding=vec,
+            )
+            for i, (text, vec) in enumerate(zip(chunks, vectors))
+        ]
+        self._store.store_chunk_embeddings(stored.ref, chunk_embeddings)
+        logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
+
+    def _semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
+        """Embedding-based semantic search over stored chunk vectors."""
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return []
+
+        all_chunks = self._store.get_all_chunk_embeddings()
+        if not all_chunks:
+            # Lazy backfill: embed all existing segments if chunks table is empty
+            all_chunks = self._backfill_chunk_embeddings()
+            if not all_chunks:
+                return []
+
+        try:
+            query_vec = embed_fn([query])[0]
+        except Exception:
+            logger.debug("Failed to embed query for semantic search")
+            return []
+
+        # Score all chunks
+        scored: list[tuple[float, ChunkEmbedding]] = []
+        for chunk in all_chunks:
+            sim = _cosine_sim(query_vec, chunk.embedding)
+            if sim >= 0.25:
+                scored.append((sim, chunk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Deduplicate by segment_ref (best chunk per segment)
+        seen_refs: set[str] = set()
+        results: list[QuoteResult] = []
+        for sim, chunk in scored:
+            if chunk.segment_ref in seen_refs:
+                continue
+            seen_refs.add(chunk.segment_ref)
+            # Look up segment tags and metadata
+            seg = self._store.get_segment(chunk.segment_ref)
+            results.append(QuoteResult(
+                text=chunk.text,
+                tag=seg.primary_tag if seg else "",
+                segment_ref=chunk.segment_ref,
+                tags=seg.tags if seg else [],
+                match_type="semantic",
+                similarity=round(sim, 3),
+                session_date=seg.metadata.session_date if seg else "",
+            ))
+            if len(results) >= max_results:
+                break
+
+        return results
+
+    def _backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
+        """One-time backfill: embed all existing segments' full_text."""
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return []
+
+        all_tags = self._store.get_all_tags()
+        if not all_tags:
+            return []
+
+        logger.info("Backfilling chunk embeddings for semantic search...")
+        all_chunks: list[ChunkEmbedding] = []
+        for tag_stat in all_tags:
+            segments = self._store.get_segments_by_tags([tag_stat.tag], limit=100)
+            for seg in segments:
+                chunks = _chunk_segment_text(seg.full_text)
+                if not chunks:
+                    continue
+                try:
+                    vectors = embed_fn(chunks)
+                except Exception:
+                    continue
+                chunk_embeddings = [
+                    ChunkEmbedding(
+                        segment_ref=seg.ref,
+                        chunk_index=i,
+                        text=text,
+                        embedding=vec,
+                    )
+                    for i, (text, vec) in enumerate(zip(chunks, vectors))
+                ]
+                self._store.store_chunk_embeddings(seg.ref, chunk_embeddings)
+                all_chunks.extend(chunk_embeddings)
+
+        logger.info("Backfilled %d chunk embeddings", len(all_chunks))
+        return all_chunks
 
     def _context_is_relevant(
         self, current_text: str, context_pairs: list[str],
@@ -1221,33 +1470,21 @@ class VirtualContextEngine:
         if not compact_messages:
             return None
 
-        # Segment and compact (turn_offset maps pair indices to global turn numbers)
+        # Segment and compact in batches (results stored to DB incrementally)
         turn_offset = self._compacted_through // 2
+        logger.info(
+            "compact_manual: about to segment %d messages (watermark=%d, turn_offset=%d)",
+            len(compact_messages), self._compacted_through, turn_offset,
+        )
         segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
-        results = self._compactor.compact(segments)
+        logger.info(
+            "compact_manual: segmented into %d segments",
+            len(segments),
+        )
+        results = self._compact_and_store(segments, len(compact_messages))
 
         # Advance watermark past compacted messages
         self._compacted_through += len(compact_messages)
-
-        # Store compacted segments
-        for result in results:
-            stored = StoredSegment(
-                ref=result.segment_id,
-                session_id=self.config.session_id,
-                primary_tag=result.primary_tag,
-                tags=result.tags,
-                summary=result.summary,
-                summary_tokens=result.summary_tokens,
-                full_text=result.full_text,
-                full_tokens=result.original_tokens,
-                messages=result.messages,
-                metadata=result.metadata,
-                compaction_model=self._compactor.model_name,
-                compression_ratio=result.compression_ratio,
-                start_timestamp=result.timestamp,
-                end_timestamp=result.timestamp,
-            )
-            self._store.store_segment(stored)
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
@@ -1340,6 +1577,7 @@ class VirtualContextEngine:
         store_tags = [ts.tag for ts in self._store.get_all_tags()]
         ingested = 0
         n_context = self.config.tag_generator.context_lookback_pairs
+        running_session_date = ""
 
         for i in range(0, len(history_pairs) - 1, 2):
             user_msg = history_pairs[i]
@@ -1349,6 +1587,13 @@ class VirtualContextEngine:
             if not user_msg.content.strip() and not asst_msg.content.strip():
                 logger.debug("Skipping empty turn at pair index %d", i // 2)
                 continue
+
+            # Track running session date from [Session from ...] headers
+            m = _SESSION_HEADER_RE.search(user_msg.content)
+            if m:
+                running_session_date = m.group(1)
+            elif not running_session_date and user_msg.timestamp:
+                running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
 
@@ -1410,6 +1655,7 @@ class VirtualContextEngine:
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
+                session_date=running_session_date,
             )
             self._turn_tag_index.append(entry)
             ingested += 1
@@ -1422,6 +1668,12 @@ class VirtualContextEngine:
             if ingested % 10 == 0:
                 store_tags = [ts.tag for ts in self._store.get_all_tags()]
 
+            # Periodic state save so session_date + tags are queryable during ingestion
+            if ingested % 20 == 0:
+                self._save_state(history_pairs)
+
+        # Final save after all turns ingested
+        self._save_state(history_pairs)
         logger.info("Ingested %d historical turns into TurnTagIndex", ingested)
         return ingested
 
@@ -1653,6 +1905,90 @@ class VirtualContextEngine:
 
         return evicted, freed
 
+    # ------------------------------------------------------------------
+    # Description-aware search supplement for find_quote
+    # ------------------------------------------------------------------
+
+    def _supplement_from_descriptions(
+        self,
+        query: str,
+        results: list[QuoteResult],
+        max_results: int,
+    ) -> list[QuoteResult]:
+        """Add results from tags whose descriptions match query terms.
+
+        Scans all tag descriptions for query words.  For tags that match
+        but aren't already represented in *results*, fetches their
+        segments and searches full_text for the best excerpt.  This
+        bridges the vocabulary gap: the compacted description may use
+        words that don't appear in FTS or embedding results.
+        """
+        import re
+        from virtual_context.storage.sqlite import _extract_excerpt
+
+        # Tags already covered by existing results
+        covered_tags: set[str] = set()
+        for qr in results:
+            covered_tags.add(qr.tag)
+
+        # Tokenize query into meaningful words (3+ chars)
+        query_words = [
+            w.lower()
+            for w in re.findall(r"[a-zA-Z']+", query)
+            if len(w) >= 3
+        ]
+        if not query_words:
+            return results
+
+        # Score each tag description by how many query words it contains
+        all_summaries = self._store.get_all_tag_summaries()
+        candidates: list[tuple[str, int, str]] = []  # (tag, score, description)
+        for ts in all_summaries:
+            if ts.tag in covered_tags:
+                continue
+            desc_lower = ts.description.lower() if ts.description else ""
+            if not desc_lower:
+                continue
+            score = sum(1 for w in query_words if w in desc_lower)
+            if score > 0:
+                candidates.append((ts.tag, score, ts.description))
+
+        # Sort by score descending, take top candidates
+        candidates.sort(key=lambda x: -x[1])
+        slots = max_results - len(results)
+        if slots <= 0:
+            return results
+
+        for tag, _score, _desc in candidates[:slots]:
+            # Fetch segments for this tag and search their full_text
+            segments = self._store.get_segments_by_tags([tag], limit=5)
+            best: QuoteResult | None = None
+            best_score = 0
+            for seg in segments:
+                if not seg.full_text:
+                    continue
+                text_lower = seg.full_text.lower()
+                seg_score = sum(1 for w in query_words if w in text_lower)
+                if seg_score > best_score:
+                    best_score = seg_score
+                    excerpt = _extract_excerpt(
+                        seg.full_text, query, context_chars=200
+                    )
+                    meta = seg.metadata or SegmentMetadata(turn_count=0)
+                    best = QuoteResult(
+                        text=excerpt,
+                        tag=seg.primary_tag,
+                        segment_ref=seg.ref,
+                        tags=seg.tags,
+                        match_type="description",
+                        session_date=meta.session_date,
+                    )
+            if best is not None:
+                results.append(best)
+                covered_tags.add(tag)
+
+        return results
+
     def find_quote(
         self,
         query: str,
@@ -1661,13 +1997,29 @@ class VirtualContextEngine:
         """Search stored conversation text for a specific phrase or keyword.
 
         Searches across all segments' full_text regardless of tags.
-        Returns matching excerpts with context.  Works even when paging
-        is disabled — this is a pure search tool with no working-set side effects.
+        Returns FTS matches supplemented by semantic (embedding) search
+        to surface excerpts that use different vocabulary.  Works even when
+        paging is disabled — this is a pure search tool with no working-set
+        side effects.
         """
         if not query.strip():
             return {"error": "empty query"}
 
         results = self._store.search_full_text(query, limit=max_results)
+
+        # Always run semantic search to supplement FTS — surfaces chunks
+        # that match semantically but use different words, and may return
+        # different excerpts from the same segment FTS already found.
+        remaining = max_results - len(results)
+        if remaining > 0:
+            semantic = self._semantic_search(query, max_results=remaining)
+            results.extend(semantic)
+
+        # ---- Description-aware search ----
+        # Scan tag descriptions for query terms.  Tags whose descriptions
+        # match but aren't already represented in results get a
+        # supplementary search on their segments' full_text.
+        results = self._supplement_from_descriptions(query, results, max_results)
 
         if not results:
             return {
@@ -1677,20 +2029,210 @@ class VirtualContextEngine:
                 "message": f"No matches for '{query}' in stored conversation history.",
             }
 
-        formatted = []
+        # ---- Merge snippets from the same session ----
+        # Group results by session_date so the reader sees one coherent
+        # block per session instead of fragmented independent snippets.
+        from collections import OrderedDict
+
+        session_groups: OrderedDict[str, list[QuoteResult]] = OrderedDict()
+        no_session: list[QuoteResult] = []
         for qr in results:
-            formatted.append({
+            key = qr.session_date.strip() if qr.session_date else ""
+            if key:
+                session_groups.setdefault(key, []).append(qr)
+            else:
+                no_session.append(qr)
+
+        formatted = []
+
+        for session_date, group in session_groups.items():
+            if len(group) == 1:
+                # Single hit for this session — emit as-is
+                qr = group[0]
+                entry: dict = {
+                    "excerpt": qr.text,
+                    "topic": qr.tag,
+                    "segment_ref": qr.segment_ref,
+                    "session": session_date,
+                }
+                if qr.match_type == "semantic":
+                    entry["match_type"] = "semantic"
+                    entry["similarity"] = qr.similarity
+                formatted.append(entry)
+            else:
+                # Multiple hits from the same session — merge excerpts
+                # Collect unique excerpts (deduplicate exact matches)
+                seen_texts: set[str] = set()
+                merged_parts: list[str] = []
+                all_refs: list[str] = []
+                topics: list[str] = []
+                for qr in group:
+                    norm = qr.text.strip()
+                    if norm not in seen_texts:
+                        seen_texts.add(norm)
+                        merged_parts.append(qr.text.strip())
+                    if qr.tag not in topics:
+                        topics.append(qr.tag)
+                    if qr.segment_ref not in all_refs:
+                        all_refs.append(qr.segment_ref)
+
+                entry = {
+                    "excerpt": "\n---\n".join(merged_parts),
+                    "topic": ", ".join(topics),
+                    "segment_refs": all_refs,
+                    "session": session_date,
+                    "merged_count": len(merged_parts),
+                }
+                formatted.append(entry)
+
+        # Append results with no session date individually
+        for qr in no_session:
+            entry = {
                 "excerpt": qr.text,
                 "topic": qr.tag,
-                "tags": qr.tags,
                 "segment_ref": qr.segment_ref,
-            })
+            }
+            if qr.match_type == "semantic":
+                entry["match_type"] = "semantic"
+                entry["similarity"] = qr.similarity
+            formatted.append(entry)
 
         return {
             "query": query,
             "found": True,
             "results": formatted,
         }
+
+    # ------------------------------------------------------------------
+    # query_with_tools: sync tool loop for non-proxy callers
+    # ------------------------------------------------------------------
+
+    def query_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str = "claude-sonnet-4-5-20250929",
+        system: str = "",
+        max_tokens: int = 4096,
+        api_key: str = "",
+        api_url: str = "",
+        temperature: float = 0.0,
+        tools: list[dict] | None = None,
+        force_tools: bool = False,
+        max_loops: int = 5,
+        provider: str = "anthropic",
+    ) -> "ToolLoopResult":
+        """Send a query to an LLM with VC tool support.
+
+        Builds a provider-specific request, optionally injects VC paging
+        tools, sends a non-streaming POST, and runs a synchronous tool
+        loop if the model invokes any VC tools.
+
+        Supports Anthropic, OpenAI, and Gemini providers via the adapter
+        pattern.
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Messages in ``[{"role": "user", "content": "..."}]`` format.
+        model : str
+            Model ID (e.g. ``"claude-sonnet-4-5-20250929"``, ``"gpt-4o"``).
+        system : str
+            System prompt.
+        max_tokens : int
+            Maximum tokens for the response.
+        api_key : str
+            API key for the provider.
+        api_url : str
+            Override for the API endpoint URL (default per provider).
+        temperature : float
+            Sampling temperature.
+        tools : list[dict] | None
+            Additional (non-VC) tool definitions to include (Anthropic format).
+        force_tools : bool
+            If True, inject VC tools even when the normal gate (paging
+            enabled + compaction occurred) is not met.
+        max_loops : int
+            Maximum continuation rounds for the tool loop.
+        provider : str
+            LLM provider: ``"anthropic"``, ``"openai"``, or ``"gemini"``.
+
+        Returns
+        -------
+        ToolLoopResult
+            Final text, tool call records, and usage metrics.
+        """
+        import httpx
+
+        from .core.tool_loop import (
+            get_adapter,
+            run_tool_loop,
+            vc_tool_definitions,
+        )
+
+        adapter = get_adapter(provider, api_key, api_url)
+
+        # Decide whether to inject VC tools
+        inject_vc = force_tools or (
+            self.config.paging.enabled and self._compacted_through > 0
+        )
+        all_tools: list[dict] = []
+        if inject_vc:
+            all_tools.extend(vc_tool_definitions())
+        if tools:
+            all_tools.extend(tools)
+
+        # Convert tool definitions to provider format
+        converted_tools = adapter.convert_tool_defs(all_tools) if all_tools else None
+
+        # Build provider-specific request body
+        body = adapter.build_request_body(
+            model=model,
+            messages=messages,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=converted_tools,
+        )
+
+        url = adapter.get_url(model)
+        headers = adapter.get_headers()
+
+        with httpx.Client(timeout=300.0) as client:
+            resp = client.post(url, headers=headers, json=body)
+
+        if resp.status_code >= 300:
+            raise RuntimeError(
+                f"{provider} API error {resp.status_code}: {resp.text[:500]}"
+            )
+
+        data = resp.json()
+
+        # Check for VC tool calls
+        tool_calls = adapter.extract_tool_calls(data)
+        has_vc_tools = any(
+            tc["name"].startswith("vc_") for tc in tool_calls
+        )
+
+        if has_vc_tools:
+            loop_result = run_tool_loop(
+                self, data, body, adapter,
+                url=url, max_loops=max_loops,
+            )
+            # Prepend the initial request to raw_requests
+            loop_result.raw_requests.insert(0, body)
+            return loop_result
+
+        # No tool calls — return text directly
+        result = ToolLoopResult()
+        result.raw_requests.append(body)
+        result.raw_responses.append(data)
+        input_toks, output_toks = adapter.extract_usage(data)
+        result.input_tokens = input_toks
+        result.output_tokens = output_toks
+        result.stop_reason = adapter.get_stop_reason(data)
+        result.text = adapter.extract_text(data)
+        return result
 
     def get_cost_report(self) -> SessionCostSummary:
         """Return current session cost summary."""
