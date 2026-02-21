@@ -18,6 +18,7 @@ from ..types import (
     TagPromptRule,
     TagSummary,
 )
+from .cost_tracker import CostTracker
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +26,26 @@ TAG_SUMMARY_ROLLUP_PROMPT = """\
 You are summarizing all stored context about the tag "{tag}".
 Below are {count} segment summaries that each cover a portion of conversation
 where "{tag}" was discussed. Roll them up into a single coherent summary that
-preserves all key decisions, action items, entities, names, dates, and numbers.
+preserves all key decisions, action items, entities, and names.
 Keep the chronological progression. The summary should be comprehensive enough
 that someone could resume the conversation from it.
 
-Also provide a "description": a single line (max 20 words) capturing who is
-involved, what is being discussed, and the most distinctive detail. This will
-be shown as a topic label in a compact topic list.
+CRITICAL — Any text involving numbers is mandatory and absolutely essential to the summary, always include them exactly as in the source.
+Dates, prices, any number is important and should not be modified.
+Never round, approximate, or paraphrase a number.
+
+Also provide a "description": a concise paragraph (max 80 words) capturing who is
+involved, what is being discussed, key facts, and distinctive details. This will
+be shown as a topic label in a compact topic list — it is the reader's primary
+way to decide which topics are relevant, so include enough detail to be useful.
+Any text involving numbers is mandatory and absolutely essential to the description.
+Dates, prices, any number is important and should not be modified.
+Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 hours", not
+"about an hour"; "$45" must stay "$45", not "around $50").
+Always preserve the user's role and relationship to the topic — phrases like
+"I led", "my project", "solo project", "I built", "I'm responsible for" are
+critical personal context. Never paraphrase these into passive voice or drop them
+in favor of technical details.
 
 Target length: {target_tokens} tokens or fewer.
 
@@ -41,7 +55,7 @@ Segment summaries:
 Respond with JSON:
 {{
   "summary": "...",
-  "description": "1-line topic label, max 20 words",
+  "description": "concise topic paragraph, max 80 words",
   "entities": ["..."],
   "key_decisions": ["..."],
   "action_items": ["..."]
@@ -50,9 +64,25 @@ Respond with JSON:
 
 DEFAULT_SUMMARY_PROMPT = """\
 Summarize the following conversation segment (tags: {tags}).
-Preserve: key decisions, action items, entities mentioned, specific data points (numbers, dates, names),
+Preserve: key decisions, action items, entities mentioned, specific data points,
 and specific feature/concept names exactly as discussed (e.g. "cook mode", "dark theme", "rate limiter" —
 do NOT generalize these into broader categories like "UI features" or "infrastructure").
+
+CRITICAL — Any text involving numbers is mandatory and absolutely essential to the summary, always include them exactly as in the conversation.
+Dates, prices, any number is important and should not be modified.
+Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 hours", not
+"about an hour"; "$45" must stay "$45", not "around $50").
+
+When the user states what they are doing, have done, or where they keep/store something,
+preserve that as a direct assertion, not as a plan or intention.
+For example, "I'm storing my sneakers in a shoe rack" should be summarized as
+"User stores/is storing sneakers in shoe rack", NOT "User plans to store sneakers in shoe rack."
+
+Always preserve the user's role and relationship to the topic — phrases like
+"I led", "my project", "solo project", "I built", "I'm responsible for" are
+critical personal context. Never paraphrase these into passive voice or drop them
+in favor of technical details.
+
 Be concise but retain enough detail that the conversation could be resumed from this summary.
 The summary should be {target_tokens} tokens or fewer.
 
@@ -85,12 +115,14 @@ class DomainCompactor:
         token_counter: Callable[[str], int] | None = None,
         model_name: str = "",
         tag_rules: list[TagPromptRule] | None = None,
+        cost_tracker: CostTracker | None = None,
     ) -> None:
         self.llm = llm_provider
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self.model_name = model_name
         self.tag_rules = tag_rules or []
+        self._cost_tracker = cost_tracker
 
     def compact(self, segments: list[TaggedSegment]) -> list[CompactionResult]:
         """Summarize each segment independently.
@@ -98,6 +130,10 @@ class DomainCompactor:
         Uses ThreadPoolExecutor for concurrent summarization when there are
         multiple segments. Falls back to sequential for single segments.
         """
+        logger.info(
+            "Compacting %d segments (%d workers)...",
+            len(segments), min(self.config.max_concurrent_summaries, len(segments)),
+        )
         if len(segments) <= 1:
             # Sequential for single segment — no threading overhead
             return [self._compact_one(s) for s in segments]
@@ -107,6 +143,7 @@ class DomainCompactor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results: list[CompactionResult] = [None] * len(segments)  # type: ignore[list-item]
+        done_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(self._compact_one, segment): i
@@ -114,8 +151,16 @@ class DomainCompactor:
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
+                done_count += 1
                 try:
                     results[idx] = future.result()
+                    logger.info(
+                        "  Segment %d/%d done (%s, %dt → %dt)",
+                        done_count, len(segments),
+                        results[idx].primary_tag,
+                        results[idx].original_tokens,
+                        results[idx].summary_tokens,
+                    )
                 except Exception as e:
                     logger.error(f"Concurrent compaction failed for segment {idx}: {e}")
                     # Create a fallback result
@@ -178,6 +223,7 @@ class DomainCompactor:
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
+            self._log_usage("compaction")
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
@@ -211,6 +257,7 @@ class DomainCompactor:
             date_references=parsed.get("date_references", []),
             turn_count=segment.turn_count,
             time_span=(segment.start_timestamp, segment.end_timestamp),
+            session_date=segment.session_date,
         )
 
         messages_dicts = [
@@ -257,6 +304,22 @@ class DomainCompactor:
                 if fnmatch.fnmatch(tag, rule.match) and rule.summary_prompt:
                     return rule.summary_prompt
         return None
+
+    def _log_usage(self, event_type: str) -> None:
+        """Log LLM token usage from the provider's last_usage to the cost tracker."""
+        if not self._cost_tracker:
+            return
+        usage = getattr(self.llm, "last_usage", {})
+        if not usage:
+            return
+        input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        if input_tokens or output_tokens:
+            self._cost_tracker.log_compaction(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                provider=self.model_name,
+            )
 
     def _format_conversation(self, messages: list[Message]) -> str:
         """Format messages as 'Role (HH:MM): content' blocks."""
@@ -333,6 +396,8 @@ class DomainCompactor:
         if not tags_to_build:
             return []
 
+        logger.info("Building tag summaries for %d tags: %s", len(tags_to_build), tags_to_build[:10])
+
         if len(tags_to_build) <= 1:
             return [
                 self._build_one_tag_summary(
@@ -360,10 +425,17 @@ class DomainCompactor:
                 ): i
                 for i, tag in enumerate(tags_to_build)
             }
+            done_count = 0
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
+                done_count += 1
                 try:
                     results[idx] = future.result()
+                    logger.info(
+                        "  Tag summary %d/%d done (%s, %dt)",
+                        done_count, len(tags_to_build),
+                        tags_to_build[idx], results[idx].summary_tokens,
+                    )
                 except Exception as e:
                     tag = tags_to_build[idx]
                     logger.error(f"Tag summary build failed for '{tag}': {e}")
@@ -416,6 +488,7 @@ class DomainCompactor:
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
+            self._log_usage("compaction")
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM tag summary rollup failed for '{tag}': {e}")

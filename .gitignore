@@ -31,5 +31,18 @@ prompts-coding-agent.json
 # Config files with API keys
 virtual-context-openrouter.yaml
 
+# Benchmark data & results
+benchmarks/longmemeval/data/
+longmemeval_results_*.json
+
+# Temporary scratch/experiment files
+full_payload.json
+old_tags.json
+new_tags.json
+prev_tags.json
+longmemeval_q2_test.json
+retag_experiment.py
+*.bak
+
 # OS
 .DS_Store

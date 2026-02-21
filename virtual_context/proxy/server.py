@@ -27,6 +27,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..engine import VirtualContextEngine
+from ..core.tool_loop import (
+    VC_TOOL_NAMES,
+    vc_tool_definitions,
+    is_vc_tool,
+    execute_vc_tool,
+)
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import Message, SplitResult
 
@@ -1970,132 +1976,8 @@ def _dump_session_state(
 # ---------------------------------------------------------------------------
 # Paging tool interception helpers (Phase 6)
 # ---------------------------------------------------------------------------
-
-_VC_TOOL_NAMES = frozenset({"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"})
-
-
-def _vc_tool_definitions() -> list[dict]:
-    """Return Anthropic tool definitions for VC context tools."""
-    return [
-        {
-            "name": "vc_expand_topic",
-            "description": (
-                "Zoom into a topic you can already see in the context-topics list. "
-                "Use when a topic summary mentions the area you need but lacks "
-                "detail — e.g. it says 'discussed supplements' but you need the "
-                "specific dosage. Requires knowing which tag to expand. "
-                "For specific facts when you don't know which topic holds them, "
-                "use vc_find_quote instead."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "tag": {
-                        "type": "string",
-                        "description": "Topic tag from the context-topics list to expand.",
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["segments", "full"],
-                        "description": (
-                            "Target depth: 'segments' for individual summaries, "
-                            "'full' for original conversation text."
-                        ),
-                    },
-                },
-                "required": ["tag"],
-            },
-        },
-        {
-            "name": "vc_collapse_topic",
-            "description": (
-                "Collapse an expanded topic back to its summary to free context "
-                "budget. Use after you've retrieved what you need from an expanded "
-                "topic, or to make room before expanding a different one."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "tag": {
-                        "type": "string",
-                        "description": "Topic tag to collapse.",
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["summary", "none"],
-                        "description": (
-                            "Target depth: 'summary' for brief overview, "
-                            "'none' to remove from context entirely."
-                        ),
-                    },
-                },
-                "required": ["tag"],
-            },
-        },
-        {
-            "name": "vc_find_quote",
-            "description": (
-                "Search the full original conversation text for a specific word, "
-                "phrase, or detail. Use this as your first tool when the user asks "
-                "about a specific fact — a name, number, dosage, recommendation, "
-                "date, or decision — especially when no topic summary mentions it "
-                "or you don't know which topic it falls under. This bypasses tags "
-                "entirely and searches raw text, so it finds content even when "
-                "it's filed under an unexpected topic."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "The word or phrase to search for. Use the most specific and "
-                            "distinctive terms — e.g. 'magnesium glycinate' rather than "
-                            "'supplement', or 'reservation 7pm' rather than 'dinner'."
-                        ),
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum results to return (default 5).",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    ]
-
-
-def _is_vc_tool(name: str) -> bool:
-    """Return True if *name* is a known VC paging tool."""
-    return name in _VC_TOOL_NAMES
-
-
-def _execute_vc_tool(
-    engine: "VirtualContextEngine", name: str, tool_input: dict,
-) -> str:
-    """Execute a VC paging tool and return a JSON result string."""
-    import json as _json
-    try:
-        if name == "vc_expand_topic":
-            result = engine.expand_topic(
-                tag=tool_input.get("tag", ""),
-                depth=tool_input.get("depth", "full"),
-            )
-        elif name == "vc_collapse_topic":
-            result = engine.collapse_topic(
-                tag=tool_input.get("tag", ""),
-                depth=tool_input.get("depth", "summary"),
-            )
-        elif name == "vc_find_quote":
-            result = engine.find_quote(
-                query=tool_input.get("query", ""),
-                max_results=tool_input.get("max_results", 5),
-            )
-        else:
-            result = {"error": f"unknown VC tool: {name}"}
-        return _json.dumps(result)
-    except Exception as e:
-        return _json.dumps({"is_error": True, "content": str(e)})
+# Tool definitions, is_vc_tool, and execute_vc_tool are imported from
+# virtual_context.core.tool_loop at the top of this module.
 
 
 def _inject_vc_tools(body: dict, engine: "VirtualContextEngine") -> dict:
@@ -2104,7 +1986,7 @@ def _inject_vc_tools(body: dict, engine: "VirtualContextEngine") -> dict:
     Delegates to the detected ``PayloadFormat`` for format-specific injection.
     """
     fmt = detect_format(body)
-    return fmt.inject_tools(body, _vc_tool_definitions())
+    return fmt.inject_tools(body, vc_tool_definitions())
 
 
 def _parse_sse_events(
@@ -2402,7 +2284,7 @@ async def _handle_streaming(
                             btype = block.get("type", "")
                             if (
                                 btype == "tool_use"
-                                and _is_vc_tool(block.get("name", ""))
+                                and is_vc_tool(block.get("name", ""))
                             ):
                                 suppressing = True
                                 current_vc_tool = {
@@ -2516,7 +2398,7 @@ async def _handle_streaming(
                     tool_results: list[dict] = []
                     for tool in vc_tools:
                         t_tool = time.monotonic()
-                        result_str = _execute_vc_tool(
+                        result_str = execute_vc_tool(
                             state.engine,
                             tool["name"],
                             tool["input"],
@@ -2615,7 +2497,7 @@ async def _handle_streaming(
                     ]
                     vc_next = [
                         b for b in tool_blocks
-                        if _is_vc_tool(b.get("name", ""))
+                        if is_vc_tool(b.get("name", ""))
                     ]
 
                     for tb in text_blocks:
@@ -2633,7 +2515,7 @@ async def _handle_streaming(
                         stop_reason == "tool_use"
                         and vc_next
                         and all(
-                            _is_vc_tool(b.get("name", ""))
+                            is_vc_tool(b.get("name", ""))
                             for b in tool_blocks
                         )
                     ):
@@ -2650,7 +2532,7 @@ async def _handle_streaming(
                     # Done — forward any non-VC tools to client
                     non_vc_in_cont = [
                         b for b in tool_blocks
-                        if not _is_vc_tool(b.get("name", ""))
+                        if not is_vc_tool(b.get("name", ""))
                     ]
                     if non_vc_in_cont:
                         for nvc in non_vc_in_cont:
@@ -2670,7 +2552,7 @@ async def _handle_streaming(
                     raw_stop = cont_data.get("stop_reason", "end_turn")
                     non_vc_forwarded = any(
                         b.get("type") == "tool_use"
-                        and not _is_vc_tool(b.get("name", ""))
+                        and not is_vc_tool(b.get("name", ""))
                         for b in cont_data.get("content", [])
                     )
                     if raw_stop == "tool_use" and non_vc_forwarded:

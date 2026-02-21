@@ -28,6 +28,7 @@ class AnthropicProvider:
         self.api_key = api_key or os.environ.get(api_key_env, "")
         self.model = model
         self.temperature = temperature
+        self.last_usage: dict = {}  # populated after each complete() call
         if not self.api_key:
             raise LLMProviderError(
                 f"No API key found. Set {api_key_env} env var or pass api_key.",
@@ -59,6 +60,7 @@ class AnthropicProvider:
 
                 if response.status_code == 200:
                     data = response.json()
+                    self.last_usage = data.get("usage", {})
                     content = data.get("content", [])
                     text_parts = [
                         block["text"]

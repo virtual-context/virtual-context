@@ -244,7 +244,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         auto_evict=paging_raw.get("auto_evict", True),
     )
 
-    return VirtualContextConfig(
+    cfg = VirtualContextConfig(
         version=raw.get("version", "0.2"),
         storage_root=storage_root,
         context_window=raw.get("context_window", 120_000),
@@ -263,6 +263,9 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         proxy=proxy_config,
         providers=raw.get("providers", {}),
     )
+    if "session_id" in raw:
+        cfg.session_id = raw["session_id"]
+    return cfg
 
 
 def validate_config(config: VirtualContextConfig) -> list[str]:

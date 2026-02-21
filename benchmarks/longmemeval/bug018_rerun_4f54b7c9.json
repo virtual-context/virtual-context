@@ -1,0 +1,87 @@
+{
+  "benchmark": "longmemeval",
+  "date": "2026-02-20",
+  "config": {
+    "context_window": 65536,
+    "baseline_model": "claude-sonnet-4-5-20250929",
+    "reader_model": "claude-sonnet-4-5-20250929",
+    "judge_model": "claude-haiku-4-5-20251001"
+  },
+  "budget_limit": 5.0,
+  "actual_cost": 0.234,
+  "questions": [
+    {
+      "question_id": "4f54b7c9",
+      "question_type": "multi-session",
+      "question": "How many antique items did I inherit or acquire from my family members?",
+      "answer": "5",
+      "haystack_tokens_est": 113745,
+      "n_sessions": 45,
+      "vc": {
+        "hypothesis": "Based on the conversation history, you inherited or acquired **5 antique items** from your family members:\n\n1. **Vintage diamond necklace** - from your grandmother\n2. **Antique music box** - from your great-aunt\n3. **Depression-era glassware** - from your mother\n4. **Antique tea set** - from your cousin Rachel\n5. **Vintage typewriter** - from your dad",
+        "input_tokens": 4053,
+        "output_tokens": 99,
+        "cost": 0.233644,
+        "tags_matched": [
+          "antique-valuation",
+          "heirloom-insurance",
+          "provenance",
+          "family-history",
+          "collection-inventory"
+        ],
+        "tokens_injected": 63508,
+        "compaction_events": 1,
+        "turns_ingested": 245,
+        "timings": {
+          "ingest_s": 457.7,
+          "compact_s": 185.8,
+          "retrieve_s": 1.5,
+          "query_s": 3.5
+        },
+        "elapsed_s": 648.5,
+        "correct": true,
+        "judge_explanation": "**Yes**\n\nThe model's response contains the correct answer. It identifies that 5 antique items were inherited or acquired from family members, which matches the correct answer of 5. The response also provides specific examples of each item and their sources, demonstrating comprehension of the question."
+      }
+    }
+  ],
+  "summary": {
+    "vc_accuracy": 1.0,
+    "vc_correct": 1,
+    "vc_total": 1,
+    "vc_per_category": {
+      "multi-session": {
+        "accuracy": 1.0,
+        "correct": 1,
+        "total": 1
+      }
+    }
+  },
+  "cost_breakdown": {
+    "budget": 5.0,
+    "spent": 0.234,
+    "remaining": 4.766,
+    "entries": [
+      {
+        "label": "vc_haiku:4f54b7c9",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 150000,
+        "output_tokens": 25000,
+        "cost_usd": 0.22
+      },
+      {
+        "label": "vc_reader:4f54b7c9",
+        "model": "claude-sonnet-4-5-20250929",
+        "input_tokens": 4053,
+        "output_tokens": 99,
+        "cost_usd": 0.013644
+      },
+      {
+        "label": "judge:vc:4f54b7c9",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 186,
+        "output_tokens": 63,
+        "cost_usd": 0.000401
+      }
+    ]
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "benchmark": "longmemeval",
+  "date": "2026-02-20",
+  "config": {
+    "context_window": 65536,
+    "baseline_model": "claude-sonnet-4-5-20250929",
+    "reader_model": "claude-sonnet-4-5-20250929",
+    "judge_model": "claude-haiku-4-5-20251001"
+  },
+  "budget_limit": 5.0,
+  "actual_cost": 0.3727,
+  "questions": [
+    {
+      "question_id": "c8090214",
+      "question_type": "temporal-reasoning",
+      "question": "How many days before I bought the iPhone 13 Pro did I attend the Holiday Market?",
+      "answer": "7 days. 8 days (including the last day) is also acceptable.",
+      "haystack_tokens_est": 116834,
+      "n_sessions": 47,
+      "baseline": {
+        "hypothesis": "I apologize, but I don't have any information about you buying an iPhone 13 Pro or attending a Holiday Market. Our conversation just started, and I don't have any prior knowledge about your personal activities or purchases.\n\nIf you'd like to share more context or information about your question, I'd be happy to try and help you figure out the answer!",
+        "input_tokens": 113208,
+        "output_tokens": 78,
+        "cost": 0.340794,
+        "elapsed_s": 6.7,
+        "correct": false,
+        "judge_explanation": "No"
+      },
+      "vc": {
+        "hypothesis": "I need to find the specific dates mentioned in the chat history to calculate the time difference.Based on the chat history:\n\n- You purchased your iPhone 13 Pro at Best Buy on **Black Friday**\n- You attended the Holiday Market at the local mall **one week before Black Friday**\n\nIn 2023, Black Friday was on November 24th. Since you attended the Holiday Market one week before Black Friday, that would have been around November 17th.\n\nTherefore, you attended the Holiday Market **7 days before** you bought the iPhone 13 Pro.",
+        "input_tokens": 9161,
+        "output_tokens": 259,
+        "haiku_input_tokens": 0,
+        "haiku_output_tokens": 0,
+        "haiku_calls": 0,
+        "cost": 0.031368,
+        "tags_matched": [
+          "holiday-market",
+          "iphone-accessories",
+          "temporal"
+        ],
+        "tokens_injected": 63687,
+        "compaction_events": -1,
+        "turns_ingested": 229,
+        "timings": {
+          "ingest_s": 0.0,
+          "compact_s": 0.0,
+          "retrieve_s": 1.3,
+          "query_s": 6.8
+        },
+        "cached": true,
+        "tool_calls": [
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "Black Friday",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"Black Friday\", \"found\": true, \"results\": [{\"excerpt\": \"...Can you show me some options for iPhone 13 Pro cases and screen protectors? By the way, I got my iPhone 13 Pro at a discounted price of $800 from Best Buy on >>>Black<<< >>>Friday<<<, which was a great deal...\", \"topic\": \"phone-case-selection\", \"tags\": [\"battery-case\", \"device-protection\", \"drop-protection\", \"impact-resistance\", \"iphone-accessories\", \"mobile-device-cases\", \"phone-case-selection\", \"phone-durability\", \"protective-accessories\", \"screen-protector\", \"tempered-glass-protection\"], \"segment_ref\": \"30cce5d9-660d-4b01-991d-165e77a28429\"}, {\"excerpt\": \"...Do you have any suggestions? By the way, I attended the annual Holiday Market at the local mall a week before >>>Black<<< >>>Friday<<<, and I saw some unique handmade jewelry there, but I'm not sure if that's her...\", \"topic\": \"gift-ideas\", \"tags\": [\"affordable-presents\", \"budget-shopping\", \"customized-accessories\", \"engraved-gifts\", \"gift-ideas\", \"handmade-jewelry\", \"holiday-market\", \"meaningful-keepsakes\", \"monogrammed-items\", \"personalized-gifts\", \"sister-gifts\", \"thoughtful-gifting\"], \"segment_ref\": \"b4ea3f71-e805-464f-804e-25b35607536f\"}, {\"excerpt\": \"...By the way, speaking of birthdays, I attended the annual Holiday Market at the local mall a week before >>>Black<<< >>>Friday<<<, and I saw some unique handmade jewelry there that I think she might like. Do you think I should...\", \"topic\": \"personalized-gifts\", \"tags\": [\"artisan-jewelry\", \"budget-shopping\", \"custom-design\", \"design-tools\", \"diy-gifts\", \"gift-bundling\", \"gift-ideas\", \"graphic-design-software\", \"handmade-jewelry\", \"holiday-market\", \"personalization-options\", \"personalized-gifts\", \"phone-case-selection\", \"product-recommendations\", \"seasonal-shopping\", \"vendor-selection\"], \"segment_ref\": \"fe9dfd89-21c4-404d-bb8c-b497aa222d5c\"}]}",
+            "duration_ms": 2.3
+          },
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "Holiday Market",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"Holiday Market\", \"found\": true, \"results\": [{\"excerpt\": \"...Do you have any favorite pieces in mind from the >>>Holiday<<< >>>Market<<<, or are you planning to go back and take a closer look?\\n\\nUser: I think I'll go back to the >>>Holiday<<< >>>Market<<< and take a closer look...\", \"topic\": \"personalized-gifts\", \"tags\": [\"artisan-jewelry\", \"budget-shopping\", \"custom-design\", \"design-tools\", \"diy-gifts\", \"gift-bundling\", \"gift-ideas\", \"graphic-design-software\", \"handmade-jewelry\", \"holiday-market\", \"personalization-options\", \"personalized-gifts\", \"phone-case-selection\", \"product-recommendations\", \"seasonal-shopping\", \"vendor-selection\"], \"segment_ref\": \"fe9dfd89-21c4-404d-bb8c-b497aa222d5c\"}, {\"excerpt\": \"...Do you have any suggestions? By the way, I attended the annual >>>Holiday<<< >>>Market<<< at the local mall a week before Black Friday, and I saw some unique handmade jewelry there, but I'm not sure if that's her...\", \"topic\": \"gift-ideas\", \"tags\": [\"affordable-presents\", \"budget-shopping\", \"customized-accessories\", \"engraved-gifts\", \"gift-ideas\", \"handmade-jewelry\", \"holiday-market\", \"meaningful-keepsakes\", \"monogrammed-items\", \"personalized-gifts\", \"sister-gifts\", \"thoughtful-gifting\"], \"segment_ref\": \"b4ea3f71-e805-464f-804e-25b35607536f\"}]}",
+            "duration_ms": 0.6
+          }
+        ],
+        "continuation_count": 1,
+        "stop_reason": "end_turn",
+        "elapsed_s": 8.1,
+        "correct": true,
+        "judge_explanation": "Yes"
+      }
+    }
+  ],
+  "summary": {
+    "baseline_accuracy": 0.0,
+    "baseline_correct": 0,
+    "baseline_total": 1,
+    "baseline_per_category": {
+      "temporal-reasoning": {
+        "accuracy": 0.0,
+        "correct": 0,
+        "total": 1
+      }
+    },
+    "vc_accuracy": 1.0,
+    "vc_correct": 1,
+    "vc_total": 1,
+    "vc_per_category": {
+      "temporal-reasoning": {
+        "accuracy": 1.0,
+        "correct": 1,
+        "total": 1
+      }
+    }
+  },
+  "cost_breakdown": {
+    "budget": 5.0,
+    "spent": 0.3727,
+    "remaining": 4.6273,
+    "entries": [
+      {
+        "label": "baseline:c8090214",
+        "model": "claude-sonnet-4-5-20250929",
+        "input_tokens": 113208,
+        "output_tokens": 78,
+        "cost_usd": 0.340794
+      },
+      {
+        "label": "judge:baseline:c8090214",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 296,
+        "output_tokens": 4,
+        "cost_usd": 0.000253
+      },
+      {
+        "label": "vc_reader:c8090214",
+        "model": "claude-sonnet-4-5-20250929",
+        "input_tokens": 9161,
+        "output_tokens": 259,
+        "cost_usd": 0.031368
+      },
+      {
+        "label": "judge:vc:c8090214",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 341,
+        "output_tokens": 4,
+        "cost_usd": 0.000289
+      }
+    ]
+  }
+}

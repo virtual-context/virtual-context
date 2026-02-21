@@ -127,6 +127,7 @@ class TurnTagEntry:
     tags: list[str] = field(default_factory=list)
     primary_tag: str = "_general"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    session_date: str = ""         # e.g. "2023/05/25 (Thu) 10:04" or ISO timestamp
 
 
 @dataclass
@@ -200,6 +201,7 @@ class TaggedSegment:
     start_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     end_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     turn_count: int = 0
+    session_date: str = ""         # propagated from constituent turns
 
 
 @dataclass
@@ -210,6 +212,7 @@ class SegmentMetadata:
     date_references: list[str] = field(default_factory=list)
     turn_count: int = 0
     time_span: tuple[datetime, datetime] | None = None
+    session_date: str = ""         # propagated from constituent turns
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +291,18 @@ class QuoteResult:
     segment_ref: str   # segment reference for drill-down
     tags: list[str] = field(default_factory=list)  # all tags on the segment
     score: float = 0.0 # FTS5 rank or match quality
+    match_type: str = "fts"  # "fts", "like", or "semantic"
+    similarity: float = 0.0  # cosine similarity (semantic matches only)
+    session_date: str = ""   # session date from segment metadata
+
+
+@dataclass
+class ChunkEmbedding:
+    """A chunk of segment text with its embedding vector."""
+    segment_ref: str
+    chunk_index: int
+    text: str
+    embedding: list[float]
 
 
 @dataclass
@@ -425,6 +440,32 @@ class AssembledContext:
     context_hint: str = ""  # Topic list injected post-compaction
     broad: bool = False  # True when query is broad — include all history
     temporal: bool = False  # True when query references a time position
+
+
+# ---------------------------------------------------------------------------
+# Tool Loop
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolCallRecord:
+    """Record of a single VC tool invocation within a tool loop."""
+    tool_name: str
+    tool_input: dict = field(default_factory=dict)
+    result_json: str = ""
+    duration_ms: float = 0.0
+
+
+@dataclass
+class ToolLoopResult:
+    """Result of a synchronous tool loop."""
+    text: str = ""
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    continuation_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    stop_reason: str = "end_turn"
+    raw_requests: list[dict] = field(default_factory=list)
+    raw_responses: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

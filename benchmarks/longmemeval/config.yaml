@@ -1,0 +1,75 @@
+# LongMemEval Benchmark Reference Config
+# 32K context window, Haiku tagger + summarizer, Sonnet reader
+# Used as documentation — the actual config is built programmatically in vc_runner.py
+
+version: "0.2"
+context_window: 32768
+token_counter: "estimate"
+
+paging:
+  enabled: false
+
+tag_generator:
+  type: "llm"
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tags: 10
+  min_tags: 5
+  prompt_mode: "detailed"
+  broad_heuristic_enabled: false
+  temporal_heuristic_enabled: false
+
+compaction:
+  soft_threshold: 0.70
+  hard_threshold: 0.85
+  protected_recent_turns: 4
+  overflow_buffer: 1.2
+  summary_ratio: 0.15
+  min_summary_tokens: 100
+  max_summary_tokens: 800
+  max_concurrent_summaries: 4
+
+summarization:
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 500
+  temperature: 0.3
+
+providers:
+  anthropic:
+    type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
+    model: "claude-haiku-4-5-20251001"
+
+storage:
+  backend: "sqlite"
+
+assembly:
+  core_context_max_tokens: 2000
+  tag_context_max_tokens: 8000
+  context_hint_enabled: true
+  context_hint_max_tokens: 500
+  core_files: []
+
+retrieval:
+  skip_active_tags: true
+  active_tag_lookback: 4
+  strategy_config:
+    default:
+      min_overlap: 1
+      max_results: 10
+      max_budget_fraction: 0.25
+      include_related: true
+
+cost_tracking:
+  enabled: true
+  pricing:
+    haiku:
+      input_per_1k: 0.001      # Haiku 4.5: $1.00/MTok
+      output_per_1k: 0.005     # Haiku 4.5: $5.00/MTok
+    sonnet:
+      input_per_1k: 0.003      # Sonnet 4.5: $3.00/MTok
+      output_per_1k: 0.015     # Sonnet 4.5: $15.00/MTok
+    gpt-5-mini:
+      input_per_1k: 0.00025    # GPT-5 mini: $0.25/MTok
+      output_per_1k: 0.002     # GPT-5 mini: $2.00/MTok

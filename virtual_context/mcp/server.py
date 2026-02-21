@@ -138,6 +138,11 @@ def find_quote(query: str, max_results: int = 5) -> str:
     Bypasses tags entirely and searches raw text, so it finds content even
     when it's filed under an unexpected topic.
 
+    Uses exact-word FTS first. If no exact match is found, falls back to
+    semantic (embedding) search to catch vocabulary mismatches (e.g.
+    "received" vs "arrived"). Semantic results include match_type and
+    similarity score.
+
     Args:
         query: Word or phrase to search for. Use distinctive terms, e.g.
             'magnesium glycinate' not 'supplement'.

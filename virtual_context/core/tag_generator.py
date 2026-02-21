@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from ..types import (
     KeywordTagConfig,
@@ -14,6 +14,7 @@ from ..types import (
     TagResult,
     DEFAULT_TEMPORAL_PATTERNS,
 )
+from .cost_tracker import CostTracker
 from .tag_canonicalizer import TagCanonicalizer
 
 logger = logging.getLogger(__name__)
@@ -169,11 +170,15 @@ class LLMTagGenerator:
         llm_provider: LLMProvider,
         config: TagGeneratorConfig,
         canonicalizer: TagCanonicalizer | None = None,
+        cost_tracker: CostTracker | None = None,
+        embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
     ) -> None:
         self.llm = llm_provider
         self.config = config
         self._tag_vocabulary: dict[str, int] = {}
         self._canonicalizer = canonicalizer
+        self._cost_tracker = cost_tracker
+        self._embed_fn_factory = embed_fn_factory
         self._broad_patterns = _compile_broad_patterns(config.broad_patterns)
         self._temporal_patterns = _compile_broad_patterns(config.temporal_patterns)
 
@@ -202,6 +207,7 @@ class LLMTagGenerator:
                 user=prompt,
                 max_tokens=self.config.max_tokens,
             )
+            self._log_usage()
             result = self._parse_response(response)
         except Exception as e:
             logger.warning(f"LLM tag generation failed: {e}")
@@ -223,12 +229,79 @@ class LLMTagGenerator:
 
         return result
 
+    def _select_relevant_store_tags(
+        self, text: str, store_tags: list[str], limit: int = 30,
+        similarity_threshold: float = 0.25,
+    ) -> list[str]:
+        """Select store tags most relevant to *text* using embedding similarity,
+        then fill remaining slots with high-usage tags.
+
+        Strategy: embed the text and all store tags, take those above
+        *similarity_threshold* (up to *limit*). If fewer than *limit* tags
+        qualify, pad with the highest-usage tags (which come first in
+        *store_tags* since the caller orders by usage_count DESC).
+
+        Falls back entirely to usage-count ordering when no embedding
+        function is available.
+        """
+        if not store_tags:
+            return []
+
+        embed_fn: Callable | None = None
+        if self._embed_fn_factory is not None:
+            try:
+                embed_fn = self._embed_fn_factory()
+            except Exception:
+                embed_fn = None
+
+        if embed_fn is None:
+            return store_tags[:limit]
+
+        try:
+            import numpy as np
+
+            # Truncate text for embedding (first 500 chars is plenty for topic signal)
+            snippet = text[:500]
+            all_texts = [snippet] + store_tags
+            vectors = embed_fn(all_texts)
+            text_vec = np.array(vectors[0])
+            tag_vecs = np.array(vectors[1:])
+
+            # Cosine similarity
+            norms = np.linalg.norm(tag_vecs, axis=1)
+            norms[norms == 0] = 1.0
+            text_norm = np.linalg.norm(text_vec)
+            if text_norm == 0:
+                return store_tags[:limit]
+            similarities = tag_vecs @ text_vec / (norms * text_norm)
+
+            # Take tags above threshold, ranked by similarity
+            above = [(float(similarities[i]), i) for i in range(len(store_tags))
+                     if similarities[i] >= similarity_threshold]
+            above.sort(reverse=True)
+            selected_indices = [i for _, i in above[:limit]]
+            selected_set = set(selected_indices)
+
+            # Fill remaining slots with highest-usage tags (preserve caller order)
+            for i in range(len(store_tags)):
+                if len(selected_indices) >= limit:
+                    break
+                if i not in selected_set:
+                    selected_indices.append(i)
+                    selected_set.add(i)
+
+            return [store_tags[i] for i in selected_indices]
+        except Exception:
+            logger.debug("Embed-based tag selection failed, falling back to usage-count", exc_info=True)
+            return store_tags[:limit]
+
     def _build_prompt(self, text: str, existing_tags: list[str] | None = None, context_turns: list[str] | None = None) -> str:
         """Build the tagging prompt with vocabulary hint.
 
         Splits tags into recent session tags (highest reuse priority) and
-        store tags (secondary). This encourages the LLM to converge on the
-        same tags within a session rather than inventing synonyms.
+        store tags (secondary, selected by embedding relevance to the text).
+        This encourages the LLM to converge on the same tags within a session
+        rather than inventing synonyms.
         """
         parts = []
 
@@ -242,9 +315,10 @@ class LLMTagGenerator:
         # Store/external tags (passed in by caller)
         store_tags = existing_tags or []
 
-        # Merge: session tags first, then store tags not already covered
+        # Select store tags relevant to this text (embed-based when available)
         session_set = set(session_tags)
-        extra_store = [t for t in store_tags if t not in session_set][:20]
+        candidates = [t for t in store_tags if t not in session_set]
+        extra_store = self._select_relevant_store_tags(text, candidates, limit=30)
 
         if session_tags:
             parts.append(
@@ -378,6 +452,22 @@ class LLMTagGenerator:
         """Bootstrap vocabulary from existing stored tag counts."""
         self._tag_vocabulary.update(tag_counts)
 
+    def _log_usage(self) -> None:
+        """Log LLM token usage from the provider's last_usage to the cost tracker."""
+        if not self._cost_tracker:
+            return
+        usage = getattr(self.llm, "last_usage", {})
+        if not usage:
+            return
+        input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        if input_tokens or output_tokens:
+            self._cost_tracker.log_tag_generation(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                provider=getattr(self.llm, "model", ""),
+            )
+
 
 class KeywordTagGenerator:
     """Deterministic tag generation using keywords and regex patterns."""
@@ -440,10 +530,16 @@ def build_tag_generator(
     config: TagGeneratorConfig,
     llm_provider: LLMProvider | None = None,
     canonicalizer: TagCanonicalizer | None = None,
+    cost_tracker: CostTracker | None = None,
+    embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
 ) -> TagGenerator:
     """Build a tag generator from config. Falls back to keyword if no LLM available."""
     if config.type == "llm" and llm_provider is not None:
-        return LLMTagGenerator(llm_provider=llm_provider, config=config, canonicalizer=canonicalizer)
+        return LLMTagGenerator(
+            llm_provider=llm_provider, config=config,
+            canonicalizer=canonicalizer, cost_tracker=cost_tracker,
+            embed_fn_factory=embed_fn_factory,
+        )
 
     if config.type == "embedding":
         from .embedding_tag_generator import EmbeddingTagGenerator

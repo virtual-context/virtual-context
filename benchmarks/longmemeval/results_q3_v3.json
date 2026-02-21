@@ -1,0 +1,165 @@
+{
+  "benchmark": "longmemeval",
+  "date": "2026-02-20",
+  "config": {
+    "context_window": 65536,
+    "baseline_model": "claude-sonnet-4-5-20250929",
+    "reader_model": "claude-sonnet-4-5-20250929",
+    "judge_model": "claude-haiku-4-5-20251001"
+  },
+  "budget_limit": 5.0,
+  "actual_cost": 0.3801,
+  "questions": [
+    {
+      "question_id": "4f54b7c9",
+      "question_type": "multi-session",
+      "question": "How many antique items did I inherit or acquire from my family members?",
+      "answer": "5",
+      "haystack_tokens_est": 113745,
+      "n_sessions": 45,
+      "baseline": {
+        "hypothesis": "I don't recall you mentioning inheriting or acquiring any antique items from your family members in our conversation. We've discussed meal planning, recipe ideas, and plant-based alternatives, but I don't have any information about antique items.\n\nIf you'd like to share more about the antique items you've inherited or acquired, I'd be happy to chat with you about them!",
+        "input_tokens": 110178,
+        "output_tokens": 83,
+        "cost": 0.331779,
+        "elapsed_s": 6.0,
+        "correct": false,
+        "judge_explanation": "No"
+      },
+      "vc": {
+        "hypothesis": "Based on your chat history, you inherited or acquired **5 antique items** from your family members:\n\n1. **Vintage diamond necklace** - from your grandmother (inherited)\n2. **Antique music box** - from your great-aunt (inherited)\n3. **Depression-era glassware set** - from your mom (inherited)\n4. **Antique tea set** - from your cousin Rachel\n5. **Vintage typewriter** - from your dad\n\nThe first three items (necklace, music box, and glassware) were discussed in your conversation on May 30, 2023, when you were seeking insurance recommendations for these inherited family heirlooms. The tea set and typewriter were mentioned in your May 25, 2023 conversation when you were considering decluttering and selling them.",
+        "input_tokens": 13368,
+        "output_tokens": 519,
+        "haiku_input_tokens": 0,
+        "haiku_output_tokens": 0,
+        "haiku_calls": 0,
+        "cost": 0.047889,
+        "tags_matched": [
+          "family-heirlooms",
+          "antique-appraisal",
+          "collectibles-assessment",
+          "memory-preservation"
+        ],
+        "tokens_injected": 63216,
+        "compaction_events": -1,
+        "turns_ingested": 245,
+        "timings": {
+          "ingest_s": 0.0,
+          "compact_s": 0.0,
+          "retrieve_s": 1.4,
+          "query_s": 13.4
+        },
+        "cached": true,
+        "tool_calls": [
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "inherited grandmother vintage diamond necklace",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"inherited grandmother vintage diamond necklace\", \"found\": true, \"results\": [{\"excerpt\": \"User: [Session from 2023/05/30 (Tue) 06:33] I'm trying to get my >>>grandmother<<<'s >>>vintage<<< >>>diamond<<< >>>necklace<<< insured, but I'm not sure where to start. I >>>inherited<<< it recently, along with a few other family heirlooms...\", \"topic\": \"jewelry-appraisal\", \"tags\": [\"agreed-value-coverage\", \"antique-protection\", \"appraisal-documentation\", \"collectibles-protection\", \"collectibles-valuation\", \"family-heirlooms\", \"heirloom-insurance\", \"high-value-items-coverage\", \"jewelry-appraisal\", \"provenance\", \"specialty-insurance\", \"valuable-possessions-policy\"], \"segment_ref\": \"3cff2998-ee80-4cdf-aa69-6b97464cb8f0\"}]}",
+            "duration_ms": 2.5
+          },
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "antique music box great-aunt",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"antique music box great-aunt\", \"found\": true, \"results\": [{\"excerpt\": \"User: [Session from 2023/05/30 (Tue) 06:33] I'm trying to get my grandmother's vintage diamond necklace insured, but I'm not sure where to start. I inherited it recently, along with a few other family heirlooms, including an antique music box from my great-aunt and a set of depression-era glassware from my mom. Do you have any recommendations for insurance companies that specialize in insuring valuable items like these?\\n\\nAssistant: Congratulations on inheriting these precious family heirlooms! Insuring them is a wise decision to protect their value and sentimental significance. You're on the right track by seeking specialized insurance companies that cater to valuable items like yours. Here are some recommendations and tips to get you started:\", \"topic\": \"jewelry-appraisal\", \"tags\": [\"agreed-value-coverage\", \"antique-protection\", \"appraisal-documentation\", \"collectibles-protection\", \"collectibles-valuation\", \"family-heirlooms\", \"heirloom-insurance\", \"high-value-items-coverage\", \"jewelry-appraisal\", \"provenance\", \"specialty-insurance\", \"valuable-possessions-policy\"], \"segment_ref\": \"3cff2998-ee80-4cdf-aa69-6b97464cb8f0\", \"match_type\": \"semantic\", \"similarity\": 0.449}, {\"excerpt\": \"User: I'll focus on highlighting the item's features, condition, and provenance when reaching out to the antique dealers. I'll mention that the antique tea set came from my cousin Rachel and the vintage typewriter belonged to my dad, and share any relevant stories or documents that I have. If asked, I'll briefly mention that I'm decluttering and found the items, but I won't make it the central focus of the conversation. Thanks for the advice!\\n\\nAssistant: You're welcome! I'm glad I could help. You're taking the right approach by focusing on the item's features, condition, and provenance. By highlighting these aspects, you'll be able to showcase the items' value and significance to potential buyers.\\n\\nRemember to also be open-minded and prepared for different reactions from the dealers. Some might be very interested, while others might not be the right fit. Don't be discouraged if you don't get an immediate response or if the dealers don't offer you the price you're hoping for.\\n\\nIt's also important to keep in mind that you're not just selling items, you're also sharing a part of your family's history and story. Be proud of the items and their significance, and don't hesitate to share that with the dealers.\\n\\nIf you have any more questions or need further guidance, feel free to ask. Good luck with your outreach to the antique dealers, and I hope you find the right buyer for your treasured items!\", \"topic\": \"antique-valuation\", \"tags\": [\"antique-appraisal\", \"antique-tea-set\", \"antique-valuation\", \"collectibles-appraisal\", \"collector-market\", \"decluttering\", \"estate-sale\", \"family-heirlooms\", \"item-authentication\", \"local-antique-dealers\", \"online-marketplace-research\", \"ownership-history\", \"provenance\", \"resale-valuation\", \"vintage-collectibles\", \"vintage-typewriter\"], \"segment_ref\": \"9b027b3d-cc0d-45b7-b0a0-c6b3eb7f447d\", \"match_type\": \"semantic\", \"similarity\": 0.441}, {\"excerpt\": \"**What to expect from the appraisal report?**\\nThe appraisal report should include:\\n\\n1. **Detailed description**: A thorough description of the necklace, including its materials, dimensions, and characteristics.\\n2. **Value**: The appraiser's opinion of the necklace's value, which may include a range (e.g., $5,000 to $7,000).\\n3. **Methodology**: An explanation of the appraisal methodology used to determine the value.\\n4. **Photos and diagrams**: Supporting images and diagrams to illustrate the necklace's features.\\n\\nOnce you have the appraisal report, you can use it to obtain insurance coverage for your grandmother's vintage diamond necklace. Remember to keep the report and supporting documents in a safe and secure location.\\n\\nUser: That's really helpful, thanks. So, I should get the appraisal report and then shop around for insurance companies that specialize in insuring valuable items like my grandmother's necklace. I also have an antique music box from my great-aunt and a set of depression-era glassware from my mom that I'd like to insure. Do you think I should get those items appraised as well, or would it be better to focus on insuring the necklace first?\\n\\nAssistant: You're on the right track!\\n\\nYes, it's a good idea to get all three items appraised, as each has its unique characteristics and values. Having appraisals for all three items will help you:\", \"topic\": \"heirloom-insurance\", \"tags\": [\"antique-glassware\", \"antique-music-box\", \"appraisal-process\", \"appraiser-certification\", \"asset-protection\", \"collectibles-valuation\", \"comparable-sales-analysis\", \"condition-assessment\", \"family-heirlooms\", \"heirloom-documentation\", \"heirloom-insurance\", \"insurance-coverage-assessment\", \"jewelry-appraisal\", \"provenance\", \"specialized-appraisers\", \"vintage-jewelry-valuation\"], \"segment_ref\": \"7705c7a9-17b7-4b38-88dd-71de1236da2e\", \"match_type\": \"semantic\", \"similarity\": 0.416}, {\"excerpt\": \"User: [Session from 2023/05/25 (Thu) 06:06] I'm thinking of decluttering my apartment and selling some old family heirlooms to make some extra cash. I have an antique tea set from my cousin Rachel and a vintage typewriter that belonged to my dad. Do you know where I can find a good appraiser or someone to help me determine their value?\\n\\nAssistant: What a great idea! Decluttering and making some extra cash is always a win-win!\\n\\nFinding the right appraiser or expert to evaluate your antique tea set and vintage typewriter can be a bit daunting, but don't worry, I've got some suggestions to help you get started:\\n\\n**Online Marketplaces and Forums**\\n\\n1. **eBay**: Research completed listings and sold items on eBay to get an idea of your items' value. You can also post a question on eBay's community forum or ask a seller with similar items for guidance.\\n2. **Etsy**: Although Etsy is primarily for handmade items, many sellers specialize in vintage and antique goods. You can search for similar items and contact sellers for advice or appraisal services.\\n3. **Reddit**: Share photos and details of your items on subreddits like r/antiques, r/vintage, or r/typewriters, and ask for feedback from enthusiasts and collectors.\\n\\n**Professional Appraisers and Organizations**\", \"topic\": \"car-maintenance-products\", \"tags\": [\"antique-appraisal\", \"antique-valuation\", \"appraisal-services\", \"car-air-fresheners\", \"car-cover-protection\", \"car-interior-cleaning\", \"car-maintenance-products\", \"car-wash-soap\", \"collectibles-assessment\", \"collectibles-pricing\", \"estate-liquidation\", \"estate-sale\", \"heirloom-evaluation\", \"microfiber-cloths\", \"product-recommendations\", \"vintage-assessment\", \"vintage-valuation\", \"weather-protection\"], \"segment_ref\": \"84088ce1-837a-4d34-9563-17b22c531964\", \"match_type\": \"semantic\", \"similarity\": 0.4}, {\"excerpt\": \"1. **Check for certification**: Look for appraisers who hold certifications from reputable organizations, such as those mentioned above.\\n2. **Experience and expertise**: Ensure the appraiser has experience with items similar to yours, including vintage jewelry, antique music boxes, and depression-era glassware.\\n3. **Professional affiliations**: Check if the appraiser is a member of industry associations, which can indicate their commitment to staying up-to-date with industry developments and best practices.\\n4. **Insurance industry recognition**: Some appraisers may be recognized by insurance companies, which can be beneficial when filing claims or negotiating settlements.\\n5. **Referrals and reputation**: Ask for referrals from trusted sources, such as friends, family, or professionals in the industry. Research the appraiser's reputation online, checking reviews and testimonials.\\n\\nBy finding an appraiser who meets these criteria, you can ensure a thorough and accurate appraisal for your grandmother's necklace, as well as your great-aunt's music box and your mom's glassware.\", \"topic\": \"jewelry-appraisal\", \"tags\": [\"antique-glassware\", \"antique-music-box\", \"appraisal-process\", \"appraiser-credentials\", \"collectible-assessment\", \"collectibles-valuation\", \"expert-authentication\", \"heirloom-insurance\", \"insurance-appraisals\", \"jewelry-appraisal\", \"local-antique-dealers\", \"professional-certifications\", \"valuation-standards\", \"vintage-item-evaluation\"], \"segment_ref\": \"1c315710-3cb3-461b-8d94-2ff58627a13d\", \"match_type\": \"semantic\", \"similarity\": 0.339}]}",
+            "duration_ms": 3673.9
+          },
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "depression-era glassware mother",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"depression-era glassware mother\", \"found\": true, \"results\": [{\"excerpt\": \"User: [Session from 2023/05/30 (Tue) 06:33] I'm trying to get my grandmother's vintage diamond necklace insured, but I'm not sure where to start. I inherited it recently, along with a few other family heirlooms, including an antique music box from my great-aunt and a set of depression-era glassware from my mom. Do you have any recommendations for insurance companies that specialize in insuring valuable items like these?\\n\\nAssistant: Congratulations on inheriting these precious family heirlooms! Insuring them is a wise decision to protect their value and sentimental significance. You're on the right track by seeking specialized insurance companies that cater to valuable items like yours. Here are some recommendations and tips to get you started:\", \"topic\": \"jewelry-appraisal\", \"tags\": [\"agreed-value-coverage\", \"antique-protection\", \"appraisal-documentation\", \"collectibles-protection\", \"collectibles-valuation\", \"family-heirlooms\", \"heirloom-insurance\", \"high-value-items-coverage\", \"jewelry-appraisal\", \"provenance\", \"specialty-insurance\", \"valuable-possessions-policy\"], \"segment_ref\": \"3cff2998-ee80-4cdf-aa69-6b97464cb8f0\", \"match_type\": \"semantic\", \"similarity\": 0.332}]}",
+            "duration_ms": 43.4
+          },
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "antique tea set cousin Rachel",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"antique tea set cousin Rachel\", \"found\": true, \"results\": [{\"excerpt\": \"...By following these tips, you can effectively approach local >>>antique<<< dealers and potentially find a buyer for your >>>tea<<< >>>set<<< and typewriter. Good luck!\\n\\nUser: I'll also mention that I received the >>>antique<<< >>>tea<<< >>>set<<< from my >>>cousin<<< >>>Rachel<<<...\", \"topic\": \"antique-valuation\", \"tags\": [\"antique-appraisal\", \"antique-tea-set\", \"antique-valuation\", \"collectibles-appraisal\", \"collector-market\", \"decluttering\", \"estate-sale\", \"family-heirlooms\", \"item-authentication\", \"local-antique-dealers\", \"online-marketplace-research\", \"ownership-history\", \"provenance\", \"resale-valuation\", \"vintage-collectibles\", \"vintage-typewriter\"], \"segment_ref\": \"9b027b3d-cc0d-45b7-b0a0-c6b3eb7f447d\"}, {\"excerpt\": \"...I have an >>>antique<<< >>>tea<<< >>>set<<< from my >>>cousin<<< >>>Rachel<<< and a vintage typewriter that belonged to my dad. Do you know where I can find a good appraiser or someone to help me determine their value?\\n\\nAssistant: What a...\", \"topic\": \"car-maintenance-products\", \"tags\": [\"antique-appraisal\", \"antique-valuation\", \"appraisal-services\", \"car-air-fresheners\", \"car-cover-protection\", \"car-interior-cleaning\", \"car-maintenance-products\", \"car-wash-soap\", \"collectibles-assessment\", \"collectibles-pricing\", \"estate-liquidation\", \"estate-sale\", \"heirloom-evaluation\", \"microfiber-cloths\", \"product-recommendations\", \"vintage-assessment\", \"vintage-valuation\", \"weather-protection\"], \"segment_ref\": \"84088ce1-837a-4d34-9563-17b22c531964\"}]}",
+            "duration_ms": 0.5
+          },
+          {
+            "tool": "vc_find_quote",
+            "input": {
+              "query": "vintage typewriter dad",
+              "max_results": 5
+            },
+            "result": "{\"query\": \"vintage typewriter dad\", \"found\": true, \"results\": [{\"excerpt\": \"...I'll also mention that I received the antique tea set from my cousin Rachel and a >>>vintage<<< >>>typewriter<<< that belonged to my >>>dad<<<, in case that adds any context or significance to the items.\\n\\nAssistant: That's a great...\", \"topic\": \"antique-valuation\", \"tags\": [\"antique-appraisal\", \"antique-tea-set\", \"antique-valuation\", \"collectibles-appraisal\", \"collector-market\", \"decluttering\", \"estate-sale\", \"family-heirlooms\", \"item-authentication\", \"local-antique-dealers\", \"online-marketplace-research\", \"ownership-history\", \"provenance\", \"resale-valuation\", \"vintage-collectibles\", \"vintage-typewriter\"], \"segment_ref\": \"9b027b3d-cc0d-45b7-b0a0-c6b3eb7f447d\"}, {\"excerpt\": \"...I have an antique tea set from my cousin Rachel and a >>>vintage<<< >>>typewriter<<< that belonged to my >>>dad<<<. Do you know where I can find a good appraiser or someone to help me determine their value?\\n\\nAssistant: What a...\", \"topic\": \"car-maintenance-products\", \"tags\": [\"antique-appraisal\", \"antique-valuation\", \"appraisal-services\", \"car-air-fresheners\", \"car-cover-protection\", \"car-interior-cleaning\", \"car-maintenance-products\", \"car-wash-soap\", \"collectibles-assessment\", \"collectibles-pricing\", \"estate-liquidation\", \"estate-sale\", \"heirloom-evaluation\", \"microfiber-cloths\", \"product-recommendations\", \"vintage-assessment\", \"vintage-valuation\", \"weather-protection\"], \"segment_ref\": \"84088ce1-837a-4d34-9563-17b22c531964\"}]}",
+            "duration_ms": 0.2
+          }
+        ],
+        "continuation_count": 1,
+        "stop_reason": "end_turn",
+        "elapsed_s": 14.8,
+        "correct": true,
+        "judge_explanation": "Yes"
+      }
+    }
+  ],
+  "summary": {
+    "baseline_accuracy": 0.0,
+    "baseline_correct": 0,
+    "baseline_total": 1,
+    "baseline_per_category": {
+      "multi-session": {
+        "accuracy": 0.0,
+        "correct": 0,
+        "total": 1
+      }
+    },
+    "vc_accuracy": 1.0,
+    "vc_correct": 1,
+    "vc_total": 1,
+    "vc_per_category": {
+      "multi-session": {
+        "accuracy": 1.0,
+        "correct": 1,
+        "total": 1
+      }
+    }
+  },
+  "cost_breakdown": {
+    "budget": 5.0,
+    "spent": 0.3801,
+    "remaining": 4.6199,
+    "entries": [
+      {
+        "label": "baseline:4f54b7c9",
+        "model": "claude-sonnet-4-5-20250929",
+        "input_tokens": 110178,
+        "output_tokens": 83,
+        "cost_usd": 0.331779
+      },
+      {
+        "label": "judge:baseline:4f54b7c9",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 209,
+        "output_tokens": 4,
+        "cost_usd": 0.000183
+      },
+      {
+        "label": "vc_reader:4f54b7c9",
+        "model": "claude-sonnet-4-5-20250929",
+        "input_tokens": 13368,
+        "output_tokens": 519,
+        "cost_usd": 0.047889
+      },
+      {
+        "label": "judge:vc:4f54b7c9",
+        "model": "claude-haiku-4-5-20251001",
+        "input_tokens": 312,
+        "output_tokens": 4,
+        "cost_usd": 0.000266
+      }
+    ]
+  }
+}

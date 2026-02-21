@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -14,6 +15,19 @@ from ..types import (
     TagResult,
     TurnPair,
 )
+
+_SESSION_RE = re.compile(r'\[Session from ([^\]]+)\]')
+
+
+def _parse_session_date(pair: TurnPair) -> str:
+    """Extract session date from first user message, or empty string."""
+    for msg in pair.messages:
+        if msg.role == "user":
+            m = _SESSION_RE.search(msg.content)
+            if m:
+                return m.group(1)
+            break
+    return ""
 
 
 class TopicSegmenter:
@@ -65,18 +79,29 @@ class TopicSegmenter:
                 tag_result = self.tag_generator.generate_tags(combined)
             tagged.append((pair, tag_result))
 
-        # Step 3: group contiguous same-primary-tag pairs
+        # Step 3: group contiguous same-primary-tag pairs, split on session date change
         segments: list[TaggedSegment] = []
         current_group: list[tuple[TurnPair, TagResult]] = []
+        running_session: str = ""  # tracks session date across all pairs
+        group_session: str = ""    # session date for the current group
 
         for pair, result in tagged:
-            if current_group and current_group[0][1].primary != result.primary:
-                segments.append(self._build_segment(current_group))
-                current_group = []
+            parsed = _parse_session_date(pair)
+            if parsed:
+                running_session = parsed
+            if current_group:
+                tag_changed = current_group[0][1].primary != result.primary
+                session_changed = parsed and group_session and parsed != group_session
+                if tag_changed or session_changed:
+                    segments.append(self._build_segment(current_group, group_session))
+                    current_group = []
+                    group_session = running_session
+            if not current_group:
+                group_session = running_session
             current_group.append((pair, result))
 
         if current_group:
-            segments.append(self._build_segment(current_group))
+            segments.append(self._build_segment(current_group, group_session))
 
         return segments
 
@@ -107,7 +132,7 @@ class TopicSegmenter:
         return pairs
 
     def _build_segment(
-        self, group: list[tuple[TurnPair, TagResult]]
+        self, group: list[tuple[TurnPair, TagResult]], session_date: str = "",
     ) -> TaggedSegment:
         """Build a TaggedSegment from a group of tagged turn pairs."""
         all_messages: list[Message] = []
@@ -137,4 +162,5 @@ class TopicSegmenter:
             start_timestamp=start_ts,
             end_timestamp=end_ts,
             turn_count=len(group),
+            session_date=session_date,
         )

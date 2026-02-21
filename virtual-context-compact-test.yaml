@@ -202,6 +202,12 @@ cost_tracking:
     ollama:
       input_per_1k: 0.0       # local models = free
       output_per_1k: 0.0
-    anthropic:
-      input_per_1k: 0.00025   # Haiku pricing
-      output_per_1k: 0.00125
+    haiku:
+      input_per_1k: 0.001     # Haiku 4.5: $1.00/MTok
+      output_per_1k: 0.005    # Haiku 4.5: $5.00/MTok
+    sonnet:
+      input_per_1k: 0.003     # Sonnet 4.5: $3.00/MTok
+      output_per_1k: 0.015    # Sonnet 4.5: $15.00/MTok
+    gpt-5-mini:
+      input_per_1k: 0.00025   # GPT-5 mini: $0.25/MTok
+      output_per_1k: 0.002    # GPT-5 mini: $2.00/MTok
