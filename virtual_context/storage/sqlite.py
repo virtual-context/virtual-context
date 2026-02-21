@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..core.store import ContextStore
 from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -128,17 +129,6 @@ END;
 """
 
 
-def _dt_to_str(dt: datetime) -> str:
-    return dt.isoformat()
-
-
-def _str_to_dt(s: str) -> datetime:
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
@@ -188,21 +178,6 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
         start_timestamp=_str_to_dt(row["start_timestamp"]),
         end_timestamp=_str_to_dt(row["end_timestamp"]),
     )
-
-
-def _extract_excerpt(text: str, query: str, context_chars: int = 200) -> str:
-    """Extract text around the first occurrence of query."""
-    idx = text.lower().find(query.lower())
-    if idx == -1:
-        return text[:context_chars * 2]
-    start = max(0, idx - context_chars)
-    end = min(len(text), idx + len(query) + context_chars)
-    excerpt = text[start:end]
-    if start > 0:
-        excerpt = "..." + excerpt
-    if end < len(text):
-        excerpt = excerpt + "..."
-    return excerpt
 
 
 class SQLiteStore(ContextStore):
