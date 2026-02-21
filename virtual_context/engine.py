@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import load_config
 from .core.assembler import ContextAssembler
+from .core.hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
 from .core.compactor import DomainCompactor
 from .core.cost_tracker import CostTracker
 from .core.monitor import ContextMonitor
@@ -46,69 +47,13 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-_EMBED_NOT_LOADED = object()  # sentinel for lazy embed function loading
 _SESSION_HEADER_RE = re.compile(r'\[Session from ([^\]]+)\]')
 
 
-def _cosine_sim(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def _chunk_segment_text(full_text: str, max_words: int = 250, min_words: int = 20) -> list[str]:
-    """Split segment full_text into overlapping chunks for embedding.
-
-    Splits on double-newline (message boundaries), merges tiny chunks,
-    and applies sliding window with overlap for oversized chunks.
-    """
-    if not full_text or not full_text.strip():
-        return []
-
-    # Split on message boundaries
-    paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
-    if not paragraphs:
-        return []
-
-    # Merge tiny paragraphs
-    merged: list[str] = []
-    buffer = ""
-    for para in paragraphs:
-        if buffer:
-            candidate = buffer + "\n\n" + para
-        else:
-            candidate = para
-        if len(candidate.split()) <= max_words:
-            buffer = candidate
-        else:
-            if buffer:
-                merged.append(buffer)
-            buffer = para
-    if buffer:
-        merged.append(buffer)
-
-    # Split oversized chunks with sliding window
-    chunks: list[str] = []
-    overlap_words = 30
-    for chunk in merged:
-        words = chunk.split()
-        if len(words) <= max_words:
-            chunks.append(chunk)
-        else:
-            start = 0
-            while start < len(words):
-                end = min(start + max_words, len(words))
-                chunks.append(" ".join(words[start:end]))
-                if end >= len(words):
-                    break
-                start += max_words - overlap_words
-
-    # Filter fragments that are too small
-    return [c for c in chunks if len(c.split()) >= min_words]
+from .core.math_utils import cosine_similarity as _cosine_sim
+from .core.paging_manager import PagingManager
+from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions
+from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
 
 
 class VirtualContextEngine:
@@ -145,10 +90,16 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
-        self._embed_fn = _EMBED_NOT_LOADED  # lazy-loaded for context bleed gate
+        self._semantic = SemanticSearchManager(store=self._store, config=self.config)
+        self._paging = PagingManager(
+            store=self._store,
+            token_counter=self._token_counter,
+            tag_context_max_tokens=self.config.assembler.tag_context_max_tokens,
+            auto_evict=self.config.paging.auto_evict,
+            paging_enabled=self.config.paging.enabled,
+        )
         self._split_processed_tags: set[str] = set()
         self._last_split_result: SplitResult | None = None
-        self._working_set: dict[str, "WorkingSetEntry"] = {}  # paging: tag → depth state
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
 
         # Restore persisted state if available
@@ -158,6 +109,24 @@ class VirtualContextEngine:
         # with the old (empty) one.
         self._segmenter._turn_tag_index = self._turn_tag_index
         self._bootstrap_vocabulary()
+
+    @property
+    def _embed_fn(self):
+        """Proxy to SemanticSearchManager's embed function (for test compat)."""
+        return self._semantic._embed_fn
+
+    @_embed_fn.setter
+    def _embed_fn(self, value):
+        self._semantic._embed_fn = value
+
+    @property
+    def _working_set(self) -> dict[str, WorkingSetEntry]:
+        """Proxy to PagingManager's working set (for backward compat)."""
+        return self._paging.working_set
+
+    @_working_set.setter
+    def _working_set(self, value: dict[str, WorkingSetEntry]):
+        self._paging.working_set = value
 
     def _init_canonicalizer(self) -> None:
         """Initialize the tag canonicalizer with store aliases."""
@@ -1004,174 +973,29 @@ class VirtualContextEngine:
         return hint
 
     def _build_autonomous_hint(self, tag_summaries: list) -> str:
-        """Build compact autonomous paging hint with two-tier layout.
-
-        Expanded tags (in working set) listed first with full metadata.
-        Available tags (depth:none) listed compactly below.
-        Truncation drops available tags first, preserving expanded tags.
-        """
-        budget = self.config.assembler.tag_context_max_tokens
-        used = sum(ws.tokens for ws in self._working_set.values())
-        max_tokens = self.config.assembler.context_hint_max_tokens
-
-        # Partition into expanded (in working set) vs available (depth:none)
-        expanded_lines: list[str] = []
-        available_entries: list[str] = []
-        for ts in tag_summaries:
-            ws = self._working_set.get(ts.tag)
-            if ws and ws.depth != DepthLevel.NONE:
-                full_t = self._calculate_depth_tokens(ts.tag, DepthLevel.FULL)
-                desc_part = f" — {ts.description}" if ts.description else ""
-                expanded_lines.append(
-                    f"  {ts.tag}: {ws.depth.value} {ws.tokens}t"
-                    f" \u2192 {full_t}t full{desc_part}"
-                )
-            else:
-                full_t = self._calculate_depth_tokens(ts.tag, DepthLevel.FULL)
-                entry = ts.tag
-                if full_t > 0:
-                    entry += f"({full_t}t)"
-                if ts.description:
-                    entry += f" — {ts.description}"
-                available_entries.append(entry)
-
-        def _assemble(exp_lines: list[str], avail: list[str]) -> str:
-            parts: list[str] = []
-            if exp_lines:
-                parts.append("[in context \u2014 expand for full detail]")
-                parts.extend(exp_lines)
-            if avail:
-                if exp_lines:
-                    parts.append("")
-                parts.append(
-                    "[available] " + ", ".join(avail)
-                )
-            body = "\n".join(parts)
-            return (
-                f'<context-topics budget="{budget}" used="{used}"'
-                f' available="{budget - used}">\n'
-                f"RULE: These are compressed topic summaries, not the full conversation.\n"
-                f"- For specific facts (names, numbers, dosages, decisions): "
-                f"use vc_find_quote — it searches raw text across all topics.\n"
-                f"- For broad questions (summarize, put together, plan, walk me through, itinerary): "
-                f"use vc_expand_topic to load full conversation detail before answering.\n"
-                f"- For deeper understanding of a topic: "
-                f"use vc_expand_topic to load the full conversation text.\n"
-                f"- To free budget after expanding: use vc_collapse_topic.\n"
-                f"- Never claim you don't remember without searching first.\n"
-                f"- Never give a vague answer when you could expand a topic for specifics.\n\n"
-                f"{body}\n\n"
-                f"Tools: find_quote(query) | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
-                f"</context-topics>"
-            )
-
-        hint = _assemble(expanded_lines, available_entries)
-
-        # Truncate: drop available entries first, then expanded lines
-        if self._token_counter(hint) > max_tokens:
-            while available_entries and self._token_counter(hint) > max_tokens:
-                available_entries.pop()
-                hint = _assemble(expanded_lines, available_entries)
-            while expanded_lines and self._token_counter(hint) > max_tokens:
-                expanded_lines.pop()
-                hint = _assemble(expanded_lines, available_entries)
-
-        return hint
-
-    def _build_supervised_hint(self, tag_summaries: list) -> str:
-        """Build compact supervised paging hint.
-
-        Expanded tags first with depth info, available tags as compact list.
-        """
-        max_tokens = self.config.assembler.context_hint_max_tokens
-
-        expanded_lines: list[str] = []
-        available_entries: list[str] = []
-        for ts in tag_summaries:
-            ws = self._working_set.get(ts.tag)
-            if ws and ws.depth != DepthLevel.NONE:
-                desc = ts.description or ts.summary[:60].rstrip()
-                if not ts.description and len(ts.summary) > 60:
-                    desc += "..."
-                expanded_lines.append(
-                    f"  {ts.tag} ({ws.depth.value}, {ws.tokens}t): {desc}"
-                )
-            else:
-                entry = ts.tag
-                if ts.description:
-                    entry += f" — {ts.description}"
-                available_entries.append(entry)
-
-        def _assemble(exp_lines: list[str], avail: list[str]) -> str:
-            parts: list[str] = []
-            if exp_lines:
-                parts.append("[in context]")
-                parts.extend(exp_lines)
-            if avail:
-                if exp_lines:
-                    parts.append("")
-                parts.append("[available] " + ", ".join(avail))
-            body = "\n".join(parts)
-            return (
-                "<context-topics>\n"
-                "RULE: These are compressed topic summaries, not the full conversation.\n"
-                "- For specific facts (names, numbers, dosages, decisions): "
-                "use vc_find_quote — it searches raw text across all topics.\n"
-                "- For broad questions (summarize, put together, plan, walk me through, itinerary): "
-                "use vc_expand_topic to load full conversation detail before answering.\n"
-                "- For deeper understanding of a topic: "
-                "use vc_expand_topic to load the full conversation text.\n"
-                "- To free budget after expanding: use vc_collapse_topic.\n"
-                "- Never claim you don't remember without searching first.\n"
-                "- Never give a vague answer when you could expand a topic for specifics.\n\n"
-                f"{body}\n"
-                "</context-topics>"
-            )
-
-        hint = _assemble(expanded_lines, available_entries)
-
-        if self._token_counter(hint) > max_tokens:
-            while available_entries and self._token_counter(hint) > max_tokens:
-                available_entries.pop()
-                hint = _assemble(expanded_lines, available_entries)
-            while expanded_lines and self._token_counter(hint) > max_tokens:
-                expanded_lines.pop()
-                hint = _assemble(expanded_lines, available_entries)
-
-        return hint
-
-    def _build_default_hint(self, tag_summaries: list) -> str:
-        """Build simple topic list (no paging)."""
-        max_tokens = self.config.assembler.context_hint_max_tokens
-
-        lines: list[str] = []
-        for ts in tag_summaries:
-            turn_count = len(ts.source_turn_numbers)
-            desc = ts.description or ts.summary[:60].rstrip()
-            if not ts.description and len(ts.summary) > 60:
-                desc += "..."
-            lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
-
-        body = "\n".join(lines)
-        hint = (
-            "<context-topics>\n"
-            "Prior conversation topics available for recall:\n"
-            f"{body}\n"
-            "</context-topics>"
+        return build_autonomous_hint(
+            tag_summaries=tag_summaries,
+            working_set=self._working_set,
+            budget=self.config.assembler.tag_context_max_tokens,
+            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
+            token_counter=self._token_counter,
+            calculate_depth_tokens=self._calculate_depth_tokens,
         )
 
-        if self._token_counter(hint) > max_tokens:
-            while lines and self._token_counter(hint) > max_tokens:
-                lines.pop()
-                body = "\n".join(lines)
-                hint = (
-                    "<context-topics>\n"
-                    "Prior conversation topics available for recall:\n"
-                    f"{body}\n"
-                    "</context-topics>"
-                )
+    def _build_supervised_hint(self, tag_summaries: list) -> str:
+        return build_supervised_hint(
+            tag_summaries=tag_summaries,
+            working_set=self._working_set,
+            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
+            token_counter=self._token_counter,
+        )
 
-        return hint
+    def _build_default_hint(self, tag_summaries: list) -> str:
+        return build_default_hint(
+            tag_summaries=tag_summaries,
+            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
+            token_counter=self._token_counter,
+        )
 
     def _resolve_paging_mode(self, model_name: str = "") -> str:
         """Check if *model_name* matches any ``autonomous_models`` entry.
@@ -1196,193 +1020,26 @@ class VirtualContextEngine:
         return None
 
     def _get_embed_fn(self):
-        """Lazy-load the embedding function for the context bleed gate.
-
-        Returns a callable that takes a list of strings and returns a list of
-        float vectors, or ``None`` if sentence-transformers is not installed.
-        """
-        if self._embed_fn is _EMBED_NOT_LOADED:
-            try:
-                import os
-                import sys
-
-                from sentence_transformers import SentenceTransformer
-
-                model_name = self.config.retriever.embedding_model
-
-                # Suppress progress bar output during model loading.
-                # When running in subprocess environments (e.g. benchmark Task
-                # agents), stderr may be a pipe that can break — causing
-                # BrokenPipeError that propagates out of model loading.
-                old_stderr = sys.stderr
-                try:
-                    sys.stderr = open(os.devnull, "w")
-                    model = SentenceTransformer(model_name)
-                finally:
-                    try:
-                        sys.stderr.close()
-                    except Exception:
-                        pass
-                    sys.stderr = old_stderr
-
-                def embed(texts: list[str]) -> list[list[float]]:
-                    return model.encode(
-                        texts, convert_to_numpy=True, show_progress_bar=False,
-                    ).tolist()
-
-                self._embed_fn = embed
-            except ImportError:
-                logger.debug(
-                    "sentence-transformers not installed, context bleed gate disabled"
-                )
-                self._embed_fn = None
-            except Exception:
-                logger.debug(
-                    "Failed to load embedding model, semantic search disabled",
-                    exc_info=True,
-                )
-                self._embed_fn = None
-        return self._embed_fn
+        """Lazy-load the embedding function for the context bleed gate."""
+        return self._semantic.get_embed_fn()
 
     def _embed_and_store_chunks(self, stored: "StoredSegment") -> None:
         """Chunk a segment's full_text, embed, and store vectors."""
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return
-        chunks = _chunk_segment_text(stored.full_text)
-        if not chunks:
-            return
-        try:
-            vectors = embed_fn(chunks)
-        except Exception:
-            logger.debug("Failed to embed chunks for %s", stored.ref)
-            return
-        chunk_embeddings = [
-            ChunkEmbedding(
-                segment_ref=stored.ref,
-                chunk_index=i,
-                text=text,
-                embedding=vec,
-            )
-            for i, (text, vec) in enumerate(zip(chunks, vectors))
-        ]
-        self._store.store_chunk_embeddings(stored.ref, chunk_embeddings)
-        logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
+        self._semantic.embed_and_store_chunks(stored)
 
     def _semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
         """Embedding-based semantic search over stored chunk vectors."""
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return []
-
-        all_chunks = self._store.get_all_chunk_embeddings()
-        if not all_chunks:
-            # Lazy backfill: embed all existing segments if chunks table is empty
-            all_chunks = self._backfill_chunk_embeddings()
-            if not all_chunks:
-                return []
-
-        try:
-            query_vec = embed_fn([query])[0]
-        except Exception:
-            logger.debug("Failed to embed query for semantic search")
-            return []
-
-        # Score all chunks
-        scored: list[tuple[float, ChunkEmbedding]] = []
-        for chunk in all_chunks:
-            sim = _cosine_sim(query_vec, chunk.embedding)
-            if sim >= 0.25:
-                scored.append((sim, chunk))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # Deduplicate by segment_ref (best chunk per segment)
-        seen_refs: set[str] = set()
-        results: list[QuoteResult] = []
-        for sim, chunk in scored:
-            if chunk.segment_ref in seen_refs:
-                continue
-            seen_refs.add(chunk.segment_ref)
-            # Look up segment tags and metadata
-            seg = self._store.get_segment(chunk.segment_ref)
-            results.append(QuoteResult(
-                text=chunk.text,
-                tag=seg.primary_tag if seg else "",
-                segment_ref=chunk.segment_ref,
-                tags=seg.tags if seg else [],
-                match_type="semantic",
-                similarity=round(sim, 3),
-                session_date=seg.metadata.session_date if seg else "",
-            ))
-            if len(results) >= max_results:
-                break
-
-        return results
+        return self._semantic.semantic_search(query, max_results)
 
     def _backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
         """One-time backfill: embed all existing segments' full_text."""
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return []
-
-        all_tags = self._store.get_all_tags()
-        if not all_tags:
-            return []
-
-        logger.info("Backfilling chunk embeddings for semantic search...")
-        all_chunks: list[ChunkEmbedding] = []
-        for tag_stat in all_tags:
-            segments = self._store.get_segments_by_tags([tag_stat.tag], limit=100)
-            for seg in segments:
-                chunks = _chunk_segment_text(seg.full_text)
-                if not chunks:
-                    continue
-                try:
-                    vectors = embed_fn(chunks)
-                except Exception:
-                    continue
-                chunk_embeddings = [
-                    ChunkEmbedding(
-                        segment_ref=seg.ref,
-                        chunk_index=i,
-                        text=text,
-                        embedding=vec,
-                    )
-                    for i, (text, vec) in enumerate(zip(chunks, vectors))
-                ]
-                self._store.store_chunk_embeddings(seg.ref, chunk_embeddings)
-                all_chunks.extend(chunk_embeddings)
-
-        logger.info("Backfilled %d chunk embeddings", len(all_chunks))
-        return all_chunks
+        return self._semantic.backfill_chunk_embeddings()
 
     def _context_is_relevant(
         self, current_text: str, context_pairs: list[str],
     ) -> bool:
-        """Check if current turn is semantically similar to the most recent context pair.
-
-        Compares the current turn's combined text against the last user+assistant
-        pair in the collected context using embedding cosine similarity.
-        Returns ``True`` (pass context) when similarity >= threshold, or when
-        embeddings are unavailable (graceful degradation).
-        """
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return True
-
-        # Compare against the most recent pair in context
-        if len(context_pairs) >= 2:
-            recent = context_pairs[-2] + " " + context_pairs[-1]
-        else:
-            recent = " ".join(context_pairs)
-
-        embeddings = embed_fn([current_text[:2000], recent[:2000]])
-        sim = _cosine_sim(embeddings[0], embeddings[1])
-        threshold = self.config.tag_generator.context_bleed_threshold
-
-        logger.debug("Context bleed gate: sim=%.3f threshold=%.3f", sim, threshold)
-        return sim >= threshold
+        """Check if current turn is semantically similar to the most recent context pair."""
+        return self._semantic.context_is_relevant(current_text, context_pairs)
 
     def _get_recent_context(
         self, history: list[Message], n_pairs: int, exclude_last: int = 2,
@@ -1744,166 +1401,24 @@ class VirtualContextEngine:
     # ------------------------------------------------------------------
 
     def expand_topic(self, tag: str, depth: str = "full") -> dict:
-        """Expand a topic to deeper detail in the working set.
-
-        Returns dict with tag, depth, tokens_added, tokens_evicted, evicted_tags.
-        """
-        if not self.config.paging.enabled:
-            return {"error": "paging not enabled"}
-
-        try:
-            target_depth = DepthLevel(depth)
-        except ValueError:
-            return {"error": f"invalid depth: {depth}"}
-
-        if target_depth == DepthLevel.NONE:
-            return self.collapse_topic(tag, "none")
-
-        # Calculate token cost at target depth
-        tokens_at_depth = self._calculate_depth_tokens(tag, target_depth)
-        if tokens_at_depth == 0:
-            return {"error": f"no stored content for tag: {tag}"}
-
-        # Current working set total
-        current_total = sum(ws.tokens for ws in self._working_set.values())
-        current_tag_tokens = self._working_set[tag].tokens if tag in self._working_set else 0
-        delta = tokens_at_depth - current_tag_tokens
-        budget = self.config.assembler.tag_context_max_tokens
-
-        # Auto-evict if over budget
-        evicted_tags: list[str] = []
-        tokens_evicted = 0
-        if self.config.paging.auto_evict and current_total + delta > budget:
-            evicted_tags, tokens_evicted = self._auto_evict(
-                needed=current_total + delta - budget,
-                exclude_tag=tag,
-            )
-
-        # Check if expansion fits after eviction
-        new_total = current_total + delta - tokens_evicted
-        if new_total > budget:
-            return {
-                "error": "insufficient budget",
-                "tag": tag,
-                "needed": tokens_at_depth,
-                "available": budget - (current_total - current_tag_tokens - tokens_evicted),
-            }
-
-        # Update working set
-        turn = max((ws.last_accessed_turn for ws in self._working_set.values()), default=0)
-        self._working_set[tag] = WorkingSetEntry(
-            tag=tag,
-            depth=target_depth,
-            tokens=tokens_at_depth,
-            last_accessed_turn=turn + 1,
-        )
-
-        return {
-            "tag": tag,
-            "depth": target_depth.value,
-            "tokens_added": delta,
-            "tokens_evicted": tokens_evicted,
-            "evicted_tags": evicted_tags,
-        }
+        """Expand a topic to deeper detail in the working set."""
+        return self._paging.expand_topic(tag, depth)
 
     def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
         """Collapse a topic to shallower detail. Returns freed tokens."""
-        if not self.config.paging.enabled:
-            return {"error": "paging not enabled"}
-
-        try:
-            target_depth = DepthLevel(depth)
-        except ValueError:
-            return {"error": f"invalid depth: {depth}"}
-
-        if tag not in self._working_set:
-            return {"tag": tag, "depth": target_depth.value, "tokens_freed": 0}
-
-        old_tokens = self._working_set[tag].tokens
-
-        if target_depth == DepthLevel.NONE:
-            del self._working_set[tag]
-            return {"tag": tag, "depth": "none", "tokens_freed": old_tokens}
-
-        new_tokens = self._calculate_depth_tokens(tag, target_depth)
-        self._working_set[tag].depth = target_depth
-        self._working_set[tag].tokens = new_tokens
-
-        return {
-            "tag": tag,
-            "depth": target_depth.value,
-            "tokens_freed": max(0, old_tokens - new_tokens),
-        }
+        return self._paging.collapse_topic(tag, depth)
 
     def get_working_set_summary(self) -> dict:
         """Return current working set with budget info."""
-        budget = self.config.assembler.tag_context_max_tokens
-        used = sum(ws.tokens for ws in self._working_set.values())
-        entries = [
-            {
-                "tag": ws.tag,
-                "depth": ws.depth.value,
-                "tokens": ws.tokens,
-                "last_accessed_turn": ws.last_accessed_turn,
-            }
-            for ws in sorted(self._working_set.values(), key=lambda w: w.last_accessed_turn, reverse=True)
-        ]
-        return {
-            "budget": budget,
-            "used": used,
-            "available": budget - used,
-            "entries": entries,
-        }
+        return self._paging.get_working_set_summary()
 
     def _calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
         """Calculate token cost for a tag at a given depth level."""
-        if depth == DepthLevel.NONE:
-            return 0
-
-        if depth == DepthLevel.SUMMARY:
-            ts = self._store.get_tag_summary(tag)
-            return ts.summary_tokens if ts else 0
-
-        # SEGMENTS or FULL: need stored segments
-        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
-        if not segments:
-            return 0
-
-        if depth == DepthLevel.SEGMENTS:
-            return sum(s.summary_tokens for s in segments)
-        else:  # FULL
-            return sum(s.full_tokens or self._token_counter(s.full_text) for s in segments)
+        return self._paging.calculate_depth_tokens(tag, depth)
 
     def _auto_evict(self, needed: int, exclude_tag: str = "") -> tuple[list[str], int]:
-        """Auto-evict coldest topics to free `needed` tokens.
-
-        Returns (evicted_tag_names, total_tokens_freed).
-        """
-        # Sort by last_accessed_turn ascending (coldest first)
-        candidates = sorted(
-            ((tag, ws) for tag, ws in self._working_set.items() if tag != exclude_tag),
-            key=lambda x: x[1].last_accessed_turn,
-        )
-
-        evicted: list[str] = []
-        freed = 0
-        for tag, ws in candidates:
-            if freed >= needed:
-                break
-            # Collapse to SUMMARY (not NONE) to keep minimum context
-            summary_tokens = self._calculate_depth_tokens(tag, DepthLevel.SUMMARY)
-            delta = ws.tokens - summary_tokens
-            if delta <= 0:
-                # Already at summary or less, remove entirely
-                freed += ws.tokens
-                del self._working_set[tag]
-            else:
-                freed += delta
-                self._working_set[tag].depth = DepthLevel.SUMMARY
-                self._working_set[tag].tokens = summary_tokens
-            evicted.append(tag)
-
-        return evicted, freed
+        """Auto-evict coldest topics to free `needed` tokens."""
+        return self._paging._auto_evict(needed, exclude_tag)
 
     # ------------------------------------------------------------------
     # Description-aware search supplement for find_quote
@@ -1915,193 +1430,16 @@ class VirtualContextEngine:
         results: list[QuoteResult],
         max_results: int,
     ) -> list[QuoteResult]:
-        """Add results from tags whose descriptions match query terms.
-
-        Scans all tag descriptions for query words.  For tags that match
-        but aren't already represented in *results*, fetches their
-        segments and searches full_text for the best excerpt.  This
-        bridges the vocabulary gap: the compacted description may use
-        words that don't appear in FTS or embedding results.
-        """
-        import re
-        from virtual_context.storage.sqlite import _extract_excerpt
-
-        # Tags already covered by existing results
-        covered_tags: set[str] = set()
-        for qr in results:
-            covered_tags.add(qr.tag)
-
-        # Tokenize query into meaningful words (3+ chars)
-        query_words = [
-            w.lower()
-            for w in re.findall(r"[a-zA-Z']+", query)
-            if len(w) >= 3
-        ]
-        if not query_words:
-            return results
-
-        # Score each tag description by how many query words it contains
-        all_summaries = self._store.get_all_tag_summaries()
-        candidates: list[tuple[str, int, str]] = []  # (tag, score, description)
-        for ts in all_summaries:
-            if ts.tag in covered_tags:
-                continue
-            desc_lower = ts.description.lower() if ts.description else ""
-            if not desc_lower:
-                continue
-            score = sum(1 for w in query_words if w in desc_lower)
-            if score > 0:
-                candidates.append((ts.tag, score, ts.description))
-
-        # Sort by score descending, take top candidates
-        candidates.sort(key=lambda x: -x[1])
-        slots = max_results - len(results)
-        if slots <= 0:
-            return results
-
-        for tag, _score, _desc in candidates[:slots]:
-            # Fetch segments for this tag and search their full_text
-            segments = self._store.get_segments_by_tags([tag], limit=5)
-            best: QuoteResult | None = None
-            best_score = 0
-            for seg in segments:
-                if not seg.full_text:
-                    continue
-                text_lower = seg.full_text.lower()
-                seg_score = sum(1 for w in query_words if w in text_lower)
-                if seg_score > best_score:
-                    best_score = seg_score
-                    excerpt = _extract_excerpt(
-                        seg.full_text, query, context_chars=200
-                    )
-                    meta = seg.metadata or SegmentMetadata(turn_count=0)
-                    best = QuoteResult(
-                        text=excerpt,
-                        tag=seg.primary_tag,
-                        segment_ref=seg.ref,
-                        tags=seg.tags,
-                        match_type="description",
-                        session_date=meta.session_date,
-                    )
-            if best is not None:
-                results.append(best)
-                covered_tags.add(tag)
-
-        return results
+        """Add results from tags whose descriptions match query terms."""
+        return _supplement_from_descriptions(self._store, query, results, max_results)
 
     def find_quote(
         self,
         query: str,
         max_results: int = 5,
     ) -> dict:
-        """Search stored conversation text for a specific phrase or keyword.
-
-        Searches across all segments' full_text regardless of tags.
-        Returns FTS matches supplemented by semantic (embedding) search
-        to surface excerpts that use different vocabulary.  Works even when
-        paging is disabled — this is a pure search tool with no working-set
-        side effects.
-        """
-        if not query.strip():
-            return {"error": "empty query"}
-
-        results = self._store.search_full_text(query, limit=max_results)
-
-        # Always run semantic search to supplement FTS — surfaces chunks
-        # that match semantically but use different words, and may return
-        # different excerpts from the same segment FTS already found.
-        remaining = max_results - len(results)
-        if remaining > 0:
-            semantic = self._semantic_search(query, max_results=remaining)
-            results.extend(semantic)
-
-        # ---- Description-aware search ----
-        # Scan tag descriptions for query terms.  Tags whose descriptions
-        # match but aren't already represented in results get a
-        # supplementary search on their segments' full_text.
-        results = self._supplement_from_descriptions(query, results, max_results)
-
-        if not results:
-            return {
-                "query": query,
-                "found": False,
-                "results": [],
-                "message": f"No matches for '{query}' in stored conversation history.",
-            }
-
-        # ---- Merge snippets from the same session ----
-        # Group results by session_date so the reader sees one coherent
-        # block per session instead of fragmented independent snippets.
-        from collections import OrderedDict
-
-        session_groups: OrderedDict[str, list[QuoteResult]] = OrderedDict()
-        no_session: list[QuoteResult] = []
-        for qr in results:
-            key = qr.session_date.strip() if qr.session_date else ""
-            if key:
-                session_groups.setdefault(key, []).append(qr)
-            else:
-                no_session.append(qr)
-
-        formatted = []
-
-        for session_date, group in session_groups.items():
-            if len(group) == 1:
-                # Single hit for this session — emit as-is
-                qr = group[0]
-                entry: dict = {
-                    "excerpt": qr.text,
-                    "topic": qr.tag,
-                    "segment_ref": qr.segment_ref,
-                    "session": session_date,
-                }
-                if qr.match_type == "semantic":
-                    entry["match_type"] = "semantic"
-                    entry["similarity"] = qr.similarity
-                formatted.append(entry)
-            else:
-                # Multiple hits from the same session — merge excerpts
-                # Collect unique excerpts (deduplicate exact matches)
-                seen_texts: set[str] = set()
-                merged_parts: list[str] = []
-                all_refs: list[str] = []
-                topics: list[str] = []
-                for qr in group:
-                    norm = qr.text.strip()
-                    if norm not in seen_texts:
-                        seen_texts.add(norm)
-                        merged_parts.append(qr.text.strip())
-                    if qr.tag not in topics:
-                        topics.append(qr.tag)
-                    if qr.segment_ref not in all_refs:
-                        all_refs.append(qr.segment_ref)
-
-                entry = {
-                    "excerpt": "\n---\n".join(merged_parts),
-                    "topic": ", ".join(topics),
-                    "segment_refs": all_refs,
-                    "session": session_date,
-                    "merged_count": len(merged_parts),
-                }
-                formatted.append(entry)
-
-        # Append results with no session date individually
-        for qr in no_session:
-            entry = {
-                "excerpt": qr.text,
-                "topic": qr.tag,
-                "segment_ref": qr.segment_ref,
-            }
-            if qr.match_type == "semantic":
-                entry["match_type"] = "semantic"
-                entry["similarity"] = qr.similarity
-            formatted.append(entry)
-
-        return {
-            "query": query,
-            "found": True,
-            "results": formatted,
-        }
+        """Search stored conversation text for a specific phrase or keyword."""
+        return _find_quote(self._store, self._semantic, query, max_results)
 
     # ------------------------------------------------------------------
     # query_with_tools: sync tool loop for non-proxy callers

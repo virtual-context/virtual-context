@@ -10,17 +10,7 @@ import yaml
 
 from ..core.store import ContextStore
 from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
-
-
-def _dt_to_str(dt: datetime) -> str:
-    return dt.isoformat()
-
-
-def _str_to_dt(s: str) -> datetime:
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 
 def _segment_to_index_entry(seg: StoredSegment) -> dict:
@@ -175,21 +165,6 @@ def _segment_to_summary(seg: StoredSegment) -> StoredSummary:
         start_timestamp=seg.start_timestamp,
         end_timestamp=seg.end_timestamp,
     )
-
-
-def _extract_excerpt(text: str, query: str, context_chars: int = 200) -> str:
-    """Extract text around the first occurrence of query."""
-    idx = text.lower().find(query.lower())
-    if idx == -1:
-        return text[:context_chars * 2]
-    start = max(0, idx - context_chars)
-    end = min(len(text), idx + len(query) + context_chars)
-    excerpt = text[start:end]
-    if start > 0:
-        excerpt = "..." + excerpt
-    if end < len(text):
-        excerpt = excerpt + "..."
-    return excerpt
 
 
 class FilesystemStore(ContextStore):

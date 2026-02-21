@@ -7,12 +7,12 @@ import logging
 import re
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
+from ..patterns import DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
     KeywordTagConfig,
     LLMProvider,
     TagGeneratorConfig,
     TagResult,
-    DEFAULT_TEMPORAL_PATTERNS,
 )
 from .cost_tracker import CostTracker
 from .tag_canonicalizer import TagCanonicalizer

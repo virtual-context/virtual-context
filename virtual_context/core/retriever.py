@@ -10,9 +10,8 @@ import time
 from .store import ContextStore
 from .tag_generator import TagGenerator, detect_broad_heuristic, detect_temporal_heuristic
 from .turn_tag_index import TurnTagIndex
+from ..patterns import DEFAULT_BROAD_PATTERNS, DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
-    DEFAULT_BROAD_PATTERNS,
-    DEFAULT_TEMPORAL_PATTERNS,
     Message,
     RetrievalCostReport,
     RetrievalResult,

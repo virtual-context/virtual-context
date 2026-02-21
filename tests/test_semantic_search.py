@@ -233,12 +233,12 @@ class TestFindQuoteSemanticFallback:
         engine = _make_engine(tmp_path)
         engine._store.store_segment(_make_segment())
 
-        engine._semantic_search = MagicMock(return_value=[])
+        engine._semantic.semantic_search = MagicMock(return_value=[])
 
         # FTS finds 1 result, max_results=5, so semantic runs for remaining 4
         result = engine.find_quote("arrived", max_results=5)
         assert result["found"] is True
-        engine._semantic_search.assert_called_once_with("arrived", max_results=4)
+        engine._semantic.semantic_search.assert_called_once_with("arrived", max_results=4)
 
     def test_semantic_fallback_on_fts_miss(self, tmp_path):
         """FTS misses vocabulary mismatch, semantic finds it."""
@@ -255,13 +255,13 @@ class TestFindQuoteSemanticFallback:
             match_type="semantic",
             similarity=0.87,
         )
-        engine._semantic_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_search = MagicMock(return_value=[semantic_result])
 
         result = engine.find_quote("remote shutter release received")
         assert result["found"] is True
         assert result["results"][0]["match_type"] == "semantic"
         assert result["results"][0]["similarity"] == 0.87
-        engine._semantic_search.assert_called_once()
+        engine._semantic.semantic_search.assert_called_once()
 
     def test_no_embeddings_graceful(self, tmp_path):
         """No sentence-transformers → no crash, just returns not found."""
@@ -286,7 +286,7 @@ class TestFindQuoteSemanticFallback:
             match_type="semantic",
             similarity=0.75,
         )
-        engine._semantic_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_search = MagicMock(return_value=[semantic_result])
 
         result = engine.find_quote("nonexistent_fts_term")
         assert result["found"] is True
