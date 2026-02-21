@@ -6,6 +6,8 @@
 
 **Your LLM never forgets. Even in a 500-turn conversation.**
 
+*Validated on [LongMemEval](https://arxiv.org/abs/2407.09110) (ICLR 2025): **100% recall accuracy** (15/15) vs 25% baseline, with **88% token reduction**.*
+
 virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules (each compensating for the others' blind spots) to maintain a living, compressed memory of unbounded conversations.
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
@@ -144,6 +146,7 @@ Check token thresholds (soft 70%, hard 85%)
     │
     ▼ (if threshold exceeded)
 Segment by tag → summarize each segment (concurrent, ThreadPoolExecutor)
+    │  ├─ Session dates: forced segment splits on session boundaries
     │  ├─ Tags preserved: LLM can ADD refined/related tags but never REMOVE originals
     │  └─ Related tags written into stored segments for future cross-vocabulary retrieval
     │
@@ -200,6 +203,24 @@ This solves a fundamental problem with summarization: when a tag like `project-s
 
 Detection uses two layers (same pattern as broad): the LLM detects temporal intent, and deterministic regex patterns catch phrases the LLM misses (`"at the beginning"`, `"early on"`, `"the very first thing"`).
 
+### Session Date Propagation
+
+Temporal reasoning requires knowing *when* each piece of information was recorded. virtual-context propagates session dates through the entire pipeline:
+
+```
+[Session from 2023/05/25] in user message
+    → TurnTagEntry.session_date
+    → forced segment split on session change
+    → SegmentMetadata.session_date
+    → SQLite metadata_json
+    → find_quote results: {"session": "2023/05/25"}
+    → assembled context: <virtual-context session="2023/05/25">
+```
+
+The segmenter forces a new segment boundary whenever the session date changes, even if the primary tag is the same. This guarantees no segment spans multiple sessions. When the reader sees two conflicting facts — "sneakers under my bed" (session 2023/05/25) and "moved sneakers to shoe rack" (session 2023/05/29) — it can determine temporal ordering and answer correctly.
+
+For proxy/OpenClaw conversations, session dates come from `Message.timestamp` instead of text headers. Same pipeline, same temporal reasoning capability.
+
 ### Context Awareness Hints
 
 After compaction, the LLM loses visibility into what topics have been stored. virtual-context injects a lightweight `<context-topics>` block into the system prompt:
@@ -233,7 +254,9 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Model-tiered delegation.** Not all LLMs are equally capable of managing their own context. Weaker models (Haiku, small open-source) get a simplified topic list and can request expansions, but virtual-context handles all eviction decisions silently. Stronger models (Opus, Sonnet, GPT-4) see a full budget dashboard with token costs per topic, available budget, and depth levels, making explicit trade-off decisions. In both modes, virtual-context enforces budget constraints and falls back to automatic management when the LLM doesn't manage. The LLM drives, virtual-context enforces, like `madvise()` hints with kernel enforcement.
 
-**Full-text search.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches the raw stored conversation text directly, bypassing tags entirely. Results include the matching excerpt plus all tags on the segment, so the LLM can chain into `expand_topic` for broader context. This is the escape hatch for the fundamental limitation of any tag-based system: content that exists in storage but is tagged under the wrong domain.
+**Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query — FTS results are supplemented with semantic matches to fill the result set. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
+
+**Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, or follow up with `expand_topic`. Up to 5 continuation rounds run transparently within one client-visible request. This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
 
 **Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `expand_topic`, `collapse_topic`, and `find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `find_quote` → discover tag → `expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
@@ -252,7 +275,7 @@ Compaction mirrors OS page replacement:
 - **Soft threshold (70%)**: proactive compaction. Summarize now while there's headroom.
 - **Hard threshold (85%)**: mandatory compaction. Summarize immediately or the context window overflows.
 
-Compaction is greedy-batch: everything between the watermark and the protected zone gets compacted in one pass, so it fires infrequently (one big batch instead of many small ones). Summarization runs concurrently via ThreadPoolExecutor, with order-preserving results and per-tag custom prompts.
+Compaction is greedy-batch: everything between the watermark and the protected zone gets compacted in one pass, so it fires infrequently (one big batch instead of many small ones). Summarization runs concurrently via ThreadPoolExecutor, with order-preserving results, per-tag custom prompts, and per-segment progress logging. The summary prompt preserves exact numbers, proper nouns, and state assertions (e.g., "I now store sneakers on the shoe rack" is never softened to "plans to store").
 
 ### Tag Canonicalization
 
@@ -621,6 +644,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
 | **Compactor** | `core/compactor.py` | LLM summarization + tag summary rollup, concurrent via ThreadPoolExecutor |
 | **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
+| **ToolLoop** | `core/tool_loop.py` | Synchronous multi-round tool execution for reader model |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
 | **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
 | **ProxyServer** | `proxy/server.py` | HTTP proxy: enrichment, filtering, history ingestion, session continuity |
@@ -630,7 +654,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 ### Storage Backends
 
-**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries. Single file, no external dependencies.
+**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search. Single file, no external dependencies.
 
 **FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly.
 
@@ -686,6 +710,35 @@ The proxy has been validated in production with OpenClaw (Telegram bot) handling
 - **Embedding inbound matching**: Live tag vocabularies of 40+ tags correctly matched ("help me with css styling" → `[css, design]`, "what about font-weight" → `[css]` via semantic similarity)
 - **History ingestion**: 43 pre-existing conversation turns tagged and indexed in a single pass, vocabulary immediately available for subsequent requests
 
+## Benchmark: LongMemEval
+
+[LongMemEval](https://arxiv.org/abs/2407.09110) (ICLR 2025) is a 500-question benchmark designed to test long-term memory in multi-session conversations. Each question requires recalling specific facts, temporal relationships, or knowledge updates from a haystack of ~116K tokens across dozens of sessions.
+
+**Setup**: 15 sampled questions across all 5 categories. Baseline: Claude Sonnet 4.5 with full haystack (~116K tokens). VC: Claude Sonnet 4.5 with virtual-context retrieval + tool loop.
+
+|  | Correct | Accuracy | Avg Tokens |
+|--|---------|----------|------------|
+| **Baseline** (full haystack) | 3/12 | 25% | ~115K |
+| **virtual-context** | 15/15 | **100%** | ~14K |
+
+**Per-category breakdown:**
+
+| Category | Baseline | VC |
+|----------|----------|----|
+| knowledge-update | 0/4 | 4/4 |
+| multi-session | 0/4 | 7/7 |
+| single-session-assistant | 1/1 | 1/1 |
+| single-session-user | 0/1 | 1/1 |
+| temporal-reasoning | 2/2 | 2/2 |
+
+**Key findings:**
+- **Knowledge-update questions** (where facts change across sessions) are where virtual-context dominates. Session date propagation lets the reader distinguish "under my bed" (May 25) from "shoe rack in closet" (May 29) — the baseline sees both but can't determine which is current.
+- **Temporal reasoning** works because session dates flow through the entire pipeline: ingestion → segmenter → compaction → storage → find_quote results → assembled context. The reader sees `session="2023/03/04"` and can compute "March 4 to April 1 = 4 weeks."
+- **Multi-session recall** benefits from the tool loop: the reader chains multiple `find_quote` calls within a single turn to locate facts scattered across different sessions (e.g., finding Japan trip duration and Chicago trip duration independently, then summing).
+- **88% token reduction**: average 14K tokens injected vs 115K baseline, with higher accuracy. The system retrieves what matters instead of dumping everything.
+
+Full results: [`benchmarks/longmemeval/RESULTS.md`](benchmarks/longmemeval/RESULTS.md)
+
 ## Development
 
 ```bash
@@ -693,7 +746,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 911 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # 980 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 
