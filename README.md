@@ -229,7 +229,7 @@ The inbound tagger drives retrieval and filtering (what stored context to inject
 
 "What did we discuss earlier?" "Can you summarize everything?" "What did you say about image storage?"
 
-These queries don't map cleanly to specific tags. Instead of relying on a `broad` flag, virtual-context now uses an MCP-style tool call:
+These queries don't map cleanly to specific tags. virtual-context uses an MCP-style tool call:
 
 - `vc_recall_all` (proxy tool loop) / `recall_all` (MCP server) loads **all** tag summaries
 - Results are bounded by the configured tag-context token budget
@@ -241,7 +241,7 @@ This eliminates the failure mode where the LLM says "I don't recall discussing t
 
 "Going back to the very beginning, what were the key decisions?" "What did we set up with tokens at the start?" "Between June and July, what changed about indexing?"
 
-These queries reference a *position in time*, not just a topic. Instead of relying on an automatic temporal retrieval branch, virtual-context uses an explicit tool call:
+These queries reference a *position in time*, not just a topic. virtual-context uses an explicit tool call:
 
 - `vc_remember_when` (proxy tool loop) / `remember_when` (MCP server) combines semantic query + structured time range
 - Time ranges use relative presets (e.g. `last_week`, `last_month`) or explicit date bounds (`between_dates`)
@@ -352,6 +352,17 @@ An LLM pass examines all turns under the broad tag and determines whether they s
 `troubleshooting` appeared on 34/143 turns (23.8%), spanning browser connectivity issues, restaurant lookups, booking platform interaction, and credential access. Split into `browser-connection-troubleshooting` (11), `restaurant-lookup-troubleshooting` (7), `booking-platform-troubleshooting` (7), `credential-access-troubleshooting` (7).
 
 This is the second emergent property of the system. Vocabulary convergence (the first) naturally collapses synonyms into canonical tags. Tag splitting pushes unrelated concepts apart. Together they create a two-sided pressure (convergence pulls related concepts together, splitting pushes unrelated concepts apart) and the vocabulary evolves toward maximum discriminative power without manual curation.
+
+### Emergent Behaviors
+
+- **Vocabulary convergence**: Tag reuse and canonicalization naturally collapse synonyms into stable tag vocabularies over long sessions.
+- **Automatic tag refinement**: High-frequency broad tags split into narrower sub-tags, increasing retrieval precision without manual taxonomy work.
+- **Tool-first recall loops**: Models tend to converge on `vc_find_quote`/`vc_recall_all`/`vc_remember_when` → `vc_expand_topic` sequences for multi-step recall.
+- **Quote-then-context chaining**: Exact snippets from `find_quote` naturally route follow-up expansion to the right topic context.
+- **Session-date anchoring**: Time-scoped recall (`vc_remember_when`) biases responses toward chronology-correct evidence.
+- **Vocabulary entropy reduction**: Canonicalization + tag feedback lowers random tag drift and improves cross-turn consistency.
+- **Budget-shaped recall selection**: Budget-aware assembly consistently favors high-value context under tight token ceilings.
+- **Compaction survivorship effects**: Frequently reinforced facts stay highly retrievable, while low-signal details trend toward summary-level recall.
 
 Split tags are registered as aliases via TagCanonicalizer, so historical queries against the old tag still resolve. New sub-tags enter the vocabulary feedback loop immediately. The splitter never reuses existing tag names (which would cause cascading splits); it always creates new compound tags.
 
