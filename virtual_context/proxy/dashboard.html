@@ -2115,7 +2115,6 @@
     html += '</div>';
     // Tagging
     html += '<div class="settings-section">' + sectionHeader('Tagging', 'tagging');
-    html += toggleRow('tagging', 'broad_heuristic_enabled', 'Broad Heuristic', 'Regex fallback to catch broad queries the LLM missed', data.tagging.broad_heuristic_enabled);
     html += toggleRow('tagging', 'temporal_heuristic_enabled', 'Temporal Heuristic', 'Regex fallback to catch temporal queries the LLM missed', data.tagging.temporal_heuristic_enabled);
     html += '</div>';
     // Retrieval

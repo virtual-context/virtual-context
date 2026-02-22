@@ -42,26 +42,6 @@ Rules:
   "from now on ...", "don't sugarcoat", "be honest with me".
   Do NOT tag as "rule": personal opinions ("I hate running"), feelings ("I'm
   overwhelmed"), desires ("I want to learn X"), questions, or topic switches.
-- Set "broad" to true ONLY when the query asks for synthesis, summary, or
-  patterns across MULTIPLE previously-discussed topics. The key signal is
-  that answering requires context from several different conversations, not
-  just finding one specific past discussion.
-
-  broad: true examples (needs many topics):
-  - "Looking back at everything we've discussed, what would you change?"
-  - "What patterns do you see across all of this?"
-  - "Summarize what we've covered"
-  - "How does everything fit into a 6-month roadmap?"
-  - "What's the most important thing from each thread?"
-
-  broad: false examples (specific, even if referencing the past):
-  - "What did you say about X earlier?" (looking for ONE topic)
-  - "Remind me what we decided about the schema" (specific topic)
-  - "How do I implement pagination?" (specific question)
-  - "Can you summarize the auth approach?" (one topic, not everything)
-  - "What was the knee issue again?" (specific back-reference)
-  - "How does feature X work for screen readers?" (specific cross-reference)
-  - "Would that approach work at scale?" (follow-up to current topic)
 - Set "temporal" to true when the query references a specific time position in
   the conversation — "the first thing we discussed", "at the beginning",
   "early on", "going way back", "when we first started". False for general
@@ -99,7 +79,7 @@ Rules:
   "tell me about") is framing — the subject is what matters for retrieval.
   Even if the assistant's response is philosophical or reflective, always include
   at least one tag for the concrete noun or topic the user asked about.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - The "primary" tag is the single most relevant tag
 - No markdown fences, no extra text
 """
@@ -110,14 +90,13 @@ You are a semantic tagger. Generate {min_tags}-{max_tags} short, lowercase tags 
 Rules:
 - Prefer single-word tags ("database", "fitness"). Hyphenate only when ambiguous ("machine-learning").
 - Reuse existing tags when the topic matches. Create new tags only for genuinely new topics.
-- Set "broad" to true for vague/broad/retrospective/recall queries, false otherwise.
 - Set "temporal" to true when the query references a time position ("the first thing", "at the beginning", "early on").
 - Ignore channel metadata in messages (e.g. "[Telegram ...]", "[message_id: NNN]"). Tag only actual content.
 - Do NOT generate tags about the communication medium itself (e.g. "messaging", "threading", "chat"). Tag substantive topics only.
 - For very short/trivial messages, return fewer than {min_tags} tags if the content does not warrant more.
 - Tag the concrete subject, not conversational framing. "What do you think of trees?" → "trees", NOT "introspection".
 - Generate 2-5 related_tags: alternate words for future recall.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "broad": false, "temporal": false, "related_tags": ["alt1", "alt2"]}}
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"]}}
 - No markdown fences, no extra text
 """
 
@@ -135,23 +114,15 @@ class TagGenerator(Protocol):
     ) -> TagResult: ...
 
 
-def _compile_broad_patterns(patterns: list[str]) -> list[re.Pattern]:
-    """Compile broad-detection regex patterns, skipping invalid ones."""
+def _compile_temporal_patterns(patterns: list[str]) -> list[re.Pattern]:
+    """Compile temporal-detection regex patterns, skipping invalid ones."""
     compiled = []
     for pattern in patterns:
         try:
             compiled.append(re.compile(pattern, re.IGNORECASE))
         except re.error:
-            logger.warning(f"Invalid broad_pattern regex, skipping: {pattern}")
+            logger.warning(f"Invalid temporal_pattern regex, skipping: {pattern}")
     return compiled
-
-
-def detect_broad_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
-    """Deterministic broad-query detection via regex patterns."""
-    for pattern in patterns:
-        if pattern.search(text):
-            return True
-    return False
 
 
 def detect_temporal_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
@@ -179,8 +150,7 @@ class LLMTagGenerator:
         self._canonicalizer = canonicalizer
         self._cost_tracker = cost_tracker
         self._embed_fn_factory = embed_fn_factory
-        self._broad_patterns = _compile_broad_patterns(config.broad_patterns)
-        self._temporal_patterns = _compile_broad_patterns(config.temporal_patterns)
+        self._temporal_patterns = _compile_temporal_patterns(config.temporal_patterns)
 
     def generate_tags(
         self, text: str, existing_tags: list[str] | None = None,
@@ -216,11 +186,6 @@ class LLMTagGenerator:
                 primary="_general",
                 source="fallback",
             )
-
-        # Deterministic override: catch broad queries the LLM missed
-        if self.config.broad_heuristic_enabled and not result.broad and detect_broad_heuristic(text, self._broad_patterns):
-            logger.debug("Broad heuristic override: LLM missed broad, heuristic caught it")
-            result.broad = True
 
         # Deterministic override: catch temporal queries the LLM missed
         if self.config.temporal_heuristic_enabled and not result.temporal and detect_temporal_heuristic(text, self._temporal_patterns):
@@ -382,7 +347,6 @@ class LLMTagGenerator:
 
         tags = data.get("tags", [])
         primary = data.get("primary", "")
-        broad = bool(data.get("broad", False))
         temporal = bool(data.get("temporal", False))
 
         if not tags:
@@ -421,7 +385,6 @@ class LLMTagGenerator:
             tags=tags,
             primary=primary,
             source="llm",
-            broad=broad,
             temporal=temporal,
             related_tags=related_tags,
         )

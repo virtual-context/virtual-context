@@ -110,6 +110,21 @@ class VirtualContextEngine:
         self._segmenter._turn_tag_index = self._turn_tag_index
         self._bootstrap_vocabulary()
 
+    def close(self) -> None:
+        """Release backend resources held by the engine."""
+        store = getattr(self, "_store", None)
+        if store is not None and hasattr(store, "close"):
+            try:
+                store.close()
+            except Exception:
+                logger.debug("Engine store close failed", exc_info=True)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     @property
     def _embed_fn(self):
         """Proxy to SemanticSearchManager's embed function (for test compat)."""
@@ -438,14 +453,14 @@ class VirtualContextEngine:
         core_context = self._assembler.load_core_context()
 
         # Paging: load content at working set depth levels
-        # BUG-014/015/016: broad and temporal queries bypass working set depth.
-        # Broad = overview (all tags at SUMMARY). Temporal = chronological order
-        # from retriever (working set would override with unsorted full_segments).
+        # BUG-015/016: temporal queries bypass working set depth.
+        # Temporal = chronological order from retriever (working set would
+        # override with unsorted full_segments).
         # The working set itself is NOT modified — it applies again on the next
         # normal query.
         ws_param = None
         full_segments_param = None
-        _bypass_ws = retrieval_result.broad or retrieval_result.temporal
+        _bypass_ws = retrieval_result.temporal
         if self.config.paging.enabled and self._working_set and not _bypass_ws:
             ws_param = self._working_set
             # Load full segments for tags at SEGMENTS or FULL depth
@@ -508,7 +523,6 @@ class VirtualContextEngine:
 
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
-        assembled.broad = retrieval_result.broad
         assembled.temporal = retrieval_result.temporal
 
         # Cache for reassemble_context() — used after paging tool execution
@@ -858,12 +872,11 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         current_tags: list[str],
         recent_turns: int | None = None,
-        broad: bool = False,
         temporal: bool = False,
     ) -> list[Message]:
         """Filter conversation history by tag relevance.
 
-        When ``broad`` or ``temporal`` is True, all remaining turns are included
+        When ``temporal`` is True, all remaining turns are included
         without tag-based filtering.  Pre-compaction the full history fits within
         the context window; post-compaction old turns are already gone, so "all
         remaining" is bounded.
@@ -886,9 +899,9 @@ class VirtualContextEngine:
         if total <= protected_count:
             return list(conversation_history)
 
-        # Broad or temporal query — include everything, but skip compacted messages
+        # Temporal query — include everything, but skip compacted messages
         # (summaries from retriever replace them)
-        if broad or temporal:
+        if temporal:
             watermark = getattr(self, "_compacted_through", 0)
             if watermark > 0:
                 return list(conversation_history[watermark:])
@@ -1407,6 +1420,31 @@ class VirtualContextEngine:
     def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
         """Collapse a topic to shallower detail. Returns freed tokens."""
         return self._paging.collapse_topic(tag, depth)
+
+    def recall_all(self) -> dict:
+        """Load all tag summaries. Used by vc_recall_all tool."""
+        tag_summaries = self._store.get_all_tag_summaries()
+        if not tag_summaries:
+            return {"found": False, "message": "No stored summaries yet."}
+        budget = self.config.assembler.tag_context_max_tokens
+        selected = []
+        total_tokens = 0
+        for ts in tag_summaries:
+            if total_tokens + ts.summary_tokens > budget:
+                break
+            selected.append({
+                "tag": ts.tag,
+                "summary": ts.summary,
+                "tokens": ts.summary_tokens,
+                "description": ts.description or "",
+            })
+            total_tokens += ts.summary_tokens
+        return {
+            "found": True,
+            "topics_loaded": len(selected),
+            "total_tokens": total_tokens,
+            "summaries": selected,
+        }
 
     def get_working_set_summary(self) -> dict:
         """Return current working set with budget info."""

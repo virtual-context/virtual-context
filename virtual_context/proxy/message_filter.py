@@ -15,7 +15,6 @@ def filter_body_messages(
     matched_tags: list[str],
     *,
     recent_turns: int = 3,
-    broad: bool = False,
     temporal: bool = False,
     compacted_turn: int = 0,
     fmt: PayloadFormat | None = None,
@@ -88,8 +87,8 @@ def filter_body_messages(
     if total_pairs <= protected or not turn_tag_index.entries:
         return body, 0
 
-    # Broad/temporal: keep everything
-    if broad or temporal:
+    # Temporal: keep everything
+    if temporal:
         return body, 0
 
     tag_set = set(matched_tags)

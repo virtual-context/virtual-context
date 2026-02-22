@@ -259,7 +259,6 @@ class VChatApp(App):
             filtered = self.engine.filter_history(
                 self._conversation_history,
                 current_tags=assembled.matched_tags,
-                broad=assembled.broad,
                 temporal=assembled.temporal,
             )
         else:
@@ -355,7 +354,6 @@ class VChatApp(App):
             compaction=compaction,
             tags=tags,
             primary_tag=primary_tag,
-            broad=assembled.broad,
             temporal=assembled.temporal,
             input_tokens=estimated_tokens,
             turns_in_payload=turns_in_payload,

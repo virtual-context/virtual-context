@@ -621,25 +621,6 @@ class TestFilterBodyMessagesGemini:
         assert "contents" in result
         assert "messages" not in result
 
-    def test_filter_gemini_no_drop_when_broad(self):
-        from virtual_context.proxy.server import _filter_body_messages
-        from virtual_context.core.turn_tag_index import TurnTagIndex
-        from virtual_context.types import TurnTagEntry
-        from virtual_context.proxy.formats import GeminiFormat
-
-        tti = TurnTagIndex()
-        tti.append(TurnTagEntry(turn_number=0, message_hash="h0", tags=["a"], primary_tag="a"))
-
-        body = {"contents": [
-            {"role": "user", "parts": [{"text": "q0"}]},
-            {"role": "model", "parts": [{"text": "a0"}]},
-            {"role": "user", "parts": [{"text": "current"}]},
-        ]}
-
-        result, dropped = _filter_body_messages(
-            body, tti, ["a"], broad=True, fmt=GeminiFormat(),
-        )
-        assert dropped == 0
 
 
 # ---------------------------------------------------------------------------

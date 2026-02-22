@@ -321,7 +321,7 @@ class TestProxyFindQuoteTool:
         tools = vc_tool_definitions()
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
-        assert len(tools) == 3  # expand, collapse, find_quote
+        assert len(tools) == 4  # expand, collapse, find_quote, recall_all
 
     def test_find_quote_tool_schema(self):
         from virtual_context.core.tool_loop import vc_tool_definitions

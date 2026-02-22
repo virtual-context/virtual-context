@@ -54,7 +54,6 @@ def _build_settings_response(cfg) -> dict:
         "tagging": {
             "context_lookback_pairs": cfg.tag_generator.context_lookback_pairs,
             "context_bleed_threshold": cfg.tag_generator.context_bleed_threshold,
-            "broad_heuristic_enabled": cfg.tag_generator.broad_heuristic_enabled,
             "temporal_heuristic_enabled": cfg.tag_generator.temporal_heuristic_enabled,
         },
         "retrieval": {
@@ -565,7 +564,6 @@ def register_dashboard_routes(
             ("compaction", "max_summary_tokens"): (cfg.compactor, "max_summary_tokens", int),
             ("tagging", "context_lookback_pairs"): (cfg.tag_generator, "context_lookback_pairs", int),
             ("tagging", "context_bleed_threshold"): (cfg.tag_generator, "context_bleed_threshold", float),
-            ("tagging", "broad_heuristic_enabled"): (cfg.tag_generator, "broad_heuristic_enabled", bool),
             ("tagging", "temporal_heuristic_enabled"): (cfg.tag_generator, "temporal_heuristic_enabled", bool),
             ("retrieval", "active_tag_lookback"): (cfg.retriever, "active_tag_lookback", int),
             ("retrieval", "anchorless_lookback"): (cfg.retriever, "anchorless_lookback", int),
@@ -766,7 +764,6 @@ async def _replay_worker(
                 filtered = state.engine.filter_history(
                     state.conversation_history,
                     current_tags=assembled.matched_tags,
-                    broad=assembled.broad,
                     temporal=assembled.temporal,
                 )
 
@@ -811,7 +808,6 @@ async def _replay_worker(
                     "api_format": prov["format"],
                     "streaming": False,
                     "tags": assembled.matched_tags,
-                    "broad": assembled.broad,
                     "temporal": assembled.temporal,
                     "context_tokens": context_tokens,
                     "budget": assembled.budget_breakdown,

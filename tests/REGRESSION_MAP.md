@@ -55,16 +55,13 @@ Use `pytest -m regression` to run all regression tests.
   - `test_idf_retrieval.py::TestIDFRanking::test_idf_ranks_rare_tags_higher`
   - `test_idf_retrieval.py::TestIDFRanking::test_idf_with_rare_query_tag_promotes_target`
 
-### BUG-007 — Broad detection misses phrases
+### BUG-007 — Broad detection misses phrases (SUPERSEDED)
 
-- **Symptom**: Queries like "what did you say earlier" not detected as broad
-- **Root cause**: LLM unreliably sets `broad: true`; no deterministic fallback
-- **Fix**: Added regex-based `detect_broad_heuristic()` with configurable patterns
-- **Tests**:
-  - `test_tag_generator.py::TestBroadHeuristic::test_llm_broad_miss_overridden`
-  - `test_broad_query.py::TestBroadRetrieval::test_broad_retrieval_loads_tag_summaries`
-  - `test_retriever.py::TestEmbeddingRetrieverWithInbound::test_broad_heuristic_applied`
-  - `test_proxy.py::TestFilterByTagAndBroad::test_broad_keeps_everything`
+- **Superseded by**: `vc_recall_all` tool — broad detection removed entirely.
+  The LLM now decides when to load all summaries via a tool call instead of
+  regex heuristics. See `test_recall_all.py` for replacement tests.
+- **Original symptom**: Queries like "what did you say earlier" not detected as broad
+- **Original fix**: regex-based `detect_broad_heuristic()` (removed)
 
 ### BUG-008 — Compaction dilutes early detail (temporal queries)
 
@@ -314,13 +311,12 @@ Use `pytest -m regression` to run all regression tests.
 | `test_headless.py` | BUG-001 |
 | `test_tui.py` | BUG-002 |
 | `test_compactor.py` | BUG-003, BUG-004 |
-| `test_broad_query.py` | BUG-003, BUG-007 |
+| `test_recall_all.py` | (replaces BUG-007 broad detection) |
 | `test_idf_retrieval.py` | BUG-005, BUG-006 |
-| `test_tag_generator.py` | BUG-007 |
-| `test_retriever.py` | BUG-007, BUG-008, BUG-009 |
+| `test_retriever.py` | BUG-008, BUG-009 |
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
-| `test_proxy.py` | BUG-007, BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
+| `test_proxy.py` | BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
 | `test_paging.py` | PROXY-024 |
 | `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |

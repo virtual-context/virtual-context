@@ -339,15 +339,6 @@ class TestInboundMatching:
         assert "jiu-jitsu" in tags
         store.close()
 
-    @pytest.mark.regression("BUG-007")
-    def test_broad_heuristic_applied(self, tmp_sqlite_db):
-        """Embedding tagger doesn't detect broad — heuristic should catch it."""
-        retriever, store, _ = self._make_retriever_with_inbound(tmp_sqlite_db)
-
-        result = retriever.retrieve("summarize everything we discussed")
-        assert result.broad is True
-        store.close()
-
     @pytest.mark.regression("BUG-008")
     def test_temporal_heuristic_applied(self, tmp_sqlite_db):
         """Embedding tagger doesn't detect temporal — heuristic should catch it."""

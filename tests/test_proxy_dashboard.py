@@ -718,7 +718,6 @@ class TestDashboardSettings:
         assert data["compaction"]["min_summary_tokens"] == 200
         assert data["compaction"]["max_summary_tokens"] == 2000
         # Tagging defaults
-        assert data["tagging"]["broad_heuristic_enabled"] is True
         assert data["tagging"]["temporal_heuristic_enabled"] is True
         # Retrieval defaults
         assert data["retrieval"]["active_tag_lookback"] == 4

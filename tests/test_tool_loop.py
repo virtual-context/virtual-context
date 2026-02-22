@@ -29,14 +29,14 @@ from virtual_context.types import ToolCallRecord, ToolLoopResult
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_three_tools(self):
+    def test_returns_four_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 3
+        assert len(defs) == 4
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
         names = {d["name"] for d in defs}
-        assert names == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"}
+        assert names == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote", "vc_recall_all"}
 
     def test_tools_have_input_schema(self):
         defs = vc_tool_definitions()
@@ -45,7 +45,6 @@ class TestVCToolDefinitions:
             schema = d["input_schema"]
             assert schema["type"] == "object"
             assert "properties" in schema
-            assert len(schema["required"]) >= 1
 
     def test_expand_has_depth_enum(self):
         defs = vc_tool_definitions()
@@ -885,8 +884,8 @@ class TestVCToolNames:
     def test_is_frozenset(self):
         assert isinstance(VC_TOOL_NAMES, frozenset)
 
-    def test_contains_all_three(self):
-        assert VC_TOOL_NAMES == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote"}
+    def test_contains_all_four(self):
+        assert VC_TOOL_NAMES == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote", "vc_recall_all"}
 
 
 # ---------------------------------------------------------------------------

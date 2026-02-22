@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -367,15 +367,8 @@ class TestCLIMultiInstance:
 
         with (
             patch("virtual_context.config.load_config", return_value=cfg),
-            patch("virtual_context.proxy.multi.run_multi_instance") as mock_rmi,
+            patch("virtual_context.proxy.multi.run_multi_instance", new_callable=AsyncMock) as mock_rmi,
         ):
-            # asyncio.run calls the coroutine, so we need to handle it
-            async def fake_run(*a, **kw):
-                pass
-            mock_rmi.return_value = fake_run()
-
-            # The cmd_proxy function imports asyncio locally and calls asyncio.run
-            # We need to let it actually run
             cmd_proxy(args)
 
             mock_rmi.assert_called_once()

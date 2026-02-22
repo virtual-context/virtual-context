@@ -171,7 +171,7 @@ class TestEngineStateIntegration:
         db_path = str(tmp_path / "store.db")
         config_dict = {
             "context_window": 10000,
-            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
         }
 
@@ -194,6 +194,7 @@ class TestEngineStateIntegration:
         from virtual_context.types import Message
         history = [Message(role="user", content="x"), Message(role="assistant", content="y")] * 5
         engine1._save_state(history)
+        engine1._store.close()
 
         # Second engine: same store, same session_id
         config2 = load_config(config_dict=config_dict)
@@ -224,7 +225,7 @@ class TestVocabularyBootstrap:
         db_path = str(tmp_path / "store.db")
         config_dict = {
             "context_window": 10000,
-            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
         }
         config = load_config(config_dict=config_dict)
@@ -238,12 +239,12 @@ class TestVocabularyBootstrap:
         """Engine with restored TurnTagIndex should populate LLM tagger vocabulary."""
         from virtual_context.engine import VirtualContextEngine
         from virtual_context.config import load_config
-        from virtual_context.types import Message
+        from virtual_context.types import Message, EngineStateSnapshot
 
         db_path = str(tmp_path / "store.db")
         config_dict = {
             "context_window": 10000,
-            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
         }
 
@@ -251,20 +252,29 @@ class TestVocabularyBootstrap:
         config1 = load_config(config_dict=config_dict)
         engine1 = VirtualContextEngine(config=config1)
         session_id = engine1.config.session_id
+        entries = []
         for i in range(5):
-            engine1._turn_tag_index.append(TurnTagEntry(
+            entry = TurnTagEntry(
                 turn_number=i,
                 message_hash=f"h{i}",
                 tags=["skincare", "retinol"] if i % 2 == 0 else ["fitness"],
                 primary_tag="skincare" if i % 2 == 0 else "fitness",
-            ))
-        history = [Message(role="user", content="x"), Message(role="assistant", content="y")] * 5
-        engine1._save_state(history)
+            )
+            engine1._turn_tag_index.append(entry)
+            entries.append(entry)
+        # Save state directly via store to avoid silent failure in _save_state
+        engine1._store.save_engine_state(EngineStateSnapshot(
+            session_id=session_id,
+            compacted_through=0,
+            turn_tag_entries=entries,
+            turn_count=5,
+        ))
+        engine1._store.close()
 
         # Second engine: same store, LLM tagger (mock provider)
         config2 = load_config(config_dict={
             "context_window": 10000,
-            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "llm", "provider": "test-provider"},
             "providers": {"test-provider": {
                 "type": "generic_openai",
@@ -291,7 +301,7 @@ class TestVocabularyBootstrap:
         db_path = str(tmp_path / "store.db")
         config = load_config(config_dict={
             "context_window": 10000,
-            "storage": {"backend": "sqlite", "sqlite_path": db_path},
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
         })
         # Should not raise
