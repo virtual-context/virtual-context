@@ -12,7 +12,7 @@ virtual-context orchestrates a layered pipeline of LLM inference, embedding simi
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Overview queries can load everything via `vc_recall_all`/`recall_all`. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture (learned the hard way in production) ensures the system can never hallucinate irrelevant topics into your context window.
+virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Overview queries can load everything via `vc_recall_all`/`recall_all`. Time-scoped queries use `vc_remember_when`/`remember_when` with backend-resolved date windows. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture (learned the hard way in production) ensures the system can never hallucinate irrelevant topics into your context window.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -30,7 +30,7 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 |---|---|---|---|
 | **What gets kept** | Most recent N messages | Whatever embeds close to the query | Everything, at varying compression |
 | **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
-| **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | `vc_recall_all`/`recall_all` loads all summaries; temporal detection retrieves by time position |
+| **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | `vc_recall_all`/`recall_all` loads all summaries; `vc_remember_when`/`remember_when` handles time-scoped recall |
 | **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
 | **Content exceeds window** | Truncate or fail | Chunk and lose coherence | Collapse cold topics to make room, page in what's needed |
 | **Bidirectional control** | None | None (append-only) | Expand topics to full detail, collapse back to summaries, within fixed budget |
@@ -189,19 +189,17 @@ These queries don't map cleanly to specific tags. Instead of relying on a `broad
 
 This eliminates the failure mode where the LLM says "I don't recall discussing that" about something from 50 turns ago.
 
-### Temporal Query Detection
+### Time-Scoped Recall Tool (`vc_remember_when`)
 
-"Going back to the very beginning, what were the key decisions?" "What did we set up with tokens at the start?" "Something you said early on about indexing."
+"Going back to the very beginning, what were the key decisions?" "What did we set up with tokens at the start?" "Between June and July, what changed about indexing?"
 
-These queries reference a *position in time*, not just a topic. The tagger flags them as `temporal: true`, and the retriever switches to a different data path:
+These queries reference a *position in time*, not just a topic. Instead of relying on an automatic temporal retrieval branch, virtual-context uses an explicit tool call:
 
-- Instead of merged **tag summaries** (Layer 2), it fetches granular **segment summaries** (Layer 1)
-- Segments are sorted by creation time (**earliest first**), so foundational decisions surface before later refinements
-- Deep retrieval pulls full stored segment content for the top matches
+- `vc_remember_when` (proxy tool loop) / `remember_when` (MCP server) combines semantic query + structured time range
+- Time ranges use relative presets (e.g. `last_week`, `last_month`) or explicit date bounds (`between_dates`)
+- Date math is backend-resolved, not LLM-resolved, so results are deterministic and testable
 
-This solves a fundamental problem with summarization: when a tag like `project-structure` appears at turn 1, turn 57, and turn 71, a merged tag summary blends all three. A temporal query about "the very first thing we discussed" needs the turn-1 segment specifically, not the merged blob.
-
-Detection uses two layers: the LLM detects temporal intent, and deterministic regex patterns catch phrases the LLM misses (`"at the beginning"`, `"early on"`, `"the very first thing"`).
+This solves a fundamental problem with summarization: when a tag like `project-structure` appears at turn 1, turn 57, and turn 71, a merged tag summary blends all three. A time-scoped query about "the very first thing we discussed" needs constrained retrieval against early sessions, not a generic merged blob.
 
 ### Session Date Propagation
 
@@ -235,7 +233,7 @@ Prior conversation topics available for recall:
 </context-topics>
 ```
 
-This costs ~50-200 tokens and enables a natural drill-down loop: the user asks for an overview, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `vc_recall_all` for broad overviews, `vc_find_quote` for specific facts (names, numbers, decisions), `vc_expand_topic` for deeper understanding of a listed topic, and `vc_collapse_topic` to free budget.
+This costs ~50-200 tokens and enables a natural drill-down loop: the user asks for an overview, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `vc_recall_all` for broad overviews, `vc_remember_when` for time-scoped recall, `vc_find_quote` for specific facts (names, numbers, decisions), `vc_expand_topic` for deeper understanding of a listed topic, and `vc_collapse_topic` to free budget.
 
 ### Virtual Memory Paging
 
@@ -258,7 +256,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, or follow up with `expand_topic`. Up to 5 continuation rounds run transparently within one client-visible request. This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
 
-**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `vc_recall_all`, `vc_expand_topic`, `vc_collapse_topic`, and `vc_find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `vc_recall_all` → `vc_find_quote` → `vc_expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
+**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `vc_recall_all`, `vc_remember_when`, `vc_expand_topic`, `vc_collapse_topic`, and `vc_find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `vc_recall_all` → `vc_remember_when` → `vc_find_quote` → `vc_expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
 ### Three-Layer Memory Hierarchy
 
@@ -516,7 +514,7 @@ A terminal chat interface with live context visualization, useful for developmen
 - **Tag panel**: current tag working set with activity levels, updated live as `on_turn_complete` processes each turn
 - **Budget bar**: real-time token usage breakdown (core, tags, hint, conversation)
 - **Turn list**: every turn with its tags, navigable with Ctrl+B/F
-- **Turn inspector** (Ctrl+I): full turn data: API payload, tags, assembled context, temporal flags, and tool activity
+- **Turn inspector** (Ctrl+I): full turn data: API payload, tags, assembled context, and tool activity
 - **Brief mode** (Ctrl+T): silently appends "answer in 2 lines" for faster iteration during testing
 - **Manual compaction**: type `/compact` or press Ctrl+K to trigger compaction on demand
 - **Session export** (Ctrl+S): saves full session to `vc-session.json` with all metadata
@@ -659,7 +657,7 @@ curl http://127.0.0.1:5757/v1/messages \
 
 The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dashboard`, a full operational view of what virtual-context is doing to every request.
 
-**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), temporal flags, tool activity, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
+**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), tool activity, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
 
 **Turn inspector.** Click any request row to see the full picture: every message in the request with role labels, content block types (`text`, `tool_use`, `tool_result`, `thinking`), the raw text content, inbound tags vs response tags side by side, and the token budget breakdown showing how context was assembled.
 
@@ -685,6 +683,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 |------|------|-------------|
 | Tool | `recall_context` | Tag + retrieve + assemble context for a message |
 | Tool | `recall_all` | Load summaries for all topics (broad overview path) |
+| Tool | `remember_when` | Time-scoped recall with relative presets or explicit date bounds |
 | Tool | `compact_context` | Trigger compaction on a message history |
 | Tool | `domain_status` | All tags with stats |
 | Tool | `expand_topic` | Expand a topic to segment or full detail depth |
@@ -710,7 +709,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback |
 | **EmbeddingTagGenerator** | `core/embedding_tag_generator.py` | Sentence-transformers cosine similarity against tag vocabulary |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
-| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, temporal queries, FTS fallback |
+| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
