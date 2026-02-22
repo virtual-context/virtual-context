@@ -12,7 +12,7 @@ virtual-context orchestrates a layered pipeline of LLM inference, embedding simi
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Overview queries can load everything via `vc_recall_all`/`recall_all`. Time-scoped queries use `vc_remember_when`/`remember_when` with backend-resolved date windows. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture (learned the hard way in production) ensures the system can never hallucinate irrelevant topics into your context window.
+virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Overview queries can load everything via `vc_recall_all`/`recall_all`. Time-scoped queries use `vc_remember_when`/`remember_when` with backend-resolved date windows. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. A two-tagger architecture ensures the system can never hallucinate irrelevant topics into your context window.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -22,20 +22,24 @@ Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-e
 
 The result: an LLM that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.
 
-## Why Not Just Use RAG?
+## Virtual-Context vs RAG vs Compaction
 
-RAG retrieves by similarity. virtual-context manages by understanding.
+These approaches are complementary, but optimize different failure modes.
 
-| | Truncation | RAG | virtual-context |
+| | RAG | Compaction-only | virtual-context |
 |---|---|---|---|
-| **What gets kept** | Most recent N messages | Whatever embeds close to the query | Everything, at varying compression |
-| **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
-| **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | `vc_recall_all`/`recall_all` loads all summaries; `vc_remember_when`/`remember_when` handles time-scoped recall |
-| **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
-| **Content exceeds window** | Truncate or fail | Chunk and lose coherence | Collapse cold topics to make room, page in what's needed |
-| **Bidirectional control** | None | None (append-only) | Expand topics to full detail, collapse back to summaries, within fixed budget |
-| **Interpretability** | None | Opaque similarity scores | Visible tags, matched segments, budget breakdown per request |
-| **Latency** | Zero | Embedding computation per query | Subsecond with local models |
+| **Primary mechanism** | Query-time retrieval by embedding similarity | Summarize old history to fit window | Tagged memory + retrieval + compaction + paging tools |
+| **What gets kept** | External chunks + recent raw chat | Mostly summaries of old turns + recent raw chat | Multi-layer memory (raw turns, segment summaries, tag summaries) |
+| **Specific fact lookup** | Good if embedding/query phrasing aligns | Often lossy after summarization | `vc_find_quote` + summary/segment drill-down |
+| **Broad overview ("what did we discuss?")** | Weak unless special orchestration | Can summarize, but often generic | `vc_recall_all` returns all topic summaries within budget |
+| **Time-scoped recall ("last week", "between June and July")** | Usually custom logic outside core RAG | Usually weak unless dates preserved in summaries | `vc_remember_when` with backend-resolved time ranges |
+| **Vocabulary mismatch tolerance** | Moderate (embedding-dependent) | Low to moderate | Related-tag expansion + IDF-weighted ranking + quote search fallback |
+| **Context budget control** | Mostly append retrieved chunks | Compresses, but limited selective rehydration | Explicit paging: expand/collapse topics and bounded assembly |
+| **Interpretability** | Medium (scores/chunks) | Low-medium (summary quality dependent) | High (tags, tool calls, budgets, sections, stored summaries) |
+| **Failure mode** | Miss relevant chunk | Over-compress / lose detail | Requires tool-aware prompting + memory hygiene |
+| **Best fit** | Knowledge/doc retrieval | Simple long-chat cost reduction | Long-running agent memory with mixed query types |
+
+virtual-context combines retrieval and compaction, then adds explicit tools for overview/time/fact recall under strict token budgets.
 
 ## How It Works
 
@@ -167,11 +171,9 @@ The same codebase handles legal briefs, medical notes, coding sessions, recipe p
 
 ### Two-Tagger Architecture
 
-This design was born from a production bug. The original system used a single LLM tagger for both inbound (before the LLM responds) and response (after) tagging. In a live OpenClaw deployment, a user message about *electronics* caused the LLM inbound tagger to hallucinate the tag `planes` (because `planes` existed in the active vocabulary and shared abstract secondary tags like `engineering` and `design`). That single hallucinated tag pulled 11 irrelevant history turns into the context window, contaminating the LLM's response with planes, guitars, and jiu-jitsu.
+virtual-context splits inbound and response tagging into two distinct operations with different objectives.
 
-The fix was architectural: split inbound and response tagging into two fundamentally different operations.
-
-**Inbound tagger** (embedding, runs before LLM responds): Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. It cannot hallucinate `planes` for an electronics message because the embedding of "tell me about arduino circuits" is semantically far from `planes` and close to `electronics`. Deterministic, subsecond, zero LLM cost.
+**Inbound tagger** (embedding, runs before LLM responds): Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. Deterministic, subsecond, zero LLM cost.
 
 **Response tagger** (LLM, runs after LLM responds): Sees the full user+assistant pair and generates authoritative semantic tags. This is the creative, vocabulary-building pass, inventing new tags when new topics emerge, generating related tags for cross-vocabulary retrieval, and detecting temporal query intent. Runs in a background thread so it never blocks the next request.
 
@@ -743,7 +745,7 @@ Retry logic with exponential backoff on both.
 
 **Sync-first.** Zero async/await in the engine. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model. The proxy uses FastAPI async for HTTP handling but calls the sync engine via `asyncio.to_thread`.
 
-**Two-tagger architecture.** Inbound tagging (before the LLM responds) and response tagging (after) use different models optimized for different tasks. The recommended configuration uses embedding cosine similarity for inbound (closed-set, deterministic, can't hallucinate novel tags) and an LLM for response (creative, vocabulary-building, generates related tags). This separation was driven by a production bug where the LLM inbound tagger hallucinated `planes` for an electronics message, pulling irrelevant history via abstract cross-cutting tags like `engineering` and `craftsmanship`.
+**Two-tagger architecture.** Inbound tagging (before the LLM responds) and response tagging (after) use different models optimized for different tasks. The recommended configuration uses embedding cosine similarity for inbound (closed-set, deterministic, can't hallucinate novel tags) and an LLM for response (creative, vocabulary-building, generates related tags).
 
 **Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
 
