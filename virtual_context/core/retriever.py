@@ -8,9 +8,9 @@ import re
 import time
 
 from .store import ContextStore
-from .tag_generator import TagGenerator, detect_broad_heuristic, detect_temporal_heuristic
+from .tag_generator import TagGenerator, detect_temporal_heuristic
 from .turn_tag_index import TurnTagIndex
-from ..patterns import DEFAULT_BROAD_PATTERNS, DEFAULT_TEMPORAL_PATTERNS
+from ..patterns import DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
     Message,
     RetrievalCostReport,
@@ -40,7 +40,6 @@ class ContextRetriever:
         self._turn_tag_index = turn_tag_index
         self._inbound_tagger = inbound_tagger
         # Pre-compile heuristic patterns for embedding-based inbound tagger
-        self._broad_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_BROAD_PATTERNS]
         self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
 
     def _compute_idf_weights(self) -> dict[str, float]:
@@ -63,8 +62,8 @@ class ContextRetriever:
     def _load_all_tag_summaries(self, token_budget: int) -> tuple[list[StoredSummary], int]:
         """Load all tag summaries within *token_budget*.
 
-        Returns ``(selected_summaries, total_tokens)``.  Used by the broad
-        retrieval branch and the post-compaction summary floor.
+        Returns ``(selected_summaries, total_tokens)``.  Used by the
+        post-compaction summary floor.
         """
         tag_summaries = self.store.get_all_tag_summaries()
         if not tag_summaries:
@@ -121,13 +120,11 @@ class ContextRetriever:
             tag_result = self._inbound_tagger.generate_tags(
                 message, vocab_tags, context_turns=context_turns,
             )
-            # Apply broad/temporal heuristics (embedding tagger doesn't detect these)
-            if not tag_result.broad:
-                tag_result.broad = detect_broad_heuristic(message, self._broad_patterns)
+            # Apply temporal heuristic (embedding tagger doesn't detect these)
             if not tag_result.temporal:
                 tag_result.temporal = detect_temporal_heuristic(message, self._temporal_patterns)
-            logger.debug("Inbound embedding match: tags=%s broad=%s temporal=%s",
-                         tag_result.tags, tag_result.broad, tag_result.temporal)
+            logger.debug("Inbound embedding match: tags=%s temporal=%s",
+                         tag_result.tags, tag_result.temporal)
         else:
             # LLM-based: open-ended tag generation (pass known tags for reuse)
             tag_result = self.tag_generator.generate_tags(
@@ -135,37 +132,6 @@ class ContextRetriever:
             )
 
         retrieval_metadata: dict = {}
-
-        # --- Broad query branch ---
-        if tag_result.broad:
-            token_budget = self.config.tag_context_max_tokens
-            selected_broad, total_broad_tokens = self._load_all_tag_summaries(token_budget)
-            if selected_broad:
-                elapsed = time.monotonic() - start_time
-                tag_summaries = self.store.get_all_tag_summaries()
-                return RetrievalResult(
-                    tags_matched=[ts.tag for ts in tag_summaries],
-                    summaries=selected_broad,
-                    total_tokens=total_broad_tokens,
-                    broad=True,
-                    retrieval_metadata={
-                        "elapsed_ms": round(elapsed * 1000, 1),
-                        "tags_from_message": tag_result.tags,
-                        "broad": True,
-                        "tag_summaries_loaded": len(selected_broad),
-                    },
-                    cost_report=RetrievalCostReport(
-                        tokens_retrieved=total_broad_tokens,
-                        budget_fraction_used=(
-                            total_broad_tokens / token_budget if token_budget > 0 else 0.0
-                        ),
-                        strategy_active="broad",
-                        tags_queried=tag_result.tags,
-                    ),
-                )
-            # No tag summaries yet — fall through to normal retrieval
-            # but still mark broad so filter_history includes all turns
-            retrieval_metadata["broad"] = True
 
         # --- Temporal query branch ---
         # Fetch segment summaries (Layer 1) sorted by creation time ASC.
@@ -207,7 +173,6 @@ class ContextRetriever:
                     full_detail=full_detail,
                     total_tokens=total_temporal_tokens,
                     temporal=True,
-                    broad=tag_result.broad,
                     retrieval_metadata={
                         "elapsed_ms": round(elapsed * 1000, 1),
                         "tags_from_message": tag_result.tags,
@@ -258,7 +223,6 @@ class ContextRetriever:
                         tags_matched=[],
                         summaries=floor_summaries,
                         total_tokens=floor_tokens,
-                        broad=tag_result.broad,
                         retrieval_metadata={
                             "elapsed_ms": round(elapsed * 1000, 1),
                             "tags_from_message": tag_result.tags,
@@ -277,7 +241,6 @@ class ContextRetriever:
                 tags_matched=[],
                 summaries=[],
                 total_tokens=0,
-                broad=tag_result.broad,
                 retrieval_metadata={
                     "elapsed_ms": round(elapsed * 1000, 1),
                     "tags_from_message": tag_result.tags,
@@ -410,7 +373,6 @@ class ContextRetriever:
             summaries=selected,
             full_detail=full_detail,
             total_tokens=total_tokens,
-            broad=tag_result.broad,
             retrieval_metadata=retrieval_metadata,
             cost_report=RetrievalCostReport(
                 tokens_retrieved=total_tokens,

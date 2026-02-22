@@ -69,7 +69,6 @@ def build_engine_config(cache_dir: str, cache_id: str) -> dict:
             "model": "claude-haiku-4-5-20251001",
             "max_tags": 10, "min_tags": 5,
             "prompt_mode": "detailed",
-            "broad_heuristic_enabled": False,
             "temporal_heuristic_enabled": False,
             "context_bleed_threshold": 0,
         },

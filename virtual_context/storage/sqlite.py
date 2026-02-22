@@ -194,7 +194,7 @@ class SQLiteStore(ContextStore):
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=5)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -251,6 +251,19 @@ class SQLiteStore(ContextStore):
                 conn.execute(
                     f"INSERT INTO {fts_table}({fts_table}) VALUES('integrity-check')"
                 )
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc):
+                    logger.debug("FTS integrity-check skipped for %s: %s", fts_table, exc)
+                    continue
+                logger.warning("FTS index %s corrupted — rebuilding", fts_table)
+                try:
+                    conn.execute(
+                        f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')"
+                    )
+                    conn.commit()
+                    logger.info("FTS index %s rebuilt successfully", fts_table)
+                except sqlite3.DatabaseError as exc2:
+                    logger.error("FTS rebuild failed for %s: %s", fts_table, exc2)
             except sqlite3.DatabaseError:
                 logger.warning("FTS index %s corrupted — rebuilding", fts_table)
                 try:
@@ -857,3 +870,9 @@ class SQLiteStore(ContextStore):
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

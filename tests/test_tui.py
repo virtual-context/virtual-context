@@ -543,11 +543,10 @@ async def test_tag_panel_updates_after_turn_complete():
                 from virtual_context.types import AssembledContext
                 ctx = AssembledContext()
                 ctx.matched_tags = ["inbound-tag"]
-                ctx.broad = False
                 ctx.temporal = False
                 return ctx
 
-            def filter_history(self, history, current_tags=None, broad=False, temporal=False):
+            def filter_history(self, history, current_tags=None, temporal=False):
                 return history
 
             def on_turn_complete(self, history):

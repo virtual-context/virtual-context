@@ -41,6 +41,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_expand_topic",
     "vc_collapse_topic",
     "vc_find_quote",
+    "vc_recall_all",
 })
 
 
@@ -137,6 +138,21 @@ def vc_tool_definitions() -> list[dict]:
                 "required": ["query"],
             },
         },
+        {
+            "name": "vc_recall_all",
+            "description": (
+                "Load summaries of ALL stored conversation topics at once. "
+                "Use when the user asks for a broad overview, wants to know "
+                "everything discussed, needs a full summary, or asks a vague "
+                "question that spans multiple topics. Returns all tag summaries "
+                "within the token budget. After reviewing, use vc_expand_topic "
+                "on specific tags if you need more detail."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
     ]
 
 
@@ -165,6 +181,8 @@ def execute_vc_tool(
                 query=tool_input.get("query", ""),
                 max_results=tool_input.get("max_results", 5),
             )
+        elif name == "vc_recall_all":
+            result = engine.recall_all()
         else:
             result = {"error": f"unknown VC tool: {name}"}
         return json.dumps(result)

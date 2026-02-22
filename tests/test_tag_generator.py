@@ -6,11 +6,9 @@ from virtual_context.core.tag_generator import (
     KeywordTagGenerator,
     LLMTagGenerator,
     build_tag_generator,
-    detect_broad_heuristic,
-    _compile_broad_patterns,
 )
 from virtual_context.core.tag_canonicalizer import TagCanonicalizer
-from virtual_context.types import DEFAULT_BROAD_PATTERNS, KeywordTagConfig, TagGeneratorConfig
+from virtual_context.types import KeywordTagConfig, TagGeneratorConfig
 
 from conftest import MockLLMProvider
 
@@ -123,122 +121,6 @@ class TestLLMTagGenerator:
         generator.load_vocabulary({"auth": 10, "database": 5})
         assert generator._tag_vocabulary["auth"] == 10
         assert generator._tag_vocabulary["database"] == 5
-
-
-class TestBroadHeuristic:
-    """Test deterministic broad-query detection."""
-
-    @pytest.fixture
-    def patterns(self):
-        return _compile_broad_patterns(DEFAULT_BROAD_PATTERNS)
-
-    @pytest.mark.parametrize("text", [
-        "What did you say about the image storage earlier?",
-        "What did we discuss about authentication?",
-        "What did you mention about the database?",
-        "Remind me what we decided about the API",
-        "Remind me about the deployment plan",
-        "Looking back at everything we've discussed",
-        "Looking back at our conversation",
-        "Summarize what we've covered so far",
-        "Recap everything we talked about",
-        "Can you summarize the project?",
-        "Can you recap our discussion?",
-        "What have we covered today?",
-        "What have we discussed so far?",
-        "You mentioned earlier that we should use Redis",
-        "We discussed before that JWT was the way to go",
-        "We talked about previously using S3",
-        "Go back over what we said",
-        "Go over everything again",
-        "If I had to explain the most important thing I learned from each of these threads",
-        "What's the takeaway from each of these topics?",
-        "Across everything we've discussed, what matters most?",
-        "From all we've covered, what should I remember?",
-    ])
-    def test_broad_detected(self, patterns, text):
-        assert detect_broad_heuristic(text, patterns) is True, f"Should detect as broad: {text!r}"
-
-    @pytest.mark.parametrize("text", [
-        "How do I implement pagination?",
-        "Fix the auth bug",
-        "What is the best database for this?",
-        "Can you write a function that sorts a list?",
-        "Deploy the app to production",
-        "I want to add a new feature",
-        "The tests are failing",
-        "What's the weather like?",
-    ])
-    def test_not_broad(self, patterns, text):
-        assert detect_broad_heuristic(text, patterns) is False, f"Should NOT detect as broad: {text!r}"
-
-    @pytest.mark.regression("BUG-007")
-    def test_llm_broad_miss_overridden(self):
-        """LLM returns broad=false, heuristic overrides to true (the T45 bug)."""
-        provider = MockLLMProvider(
-            response='{"tags": ["image-storage"], "primary": "image-storage", "broad": false}'
-        )
-        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
-        generator = LLMTagGenerator(llm_provider=provider, config=config)
-
-        result = generator.generate_tags("What did you say about the image storage earlier?")
-        assert result.broad is True, "Heuristic should override LLM's missed broad"
-
-    def test_llm_broad_true_preserved(self):
-        """LLM returns broad=true, heuristic doesn't interfere."""
-        provider = MockLLMProvider(
-            response='{"tags": ["storage"], "primary": "storage", "broad": true}'
-        )
-        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
-        generator = LLMTagGenerator(llm_provider=provider, config=config)
-
-        result = generator.generate_tags("What did you say about the image storage earlier?")
-        assert result.broad is True
-
-    def test_non_broad_not_overridden(self):
-        """Specific query stays broad=false even with heuristic active."""
-        provider = MockLLMProvider(
-            response='{"tags": ["pagination"], "primary": "pagination", "broad": false}'
-        )
-        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
-        generator = LLMTagGenerator(llm_provider=provider, config=config)
-
-        result = generator.generate_tags("How do I implement pagination?")
-        assert result.broad is False
-
-    def test_custom_patterns(self):
-        """User-configured broad patterns work."""
-        config = TagGeneratorConfig(
-            type="llm", max_tags=5, min_tags=1,
-            broad_patterns=[r"\brecuerda\b"],  # Spanish: "remember"
-        )
-        provider = MockLLMProvider(
-            response='{"tags": ["general"], "primary": "general", "broad": false}'
-        )
-        generator = LLMTagGenerator(llm_provider=provider, config=config)
-
-        result = generator.generate_tags("Recuerda lo que dijimos sobre la base de datos")
-        assert result.broad is True
-
-    def test_empty_patterns_disables_heuristic(self):
-        """Empty broad_patterns list disables the heuristic."""
-        config = TagGeneratorConfig(
-            type="llm", max_tags=5, min_tags=1,
-            broad_patterns=[],
-        )
-        provider = MockLLMProvider(
-            response='{"tags": ["image-storage"], "primary": "image-storage", "broad": false}'
-        )
-        generator = LLMTagGenerator(llm_provider=provider, config=config)
-
-        result = generator.generate_tags("What did you say about the image storage earlier?")
-        assert result.broad is False, "Empty patterns should disable heuristic"
-
-    def test_invalid_pattern_skipped(self):
-        """Invalid regex is skipped without crashing."""
-        patterns = _compile_broad_patterns(["[invalid", r"\bvalid\b"])
-        assert len(patterns) == 1
-        assert detect_broad_heuristic("this is valid", patterns) is True
 
 
 class TestRelatedTagsParsing:

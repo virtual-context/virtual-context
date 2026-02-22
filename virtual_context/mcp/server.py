@@ -129,6 +129,18 @@ def collapse_topic(tag: str, depth: str = "summary") -> str:
 
 
 @mcp.tool()
+def recall_all() -> str:
+    """Load summaries of all stored conversation topics at once.
+
+    Use when the user asks for a broad overview or wants to know
+    everything discussed. Returns all tag summaries within token budget.
+    """
+    engine = _get_engine()
+    result = engine.recall_all()
+    return json.dumps(result)
+
+
+@mcp.tool()
 def find_quote(query: str, max_results: int = 5) -> str:
     """Search the full original conversation text for a specific word, phrase, or detail.
 

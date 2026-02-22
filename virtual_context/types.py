@@ -37,13 +37,12 @@ class TagResult:
     tags: list[str]
     primary: str
     source: str  # "llm", "keyword", "fallback"
-    broad: bool = False  # True when query is vague/retrospective/overview
     temporal: bool = False  # True when query references a time position ("first thing", "early on")
     related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
 
 
 # Pattern constants — canonical definitions in patterns.py, re-exported here for compat
-from .patterns import DEFAULT_BROAD_PATTERNS, DEFAULT_TEMPORAL_PATTERNS  # noqa: F401
+from .patterns import DEFAULT_TEMPORAL_PATTERNS  # noqa: F401
 
 
 @dataclass
@@ -75,9 +74,7 @@ class TagGeneratorConfig:
     max_tokens: int = 8192  # LLM max_tokens
     prompt_mode: str = "detailed"  # "detailed" (full rules+examples) or "compact" (minimal)
     keyword_fallback: KeywordTagConfig | None = None
-    broad_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BROAD_PATTERNS))
     temporal_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_TEMPORAL_PATTERNS))
-    broad_heuristic_enabled: bool = True
     temporal_heuristic_enabled: bool = True
     context_lookback_pairs: int = 5  # Number of recent turn pairs to feed as context to tagger
     context_bleed_threshold: float = 0.1  # Embedding similarity gate: skip context below this (0 = disabled)
@@ -338,7 +335,6 @@ class RetrievalResult:
     total_tokens: int = 0
     retrieval_metadata: dict = field(default_factory=dict)
     cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
-    broad: bool = False  # True when the query was detected as broad/retrospective
     temporal: bool = False  # True when the query references a time position
 
 
@@ -411,7 +407,6 @@ class AssembledContext:
     prepend_text: str = ""
     matched_tags: list[str] = field(default_factory=list)
     context_hint: str = ""  # Topic list injected post-compaction
-    broad: bool = False  # True when query is broad — include all history
     temporal: bool = False  # True when query references a time position
 
 

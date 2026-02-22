@@ -67,9 +67,6 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
 
     # Pattern overrides: user-supplied list, or None to use defaults
     pattern_kwargs: dict = {}
-    broad_patterns_raw = raw.get("broad_patterns")
-    if broad_patterns_raw is not None:
-        pattern_kwargs["broad_patterns"] = list(broad_patterns_raw)
     temporal_patterns_raw = raw.get("temporal_patterns")
     if temporal_patterns_raw is not None:
         pattern_kwargs["temporal_patterns"] = list(temporal_patterns_raw)
@@ -95,7 +92,6 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
         context_lookback_pairs=raw.get("context_lookback_pairs", 5),
         context_bleed_threshold=raw.get("context_bleed_threshold", 0.1),
         disable_thinking=raw.get("disable_thinking", False),
-        broad_heuristic_enabled=raw.get("broad_heuristic_enabled", True),
         temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", True),
         tag_splitting=tag_splitting,
         **pattern_kwargs,

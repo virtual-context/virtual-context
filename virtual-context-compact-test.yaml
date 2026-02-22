@@ -13,7 +13,7 @@ version: "0.2"
 #   - 3k context window (vs 120k) — compaction fires every ~5 turns
 #   - Separate storage at .virtualcontext-compact-test/ — won't pollute main data
 #   - Both tagger and summarizer use Anthropic Haiku — fast, accurate, no local GPU needed
-#   - Heuristic broad/temporal detection disabled — Haiku handles these natively
+#   - Heuristic temporal detection disabled — Haiku handles it natively
 #   - Lower assembly budgets to fit the tiny window
 
 storage_root: ".virtualcontext-compact-test"
@@ -31,8 +31,8 @@ paging:
 # =====================================================================================
 # TAG GENERATOR — Haiku tagger with detailed prompt
 # =====================================================================================
-# Uses Anthropic Haiku for high-quality tagging. Haiku reliably detects broad and temporal
-# queries via its detailed prompt, so regex heuristic overrides are disabled (empty lists).
+# Uses Anthropic Haiku for high-quality tagging. Haiku reliably detects temporal
+# queries via its detailed prompt, so regex heuristic overrides are disabled.
 
 tag_generator:
   type: "llm"
@@ -42,8 +42,7 @@ tag_generator:
   min_tags: 5
   prompt_mode: "detailed"
 
-  # Heuristics disabled — Haiku detects broad/temporal natively via the detailed prompt.
-  broad_heuristic_enabled: false
+  # Heuristics disabled — Haiku detects temporal natively via the detailed prompt.
   temporal_heuristic_enabled: false
 
   # keyword_fallback: Used when the LLM is unavailable. Maps keywords and regex patterns

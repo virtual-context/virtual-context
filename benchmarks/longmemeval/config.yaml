@@ -16,7 +16,6 @@ tag_generator:
   max_tags: 10
   min_tags: 5
   prompt_mode: "detailed"
-  broad_heuristic_enabled: false
   temporal_heuristic_enabled: false
 
 compaction:

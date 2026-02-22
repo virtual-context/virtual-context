@@ -1485,23 +1485,6 @@ class TestFilterBodyMessages:
         msgs = filtered["messages"]
         assert len(msgs) == 5  # 2 protected pairs * 2 + current user
 
-    @pytest.mark.regression("BUG-007")
-    def test_broad_keeps_everything(self):
-        """Broad queries keep all turns."""
-        body = self._build_body(5)
-        idx = self._build_index([
-            ["python"],
-            ["cooking"],
-            ["music"],
-            ["weather"],
-            ["cars"],
-        ])
-        filtered, dropped = _filter_body_messages(
-            body, idx, ["unrelated"], recent_turns=1, broad=True,
-        )
-        assert dropped == 0
-        assert filtered is body  # unchanged
-
     @pytest.mark.regression("BUG-008")
     def test_temporal_keeps_everything(self):
         """Temporal queries keep all turns."""
@@ -3369,7 +3352,7 @@ class TestInjectVCTools:
         names = [t["name"] for t in result["tools"]]
         assert names[0] == "web_search"
         assert "vc_expand_topic" in names
-        assert len(names) == 4  # web_search + 3 VC tools
+        assert len(names) == 5  # web_search + 4 VC tools
 
     def test_skips_when_tool_choice_none_string(self):
         engine = MagicMock()

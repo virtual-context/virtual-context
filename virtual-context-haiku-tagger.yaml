@@ -12,7 +12,7 @@ version: "0.2"
 #
 # Key differences from the main config:
 #   - Tagger uses Anthropic Haiku instead of local Ollama
-#   - Heuristic broad/temporal detection disabled — Haiku handles these natively
+#   - Heuristic temporal detection disabled — Haiku handles it natively
 #   - Summarizer still uses local Ollama qwen3:4b (free, quality sufficient for summaries)
 
 storage_root: ".virtualcontext"
@@ -30,7 +30,7 @@ paging:
 # =====================================================================================
 # TAG GENERATOR — Anthropic Haiku for high-quality tagging
 # =====================================================================================
-# Haiku provides reliable broad/temporal detection, accurate tag reuse, and clean JSON
+# Haiku provides reliable temporal detection, accurate tag reuse, and clean JSON
 # output. Since it handles these natively, regex heuristic overrides are disabled.
 
 tag_generator:
@@ -39,11 +39,10 @@ tag_generator:
   model: "claude-haiku-4-5-20251001"
   max_tags: 10
   min_tags: 5
-  prompt_mode: "detailed"     # full rules with broad/temporal detection guidance
+  prompt_mode: "detailed"     # full rules with temporal detection guidance
 
-  # Heuristics disabled — Haiku detects broad/temporal natively via the detailed prompt.
+  # Heuristics disabled — Haiku detects temporal queries natively via the detailed prompt.
   # Set to [] to disable; omit or set to null to use built-in defaults.
-  broad_patterns: []
   temporal_patterns: []
 
   # keyword_fallback: Used when the LLM is unavailable. Maps keywords and regex patterns

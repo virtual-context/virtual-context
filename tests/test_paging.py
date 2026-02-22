@@ -1219,173 +1219,6 @@ class TestReassembleContext:
 # ---------------------------------------------------------------------------
 
 
-class TestBroadBypassesWorkingSet:
-    """BUG-014: Broad queries must flatten working set to SUMMARY depth.
-
-    When a user asks 'summarize everything' and 2 tags are at FULL depth,
-    those tags eat the budget and 15+ topic summaries get dropped.
-    Fix: pass working_set=None to assembler when retrieval_result.broad is True.
-    """
-
-    def _make_engine(self, tmp_path, tag_budget=2000):
-        cfg = load_config(config_dict={
-            "context_window": 100_000,
-            "storage_root": str(tmp_path),
-            "storage": {
-                "backend": "sqlite",
-                "sqlite": {"path": str(tmp_path / "store.db")},
-            },
-            "tag_generator": {"type": "keyword"},
-            "paging": {"enabled": True, "autonomous_models": []},
-            "assembly": {
-                "tag_context_max_tokens": tag_budget,
-                "context_hint_enabled": False,
-            },
-        })
-        from virtual_context.engine import VirtualContextEngine
-        engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 2
-        return engine
-
-    def _seed_tag(self, engine, tag, summary_text="Summary.", full_text=None):
-        """Store a tag summary and optionally a segment with full_text."""
-        engine._store.save_tag_summary(TagSummary(
-            tag=tag,
-            summary=summary_text,
-            summary_tokens=len(summary_text) // 4,
-            source_turn_numbers=[0],
-        ))
-        if full_text:
-            engine._store.store_segment(StoredSegment(
-                ref=f"seg-{tag}",
-                primary_tag=tag,
-                tags=[tag],
-                summary=summary_text,
-                summary_tokens=len(summary_text) // 4,
-                full_text=full_text,
-                full_tokens=len(full_text) // 4,
-            ))
-
-    @pytest.mark.regression("BUG-014")
-    def test_broad_query_gets_all_summaries_despite_expanded_tags(self, tmp_path):
-        """With 2 tags at FULL depth eating budget, broad must still show all topics."""
-        # Tight budget: 2000 tokens. FULL-depth tags would eat it all.
-        engine = self._make_engine(tmp_path, tag_budget=2000)
-
-        # Seed 10 tags with summaries (~50 tokens each = 500t total at SUMMARY)
-        for i in range(10):
-            self._seed_tag(
-                engine, f"topic-{i}",
-                summary_text=f"Summary of topic {i} with enough text to be meaningful. " * 2,
-                full_text=f"Full detailed text for topic {i}. " * 50,  # ~600t each
-            )
-
-        # Expand 2 tags to FULL depth — each ~600t, total ~1200t, leaving only 800t
-        engine._working_set = {
-            "topic-0": WorkingSetEntry(tag="topic-0", depth=DepthLevel.FULL, tokens=600),
-            "topic-1": WorkingSetEntry(tag="topic-1", depth=DepthLevel.FULL, tokens=600),
-        }
-
-        # Mock retriever to return broad=True with all 10 tag summaries
-        all_summaries = []
-        for i in range(10):
-            ts = engine._store.get_tag_summary(f"topic-{i}")
-            all_summaries.append(StoredSummary(
-                ref=f"seg-topic-{i}",
-                primary_tag=f"topic-{i}",
-                tags=[f"topic-{i}"],
-                summary=ts.summary,
-                summary_tokens=ts.summary_tokens,
-                created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-                end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
-            ))
-
-        broad_result = RetrievalResult(
-            tags_matched=[f"topic-{i}" for i in range(10)],
-            summaries=all_summaries,
-            broad=True,
-        )
-
-        with patch.object(engine._retriever, "retrieve", return_value=broad_result):
-            assembled = engine.on_message_inbound(
-                "Summarize everything we've discussed",
-                [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
-            )
-
-        # ALL 10 topics should appear as summaries — not just the 2 expanded ones
-        assert len(assembled.tag_sections) >= 8, (
-            f"Broad query should show most topics but only got {len(assembled.tag_sections)}: "
-            f"{list(assembled.tag_sections.keys())}"
-        )
-
-    @pytest.mark.regression("BUG-014")
-    def test_broad_query_does_not_render_full_depth(self, tmp_path):
-        """Broad queries must not render any tag at FULL depth."""
-        engine = self._make_engine(tmp_path, tag_budget=5000)
-        self._seed_tag(
-            engine, "recipes",
-            summary_text="Discussed various recipe ideas.",
-            full_text="Very long recipe discussion. " * 100,  # ~750t
-        )
-        engine._working_set = {
-            "recipes": WorkingSetEntry(tag="recipes", depth=DepthLevel.FULL, tokens=750),
-        }
-
-        broad_result = RetrievalResult(
-            tags_matched=["recipes"],
-            summaries=[StoredSummary(
-                ref="seg-recipes", primary_tag="recipes", tags=["recipes"],
-                summary="Discussed various recipe ideas.",
-                summary_tokens=20,
-                created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-                end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
-            )],
-            broad=True,
-        )
-
-        with patch.object(engine._retriever, "retrieve", return_value=broad_result):
-            assembled = engine.on_message_inbound(
-                "What have we covered so far?",
-                [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
-            )
-
-        # Should NOT contain depth="full" — broad flattens to SUMMARY
-        if "recipes" in assembled.tag_sections:
-            assert 'depth="full"' not in assembled.tag_sections["recipes"], (
-                "Broad query rendered a tag at FULL depth — should be SUMMARY"
-            )
-
-    @pytest.mark.regression("BUG-014")
-    def test_working_set_preserved_after_broad_query(self, tmp_path):
-        """Broad query flattens assembly but must NOT modify the working set."""
-        engine = self._make_engine(tmp_path, tag_budget=5000)
-        self._seed_tag(engine, "auth", summary_text="Auth discussion.", full_text="Full auth text.")
-        engine._working_set = {
-            "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500, last_accessed_turn=5),
-        }
-
-        broad_result = RetrievalResult(
-            tags_matched=["auth"],
-            summaries=[StoredSummary(
-                ref="seg-auth", primary_tag="auth", tags=["auth"],
-                summary="Auth discussion.", summary_tokens=10,
-                created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-                end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
-            )],
-            broad=True,
-        )
-
-        with patch.object(engine._retriever, "retrieve", return_value=broad_result):
-            engine.on_message_inbound(
-                "Summarize everything",
-                [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
-            )
-
-        # Working set must be unmodified — still FULL depth
-        assert "auth" in engine._working_set
-        assert engine._working_set["auth"].depth == DepthLevel.FULL
-
-
 class TestTemporalBypassesWorkingSet:
     """BUG-015: Temporal queries must skip working set depth override.
 
@@ -1466,7 +1299,7 @@ class TestTemporalBypassesWorkingSet:
 
 
 class TestSegmentLoadingGate:
-    """BUG-016: Segment loading should be skipped for broad/temporal queries."""
+    """BUG-016: Segment loading should be skipped for temporal queries."""
 
     def _make_engine(self, tmp_path):
         cfg = load_config(config_dict={
@@ -1487,39 +1320,6 @@ class TestSegmentLoadingGate:
         engine = VirtualContextEngine(config=cfg)
         engine._compacted_through = 2
         return engine
-
-    @pytest.mark.regression("BUG-016")
-    def test_broad_query_skips_segment_loading(self, tmp_path):
-        """Broad query must not call get_segments_by_tags for working set tags."""
-        engine = self._make_engine(tmp_path)
-
-        engine._store.save_tag_summary(TagSummary(
-            tag="db", summary="Database discussion.", summary_tokens=15,
-        ))
-        engine._working_set = {
-            "db": WorkingSetEntry(tag="db", depth=DepthLevel.FULL, tokens=500),
-        }
-
-        broad_result = RetrievalResult(
-            tags_matched=["db"],
-            summaries=[StoredSummary(
-                ref="seg-db", primary_tag="db", tags=["db"],
-                summary="Database discussion.", summary_tokens=15,
-                created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-                end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
-            )],
-            broad=True,
-        )
-
-        with patch.object(engine._retriever, "retrieve", return_value=broad_result), \
-             patch.object(engine._store, "get_segments_by_tags", wraps=engine._store.get_segments_by_tags) as mock_get:
-            engine.on_message_inbound(
-                "Summarize everything",
-                [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
-            )
-
-        # get_segments_by_tags should NOT have been called for working set loading
-        mock_get.assert_not_called()
 
     @pytest.mark.regression("BUG-016")
     def test_temporal_query_skips_segment_loading(self, tmp_path):
@@ -1555,7 +1355,7 @@ class TestSegmentLoadingGate:
 
     @pytest.mark.regression("BUG-016")
     def test_normal_query_still_loads_segments(self, tmp_path):
-        """Normal (non-broad, non-temporal) queries must still load segments."""
+        """Normal (non-temporal) queries must still load segments."""
         engine = self._make_engine(tmp_path)
 
         engine._store.save_tag_summary(TagSummary(
@@ -1578,7 +1378,6 @@ class TestSegmentLoadingGate:
                 created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
                 end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
             )],
-            broad=False,
             temporal=False,
         )
 

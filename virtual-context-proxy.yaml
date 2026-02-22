@@ -32,8 +32,7 @@ tag_generator:
   min_tags: 5
   prompt_mode: "detailed"
 
-  # Haiku handles broad/temporal detection natively — disable regex overrides
-  broad_patterns: []
+  # Haiku handles temporal detection natively — disable regex overrides
   temporal_patterns: []
 
   keyword_fallback:

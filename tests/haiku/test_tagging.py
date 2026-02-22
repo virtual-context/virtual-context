@@ -41,34 +41,6 @@ class TestTopicContamination:
         assert any(t in result.tags for t in ("jiu-jitsu", "martial-arts", "bjj", "grappling"))
 
 
-class TestBroadDetection:
-    """Verify Haiku correctly identifies broad vs specific queries."""
-
-    def test_summary_request_is_broad(self, haiku_tag_generator):
-        """'Give me a summary of everything' should be detected as broad."""
-        result = haiku_tag_generator.generate_tags(
-            "Can you give me a summary of everything we've discussed today?",
-            existing_tags=["database", "auth", "frontend", "deployment"],
-        )
-        assert result.broad is True
-
-    def test_specific_question_is_not_broad(self, haiku_tag_generator):
-        """A specific technical question should not be detected as broad."""
-        result = haiku_tag_generator.generate_tags(
-            "What's the optimal resistor value for a 3.3V LED with 20mA forward current?",
-            existing_tags=["electronics", "arduino", "circuits"],
-        )
-        assert result.broad is False
-
-    def test_recap_request_is_broad(self, haiku_tag_generator):
-        """'Recap what we covered' should be detected as broad."""
-        result = haiku_tag_generator.generate_tags(
-            "Recap everything we've covered so far across all topics.",
-            existing_tags=["cooking", "fitness", "legal", "music"],
-        )
-        assert result.broad is True
-
-
 class TestTemporalDetection:
     """Verify temporal query detection in LLM tagger."""
 

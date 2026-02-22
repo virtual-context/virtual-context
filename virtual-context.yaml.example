@@ -67,7 +67,7 @@ tag_generator:
   context_bleed_threshold: 0.1
 
   # prompt_mode: Controls how much instruction the LLM receives for tagging.
-  #   "detailed" — full rules, examples, broad/temporal detection guidance (~600 tokens)
+  #   "detailed" — full rules, examples, temporal detection guidance (~600 tokens)
   #   "compact"  — minimal rules (~200 tokens), better for models with small context
   prompt_mode: "compact"
 
@@ -81,20 +81,6 @@ tag_generator:
   # this skips the internal reasoning chain — 15x fewer tokens, faster, and often
   # more accurate for structured JSON output. No effect on non-qwen models.
   # disable_thinking: true
-
-  # broad_patterns: Regex patterns for deterministic broad-query detection.
-  # When a user message matches any pattern, the query is flagged as "broad"
-  # regardless of what the LLM thinks. Broad queries retrieve ALL stored tag
-  # summaries instead of just matching ones.
-  #
-  # Defaults are built in (15 patterns covering "summarize", "recap", "what did we
-  # discuss", etc.). Set to [] to disable and rely entirely on the LLM.
-  # Set to a custom list to replace the defaults.
-  #
-  # broad_patterns:
-  #   - "\\bwhat did (?:you|we) (?:say|mention|discuss|talk about|decide)\\b"
-  #   - "\\bremind me (?:what|about|of)\\b"
-  #   - "\\b(?:summarize|recap) (?:what|everything|our|the)\\b"
 
   # temporal_patterns: Regex patterns for deterministic temporal-query detection.
   # Temporal queries reference a position in time ("the first thing we discussed",

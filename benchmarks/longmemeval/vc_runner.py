@@ -83,7 +83,6 @@ def _build_vc_config(
             "max_tags": 10,
             "min_tags": 5,
             "prompt_mode": "detailed",
-            "broad_heuristic_enabled": False,
             "temporal_heuristic_enabled": False,
             "context_bleed_threshold": 0,  # disable embedding gate for batch processing
         },

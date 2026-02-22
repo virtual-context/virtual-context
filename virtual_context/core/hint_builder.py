@@ -51,9 +51,9 @@ def build_autonomous_hint(
         "RULE: These are compressed topic summaries, not the full conversation.\n"
         "- For specific facts (names, numbers, dosages, decisions): "
         "use vc_find_quote — it searches raw text across all topics.\n"
-        "- For broad questions (summarize, put together, plan, walk me through, itinerary): "
-        "use vc_expand_topic to load full conversation detail before answering.\n"
-        "- For deeper understanding of a topic: "
+        "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
+        "use vc_recall_all to load all topic summaries at once.\n"
+        "- For deeper understanding of a specific topic: "
         "use vc_expand_topic to load the full conversation text.\n"
         "- To free budget after expanding: use vc_collapse_topic.\n"
         "- Never claim you don't remember without searching first.\n"
@@ -62,7 +62,8 @@ def build_autonomous_hint(
 
     _COMPACT_RULES = (
         "RULE: Compressed summaries. Use vc_find_quote for facts, "
-        "vc_expand_topic for detail, vc_collapse_topic to free budget."
+        "vc_recall_all for full overview, vc_expand_topic for detail, "
+        "vc_collapse_topic to free budget."
     )
 
     def _assemble(exp_lines: list[str], avail: list[str], *, compact: bool = False) -> str:
@@ -83,7 +84,7 @@ def build_autonomous_hint(
             f' available="{budget - used}">\n'
             f"{rules}\n\n"
             f"{body}\n\n"
-            f"Tools: find_quote(query) | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
+            f"Tools: find_quote(query) | recall_all() | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
             f"</context-topics>"
         )
 
@@ -147,9 +148,9 @@ def build_supervised_hint(
             "RULE: These are compressed topic summaries, not the full conversation.\n"
             "- For specific facts (names, numbers, dosages, decisions): "
             "use vc_find_quote — it searches raw text across all topics.\n"
-            "- For broad questions (summarize, put together, plan, walk me through, itinerary): "
-            "use vc_expand_topic to load full conversation detail before answering.\n"
-            "- For deeper understanding of a topic: "
+            "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
+            "use vc_recall_all to load all topic summaries at once.\n"
+            "- For deeper understanding of a specific topic: "
             "use vc_expand_topic to load the full conversation text.\n"
             "- To free budget after expanding: use vc_collapse_topic.\n"
             "- Never claim you don't remember without searching first.\n"

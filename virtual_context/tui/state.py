@@ -21,7 +21,6 @@ class TurnRecord:
     compaction: CompactionReport | None = None
     tags: list[str] = field(default_factory=list)
     primary_tag: str = "_general"
-    broad: bool = False
     temporal: bool = False
     input_tokens: int = 0
     turns_in_payload: int = 0
@@ -38,7 +37,6 @@ class TurnRecord:
             "assistant_message": self.assistant_message,
             "tags": self.tags,
             "primary_tag": self.primary_tag,
-            "broad": self.broad,
             "temporal": self.temporal,
             "input_tokens": self.input_tokens,
             "turns_in_payload": self.turns_in_payload,
