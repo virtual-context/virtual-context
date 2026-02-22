@@ -220,6 +220,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
             upstream=inst.get("upstream", ""),
             label=inst.get("label", ""),
             host=inst.get("host", "127.0.0.1"),
+            config=inst.get("config", ""),
         )
         for inst in instances_raw
     ]
@@ -329,6 +330,7 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
 
     # Proxy instances validation
     seen_ports: dict[str, int] = {}  # "host:port" -> index
+    seen_labels: dict[str, int] = {}  # "label" -> index
     for i, inst in enumerate(config.proxy.instances):
         if not inst.upstream:
             errors.append(
@@ -341,6 +343,23 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
                 f"(same as instances[{seen_ports[key]}])"
             )
         seen_ports[key] = i
+
+        # Per-instance config file validation
+        if inst.config:
+            from pathlib import Path as _Path
+            if not _Path(inst.config).is_file():
+                errors.append(
+                    f"proxy.instances[{i}].config file not found: {inst.config}"
+                )
+
+        # Label uniqueness
+        if inst.label:
+            if inst.label in seen_labels:
+                errors.append(
+                    f"proxy.instances[{i}].label '{inst.label}' duplicates "
+                    f"instances[{seen_labels[inst.label]}]"
+                )
+            seen_labels[inst.label] = i
 
     # Check that summarization provider exists in providers
     if config.providers and config.summarization.provider not in config.providers:

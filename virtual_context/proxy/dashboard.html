@@ -1304,11 +1304,11 @@
       if (live) {
         var initT = live.initial_turns != null ? live.initial_turns : '--';
         var initTags = live.initial_tag_count != null ? live.initial_tag_count : '--';
-        // Row 1: turns, tags, compacted, distinct
+        // Row 1: live requests, turns, tags, compacted
+        html += mc('Live', live.live_requests || 0);
         html += mc('Turns', initT + '\u2192' + live.turn_count);
         html += mc('Tags', initTags + '\u2192' + live.tag_count);
         html += mc('Compacted', 'T' + Math.floor(live.compacted_through / 2));
-        html += mc('Distinct', (live.distinct_tags || 0));
 
         // Row 2: window, history, utilization, segments/summaries
         var cw = live.context_window || 0;

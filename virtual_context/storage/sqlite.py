@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from ..core.store import ContextStore
 from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
@@ -233,6 +236,31 @@ class SQLiteStore(ContextStore):
         except sqlite3.OperationalError:
             pass  # Column already exists
         conn.commit()
+        self._repair_fts_if_needed(conn)
+
+    def _repair_fts_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Check FTS indexes and rebuild only if corrupted.
+
+        FTS5 indexes can become inconsistent after a hard kill (SIGKILL,
+        power loss) because the FTS internal structures aren't covered by
+        SQLite's main integrity check.  A quick ``integrity-check`` on each
+        FTS table detects this; a full ``rebuild`` fixes it.
+        """
+        for fts_table in ("segments_fts", "segments_fts_full"):
+            try:
+                conn.execute(
+                    f"INSERT INTO {fts_table}({fts_table}) VALUES('integrity-check')"
+                )
+            except sqlite3.DatabaseError:
+                logger.warning("FTS index %s corrupted — rebuilding", fts_table)
+                try:
+                    conn.execute(
+                        f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')"
+                    )
+                    conn.commit()
+                    logger.info("FTS index %s rebuilt successfully", fts_table)
+                except sqlite3.DatabaseError as exc:
+                    logger.error("FTS rebuild failed for %s: %s", fts_table, exc)
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
         conn = self._get_conn()

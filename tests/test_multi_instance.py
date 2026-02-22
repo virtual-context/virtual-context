@@ -141,6 +141,190 @@ class TestRunMultiInstance:
         call_kwargs = mock_create.call_args
         assert call_kwargs.kwargs.get("shared_engine") is not None
 
+    def test_per_instance_config_gets_own_engine(self, tmp_path):
+        """Instance with config field gets its own engine, not the shared one."""
+        import yaml
+
+        # Write a per-instance config file
+        inst_cfg = {
+            "version": "0.2",
+            "storage_root": str(tmp_path / "inst_store"),
+            "storage": {
+                "backend": "sqlite",
+                "sqlite": {"path": str(tmp_path / "inst.db")},
+            },
+        }
+        inst_cfg_path = tmp_path / "inst.yaml"
+        inst_cfg_path.write_text(yaml.safe_dump(inst_cfg))
+
+        instances = [
+            ProxyInstanceConfig(
+                port=5757, upstream="https://api.anthropic.com",
+                label="isolated", config=str(inst_cfg_path),
+            ),
+        ]
+
+        apps_created = []
+
+        def tracking_create_app(**kwargs):
+            apps_created.append(kwargs)
+            app = MagicMock()
+            app.title = "test"
+            app.state = MagicMock()
+            return app
+
+        class FakeServer:
+            def __init__(self, config):
+                pass
+            async def serve(self):
+                pass
+
+        class FakeConfig:
+            def __init__(self, app, **kw):
+                pass
+
+        shared_engine = MagicMock()
+        shared_engine.config.monitor.context_window = 120_000
+
+        with (
+            patch("virtual_context.proxy.multi.create_app", side_effect=tracking_create_app),
+            patch("virtual_context.proxy.multi.uvicorn") as mock_uv,
+        ):
+            mock_uv.Config = FakeConfig
+            mock_uv.Server = FakeServer
+
+            asyncio.run(run_multi_instance(
+                instances=instances,
+                config_path=None,
+                engine=shared_engine,
+            ))
+
+        assert len(apps_created) == 1
+        # Should NOT be the shared engine — it should be a new one
+        assert apps_created[0]["shared_engine"] is not shared_engine
+        assert apps_created[0]["config_path"] == str(inst_cfg_path)
+
+    def test_instance_without_config_uses_shared_engine(self):
+        """Instance without config field uses the shared engine."""
+        instances = [
+            ProxyInstanceConfig(
+                port=5757, upstream="https://api.anthropic.com",
+                label="shared", config="",
+            ),
+        ]
+
+        apps_created = []
+
+        def tracking_create_app(**kwargs):
+            apps_created.append(kwargs)
+            app = MagicMock()
+            app.title = "test"
+            app.state = MagicMock()
+            return app
+
+        class FakeServer:
+            def __init__(self, config):
+                pass
+            async def serve(self):
+                pass
+
+        class FakeConfig:
+            def __init__(self, app, **kw):
+                pass
+
+        shared_engine = MagicMock()
+        shared_engine.config.monitor.context_window = 120_000
+        shared_metrics = ProxyMetrics(context_window=120_000)
+
+        with (
+            patch("virtual_context.proxy.multi.create_app", side_effect=tracking_create_app),
+            patch("virtual_context.proxy.multi.uvicorn") as mock_uv,
+        ):
+            mock_uv.Config = FakeConfig
+            mock_uv.Server = FakeServer
+
+            asyncio.run(run_multi_instance(
+                instances=instances,
+                config_path=None,
+                engine=shared_engine,
+                metrics=shared_metrics,
+            ))
+
+        assert len(apps_created) == 1
+        assert apps_created[0]["shared_engine"] is shared_engine
+        assert apps_created[0]["shared_metrics"] is shared_metrics
+
+    def test_mixed_shared_and_isolated(self, tmp_path):
+        """One shared + one isolated instance get correct engine assignment."""
+        import yaml
+
+        inst_cfg = {
+            "version": "0.2",
+            "storage_root": str(tmp_path / "iso"),
+            "storage": {
+                "backend": "sqlite",
+                "sqlite": {"path": str(tmp_path / "iso.db")},
+            },
+        }
+        inst_cfg_path = tmp_path / "iso.yaml"
+        inst_cfg_path.write_text(yaml.safe_dump(inst_cfg))
+
+        instances = [
+            ProxyInstanceConfig(
+                port=5757, upstream="https://api.anthropic.com",
+                label="shared_inst", config="",
+            ),
+            ProxyInstanceConfig(
+                port=5758, upstream="https://api.openai.com/v1",
+                label="isolated_inst", config=str(inst_cfg_path),
+            ),
+        ]
+
+        apps_created = []
+
+        def tracking_create_app(**kwargs):
+            apps_created.append(kwargs)
+            app = MagicMock()
+            app.title = "test"
+            app.state = MagicMock()
+            return app
+
+        class FakeServer:
+            def __init__(self, config):
+                pass
+            async def serve(self):
+                pass
+
+        class FakeConfig:
+            def __init__(self, app, **kw):
+                pass
+
+        shared_engine = MagicMock()
+        shared_engine.config.monitor.context_window = 120_000
+        shared_metrics = ProxyMetrics(context_window=120_000)
+
+        with (
+            patch("virtual_context.proxy.multi.create_app", side_effect=tracking_create_app),
+            patch("virtual_context.proxy.multi.uvicorn") as mock_uv,
+        ):
+            mock_uv.Config = FakeConfig
+            mock_uv.Server = FakeServer
+
+            asyncio.run(run_multi_instance(
+                instances=instances,
+                config_path="/master.yaml",
+                engine=shared_engine,
+                metrics=shared_metrics,
+            ))
+
+        assert len(apps_created) == 2
+        # First instance (no config) → shared engine
+        assert apps_created[0]["shared_engine"] is shared_engine
+        assert apps_created[0]["shared_metrics"] is shared_metrics
+        # Second instance (with config) → isolated engine
+        assert apps_created[1]["shared_engine"] is not shared_engine
+        assert apps_created[1]["shared_metrics"] is not shared_metrics
+
 
 class TestCLIMultiInstance:
     """Test CLI dispatches correctly between single and multi-instance."""

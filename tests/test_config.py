@@ -230,3 +230,79 @@ class TestMultiInstanceConfig:
         })
         errors = validate_config(config)
         assert not any("duplicates" in e for e in errors)
+
+    def test_config_field_parsed(self):
+        """Per-instance config field is parsed from YAML."""
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {
+                        "port": 5757,
+                        "upstream": "https://api.anthropic.com",
+                        "label": "anthropic",
+                        "config": "/tmp/vc-anthropic.yaml",
+                    },
+                ],
+            },
+        })
+        assert config.proxy.instances[0].config == "/tmp/vc-anthropic.yaml"
+
+    def test_config_field_defaults_empty(self):
+        """Config field defaults to empty string when absent."""
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com"},
+                ],
+            },
+        })
+        assert config.proxy.instances[0].config == ""
+
+    def test_validate_missing_config_file(self):
+        """Validation error when per-instance config file doesn't exist."""
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {
+                        "port": 5757,
+                        "upstream": "https://api.anthropic.com",
+                        "label": "anthropic",
+                        "config": "/nonexistent/path/vc.yaml",
+                    },
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert any("config file not found" in e for e in errors)
+
+    def test_validate_existing_config_file(self, tmp_path):
+        """No error when per-instance config file exists."""
+        cfg_file = tmp_path / "instance.yaml"
+        cfg_file.write_text("version: '0.2'\n")
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {
+                        "port": 5757,
+                        "upstream": "https://api.anthropic.com",
+                        "label": "anthropic",
+                        "config": str(cfg_file),
+                    },
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert not any("config file not found" in e for e in errors)
+
+    def test_validate_duplicate_labels(self):
+        """Duplicate labels across instances produce validation error."""
+        config = load_config(config_dict={
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com", "label": "myproxy"},
+                    {"port": 5758, "upstream": "https://api.openai.com/v1", "label": "myproxy"},
+                ],
+            },
+        })
+        errors = validate_config(config)
+        assert any("label 'myproxy' duplicates" in e for e in errors)

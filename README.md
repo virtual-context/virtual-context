@@ -352,6 +352,35 @@ Higher-priority tags get assembled first. If the budget runs out, lower-priority
 pip install virtual-context
 ```
 
+One-command installers (OpenClaw-style):
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+iwr https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.ps1 -useb | iex
+```
+
+Guided setup (interactive wizard → config + proxy instances + daemon):
+
+```bash
+virtual-context onboard --wizard
+```
+
+The wizard walks through: tagging provider/model selection → inbound tagger mode (embedding/LLM/keyword) → proxy instances (upstream provider, port, label per instance) → per-instance config generation with isolated storage → optional daemon install. Each instance gets a standalone YAML config pointing to its own SQLite DB.
+
+Or non-interactive:
+
+```bash
+virtual-context onboard
+virtual-context onboard --install-daemon --upstream https://api.anthropic.com
+```
+
+Daemon setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
+
 Optional extras:
 
 ```bash
@@ -437,6 +466,8 @@ Generate a starter config from a preset:
 
 ```bash
 virtual-context init coding    # tuned for software development
+virtual-context presets list   # see all available presets
+virtual-context presets show coding  # dump a preset's config as YAML
 ```
 
 ## Three Tag Generators
@@ -462,6 +493,13 @@ virtual-context aliases suggest                # auto-detect potential aliases
 virtual-context aliases add db database        # register alias manually
 virtual-context proxy -u https://api.anthropic.com  # single-instance proxy
 virtual-context proxy                               # multi-instance (from config)
+virtual-context presets list                   # list available config presets
+virtual-context presets show coding            # dump preset config as YAML
+virtual-context daemon status                  # service status (platform-specific)
+virtual-context daemon start                   # start/enable daemon
+virtual-context daemon stop                    # stop daemon
+virtual-context daemon restart                 # stop + start daemon
+virtual-context daemon uninstall               # remove daemon definition
 virtual-context config validate                # check config syntax
 virtual-context cost-report                    # show session LLM usage
 ```
@@ -520,7 +558,7 @@ virtual-context -c virtual-context.yaml proxy --upstream https://api.openai.com 
 virtual-context -c virtual-context.yaml proxy -u https://api.anthropic.com --host 0.0.0.0 --port 9090
 ```
 
-**Multi-instance mode.** Run multiple proxy listeners on different ports, each forwarding to a different upstream provider, sharing a single engine and store. Configure in YAML instead of CLI flags:
+**Multi-instance mode.** Run multiple proxy listeners on different ports, each forwarding to a different upstream provider. Configure in YAML instead of CLI flags:
 
 ```yaml
 proxy:
@@ -542,7 +580,40 @@ virtual-context -c virtual-context.yaml proxy
 # Each port gets its own dashboard showing the instance label
 ```
 
-All instances share the same `VirtualContextEngine`, `ProxyMetrics`, and storage backend. Tags and summaries built from conversations on one port are available for retrieval on all others.
+By default, all instances share the same `VirtualContextEngine`, `ProxyMetrics`, and storage backend.
+
+**Per-port config.** When different instances need different tagging providers, summarization models, or isolated storage, add a `config` field pointing to a standalone config file:
+
+```yaml
+proxy:
+  instances:
+    - port: 5757
+      upstream: https://api.anthropic.com
+      label: anthropic
+      config: ./virtual-context-proxy-anthropic.yaml
+    - port: 5758
+      upstream: https://api.openai.com/v1
+      label: openai
+      config: ./virtual-context-proxy-openai.yaml
+```
+
+Each instance config is a full standalone config with its own storage path:
+
+```yaml
+# virtual-context-proxy-anthropic.yaml
+version: '0.2'
+storage_root: .virtualcontext/anthropic
+tag_generator:
+  type: llm
+  provider: anthropic
+  model: claude-haiku-4-5-20251001
+storage:
+  backend: sqlite
+  sqlite:
+    path: .virtualcontext/anthropic/store.db
+```
+
+Instances with a `config` field get their own `VirtualContextEngine` and isolated storage. Instances without `config` share the master engine. The `onboard --wizard` flow generates these per-instance config files automatically.
 
 Point your client at the proxy:
 
@@ -648,7 +719,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
 | **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
 | **ProxyServer** | `proxy/server.py` | HTTP proxy: enrichment, filtering, history ingestion, session continuity |
-| **MultiInstance** | `proxy/multi.py` | Multi-instance launcher: N uvicorn listeners sharing one engine/store |
+| **MultiInstance** | `proxy/multi.py` | Multi-instance launcher: N uvicorn listeners, shared or per-port engine/store |
 | **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats |
 | **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector + request capture ring buffer |
 
@@ -746,7 +817,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # 980 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # ~1050 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

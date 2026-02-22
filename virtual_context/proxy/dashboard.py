@@ -237,9 +237,20 @@ def register_dashboard_routes(
                 {"error": "Store does not support session deletion"},
                 status_code=501,
             )
-        deleted = await asyncio.to_thread(store.delete_session, session_id)
-        logger.info("Deleted session %s: %d segments removed", session_id, deleted)
-        return JSONResponse({"deleted": deleted})
+        try:
+            deleted = await asyncio.to_thread(store.delete_session, session_id)
+            # Also clean up tag aliases referencing this session
+            if hasattr(store, "delete_tag_aliases_for_session"):
+                await asyncio.to_thread(
+                    store.delete_tag_aliases_for_session, session_id,
+                )
+            logger.info("Deleted session %s: %d segments removed", session_id, deleted)
+            return JSONResponse({"deleted": deleted})
+        except Exception as exc:
+            logger.error("Failed to delete session %s: %s", session_id, exc, exc_info=True)
+            return JSONResponse(
+                {"error": str(exc)}, status_code=500,
+            )
 
     @app.get("/dashboard/sessions/live")
     async def dashboard_sessions_live():
