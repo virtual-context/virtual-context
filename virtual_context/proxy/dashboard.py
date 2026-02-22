@@ -764,7 +764,6 @@ async def _replay_worker(
                 filtered = state.engine.filter_history(
                     state.conversation_history,
                     current_tags=assembled.matched_tags,
-                    temporal=assembled.temporal,
                 )
 
                 # 5. Build messages for LLM
@@ -808,7 +807,6 @@ async def _replay_worker(
                     "api_format": prov["format"],
                     "streaming": False,
                     "tags": assembled.matched_tags,
-                    "temporal": assembled.temporal,
                     "context_tokens": context_tokens,
                     "budget": assembled.budget_breakdown,
                     "history_len": len(state.conversation_history),

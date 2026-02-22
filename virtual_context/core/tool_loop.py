@@ -42,6 +42,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_collapse_topic",
     "vc_find_quote",
     "vc_recall_all",
+    "vc_remember_when",
 })
 
 
@@ -153,6 +154,40 @@ def vc_tool_definitions() -> list[dict]:
                 "properties": {},
             },
         },
+        {
+            "name": "vc_remember_when",
+            "description": (
+                "Find memory by topic within a time window. "
+                "Use for requests like 'last week', 'last month', "
+                "'3 days ago', or 'between June and July'. "
+                "Do not compute calendar dates yourself; prefer relative "
+                "presets and let the backend resolve exact dates."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Topic/fact query to search for within a time window.",
+                    },
+                    "time_range": {
+                        "type": "object",
+                        "description": (
+                            "Time window selector. One of: "
+                            "{kind:'relative', preset:'last_24_hours|last_7_days|last_30_days|"
+                            "this_week|last_week|this_month|last_month|this_year|last_year'} "
+                            "or {kind:'between_dates', start:'YYYY-MM-DD or YYYY-MM', "
+                            "end:'YYYY-MM-DD or YYYY-MM'}."
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 5).",
+                    },
+                },
+                "required": ["query", "time_range"],
+            },
+        },
     ]
 
 
@@ -183,6 +218,12 @@ def execute_vc_tool(
             )
         elif name == "vc_recall_all":
             result = engine.recall_all()
+        elif name == "vc_remember_when":
+            result = engine.remember_when(
+                query=tool_input.get("query", ""),
+                time_range=tool_input.get("time_range", {}),
+                max_results=tool_input.get("max_results", 5),
+            )
         else:
             result = {"error": f"unknown VC tool: {name}"}
         return json.dumps(result)

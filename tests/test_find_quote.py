@@ -321,7 +321,8 @@ class TestProxyFindQuoteTool:
         tools = vc_tool_definitions()
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
-        assert len(tools) == 4  # expand, collapse, find_quote, recall_all
+        assert "vc_remember_when" in names
+        assert len(tools) == 5  # expand, collapse, find_quote, recall_all, remember_when
 
     def test_find_quote_tool_schema(self):
         from virtual_context.core.tool_loop import vc_tool_definitions
@@ -385,3 +386,30 @@ class TestContextHintMentionsFindQuote:
         engine = self._make_engine_with_hint(tmp_path)
         hint = engine._build_context_hint(paging_mode="supervised")
         assert "vc_find_quote" in hint
+
+
+class TestRememberWhenTool:
+    def test_execute_vc_tool_dispatches_remember_when(self):
+        from virtual_context.core.tool_loop import execute_vc_tool
+
+        engine = MagicMock()
+        engine.remember_when.return_value = {
+            "query": "auth",
+            "found": True,
+            "results": [],
+        }
+        result_str = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "auth",
+                "time_range": {"kind": "relative", "preset": "last_7_days"},
+            },
+        )
+        engine.remember_when.assert_called_once_with(
+            query="auth",
+            time_range={"kind": "relative", "preset": "last_7_days"},
+            max_results=5,
+        )
+        result = json.loads(result_str)
+        assert result["found"] is True

@@ -1486,14 +1486,14 @@ class TestFilterBodyMessages:
         assert len(msgs) == 5  # 2 protected pairs * 2 + current user
 
     @pytest.mark.regression("BUG-008")
-    def test_temporal_keeps_everything(self):
-        """Temporal queries keep all turns."""
+    def test_no_temporal_bypass_in_filter(self):
+        """Time-scoped recall is tool-driven; history filter does not bypass."""
         body = self._build_body(3)
         idx = self._build_index([["a"], ["b"], ["c"]])
         filtered, dropped = _filter_body_messages(
-            body, idx, ["x"], recent_turns=1, temporal=True,
+            body, idx, ["x"], recent_turns=1,
         )
-        assert dropped == 0
+        assert dropped == 2
 
     def test_rule_tag_always_kept(self):
         """Turns tagged with 'rule' are always kept."""
@@ -3352,7 +3352,7 @@ class TestInjectVCTools:
         names = [t["name"] for t in result["tools"]]
         assert names[0] == "web_search"
         assert "vc_expand_topic" in names
-        assert len(names) == 5  # web_search + 4 VC tools
+        assert len(names) == 6  # web_search + 5 VC tools
 
     def test_skips_when_tool_choice_none_string(self):
         engine = MagicMock()
@@ -4513,4 +4513,3 @@ class TestCreateAppSharedEngine:
         )
         assert app.title == "virtual-context proxy"
         assert app.state.instance_label == ""
-

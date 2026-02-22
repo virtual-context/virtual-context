@@ -593,7 +593,7 @@
     <dl>
       <dt>T#</dt><dd>Turn number (0-indexed). Corresponds to the conversation turn in the session.</dd>
       <dt>Session</dt><dd>Short prefix of the session UUID this request belongs to. Click to filter the log to just that session. Multiple sessions appear when the proxy serves concurrent conversations.</dd>
-      <dt>Tags</dt><dd>Semantic tags assigned to this turn by the tagger, or a <strong style="color:var(--purple)">BROAD</strong> / <strong style="color:var(--orange)">TEMPORAL</strong> badge if the query was detected as broad or temporal. Tags update after on_turn_complete finishes.</dd>
+      <dt>Tags</dt><dd>Semantic tags assigned to this turn by the tagger. Tags update after on_turn_complete finishes.</dd>
       <dt>Message</dt><dd>Preview of the user message (first 50 characters).</dd>
       <dt>Payload</dt><dd>How many turns were included in the LLM payload after tag-based filtering (filtered/total).</dd>
       <dt>Tokens</dt><dd>Estimated total input tokens sent to the upstream provider for this request (system prompt + enriched messages).</dd>
@@ -892,7 +892,6 @@
   function buildTagCell(tags, broad, temporal) {
     const badges = [];
     if (broad) badges.push('<span class="broad-badge">BROAD</span>');
-    if (temporal) badges.push('<span class="temporal-badge">TEMPORAL</span>');
     if (badges.length) return badges.join(' ');
     return (tags || []).join(', ');
   }
@@ -909,13 +908,12 @@
     tr.id = rowId(sid, evt.turn);
     tr.dataset.session = sid;
     if (evt.broad) tr.dataset.broad = '1';
-    if (evt.temporal) tr.dataset.temporal = '1';
     // Store raw values for kt/$ toggle
     tr.dataset.inputTokens = evt.input_tokens || 0;
     tr.dataset.rawTokens = evt.raw_input_tokens || 0;
     tr.dataset.contextTokens = evt.context_tokens || 0;
     tr.dataset.model = evt.model || '';
-    const tagStr = evt.passthrough ? '<span class="passthrough-badge">PASSTHROUGH</span>' : buildTagCell(evt.tags, evt.broad, evt.temporal);
+    const tagStr = evt.passthrough ? '<span class="passthrough-badge">PASSTHROUGH</span>' : buildTagCell(evt.tags, evt.broad, false);
     const preview = (evt.message_preview || '').substring(0, 50);
     const vcMs = evt.overhead_ms !== undefined ? evt.overhead_ms : Math.round((evt.wait_ms || 0) + (evt.inbound_ms || 0));
     // Payload: filtered/total turns
@@ -2049,7 +2047,7 @@
       '<p>Tags are semantic labels assigned to each conversation turn (e.g., "authentication", "database", "deployment"). They drive retrieval: when you ask about a topic, the engine matches query tags against tags on stored segments to find relevant summaries. The LLM tagger generates tags from conversation content; the heuristic overrides are regex safety nets that catch specific query patterns the LLM might miss.</p>' +
       '<dl>' +
       '<dt>Broad Heuristic</dt><dd>A set of regex patterns that detect broad, retrospective queries like "what did we discuss?", "summarize everything", or "recap our conversation". When a broad query is detected, retrieval switches to a special branch that fetches <strong>all</strong> stored tag summaries (not just tag-overlap matches), giving the LLM a complete picture. This heuristic fires as a post-LLM override — if the LLM already flagged the query as broad, the heuristic is skipped. Disable if your tagger model reliably detects broad queries on its own.</dd>' +
-      '<dt>Temporal Heuristic</dt><dd>A set of regex patterns that detect time-referencing queries like "what was the first thing we discussed?", "early on", or "going way back". When temporal intent is detected, retrieval fetches segment-level summaries sorted chronologically (oldest first), providing detailed recall of early conversation content that may have been compacted long ago. Disable if your tagger model reliably detects temporal intent.</dd>' +
+      '<dt>Remember-When Tool</dt><dd>Use <code>vc_remember_when</code> for time-scoped recall (e.g. "last week", "last month", "between June and July"). The model passes a relative preset or explicit date range; the backend resolves exact dates and filters results.</dd>' +
       '</dl>',
     retrieval:
       '<p>Retrieval fetches stored summaries relevant to the current user message. The engine tags the incoming query, then matches those tags against tags on stored segments. Matching summaries are ranked, trimmed to budget, and assembled into a context block prepended to the LLM request as a <code>&lt;virtual-context&gt;</code> block.</p>' +

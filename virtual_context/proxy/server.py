@@ -1334,7 +1334,6 @@ def create_app(
                 state.engine._turn_tag_index,
                 _real_tags,
                 recent_turns=recent,
-                temporal=assembled.temporal,
                 compacted_turn=_ct,
                 fmt=fmt,
             )
@@ -1404,7 +1403,6 @@ def create_app(
             "api_format": api_format,
             "streaming": is_streaming,
             "tags": assembled.matched_tags if assembled else [],
-            "temporal": assembled.temporal if assembled else False,
             "context_tokens": context_tokens,
             "budget": assembled.budget_breakdown if assembled else {},
             "history_len": len(state.conversation_history) if state else 0,
@@ -1425,10 +1423,7 @@ def create_app(
 
         # Log request to terminal for debugging
         _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
-        _flags = []
-        if assembled and assembled.temporal:
-            _flags.append("TEMPORAL")
-        _flag_str = f" [{' '.join(_flags)}]" if _flags else ""
+        _flag_str = ""
         print(
             f"[T{turn}] POST {api_format} stream={is_streaming} "
             f"tags=[{_tags_str}]{_flag_str} "

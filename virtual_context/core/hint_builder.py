@@ -53,6 +53,8 @@ def build_autonomous_hint(
         "use vc_find_quote — it searches raw text across all topics.\n"
         "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
         "use vc_recall_all to load all topic summaries at once.\n"
+        "- For time-scoped questions (last week, last month, between dates): "
+        "use vc_remember_when and choose a relative preset; do not do date math.\n"
         "- For deeper understanding of a specific topic: "
         "use vc_expand_topic to load the full conversation text.\n"
         "- To free budget after expanding: use vc_collapse_topic.\n"
@@ -62,7 +64,8 @@ def build_autonomous_hint(
 
     _COMPACT_RULES = (
         "RULE: Compressed summaries. Use vc_find_quote for facts, "
-        "vc_recall_all for full overview, vc_expand_topic for detail, "
+        "vc_recall_all for full overview, vc_remember_when for time windows, "
+        "vc_expand_topic for detail, "
         "vc_collapse_topic to free budget."
     )
 
@@ -84,7 +87,8 @@ def build_autonomous_hint(
             f' available="{budget - used}">\n'
             f"{rules}\n\n"
             f"{body}\n\n"
-            f"Tools: find_quote(query) | recall_all() | expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
+            f"Tools: find_quote(query) | recall_all() | remember_when(query, time_range) | "
+            f"expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
             f"</context-topics>"
         )
 
@@ -150,6 +154,8 @@ def build_supervised_hint(
             "use vc_find_quote — it searches raw text across all topics.\n"
             "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
             "use vc_recall_all to load all topic summaries at once.\n"
+            "- For time-scoped questions (last week, last month, between dates): "
+            "use vc_remember_when and choose a relative preset; do not do date math.\n"
             "- For deeper understanding of a specific topic: "
             "use vc_expand_topic to load the full conversation text.\n"
             "- To free budget after expanding: use vc_collapse_topic.\n"
