@@ -536,6 +536,7 @@ class ProxyInstanceConfig:
     upstream: str = ""
     label: str = ""
     host: str = "127.0.0.1"
+    config: str = ""  # path to per-instance config file; empty = use master config
 
 
 @dataclass

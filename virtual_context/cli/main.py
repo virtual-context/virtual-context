@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import subprocess
 import sys
 from pathlib import Path
+
+import yaml
 
 from ..config import load_config, validate_config
 from ..presets import get_preset, list_presets
@@ -181,6 +185,31 @@ def cmd_init(args):
     print("  2. Start Ollama:      ollama serve")
     print("  3. Validate config:   virtual-context config validate")
     print("  4. List tags:         virtual-context tags")
+
+
+def cmd_presets(args):
+    """List or show presets."""
+    action = getattr(args, "presets_action", None) or "list"
+
+    if action == "list":
+        presets = list_presets()
+        if not presets:
+            print("No presets registered.")
+            return
+        print(f"{'Name':<15} {'Description'}")
+        print("-" * 60)
+        for p in presets:
+            print(f"{p.name:<15} {p.description}")
+
+    elif action == "show":
+        preset = get_preset(args.preset_name)
+        if preset is None:
+            available = ", ".join(p.name for p in list_presets())
+            print(f"Unknown preset: {args.preset_name}", file=sys.stderr)
+            if available:
+                print(f"Available: {available}", file=sys.stderr)
+            sys.exit(1)
+        print(yaml.safe_dump(preset.config_dict, sort_keys=False))
 
 
 def cmd_config_validate(args):
@@ -418,6 +447,518 @@ def cmd_transform(args):
         sys.exit(2)
 
 
+def _prompt(text: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    raw = input(f"{text}{suffix}: ").strip()
+    if raw:
+        return raw
+    return default or ""
+
+
+def _prompt_int(text: str, default: int, min_value: int = 1) -> int:
+    while True:
+        value = _prompt(text, str(default))
+        try:
+            parsed = int(value)
+        except ValueError:
+            print("Please enter a valid integer.")
+            continue
+        if parsed < min_value:
+            print(f"Please enter a value >= {min_value}.")
+            continue
+        return parsed
+
+
+def _prompt_yes_no(text: str, default_yes: bool = True) -> bool:
+    default = "Y/n" if default_yes else "y/N"
+    while True:
+        raw = input(f"{text} [{default}]: ").strip().lower()
+        if not raw:
+            return default_yes
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def _prompt_choice(text: str, options: list[str], default: str | None = None) -> str:
+    """Display a numbered menu and return the selected option."""
+    print(f"\n{text}")
+    for i, opt in enumerate(options, 1):
+        marker = " (default)" if opt == default else ""
+        print(f"  {i}) {opt}{marker}")
+    while True:
+        raw = input(f"Choice [1-{len(options)}]: ").strip()
+        if not raw and default:
+            return default
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+        except ValueError:
+            pass
+        print(f"Please enter a number between 1 and {len(options)}.")
+
+
+_PROVIDER_MODELS: dict[str, list[str]] = {
+    "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-6"],
+    "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-nano"],
+    "ollama": ["qwen3:4b-instruct-2507-fp16", "llama3.1:8b", "mistral:7b"],
+}
+
+
+def _prompt_tagging_provider() -> tuple[str, str]:
+    """Ask for a tagging/summarization provider and model. Returns (provider, model)."""
+    provider = _prompt_choice(
+        "Tagging/summarization provider:",
+        ["anthropic", "openai", "ollama", "custom"],
+        default="ollama",
+    )
+    models = _PROVIDER_MODELS.get(provider)
+    if models:
+        model = _prompt_choice(f"{provider} model:", models, default=models[0])
+    else:
+        model = _prompt("Model name", "")
+    return provider, model
+
+
+def _provider_defaults(provider: str) -> tuple[str, str]:
+    if provider == "anthropic":
+        return "anthropic", "https://api.anthropic.com"
+    if provider == "openai":
+        return "openai", "https://api.openai.com/v1"
+    if provider == "gemini":
+        return "gemini", "https://generativelanguage.googleapis.com"
+    if provider == "ollama":
+        return "ollama", "http://127.0.0.1:11434"
+    return "custom", "https://api.example.com"
+
+
+def _write_instance_config(
+    base_dir: Path, label: str, provider: str, model: str, inbound_tagger_type: str,
+) -> str:
+    """Generate a standalone YAML config for one proxy instance.
+
+    Creates isolated storage at ``<base_dir>/.virtualcontext/<label>/store.db``
+    and writes config to ``<base_dir>/virtual-context-proxy-<label>.yaml``.
+    Returns the path to the written file.
+    """
+    storage_root = f".virtualcontext/{label}"
+    provider_label, base_url = _provider_defaults(provider)
+    provider_block: dict = {}
+    if provider == "ollama":
+        provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url + "/v1"}}
+    elif provider == "anthropic":
+        provider_block = {provider_label: {"type": "anthropic"}}
+    elif provider == "openai":
+        provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
+    else:
+        provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
+
+    cfg: dict = {
+        "version": "0.2",
+        "storage_root": storage_root,
+        "context_window": 120_000,
+        "token_counter": "estimate",
+        "tag_generator": {
+            "type": "llm" if provider != "keyword" else "keyword",
+            "provider": provider_label,
+            "model": model,
+            "max_tags": 5,
+            "min_tags": 1,
+        },
+        "summarization": {
+            "provider": provider_label,
+            "model": model,
+            "max_tokens": 1000,
+            "temperature": 0.3,
+        },
+        "providers": provider_block,
+        "storage": {
+            "backend": "sqlite",
+            "sqlite": {"path": f"{storage_root}/store.db"},
+        },
+        "retrieval": {
+            "inbound_tagger_type": inbound_tagger_type,
+        },
+    }
+
+    out_path = base_dir / f"virtual-context-proxy-{label}.yaml"
+    out_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return str(out_path)
+
+
+def _run_instance_wizard() -> tuple[list[dict], list[str]]:
+    """Interactive wizard for proxy instance setup.
+
+    Returns:
+        (instances, config_paths): instances list (dicts for YAML) and
+        list of written per-instance config file paths.
+    """
+    print("\n--- Tagging & Summarization ---")
+    tag_provider, tag_model = _prompt_tagging_provider()
+
+    inbound_tagger_type = _prompt_choice(
+        "Inbound tagging mode:",
+        ["embedding", "llm", "keyword"],
+        default="embedding",
+    )
+
+    multi = _prompt_yes_no("Configure multiple proxy instances?", default_yes=False)
+    count = 1
+    if multi:
+        count = _prompt_int("How many proxy instances?", default=2, min_value=1)
+
+    instances: list[dict] = []
+    config_paths: list[str] = []
+    used_ports: set[int] = set()
+    base_dir = Path.cwd()
+
+    for i in range(count):
+        print(f"\n--- Instance {i + 1}/{count} ---")
+        provider = _prompt_choice(
+            "Upstream provider:",
+            ["anthropic", "openai", "gemini", "custom"],
+            default="anthropic" if i == 0 else "openai",
+        )
+
+        default_label, default_upstream = _provider_defaults(provider)
+        label = _prompt("Label", default_label)
+        upstream = _prompt("Upstream URL", default_upstream)
+
+        default_port = 5757 + i
+        while True:
+            port = _prompt_int("Port", default=default_port, min_value=1)
+            if port in used_ports:
+                print("That port is already used in this setup.")
+                continue
+            used_ports.add(port)
+            break
+
+        host = _prompt("Host", "127.0.0.1")
+
+        # Per-instance tagger override
+        use_different_tagger = False
+        if count > 1:
+            use_different_tagger = _prompt_yes_no(
+                f"Use a different tagger provider for '{label}'?", default_yes=False,
+            )
+
+        inst_tag_provider = tag_provider
+        inst_tag_model = tag_model
+        if use_different_tagger:
+            inst_tag_provider, inst_tag_model = _prompt_tagging_provider()
+
+        # Write per-instance config
+        cfg_path = _write_instance_config(
+            base_dir, label, inst_tag_provider, inst_tag_model, inbound_tagger_type,
+        )
+        config_paths.append(cfg_path)
+
+        instances.append(
+            {
+                "port": port,
+                "upstream": upstream,
+                "label": label,
+                "host": host,
+                "config": cfg_path,
+            }
+        )
+
+    # Review screen
+    print("\n--- Review ---")
+    for inst in instances:
+        print(f"  [{inst['label']}] :{inst['port']} -> {inst['upstream']}")
+        print(f"    config: {inst['config']}")
+    print()
+
+    if not _prompt_yes_no("Proceed with this configuration?", default_yes=True):
+        print("Aborted.")
+        sys.exit(0)
+
+    return instances, config_paths
+
+
+def _apply_proxy_instances(config_path: Path, instances: list[dict]) -> None:
+    raw = yaml.safe_load(config_path.read_text()) or {}
+    proxy = raw.get("proxy") or {}
+    proxy["instances"] = instances
+    raw["proxy"] = proxy
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+
+def _proxy_command(config_path: Path, upstream: str | None) -> str:
+    cmd = f'virtual-context -c "{config_path}" proxy'
+    if upstream:
+        cmd += f" --upstream {upstream}"
+    return cmd
+
+
+def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+    launch_agents = Path.home() / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    plist_path = launch_agents / "io.virtualcontext.proxy.plist"
+    cmd = _proxy_command(config_path, upstream)
+    log_path = Path.home() / "Library" / "Logs" / "virtual-context.log"
+    err_path = Path.home() / "Library" / "Logs" / "virtual-context.err.log"
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.virtualcontext.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>{cmd}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{log_path}</string>
+  <key>StandardErrorPath</key>
+  <string>{err_path}</string>
+</dict>
+</plist>
+"""
+    plist_path.write_text(plist)
+    print(f"Wrote LaunchAgent: {plist_path}")
+    if not start:
+        print("Start manually:")
+        print(f"  launchctl load {plist_path}")
+        print("  launchctl start io.virtualcontext.proxy")
+        return
+
+    subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+    subprocess.run(["launchctl", "load", str(plist_path)], check=True)
+    subprocess.run(["launchctl", "start", "io.virtualcontext.proxy"], check=True)
+    print("Daemon installed and started (launchd).")
+
+
+def _install_systemd_user_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+    if not (Path("/bin/systemctl").exists() or Path("/usr/bin/systemctl").exists()):
+        print("systemd not found. Skipping daemon install.")
+        return
+
+    user_dir = Path.home() / ".config" / "systemd" / "user"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    service_path = user_dir / "virtual-context.service"
+    cmd = _proxy_command(config_path, upstream)
+    service_text = f"""[Unit]
+Description=virtual-context proxy
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc '{cmd}'
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+"""
+    service_path.write_text(service_text)
+    print(f"Wrote systemd user unit: {service_path}")
+    if not start:
+        print("Start manually:")
+        print("  systemctl --user daemon-reload")
+        print("  systemctl --user enable --now virtual-context")
+        return
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "virtual-context"], check=True)
+    print("Daemon installed and started (systemd --user).")
+
+
+def _install_windows_task_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+    task_name = "virtual-context-proxy"
+    cmd = _proxy_command(config_path, upstream)
+    task_cmd = (
+        'powershell.exe -NoProfile -WindowStyle Hidden -Command '
+        f'"{cmd}"'
+    )
+    subprocess.run(
+        [
+            "schtasks",
+            "/create",
+            "/f",
+            "/sc",
+            "ONLOGON",
+            "/tn",
+            task_name,
+            "/tr",
+            task_cmd,
+        ],
+        check=True,
+    )
+    print(f"Scheduled task installed: {task_name}")
+    if not start:
+        print(f"Start manually: schtasks /run /tn {task_name}")
+        return
+    subprocess.run(["schtasks", "/run", "/tn", task_name], check=True)
+    print("Daemon installed and started (Task Scheduler).")
+
+
+def cmd_onboard(args):
+    """Guided setup: initialize config, validate, optionally install daemon."""
+    config_path = Path(args.config) if args.config else Path.cwd() / "virtual-context.yaml"
+
+    if not config_path.exists():
+        preset = get_preset(args.preset)
+        if preset is None:
+            available = ", ".join(p.name for p in list_presets())
+            print(f"Unknown preset: {args.preset}", file=sys.stderr)
+            if available:
+                print(f"Available presets: {available}", file=sys.stderr)
+            sys.exit(1)
+        config_path.write_text(preset.template)
+        print(f"Created config: {config_path}")
+    else:
+        print(f"Using existing config: {config_path}")
+
+    try:
+        config = load_config(str(config_path))
+    except Exception as e:
+        print(f"Error loading config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    errors = validate_config(config)
+    if errors:
+        print("Config validation errors:")
+        for err in errors:
+            print(f"  - {err}")
+        sys.exit(1)
+
+    print("Config is valid.")
+
+    daemon_requested = bool(args.install_daemon)
+    interactive = bool(args.wizard and sys.stdin.isatty())
+    selected_upstream = args.upstream
+
+    if interactive:
+        instances, _config_paths = _run_instance_wizard()
+        _apply_proxy_instances(config_path, instances)
+        print(f"Updated {config_path} with {len(instances)} proxy instance(s).")
+        # In multi-instance mode, upstream comes from config; daemon command should omit it.
+        selected_upstream = None
+        if not daemon_requested:
+            daemon_requested = _prompt_yes_no("Install daemon/service now?", default_yes=True)
+
+    if not daemon_requested:
+        print("Onboarding complete.")
+        print("Start proxy manually:")
+        if selected_upstream:
+            print(f"  virtual-context -c {config_path} proxy --upstream {selected_upstream}")
+        else:
+            print(f"  virtual-context -c {config_path} proxy")
+        return
+
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            _install_launchd_daemon(config_path, selected_upstream, start=not args.no_start)
+        elif system == "linux":
+            _install_systemd_user_daemon(config_path, selected_upstream, start=not args.no_start)
+        elif system == "windows":
+            _install_windows_task_daemon(config_path, selected_upstream, start=not args.no_start)
+        else:
+            print(f"Unsupported platform for daemon install: {system}")
+            sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Daemon installation failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Onboarding complete.")
+
+
+def _daemon_platform() -> str:
+    return platform.system().lower()
+
+
+def _daemon_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / "io.virtualcontext.proxy.plist"
+
+
+def _daemon_systemd_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / "virtual-context.service"
+
+
+def cmd_daemon(args):
+    """Manage daemon lifecycle for the proxy service."""
+    import time
+
+    action = args.daemon_action
+    system = _daemon_platform()
+
+    try:
+        if system == "darwin":
+            label = "io.virtualcontext.proxy"
+            plist_path = _daemon_plist_path()
+            if action == "status":
+                subprocess.run(["launchctl", "list"], check=False)
+            elif action == "start":
+                subprocess.run(["launchctl", "load", str(plist_path)], check=False)
+                subprocess.run(["launchctl", "start", label], check=True)
+            elif action == "stop":
+                subprocess.run(["launchctl", "stop", label], check=False)
+            elif action == "restart":
+                subprocess.run(["launchctl", "stop", label], check=False)
+                time.sleep(1)
+                subprocess.run(["launchctl", "start", label], check=True)
+                print("Daemon restarted (launchd).")
+            elif action == "uninstall":
+                subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+                if plist_path.exists():
+                    plist_path.unlink()
+                    print(f"Removed {plist_path}")
+        elif system == "linux":
+            unit = "virtual-context"
+            unit_path = _daemon_systemd_unit_path()
+            if action == "status":
+                subprocess.run(["systemctl", "--user", "status", unit, "--no-pager"], check=False)
+            elif action == "start":
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+                subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
+            elif action == "stop":
+                subprocess.run(["systemctl", "--user", "stop", unit], check=False)
+            elif action == "restart":
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+                subprocess.run(["systemctl", "--user", "restart", unit], check=True)
+                print("Daemon restarted (systemd).")
+            elif action == "uninstall":
+                subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=False)
+                if unit_path.exists():
+                    unit_path.unlink()
+                    print(f"Removed {unit_path}")
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        elif system == "windows":
+            task = "virtual-context-proxy"
+            if action == "status":
+                subprocess.run(["schtasks", "/query", "/tn", task], check=False)
+            elif action == "start":
+                subprocess.run(["schtasks", "/run", "/tn", task], check=True)
+            elif action == "stop":
+                subprocess.run(["schtasks", "/end", "/tn", task], check=False)
+            elif action == "restart":
+                subprocess.run(["schtasks", "/end", "/tn", task], check=False)
+                time.sleep(1)
+                subprocess.run(["schtasks", "/run", "/tn", task], check=True)
+                print("Daemon restarted (Task Scheduler).")
+            elif action == "uninstall":
+                subprocess.run(["schtasks", "/delete", "/tn", task, "/f"], check=False)
+        else:
+            print(f"Unsupported platform: {system}", file=sys.stderr)
+            sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Daemon action failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="virtual-context",
@@ -446,6 +987,38 @@ def main():
     init_parser = subparsers.add_parser("init", help="Generate config from a preset")
     init_parser.add_argument("preset", help="Preset name (e.g. 'coding')")
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing config")
+
+    # onboard
+    onboard_parser = subparsers.add_parser(
+        "onboard",
+        help="Guided setup: create/validate config, optionally install daemon",
+    )
+    onboard_parser.add_argument(
+        "--preset",
+        default="general",
+        help="Preset used when creating a new config (default: general)",
+    )
+    onboard_parser.add_argument(
+        "--install-daemon",
+        action="store_true",
+        help="Install OS daemon/service for proxy",
+    )
+    onboard_parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Install daemon but do not start it",
+    )
+    onboard_parser.add_argument(
+        "--upstream",
+        "-u",
+        default=None,
+        help="Optional upstream URL for single-instance proxy mode",
+    )
+    onboard_parser.add_argument(
+        "--wizard",
+        action="store_true",
+        help="Run interactive setup wizard (instances, ports, providers)",
+    )
 
     # cost-report
     subparsers.add_parser("cost-report", help="Show session cost report")
@@ -504,6 +1077,21 @@ def main():
     proxy_parser.add_argument("--port", "-p", type=int, default=5757)
     proxy_parser.add_argument("--host", default="127.0.0.1")
 
+    # presets
+    presets_parser = subparsers.add_parser("presets", help="List or inspect config presets")
+    presets_sub = presets_parser.add_subparsers(dest="presets_action")
+    presets_sub.add_parser("list", help="List all available presets")
+    presets_show_parser = presets_sub.add_parser("show", help="Show a preset's config as YAML")
+    presets_show_parser.add_argument("preset_name", help="Preset name to show")
+
+    # daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Manage proxy daemon/service")
+    daemon_parser.add_argument(
+        "daemon_action",
+        choices=["status", "start", "stop", "restart", "uninstall"],
+        help="Daemon action",
+    )
+
     # config validate
     config_parser = subparsers.add_parser("config", help="Config operations")
     config_sub = config_parser.add_subparsers(dest="config_command")
@@ -517,6 +1105,8 @@ def main():
 
     if args.command == "chat":
         cmd_chat(args)
+    elif args.command == "onboard":
+        cmd_onboard(args)
     elif args.command == "init":
         cmd_init(args)
     elif args.command == "status":
@@ -537,6 +1127,10 @@ def main():
         cmd_aliases(args)
     elif args.command == "proxy":
         cmd_proxy(args)
+    elif args.command == "presets":
+        cmd_presets(args)
+    elif args.command == "daemon":
+        cmd_daemon(args)
     elif args.command == "config":
         if args.config_command == "validate":
             cmd_config_validate(args)

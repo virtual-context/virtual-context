@@ -55,3 +55,68 @@ def test_init_unknown_preset(tmp_cwd):
     result = _run_cli("init", "nonexistent")
     assert result.returncode != 0
     assert "Unknown preset" in result.stderr
+
+
+def test_onboard_creates_and_validates_config(tmp_cwd):
+    result = _run_cli("onboard")
+    assert result.returncode == 0
+    config_path = tmp_cwd / "virtual-context.yaml"
+    assert config_path.exists()
+    assert "Config is valid." in result.stdout
+    assert "Onboarding complete." in result.stdout
+
+
+def test_onboard_uses_existing_config(tmp_cwd):
+    _run_cli("init", "coding")
+    result = _run_cli("onboard")
+    assert result.returncode == 0
+    assert "Using existing config" in result.stdout
+
+
+def test_onboard_unknown_preset(tmp_cwd):
+    result = _run_cli("onboard", "--preset", "nonexistent")
+    assert result.returncode != 0
+    assert "Unknown preset" in result.stderr
+
+
+def test_daemon_help(tmp_cwd):
+    result = _run_cli("daemon", "--help")
+    assert result.returncode == 0
+    assert "status" in result.stdout
+    assert "uninstall" in result.stdout
+
+
+def test_daemon_requires_action(tmp_cwd):
+    result = _run_cli("daemon")
+    assert result.returncode != 0
+
+
+def test_daemon_restart_in_help(tmp_cwd):
+    result = _run_cli("daemon", "--help")
+    assert result.returncode == 0
+    assert "restart" in result.stdout
+
+
+def test_presets_list(tmp_cwd):
+    result = _run_cli("presets", "list")
+    assert result.returncode == 0
+    assert "coding" in result.stdout
+    assert "general" in result.stdout
+
+
+def test_presets_show_coding(tmp_cwd):
+    result = _run_cli("presets", "show", "coding")
+    assert result.returncode == 0
+    assert "tag_generator" in result.stdout
+
+
+def test_presets_show_general(tmp_cwd):
+    result = _run_cli("presets", "show", "general")
+    assert result.returncode == 0
+    assert "tag_generator" in result.stdout
+
+
+def test_presets_show_nonexistent(tmp_cwd):
+    result = _run_cli("presets", "show", "nonexistent")
+    assert result.returncode != 0
+    assert "Unknown preset" in result.stderr
