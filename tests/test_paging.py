@@ -1215,16 +1215,12 @@ class TestReassembleContext:
 
 
 # ---------------------------------------------------------------------------
-# BUG-014 / BUG-015 / BUG-016: Broad & temporal queries must bypass working set
+# BUG-015/016 were superseded: temporal recall is now tool-driven.
 # ---------------------------------------------------------------------------
 
 
-class TestTemporalBypassesWorkingSet:
-    """BUG-015: Temporal queries must skip working set depth override.
-
-    Temporal queries retrieve chronologically-sorted segment summaries,
-    but paging overrides with unsorted full_segments from get_segments_by_tags().
-    """
+class TestTemporalNoBypass:
+    """Temporal flag no longer bypasses paging depth (tool-driven temporal recall)."""
 
     def _make_engine(self, tmp_path):
         cfg = load_config(config_dict={
@@ -1247,8 +1243,8 @@ class TestTemporalBypassesWorkingSet:
         return engine
 
     @pytest.mark.regression("BUG-015")
-    def test_temporal_query_ignores_working_set_depth(self, tmp_path):
-        """Temporal query must render at SUMMARY depth even if working set says FULL."""
+    def test_temporal_flag_does_not_bypass_working_set_depth(self, tmp_path):
+        """Temporal flag should not alter paging depth behavior."""
         engine = self._make_engine(tmp_path)
 
         # Tag in working set at FULL depth
@@ -1282,7 +1278,6 @@ class TestTemporalBypassesWorkingSet:
                 created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
                 end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
             )],
-            temporal=True,
         )
 
         with patch.object(engine._retriever, "retrieve", return_value=temporal_result):
@@ -1291,15 +1286,13 @@ class TestTemporalBypassesWorkingSet:
                 [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
             )
 
-        # Should NOT be at FULL depth — temporal preserves retriever's chronological order
+        # Temporal flag is advisory only; normal paging still applies.
         if "architecture" in assembled.tag_sections:
-            assert 'depth="full"' not in assembled.tag_sections["architecture"], (
-                "Temporal query rendered at FULL depth — should preserve retriever's sort order"
-            )
+            assert 'depth="full"' in assembled.tag_sections["architecture"]
 
 
 class TestSegmentLoadingGate:
-    """BUG-016: Segment loading should be skipped for temporal queries."""
+    """Temporal flag no longer gates segment loading (tool-driven temporal recall)."""
 
     def _make_engine(self, tmp_path):
         cfg = load_config(config_dict={
@@ -1322,8 +1315,8 @@ class TestSegmentLoadingGate:
         return engine
 
     @pytest.mark.regression("BUG-016")
-    def test_temporal_query_skips_segment_loading(self, tmp_path):
-        """Temporal query must not call get_segments_by_tags for working set tags."""
+    def test_temporal_flag_does_not_skip_segment_loading(self, tmp_path):
+        """Temporal flag should not suppress segment loading."""
         engine = self._make_engine(tmp_path)
 
         engine._store.save_tag_summary(TagSummary(
@@ -1341,7 +1334,6 @@ class TestSegmentLoadingGate:
                 created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
                 end_timestamp=datetime(2024, 6, 1, tzinfo=timezone.utc),
             )],
-            temporal=True,
         )
 
         with patch.object(engine._retriever, "retrieve", return_value=temporal_result), \
@@ -1351,7 +1343,7 @@ class TestSegmentLoadingGate:
                 [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
             )
 
-        mock_get.assert_not_called()
+        mock_get.assert_called()
 
     @pytest.mark.regression("BUG-016")
     def test_normal_query_still_loads_segments(self, tmp_path):

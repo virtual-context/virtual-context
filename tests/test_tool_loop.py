@@ -29,14 +29,20 @@ from virtual_context.types import ToolCallRecord, ToolLoopResult
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_four_tools(self):
+    def test_returns_five_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 4
+        assert len(defs) == 5
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
         names = {d["name"] for d in defs}
-        assert names == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote", "vc_recall_all"}
+        assert names == {
+            "vc_expand_topic",
+            "vc_collapse_topic",
+            "vc_find_quote",
+            "vc_recall_all",
+            "vc_remember_when",
+        }
 
     def test_tools_have_input_schema(self):
         defs = vc_tool_definitions()
@@ -114,6 +120,25 @@ class TestExecuteVCTool:
         engine.find_quote.return_value = {"query": "test", "found": True, "results": []}
         result = execute_vc_tool(engine, "vc_find_quote", {"query": "test"})
         engine.find_quote.assert_called_once_with(query="test", max_results=5)
+        parsed = json.loads(result)
+        assert parsed["found"] is True
+
+    def test_remember_when_calls_engine(self):
+        engine = MagicMock()
+        engine.remember_when.return_value = {"query": "auth", "found": True, "results": []}
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "auth",
+                "time_range": {"kind": "relative", "preset": "last_7_days"},
+            },
+        )
+        engine.remember_when.assert_called_once_with(
+            query="auth",
+            time_range={"kind": "relative", "preset": "last_7_days"},
+            max_results=5,
+        )
         parsed = json.loads(result)
         assert parsed["found"] is True
 
@@ -885,7 +910,13 @@ class TestVCToolNames:
         assert isinstance(VC_TOOL_NAMES, frozenset)
 
     def test_contains_all_four(self):
-        assert VC_TOOL_NAMES == {"vc_expand_topic", "vc_collapse_topic", "vc_find_quote", "vc_recall_all"}
+        assert VC_TOOL_NAMES == {
+            "vc_expand_topic",
+            "vc_collapse_topic",
+            "vc_find_quote",
+            "vc_recall_all",
+            "vc_remember_when",
+        }
 
 
 # ---------------------------------------------------------------------------

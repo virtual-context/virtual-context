@@ -15,7 +15,6 @@ def filter_body_messages(
     matched_tags: list[str],
     *,
     recent_turns: int = 3,
-    temporal: bool = False,
     compacted_turn: int = 0,
     fmt: PayloadFormat | None = None,
 ) -> tuple[dict, int]:
@@ -85,10 +84,6 @@ def filter_body_messages(
     protected = min(recent_turns, total_pairs)
 
     if total_pairs <= protected or not turn_tag_index.entries:
-        return body, 0
-
-    # Temporal: keep everything
-    if temporal:
         return body, 0
 
     tag_set = set(matched_tags)

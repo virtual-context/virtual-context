@@ -12,7 +12,7 @@ virtual-context orchestrates a layered pipeline of LLM inference, embedding simi
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Broad queries load everything. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture (learned the hard way in production) ensures the system can never hallucinate irrelevant topics into your context window.
+virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed. Overview queries can load everything via `vc_recall_all`/`recall_all`. Temporal queries seek back to specific points in time. Tag overlap and IDF scoring surface the right segment even when the user's vocabulary doesn't match the original discussion. And a two-tagger architecture (learned the hard way in production) ensures the system can never hallucinate irrelevant topics into your context window.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -30,7 +30,7 @@ RAG retrieves by similarity. virtual-context manages by understanding.
 |---|---|---|---|
 | **What gets kept** | Most recent N messages | Whatever embeds close to the query | Everything, at varying compression |
 | **Cross-topic recall** | Fails silently | Depends on embedding quality | Tag overlap guarantees retrieval |
-| **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | Broad detection loads all summaries; temporal detection retrieves by time position |
+| **"What did we discuss?"** | Only recent context | Poor (query is too vague to embed) | `vc_recall_all`/`recall_all` loads all summaries; temporal detection retrieves by time position |
 | **Token efficiency** | Wastes budget on irrelevant turns | Retrieved chunks may not fit budget | Budget-aware assembly with priority ordering |
 | **Content exceeds window** | Truncate or fail | Chunk and lose coherence | Collapse cold topics to make room, page in what's needed |
 | **Bidirectional control** | None | None (append-only) | Expand topics to full detail, collapse back to summaries, within fixed budget |
@@ -62,8 +62,8 @@ assembled = engine.on_message_inbound(
 )
 # assembled.prepend_text → enriched system prompt with retrieved summaries
 # assembled.matched_tags → ["legal", "filing"]
-# assembled.broad → False (this is a specific query)
-# assembled.temporal → False (no time-position reference)
+# For time-scoped recall, call vc_remember_when(query, time_range)
+# For broad overviews, call the recall-all tool (vc_recall_all / recall_all)
 
 # AFTER LLM responds - tag, index, compact if needed
 report = engine.on_turn_complete(messages)
@@ -98,11 +98,11 @@ Inbound tagging - identify what this message is about
     │  │   (closed-set, deterministic, can't hallucinate novel tags)
     │  ├─ LLM / keyword tagger: alternative with vocabulary feedback
     │  ├─ Tag canonicalization: "db" → "database", alias detection via edit distance
-    │  └─ Broad/temporal detection: regex + LLM flags for vague or time-referencing queries
+    │  └─ Temporal detection: regex + LLM flags for time-referencing queries
     │
     ▼
 Retrieve matching summaries from store
-    │  ├─ Broad query? → load ALL tag summaries (bounded post-compaction)
+    │  ├─ Recall-all tool call? → load ALL tag summaries (bounded by token budget)
     │  ├─ Temporal query? → load segment summaries sorted earliest-first (Layer 1)
     │  ├─ Query expansion: primary tags + related tags widen the search
     │  ├─ Overfetch 3x → IDF-weighted re-rank (rare tag matches score higher)
@@ -119,7 +119,7 @@ Filter conversation history
     │  ├─ Drop turns whose tags don't overlap with inbound tags
     │  ├─ Preserve tool chains atomically (tool_use ↔ tool_result never separated)
     │  ├─ Protect recent turns (always kept regardless of tags)
-    │  └─ Broad/temporal queries skip filtering entirely
+    │  └─ Temporal queries skip filtering entirely
     │
     ▼
 Inject <virtual-context> block → forward enriched request to LLM
@@ -173,19 +173,19 @@ The fix was architectural: split inbound and response tagging into two fundament
 
 **Inbound tagger** (embedding, runs before LLM responds): Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. It cannot hallucinate `planes` for an electronics message because the embedding of "tell me about arduino circuits" is semantically far from `planes` and close to `electronics`. Deterministic, subsecond, zero LLM cost.
 
-**Response tagger** (LLM, runs after LLM responds): Sees the full user+assistant pair and generates authoritative semantic tags. This is the creative, vocabulary-building pass, inventing new tags when new topics emerge, generating related tags for cross-vocabulary retrieval, and detecting broad/temporal query intent. Runs in a background thread so it never blocks the next request.
+**Response tagger** (LLM, runs after LLM responds): Sees the full user+assistant pair and generates authoritative semantic tags. This is the creative, vocabulary-building pass, inventing new tags when new topics emerge, generating related tags for cross-vocabulary retrieval, and detecting temporal query intent. Runs in a background thread so it never blocks the next request.
 
 The inbound tagger drives retrieval and filtering (what stored context to inject, which history turns to keep). The response tagger drives the permanent record (what tags describe this turn for all future queries). Each tagger is optimized for its task: the inbound tagger prizes safety (never contaminate the context), the response tagger prizes richness (capture every nuance for future recall).
 
-### Broad Query Detection
+### Broad Overview Tool (`vc_recall_all`)
 
 "What did we discuss earlier?" "Can you summarize everything?" "What did you say about image storage?"
 
-These queries don't map cleanly to specific tags. The tagger flags them as `broad: true`, and the system switches behavior:
+These queries don't map cleanly to specific tags. Instead of relying on a `broad` flag, virtual-context now uses an MCP-style tool call:
 
-- The retriever loads **all** tag summaries instead of filtering by tag overlap
-- History filtering includes all remaining turns instead of dropping unrelated ones
-- Post-compaction, broad queries are **bounded**: compacted messages are skipped (tag summaries replace them), preventing token blowout
+- `vc_recall_all` (proxy tool loop) / `recall_all` (MCP server) loads **all** tag summaries
+- Results are bounded by the configured tag-context token budget
+- The reader can follow up with `vc_expand_topic` on specific tags for deeper detail
 
 This eliminates the failure mode where the LLM says "I don't recall discussing that" about something from 50 turns ago.
 
@@ -201,7 +201,7 @@ These queries reference a *position in time*, not just a topic. The tagger flags
 
 This solves a fundamental problem with summarization: when a tag like `project-structure` appears at turn 1, turn 57, and turn 71, a merged tag summary blends all three. A temporal query about "the very first thing we discussed" needs the turn-1 segment specifically, not the merged blob.
 
-Detection uses two layers (same pattern as broad): the LLM detects temporal intent, and deterministic regex patterns catch phrases the LLM misses (`"at the beginning"`, `"early on"`, `"the very first thing"`).
+Detection uses two layers: the LLM detects temporal intent, and deterministic regex patterns catch phrases the LLM misses (`"at the beginning"`, `"early on"`, `"the very first thing"`).
 
 ### Session Date Propagation
 
@@ -235,7 +235,7 @@ Prior conversation topics available for recall:
 </context-topics>
 ```
 
-This costs ~50-200 tokens and enables a natural drill-down loop: the user asks a broad question, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `find_quote` for specific facts (names, numbers, decisions), `expand_topic` for deeper understanding of a listed topic, and `collapse_topic` to free budget.
+This costs ~50-200 tokens and enables a natural drill-down loop: the user asks for an overview, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `vc_recall_all` for broad overviews, `vc_find_quote` for specific facts (names, numbers, decisions), `vc_expand_topic` for deeper understanding of a listed topic, and `vc_collapse_topic` to free budget.
 
 ### Virtual Memory Paging
 
@@ -258,7 +258,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, or follow up with `expand_topic`. Up to 5 continuation rounds run transparently within one client-visible request. This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
 
-**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `expand_topic`, `collapse_topic`, and `find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `find_quote` → discover tag → `expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
+**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `vc_recall_all`, `vc_expand_topic`, `vc_collapse_topic`, and `vc_find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `vc_recall_all` → `vc_find_quote` → `vc_expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
 ### Three-Layer Memory Hierarchy
 
@@ -472,7 +472,7 @@ virtual-context presets show coding  # dump a preset's config as YAML
 
 ## Three Tag Generators
 
-**LLM tagger** (recommended for response tagging): Uses any local model via Ollama, LM Studio, or vLLM. Generates rich semantic tags with broad/temporal query detection and related tag generation. Vocabulary feedback ensures convergence: the tagger sees all existing tags and reuses them instead of inventing synonyms. Falls back to keyword tagger if the LLM is unavailable. This is the creative, vocabulary-building tagger that runs after the LLM responds.
+**LLM tagger** (recommended for response tagging): Uses any local model via Ollama, LM Studio, or vLLM. Generates rich semantic tags with temporal query detection and related tag generation. Vocabulary feedback ensures convergence: the tagger sees all existing tags and reuses them instead of inventing synonyms. Falls back to keyword tagger if the LLM is unavailable. This is the creative, vocabulary-building tagger that runs after the LLM responds.
 
 **Keyword tagger**: Deterministic regex and keyword matching. Zero latency, zero cost, fully reproducible. Good for domains with well-defined vocabularies where you don't want LLM variability.
 
@@ -516,7 +516,7 @@ A terminal chat interface with live context visualization, useful for developmen
 - **Tag panel**: current tag working set with activity levels, updated live as `on_turn_complete` processes each turn
 - **Budget bar**: real-time token usage breakdown (core, tags, hint, conversation)
 - **Turn list**: every turn with its tags, navigable with Ctrl+B/F
-- **Turn inspector** (Ctrl+I): full turn data: API payload, tags, assembled context, broad/temporal flags
+- **Turn inspector** (Ctrl+I): full turn data: API payload, tags, assembled context, temporal flags, and tool activity
 - **Brief mode** (Ctrl+T): silently appends "answer in 2 lines" for faster iteration during testing
 - **Manual compaction**: type `/compact` or press Ctrl+K to trigger compaction on demand
 - **Session export** (Ctrl+S): saves full session to `vc-session.json` with all metadata
@@ -659,7 +659,7 @@ curl http://127.0.0.1:5757/v1/messages \
 
 The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dashboard`, a full operational view of what virtual-context is doing to every request.
 
-**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), broad/temporal flags, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
+**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), temporal flags, tool activity, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
 
 **Turn inspector.** Click any request row to see the full picture: every message in the request with role labels, content block types (`text`, `tool_use`, `tool_result`, `thinking`), the raw text content, inbound tags vs response tags side by side, and the token budget breakdown showing how context was assembled.
 
@@ -684,6 +684,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Type | Name | Description |
 |------|------|-------------|
 | Tool | `recall_context` | Tag + retrieve + assemble context for a message |
+| Tool | `recall_all` | Load summaries for all topics (broad overview path) |
 | Tool | `compact_context` | Trigger compaction on a message history |
 | Tool | `domain_status` | All tags with stats |
 | Tool | `expand_topic` | Expand a topic to segment or full detail depth |
@@ -709,7 +710,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback |
 | **EmbeddingTagGenerator** | `core/embedding_tag_generator.py` | Sentence-transformers cosine similarity against tag vocabulary |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
-| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, broad/temporal queries, FTS fallback |
+| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, temporal queries, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
@@ -767,7 +768,7 @@ virtual-context has been validated across multiple dimensions: adversarial promp
 - **IDF-weighted precision**: "precomputed summary table" retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
 - **Ambiguous multi-match**: "what middleware pattern?" correctly identifies both auth and logging middleware across 4 overlapping domains; "plugins - Flask, audio, or ML?" correctly disambiguates
 - **Temporal recall**: "going back to the very beginning, what were the key decisions?" retrieves original Flask blueprint architecture from turn 1 via segment-level retrieval, even after 4 compaction events
-- **Broad query bounding**: "summary of everything we've discussed" loads 22 bundled tag summaries but stays bounded at ~2,900 tokens post-compaction
+- **Overview query bounding**: `vc_recall_all` can load 22 bundled tag summaries while staying bounded at ~2,900 tokens post-compaction
 - **Adversarial pass rate**: 89% on 28 deliberately adversarial prompts (vocabulary mismatches, ambiguous references, cross-domain synthesis, late vague recalls)
 - **Compaction**: 4 events across 100 turns, average 1,147 tokens per turn, peak 3,018 tokens
 - **Tag convergence**: vocabulary stabilizes within 10-15 turns via feedback loop

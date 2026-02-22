@@ -141,6 +141,17 @@ def recall_all() -> str:
 
 
 @mcp.tool()
+def remember_when(query: str, time_range: dict, max_results: int = 5) -> str:
+    """Find memory by topic within a time window.
+
+    Prefer relative presets in ``time_range``; the backend resolves exact dates.
+    """
+    engine = _get_engine()
+    result = engine.remember_when(query=query, time_range=time_range, max_results=max_results)
+    return json.dumps(result)
+
+
+@mcp.tool()
 def find_quote(query: str, max_results: int = 5) -> str:
     """Search the full original conversation text for a specific word, phrase, or detail.
 

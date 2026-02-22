@@ -6,6 +6,8 @@ import hashlib
 import logging
 import os
 import re
+from calendar import monthrange
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
@@ -48,6 +50,8 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 _SESSION_HEADER_RE = re.compile(r'\[Session from ([^\]]+)\]')
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
 from .core.math_utils import cosine_similarity as _cosine_sim
@@ -453,15 +457,11 @@ class VirtualContextEngine:
         core_context = self._assembler.load_core_context()
 
         # Paging: load content at working set depth levels
-        # BUG-015/016: temporal queries bypass working set depth.
-        # Temporal = chronological order from retriever (working set would
-        # override with unsorted full_segments).
-        # The working set itself is NOT modified — it applies again on the next
-        # normal query.
+        # Working-set paging applies uniformly; time-scoped retrieval now runs
+        # through vc_remember_when instead of a temporal retrieval branch.
         ws_param = None
         full_segments_param = None
-        _bypass_ws = retrieval_result.temporal
-        if self.config.paging.enabled and self._working_set and not _bypass_ws:
+        if self.config.paging.enabled and self._working_set:
             ws_param = self._working_set
             # Load full segments for tags at SEGMENTS or FULL depth
             full_segments_param = {}
@@ -523,7 +523,6 @@ class VirtualContextEngine:
 
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
-        assembled.temporal = retrieval_result.temporal
 
         # Cache for reassemble_context() — used after paging tool execution
         self._last_retrieval_result = retrieval_result
@@ -872,14 +871,8 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         current_tags: list[str],
         recent_turns: int | None = None,
-        temporal: bool = False,
     ) -> list[Message]:
         """Filter conversation history by tag relevance.
-
-        When ``temporal`` is True, all remaining turns are included
-        without tag-based filtering.  Pre-compaction the full history fits within
-        the context window; post-compaction old turns are already gone, so "all
-        remaining" is bounded.
 
         Always includes the last ``recent_turns`` turn pairs.  For older turns,
         includes only those whose TurnTagIndex tags overlap with *current_tags*.
@@ -897,14 +890,6 @@ class VirtualContextEngine:
         protected_count = recent_turns * 2
 
         if total <= protected_count:
-            return list(conversation_history)
-
-        # Temporal query — include everything, but skip compacted messages
-        # (summaries from retriever replace them)
-        if temporal:
-            watermark = getattr(self, "_compacted_through", 0)
-            if watermark > 0:
-                return list(conversation_history[watermark:])
             return list(conversation_history)
 
         # Skip compacted messages — their content is in stored summaries
@@ -1478,6 +1463,151 @@ class VirtualContextEngine:
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
         return _find_quote(self._store, self._semantic, query, max_results)
+
+    def _parse_session_date(self, raw: str) -> date | None:
+        """Best-effort parse for session date strings from stored metadata."""
+        s = (raw or "").strip()
+        if not s:
+            return None
+        # Fast-path ISO date/month prefixes.
+        m = re.search(r"\d{4}-\d{2}-\d{2}", s)
+        if m:
+            try:
+                return date.fromisoformat(m.group(0))
+            except ValueError:
+                pass
+        m = re.search(r"\d{4}/\d{2}/\d{2}", s)
+        if m:
+            try:
+                y, mo, d = [int(x) for x in m.group(0).split("/")]
+                return date(y, mo, d)
+            except ValueError:
+                pass
+        return None
+
+    def _resolve_remember_when_range(self, time_range: dict) -> tuple[date, date, str]:
+        """Resolve tool time_range input to absolute [start_date, end_date]."""
+        if not isinstance(time_range, dict):
+            raise ValueError("time_range must be an object")
+
+        kind = str(time_range.get("kind", "")).strip().lower()
+        today = datetime.now(timezone.utc).date()
+
+        if kind == "relative":
+            preset = str(time_range.get("preset", "")).strip().lower()
+            if preset == "last_24_hours":
+                return today - timedelta(days=1), today, preset
+            if preset == "last_7_days":
+                return today - timedelta(days=6), today, preset
+            if preset == "last_30_days":
+                return today - timedelta(days=29), today, preset
+            if preset == "this_week":
+                start = today - timedelta(days=today.weekday())
+                return start, start + timedelta(days=6), preset
+            if preset == "last_week":
+                this_week_start = today - timedelta(days=today.weekday())
+                start = this_week_start - timedelta(days=7)
+                return start, start + timedelta(days=6), preset
+            if preset == "this_month":
+                start = date(today.year, today.month, 1)
+                end = date(today.year, today.month, monthrange(today.year, today.month)[1])
+                return start, end, preset
+            if preset == "last_month":
+                year = today.year
+                month = today.month - 1
+                if month == 0:
+                    month = 12
+                    year -= 1
+                start = date(year, month, 1)
+                end = date(year, month, monthrange(year, month)[1])
+                return start, end, preset
+            if preset == "this_year":
+                return date(today.year, 1, 1), date(today.year, 12, 31), preset
+            if preset == "last_year":
+                y = today.year - 1
+                return date(y, 1, 1), date(y, 12, 31), preset
+            raise ValueError(f"unsupported relative preset: {preset}")
+
+        if kind == "between_dates":
+            start_raw = str(time_range.get("start", "")).strip()
+            end_raw = str(time_range.get("end", "")).strip()
+            if not start_raw or not end_raw:
+                raise ValueError("between_dates requires start and end")
+
+            def parse_boundary(raw: str, is_end: bool) -> date:
+                if _ISO_DATE_RE.match(raw):
+                    return date.fromisoformat(raw)
+                if _ISO_MONTH_RE.match(raw):
+                    y, mo = [int(x) for x in raw.split("-")]
+                    if is_end:
+                        return date(y, mo, monthrange(y, mo)[1])
+                    return date(y, mo, 1)
+                raise ValueError(f"invalid date format: {raw}")
+
+            start = parse_boundary(start_raw, is_end=False)
+            end = parse_boundary(end_raw, is_end=True)
+            if end < start:
+                raise ValueError("time_range end must be >= start")
+            return start, end, "between_dates"
+
+        raise ValueError("time_range.kind must be 'relative' or 'between_dates'")
+
+    def remember_when(
+        self,
+        query: str,
+        time_range: dict,
+        max_results: int = 5,
+    ) -> dict:
+        """Find memory snippets for *query* constrained to a resolved date window."""
+        if not query.strip():
+            return {"error": "empty query"}
+
+        try:
+            start, end, resolved_kind = self._resolve_remember_when_range(time_range)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        # Overfetch, then filter by session_date bounds.
+        raw = self.find_quote(query=query, max_results=max(max_results * 4, 20))
+        if not raw.get("found"):
+            return {
+                "query": query,
+                "found": False,
+                "range": {
+                    "kind": resolved_kind,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+                "results": [],
+                "message": raw.get("message", "No matches found."),
+            }
+
+        filtered: list[dict] = []
+        for item in raw.get("results", []):
+            session = str(item.get("session", "")).strip()
+            parsed = self._parse_session_date(session)
+            if parsed is None:
+                # No parseable session date -> exclude from time-filtered recall.
+                continue
+            if start <= parsed <= end:
+                filtered.append(item)
+            if len(filtered) >= max_results:
+                break
+
+        return {
+            "query": query,
+            "found": bool(filtered),
+            "range": {
+                "kind": resolved_kind,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
+            "results": filtered,
+            "message": (
+                f"No matches for '{query}' in the requested time window."
+                if not filtered else ""
+            ),
+        }
 
     # ------------------------------------------------------------------
     # query_with_tools: sync tool loop for non-proxy callers
