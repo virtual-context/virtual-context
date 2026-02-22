@@ -29,19 +29,65 @@ These approaches are complementary, but optimize different failure modes.
 | | RAG | Compaction-only | virtual-context |
 |---|---|---|---|
 | **Primary mechanism** | Query-time retrieval by embedding similarity | Summarize old history to fit window | Tagged memory + retrieval + compaction + paging tools |
-| **What gets kept** | External chunks + recent raw chat | Mostly summaries of old turns + recent raw chat | Multi-layer memory (raw turns, segment summaries, tag summaries) |
-| **Specific fact lookup** | Good if embedding/query phrasing aligns | Often lossy after summarization | `vc_find_quote` + summary/segment drill-down |
+| **What gets kept** | External documents + recent raw chat | Summaries of old turns + recent raw chat | Multi-layer memory (raw turns, segment summaries, tag summaries) |
+| **Specific fact lookup** | Depends on embedding/query phrasing alignment | Lossy after summarization | `vc_find_quote` + summary/segment drill-down |
 | **Broad overview ("what did we discuss?")** | Weak unless special orchestration | Can summarize, but often generic | `vc_recall_all` returns all topic summaries within budget |
-| **Time-scoped recall ("last week", "between June and July")** | Usually custom logic outside core RAG | Usually weak unless dates preserved in summaries | `vc_remember_when` with backend-resolved time ranges |
-| **Vocabulary mismatch tolerance** | Moderate (embedding-dependent) | Low to moderate | Related-tag expansion + IDF-weighted ranking + quote search fallback |
-| **Context budget control** | Mostly append retrieved chunks | Compresses, but limited selective rehydration | Explicit paging: expand/collapse topics and bounded assembly |
+| **Time-scoped recall ("last week", "between June and July")** | Custom logic outside core RAG | Requires date fidelity in summaries | `vc_remember_when` with backend-resolved time ranges |
+| **Vocabulary mismatch tolerance** | Embedding-dependent | Low | Related-tag expansion + IDF-weighted ranking + quote search fallback |
+| **Context budget control** | Append retrieved chunks | Compression with limited selective rehydration | Explicit paging: expand/collapse topics and bounded assembly |
 | **Interpretability** | Medium (scores/chunks) | Low-medium (summary quality dependent) | High (tags, tool calls, budgets, sections, stored summaries) |
 | **Failure mode** | Miss relevant chunk | Over-compress / lose detail | Requires tool-aware prompting + memory hygiene |
 | **Best fit** | Knowledge/doc retrieval | Simple long-chat cost reduction | Long-running agent memory with mixed query types |
 
 virtual-context combines retrieval and compaction, then adds explicit tools for overview/time/fact recall under strict token budgets.
 
-## How It Works
+## Install
+
+```bash
+pip install virtual-context
+```
+
+One-command installers (OpenClaw-style):
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+iwr https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.ps1 -useb | iex
+```
+
+Guided setup (interactive wizard → config + proxy instances + daemon):
+
+```bash
+virtual-context onboard --wizard
+```
+
+The wizard walks through: tagging provider/model selection → inbound tagger mode (embedding/LLM/keyword) → proxy instances (upstream provider, port, label per instance) → per-instance config generation with isolated storage → optional daemon install. Each instance gets a standalone YAML config pointing to its own SQLite DB.
+
+Or non-interactive:
+
+```bash
+virtual-context onboard
+virtual-context onboard --install-daemon --upstream https://api.anthropic.com
+```
+
+Daemon setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
+
+Optional extras:
+
+```bash
+pip install virtual-context[tui]         # interactive chat terminal
+pip install virtual-context[bridge]      # HTTP proxy (FastAPI + uvicorn)
+pip install virtual-context[embeddings]  # sentence-transformers tag generator
+pip install virtual-context[tiktoken]    # exact token counting
+pip install virtual-context[mcp]         # Model Context Protocol server
+pip install virtual-context[all]         # everything
+```
+
+Minimal dependencies: `pyyaml` + `httpx`. Python 3.11+.
 
 Two hooks into your LLM pipeline. Pick whichever integration fits:
 
@@ -345,54 +391,6 @@ tag_rules:
 ```
 
 Higher-priority tags get assembled first. If the budget runs out, lower-priority summaries are dropped. The budget breakdown is fully transparent: core context, context hint, tag sections, and conversation history each have their own allocation.
-
-## Install
-
-```bash
-pip install virtual-context
-```
-
-One-command installers (OpenClaw-style):
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.sh | bash
-```
-
-```powershell
-# Windows PowerShell
-iwr https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.ps1 -useb | iex
-```
-
-Guided setup (interactive wizard → config + proxy instances + daemon):
-
-```bash
-virtual-context onboard --wizard
-```
-
-The wizard walks through: tagging provider/model selection → inbound tagger mode (embedding/LLM/keyword) → proxy instances (upstream provider, port, label per instance) → per-instance config generation with isolated storage → optional daemon install. Each instance gets a standalone YAML config pointing to its own SQLite DB.
-
-Or non-interactive:
-
-```bash
-virtual-context onboard
-virtual-context onboard --install-daemon --upstream https://api.anthropic.com
-```
-
-Daemon setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
-
-Optional extras:
-
-```bash
-pip install virtual-context[tui]         # interactive chat terminal
-pip install virtual-context[bridge]      # HTTP proxy (FastAPI + uvicorn)
-pip install virtual-context[embeddings]  # sentence-transformers tag generator
-pip install virtual-context[tiktoken]    # exact token counting
-pip install virtual-context[mcp]         # Model Context Protocol server
-pip install virtual-context[all]         # everything
-```
-
-Minimal dependencies: `pyyaml` + `httpx`. Python 3.11+.
 
 ## Configuration
 
