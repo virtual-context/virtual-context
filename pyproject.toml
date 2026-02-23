@@ -44,7 +44,7 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--ignore=tests/ollama --ignore=tests/haiku -m 'not slow'"
+addopts = "--ignore=tests/ollama --ignore=tests/haiku --ignore=tests/tui -m 'not slow' -n auto"
 markers = [
     "ollama: tests requiring a running Ollama instance with qwen3:4b-instruct-2507-fp16",
     "haiku: tests requiring ANTHROPIC_API_KEY for Haiku integration",

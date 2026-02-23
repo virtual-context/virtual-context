@@ -120,7 +120,7 @@ class TestExecuteVCTool:
         engine = MagicMock()
         engine.find_quote.return_value = {"query": "test", "found": True, "results": []}
         result = execute_vc_tool(engine, "vc_find_quote", {"query": "test"})
-        engine.find_quote.assert_called_once_with(query="test", max_results=5)
+        engine.find_quote.assert_called_once_with(query="test", max_results=20)
         parsed = json.loads(result)
         assert parsed["found"] is True
 

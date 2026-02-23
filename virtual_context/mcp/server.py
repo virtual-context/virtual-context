@@ -152,7 +152,7 @@ def remember_when(query: str, time_range: dict, max_results: int = 5) -> str:
 
 
 @mcp.tool()
-def find_quote(query: str, max_results: int = 5) -> str:
+def find_quote(query: str) -> str:
     """Search the full original conversation text for a specific word, phrase, or detail.
 
     Use this as your first tool when the user asks about a specific fact — a
@@ -169,13 +169,12 @@ def find_quote(query: str, max_results: int = 5) -> str:
     Args:
         query: Word or phrase to search for. Use distinctive terms, e.g.
             'magnesium glycinate' not 'supplement'.
-        max_results: Maximum number of results (default 5).
-
     Returns:
         JSON with matching excerpts, their topics, and segment references.
     """
     engine = _get_engine()
-    result = engine.find_quote(query, max_results=max_results)
+    # Keep MCP behavior aligned with proxy tool loop: always return top 20.
+    result = engine.find_quote(query, max_results=20)
     return json.dumps(result)
 
 

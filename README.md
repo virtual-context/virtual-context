@@ -300,7 +300,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Model-tiered delegation.** Not all LLMs are equally capable of managing their own context. Weaker models (Haiku, small open-source) get a simplified topic list and can request expansions, but virtual-context handles all eviction decisions silently. Stronger models (Opus, Sonnet, GPT-4) see a full budget dashboard with token costs per topic, available budget, and depth levels, making explicit trade-off decisions. In both modes, virtual-context enforces budget constraints and falls back to automatic management when the LLM doesn't manage. The LLM drives, virtual-context enforces, like `madvise()` hints with kernel enforcement.
 
-**Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query — FTS results are supplemented with semantic matches to fill the result set. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
+**Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query — FTS results are supplemented with semantic matches to fill the result set. Each call returns a fixed top 20 results. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
 
 **Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, or follow up with `expand_topic`. Up to 5 continuation rounds run transparently within one client-visible request. This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
 
@@ -699,7 +699,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Tool | `domain_status` | All tags with stats |
 | Tool | `expand_topic` | Expand a topic to segment or full detail depth |
 | Tool | `collapse_topic` | Collapse a topic back to summary or none |
-| Tool | `find_quote` | Full-text search across all stored conversation text |
+| Tool | `find_quote` | Full-text search across all stored conversation text (fixed top 20 results per call) |
 | Resource | `virtualcontext://domains` | List all tags |
 | Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
 | Prompt | `recall` | Suggest context retrieval for a topic |

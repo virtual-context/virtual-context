@@ -150,6 +150,8 @@ def build_supervised_hint(
         return (
             "<context-topics>\n"
             "RULE: These are compressed topic summaries, not the full conversation.\n"
+            "RULE: Summaries are lossy and may omit events/details.\n"
+            "RULE: For count/date/list questions (how many, which days, when), verify with vc_find_quote before finalizing.\n"
             "- For specific facts (names, numbers, dosages, decisions): "
             "use vc_find_quote — it searches raw text across all topics.\n"
             "- For broad overview questions (summarize everything, what have we discussed, catch me up): "

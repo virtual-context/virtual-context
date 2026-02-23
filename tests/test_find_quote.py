@@ -329,7 +329,7 @@ class TestProxyFindQuoteTool:
         tools = vc_tool_definitions()
         fq = next(t for t in tools if t["name"] == "vc_find_quote")
         assert "query" in fq["input_schema"]["properties"]
-        assert "max_results" in fq["input_schema"]["properties"]
+        assert "max_results" not in fq["input_schema"]["properties"]
         assert fq["input_schema"]["required"] == ["query"]
 
     def test_execute_vc_tool_dispatches_find_quote(self):
@@ -342,17 +342,17 @@ class TestProxyFindQuoteTool:
         }
 
         result_str = execute_vc_tool(engine, "vc_find_quote", {"query": "magnesium"})
-        engine.find_quote.assert_called_once_with(query="magnesium", max_results=5)
+        engine.find_quote.assert_called_once_with(query="magnesium", max_results=20)
         result = json.loads(result_str)
         assert result["found"] is True
 
-    def test_execute_vc_tool_find_quote_with_max_results(self):
+    def test_execute_vc_tool_find_quote_ignores_input_max_results(self):
         from virtual_context.core.tool_loop import execute_vc_tool
         engine = MagicMock()
         engine.find_quote.return_value = {"found": False, "results": []}
 
         execute_vc_tool(engine, "vc_find_quote", {"query": "test", "max_results": 3})
-        engine.find_quote.assert_called_once_with(query="test", max_results=3)
+        engine.find_quote.assert_called_once_with(query="test", max_results=20)
 
 
 # ---------------------------------------------------------------------------

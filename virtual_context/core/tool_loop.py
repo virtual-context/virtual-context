@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from ..engine import VirtualContextEngine
 
 logger = logging.getLogger(__name__)
+VC_FIND_QUOTE_MAX_RESULTS = 20
 
 # ---------------------------------------------------------------------------
 # Tool catalogue
@@ -132,10 +133,6 @@ def vc_tool_definitions() -> list[dict]:
                             "'supplement', or 'reservation 7pm' rather than 'dinner'."
                         ),
                     },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum results to return (default 5).",
-                    },
                 },
                 "required": ["query"],
             },
@@ -215,7 +212,7 @@ def execute_vc_tool(
         elif name == "vc_find_quote":
             result = engine.find_quote(
                 query=tool_input.get("query", ""),
-                max_results=tool_input.get("max_results", 5),
+                max_results=VC_FIND_QUOTE_MAX_RESULTS,
             )
         elif name == "vc_recall_all":
             result = engine.recall_all()

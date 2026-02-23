@@ -1040,6 +1040,12 @@ def create_app(
         _app_title += f" [{instance_label}]"
     app = FastAPI(title=_app_title, lifespan=lifespan)
     app.state.instance_label = instance_label
+    # Pluggable session resolver: if set, called instead of the built-in
+    # SessionRegistry.  Signature:
+    #   (request, body, session_id) -> (ProxyState, is_new)
+    # Cloud wrappers (e.g. virtual-context-cloud) set this to route
+    # requests to per-tenant engines.  Default None = use local registry.
+    app.state.state_resolver = None
 
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed
     # Dashboard uses the default state for settings and config access
@@ -1101,7 +1107,10 @@ def create_app(
 
         # Route to the correct session
         state: ProxyState | None = None
-        if registry:
+        _resolver = getattr(app.state, "state_resolver", None)
+        if _resolver is not None:
+            state, is_new = _resolver(request, body, inbound_session_id)
+        elif registry:
             state, is_new = registry.get_or_create(
                 inbound_session_id, body=body,
             )
