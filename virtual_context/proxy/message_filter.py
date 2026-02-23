@@ -37,6 +37,9 @@ def filter_body_messages(
     if fmt.name == "gemini":
         _msg_key = "contents"
         _asst_role = "model"
+    elif fmt.name == "openai_responses":
+        _msg_key = "input"
+        _asst_role = "assistant"
     else:
         _msg_key = "messages"
         _asst_role = "assistant"
@@ -174,9 +177,14 @@ def filter_body_messages(
     # we drop pairs around these "unpaired" messages the result can have
     # consecutive same-role entries, which the Anthropic API rejects.
     # Fix: walk the kept list and drop any message that repeats the previous role.
+    # Note: bare items (no role, e.g. function_call in Responses API) are always kept.
     alternating: list[dict] = []
     for msg in kept:
-        if alternating and msg.get("role") == alternating[-1].get("role"):
+        role = msg.get("role")
+        if role is None:
+            alternating.append(msg)  # bare items always kept
+            continue
+        if alternating and role == alternating[-1].get("role"):
             continue  # skip — would create consecutive same-role
         alternating.append(msg)
     kept = alternating

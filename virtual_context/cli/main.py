@@ -689,19 +689,23 @@ def _apply_proxy_instances(config_path: Path, instances: list[dict]) -> None:
 
 
 def _proxy_command(config_path: Path, upstream: str | None) -> str:
-    cmd = f'virtual-context -c "{config_path}" proxy'
+    import shlex
+    cmd = f'virtual-context -c {shlex.quote(str(config_path))} proxy'
     if upstream:
-        cmd += f" --upstream {upstream}"
+        cmd += f" --upstream {shlex.quote(upstream)}"
     return cmd
 
 
 def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+    from xml.sax.saxutils import escape as _xml_escape
+
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     launch_agents.mkdir(parents=True, exist_ok=True)
     plist_path = launch_agents / "io.virtualcontext.proxy.plist"
     cmd = _proxy_command(config_path, upstream)
     log_path = Path.home() / "Library" / "Logs" / "virtual-context.log"
     err_path = Path.home() / "Library" / "Logs" / "virtual-context.err.log"
+    # Escape XML special characters to prevent XML injection
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -712,16 +716,16 @@ def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>{cmd}</string>
+    <string>{_xml_escape(cmd)}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>{log_path}</string>
+  <string>{_xml_escape(str(log_path))}</string>
   <key>StandardErrorPath</key>
-  <string>{err_path}</string>
+  <string>{_xml_escape(str(err_path))}</string>
 </dict>
 </plist>
 """

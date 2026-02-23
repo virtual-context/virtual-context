@@ -142,9 +142,9 @@ def _extract_user_message(body: dict) -> str:
     return fmt.extract_user_message(body)
 
 
-def _extract_message_text(msg: dict) -> str:
+def _extract_message_text(msg: dict, api_format: str = "anthropic") -> str:
     """Extract text from a single message dict (string or content blocks)."""
-    return get_format("anthropic").extract_message_text(msg)
+    return get_format(api_format).extract_message_text(msg)
 
 
 def _extract_history_pairs(body: dict) -> list[Message]:
@@ -287,6 +287,175 @@ def _emit_tool_use_as_sse(
         "index": block_index,
     })
     events.append(f"event: content_block_stop\ndata: {stop}\n\n".encode())
+    return events
+
+
+def _emit_text_as_responses_sse(text: str, item_index: int = 0) -> list[bytes]:
+    """Convert *text* into OpenAI Responses API SSE events."""
+    events: list[bytes] = []
+
+    item_id = f"item_{item_index}"
+    output_index = item_index
+
+    # response.output_item.added — message item
+    item_added = _json.dumps({
+        "type": "response.output_item.added",
+        "output_index": output_index,
+        "item": {
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "content": [],
+        },
+    })
+    events.append(
+        f"event: response.output_item.added\ndata: {item_added}\n\n".encode(),
+    )
+
+    # response.content_part.added — output_text part
+    part_added = _json.dumps({
+        "type": "response.content_part.added",
+        "output_index": output_index,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": ""},
+    })
+    events.append(
+        f"event: response.content_part.added\ndata: {part_added}\n\n".encode(),
+    )
+
+    # response.output_text.delta — the text
+    text_delta = _json.dumps({
+        "type": "response.output_text.delta",
+        "output_index": output_index,
+        "content_index": 0,
+        "delta": text,
+    })
+    events.append(
+        f"event: response.output_text.delta\ndata: {text_delta}\n\n".encode(),
+    )
+
+    # response.output_text.done
+    text_done = _json.dumps({
+        "type": "response.output_text.done",
+        "output_index": output_index,
+        "content_index": 0,
+        "text": text,
+    })
+    events.append(
+        f"event: response.output_text.done\ndata: {text_done}\n\n".encode(),
+    )
+
+    # response.content_part.done
+    part_done = _json.dumps({
+        "type": "response.content_part.done",
+        "output_index": output_index,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": text},
+    })
+    events.append(
+        f"event: response.content_part.done\ndata: {part_done}\n\n".encode(),
+    )
+
+    # response.output_item.done
+    item_done = _json.dumps({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": {
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    })
+    events.append(
+        f"event: response.output_item.done\ndata: {item_done}\n\n".encode(),
+    )
+    return events
+
+
+def _emit_tool_use_as_responses_sse(
+    tool: dict, item_index: int = 0,
+) -> list[bytes]:
+    """Convert a function_call into OpenAI Responses API SSE events."""
+    events: list[bytes] = []
+    output_index = item_index
+    call_id = tool.get("id", tool.get("call_id", ""))
+    name = tool.get("name", "")
+    args = tool.get("input", {})
+    args_str = _json.dumps(args) if isinstance(args, dict) else str(args)
+
+    # response.output_item.added — function_call item
+    item_added = _json.dumps({
+        "type": "response.output_item.added",
+        "output_index": output_index,
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": "",
+        },
+    })
+    events.append(
+        f"event: response.output_item.added\ndata: {item_added}\n\n".encode(),
+    )
+
+    # response.function_call_arguments.delta
+    args_delta = _json.dumps({
+        "type": "response.function_call_arguments.delta",
+        "output_index": output_index,
+        "delta": args_str,
+    })
+    events.append(
+        f"event: response.function_call_arguments.delta\n"
+        f"data: {args_delta}\n\n".encode(),
+    )
+
+    # response.function_call_arguments.done
+    args_done = _json.dumps({
+        "type": "response.function_call_arguments.done",
+        "output_index": output_index,
+        "name": name,
+        "arguments": args_str,
+    })
+    events.append(
+        f"event: response.function_call_arguments.done\n"
+        f"data: {args_done}\n\n".encode(),
+    )
+
+    # response.output_item.done
+    item_done = _json.dumps({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": args_str,
+        },
+    })
+    events.append(
+        f"event: response.output_item.done\ndata: {item_done}\n\n".encode(),
+    )
+    return events
+
+
+def _emit_response_done_sse(
+    output_items: list[dict],
+    usage: dict | None = None,
+) -> list[bytes]:
+    """Emit ``response.completed`` SSE event for Responses API."""
+    events: list[bytes] = []
+    completed = _json.dumps({
+        "type": "response.completed",
+        "response": {
+            "output": output_items,
+            "status": "completed",
+            "usage": usage or {},
+        },
+    })
+    events.append(
+        f"event: response.completed\ndata: {completed}\n\n".encode(),
+    )
     return events
 
 

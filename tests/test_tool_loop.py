@@ -12,6 +12,7 @@ from virtual_context.core.tool_loop import (
     AnthropicAdapter,
     GeminiAdapter,
     OpenAIAdapter,
+    OpenAICodexAdapter,
     ProviderAdapter,
     execute_vc_tool,
     get_adapter,
@@ -188,6 +189,10 @@ class TestGetAdapter:
     def test_gemini(self):
         a = get_adapter("gemini", "AIza...")
         assert isinstance(a, GeminiAdapter)
+
+    def test_openai_codex(self):
+        a = get_adapter("openai-codex", "oauth-token")
+        assert isinstance(a, OpenAICodexAdapter)
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown provider"):
@@ -511,6 +516,7 @@ class _MockHTTPResponse:
         self._data = data
         self.status_code = status_code
         self.text = json.dumps(data)
+        self.headers = {"content-type": "application/json"}
 
     def json(self):
         return self._data

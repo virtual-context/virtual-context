@@ -99,8 +99,9 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/static/{filename}")
     async def dashboard_static(filename: str):
-        filepath = _static_dir / filename
-        if not filepath.is_file() or ".." in filename:
+        filepath = (_static_dir / filename).resolve()
+        # Ensure resolved path is still within _static_dir (prevents traversal)
+        if not filepath.is_file() or not str(filepath).startswith(str(_static_dir.resolve())):
             return Response(status_code=404)
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         return Response(content=filepath.read_bytes(), media_type=media_type)
@@ -248,7 +249,7 @@ def register_dashboard_routes(
         except Exception as exc:
             logger.error("Failed to delete session %s: %s", session_id, exc, exc_info=True)
             return JSONResponse(
-                {"error": str(exc)}, status_code=500,
+                {"error": "Internal server error"}, status_code=500,
             )
 
     @app.get("/dashboard/sessions/live")
@@ -331,7 +332,8 @@ def register_dashboard_routes(
                     engine, "_compacted_through", 0
                 )
             except Exception as e:
-                snap["_export_error"] = str(e)
+                logger.error("Export error: %s", e, exc_info=True)
+                snap["_export_error"] = "Failed to export engine state"
 
         return JSONResponse(snap)
 
@@ -382,17 +384,27 @@ def register_dashboard_routes(
                 {"error": "Missing 'file' field"}, status_code=400,
             )
 
-        p = Path(file_path)
+        p = Path(file_path).resolve()
+
+        # Restrict to files with expected replay extensions to prevent
+        # arbitrary file reads via this endpoint.
+        allowed_extensions = {".txt", ".md", ".yaml", ".yml", ".json", ".jsonl"}
+        if p.suffix.lower() not in allowed_extensions:
+            return JSONResponse(
+                {"error": f"File type not allowed: {p.suffix}"}, status_code=400,
+            )
+
         if not p.exists():
             return JSONResponse(
-                {"error": f"File not found: {file_path}"}, status_code=400,
+                {"error": "File not found"}, status_code=400,
             )
 
         try:
             prompts = load_replay_prompts(p)
         except Exception as e:
+            logger.error("Failed to load prompts from %s: %s", p, e)
             return JSONResponse(
-                {"error": f"Failed to load prompts: {e}"}, status_code=400,
+                {"error": "Failed to load prompts file"}, status_code=400,
             )
 
         if not prompts:

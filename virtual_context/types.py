@@ -488,7 +488,7 @@ class RetrieverConfig:
         "default": StrategyConfig()
     })
     anchorless_lookback: int = 6           # how many recent turns for working set
-    inbound_tagger_type: str = "llm"       # "llm" (default) or "embedding"
+    inbound_tagger_type: str = "embedding"  # "embedding" (default) or "llm"
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_threshold: float = 0.3
 

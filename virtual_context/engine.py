@@ -1634,7 +1634,7 @@ class VirtualContextEngine:
         tools, sends a non-streaming POST, and runs a synchronous tool
         loop if the model invokes any VC tools.
 
-        Supports Anthropic, OpenAI, and Gemini providers via the adapter
+        Supports Anthropic, OpenAI, OpenAI Codex, and Gemini providers via the adapter
         pattern.
 
         Parameters
@@ -1661,7 +1661,8 @@ class VirtualContextEngine:
         max_loops : int
             Maximum continuation rounds for the tool loop.
         provider : str
-            LLM provider: ``"anthropic"``, ``"openai"``, or ``"gemini"``.
+            LLM provider: ``"anthropic"``, ``"openai"``,
+            ``"openai-codex"``, or ``"gemini"``.
 
         Returns
         -------
@@ -1671,6 +1672,7 @@ class VirtualContextEngine:
         import httpx
 
         from .core.tool_loop import (
+            _parse_provider_http_response,
             get_adapter,
             run_tool_loop,
             vc_tool_definitions,
@@ -1712,7 +1714,7 @@ class VirtualContextEngine:
                 f"{provider} API error {resp.status_code}: {resp.text[:500]}"
             )
 
-        data = resp.json()
+        data = _parse_provider_http_response(resp)
 
         # Check for VC tool calls
         tool_calls = adapter.extract_tool_calls(data)

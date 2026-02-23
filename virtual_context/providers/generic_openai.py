@@ -11,7 +11,7 @@ from .base import BaseProvider
 class GenericOpenAIProvider(BaseProvider):
     """LLM provider using any OpenAI-compatible chat completions API."""
 
-    _timeout = 120.0
+    _timeout = 20.0
 
     def __init__(
         self,
@@ -39,15 +39,24 @@ class GenericOpenAIProvider(BaseProvider):
         }
 
     def _build_payload(self, system: str, user: str, max_tokens: int) -> dict:
-        return {
+        payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": max_tokens,
-            "temperature": self.temperature,
         }
+        # Some OpenAI-hosted models (e.g., gpt-5-mini) only support default
+        # temperature=1 and reject explicit non-default values.
+        if "api.openai.com" not in self.base_url or self.temperature == 1:
+            payload["temperature"] = self.temperature
+        # OpenAI-hosted chat models (notably GPT-5 family) expect
+        # max_completion_tokens instead of max_tokens.
+        if "api.openai.com" in self.base_url:
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["max_tokens"] = max_tokens
+        return payload
 
     def _extract_text(self, data: dict) -> str:
         choices = data.get("choices", [])

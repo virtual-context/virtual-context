@@ -51,6 +51,9 @@ class TestOnMessageInboundLookback:
         """Replace the tagger in both the engine and the retriever."""
         engine._tag_generator = mock_tagger
         engine._retriever.tag_generator = mock_tagger
+        # Null out the embedding-based inbound tagger so the retriever
+        # falls back to tag_generator (which we just mocked).
+        engine._retriever._inbound_tagger = None
 
     def test_inbound_retries_on_general(self):
         """When inbound tagger returns _general, engine should retry with expanded context."""

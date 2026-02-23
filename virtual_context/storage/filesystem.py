@@ -197,9 +197,15 @@ class FilesystemStore(ContextStore):
         )
 
     def _segment_path(self, primary_tag: str, ref: str) -> Path:
-        tag_dir = self.root / primary_tag
+        # Sanitize tag and ref to prevent path traversal
+        safe_tag = primary_tag.replace("/", "_").replace("\\", "_").replace("..", "_")
+        safe_ref = ref.replace("/", "_").replace("\\", "_").replace("..", "_")
+        tag_dir = self.root / safe_tag
+        resolved = tag_dir.resolve()
+        if not str(resolved).startswith(str(self.root.resolve())):
+            raise ValueError(f"Path traversal detected in primary_tag: {primary_tag}")
         tag_dir.mkdir(parents=True, exist_ok=True)
-        return tag_dir / f"seg-{ref}.md"
+        return tag_dir / f"seg-{safe_ref}.md"
 
     def store_segment(self, segment: StoredSegment) -> str:
         path = self._segment_path(segment.primary_tag, segment.ref)
@@ -432,7 +438,8 @@ class FilesystemStore(ContextStore):
     def save_tag_summary(self, tag_summary: TagSummary) -> None:
         ts_dir = self.root / "_tag_summaries"
         ts_dir.mkdir(parents=True, exist_ok=True)
-        path = ts_dir / f"{tag_summary.tag}.json"
+        safe_tag = tag_summary.tag.replace("/", "_").replace("\\", "_").replace("..", "_")
+        path = ts_dir / f"{safe_tag}.json"
         data = {
             "tag": tag_summary.tag,
             "summary": tag_summary.summary,
@@ -447,7 +454,8 @@ class FilesystemStore(ContextStore):
         path.write_text(json.dumps(data, indent=2))
 
     def get_tag_summary(self, tag: str) -> TagSummary | None:
-        path = self.root / "_tag_summaries" / f"{tag}.json"
+        safe_tag = tag.replace("/", "_").replace("\\", "_").replace("..", "_")
+        path = self.root / "_tag_summaries" / f"{safe_tag}.json"
         if not path.is_file():
             return None
         try:
@@ -503,7 +511,8 @@ class FilesystemStore(ContextStore):
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
         embed_dir = self.root / "_embeddings"
         embed_dir.mkdir(parents=True, exist_ok=True)
-        path = embed_dir / f"{segment_ref}.json"
+        safe_ref = segment_ref.replace("/", "_").replace("\\", "_").replace("..", "_")
+        path = embed_dir / f"{safe_ref}.json"
         data = [
             {
                 "segment_ref": c.segment_ref,
@@ -537,7 +546,8 @@ class FilesystemStore(ContextStore):
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         state_dir = self.root / "_engine_state"
         state_dir.mkdir(parents=True, exist_ok=True)
-        path = state_dir / f"{state.session_id}.json"
+        safe_id = state.session_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+        path = state_dir / f"{safe_id}.json"
         data = {
             "session_id": state.session_id,
             "compacted_through": state.compacted_through,
@@ -602,7 +612,8 @@ class FilesystemStore(ContextStore):
         )
 
     def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
-        path = self.root / "_engine_state" / f"{session_id}.json"
+        safe_id = session_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+        path = self.root / "_engine_state" / f"{safe_id}.json"
         if not path.is_file():
             return None
         try:

@@ -24,6 +24,7 @@ from .provider_adapters import (  # noqa: F401
     AnthropicAdapter,
     GeminiAdapter,
     OpenAIAdapter,
+    OpenAICodexAdapter,
     ProviderAdapter,
     get_adapter,
 )
@@ -239,6 +240,47 @@ def execute_vc_tool(
 _MAX_LOOPS = 5
 
 
+def _parse_sse_response(text: str) -> dict:
+    """Parse SSE text and return the final `response` object."""
+    last_response: dict | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload_raw = line[6:]
+        if not payload_raw or payload_raw == "[DONE]":
+            continue
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type", "")
+        if event_type in {"response.created", "response.in_progress"}:
+            resp = payload.get("response")
+            if isinstance(resp, dict):
+                last_response = resp
+        elif event_type in {"response.completed", "response.failed"}:
+            resp = payload.get("response")
+            if isinstance(resp, dict):
+                return resp
+        elif event_type == "error":
+            return {"error": payload.get("error", payload)}
+    return last_response or {}
+
+
+def _parse_provider_http_response(resp: httpx.Response) -> dict:
+    """Parse provider HTTP response, supporting JSON and SSE payloads."""
+    content_type = (resp.headers.get("content-type", "") or "").lower()
+    if "text/event-stream" in content_type:
+        return _parse_sse_response(resp.text)
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        return _parse_sse_response(resp.text)
+
+
 def run_tool_loop(
     engine: VirtualContextEngine,
     initial_response: dict,
@@ -359,7 +401,7 @@ def run_tool_loop(
                 result.stop_reason = "error"
                 break
 
-            cont_data = resp.json()
+            cont_data = _parse_provider_http_response(resp)
             current_response = cont_data
             result.raw_responses.append(cont_data)
 
@@ -432,7 +474,7 @@ def run_tool_loop(
                 result.raw_requests.append(copy.deepcopy(cont_body))
                 resp = client.post(url, headers=headers, json=cont_body)
                 if resp.status_code < 300:
-                    forced_data = resp.json()
+                    forced_data = _parse_provider_http_response(resp)
                     result.raw_responses.append(forced_data)
                     fi, fo = adapter.extract_usage(forced_data)
                     result.input_tokens += fi

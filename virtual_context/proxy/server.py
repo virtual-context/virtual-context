@@ -68,6 +68,9 @@ from .helpers import (  # noqa: F401 — re-exported for tests
     _emit_text_as_sse,
     _emit_tool_use_as_sse,
     _emit_message_end_sse,
+    _emit_text_as_responses_sse,
+    _emit_tool_use_as_responses_sse,
+    _emit_response_done_sse,
     _dump_session_state,
 )
 from .metrics import ProxyMetrics
@@ -729,8 +732,9 @@ class SessionRegistry:
     def _compute_fingerprint(body: dict, offset: int = 0) -> str:
         """Trailing conversation fingerprint from the last N user messages.
 
-        Hashes ``_FINGERPRINT_SAMPLE_SIZE`` (S) user messages sampled from
-        the tail of the history (excluding the current turn).
+        Delegates to the format-specific ``compute_fingerprint`` method
+        which handles provider-specific message structures (Anthropic,
+        OpenAI Chat, OpenAI Responses, Gemini).
 
         The ``offset`` parameter shifts the sampling window back from the
         tail.  Two conventions:
@@ -739,39 +743,9 @@ class SessionRegistry:
           Used in ``catch_all`` to persist the fingerprint after each turn.
         - **offset=1** (match): hash S messages ending one position before
           the tail.  Used in ``get_or_create`` and restart matching.
-
-        Why offset=1 matches offset=0 from the previous request:
-
-        Request N  has history [u0 … u49].  Store fp = hash(u49).
-        Request N+1 has history [u0 … u49, u50].  Match fp = hash(u49).
-        The Nth message from the tail of request N+1 is the (N-1)th from
-        request N — the tail is stable, only the tip grows.
         """
-        messages = body.get("messages", [])
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-
-        # Exclude the current turn (last user message)
-        if len(user_msgs) < 2:
-            return ""
-        history_user = user_msgs[:-1]  # all except current turn
-
-        n = SessionRegistry._FINGERPRINT_SAMPLE_SIZE
-        # Apply offset: shift window back by `offset` positions
-        end = len(history_user) - offset
-        start = end - n
-        if start < 0 or end <= 0:
-            return ""
-        sample = history_user[start:end]
-        if not sample:
-            return ""
-
-        texts = [SessionRegistry._msg_text(m) for m in sample]
-        combined = "\n".join(texts)
-        if not combined.strip():
-            return ""
-
-        import hashlib
-        return hashlib.sha256(combined.encode()).hexdigest()[:16]
+        fmt = detect_format(body)
+        return fmt.compute_fingerprint(body, offset)
 
     def _match_persisted_fingerprint(self, body: dict) -> str | None:
         """Match inbound request against persisted session fingerprints.
@@ -1155,7 +1129,7 @@ def create_app(
 
         import datetime as _dt
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        _msg_count = len(body.get("messages", []))
+        _msg_count = len(fmt.get_messages(body))
         _sid = state.engine.config.session_id[:12] if state else "none"
         print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming} session={_sid} payload={_payload_kb}KB")
 
@@ -1753,6 +1727,134 @@ async def _handle_streaming(
                                 suppressed_raw.append(raw_bytes)
                                 continue
 
+                        # ===== Responses API events =====
+
+                        # -- response.output_item.added --
+                        elif dtype == "response.output_item.added":
+                            item = data.get("item", {})
+                            itype = item.get("type", "")
+                            if (
+                                itype == "function_call"
+                                and is_vc_tool(item.get("name", ""))
+                            ):
+                                suppressing = True
+                                current_vc_tool = {
+                                    "id": item.get(
+                                        "call_id", item.get("id", ""),
+                                    ),
+                                    "name": item["name"],
+                                    "input_parts": [],
+                                }
+                                suppressed_raw.append(raw_bytes)
+                                continue
+                            elif itype == "function_call":
+                                non_vc_tools.append({
+                                    "id": item.get(
+                                        "call_id", item.get("id", ""),
+                                    ),
+                                    "name": item.get("name", ""),
+                                })
+
+                        # -- response.function_call_arguments.delta --
+                        elif dtype == (
+                            "response.function_call_arguments.delta"
+                        ):
+                            if suppressing and current_vc_tool:
+                                current_vc_tool["input_parts"].append(
+                                    data.get("delta", ""),
+                                )
+                                suppressed_raw.append(raw_bytes)
+                                continue
+
+                        # -- response.function_call_arguments.done --
+                        elif dtype == (
+                            "response.function_call_arguments.done"
+                        ):
+                            if suppressing and current_vc_tool:
+                                args_str = data.get(
+                                    "arguments",
+                                    "".join(
+                                        current_vc_tool["input_parts"],
+                                    ),
+                                )
+                                try:
+                                    parsed_input = _json.loads(args_str)
+                                except _json.JSONDecodeError:
+                                    parsed_input = {}
+                                vc_tools.append({
+                                    "id": current_vc_tool["id"],
+                                    "name": current_vc_tool["name"],
+                                    "input": parsed_input,
+                                })
+                                all_content_blocks.append({
+                                    "type": "function_call",
+                                    "call_id": current_vc_tool["id"],
+                                    "name": current_vc_tool["name"],
+                                    "arguments": args_str,
+                                })
+                                current_vc_tool = None
+                                suppressing = False
+                                suppressed_raw.append(raw_bytes)
+                                continue
+
+                        # -- response.output_text.delta --
+                        elif dtype == "response.output_text.delta":
+                            dt = data.get("delta", "")
+                            if dt:
+                                text_chunks.append(dt)
+                                current_text_parts.append(dt)
+
+                        # -- response.output_item.done --
+                        elif dtype == "response.output_item.done":
+                            if suppressing:
+                                suppressed_raw.append(raw_bytes)
+                                continue
+                            item = data.get("item", {})
+                            if item.get("type") == "message":
+                                if current_text_parts:
+                                    all_content_blocks.append({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": "".join(
+                                                current_text_parts,
+                                            ),
+                                        }],
+                                    })
+                                    current_text_parts = []
+                                    forwarded_block_count += 1
+
+                        # -- response.completed --
+                        elif dtype == "response.completed":
+                            resp = data.get("response", {})
+                            output = resp.get("output", [])
+                            has_vc = any(
+                                it.get("type") == "function_call"
+                                and is_vc_tool(it.get("name", ""))
+                                for it in output
+                            )
+                            if has_vc and vc_tools:
+                                has_non_vc = any(
+                                    it.get("type") == "function_call"
+                                    and not is_vc_tool(it.get("name", ""))
+                                    for it in output
+                                )
+                                if has_non_vc:
+                                    logger.warning(
+                                        "Mixed VC + non-VC tools in "
+                                        "Responses API — passing through",
+                                    )
+                                    for s in suppressed_raw:
+                                        yield s
+                                    suppressed_raw.clear()
+                                    vc_tools.clear()
+                                    need_continuation = False
+                                else:
+                                    need_continuation = True
+                                    suppressed_raw.append(raw_bytes)
+                                    continue
+
                         # Default: forward event to client
                         yield raw_bytes
             finally:
@@ -1788,11 +1890,18 @@ async def _handle_streaming(
                                 "continuation_count": loop_i + 1,
                                 "session_id": session_id,
                             })
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": result_str,
-                        })
+                        if api_format == "openai_responses":
+                            tool_results.append({
+                                "type": "function_call_output",
+                                "call_id": tool["id"],
+                                "output": result_str,
+                            })
+                        else:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool["id"],
+                                "content": result_str,
+                            })
 
                     # Re-assemble context with updated working set
                     # so the LLM sees the expanded content in this
@@ -1810,17 +1919,37 @@ async def _handle_streaming(
                             tool_results,
                         )
                     else:
-                        # Update system prompt with re-assembled context
-                        if new_prepend and "system" in reassembled_body:
-                            cont_body["system"] = reassembled_body["system"]
-                        cont_body["messages"].append({
-                            "role": "assistant",
-                            "content": loop_content_blocks,
-                        })
-                        cont_body["messages"].append({
-                            "role": "user",
-                            "content": tool_results,
-                        })
+                        if api_format == "openai_responses":
+                            # Update instructions with re-assembled context
+                            if (
+                                new_prepend
+                                and "instructions" in reassembled_body
+                            ):
+                                cont_body["instructions"] = (
+                                    reassembled_body["instructions"]
+                                )
+                            # Append function_call items + results to input
+                            for block in loop_content_blocks:
+                                if block.get("type") == "function_call":
+                                    cont_body["input"].append(block)
+                            cont_body["input"].extend(tool_results)
+                        else:
+                            # Anthropic / default
+                            if (
+                                new_prepend
+                                and "system" in reassembled_body
+                            ):
+                                cont_body["system"] = (
+                                    reassembled_body["system"]
+                                )
+                            cont_body["messages"].append({
+                                "role": "assistant",
+                                "content": loop_content_blocks,
+                            })
+                            cont_body["messages"].append({
+                                "role": "user",
+                                "content": tool_results,
+                            })
 
                     # Send non-streaming continuation
                     cont_resp = await client.post(
@@ -1855,81 +1984,183 @@ async def _handle_streaming(
                         break
 
                     cont_data = cont_resp.json()
-                    stop_reason = cont_data.get("stop_reason", "end_turn")
-                    content = cont_data.get("content", [])
-                    loop_content_blocks = content
 
-                    # Emit text blocks as SSE
-                    text_blocks = [
-                        b for b in content if b.get("type") == "text"
-                    ]
-                    tool_blocks = [
-                        b for b in content if b.get("type") == "tool_use"
-                    ]
-                    vc_next = [
-                        b for b in tool_blocks
-                        if is_vc_tool(b.get("name", ""))
-                    ]
-
-                    for tb in text_blocks:
-                        t = tb.get("text", "")
-                        if t:
-                            text_chunks.append(t)
-                            for sse_evt in _emit_text_as_sse(
-                                t, forwarded_block_count,
-                            ):
-                                yield sse_evt
-                            forwarded_block_count += 1
-
-                    # More VC-only tool calls → loop
-                    if (
-                        stop_reason == "tool_use"
-                        and vc_next
-                        and all(
-                            is_vc_tool(b.get("name", ""))
-                            for b in tool_blocks
-                        )
-                    ):
-                        vc_tools = [
-                            {
-                                "id": b["id"],
-                                "name": b["name"],
-                                "input": b.get("input", {}),
-                            }
-                            for b in vc_next
+                    if api_format == "openai_responses":
+                        # Responses API: output array, no stop_reason
+                        output = cont_data.get("output", [])
+                        loop_content_blocks = output
+                        tool_blocks = [
+                            b for b in output
+                            if b.get("type") == "function_call"
                         ]
-                        continue
+                        vc_next = [
+                            b for b in tool_blocks
+                            if is_vc_tool(b.get("name", ""))
+                        ]
+                        has_tools = bool(tool_blocks)
 
-                    # Done — forward any non-VC tools to client
-                    non_vc_in_cont = [
-                        b for b in tool_blocks
-                        if not is_vc_tool(b.get("name", ""))
-                    ]
-                    if non_vc_in_cont:
-                        for nvc in non_vc_in_cont:
-                            for sse_evt in _emit_tool_use_as_sse(
-                                nvc, forwarded_block_count,
+                        # Emit text from message items
+                        for item in output:
+                            if item.get("type") != "message":
+                                continue
+                            for part in item.get("content", []):
+                                if part.get("type") == "output_text":
+                                    t = part.get("text", "")
+                                    if t:
+                                        text_chunks.append(t)
+                                        for sse_evt in (
+                                            _emit_text_as_responses_sse(
+                                                t,
+                                                forwarded_block_count,
+                                            )
+                                        ):
+                                            yield sse_evt
+                                        forwarded_block_count += 1
+
+                        # More VC-only tool calls → loop
+                        if (
+                            has_tools
+                            and vc_next
+                            and all(
+                                is_vc_tool(b.get("name", ""))
+                                for b in tool_blocks
+                            )
+                        ):
+                            fmt_obj = get_format("openai_responses")
+                            vc_tools = [
+                                {
+                                    "id": c["id"],
+                                    "name": c["name"],
+                                    "input": c["input"],
+                                }
+                                for c in fmt_obj.extract_tool_calls(
+                                    output,
+                                )
+                                if is_vc_tool(c["name"])
+                            ]
+                            continue
+
+                        # Done — forward non-VC tools
+                        non_vc_in_cont = [
+                            b for b in tool_blocks
+                            if not is_vc_tool(b.get("name", ""))
+                        ]
+                        if non_vc_in_cont:
+                            fmt_obj = get_format("openai_responses")
+                            for nvc in fmt_obj.extract_tool_calls(
+                                non_vc_in_cont,
                             ):
-                                yield sse_evt
-                            forwarded_block_count += 1
-                    break
+                                for sse_evt in (
+                                    _emit_tool_use_as_responses_sse(
+                                        nvc,
+                                        forwarded_block_count,
+                                    )
+                                ):
+                                    yield sse_evt
+                                forwarded_block_count += 1
+                        break
 
-                # Emit message end events
-                cont_usage = cont_data.get("usage") if cont_data else None
-                cont_stop = "end_turn"
-                if cont_data:
-                    # If the LLM stopped for tool_use and we forwarded
-                    # non-VC tools, tell the client so it handles them.
-                    raw_stop = cont_data.get("stop_reason", "end_turn")
-                    non_vc_forwarded = any(
-                        b.get("type") == "tool_use"
-                        and not is_vc_tool(b.get("name", ""))
-                        for b in cont_data.get("content", [])
-                    )
-                    if raw_stop == "tool_use" and non_vc_forwarded:
-                        cont_stop = "tool_use"
-                for sse_evt in _emit_message_end_sse(cont_stop, usage=cont_usage):
-                    yield sse_evt
+                    else:
+                        # Anthropic / default
+                        stop_reason = cont_data.get(
+                            "stop_reason", "end_turn",
+                        )
+                        content = cont_data.get("content", [])
+                        loop_content_blocks = content
+
+                        text_blocks = [
+                            b for b in content
+                            if b.get("type") == "text"
+                        ]
+                        tool_blocks = [
+                            b for b in content
+                            if b.get("type") == "tool_use"
+                        ]
+                        vc_next = [
+                            b for b in tool_blocks
+                            if is_vc_tool(b.get("name", ""))
+                        ]
+
+                        for tb in text_blocks:
+                            t = tb.get("text", "")
+                            if t:
+                                text_chunks.append(t)
+                                for sse_evt in _emit_text_as_sse(
+                                    t, forwarded_block_count,
+                                ):
+                                    yield sse_evt
+                                forwarded_block_count += 1
+
+                        # More VC-only tool calls → loop
+                        if (
+                            stop_reason == "tool_use"
+                            and vc_next
+                            and all(
+                                is_vc_tool(b.get("name", ""))
+                                for b in tool_blocks
+                            )
+                        ):
+                            vc_tools = [
+                                {
+                                    "id": b["id"],
+                                    "name": b["name"],
+                                    "input": b.get("input", {}),
+                                }
+                                for b in vc_next
+                            ]
+                            continue
+
+                        # Done — forward non-VC tools
+                        non_vc_in_cont = [
+                            b for b in tool_blocks
+                            if not is_vc_tool(b.get("name", ""))
+                        ]
+                        if non_vc_in_cont:
+                            for nvc in non_vc_in_cont:
+                                for sse_evt in _emit_tool_use_as_sse(
+                                    nvc, forwarded_block_count,
+                                ):
+                                    yield sse_evt
+                                forwarded_block_count += 1
+                        break
+
+                # Emit end events (format-aware)
+                cont_usage = (
+                    cont_data.get("usage") if cont_data else None
+                )
+                if api_format == "openai_responses":
+                    # Collect all forwarded output items
+                    _final_output: list[dict] = []
+                    if cont_data:
+                        for item in cont_data.get("output", []):
+                            if item.get("type") == "function_call":
+                                if not is_vc_tool(
+                                    item.get("name", ""),
+                                ):
+                                    _final_output.append(item)
+                            else:
+                                _final_output.append(item)
+                    for sse_evt in _emit_response_done_sse(
+                        _final_output, usage=cont_usage,
+                    ):
+                        yield sse_evt
+                else:
+                    cont_stop = "end_turn"
+                    if cont_data:
+                        raw_stop = cont_data.get(
+                            "stop_reason", "end_turn",
+                        )
+                        non_vc_forwarded = any(
+                            b.get("type") == "tool_use"
+                            and not is_vc_tool(b.get("name", ""))
+                            for b in cont_data.get("content", [])
+                        )
+                        if raw_stop == "tool_use" and non_vc_forwarded:
+                            cont_stop = "tool_use"
+                    for sse_evt in _emit_message_end_sse(
+                        cont_stop, usage=cont_usage,
+                    ):
+                        yield sse_evt
 
             # Post-stream processing
             assistant_text, _ = _post_stream(text_chunks, raw_events)

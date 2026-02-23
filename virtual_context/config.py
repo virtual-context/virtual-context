@@ -195,7 +195,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         tag_context_max_tokens=assembler_config.tag_context_max_tokens,
         strategy_configs=strategy_configs,
         anchorless_lookback=retrieval_raw.get("anchorless_lookback", 6),
-        inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", "llm"),
+        inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", "embedding"),
         embedding_model=retrieval_raw.get("embedding_model", "all-MiniLM-L6-v2"),
         embedding_threshold=retrieval_raw.get("embedding_threshold", 0.3),
     )

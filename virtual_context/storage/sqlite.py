@@ -285,6 +285,21 @@ class SQLiteStore(ContextStore):
 
     def store_segment(self, segment: StoredSegment) -> str:
         conn = self._get_conn()
+        primary_tag = (
+            segment.primary_tag
+            if isinstance(segment.primary_tag, str)
+            else json.dumps(segment.primary_tag, ensure_ascii=True, default=str)
+        )
+        summary_text = (
+            segment.summary
+            if isinstance(segment.summary, str)
+            else json.dumps(segment.summary, ensure_ascii=True, default=str)
+        )
+        full_text = (
+            segment.full_text
+            if isinstance(segment.full_text, str)
+            else json.dumps(segment.full_text, ensure_ascii=True, default=str)
+        )
         metadata_dict = {
             "entities": segment.metadata.entities,
             "key_decisions": segment.metadata.key_decisions,
@@ -305,9 +320,9 @@ class SQLiteStore(ContextStore):
             (
                 segment.ref,
                 segment.session_id,
-                segment.primary_tag,
-                segment.summary,
-                segment.full_text,
+                primary_tag,
+                summary_text,
+                full_text,
                 json.dumps(segment.messages, default=str),
                 metadata_json,
                 segment.summary_tokens,
@@ -323,9 +338,12 @@ class SQLiteStore(ContextStore):
         # Update tags
         conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
         for tag in segment.tags:
+            normalized_tag = (
+                tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=True, default=str)
+            )
             conn.execute(
                 "INSERT INTO segment_tags (segment_ref, tag) VALUES (?, ?)",
-                (segment.ref, tag),
+                (segment.ref, normalized_tag),
             )
 
         conn.commit()
@@ -426,20 +444,22 @@ class SQLiteStore(ContextStore):
                 ).fetchall()
         except sqlite3.OperationalError:
             # FTS5 not available, fall back to LIKE
-            like_query = f"%{query}%"
+            # Escape LIKE wildcards in user input to prevent pattern injection
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like_query = f"%{escaped}%"
             if tags:
                 placeholders = ",".join("?" * len(tags))
                 rows = conn.execute(
                     f"""SELECT DISTINCT s.* FROM segments s
                     JOIN segment_tags st ON s.ref = st.segment_ref
-                    WHERE s.summary LIKE ?
+                    WHERE s.summary LIKE ? ESCAPE '\\'
                     AND st.tag IN ({placeholders})
                     LIMIT ?""",
                     [like_query, *tags, limit],
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM segments WHERE summary LIKE ? LIMIT ?",
+                    "SELECT * FROM segments WHERE summary LIKE ? ESCAPE '\\' LIMIT ?",
                     [like_query, limit],
                 ).fetchall()
 
@@ -484,10 +504,12 @@ class SQLiteStore(ContextStore):
             pass
 
         # Fallback: LIKE search on full_text with manual excerpt
-        like_query = f"%{query}%"
+        # Escape LIKE wildcards in user input to prevent pattern injection
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_query = f"%{escaped}%"
         rows = conn.execute(
             """SELECT ref, primary_tag, full_text, metadata_json FROM segments
-               WHERE full_text LIKE ?
+               WHERE full_text LIKE ? ESCAPE '\\'
                LIMIT ?""",
             [like_query, limit],
         ).fetchall()

@@ -1,11 +1,14 @@
-import { execSync, exec } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export default {
   id: "virtual-context",
   register(api) {
     const config = api.getConfig?.() ?? {};
     const bin = config.pythonBin ?? "virtual-context";
-    const configFlag = config.configPath ? `-c "${config.configPath}"` : "";
+    const configArgs = config.configPath ? ["-c", config.configPath] : [];
 
     // before_context_send: sync hook — inject retrieved context
     api.on("before_context_send", (event) => {
@@ -17,8 +20,10 @@ export default {
         : lastUser.content.map(b => b.text ?? "").join(" ");
 
       try {
-        const stdout = execSync(
-          `${bin} ${configFlag} transform --message ${JSON.stringify(messageText)}`,
+        // Use execFileSync to avoid shell interpolation (prevents command injection)
+        const stdout = execFileSync(
+          bin,
+          [...configArgs, "transform", "--message", messageText],
           { encoding: "utf-8", timeout: 10000 }
         ).trim();
 
@@ -51,11 +56,21 @@ export default {
         }))
       );
 
-      // Fire-and-forget: compact in background
-      exec(
-        `echo '${jsonMessages.replace(/'/g, "'\\''")}' | ${bin} ${configFlag} compact --input -`,
+      // Write JSON to a temp file and pass via stdin to avoid shell injection
+      const tmpFile = join(tmpdir(), `vc-compact-${process.pid}-${Date.now()}.json`);
+      try {
+        writeFileSync(tmpFile, jsonMessages, "utf-8");
+      } catch {
+        return;
+      }
+
+      // Use execFile to avoid shell interpolation (prevents command injection)
+      execFile(
+        bin,
+        [...configArgs, "compact", "--input", tmpFile],
         { timeout: 30000 },
         (err) => {
+          try { unlinkSync(tmpFile); } catch {}
           if (err) console.error("[virtual-context] compact error:", err.message);
         }
       );

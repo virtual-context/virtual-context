@@ -956,12 +956,389 @@ class GeminiFormat(PayloadFormat):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Responses API
+# ---------------------------------------------------------------------------
+
+class OpenAIResponsesFormat(PayloadFormat):
+    """OpenAI Responses API format (used by Codex and newer OpenAI tools).
+
+    Key differences from Chat Completions:
+    - Messages are in ``input`` (not ``messages``)
+    - System prompt is ``instructions`` (not ``system``)
+    - Items have ``type`` (``message``) and ``role``
+    - Content is ``content`` list with ``type: "input_text"`` / ``"output_text"``
+    - SSE delta: ``response.output_text.delta`` events with ``delta`` field
+    - Tool calls: ``function_call`` / ``function_call_output`` item types
+    """
+
+    @property
+    def name(self) -> str:
+        return "openai_responses"
+
+    # -- helpers --
+
+    @staticmethod
+    def _extract_text_from_content(content) -> str:
+        """Extract text from a Responses API content field.
+
+        Content can be:
+        - A plain string (simple user input)
+        - A list of content blocks with ``type: "input_text"`` or ``"output_text"``
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") in ("input_text", "output_text"):
+                        texts.append(block.get("text", ""))
+                    elif block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+            return " ".join(texts) if texts else ""
+        return ""
+
+    @staticmethod
+    def _is_bare_item(item: dict) -> bool:
+        """Return True if the item is a bare function_call or function_call_output."""
+        item_type = item.get("type", "")
+        return item_type in ("function_call", "function_call_output")
+
+    # -- Message extraction --
+
+    def extract_user_message(self, body: dict) -> str:
+        items = body.get("input", [])
+        if isinstance(items, str):
+            return _strip_openclaw_envelope(items)
+        if not isinstance(items, list):
+            return ""
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("role") != "user":
+                continue
+            content = item.get("content", "")
+            text = self._extract_text_from_content(content)
+            if text:
+                return _strip_openclaw_envelope(text)
+        return ""
+
+    def extract_message_text(self, msg: dict) -> str:
+        content = msg.get("content", "")
+        text = self._extract_text_from_content(content)
+        return _strip_openclaw_envelope(text)
+
+    def extract_history_pairs(self, body: dict) -> list:
+        from ..types import Message
+
+        items = body.get("input", [])
+        if not isinstance(items, list):
+            return []
+        # Filter to user/assistant message items, skip bare function_call items
+        chat_msgs = [
+            m for m in items
+            if isinstance(m, dict)
+            and m.get("role") in ("user", "assistant")
+            and not self._is_bare_item(m)
+        ]
+        if not chat_msgs:
+            return []
+        if chat_msgs[-1].get("role") == "user":
+            chat_msgs = chat_msgs[:-1]
+        if not chat_msgs:
+            return []
+
+        pairs: list[Message] = []
+        i = 0
+        while i + 1 < len(chat_msgs):
+            if (chat_msgs[i].get("role") == "user"
+                    and chat_msgs[i + 1].get("role") == "assistant"):
+                pairs.append(Message(
+                    role="user",
+                    content=self.extract_message_text(chat_msgs[i]),
+                ))
+                pairs.append(Message(
+                    role="assistant",
+                    content=self.extract_message_text(chat_msgs[i + 1]),
+                ))
+                i += 2
+            else:
+                i += 1
+        return pairs
+
+    def get_messages(self, body: dict) -> list[dict]:
+        items = body.get("input", [])
+        return items if isinstance(items, list) else []
+
+    def has_messages(self, body: dict) -> bool:
+        return isinstance(body.get("input"), list)
+
+    # -- Context injection --
+
+    def inject_context(self, body: dict, prepend_text: str) -> dict:
+        if not prepend_text:
+            return body
+        body = copy.deepcopy(body)
+        context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        existing = body.get("instructions", "")
+        body["instructions"] = (
+            f"{context_block}\n\n{existing}" if existing else context_block
+        )
+        return body
+
+    # -- Session markers --
+
+    def extract_session_id(self, body: dict) -> str | None:
+        items = body.get("input", [])
+        if not isinstance(items, list):
+            return None
+        for item in reversed(items):
+            if not isinstance(item, dict) or item.get("role") != "assistant":
+                continue
+            content = item.get("content", "")
+            if isinstance(content, str):
+                m = _VC_SESSION_RE.search(content)
+                if m:
+                    return m.group(1)
+            elif isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict):
+                        text = block.get("text", "")
+                        if text:
+                            m = _VC_SESSION_RE.search(text)
+                            if m:
+                                return m.group(1)
+        return None
+
+    def strip_session_markers(self, body: dict) -> dict:
+        items = body.get("input")
+        if not isinstance(items, list) or not items:
+            return body
+
+        modified = False
+        new_items = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("role") != "assistant":
+                new_items.append(item)
+                continue
+
+            content = item.get("content", "")
+            if isinstance(content, str):
+                cleaned = _VC_SESSION_RE.sub("", content).rstrip()
+                if cleaned != content:
+                    item = dict(item)
+                    item["content"] = cleaned
+                    modified = True
+            elif isinstance(content, list):
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("text"):
+                        text = block["text"]
+                        cleaned = _VC_SESSION_RE.sub("", text).rstrip()
+                        if cleaned != text:
+                            block = dict(block)
+                            block["text"] = cleaned
+                            modified = True
+                    new_blocks.append(block)
+                if modified:
+                    item = dict(item)
+                    item["content"] = new_blocks
+            new_items.append(item)
+
+        if not modified:
+            return body
+
+        body = dict(body)
+        body["input"] = new_items
+        return body
+
+    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
+        response_body = copy.deepcopy(response_body)
+        output = response_body.get("output", [])
+        # Find last output_text block in output items
+        for item in reversed(output):
+            if not isinstance(item, dict):
+                continue
+            # Items with type "message" have content list
+            content = item.get("content", [])
+            if isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        block["text"] = (block.get("text", "") or "") + marker
+                        return response_body
+        # Fallback: append a new output item
+        output.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": marker}],
+        })
+        return response_body
+
+    def emit_session_marker_sse(self, session_id: str) -> bytes:
+        marker = f"\n<!-- vc:session={session_id} -->"
+        marker_event = json.dumps({
+            "type": "response.output_text.delta",
+            "delta": marker,
+        })
+        return f"event: response.output_text.delta\ndata: {marker_event}\n\n".encode()
+
+    # -- SSE / response parsing --
+
+    def extract_delta_text(self, data: dict) -> str:
+        event_type = data.get("type", "")
+        if event_type == "response.output_text.delta":
+            return data.get("delta", "") or ""
+        return ""
+
+    def extract_assistant_text(self, response_body: dict) -> str:
+        output = response_body.get("output", [])
+        texts = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        texts.append(block.get("text", ""))
+        return " ".join(texts) if texts else ""
+
+    # -- Token estimation --
+
+    def _estimate_system_tokens(self, body: dict) -> int:
+        instructions = body.get("instructions", "")
+        if isinstance(instructions, str):
+            return len(instructions) // 4
+        return 0
+
+    def estimate_payload_tokens(self, body: dict) -> int:
+        """Override to handle bare function_call/function_call_output items."""
+        total = 0
+        for item in self.get_messages(body):
+            if not isinstance(item, dict):
+                continue
+            # Bare function_call/function_call_output items have different structure
+            if self._is_bare_item(item):
+                # Estimate from name + arguments/output
+                name = item.get("name", "") or item.get("call_id", "")
+                args = item.get("arguments", "") or item.get("output", "")
+                total += (len(str(name)) + len(str(args))) // 4
+                continue
+            content = item.get("content", "")
+            if isinstance(content, str):
+                total += len(content) // 4
+            elif isinstance(content, list):
+                total += sum(
+                    len(b.get("text", "")) // 4
+                    for b in content if isinstance(b, dict)
+                )
+        total += self._estimate_system_tokens(body)
+        return total
+
+    # -- Fingerprinting --
+
+    def compute_fingerprint(self, body: dict, offset: int = 0) -> str:
+        """Override to filter input items by role=user (skip bare items)."""
+        items = body.get("input", [])
+        if not isinstance(items, list):
+            return ""
+        user_msgs = [
+            m for m in items
+            if isinstance(m, dict)
+            and m.get("role") == "user"
+            and not self._is_bare_item(m)
+        ]
+        if len(user_msgs) < 2:
+            return ""
+        history_user = user_msgs[:-1]
+
+        n = 1  # _FINGERPRINT_SAMPLE_SIZE
+        end = len(history_user) - offset
+        start = end - n
+        if start < 0 or end <= 0:
+            return ""
+        sample = history_user[start:end]
+        if not sample:
+            return ""
+
+        texts = [self._extract_text_from_content(m.get("content", "")) for m in sample]
+        combined = "\n".join(texts)
+        if not combined.strip():
+            return ""
+        return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+    @property
+    def supports_tool_interception(self) -> bool:
+        return True
+
+    def inject_tools(self, body: dict, tool_defs: list) -> dict:
+        body = dict(body)
+        tools = list(body.get("tools") or [])
+        for td in tool_defs:
+            tools.append({
+                "type": "function",
+                "name": td["name"],
+                "description": td.get("description", ""),
+                "parameters": td.get("input_schema", {}),
+            })
+        body["tools"] = tools
+        return body
+
+    def is_tool_use_event(self, data: dict) -> bool:
+        dtype = data.get("type", "")
+        if dtype == "response.output_item.added":
+            return data.get("item", {}).get("type") == "function_call"
+        return dtype.startswith("response.function_call_arguments")
+
+    def extract_tool_calls(self, content: list) -> list[dict]:
+        calls = []
+        for item in content:
+            if item.get("type") == "function_call":
+                args_raw = item.get("arguments", "")
+                try:
+                    args = json.loads(args_raw) if args_raw else {}
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append({
+                    "id": item.get("call_id", item.get("id", "")),
+                    "name": item.get("name", ""),
+                    "input": args,
+                })
+        return calls
+
+    def build_tool_results(self, results: list[dict]) -> list[dict]:
+        return [{
+            "type": "function_call_output",
+            "call_id": r.get("tool_use_id", r.get("call_id", "")),
+            "output": r.get("content", ""),
+        } for r in results]
+
+    def build_continuation_request(
+        self,
+        original_body: dict,
+        assistant_content: list[dict],
+        tool_results: list[dict],
+    ) -> dict:
+        body = copy.deepcopy(original_body)
+        body["stream"] = False
+        inp = list(body.get("input", []))
+        for block in assistant_content:
+            if block.get("type") == "function_call":
+                inp.append(block)
+        for r in tool_results:
+            inp.append(r)
+        body["input"] = inp
+        return body
+
+
+# ---------------------------------------------------------------------------
 # Format registry + detection
 # ---------------------------------------------------------------------------
 
 _FORMAT_REGISTRY: dict[str, PayloadFormat] = {
     "anthropic": AnthropicFormat(),
     "openai": OpenAIFormat(),
+    "openai_responses": OpenAIResponsesFormat(),
     "gemini": GeminiFormat(),
 }
 
@@ -971,12 +1348,15 @@ def detect_format(body: dict) -> PayloadFormat:
 
     Detection order:
     1. ``contents`` or ``system_instruction`` → Gemini
-    2. ``system`` (top-level) → Anthropic
-    3. Model name starts with ``"claude"`` → Anthropic
-    4. Default → OpenAI
+    2. ``input`` (as list) or ``instructions`` → OpenAI Responses
+    3. ``system`` (top-level) → Anthropic
+    4. Model name starts with ``"claude"`` → Anthropic
+    5. Default → OpenAI (Chat Completions)
     """
     if "contents" in body or "system_instruction" in body:
         return _FORMAT_REGISTRY["gemini"]
+    if isinstance(body.get("input"), list) or "instructions" in body:
+        return _FORMAT_REGISTRY["openai_responses"]
     if "system" in body:
         return _FORMAT_REGISTRY["anthropic"]
     model = body.get("model", "")

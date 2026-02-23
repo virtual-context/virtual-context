@@ -4,7 +4,7 @@ Each adapter encapsulates provider-specific API format details:
 headers, URL construction, request body format, response parsing,
 tool definition conversion, context injection, and continuation building.
 
-Supports: Anthropic, OpenAI, Gemini.
+Supports: Anthropic, OpenAI, OpenAI Codex (ChatGPT backend), Gemini.
 """
 
 from __future__ import annotations
@@ -382,6 +382,160 @@ class OpenAIAdapter(ProviderAdapter):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Codex Adapter (ChatGPT backend Responses API)
+# ---------------------------------------------------------------------------
+
+class OpenAICodexAdapter(ProviderAdapter):
+    """Adapter for ChatGPT Codex Responses API (`chatgpt.com/backend-api`)."""
+
+    def __init__(self, api_key: str, api_url: str = ""):
+        super().__init__(
+            api_key, api_url or "https://chatgpt.com/backend-api/codex/responses",
+        )
+
+    def get_headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def get_url(self, model: str = "") -> str:
+        return self._base_url
+
+    def _to_input_item(self, msg: dict) -> dict:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, str):
+                    text_parts.append(block)
+                elif isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif "text" in block and isinstance(block["text"], str):
+                        text_parts.append(block["text"])
+            text = "\n".join(p for p in text_parts if p)
+        else:
+            text = str(content)
+        return {
+            "role": role,
+            "content": [{"type": "input_text", "text": text}],
+        }
+
+    def build_request_body(self, *, model, messages, system, max_tokens,
+                           temperature, tools):
+        body: dict = {
+            "model": model,
+            "instructions": system or "You are a helpful assistant.",
+            "stream": True,
+            "store": False,
+            "input": [self._to_input_item(m) for m in messages],
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        return body
+
+    def convert_tool_defs(self, anthropic_defs):
+        codex_tools = []
+        for tool in anthropic_defs:
+            codex_tools.append({
+                "type": "function",
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+            })
+        return codex_tools
+
+    def extract_text(self, response):
+        output = response.get("output", [])
+        text_parts: list[str] = []
+        for item in output:
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text_parts.append(part.get("text", ""))
+        return "".join(text_parts)
+
+    def extract_tool_calls(self, response):
+        calls = []
+        for item in response.get("output", []):
+            if item.get("type") != "function_call":
+                continue
+            args_raw = item.get("arguments", "")
+            try:
+                args = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                args = {}
+            calls.append({
+                "id": item.get("call_id", item.get("id", str(uuid.uuid4()))),
+                "name": item.get("name", ""),
+                "input": args,
+            })
+        return calls
+
+    def extract_usage(self, response):
+        usage = response.get("usage", {})
+        return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+
+    def is_tool_use_stop(self, response):
+        return any(item.get("type") == "function_call"
+                   for item in response.get("output", []))
+
+    def get_stop_reason(self, response):
+        if response.get("error"):
+            return "error"
+        if self.is_tool_use_stop(response):
+            return "tool_use"
+        return "end_turn"
+
+    def build_tool_result(self, tool_call_id, tool_name, content):
+        return {
+            "type": "function_call_output",
+            "call_id": tool_call_id,
+            "output": content,
+        }
+
+    def build_continuation(self, cont_body, original_body, raw_response,
+                           tool_results):
+        if cont_body is None:
+            body = copy.deepcopy(original_body)
+            body["input"] = list(original_body.get("input", []))
+            body["stream"] = True
+            body["store"] = False
+        else:
+            body = cont_body
+
+        for item in raw_response.get("output", []):
+            if item.get("type") == "function_call":
+                body["input"].append({
+                    "type": "function_call",
+                    "call_id": item.get("call_id", item.get("id", "")),
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}"),
+                })
+
+        body["input"].extend(tool_results)
+        return body
+
+    def inject_context(self, body, prepend_text):
+        new_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        instructions = body.get("instructions", "")
+        if isinstance(instructions, str) and _VC_BLOCK_RE.search(instructions):
+            body["instructions"] = _VC_BLOCK_RE.sub(new_block, instructions, count=1)
+        elif isinstance(instructions, str):
+            body["instructions"] = (
+                f"{new_block}\n\n{instructions}" if instructions else new_block
+            )
+
+    def strip_tools(self, body):
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+
+
+# ---------------------------------------------------------------------------
 # Gemini Adapter
 # ---------------------------------------------------------------------------
 
@@ -557,7 +711,8 @@ def get_adapter(
     Parameters
     ----------
     provider : str
-        One of ``"anthropic"``, ``"openai"``, ``"gemini"``.
+        One of ``"anthropic"``, ``"openai"``, ``"openai-codex"``,
+        ``"gemini"``.
     api_key : str
         API key for the provider.
     api_url : str
@@ -567,10 +722,12 @@ def get_adapter(
         return AnthropicAdapter(api_key, api_url)
     elif provider == "openai":
         return OpenAIAdapter(api_key, api_url)
+    elif provider in {"openai-codex", "openai_codex"}:
+        return OpenAICodexAdapter(api_key, api_url)
     elif provider == "gemini":
         return GeminiAdapter(api_key, api_url)
     else:
         raise ValueError(
             f"Unknown provider: {provider!r}. "
-            "Use 'anthropic', 'openai', or 'gemini'."
+            "Use 'anthropic', 'openai', 'openai-codex', or 'gemini'."
         )
