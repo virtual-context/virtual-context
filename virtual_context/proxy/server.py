@@ -1057,6 +1057,10 @@ def create_app(
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     async def catch_all(request: Request, path: str):
         url = f"{upstream}/{path}"
+        # Per-request upstream override (e.g. subdomain routing in cloud)
+        _req_upstream = getattr(request.state, "upstream", None)
+        if _req_upstream:
+            url = f"{_req_upstream}/{path}"
         raw_headers = dict(request.headers)
         fwd_headers = _forward_headers(raw_headers)
 
