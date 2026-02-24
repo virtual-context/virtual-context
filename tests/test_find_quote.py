@@ -22,6 +22,7 @@ from virtual_context.core.quote_search import (
     _parse_session_date,
     _union_spans,
     find_quote as core_find_quote,
+    supplement_from_descriptions,
 )
 from virtual_context.storage.sqlite import SQLiteStore, _extract_excerpt
 from virtual_context.storage.filesystem import FilesystemStore
@@ -805,3 +806,60 @@ class TestFindQuoteIntentAndRecency:
         assert out["query_intent"] == "current_state"
         sessions = [row["session"] for row in out["results"]]
         assert sessions == ["2026/02/20", "2025/12/01"]
+
+
+@pytest.mark.regression("BUG-029")
+class TestSupplementFromDescriptionsWordBoundary:
+    """Regression: 'old' must NOT match 'gold' as a substring."""
+
+    def test_old_does_not_match_gold(self):
+        """Query word 'old' should not match 'gold' in tag description."""
+        store = MagicMock()
+        store.get_all_tag_summaries.return_value = [
+            TagSummary(
+                tag="asian-games",
+                description="China won 150 gold medals at the 2002 Asian Games.",
+            ),
+        ]
+        store.get_segments_by_tags.return_value = []
+
+        results = supplement_from_descriptions(
+            store=store,
+            query="storing old sneakers",
+            results=[],
+            max_results=5,
+        )
+        tags = [r.tag for r in results]
+        assert "asian-games" not in tags
+
+    def test_old_matches_whole_word_old(self):
+        """Query word 'old' should match 'old' as a whole word."""
+        store = MagicMock()
+        store.get_all_tag_summaries.return_value = [
+            TagSummary(
+                tag="messenger-bag",
+                description="User wants to replace their old messenger bag.",
+            ),
+        ]
+        seg = StoredSegment(
+            ref="seg1",
+            session_id="s1",
+            primary_tag="messenger-bag",
+            tags=["messenger-bag"],
+            summary="",
+            full_text="My old bag is falling apart",
+            messages=[],
+            metadata=SegmentMetadata(
+                turn_count=1, session_date="2023/05/27"
+            ),
+        )
+        store.get_segments_by_tags.return_value = [seg]
+
+        results = supplement_from_descriptions(
+            store=store,
+            query="storing old sneakers",
+            results=[],
+            max_results=5,
+        )
+        tags = [r.tag for r in results]
+        assert "messenger-bag" in tags

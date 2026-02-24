@@ -106,6 +106,20 @@ class ProviderAdapter(ABC):
     def strip_tools(self, body: dict) -> None:
         """Remove tool definitions from a request body (in-place)."""
 
+    def add_tool_defs(self, body: dict, anthropic_defs: list[dict]) -> None:
+        """Add tool definitions to a request body (in-place).
+
+        Default implementation converts via ``convert_tool_defs`` and
+        appends to ``body["tools"]``.  Override for providers with
+        non-flat tool structures (e.g. Gemini).
+        """
+        converted = self.convert_tool_defs(anthropic_defs)
+        tools = body.get("tools")
+        if tools is None:
+            body["tools"] = converted
+        else:
+            tools.extend(converted)
+
 
 # ---------------------------------------------------------------------------
 # Anthropic Adapter
@@ -708,6 +722,22 @@ class GeminiAdapter(ProviderAdapter):
 
     def strip_tools(self, body):
         body.pop("tools", None)
+
+    def add_tool_defs(self, body, anthropic_defs):
+        """Add tool definitions, merging into existing functionDeclarations."""
+        declarations = []
+        for tool in anthropic_defs:
+            declarations.append({
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+            })
+        tools = body.get("tools", [])
+        if tools and isinstance(tools[0], dict) and "functionDeclarations" in tools[0]:
+            tools[0]["functionDeclarations"].extend(declarations)
+        else:
+            tools.append({"functionDeclarations": declarations})
+        body["tools"] = tools
 
 
 # ---------------------------------------------------------------------------

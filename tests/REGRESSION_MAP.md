@@ -293,6 +293,15 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_tool_loop.py::TestRunToolLoop::test_forced_text_after_max_loops_exhausted`
 
+### BUG-029 — Description search substring match promotes irrelevant session to rank 1
+
+- **Symptom**: `find_quote("storing old sneakers")` returns Asian Games segment at rank 1 because `"old"` substring-matches `"gold"` in the tag description. Session-recency sorting then promotes this irrelevant newer session, suppressing the correct answer.
+- **Root cause**: `supplement_from_descriptions()` used Python `in` operator (`w in desc_lower`) for word matching, which does substring match. `"old" in "gold"` → `True`.
+- **Fix**: Precompile `\b`-bounded regex patterns for each query word; use `pattern.search()` instead of `in`.
+- **Tests**:
+  - `test_find_quote.py::TestSupplementFromDescriptionsWordBoundary::test_old_does_not_match_gold`
+  - `test_find_quote.py::TestSupplementFromDescriptionsWordBoundary::test_old_matches_whole_word_old`
+
 ### BUG-018 — Context turns pollute inbound tagger post-compaction
 
 - **Symptom**: LongMemEval benchmark — question about "antique items" generates `meal-prep` tags because last haystack turns were about food. 3/7 questions affected.
@@ -321,3 +330,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |
 | `test_tag_splitter.py` | BUG-011, BUG-012 |
+| `test_find_quote.py` | BUG-029 |

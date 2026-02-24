@@ -142,6 +142,33 @@ class TestExecuteVCTool:
         assert "segment_ref" not in parsed["results"][0]
         assert "segment_refs" not in parsed["results"][0]
 
+    def test_find_session_calls_engine_with_session_filter(self):
+        engine = MagicMock()
+        engine.find_quote.return_value = {
+            "found": True,
+            "results": [{"excerpt": "found it", "topic": "sneakers"}],
+        }
+        result = execute_vc_tool(
+            engine, "vc_find_session",
+            {"query": "shoe rack", "session": "2023/05/29"},
+        )
+        engine.find_quote.assert_called_once_with(
+            query="shoe rack",
+            max_results=20,
+            intent_context="",
+            session_filter="2023/05/29",
+        )
+        parsed = json.loads(result)
+        assert parsed["found"] is True
+
+    def test_find_quote_does_not_pass_session_filter(self):
+        """vc_find_quote must NOT pass session_filter to engine."""
+        engine = MagicMock()
+        engine.find_quote.return_value = {"found": False, "results": []}
+        execute_vc_tool(engine, "vc_find_quote", {"query": "test"})
+        call_kwargs = engine.find_quote.call_args[1]
+        assert "session_filter" not in call_kwargs
+
     def test_remember_when_calls_engine(self):
         engine = MagicMock()
         engine.remember_when.return_value = {"query": "auth", "found": True, "results": []}
@@ -925,6 +952,97 @@ class TestRunToolLoop:
         assert result.text != "", "BUG-017: text must not be empty after forced continuation"
         assert "couldn't find" in result.text
 
+    def test_find_session_injected_on_suppression(self):
+        """vc_find_session tool is dynamically added when suppression occurs."""
+        engine = MagicMock()
+        # find_quote returns a result that will trigger suppression
+        engine.find_quote.return_value = {
+            "found": True,
+            "current_state_multi_session": True,
+            "results": [
+                {
+                    "excerpt": "shoe rack",
+                    "session": "2023/05/29",
+                    "session_recency_rank": 1,
+                },
+                {
+                    "excerpt": "under the bed",
+                    "session": "2023/05/25",
+                    "session_recency_rank": 2,
+                },
+            ],
+        }
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {"type": "tool_use", "id": "t1", "name": "vc_find_quote",
+             "input": {"query": "sneakers"}},
+        ], stop_reason="tool_use")
+
+        continuation = _make_response([{"type": "text", "text": "shoe rack"}])
+        mock_resp = _MockHTTPResponse(continuation)
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = run_tool_loop(
+                engine, initial,
+                {"model": "m", "max_tokens": 100, "messages": [],
+                 "tools": [{"name": "vc_find_quote", "input_schema": {}}]},
+                _anthropic_adapter(),
+            )
+
+        # The continuation body should contain vc_find_session tool
+        sent_body = mock_client.post.call_args[1]["json"]
+        tool_names = {t["name"] for t in sent_body.get("tools", [])}
+        assert "vc_find_session" in tool_names
+
+        # The suppressed excerpt should reference vc_find_session
+        suppressed = json.loads(result.tool_calls[0].result_json)
+        rank2 = [r for r in suppressed["results"]
+                 if r.get("session_recency_rank") == 2][0]
+        assert "vc_find_session" in rank2["excerpt"]
+        assert "vc_find_quote" not in rank2["excerpt"]
+
+    def test_find_session_not_injected_without_suppression(self):
+        """vc_find_session is NOT added when no suppression occurs."""
+        engine = MagicMock()
+        engine.find_quote.return_value = {
+            "found": True,
+            "results": [{"excerpt": "data", "topic": "t"}],
+        }
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {"type": "tool_use", "id": "t1", "name": "vc_find_quote",
+             "input": {"query": "test"}},
+        ], stop_reason="tool_use")
+
+        continuation = _make_response([{"type": "text", "text": "answer"}])
+        mock_resp = _MockHTTPResponse(continuation)
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            run_tool_loop(
+                engine, initial,
+                {"model": "m", "max_tokens": 100, "messages": [],
+                 "tools": [{"name": "vc_find_quote", "input_schema": {}}]},
+                _anthropic_adapter(),
+            )
+
+        sent_body = mock_client.post.call_args[1]["json"]
+        tool_names = {t["name"] for t in sent_body.get("tools", [])}
+        assert "vc_find_session" not in tool_names
+
 
 # ---------------------------------------------------------------------------
 # TestRunToolLoopOpenAI
@@ -1007,6 +1125,7 @@ class TestVCToolNames:
             "vc_expand_topic",
             "vc_collapse_topic",
             "vc_find_quote",
+            "vc_find_session",
             "vc_recall_all",
             "vc_remember_when",
         }

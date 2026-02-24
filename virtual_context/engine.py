@@ -1457,6 +1457,7 @@ class VirtualContextEngine:
         query: str,
         max_results: int = 5,
         intent_context: str = "",
+        session_filter: str = "",
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
         return _find_quote(
@@ -1465,6 +1466,7 @@ class VirtualContextEngine:
             query,
             max_results,
             intent_context=intent_context,
+            session_filter=session_filter,
         )
 
     def _parse_session_date(self, raw: str) -> date | None:

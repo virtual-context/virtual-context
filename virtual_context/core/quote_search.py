@@ -231,6 +231,10 @@ def supplement_from_descriptions(
     if not query_words:
         return results
 
+    # Precompile word-boundary patterns to avoid substring false positives
+    # (e.g. "old" matching "gold").
+    word_patterns = [re.compile(rf"\b{re.escape(w)}\b") for w in query_words]
+
     # Score each tag description by how many query words it contains
     all_summaries = store.get_all_tag_summaries()
     candidates: list[tuple[str, int, str]] = []  # (tag, score, description)
@@ -240,7 +244,7 @@ def supplement_from_descriptions(
         desc_lower = ts.description.lower() if ts.description else ""
         if not desc_lower:
             continue
-        score = sum(1 for w in query_words if w in desc_lower)
+        score = sum(1 for p in word_patterns if p.search(desc_lower))
         if score > 0:
             candidates.append((ts.tag, score, ts.description))
 
@@ -259,7 +263,7 @@ def supplement_from_descriptions(
             if not seg.full_text:
                 continue
             text_lower = seg.full_text.lower()
-            seg_score = sum(1 for w in query_words if w in text_lower)
+            seg_score = sum(1 for p in word_patterns if p.search(text_lower))
             if seg_score > best_score:
                 best_score = seg_score
                 excerpt = extract_excerpt(
@@ -287,6 +291,7 @@ def find_quote(
     query: str,
     max_results: int = 5,
     intent_context: str = "",
+    session_filter: str = "",
 ) -> dict:
     """Search stored conversation text for a specific phrase or keyword.
 
@@ -346,6 +351,72 @@ def find_quote(
         parsed = _parse_session_date(session_date)
         session_dates_parsed[session_date] = parsed
         session_dates_normalized[session_date] = parsed.isoformat() if parsed else ""
+
+    # When session_filter is provided, restrict to matching sessions and
+    # skip current-state suppression (the model is explicitly drilling in).
+    if session_filter.strip():
+        _sf = session_filter.strip()
+        filtered = OrderedDict()
+        for k, v in session_groups.items():
+            norm = session_dates_normalized.get(k, "")
+            if _sf in k or _sf in norm:
+                filtered[k] = v
+        if not filtered:
+            return {
+                "query": query,
+                "found": False,
+                "results": [],
+                "message": f"No matches for '{query}' in session '{_sf}'.",
+            }
+        session_groups = filtered
+        # Bypass current-state multi-session logic when drilling into a
+        # specific session — return full excerpts, no suppression.
+        session_items = list(session_groups.items())
+        formatted = []
+        for session_date, group in session_items:
+            if len(group) == 1:
+                qr = group[0]
+                entry: dict = {
+                    "excerpt": qr.text,
+                    "topic": qr.tag,
+                    "session": session_date,
+                    "session_date_normalized": session_dates_normalized.get(session_date, ""),
+                }
+                if qr.match_type == "semantic":
+                    entry["match_type"] = "semantic"
+                    entry["similarity"] = qr.similarity
+                formatted.append(entry)
+            else:
+                seen_texts: set[str] = set()
+                merged_parts: list[str] = []
+                topics: list[str] = []
+                for qr in group:
+                    norm = qr.text.strip()
+                    if norm not in seen_texts:
+                        seen_texts.add(norm)
+                        merged_parts.append(qr.text.strip())
+                    if qr.tag not in topics:
+                        topics.append(qr.tag)
+                entry = {
+                    "excerpt": "\n---\n".join(merged_parts),
+                    "topic": ", ".join(topics),
+                    "session": session_date,
+                    "session_date_normalized": session_dates_normalized.get(session_date, ""),
+                    "merged_count": len(merged_parts),
+                }
+                formatted.append(entry)
+        for qr in no_session:
+            formatted.append({
+                "excerpt": qr.text,
+                "topic": qr.tag,
+            })
+        return {
+            "query": query,
+            "query_intent": query_intent,
+            "session_filter": _sf,
+            "found": True,
+            "results": formatted,
+        }
 
     session_items = list(session_groups.items())
     if query_intent == "current_state":
@@ -432,10 +503,17 @@ def find_quote(
     if current_state_multi_session:
         response["current_state_multi_session"] = True
         response["priority_label"] = "HIGHEST_PRIORITY_CURRENT_STATE"
+        # Build a deterministic resolution from the newest session's date.
+        newest_date = ""
+        if formatted:
+            newest_date = formatted[0].get("session_date_normalized", "") or formatted[0].get("session", "")
         response["reader_hint"] = (
-            "Current-state query with multiple dated sessions. "
-            "Prioritize evidence from the most recent session first; "
-            "treat older sessions as historical unless the newest evidence is "
-            "explicitly a future plan."
+            "CURRENT-STATE RESOLUTION RULE (mandatory): "
+            "The most recent session"
+            + (f" ({newest_date})" if newest_date else "")
+            + " is the single authoritative source for the user's current state. "
+            "Older sessions are superseded history — do NOT use them to override the newest session. "
+            "Intent language ('going to', 'planning to', 'looking forward to') in the newest session "
+            "counts as the current answer because the question date is after that session."
         )
     return response

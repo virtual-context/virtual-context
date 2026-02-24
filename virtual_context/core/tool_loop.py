@@ -43,6 +43,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_expand_topic",
     "vc_collapse_topic",
     "vc_find_quote",
+    "vc_find_session",
     "vc_recall_all",
     "vc_remember_when",
 })
@@ -189,6 +190,45 @@ def vc_tool_definitions() -> list[dict]:
     ]
 
 
+_SUPPRESSION_MARKER = "[Older session ("
+
+
+def _vc_find_session_def() -> dict:
+    """Return the Anthropic-format tool definition for vc_find_session.
+
+    This tool is NOT included in the default tool set.  It is injected
+    dynamically into the continuation request only after a vc_find_quote
+    result contains suppressed older-session excerpts, giving the model
+    an escape hatch to retrieve full text from a specific session.
+    """
+    return {
+        "name": "vc_find_session",
+        "description": (
+            "Retrieve full conversation excerpts from a specific older session "
+            "that was marked as superseded in a previous vc_find_quote result. "
+            "Use this ONLY when you see '[Older session — superseded]' and "
+            "need the original text to answer the question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The word or phrase to search for within the session.",
+                },
+                "session": {
+                    "type": "string",
+                    "description": (
+                        "The session date to search (e.g. '2023/05/25'). "
+                        "Copy the date shown in the '[Older session (...)]' marker."
+                    ),
+                },
+            },
+            "required": ["query", "session"],
+        },
+    }
+
+
 def is_vc_tool(name: str) -> bool:
     """Return True if *name* is a known VC paging tool."""
     return name in VC_TOOL_NAMES
@@ -281,6 +321,7 @@ def execute_vc_tool(
         if not isinstance(found, bool):
             found = bool(results)
 
+        is_current_state = raw.get("current_state_multi_session") is True
         sanitized_results: list[object] = []
         for item in results:
             if isinstance(item, dict):
@@ -289,6 +330,18 @@ def execute_vc_tool(
                 # out of model-facing tool outputs to reduce noise.
                 clean_item.pop("segment_ref", None)
                 clean_item.pop("segment_refs", None)
+                # For current-state multi-session queries, truncate older
+                # session excerpts so the model can't latch onto superseded
+                # evidence that contradicts the newest session.
+                if is_current_state:
+                    rank = clean_item.get("session_recency_rank")
+                    if isinstance(rank, int) and rank > 1:
+                        session = clean_item.get("session", "older session")
+                        clean_item["excerpt"] = (
+                            f"[Older session ({session}) — superseded by newest session. "
+                            f"To view full text, call vc_find_session with "
+                            f"session=\"{session}\".]"
+                        )
                 sanitized_results.append(clean_item)
             else:
                 sanitized_results.append(item)
@@ -326,6 +379,14 @@ def execute_vc_tool(
                 query=tool_input.get("query", ""),
                 max_results=VC_FIND_QUOTE_MAX_RESULTS,
                 intent_context=intent_context,
+            )
+            result = _trim_find_quote_payload(result)
+        elif name == "vc_find_session":
+            result = engine.find_quote(
+                query=tool_input.get("query", ""),
+                max_results=VC_FIND_QUOTE_MAX_RESULTS,
+                intent_context=intent_context,
+                session_filter=tool_input.get("session", ""),
             )
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
@@ -463,6 +524,7 @@ def run_tool_loop(
     cont_body: dict | None = None
     current_response = initial_response
     intent_context = _extract_last_user_text(original_request)
+    _find_session_injected = False
 
     with httpx.Client(timeout=300.0) as client:
         for loop_i in range(max_loops):
@@ -500,6 +562,13 @@ def run_tool_loop(
             # Inject updated context into system prompt
             if new_prepend:
                 adapter.inject_context(cont_body, new_prepend)
+
+            # Dynamically inject vc_find_session tool if suppression occurred
+            if not _find_session_injected:
+                recent_results = result.tool_calls[-len(vc_tools):]
+                if any(_SUPPRESSION_MARKER in r.result_json for r in recent_results):
+                    adapter.add_tool_defs(cont_body, [_vc_find_session_def()])
+                    _find_session_injected = True
 
             result.continuation_count += 1
 
