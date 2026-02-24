@@ -73,6 +73,7 @@ def test_assemble_xml_tags(assembler, retrieval_result):
     )
     section = result.tag_sections.get("legal", "")
     assert '<virtual-context tags="court, legal"' in section
+    assert "last_updated=" not in section
     assert "</virtual-context>" in section
 
 

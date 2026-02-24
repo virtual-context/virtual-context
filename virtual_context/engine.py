@@ -427,18 +427,14 @@ class VirtualContextEngine:
         )
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
 
-        # Build context for inbound tagger
+        # Build context for inbound tagger.
+        # Include recent turns even post-compaction so query-time tagging can
+        # use immediate conversational cues.
         n_context = self.config.tag_generator.context_lookback_pairs
-        # Post-compaction: skip context_turns — recent conversation topic would
-        # bias the tagger against retrieving historical (compacted) topics.
-        # Tag purely on question text + store vocabulary instead.
-        if self._compacted_through > 0:
-            context = None
-        else:
-            # For inbound, the current message is not yet in history — no need to exclude
-            context = self._get_recent_context(
-                conversation_history, n_context, exclude_last=0,
-            )
+        # For inbound, the current message is not yet in history — no need to exclude
+        context = self._get_recent_context(
+            conversation_history, n_context, exclude_last=0,
+        )
 
         # Retrieve relevant tag summaries
         retrieval_result = self._retriever.retrieve(
@@ -494,9 +490,9 @@ class VirtualContextEngine:
             "tags_from_message", retrieval_result.tags_matched
         )
 
-        # Retry with expanded context if only _general was produced
-        # Skip post-compaction: context_turns would just pollute (BUG-018)
-        if message_tags == ["_general"] and self._compacted_through == 0:
+        # Retry with expanded context if only _general was produced.
+        # Applies both pre- and post-compaction.
+        if message_tags == ["_general"]:
             expanded = self._get_recent_context(
                 conversation_history, n_context * 2, exclude_last=0,
             )
@@ -505,7 +501,7 @@ class VirtualContextEngine:
                     message=message,
                     current_active_tags=active_tags,
                     current_utilization=utilization,
-                    post_compaction=False,
+                    post_compaction=(self._compacted_through > 0),
                     context_turns=expanded,
                 )
                 retry_tags = retry_result.retrieval_metadata.get(
@@ -1460,9 +1456,16 @@ class VirtualContextEngine:
         self,
         query: str,
         max_results: int = 5,
+        intent_context: str = "",
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
-        return _find_quote(self._store, self._semantic, query, max_results)
+        return _find_quote(
+            self._store,
+            self._semantic,
+            query,
+            max_results,
+            intent_context=intent_context,
+        )
 
     def _parse_session_date(self, raw: str) -> date | None:
         """Best-effort parse for session date strings from stored metadata."""
@@ -1625,6 +1628,7 @@ class VirtualContextEngine:
         temperature: float = 0.0,
         tools: list[dict] | None = None,
         force_tools: bool = False,
+        require_tools: bool | None = None,
         max_loops: int = 5,
         provider: str = "anthropic",
     ) -> "ToolLoopResult":
@@ -1658,6 +1662,9 @@ class VirtualContextEngine:
         force_tools : bool
             If True, inject VC tools even when the normal gate (paging
             enabled + compaction occurred) is not met.
+        require_tools : bool | None
+            If set, overrides provider tool policy: ``True`` requires at
+            least one tool call, ``False`` leaves tool use optional.
         max_loops : int
             Maximum continuation rounds for the tool loop.
         provider : str
@@ -1702,6 +1709,19 @@ class VirtualContextEngine:
             temperature=temperature,
             tools=converted_tools,
         )
+
+        # Optional tool-policy override for thresholded behavior.
+        if converted_tools and require_tools is not None:
+            if provider == "anthropic":
+                if require_tools:
+                    body["tool_choice"] = {"type": "any"}
+                else:
+                    body.pop("tool_choice", None)
+            elif provider in {"openai", "openai-codex", "openai_codex"}:
+                if require_tools:
+                    body["tool_choice"] = "required"
+                else:
+                    body.pop("tool_choice", None)
 
         url = adapter.get_url(model)
         headers = adapter.get_headers()

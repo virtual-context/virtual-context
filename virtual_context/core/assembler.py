@@ -171,7 +171,6 @@ class ContextAssembler:
         # Sort chronologically so reader sees old → new progression
         summaries = sorted(summaries, key=lambda s: s.start_timestamp)
 
-        last_updated = max(s.end_timestamp for s in summaries)
         all_tags = sorted({t for s in summaries for t in s.tags})
         tags_attr = ", ".join(all_tags) if all_tags else tag
 
@@ -187,8 +186,7 @@ class ContextAssembler:
         body = "\n\n---\n\n".join(summary_texts)
 
         return (
-            f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}" '
-            f'last_updated="{last_updated.isoformat()}">\n'
+            f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}">\n'
             f"{body}\n"
             f"</virtual-context>"
         )

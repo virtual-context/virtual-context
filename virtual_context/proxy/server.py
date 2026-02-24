@@ -1338,10 +1338,26 @@ def create_app(
                 enriched_body.get("model", ""),
             )
             if _paging_mode == "autonomous":
-                enriched_body = _inject_vc_tools(enriched_body, state.engine)
+                tool_turn_count = state.turn_offset + len(state.conversation_history) // 2
+                try:
+                    compacted_count = int(getattr(state.engine, "_compacted_through", 0))
+                except (TypeError, ValueError):
+                    compacted_count = 0
+                require_tools = compacted_count > 0
+                enriched_body = _inject_vc_tools(
+                    enriched_body,
+                    state.engine,
+                    require_tool_use=require_tools,
+                )
                 paging_enabled = True
                 _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
-                print(f"[PAGING] Tools injected: {_vc_names} (total tools: {len(enriched_body.get('tools', []))})")
+                print(
+                    f"[PAGING] Tools injected: {_vc_names} "
+                    f"(total tools: {len(enriched_body.get('tools', []))}, "
+                    f"policy={'required' if require_tools else 'optional'}, "
+                    f"turns={tool_turn_count}, "
+                    f"compacted_through={compacted_count})"
+                )
             else:
                 print(f"[PAGING] Mode={_paging_mode} for model={enriched_body.get('model', '?')} — tools NOT injected")
 

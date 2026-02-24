@@ -173,11 +173,17 @@ def _extract_assistant_text(response_body: dict, api_format: str) -> str:
     return get_format(api_format).extract_assistant_text(response_body)
 
 
-def _inject_vc_tools(body: dict, engine: "VirtualContextEngine") -> dict:
+def _inject_vc_tools(
+    body: dict,
+    engine: "VirtualContextEngine",
+    require_tool_use: bool | None = None,
+) -> dict:
     """Append VC paging tool definitions to the request body's tools array."""
     from ..core.tool_loop import vc_tool_definitions
     fmt = detect_format(body)
-    return fmt.inject_tools(body, vc_tool_definitions())
+    return fmt.inject_tools(
+        body, vc_tool_definitions(), require_tool_use=require_tool_use,
+    )
 
 
 def _build_continuation_request(

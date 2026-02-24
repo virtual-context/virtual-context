@@ -203,7 +203,12 @@ class PayloadFormat(ABC):
         """Whether this format supports VC paging tool interception."""
         return False
 
-    def inject_tools(self, body: dict, tool_defs: list) -> dict:
+    def inject_tools(
+        self,
+        body: dict,
+        tool_defs: list,
+        require_tool_use: bool | None = None,
+    ) -> dict:
         """Inject tool definitions into the request body. Override in subclasses."""
         return body
 
@@ -415,7 +420,12 @@ class AnthropicFormat(PayloadFormat):
     def supports_tool_interception(self) -> bool:
         return True
 
-    def inject_tools(self, body: dict, tool_defs: list) -> dict:
+    def inject_tools(
+        self,
+        body: dict,
+        tool_defs: list,
+        require_tool_use: bool | None = None,
+    ) -> dict:
         tc = body.get("tool_choice")
         if isinstance(tc, dict) and tc.get("type") == "none":
             return body
@@ -425,6 +435,8 @@ class AnthropicFormat(PayloadFormat):
         tools = list(body.get("tools") or [])
         tools.extend(tool_defs)
         body["tools"] = tools
+        if require_tool_use and "tool_choice" not in body:
+            body["tool_choice"] = {"type": "any"}
         return body
 
     def build_continuation_request(
@@ -886,7 +898,12 @@ class GeminiFormat(PayloadFormat):
     def supports_tool_interception(self) -> bool:
         return True
 
-    def inject_tools(self, body: dict, tool_defs: list) -> dict:
+    def inject_tools(
+        self,
+        body: dict,
+        tool_defs: list,
+        require_tool_use: bool | None = None,
+    ) -> dict:
         """Inject tool definitions using Gemini's functionDeclarations format."""
         body = dict(body)
         tools = list(body.get("tools") or [])
@@ -1271,7 +1288,17 @@ class OpenAIResponsesFormat(PayloadFormat):
     def supports_tool_interception(self) -> bool:
         return True
 
-    def inject_tools(self, body: dict, tool_defs: list) -> dict:
+    def inject_tools(
+        self,
+        body: dict,
+        tool_defs: list,
+        require_tool_use: bool | None = None,
+    ) -> dict:
+        tc = body.get("tool_choice")
+        if isinstance(tc, dict) and tc.get("type") == "none":
+            return body
+        if tc == "none":
+            return body
         body = dict(body)
         tools = list(body.get("tools") or [])
         for td in tool_defs:
@@ -1282,6 +1309,8 @@ class OpenAIResponsesFormat(PayloadFormat):
                 "parameters": td.get("input_schema", {}),
             })
         body["tools"] = tools
+        if require_tool_use and "tool_choice" not in body:
+            body["tool_choice"] = "required"
         return body
 
     def is_tool_use_event(self, data: dict) -> bool:

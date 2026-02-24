@@ -194,10 +194,122 @@ def is_vc_tool(name: str) -> bool:
     return name in VC_TOOL_NAMES
 
 
+def _flatten_text_content(content: object) -> str:
+    """Best-effort flattening of provider-specific message content to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            text = _flatten_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return str(content.get("text"))
+        if "content" in content:
+            return _flatten_text_content(content.get("content"))
+        if "parts" in content:
+            return _flatten_text_content(content.get("parts"))
+    return ""
+
+
+def _extract_last_user_text(original_request: dict) -> str:
+    """Extract the latest user question from provider request payloads."""
+    # Anthropic/OpenAI chat-completions style
+    messages = original_request.get("messages")
+    if isinstance(messages, list):
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role", "")).lower() != "user":
+                continue
+            text = _flatten_text_content(msg.get("content", ""))
+            if text.strip():
+                return text.strip()
+
+    # OpenAI Codex responses style
+    inputs = original_request.get("input")
+    if isinstance(inputs, list):
+        for item in reversed(inputs):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role", "")).lower() != "user":
+                continue
+            text = _flatten_text_content(item.get("content", ""))
+            if text.strip():
+                return text.strip()
+
+    # Gemini generateContent style
+    contents = original_request.get("contents")
+    if isinstance(contents, list):
+        for item in reversed(contents):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role", "")).lower() != "user":
+                continue
+            text = _flatten_text_content(item.get("parts", []))
+            if text.strip():
+                return text.strip()
+
+    return ""
+
+
 def execute_vc_tool(
-    engine: VirtualContextEngine, name: str, tool_input: dict,
+    engine: VirtualContextEngine,
+    name: str,
+    tool_input: dict,
+    *,
+    intent_context: str = "",
 ) -> str:
     """Execute a VC paging tool and return a JSON result string."""
+    def _trim_find_quote_payload(raw: object) -> object:
+        """Return only model-relevant find_quote fields for tool output."""
+        if not isinstance(raw, dict):
+            return raw
+        if "error" in raw or raw.get("is_error") is True:
+            return raw
+        if "found" not in raw and "results" not in raw:
+            return raw
+
+        results = raw.get("results")
+        if not isinstance(results, list):
+            results = []
+
+        found = raw.get("found")
+        if not isinstance(found, bool):
+            found = bool(results)
+
+        sanitized_results: list[object] = []
+        for item in results:
+            if isinstance(item, dict):
+                clean_item = dict(item)
+                # Internal segment ids are provenance/debug data; keep them
+                # out of model-facing tool outputs to reduce noise.
+                clean_item.pop("segment_ref", None)
+                clean_item.pop("segment_refs", None)
+                sanitized_results.append(clean_item)
+            else:
+                sanitized_results.append(item)
+
+        trimmed: dict[str, object] = {
+            "found": found,
+            "results": sanitized_results,
+        }
+        if raw.get("current_state_multi_session") is True:
+            trimmed["current_state_multi_session"] = True
+        priority_label = raw.get("priority_label")
+        if isinstance(priority_label, str) and priority_label.strip():
+            trimmed["priority_label"] = priority_label
+        reader_hint = raw.get("reader_hint")
+        if isinstance(reader_hint, str) and reader_hint.strip():
+            trimmed["reader_hint"] = reader_hint
+        message = raw.get("message")
+        if isinstance(message, str) and message.strip() and not found:
+            trimmed["message"] = message
+        return trimmed
+
     try:
         if name == "vc_expand_topic":
             result = engine.expand_topic(
@@ -213,7 +325,9 @@ def execute_vc_tool(
             result = engine.find_quote(
                 query=tool_input.get("query", ""),
                 max_results=VC_FIND_QUOTE_MAX_RESULTS,
+                intent_context=intent_context,
             )
+            result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
         elif name == "vc_remember_when":
@@ -348,6 +462,7 @@ def run_tool_loop(
     headers = adapter.get_headers()
     cont_body: dict | None = None
     current_response = initial_response
+    intent_context = _extract_last_user_text(original_request)
 
     with httpx.Client(timeout=300.0) as client:
         for loop_i in range(max_loops):
@@ -356,7 +471,10 @@ def run_tool_loop(
             for tc in vc_tools:
                 t0 = time.monotonic()
                 result_str = execute_vc_tool(
-                    engine, tc["name"], tc["input"],
+                    engine,
+                    tc["name"],
+                    tc["input"],
+                    intent_context=intent_context,
                 )
                 duration_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -440,7 +558,10 @@ def run_tool_loop(
                 for tc in vc_tools:
                     t0 = time.monotonic()
                     result_str = execute_vc_tool(
-                        engine, tc["name"], tc["input"],
+                        engine,
+                        tc["name"],
+                        tc["input"],
+                        intent_context=intent_context,
                     )
                     duration_ms = round((time.monotonic() - t0) * 1000, 1)
                     result.tool_calls.append(ToolCallRecord(

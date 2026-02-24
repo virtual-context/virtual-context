@@ -274,6 +274,13 @@ class TestAnthropicFormat:
         result = self.fmt.inject_tools(body, [{"name": "vc_expand_topic"}])
         assert len(result["tools"]) == 2
 
+    def test_inject_tools_sets_required_when_requested(self):
+        body = {"messages": []}
+        result = self.fmt.inject_tools(
+            body, [{"name": "vc_expand_topic"}], require_tool_use=True,
+        )
+        assert result["tool_choice"] == {"type": "any"}
+
     def test_inject_tools_respects_none_choice(self):
         body = {"tool_choice": "none", "messages": []}
         result = self.fmt.inject_tools(body, [{"name": "test"}])
@@ -1045,6 +1052,18 @@ class TestOpenAIResponsesFormat:
         tool_defs = [{"name": "vc_expand_topic", "description": "Expand"}]
         result = self.fmt.inject_tools(body, tool_defs)
         assert len(result["tools"]) == 1
+
+    def test_inject_tools_sets_required_when_requested(self):
+        body = {"input": []}
+        tool_defs = [{"name": "vc_expand_topic", "description": "Expand"}]
+        result = self.fmt.inject_tools(body, tool_defs, require_tool_use=True)
+        assert result["tool_choice"] == "required"
+
+    def test_inject_tools_respects_none_choice(self):
+        body = {"input": [], "tool_choice": "none"}
+        tool_defs = [{"name": "vc_expand_topic", "description": "Expand"}]
+        result = self.fmt.inject_tools(body, tool_defs, require_tool_use=True)
+        assert result is body
 
     def test_is_tool_use_event_output_item_added(self):
         data = {

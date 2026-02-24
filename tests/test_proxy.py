@@ -3354,6 +3354,12 @@ class TestInjectVCTools:
         assert "vc_expand_topic" in names
         assert len(names) == 6  # web_search + 5 VC tools
 
+    def test_sets_required_policy_when_requested(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": []}
+        result = _inject_vc_tools(body, engine, require_tool_use=True)
+        assert result["tool_choice"] == {"type": "any"}
+
     def test_skips_when_tool_choice_none_string(self):
         engine = MagicMock()
         body = {"model": "claude-3", "messages": [], "tool_choice": "none"}
@@ -3691,6 +3697,7 @@ def paging_test_client(tmp_path):
         engine.on_turn_complete.return_value = None
         engine._turn_tag_index = TurnTagIndex()
         engine._resolve_paging_mode.return_value = "autonomous"
+        engine._compacted_through = 0
         engine.expand_topic.return_value = {
             "tag": "database",
             "depth": "full",

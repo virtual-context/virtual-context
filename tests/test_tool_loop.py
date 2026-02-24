@@ -13,14 +13,12 @@ from virtual_context.core.tool_loop import (
     GeminiAdapter,
     OpenAIAdapter,
     OpenAICodexAdapter,
-    ProviderAdapter,
     execute_vc_tool,
     get_adapter,
     is_vc_tool,
     run_tool_loop,
     vc_tool_definitions,
 )
-from virtual_context.types import ToolCallRecord, ToolLoopResult
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +116,31 @@ class TestExecuteVCTool:
 
     def test_find_quote_calls_engine(self):
         engine = MagicMock()
-        engine.find_quote.return_value = {"query": "test", "found": True, "results": []}
+        engine.find_quote.return_value = {
+            "query": "test",
+            "query_intent": "current_state",
+            "found": True,
+            "results": [
+                {
+                    "excerpt": "found it",
+                    "topic": "health",
+                    "segment_ref": "seg-1",
+                    "segment_refs": ["seg-1", "seg-2"],
+                }
+            ],
+        }
         result = execute_vc_tool(engine, "vc_find_quote", {"query": "test"})
-        engine.find_quote.assert_called_once_with(query="test", max_results=20)
+        engine.find_quote.assert_called_once_with(
+            query="test",
+            max_results=20,
+            intent_context="",
+        )
         parsed = json.loads(result)
         assert parsed["found"] is True
+        assert "query" not in parsed
+        assert "query_intent" not in parsed
+        assert "segment_ref" not in parsed["results"][0]
+        assert "segment_refs" not in parsed["results"][0]
 
     def test_remember_when_calls_engine(self):
         engine = MagicMock()
@@ -232,6 +250,7 @@ class TestAnthropicAdapter:
         assert body["model"] == "claude-sonnet-4-5-20250929"
         assert body["system"] == "Be helpful."
         assert body["tools"] == [{"name": "t"}]
+        assert body["tool_choice"] == {"type": "any"}
         assert body["stream"] is False
 
     def test_convert_tool_defs_passthrough(self):
@@ -269,6 +288,7 @@ class TestAnthropicAdapter:
             "model": "claude-sonnet-4-5-20250929", "max_tokens": 1024,
             "messages": [{"role": "user", "content": "hi"}],
             "system": "You are helpful.", "tools": [{"name": "web_search"}],
+            "tool_choice": {"type": "any"},
         }
         raw_resp = {"content": [
             {"type": "text", "text": "Let me check."},
@@ -283,6 +303,7 @@ class TestAnthropicAdapter:
         assert body["stream"] is False
         assert body["system"] == "You are helpful."
         assert body["tools"] == [{"name": "web_search"}]
+        assert body["tool_choice"] == {"type": "any"}
         assert len(body["messages"]) == 3
         assert body["messages"][0] == {"role": "user", "content": "hi"}
         assert body["messages"][1]["role"] == "assistant"
@@ -299,9 +320,10 @@ class TestAnthropicAdapter:
         assert len(original["messages"]) == original_len
 
     def test_strip_tools(self):
-        body = {"model": "m", "tools": [{"name": "t"}]}
+        body = {"model": "m", "tools": [{"name": "t"}], "tool_choice": {"type": "any"}}
         self.adapter.strip_tools(body)
         assert "tools" not in body
+        assert "tool_choice" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +353,18 @@ class TestOpenAIAdapter:
         assert body["messages"][0] == {"role": "system", "content": "Be helpful."}
         assert body["messages"][1] == {"role": "user", "content": "hi"}
         assert "tools" not in body
+        assert "tool_choice" not in body
+
+    def test_build_request_body_with_tools_sets_required_policy(self):
+        body = self.adapter.build_request_body(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            system="Be helpful.",
+            max_tokens=1024,
+            temperature=0.5,
+            tools=[{"type": "function", "function": {"name": "t"}}],
+        )
+        assert body["tool_choice"] == "required"
 
     def test_convert_tool_defs(self):
         defs = [{"name": "vc_find_quote", "description": "Search", "input_schema": {"type": "object", "properties": {}}}]
@@ -391,6 +425,7 @@ class TestOpenAIAdapter:
             "model": "gpt-4o", "max_completion_tokens": 1024,
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "t"}}],
+            "tool_choice": "required",
         }
         raw_resp = {"choices": [{"message": {
             "role": "assistant", "content": None,
@@ -400,9 +435,20 @@ class TestOpenAIAdapter:
 
         body = self.adapter.build_continuation(None, original, raw_resp, tool_results)
         assert body["model"] == "gpt-4o"
+        assert body["tool_choice"] == "required"
         assert len(body["messages"]) == 3  # user + assistant + tool
         assert body["messages"][1]["role"] == "assistant"
         assert body["messages"][2]["role"] == "tool"
+
+    def test_strip_tools(self):
+        body = {
+            "model": "gpt-4o",
+            "tools": [{"type": "function", "function": {"name": "t"}}],
+            "tool_choice": "required",
+        }
+        self.adapter.strip_tools(body)
+        assert "tools" not in body
+        assert "tool_choice" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +636,47 @@ class TestRunToolLoop:
         assert result.output_tokens == 130  # 50 + 80
         assert result.stop_reason == "end_turn"
         engine.reassemble_context.assert_called_once()
+        engine.find_quote.assert_called_once_with(
+            query="x",
+            max_results=20,
+            intent_context="test",
+        )
+
+    def test_passes_last_user_text_as_intent_context(self):
+        engine = MagicMock()
+        engine.find_quote.return_value = {"found": True, "results": []}
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {"type": "tool_use", "id": "t1", "name": "vc_find_quote", "input": {"query": "shoe rack"}},
+        ], stop_reason="tool_use")
+        continuation = _make_response([{"type": "text", "text": "answer"}])
+
+        original_request = {
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "Where do I currently keep my old sneakers?"},
+            ],
+        }
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = _MockHTTPResponse(continuation)
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = run_tool_loop(engine, initial, original_request, _anthropic_adapter())
+
+        assert result.text == "answer"
+        engine.find_quote.assert_called_once_with(
+            query="shoe rack",
+            max_results=20,
+            intent_context="Where do I currently keep my old sneakers?",
+        )
 
     def test_multi_tool_single_loop(self):
         engine = MagicMock()

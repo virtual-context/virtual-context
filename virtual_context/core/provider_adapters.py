@@ -140,6 +140,8 @@ class AnthropicAdapter(ProviderAdapter):
             body["system"] = system
         if tools:
             body["tools"] = tools
+            # Require at least one tool call when tools are provided.
+            body["tool_choice"] = {"type": "any"}
         return body
 
     def convert_tool_defs(self, anthropic_defs):
@@ -194,6 +196,8 @@ class AnthropicAdapter(ProviderAdapter):
                 body["system"] = original_body["system"]
             if "tools" in original_body:
                 body["tools"] = original_body["tools"]
+            if "tool_choice" in original_body:
+                body["tool_choice"] = original_body["tool_choice"]
             body["messages"].append({"role": "assistant", "content": content})
             body["messages"].append({"role": "user", "content": tool_results})
             return body
@@ -224,6 +228,7 @@ class AnthropicAdapter(ProviderAdapter):
 
     def strip_tools(self, body):
         body.pop("tools", None)
+        body.pop("tool_choice", None)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +268,8 @@ class OpenAIAdapter(ProviderAdapter):
         }
         if tools:
             body["tools"] = tools
+            # Require at least one tool call when tools are provided.
+            body["tool_choice"] = "required"
         return body
 
     def convert_tool_defs(self, anthropic_defs):
@@ -352,6 +359,8 @@ class OpenAIAdapter(ProviderAdapter):
             }
             if "tools" in original_body:
                 body["tools"] = original_body["tools"]
+            if "tool_choice" in original_body:
+                body["tool_choice"] = original_body["tool_choice"]
             if "temperature" in original_body:
                 body["temperature"] = original_body["temperature"]
         else:
@@ -379,6 +388,7 @@ class OpenAIAdapter(ProviderAdapter):
 
     def strip_tools(self, body):
         body.pop("tools", None)
+        body.pop("tool_choice", None)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +444,8 @@ class OpenAICodexAdapter(ProviderAdapter):
         }
         if tools:
             body["tools"] = tools
-            body["tool_choice"] = "auto"
+            # Require at least one tool call when tools are provided.
+            body["tool_choice"] = "required"
         return body
 
     def convert_tool_defs(self, anthropic_defs):
