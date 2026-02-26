@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, Fact, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -125,3 +125,37 @@ class ContextStore(ABC):
         Used by SessionRegistry on restart to match inbound requests to
         existing sessions when session markers are unavailable.
         """
+
+    # ------------------------------------------------------------------
+    # D1: Fact Extraction
+    # ------------------------------------------------------------------
+
+    def store_facts(self, facts: list[Fact]) -> int:
+        """Store extracted facts. Returns count stored."""
+        return 0
+
+    def query_facts(
+        self,
+        *,
+        subject: str | None = None,
+        verb: str | None = None,
+        verbs: list[str] | None = None,
+        object_contains: str | None = None,
+        status: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[Fact]:
+        """Query facts by structured filters."""
+        return []
+
+    def get_unique_fact_verbs(self) -> list[str]:
+        """Return all distinct non-empty verbs from non-superseded facts."""
+        return []
+
+    def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
+        """Get all facts extracted from a given segment."""
+        return []
+
+    def get_fact_count_by_tags(self) -> dict[str, int]:
+        """Return {tag: fact_count} for context hint annotations."""
+        return {}

@@ -264,8 +264,22 @@ class VirtualContextEngine:
     ) -> list[CompactionResult]:
         """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
         batch immediately so results are visible in the DB incrementally."""
+        from .types import FactSignal
+
         all_results: list[CompactionResult] = []
         batch_size = self._COMPACT_BATCH_SIZE
+
+        # D1: Gather fact signals from TurnTagIndex for compacted turns.
+        # Build a flat list per segment.  Since we don't have a direct
+        # segment→turn mapping, collect all signals and let the compactor
+        # verify against the segment's conversation text.
+        turn_offset = self._compacted_through // 2
+        compact_turns = compact_messages_len // 2
+        all_signals: list[FactSignal] = []
+        for t in range(turn_offset, turn_offset + compact_turns):
+            entry = self._turn_tag_index.get_tags_for_turn(t)
+            if entry and entry.fact_signals:
+                all_signals.extend(entry.fact_signals)
 
         for start in range(0, len(segments), batch_size):
             batch = segments[start:start + batch_size]
@@ -275,7 +289,10 @@ class VirtualContextEngine:
                 "Compacting batch %d/%d (%d segments)...",
                 batch_num, total_batches, len(batch),
             )
-            results = self._compactor.compact(batch)
+            # D1: Pass all signals to the compactor; each segment's prompt
+            # will include them as hints for verification.
+            fact_signals_by_segment = {seg.id: all_signals for seg in batch} if all_signals else None
+            results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
             # Store each result to DB right away
             for i, result in enumerate(results):
                 stored = StoredSegment(
@@ -296,6 +313,16 @@ class VirtualContextEngine:
                 )
                 self._store.store_segment(stored)
                 self._embed_and_store_chunks(stored)
+                # D1: Store extracted facts with provenance
+                if result.facts:
+                    for fact in result.facts:
+                        fact.segment_ref = stored.ref
+                        fact.session_id = self.config.session_id
+                    self._store.store_facts(result.facts)
+                    logger.info(
+                        "  Stored %d facts for segment %s",
+                        len(result.facts), result.primary_tag,
+                    )
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
                     "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
@@ -583,6 +610,7 @@ class VirtualContextEngine:
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
+                fact_signals=tag_result.fact_signals,
             ))
 
         # Check for overly-broad tags needing splitting
@@ -974,6 +1002,8 @@ class VirtualContextEngine:
             max_hint_tokens=self.config.assembler.context_hint_max_tokens,
             token_counter=self._token_counter,
             calculate_depth_tokens=self._calculate_depth_tokens,
+            fact_counts=self._store.get_fact_count_by_tags(),
+            max_tool_rounds=self.config.paging.max_tool_loops,
         )
 
     def _build_supervised_hint(self, tag_summaries: list) -> str:
@@ -982,6 +1012,7 @@ class VirtualContextEngine:
             working_set=self._working_set,
             max_hint_tokens=self.config.assembler.context_hint_max_tokens,
             token_counter=self._token_counter,
+            max_tool_rounds=self.config.paging.max_tool_loops,
         )
 
     def _build_default_hint(self, tag_summaries: list) -> str:
@@ -1557,6 +1588,212 @@ class VirtualContextEngine:
 
         raise ValueError("time_range.kind must be 'relative' or 'between_dates'")
 
+    def query_facts(self, **kwargs) -> list | dict:
+        """Query structured facts by filters. Expands verb semantically, then delegates to store.
+
+        Returns list[Fact] normally.  When called with ``_return_meta=True``
+        (used by the tool loop), returns a dict with ``facts``, ``expanded_verbs``,
+        ``object_relaxed``, and ``semantic_note`` keys so the caller can
+        annotate the response.
+        """
+        return_meta = kwargs.pop("_return_meta", False)
+        intent_context = kwargs.pop("_intent_context", "") or ""
+        expanded_verbs: list[str] | None = None
+        semantic_note: str | None = None
+
+        # Save original params before verb expansion mutates kwargs
+        orig_verb = kwargs.get("verb")
+        orig_subject = kwargs.get("subject")
+        orig_object = kwargs.get("object_contains")
+        status_filter = kwargs.get("status")
+
+        verb = kwargs.get("verb")
+        if verb and not kwargs.get("verbs"):
+            expanded = self._expand_verb(verb)
+            if expanded and len(expanded) > 1:
+                expanded_verbs = expanded
+                kwargs["verbs"] = expanded
+                kwargs.pop("verb", None)
+
+        results = self._store.query_facts(**kwargs)
+
+        # Semantic search: find additional facts via embedding on 'what'
+        # field.  Runs before auto-relax so it can provide precise results
+        # and prevent the noisy fallback that drops object_contains.
+        sem_all = self._semantic_fact_search(
+            existing=results,
+            subject=orig_subject,
+            verb=orig_verb,
+            object_contains=orig_object,
+            intent_context=intent_context,
+        )
+        if sem_all:
+            sem_filtered = sem_all
+            if status_filter:
+                sem_filtered = [f for f in sem_filtered if f.status == status_filter]
+            # Respect the reader's explicit object_contains filter —
+            # semantic search ignores structured constraints when building
+            # candidates, so post-filter here to avoid returning facts
+            # that contradict the reader's request (BUG-032).
+            if orig_object:
+                obj_lower = orig_object.lower()
+                sem_filtered = [
+                    f for f in sem_filtered
+                    if obj_lower in (f.object or "").lower()
+                    or obj_lower in (f.what or "").lower()
+                ]
+            if sem_filtered:
+                results = results + sem_filtered
+                semantic_note = f"semantic search added {len(sem_filtered)} fact(s)"
+
+        # Auto-relax removed (BUG-032): dropping object_contains returns facts
+        # that contradict the reader's explicit constraint, causing over-counting.
+        # If 0 results, the reader should broaden its own query intentionally.
+
+        if return_meta:
+            meta: dict = {
+                "facts": results,
+                "expanded_verbs": expanded_verbs,
+                "object_relaxed": False,  # auto-relax removed (BUG-032)
+                "semantic_note": semantic_note,
+            }
+            # When status was filtered, also query without status so the
+            # caller can show total_all_statuses — prevents the reader from
+            # splitting into per-status calls and never seeing the grand total.
+            if status_filter:
+                # Strip both status and object_contains — we want the
+                # grand total for this verb+subject across all statuses.
+                # object_contains uses strict LIKE at the store layer and
+                # would return 0 when the auto-relax only happened above.
+                unfiltered = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ("status", "object_contains")
+                }
+                all_facts = self._store.query_facts(**unfiltered)
+                # Merge semantic matches into the unfiltered total
+                if sem_all:
+                    all_ids = {f.id for f in all_facts}
+                    for f in sem_all:
+                        if f.id not in all_ids:
+                            all_facts.append(f)
+                            all_ids.add(f.id)
+                status_counts: dict[str, int] = {}
+                for f in all_facts:
+                    s = f.status or "unknown"
+                    status_counts[s] = status_counts.get(s, 0) + 1
+                meta["all_statuses"] = status_counts
+                meta["total_all_statuses"] = len(all_facts)
+            return meta
+        return results
+
+    def _expand_verb(self, verb: str) -> list[str] | None:
+        """Find semantically similar verbs in the facts DB via embedding similarity.
+
+        Returns list of matching verbs (including original) if expansions found,
+        None if embeddings unavailable or no expansions.
+        """
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return None
+        all_verbs = self._store.get_unique_fact_verbs()
+        if not all_verbs:
+            return None
+        from .core.math_utils import cosine_similarity
+
+        texts = [verb] + all_verbs
+        vectors = embed_fn(texts)
+        query_vec = vectors[0]
+        threshold = 0.53
+        matches = [verb]
+        for i, v in enumerate(all_verbs):
+            if v != verb:
+                sim = cosine_similarity(query_vec, vectors[i + 1])
+                if sim >= threshold:
+                    matches.append(v)
+        return matches if len(matches) > 1 else None
+
+    def _semantic_fact_search(
+        self,
+        existing: list,
+        subject: str | None = None,
+        verb: str | None = None,
+        object_contains: str | None = None,
+        intent_context: str = "",
+    ) -> list:
+        """Find additional facts by embedding similarity on the ``what`` field.
+
+        Builds a natural-language query from the provided structured params
+        (and optionally the user's question via *intent_context*), retrieves
+        all facts for the given subject, and returns those whose ``what``
+        field is semantically close to the query but that were NOT already
+        in *existing*.  Returns an empty list when embeddings are unavailable
+        or no new matches are found.
+        """
+        # Need at least a verb or object to form a meaningful query
+        if not verb and not object_contains:
+            return []
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None:
+            return []
+
+        # Build query string from whatever params were provided.
+        # When intent_context (the user's question) is available, use it
+        # as the primary query — it carries richer semantic signal than the
+        # short structured params (e.g. "How many health-related devices
+        # do I use?" vs just "user use").
+        if intent_context.strip():
+            query_str = intent_context.strip()
+            # The intent_context may be the full enriched prompt (context
+            # summaries + question).  Strip the <virtual-context> block so
+            # only the trailing question/instruction remains.
+            if "</virtual-context>" in query_str:
+                query_str = query_str.split("</virtual-context>")[-1].strip()
+            # Strip leading preamble that the benchmark wraps around the
+            # context block — only keep meaningful trailing text.
+            import re
+            m = re.search(r"(?:^|\n)\s*Question:\s*(.+)", query_str, re.IGNORECASE)
+            if m:
+                query_str = m.group(1).strip()
+                # Remove trailing "Answer:" marker if present
+                query_str = re.sub(r"\s*Answer:\s*$", "", query_str).strip()
+        else:
+            parts: list[str] = []
+            if subject:
+                parts.append(subject)
+            if verb:
+                parts.append(verb)
+            if object_contains:
+                parts.append(object_contains)
+            query_str = " ".join(parts)
+
+        # Broad candidate set: all facts for this subject (no verb/object filter)
+        cand_kwargs: dict = {"limit": 200}
+        if subject:
+            cand_kwargs["subject"] = subject
+        candidates = self._store.query_facts(**cand_kwargs)
+
+        # Exclude already-found facts and facts without a 'what' description
+        existing_ids = {f.id for f in existing}
+        candidates = [f for f in candidates if f.id not in existing_ids and f.what]
+        if not candidates:
+            return []
+
+        from .core.math_utils import cosine_similarity
+
+        texts = [query_str] + [f.what for f in candidates]
+        vectors = embed_fn(texts)
+        query_vec = vectors[0]
+
+        threshold = 0.35
+        matches = []
+        for i, fact in enumerate(candidates):
+            sim = cosine_similarity(query_vec, vectors[i + 1])
+            if sim >= threshold:
+                matches.append(fact)
+
+        return matches
+
     def remember_when(
         self,
         query: str,
@@ -1631,7 +1868,7 @@ class VirtualContextEngine:
         tools: list[dict] | None = None,
         force_tools: bool = False,
         require_tools: bool | None = None,
-        max_loops: int = 5,
+        max_loops: int | None = None,
         provider: str = "anthropic",
     ) -> "ToolLoopResult":
         """Send a query to an LLM with VC tool support.
@@ -1745,9 +1982,14 @@ class VirtualContextEngine:
         )
 
         if has_vc_tools:
+            effective_loops = (
+                max_loops
+                if max_loops is not None
+                else self.config.paging.max_tool_loops
+            )
             loop_result = run_tool_loop(
                 self, data, body, adapter,
-                url=url, max_loops=max_loops,
+                url=url, max_loops=effective_loops,
             )
             # Prepend the initial request to raw_requests
             loop_result.raw_requests.insert(0, body)

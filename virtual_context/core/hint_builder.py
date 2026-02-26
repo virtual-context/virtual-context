@@ -17,6 +17,8 @@ def build_autonomous_hint(
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
     calculate_depth_tokens: Callable[[str, DepthLevel], int],
+    fact_counts: dict[str, int] | None = None,
+    max_tool_rounds: int = 10,
 ) -> str:
     """Build compact autonomous paging hint with two-tier layout.
 
@@ -25,48 +27,66 @@ def build_autonomous_hint(
     Truncation drops available tags first, preserving expanded tags.
     """
     used = sum(ws.tokens for ws in working_set.values())
+    fc = fact_counts or {}
 
     # Partition into expanded (in working set) vs available (depth:none)
     expanded_lines: list[str] = []
     available_entries: list[str] = []
     for ts in tag_summaries:
+        n_facts = fc.get(ts.tag, 0)
+        facts_label = f", {n_facts} facts" if n_facts > 0 else ""
         ws = working_set.get(ts.tag)
         if ws and ws.depth != DepthLevel.NONE:
             full_t = calculate_depth_tokens(ts.tag, DepthLevel.FULL)
             desc_part = f" — {ts.description}" if ts.description else ""
             expanded_lines.append(
                 f"  {ts.tag}: {ws.depth.value} {ws.tokens}t"
-                f" \u2192 {full_t}t full{desc_part}"
+                f" \u2192 {full_t}t full{facts_label}{desc_part}"
             )
         else:
             full_t = calculate_depth_tokens(ts.tag, DepthLevel.FULL)
             entry = ts.tag
             if full_t > 0:
-                entry += f"({full_t}t)"
+                entry += f"({full_t}t{facts_label})"
+            elif facts_label:
+                entry += f"({facts_label.lstrip(', ')})"
             if ts.description:
                 entry += f" — {ts.description}"
             available_entries.append(entry)
 
     _RULES = (
-        "RULE: These are compressed topic summaries, not the full conversation.\n"
-        "- For specific facts (names, numbers, dosages, decisions): "
-        "use vc_find_quote — it searches raw text across all topics.\n"
-        "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
-        "use vc_recall_all to load all topic summaries at once.\n"
-        "- For time-scoped questions (last week, last month, between dates): "
-        "use vc_remember_when and choose a relative preset; do not do date math.\n"
-        "- For deeper understanding of a specific topic: "
-        "use vc_expand_topic to load the full conversation text.\n"
-        "- To free budget after expanding: use vc_collapse_topic.\n"
-        "- Never claim you don't remember without searching first.\n"
-        "- Never give a vague answer when you could expand a topic for specifics."
+        "RULE: These are compressed summaries — Summaries DO omit details.\n"
+        "To find detailed information you have the following tools:\n"
+        "- vc_find_quote(query): search raw text across ALL topics.\n"
+        "- vc_query_facts(subject?, verb?, status?, object_contains?): "
+        "structured fact lookup.\n"
+        "- vc_expand_topic(tag): load original text for a topic.\n"
+        "- vc_remember_when(query, time_range): time-scoped recall.\n"
+        "- vc_recall_all(): load every summary at once.\n"
+        "- vc_collapse_topic(tag): free budget after expanding.\n"
+        f"You have a maximum of {max_tool_rounds} tool rounds. "
+        "Plan your strategy upfront: use diverse queries, not repetitions. "
+        "If a search already returned the answer, stop and respond.\n"
+        "For counting/listing questions: scan [all topics] for every topic "
+        "that could relate — items are often spread across unrelated topics.\n"
+        "Never answer without searching first."
     )
 
     _COMPACT_RULES = (
-        "RULE: Compressed summaries. Use vc_find_quote for facts, "
-        "vc_recall_all for full overview, vc_remember_when for time windows, "
-        "vc_expand_topic for detail, "
-        "vc_collapse_topic to free budget."
+        "RULE: Summaries DO omit details. "
+        "Tools: find_quote, query_facts, expand_topic, "
+        "remember_when, recall_all, collapse_topic. "
+        f"Max {max_tool_rounds} tool rounds — be strategic. "
+        "Scan [all topics]. Never answer without searching first."
+    )
+
+    # Compact name-only list of ALL tags — never truncated.
+    all_tag_names = [ts.tag for ts in tag_summaries]
+    all_topics_line = (
+        f"[all {len(all_tag_names)} topics] "
+        + ", ".join(all_tag_names)
+        + "\nScan before answering — relevant context may be under "
+        "an unexpected topic name."
     )
 
     def _assemble(exp_lines: list[str], avail: list[str], *, compact: bool = False) -> str:
@@ -80,6 +100,8 @@ def build_autonomous_hint(
             parts.append(
                 "[available] " + ", ".join(avail)
             )
+        parts.append("")
+        parts.append(all_topics_line)
         body = "\n".join(parts)
         rules = _COMPACT_RULES if compact else _RULES
         return (
@@ -87,7 +109,8 @@ def build_autonomous_hint(
             f' available="{budget - used}">\n'
             f"{rules}\n\n"
             f"{body}\n\n"
-            f"Tools: find_quote(query) | recall_all() | remember_when(query, time_range) | "
+            f"Tools: find_quote(query) | query_facts(subject?, verb?, status?, object_contains?) | "
+            f"recall_all() | remember_when(query, time_range) | "
             f"expand_topic(tag, depth?) | collapse_topic(tag, depth?)\n"
             f"</context-topics>"
         )
@@ -115,6 +138,7 @@ def build_supervised_hint(
     working_set: dict[str, WorkingSetEntry],
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
+    max_tool_rounds: int = 10,
 ) -> str:
     """Build compact supervised paging hint.
 
@@ -137,6 +161,15 @@ def build_supervised_hint(
                 entry += f" — {ts.description}"
             available_entries.append(entry)
 
+    # Compact name-only list of ALL tags — never truncated.
+    all_tag_names = [ts.tag for ts in tag_summaries]
+    all_topics_line = (
+        f"[all {len(all_tag_names)} topics] "
+        + ", ".join(all_tag_names)
+        + "\nScan before answering — relevant context may be under "
+        "an unexpected topic name."
+    )
+
     def _assemble(exp_lines: list[str], avail: list[str]) -> str:
         parts: list[str] = []
         if exp_lines:
@@ -146,23 +179,26 @@ def build_supervised_hint(
             if exp_lines:
                 parts.append("")
             parts.append("[available] " + ", ".join(avail))
+        parts.append("")
+        parts.append(all_topics_line)
         body = "\n".join(parts)
         return (
             "<context-topics>\n"
-            "RULE: These are compressed topic summaries, not the full conversation.\n"
-            "RULE: Summaries are lossy and may omit events/details.\n"
-            "RULE: For count/date/list questions (how many, which days, when), verify with vc_find_quote before finalizing.\n"
-            "- For specific facts (names, numbers, dosages, decisions): "
-            "use vc_find_quote — it searches raw text across all topics.\n"
-            "- For broad overview questions (summarize everything, what have we discussed, catch me up): "
-            "use vc_recall_all to load all topic summaries at once.\n"
-            "- For time-scoped questions (last week, last month, between dates): "
-            "use vc_remember_when and choose a relative preset; do not do date math.\n"
-            "- For deeper understanding of a specific topic: "
-            "use vc_expand_topic to load the full conversation text.\n"
-            "- To free budget after expanding: use vc_collapse_topic.\n"
-            "- Never claim you don't remember without searching first.\n"
-            "- Never give a vague answer when you could expand a topic for specifics.\n\n"
+            "RULE: These are compressed summaries — Summaries DO omit details.\n"
+            "To find detailed information you have the following tools:\n"
+            "- vc_find_quote(query): search raw text across ALL topics.\n"
+            "- vc_query_facts(subject?, verb?, status?, object_contains?): "
+            "structured fact lookup.\n"
+            "- vc_expand_topic(tag): load original text for a topic.\n"
+            "- vc_remember_when(query, time_range): time-scoped recall.\n"
+            "- vc_recall_all(): load every summary at once.\n"
+            "- vc_collapse_topic(tag): free budget after expanding.\n"
+            f"You have a maximum of {max_tool_rounds} tool rounds. "
+            "Plan your strategy upfront: use diverse queries, not repetitions. "
+            "If a search already returned the answer, stop and respond.\n"
+            "For counting/listing questions: scan [all topics] for every topic "
+            "that could relate — items are often spread across unrelated topics.\n"
+            "Never answer without searching first.\n\n"
             f"{body}\n"
             "</context-topics>"
         )
@@ -186,6 +222,15 @@ def build_default_hint(
     token_counter: Callable[[str], int],
 ) -> str:
     """Build simple topic list (no paging)."""
+    # Compact name-only list of ALL tags — never truncated.
+    all_tag_names = [ts.tag for ts in tag_summaries]
+    all_topics_line = (
+        f"[all {len(all_tag_names)} topics] "
+        + ", ".join(all_tag_names)
+        + "\nScan before answering — relevant context may be under "
+        "an unexpected topic name."
+    )
+
     lines: list[str] = []
     for ts in tag_summaries:
         turn_count = len(ts.source_turn_numbers)
@@ -198,7 +243,8 @@ def build_default_hint(
     hint = (
         "<context-topics>\n"
         "Prior conversation topics available for recall:\n"
-        f"{body}\n"
+        f"{body}\n\n"
+        f"{all_topics_line}\n"
         "</context-topics>"
     )
 
@@ -209,7 +255,8 @@ def build_default_hint(
             hint = (
                 "<context-topics>\n"
                 "Prior conversation topics available for recall:\n"
-                f"{body}\n"
+                f"{body}\n\n"
+                f"{all_topics_line}\n"
                 "</context-topics>"
             )
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from ..patterns import DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
+    FactSignal,
     KeywordTagConfig,
     LLMProvider,
     TagGeneratorConfig,
@@ -32,9 +33,13 @@ Rules:
   "cycle-tracking" not "tracking", "transit-schedule" not "schedule".
   Ask yourself: "Would this tag match conversations about completely different topics?"
   If yes, make it more specific.
-- When the text genuinely discusses a topic already covered by an existing tag, reuse
-  that tag instead of inventing a synonym (e.g. use "teeth" not "dental"
-  if "teeth" already exists and the text is about teeth).
+- STRONGLY prefer reusing existing tags over creating new ones. Before inventing
+  ANY new tag, check whether an existing tag already covers that topic — even if
+  the wording is slightly different. Use "teeth" not "dental" if "teeth" exists.
+  Use "data-visualization" not "data-visualization-tools" or "visualization-techniques".
+  Do NOT create variants by appending -tips, -tools, -techniques, -strategies, -options,
+  -resources, -planning, -management, etc. to an existing tag stem.
+  A new tag is only justified when the topic is genuinely absent from the existing list.
 - When the text introduces a genuinely NEW topic not covered by any existing tag,
   create a new tag. Do NOT force-fit unrelated text into existing tags.
 - Only add the tag "rule" when the user gives the assistant an explicit standing
@@ -79,7 +84,12 @@ Rules:
   "tell me about") is framing — the subject is what matters for retrieval.
   Even if the assistant's response is philosophical or reflective, always include
   at least one tag for the concrete noun or topic the user asked about.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"]}}
+- Tag both what the conversation is about AND what the user reveals about
+  their own life, experiences, or situation — even if mentioned in passing.
+- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase", "status": "active|completed|planned|abandoned|recurring"}}
+  The verb should be the actual action from the conversation (e.g. "led", "ordered", "rearranged", "prefers", "lives in"). Do not categorize — use the real verb.
+  Only extract facts with genuine substance. Skip greetings and filler.
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"], "facts": [{{"subject": "user", "verb": "...", "object": "...", "status": "..."}}]}}
 - The "primary" tag is the single most relevant tag
 - No markdown fences, no extra text
 """
@@ -89,14 +99,20 @@ You are a semantic tagger. Generate {min_tags}-{max_tags} short, lowercase tags 
 
 Rules:
 - Prefer single-word tags ("database", "fitness"). Hyphenate only when ambiguous ("machine-learning").
-- Reuse existing tags when the topic matches. Create new tags only for genuinely new topics.
+- STRONGLY prefer reusing existing tags. Do NOT create near-synonyms or variants
+  (e.g. "data-visualization-tools" when "data-visualization" exists). A new tag is
+  only justified when the topic is genuinely absent from the existing list.
 - Set "temporal" to true when the query references a time position ("the first thing", "at the beginning", "early on").
 - Ignore channel metadata in messages (e.g. "[Telegram ...]", "[message_id: NNN]"). Tag only actual content.
 - Do NOT generate tags about the communication medium itself (e.g. "messaging", "threading", "chat"). Tag substantive topics only.
 - For very short/trivial messages, return fewer than {min_tags} tags if the content does not warrant more.
 - Tag the concrete subject, not conversational framing. "What do you think of trees?" → "trees", NOT "introspection".
+- Tag both what the conversation is about AND what the user reveals about
+  their own life, experiences, or situation — even if mentioned in passing.
+- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase", "status": "active|completed|planned|abandoned|recurring"}}
+  Use the real verb from the conversation (e.g. "led", "ordered", "prefers"). Do not categorize.
 - Generate 2-5 related_tags: alternate words for future recall.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"]}}
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"], "facts": [...]}}
 - No markdown fences, no extra text
 """
 
@@ -377,6 +393,19 @@ class LLMTagGenerator:
         else:
             related_tags = []
 
+        # Parse fact signals (D1)
+        raw_facts = data.get("facts", [])
+        fact_signals: list[FactSignal] = []
+        if isinstance(raw_facts, list):
+            for f in raw_facts:
+                if isinstance(f, dict) and f.get("subject") and f.get("object"):
+                    fact_signals.append(FactSignal(
+                        subject=f.get("subject", ""),
+                        verb=f.get("verb", f.get("role", "")),
+                        object=f.get("object", ""),
+                        status=f.get("status", "active"),
+                    ))
+
         # Update vocabulary
         for tag in tags:
             self._tag_vocabulary[tag] = self._tag_vocabulary.get(tag, 0) + 1
@@ -387,6 +416,7 @@ class LLMTagGenerator:
             source="llm",
             temporal=temporal,
             related_tags=related_tags,
+            fact_signals=fact_signals,
         )
 
     def _normalize_tag(self, tag: str) -> str:

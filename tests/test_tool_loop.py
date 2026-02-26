@@ -28,9 +28,9 @@ from virtual_context.core.tool_loop import (
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_five_tools(self):
+    def test_returns_six_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 5
+        assert len(defs) == 6
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
@@ -39,6 +39,7 @@ class TestVCToolDefinitions:
             "vc_expand_topic",
             "vc_collapse_topic",
             "vc_find_quote",
+            "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",
         }
@@ -662,7 +663,8 @@ class TestRunToolLoop:
         assert result.input_tokens == 300  # 100 + 200
         assert result.output_tokens == 130  # 50 + 80
         assert result.stop_reason == "end_turn"
-        engine.reassemble_context.assert_called_once()
+        # find_quote is read-only — no working-set mutation, so no reassemble
+        engine.reassemble_context.assert_not_called()
         engine.find_quote.assert_called_once_with(
             query="x",
             max_results=20,
@@ -1120,12 +1122,13 @@ class TestVCToolNames:
     def test_is_frozenset(self):
         assert isinstance(VC_TOOL_NAMES, frozenset)
 
-    def test_contains_all_four(self):
+    def test_contains_all_tools(self):
         assert VC_TOOL_NAMES == {
             "vc_expand_topic",
             "vc_collapse_topic",
             "vc_find_quote",
             "vc_find_session",
+            "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",
         }

@@ -33,6 +33,12 @@ def _detect_query_intent(query: str) -> str:
     """Return deterministic intent label for quote retrieval ordering."""
     for pattern in _CURRENT_STATE_PATTERNS:
         if pattern.search(query):
+            # "or" in the query signals a disjunction (e.g. "led or am
+            # currently leading") — the question spans past and present,
+            # so treating it as pure current-state would suppress the
+            # historical part.
+            if re.search(r"\bor\b", query, re.IGNORECASE):
+                return "default"
             return "current_state"
     return "default"
 
@@ -429,9 +435,23 @@ def find_quote(
             reverse=True,
         )
 
-    current_state_multi_session = (
-        query_intent == "current_state" and len(session_items) > 1
-    )
+    current_state_multi_session = False
+    if query_intent == "current_state" and len(session_items) > 1:
+        # Only suppress older sessions when the newest session has a
+        # topically relevant match (FTS/like hit, or semantic >= 0.4).
+        # Without this gate, an unrelated session that happened to be
+        # more recent can suppress the sessions that actually answer
+        # the question (e.g. a gaming-keyboard session suppressing
+        # sneaker-storage sessions).
+        _SEMANTIC_GATE = 0.4
+        newest_group = session_items[0][1]  # already sorted by recency
+        for qr in newest_group:
+            if qr.match_type in ("fts", "like", "description"):
+                current_state_multi_session = True
+                break
+            if qr.match_type == "semantic" and qr.similarity >= _SEMANTIC_GATE:
+                current_state_multi_session = True
+                break
     formatted = []
 
     for session_rank, (session_date, group) in enumerate(session_items, start=1):

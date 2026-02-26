@@ -6,8 +6,6 @@
 
 **Your LLM never forgets. Even in a 500-turn conversation.**
 
-*Validated on [LongMemEval](https://arxiv.org/abs/2407.09110) (ICLR 2025): **100% recall accuracy** (15/15) vs 25% baseline, with **88% token reduction**.*
-
 virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules (each compensating for the others' blind spots) to maintain a living, compressed memory of unbounded conversations.
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
@@ -30,7 +28,7 @@ These approaches are complementary, but optimize different failure modes.
 |---|---|---|---|
 | **Primary mechanism** | Query-time retrieval by embedding similarity | Summarize old history to fit window | Tagged memory + retrieval + compaction + paging tools |
 | **What gets kept** | External documents + recent raw chat | Summaries of old turns + recent raw chat | Multi-layer memory (raw turns, segment summaries, tag summaries) |
-| **Specific fact lookup** | Depends on embedding/query phrasing alignment | Lossy after summarization | `vc_find_quote` + summary/segment drill-down |
+| **Specific fact lookup** | Depends on embedding/query phrasing alignment | Lossy after summarization | `vc_find_quote` + `vc_query_facts` + summary/segment drill-down |
 | **Broad overview ("what did we discuss?")** | Weak unless special orchestration | Can summarize, but often generic | `vc_recall_all` returns all topic summaries within budget |
 | **Time-scoped recall ("last week", "between June and July")** | Custom logic outside core RAG | Requires date fidelity in summaries | `vc_remember_when` with backend-resolved time ranges |
 | **Vocabulary mismatch tolerance** | Embedding-dependent | Low | Related-tag expansion + IDF-weighted ranking + quote search fallback |
@@ -188,6 +186,7 @@ Response tagging - LLM tags the full user+assistant pair (background thread)
     │  ├─ Context bleed gate: embedding similarity blocks stale context on topic shifts
     │  ├─ Retry on _general: if tagger returns only _general, retry with expanded context
     │  ├─ Authoritative tags written to TurnTagIndex (vocabulary-building)
+    │  ├─ Fact signal extraction: lightweight subject/verb/object triples per turn
     │  ├─ Related tags generated for cross-vocabulary retrieval
     │  └─ Compactor generates related_tags at write time (vocabulary bridging)
     │
@@ -198,6 +197,7 @@ Check token thresholds (soft 70%, hard 85%)
 Segment by tag → summarize each segment (concurrent, ThreadPoolExecutor)
     │  ├─ Session dates: forced segment splits on session boundaries
     │  ├─ Tags preserved: LLM can ADD refined/related tags but never REMOVE originals
+    │  ├─ Fact consolidation: per-turn fact signals → structured Fact records with provenance
     │  └─ Related tags written into stored segments for future cross-vocabulary retrieval
     │
     ▼
@@ -281,7 +281,27 @@ Prior conversation topics available for recall:
 </context-topics>
 ```
 
-This costs ~50-200 tokens and enables a natural drill-down loop: the user asks for an overview, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules: use `vc_recall_all` for broad overviews, `vc_remember_when` for time-scoped recall, `vc_find_quote` for specific facts (names, numbers, decisions), `vc_expand_topic` for deeper understanding of a listed topic, and `vc_collapse_topic` to free budget.
+This costs ~50-200 tokens and enables a natural drill-down loop: the user asks for an overview, the LLM sees what's available, synthesizes or asks for clarification, and the next turn pulls full detail via narrow tag retrieval. When paging is enabled, the hint also includes tool usage rules and a budget indicator: use `vc_recall_all` for broad overviews, `vc_remember_when` for time-scoped recall, `vc_find_quote` for specific text (names, numbers, decisions), `vc_query_facts` for structured fact lookup (subject/verb/object filters with semantic expansion), `vc_expand_topic` for deeper understanding of a listed topic, and `vc_collapse_topic` to free budget.
+
+### Structured Fact Extraction (`vc_query_facts`)
+
+Summaries compress information but inevitably lose specific details. When the user says "I run 5K every morning" at turn 14, a summary might retain "runs regularly" but drop the exact distance and timing. virtual-context addresses this with a two-phase fact extraction pipeline.
+
+**Phase 1: Fact signals (per-turn).** The response tagger extracts lightweight subject/verb/object triples from each turn as it's processed. "I run 5K every morning" becomes `{subject: "user", verb: "runs", object: "5K every morning"}`. These are fast, cheap, and stored on the TurnTagIndex.
+
+**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are consolidated into structured `Fact` records with full provenance: subject, verb, what (the core assertion), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
+
+**Querying.** The `vc_query_facts` tool (proxy tool loop) provides structured fact lookup with filters:
+
+```
+vc_query_facts(subject="user", verb="runs")
+vc_query_facts(object_contains="5K")
+vc_query_facts(status="active")
+```
+
+**Semantic verb expansion.** Queries like `verb="runs"` automatically expand to morphologically similar verbs in the database (e.g., "running", "run", "jogs") via sentence-transformer embedding similarity. This means the reader doesn't need to guess the exact verb form used during extraction.
+
+**Semantic fact search.** When structured filters return sparse results, a fallback embedding search matches the query intent against all stored facts' `what` fields by cosine similarity, surfacing relevant facts even when the subject/verb/object decomposition doesn't align.
 
 ### Virtual Memory Paging
 
@@ -302,15 +322,23 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query — FTS results are supplemented with semantic matches to fill the result set. Each call returns a fixed top 20 results. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
 
-**Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, or follow up with `expand_topic`. Up to 5 continuation rounds run transparently within one client-visible request. This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
+**Working-set optimization.** Read-only tools (`find_quote`, `query_facts`, `recall_all`, `remember_when`) skip the expensive context reassembly step. Only `expand_topic` and `collapse_topic` (which change the working set) trigger a full context rebuild. This reduces per-round overhead in tool chains that make multiple read-only calls before expanding.
 
-**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `vc_recall_all`, `vc_remember_when`, `vc_expand_topic`, `vc_collapse_topic`, and `vc_find_quote` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `vc_recall_all` → `vc_remember_when` → `vc_find_quote` → `vc_expand_topic`), using up to 5 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
+**Tool loop.** The reader model can chain multiple tool calls within a single turn. After `find_quote` returns a result, the reader can issue another `find_quote` with a refined query, `query_facts` for structured lookup, or follow up with `expand_topic`. Up to 10 continuation rounds run transparently within one client-visible request (configurable via `paging.max_tool_loops`). This is essential for multi-fact questions: "What is the total number of days I spent in Japan and Chicago?" requires two independent `find_quote` calls to locate each trip's details before computing the sum.
+
+**Budget-aware reader prompting.** The context hint tells the reader exactly how many tool rounds it has, encouraging strategic tool use: "You have a maximum of N tool rounds. Plan your strategy upfront: use diverse queries, not repetitions. If a search already returned the answer, stop and respond." This prevents the reader from exhausting all rounds on redundant searches when the answer was found on the first call.
+
+**Multi-provider tool loop.** The tool loop supports Anthropic, OpenAI, and Gemini as reader models via a `ProviderAdapter` pattern. Each adapter handles provider-specific request/response formats, tool call parsing, and context injection. The reader model can be different from the upstream provider — e.g., use GPT-5 Codex as the reader with an Anthropic upstream, or Gemini as the reader with an OpenAI upstream.
+
+**Resilient continuation.** When the tool loop exhausts all rounds and forces a final text-only continuation, transient HTTP errors (server 500s) are retried once with a brief delay before falling back to error state. This prevents a single upstream hiccup from discarding an otherwise complete answer.
+
+**Live MCP via proxy.** The proxy intercepts `tool_use` blocks in the LLM's streaming response, fulfills `vc_recall_all`, `vc_remember_when`, `vc_expand_topic`, `vc_collapse_topic`, `vc_find_quote`, and `vc_query_facts` calls from the engine, and injects `tool_result` back into the conversation, all within a single client-visible request. The LLM can chain tools within one turn (e.g. `vc_recall_all` → `vc_query_facts` → `vc_find_quote` → `vc_expand_topic`), using up to 10 continuation loops transparently. Every proxy-connected client gets MCP-equivalent tool access with zero configuration, zero client-side changes, and zero extra user turns.
 
 ### Three-Layer Memory Hierarchy
 
 **Layer 0: Raw turns.** The live conversation in the context window. Protected recent turns are never compacted.
 
-**Layer 1: Segment summaries.** When token pressure hits thresholds, consecutive same-tag turns are grouped and summarized by an LLM. Each segment preserves key decisions, entities, specific names, and action items. Original tags are never lost; the LLM can add tags during summarization but never remove them.
+**Layer 1: Segment summaries.** When token pressure hits thresholds, consecutive same-tag turns are grouped and summarized by an LLM. Each segment preserves key decisions, entities, specific names, and action items. Original tags are never lost; the LLM can add tags during summarization but never remove them. Structured facts (subject/verb/object triples with temporal status) are extracted during compaction and stored separately for precise querying via `vc_query_facts`.
 
 **Layer 2: Tag summaries.** A greedy set cover algorithm finds the minimum set of tags that covers every turn. For each cover tag, all segment summaries are rolled up into a single tag-level summary. A focused session might produce 3 cover tags; a sprawling multi-topic session produces 10+. Only stale summaries (where new segments exist since the last build) are recomputed.
 
@@ -357,12 +385,14 @@ This is the second emergent property of the system. Vocabulary convergence (the 
 
 - **Vocabulary convergence**: Tag reuse and canonicalization naturally collapse synonyms into stable tag vocabularies over long sessions.
 - **Automatic tag refinement**: High-frequency broad tags split into narrower sub-tags, increasing retrieval precision without manual taxonomy work.
-- **Tool-first recall loops**: Models tend to converge on `vc_find_quote`/`vc_recall_all`/`vc_remember_when` → `vc_expand_topic` sequences for multi-step recall.
+- **Tool-first recall loops**: Models tend to converge on `vc_find_quote`/`vc_query_facts`/`vc_recall_all`/`vc_remember_when` → `vc_expand_topic` sequences for multi-step recall.
 - **Quote-then-context chaining**: Exact snippets from `find_quote` naturally route follow-up expansion to the right topic context.
+- **Fact-then-quote verification**: Structured facts from `query_facts` provide quick answers; the reader chains into `find_quote` to verify or locate the original conversational context.
 - **Session-date anchoring**: Time-scoped recall (`vc_remember_when`) biases responses toward chronology-correct evidence.
 - **Vocabulary entropy reduction**: Canonicalization + tag feedback lowers random tag drift and improves cross-turn consistency.
 - **Budget-shaped recall selection**: Budget-aware assembly consistently favors high-value context under tight token ceilings.
 - **Compaction survivorship effects**: Frequently reinforced facts stay highly retrievable, while low-signal details trend toward summary-level recall.
+- **Semantic verb bridging**: Verb expansion at query time lets the reader find facts regardless of morphological form — "runs" finds facts stored as "running", "jogging", "exercises".
 
 Split tags are registered as aliases via TagCanonicalizer, so historical queries against the old tag still resolve. New sub-tags enter the vocabulary feedback loop immediately. The splitter never reuses existing tag names (which would cause cascading splits); it always creates new compound tags.
 
@@ -645,6 +675,10 @@ curl http://127.0.0.1:5757/v1/messages \
 
 **Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. Client SDKs store this as part of the message. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state (TurnTagIndex + compaction watermark) from the store, so no re-ingestion is needed. Multiple concurrent conversations are routed independently via a session registry.
 
+**Session suppression.** When a session has no compacted data (no tag summaries, no stored segments), the full virtual-context pipeline is suppressed — no context injection, no tool definitions, no history filtering. The request passes through as-is with minimal overhead. Once the first compaction runs and summaries exist, the pipeline activates automatically.
+
+**Dynamic session discovery.** A `vc_find_session` tool is injected into the reader's tool definitions only when multiple sessions exist in the store. This lets the reader discover and reference prior sessions when answering cross-session questions, without cluttering the tool set in single-session conversations.
+
 **History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period; the tag vocabulary is immediately available for inbound matching.
 
 **Format-agnostic.** Auto-detects Anthropic, OpenAI, and Gemini request formats via a `PayloadFormat` strategy pattern and injects context accordingly: into `system` for Anthropic, into `messages[0]` for OpenAI, into `system_instruction.parts` for Gemini. Paging tool interception works across Anthropic and Gemini formats (`tool_use`/`tool_result` and `functionCall`/`functionResponse` respectively).
@@ -700,6 +734,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Tool | `expand_topic` | Expand a topic to segment or full detail depth |
 | Tool | `collapse_topic` | Collapse a topic back to summary or none |
 | Tool | `find_quote` | Full-text search across all stored conversation text (fixed top 20 results per call) |
+| Tool | `query_facts` | Structured fact lookup with subject/verb/object/status filters and semantic expansion |
 | Resource | `virtualcontext://domains` | List all tags |
 | Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
 | Prompt | `recall` | Suggest context retrieval for a topic |
@@ -717,16 +752,16 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 |-----------|------|---------|
 | **Engine** | `engine.py` | Main orchestrator: `on_message_inbound()`, `on_turn_complete()`, `ingest_history()` |
 | **TurnTagIndex** | `core/turn_tag_index.py` | Live per-turn tag index, velocity tracking, greedy set cover |
-| **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback |
+| **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback + per-turn fact signal extraction |
 | **EmbeddingTagGenerator** | `core/embedding_tag_generator.py` | Sentence-transformers cosine similarity against tag vocabulary |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
 | **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, FTS fallback |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
-| **Compactor** | `core/compactor.py` | LLM summarization + tag summary rollup, concurrent via ThreadPoolExecutor |
+| **Compactor** | `core/compactor.py` | LLM summarization + fact extraction + tag summary rollup, concurrent via ThreadPoolExecutor |
 | **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
-| **ToolLoop** | `core/tool_loop.py` | Synchronous multi-round tool execution for reader model |
+| **ToolLoop** | `core/tool_loop.py` | Multi-provider multi-round tool execution for reader model (Anthropic/OpenAI/Gemini) |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
 | **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
 | **ProxyServer** | `proxy/server.py` | HTTP proxy: enrichment, filtering, history ingestion, session continuity |
@@ -736,7 +771,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 ### Storage Backends
 
-**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search. Single file, no external dependencies.
+**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search, structured fact tables with provenance tracking. Single file, no external dependencies.
 
 **FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly.
 
@@ -792,35 +827,6 @@ The proxy has been validated in production with OpenClaw (Telegram bot) handling
 - **Embedding inbound matching**: Live tag vocabularies of 40+ tags correctly matched ("help me with css styling" → `[css, design]`, "what about font-weight" → `[css]` via semantic similarity)
 - **History ingestion**: 43 pre-existing conversation turns tagged and indexed in a single pass, vocabulary immediately available for subsequent requests
 
-## Benchmark: LongMemEval
-
-[LongMemEval](https://arxiv.org/abs/2407.09110) (ICLR 2025) is a 500-question benchmark designed to test long-term memory in multi-session conversations. Each question requires recalling specific facts, temporal relationships, or knowledge updates from a haystack of ~116K tokens across dozens of sessions.
-
-**Setup**: 15 sampled questions across all 5 categories. Baseline: Claude Sonnet 4.5 with full haystack (~116K tokens). VC: Claude Sonnet 4.5 with virtual-context retrieval + tool loop.
-
-|  | Correct | Accuracy | Avg Tokens |
-|--|---------|----------|------------|
-| **Baseline** (full haystack) | 3/12 | 25% | ~115K |
-| **virtual-context** | 15/15 | **100%** | ~14K |
-
-**Per-category breakdown:**
-
-| Category | Baseline | VC |
-|----------|----------|----|
-| knowledge-update | 0/4 | 4/4 |
-| multi-session | 0/4 | 7/7 |
-| single-session-assistant | 1/1 | 1/1 |
-| single-session-user | 0/1 | 1/1 |
-| temporal-reasoning | 2/2 | 2/2 |
-
-**Key findings:**
-- **Knowledge-update questions** (where facts change across sessions) are where virtual-context dominates. Session date propagation lets the reader distinguish "under my bed" (May 25) from "shoe rack in closet" (May 29) — the baseline sees both but can't determine which is current.
-- **Temporal reasoning** works because session dates flow through the entire pipeline: ingestion → segmenter → compaction → storage → find_quote results → assembled context. The reader sees `session="2023/03/04"` and can compute "March 4 to April 1 = 4 weeks."
-- **Multi-session recall** benefits from the tool loop: the reader chains multiple `find_quote` calls within a single turn to locate facts scattered across different sessions (e.g., finding Japan trip duration and Chicago trip duration independently, then summing).
-- **88% token reduction**: average 14K tokens injected vs 115K baseline, with higher accuracy. The system retrieves what matters instead of dumping everything.
-
-Full results: [`benchmarks/longmemeval/RESULTS.md`](benchmarks/longmemeval/RESULTS.md)
-
 ## Development
 
 ```bash
@@ -828,7 +834,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # ~1050 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # ~1170 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 

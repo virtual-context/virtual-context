@@ -11,7 +11,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, Fact, FactSignal, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
@@ -235,6 +235,59 @@ class SQLiteStore(ContextStore):
             conn.execute("ALTER TABLE tag_summaries ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # D1: migrate role→verb — drop old schema if it has the 'role' column
+        try:
+            cur = conn.execute("PRAGMA table_info(facts)")
+            cols = [row[1] for row in cur.fetchall()]
+            if cols and "role" in cols and "verb" not in cols:
+                conn.execute("DROP TABLE IF EXISTS fact_tags")
+                conn.execute("DROP TABLE IF EXISTS facts")
+        except sqlite3.OperationalError:
+            pass
+        # D1: facts + fact_tags tables
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL DEFAULT '',
+                verb TEXT NOT NULL DEFAULT '',
+                object TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                what TEXT NOT NULL DEFAULT '',
+                who TEXT NOT NULL DEFAULT '',
+                when_date TEXT NOT NULL DEFAULT '',
+                "where" TEXT NOT NULL DEFAULT '',
+                why TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                segment_ref TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                turn_numbers_json TEXT NOT NULL DEFAULT '[]',
+                mentioned_at TEXT NOT NULL DEFAULT '',
+                superseded_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
+            CREATE INDEX IF NOT EXISTS idx_facts_verb ON facts(verb);
+            CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status);
+            CREATE INDEX IF NOT EXISTS idx_facts_subject_verb ON facts(subject, verb);
+            CREATE INDEX IF NOT EXISTS idx_facts_segment_ref ON facts(segment_ref);
+            CREATE INDEX IF NOT EXISTS idx_facts_session_id ON facts(session_id);
+
+            CREATE TABLE IF NOT EXISTS fact_tags (
+                fact_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (fact_id, tag),
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fact_tags_tag ON fact_tags(tag);
+        """)
+        # Cascade delete facts when parent segment is deleted
+        try:
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS segments_facts_ad AFTER DELETE ON segments BEGIN
+                    DELETE FROM facts WHERE segment_ref = old.ref;
+                END;
+            """)
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -778,6 +831,11 @@ class SQLiteStore(ContextStore):
                 "primary_tag": e.primary_tag,
                 "timestamp": _dt_to_str(e.timestamp),
                 "session_date": e.session_date,
+                "fact_signals": [
+                    {"subject": fs.subject, "verb": fs.verb,
+                     "object": fs.object, "status": fs.status}
+                    for fs in e.fact_signals
+                ] if e.fact_signals else [],
             }
             for e in state.turn_tag_entries
         ])
@@ -833,6 +891,15 @@ class SQLiteStore(ContextStore):
                 primary_tag=e["primary_tag"],
                 timestamp=_str_to_dt(e["timestamp"]),
                 session_date=e.get("session_date", ""),
+                fact_signals=[
+                    FactSignal(
+                        subject=fs.get("subject", ""),
+                        verb=fs.get("verb", fs.get("role", "")),
+                        object=fs.get("object", ""),
+                        status=fs.get("status", ""),
+                    )
+                    for fs in e.get("fact_signals", [])
+                ],
             )
             for e in entries_raw
         ]
@@ -887,6 +954,157 @@ class SQLiteStore(ContextStore):
             except (json.JSONDecodeError, TypeError):
                 continue
         return result
+
+    # ------------------------------------------------------------------
+    # D1: Fact Extraction
+    # ------------------------------------------------------------------
+
+    def store_facts(self, facts: list[Fact]) -> int:
+        """Store extracted facts + fact_tags in a single transaction."""
+        if not facts:
+            return 0
+        conn = self._get_conn()
+        count = 0
+        for fact in facts:
+            conn.execute(
+                """INSERT OR REPLACE INTO facts
+                (id, subject, verb, object, status, what, who, when_date,
+                 "where", why, tags_json, segment_ref, session_id,
+                 turn_numbers_json, mentioned_at, superseded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fact.id,
+                    fact.subject,
+                    fact.verb,
+                    fact.object,
+                    fact.status,
+                    fact.what,
+                    fact.who,
+                    fact.when_date,
+                    fact.where,
+                    fact.why,
+                    json.dumps(fact.tags),
+                    fact.segment_ref,
+                    fact.session_id,
+                    json.dumps(fact.turn_numbers),
+                    _dt_to_str(fact.mentioned_at),
+                    fact.superseded_by,
+                ),
+            )
+            # Update fact_tags junction
+            conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
+            for tag in fact.tags:
+                conn.execute(
+                    "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
+                    (fact.id, tag),
+                )
+            count += 1
+        conn.commit()
+        return count
+
+    def _row_to_fact(self, row: sqlite3.Row) -> Fact:
+        """Convert a sqlite3.Row from the facts table to a Fact dataclass."""
+        return Fact(
+            id=row["id"],
+            subject=row["subject"],
+            verb=row["verb"],
+            object=row["object"],
+            status=row["status"],
+            what=row["what"],
+            who=row["who"],
+            when_date=row["when_date"],
+            where=row["where"],
+            why=row["why"],
+            tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
+            segment_ref=row["segment_ref"],
+            session_id=row["session_id"],
+            turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
+            mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
+            superseded_by=row["superseded_by"],
+        )
+
+    def get_unique_fact_verbs(self) -> list[str]:
+        """Return all distinct non-empty verbs from non-superseded facts."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def query_facts(
+        self,
+        *,
+        subject: str | None = None,
+        verb: str | None = None,
+        verbs: list[str] | None = None,
+        object_contains: str | None = None,
+        status: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[Fact]:
+        """Query facts by structured filters."""
+        conn = self._get_conn()
+        conditions: list[str] = []
+        params: list[object] = []
+
+        if subject is not None:
+            conditions.append("f.subject = ?")
+            params.append(subject)
+        if verbs is not None:
+            # Disjunctive LIKE match across multiple expanded verbs
+            like_clauses = ["f.verb LIKE ?" for _ in verbs]
+            conditions.append("(" + " OR ".join(like_clauses) + ")")
+            params.extend(f"%{v}%" for v in verbs)
+        elif verb is not None:
+            conditions.append("f.verb LIKE ?")
+            params.append(f"%{verb}%")
+        if object_contains is not None:
+            conditions.append("f.object LIKE ?")
+            params.append(f"%{object_contains}%")
+        if status is not None:
+            conditions.append("f.status = ?")
+            params.append(status)
+        # Only return non-superseded facts by default
+        conditions.append("f.superseded_by IS NULL")
+
+        if tags:
+            # JOIN fact_tags and require overlap
+            placeholders = ",".join("?" for _ in tags)
+            sql = f"""
+                SELECT DISTINCT f.* FROM facts f
+                JOIN fact_tags ft ON f.id = ft.fact_id
+                WHERE ft.tag IN ({placeholders})
+            """
+            params_list = list(tags) + params
+            if conditions:
+                sql += " AND " + " AND ".join(conditions)
+            sql += f" ORDER BY f.mentioned_at DESC LIMIT ?"
+            params_list.append(limit)
+            rows = conn.execute(sql, params_list).fetchall()
+        else:
+            where = " AND ".join(conditions) if conditions else "1=1"
+            sql = f"SELECT * FROM facts f WHERE {where} ORDER BY f.mentioned_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        return [self._row_to_fact(row) for row in rows]
+
+    def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
+        """Get all facts extracted from a given segment."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM facts WHERE segment_ref = ? ORDER BY mentioned_at",
+            (segment_ref,),
+        ).fetchall()
+        return [self._row_to_fact(row) for row in rows]
+
+    def get_fact_count_by_tags(self) -> dict[str, int]:
+        """Return {tag: fact_count} for context hint annotations."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
+        ).fetchall()
+        return {row["tag"]: row["cnt"] for row in rows}
 
     def close(self) -> None:
         if self._conn:

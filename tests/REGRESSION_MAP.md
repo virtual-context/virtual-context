@@ -311,6 +311,22 @@ Use `pytest -m regression` to run all regression tests.
   - `test_broad_query.py::TestContextTurnsPostCompaction::test_no_context_turns_post_compaction`
   - `test_broad_query.py::TestContextTurnsPostCompaction::test_context_turns_passed_pre_compaction`
 
+### BUG-031 — Current-state suppression triggers on topically irrelevant sessions
+
+- **Symptom**: 07741c45 "Where do I currently keep my old sneakers?" — reader answered "under my bed" instead of "shoe rack in closet". The current-state suppression promoted an unrelated gaming-keyboard session (sim=0.26) to HIGHEST_PRIORITY and hid the sneaker sessions.
+- **Root cause**: `quote_search.py` activated suppression whenever `current_state` intent + multiple sessions, without checking if the newest session was topically relevant.
+- **Fix**: Added topical relevance gate — newest session must have FTS/like/description match or semantic similarity >= 0.4 before suppression activates.
+- **Tests**:
+  - `test_find_quote.py::TestFindQuoteIntentAndRecency::test_weak_semantic_newest_session_does_not_suppress`
+
+### BUG-032 — Semantic fact search ignores reader's object_contains filter
+
+- **Symptom**: 6d550036 "How many projects have I led?" — reader over-counts (answers 4 instead of 2). `query_facts(verb="led", object_contains="project", status="active")` returns "User leads a team of five engineers" — object is "a team of five engineers", not "project".
+- **Root cause**: `_semantic_fact_search` fetches ALL facts for the subject ignoring `object_contains`, then matches by embedding similarity to the intent context. Facts semantically close to "projects led" but failing the explicit `object_contains="project"` filter were returned.
+- **Fix**: Post-filter semantic results against `object_contains` when provided — fact must contain the substring in its `object` or `what` field.
+- **Tests**:
+  - `test_verb_expansion.py::TestQueryFactsSemanticIntegration::test_semantic_search_respects_object_contains_filter`
+
 ---
 
 ## By Test File
@@ -330,4 +346,5 @@ Use `pytest -m regression` to run all regression tests.
 | `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |
 | `test_tag_splitter.py` | BUG-011, BUG-012 |
-| `test_find_quote.py` | BUG-029 |
+| `test_find_quote.py` | BUG-029, BUG-031 |
+| `test_verb_expansion.py` | BUG-032 |

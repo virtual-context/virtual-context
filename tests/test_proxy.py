@@ -3352,7 +3352,7 @@ class TestInjectVCTools:
         names = [t["name"] for t in result["tools"]]
         assert names[0] == "web_search"
         assert "vc_expand_topic" in names
-        assert len(names) == 6  # web_search + 5 VC tools
+        assert len(names) == 7  # web_search + 6 VC tools
 
     def test_sets_required_policy_when_requested(self):
         engine = MagicMock()

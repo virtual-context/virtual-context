@@ -331,7 +331,7 @@ class TestProxyFindQuoteTool:
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
         assert "vc_remember_when" in names
-        assert len(tools) == 5  # expand, collapse, find_quote, recall_all, remember_when
+        assert len(tools) == 6  # expand, collapse, find_quote, query_facts, recall_all, remember_when
 
     def test_find_quote_tool_schema(self):
         from virtual_context.core.tool_loop import vc_tool_definitions
@@ -806,6 +806,62 @@ class TestFindQuoteIntentAndRecency:
         assert out["query_intent"] == "current_state"
         sessions = [row["session"] for row in out["results"]]
         assert sessions == ["2026/02/20", "2025/12/01"]
+
+    @pytest.mark.regression("BUG-031")
+    def test_weak_semantic_newest_session_does_not_suppress(self):
+        """An unrelated newest session matched via weak semantic similarity
+        must NOT trigger current-state suppression of topically relevant
+        older sessions.  Regression: 07741c45 sneakers question — gaming
+        keyboard session (sim=0.26) suppressed shoe-storage sessions."""
+        store = MagicMock()
+        # FTS returns the topically relevant older sessions
+        store.search_full_text.return_value = [
+            QuoteResult(
+                text="I keep my old sneakers under my bed",
+                tag="sneaker-care",
+                segment_ref="seg-may25",
+                tags=["sneaker-care"],
+                match_type="fts",
+                session_date="2023/05/25 (Thu) 10:04",
+            ),
+            QuoteResult(
+                text="storing my old sneakers in a shoe rack",
+                tag="closet-organization",
+                segment_ref="seg-may29",
+                tags=["closet-organization"],
+                match_type="fts",
+                session_date="2023/05/29 (Mon) 15:01",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        # Semantic search returns a weak, unrelated match from a newer session
+        semantic = MagicMock()
+        semantic.semantic_search.return_value = [
+            QuoteResult(
+                text="I got a new cherry-mx-brown keyboard",
+                tag="cherry-mx-brown",
+                segment_ref="seg-jun9",
+                tags=["cherry-mx-brown"],
+                match_type="semantic",
+                similarity=0.26,
+                session_date="2023/06/09 (Fri) 12:00",
+            ),
+        ]
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="Where do I currently keep my old sneakers",
+            max_results=5,
+        )
+
+        assert out["query_intent"] == "current_state"
+        # The newest session (Jun 9) has only weak semantic match —
+        # suppression must NOT activate.
+        assert out.get("current_state_multi_session") is not True
+        # All excerpts must be fully visible, not replaced with suppression text
+        for row in out["results"]:
+            assert "[Older session" not in row["excerpt"]
 
 
 @pytest.mark.regression("BUG-029")

@@ -10,6 +10,8 @@ from typing import Callable
 from ..types import (
     CompactionResult,
     CompactorConfig,
+    Fact,
+    FactSignal,
     LLMProvider,
     Message,
     SegmentMetadata,
@@ -17,6 +19,7 @@ from ..types import (
     TaggedSegment,
     TagPromptRule,
     TagSummary,
+    TemporalStatus,
 )
 from .cost_tracker import CostTracker
 
@@ -102,7 +105,20 @@ Respond with JSON:
 
 For "related_tags", generate 3-8 alternate terms someone might use to refer to these
 concepts later (e.g. if discussing "materialized views", related_tags might include
-"caching", "precomputed", "feed-optimization", "query-cache")."""
+"caching", "precomputed", "feed-optimization", "query-cache").
+
+Also extract facts from the conversation. For each fact:
+- "subject": who (usually "user"; proper names for others)
+- "verb": the exact action verb (e.g. "led", "built", "prefers", "lives in", "ordered")
+- "object": what (specific noun phrase)
+- "status": one of: active, completed, planned, abandoned, recurring
+- "what": one-sentence summary of the fact
+- "who": people involved (omit if n/a)
+- "when": date if mentioned (ISO format, omit if n/a)
+- "where": location (omit if n/a)
+- "why": context/significance (omit if n/a)
+Include "facts" in the JSON response.
+Only extract facts with genuine substance. Skip greetings and filler."""
 
 
 class DomainCompactor:
@@ -124,19 +140,28 @@ class DomainCompactor:
         self.tag_rules = tag_rules or []
         self._cost_tracker = cost_tracker
 
-    def compact(self, segments: list[TaggedSegment]) -> list[CompactionResult]:
+    def compact(
+        self,
+        segments: list[TaggedSegment],
+        fact_signals_by_segment: dict[str, list[FactSignal]] | None = None,
+    ) -> list[CompactionResult]:
         """Summarize each segment independently.
 
         Uses ThreadPoolExecutor for concurrent summarization when there are
         multiple segments. Falls back to sequential for single segments.
+
+        *fact_signals_by_segment* maps segment.id → list of FactSignal
+        collected from per-turn tagging.  Passed as hints to the compactor
+        prompt for verification and consolidation.
         """
+        signals = fact_signals_by_segment or {}
         logger.info(
             "Compacting %d segments (%d workers)...",
             len(segments), min(self.config.max_concurrent_summaries, len(segments)),
         )
         if len(segments) <= 1:
             # Sequential for single segment — no threading overhead
-            return [self._compact_one(s) for s in segments]
+            return [self._compact_one(s, signals.get(s.id, [])) for s in segments]
 
         max_workers = min(self.config.max_concurrent_summaries, len(segments))
 
@@ -146,7 +171,7 @@ class DomainCompactor:
         done_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
-                executor.submit(self._compact_one, segment): i
+                executor.submit(self._compact_one, segment, signals.get(segment.id, [])): i
                 for i, segment in enumerate(segments)
             }
             for future in as_completed(future_to_idx):
@@ -179,7 +204,9 @@ class DomainCompactor:
 
         return results
 
-    def _compact_one(self, segment: TaggedSegment) -> CompactionResult:
+    def _compact_one(
+        self, segment: TaggedSegment, fact_signals: list[FactSignal] | None = None,
+    ) -> CompactionResult:
         """Summarize a single segment."""
         conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
@@ -195,14 +222,29 @@ class DomainCompactor:
         # Check for custom prompt from tag rules
         custom_prompt = self._get_prompt_for_tags(segment.tags)
 
+        # D1: build signal hints from per-turn tagger fact signals
+        signals_text = ""
+        if fact_signals:
+            hint_lines = []
+            for s in fact_signals:
+                if s.subject and s.object:
+                    hint_lines.append(f"- {s.subject} {s.verb} {s.object} ({s.status})")
+            if hint_lines:
+                signals_text = (
+                    "\n\nPer-turn fact signals (verify and consolidate with full context):\n"
+                    + "\n".join(hint_lines)
+                )
+
         if custom_prompt:
             prompt = (
                 f"{custom_prompt}\n\n"
                 f"Target length: {target_tokens} tokens or fewer.\n\n"
-                f"Conversation:\n{conversation_text}\n\n"
+                f"Conversation:\n{conversation_text}"
+                f"{signals_text}\n\n"
                 'Respond with JSON: {{"summary": "...", "entities": ["..."], '
                 '"key_decisions": ["..."], "action_items": ["..."], '
-                '"date_references": ["..."], "refined_tags": ["tag1", "tag2"]}}'
+                '"date_references": ["..."], "refined_tags": ["tag1", "tag2"], '
+                '"facts": [...]}}'
             )
         else:
             tags_str = ", ".join(segment.tags) if segment.tags else segment.primary_tag
@@ -211,6 +253,8 @@ class DomainCompactor:
                 target_tokens=target_tokens,
                 conversation_text=conversation_text,
             )
+            if signals_text:
+                prompt += signals_text
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
@@ -269,6 +313,35 @@ class DomainCompactor:
             for m in segment.messages
         ]
 
+        # D1: Parse extracted facts
+        valid_statuses = {e.value for e in TemporalStatus}
+        raw_facts = parsed.get("facts", [])
+        facts: list[Fact] = []
+        if isinstance(raw_facts, list):
+            for f in raw_facts:
+                if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
+                    continue
+                status = f.get("status", "active")
+                if status not in valid_statuses:
+                    status = "active"
+                def _str(val) -> str:
+                    if isinstance(val, list):
+                        return ", ".join(str(v) for v in val)
+                    return str(val) if val else ""
+
+                facts.append(Fact(
+                    subject=_str(f.get("subject", "")),
+                    verb=_str(f.get("verb", f.get("role", ""))),
+                    object=_str(f.get("object", "")),
+                    status=status,
+                    what=_str(f.get("what", "")),
+                    who=_str(f.get("who", "")),
+                    when_date=_str(f.get("when", "")),
+                    where=_str(f.get("where", "")),
+                    why=_str(f.get("why", "")),
+                    tags=refined_tags,
+                ))
+
         return CompactionResult(
             segment_id=segment.id,
             primary_tag=segment.primary_tag,
@@ -280,6 +353,7 @@ class DomainCompactor:
             metadata=metadata,
             full_text=conversation_text,
             messages=messages_dicts,
+            facts=facts,
         )
 
     @staticmethod

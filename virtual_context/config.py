@@ -239,6 +239,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         ]),
         auto_promote=paging_raw.get("auto_promote", True),
         auto_evict=paging_raw.get("auto_evict", True),
+        max_tool_loops=paging_raw.get("max_tool_loops", 10),
     )
 
     cfg = VirtualContextConfig(

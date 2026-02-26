@@ -10,6 +10,55 @@ from typing import Callable, Literal, Protocol, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
+# Fact Extraction (D1)
+# ---------------------------------------------------------------------------
+
+class TemporalStatus(str, Enum):
+    """Whether the fact is ongoing, completed, or aspirational."""
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    PLANNED = "planned"
+    ABANDONED = "abandoned"
+    RECURRING = "recurring"
+
+
+@dataclass
+class FactSignal:
+    """Lightweight fact signal extracted per-turn by the tagger.
+    Cheap to produce, may be noisy/incomplete. Consolidated at compaction."""
+    subject: str = ""
+    verb: str = ""       # free-form action verb
+    object: str = ""
+    status: str = ""     # TemporalStatus value
+
+
+@dataclass
+class Fact:
+    """Consolidated queryable fact.
+    Produced at compaction from signals + multi-turn context."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Structured queryable fields
+    subject: str = ""
+    verb: str = ""              # free-form action verb
+    object: str = ""
+    status: str = "active"      # TemporalStatus value
+    # Dimensions
+    what: str = ""
+    who: str = ""
+    when_date: str = ""         # session date or specific date (ISO)
+    where: str = ""
+    why: str = ""
+    # Provenance
+    tags: list[str] = field(default_factory=list)
+    segment_ref: str = ""
+    session_id: str = ""
+    turn_numbers: list[int] = field(default_factory=list)
+    mentioned_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Knowledge update chain
+    superseded_by: str | None = None  # fact_id that replaces this fact
+
+
+# ---------------------------------------------------------------------------
 # Message & Turn
 # ---------------------------------------------------------------------------
 
@@ -39,6 +88,7 @@ class TagResult:
     source: str  # "llm", "keyword", "fallback"
     temporal: bool = False  # True when query references a time position ("first thing", "early on")
     related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
+    fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
 
 
 # Pattern constants — canonical definitions in patterns.py, re-exported here for compat
@@ -98,6 +148,7 @@ class TurnTagEntry:
     primary_tag: str = "_general"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     session_date: str = ""         # e.g. "2023/05/25 (Thu) 10:04" or ISO timestamp
+    fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
 
 
 @dataclass
@@ -202,6 +253,7 @@ class CompactionResult:
     full_text: str = ""
     messages: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    facts: list[Fact] = field(default_factory=list)  # D1: extracted facts
 
 
 @dataclass
@@ -336,6 +388,7 @@ class RetrievalResult:
     retrieval_metadata: dict = field(default_factory=dict)
     cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
     temporal: bool = False  # True when the query references a time position
+    facts: list[Fact] = field(default_factory=list)  # D1: matching facts
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +444,7 @@ class PagingConfig:
     ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
+    max_tool_loops: int = 10    # max continuation rounds in tool loop
 
 
 # ---------------------------------------------------------------------------

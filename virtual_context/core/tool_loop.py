@@ -44,6 +44,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_collapse_topic",
     "vc_find_quote",
     "vc_find_session",
+    "vc_query_facts",
     "vc_recall_all",
     "vc_remember_when",
 })
@@ -154,6 +155,40 @@ def vc_tool_definitions() -> list[dict]:
             },
         },
         {
+            "name": "vc_query_facts",
+            "description": (
+                "Query extracted facts with structured filters. Use for counting, "
+                "listing, or filtering questions like 'how many X have I done', "
+                "'what projects am I leading', 'things I prefer', 'what tools do I use'. "
+                "Returns matching facts with count. For counting questions, omit status "
+                "to get the total across all statuses in a single call. "
+                "Verb is automatically expanded to include morphological variants (e.g. "
+                "'led' also matches 'leads'). Object filter is auto-relaxed if too narrow."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Who the fact is about. Usually 'user'.",
+                    },
+                    "verb": {
+                        "type": "string",
+                        "description": "Action verb to search for (e.g. 'led', 'built', 'prefers'). Automatically expanded to include similar verbs.",
+                    },
+                    "object_contains": {
+                        "type": "string",
+                        "description": "Keyword to match in the object field.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "completed", "planned", "abandoned", "recurring"],
+                        "description": "Temporal status filter. Omit for counting queries to get all statuses at once.",
+                    },
+                },
+            },
+        },
+        {
             "name": "vc_remember_when",
             "description": (
                 "Find memory by topic within a time window. "
@@ -191,6 +226,16 @@ def vc_tool_definitions() -> list[dict]:
 
 
 _SUPPRESSION_MARKER = "[Older session ("
+
+# Tools that change the VC paging working set.  Only expand/collapse
+# actually modify the loaded topic set; all other tools (find_quote,
+# query_facts, recall_all, etc.) are read-only queries.  We only call
+# reassemble_context() after working-set mutations to avoid re-injecting
+# an unchanged system prompt on every continuation — saving significant tokens.
+_WORKING_SET_TOOLS: frozenset[str] = frozenset({
+    "vc_expand_topic",
+    "vc_collapse_topic",
+})
 
 
 def _vc_find_session_def() -> dict:
@@ -391,6 +436,56 @@ def execute_vc_tool(
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
+        elif name == "vc_query_facts":
+            meta = engine.query_facts(
+                subject=tool_input.get("subject"),
+                verb=tool_input.get("verb"),
+                object_contains=tool_input.get("object_contains"),
+                status=tool_input.get("status"),
+                _return_meta=True,
+                _intent_context=intent_context,
+            )
+            facts = meta["facts"]
+            result = {
+                "count": len(facts),
+                "facts": [
+                    {
+                        "subject": f.subject,
+                        "verb": f.verb,
+                        "object": f.object,
+                        "status": f.status,
+                        "what": f.what,
+                        "who": f.who,
+                        "when": f.when_date,
+                        "where": f.where,
+                        "why": f.why,
+                        "session_id": f.session_id,
+                        "tags": f.tags,
+                    }
+                    for f in facts
+                ],
+            }
+            # Status breakdown from the filtered results
+            status_counts: dict[str, int] = {}
+            for f in facts:
+                s = f.status or "unknown"
+                status_counts[s] = status_counts.get(s, 0) + 1
+            if status_counts:
+                result["by_status"] = status_counts
+            # When a status filter was used, show the total across ALL
+            # statuses so the reader can see the grand total without
+            # making separate per-status calls.
+            if meta.get("total_all_statuses") is not None:
+                result["total_all_statuses"] = meta["total_all_statuses"]
+                result["all_statuses_breakdown"] = meta["all_statuses"]
+            # Annotate so the reader knows what broadening happened
+            notes = []
+            if meta.get("expanded_verbs"):
+                notes.append(f"verb expanded to match: {meta['expanded_verbs']}")
+            if meta.get("semantic_note"):
+                notes.append(meta["semantic_note"])
+            if notes:
+                result["search_notes"] = "; ".join(notes)
         elif name == "vc_remember_when":
             result = engine.remember_when(
                 query=tool_input.get("query", ""),
@@ -409,7 +504,7 @@ def execute_vc_tool(
 # Synchronous tool loop
 # ---------------------------------------------------------------------------
 
-_MAX_LOOPS = 5
+_MAX_LOOPS = 10
 
 
 def _parse_sse_response(text: str) -> dict:
@@ -551,8 +646,13 @@ def run_tool_loop(
                     adapter.build_tool_result(tc["id"], tc["name"], result_str)
                 )
 
-            # Re-assemble context with updated working set
-            new_prepend = engine.reassemble_context()
+            # Re-assemble context only when working-set tools were used
+            # (expand, collapse, find_quote, etc.).  Pure query_facts rounds
+            # don't change the working set, so re-injecting just wastes tokens.
+            used_names = {tc["name"] for tc in vc_tools}
+            needs_reassemble = bool(used_names & _WORKING_SET_TOOLS)
+
+            new_prepend = engine.reassemble_context() if needs_reassemble else ""
 
             # Build continuation request
             cont_body = adapter.build_continuation(
@@ -660,6 +760,13 @@ def run_tool_loop(
                 result.continuation_count += 1
                 result.raw_requests.append(copy.deepcopy(cont_body))
                 resp = client.post(url, headers=headers, json=cont_body)
+                if resp.status_code >= 300:
+                    logger.warning(
+                        "Forced text continuation failed (HTTP %d), retrying once",
+                        resp.status_code,
+                    )
+                    time.sleep(1.0)
+                    resp = client.post(url, headers=headers, json=cont_body)
                 if resp.status_code < 300:
                     forced_data = _parse_provider_http_response(resp)
                     result.raw_responses.append(forced_data)
@@ -670,7 +777,7 @@ def run_tool_loop(
                     result.stop_reason = adapter.get_stop_reason(forced_data)
                 else:
                     logger.error(
-                        "Forced text continuation failed: HTTP %d",
+                        "Forced text continuation failed after retry: HTTP %d",
                         resp.status_code,
                     )
                     result.stop_reason = "error"
