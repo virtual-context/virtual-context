@@ -26,6 +26,9 @@ build/
 virtual-context-*.yaml
 !virtual-context.yaml.example
 
+# Internal docs
+CHANGELOG.md
+
 # Scratch / temporary files
 *.bak
 *.json

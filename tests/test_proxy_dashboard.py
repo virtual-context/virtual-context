@@ -208,6 +208,8 @@ def mock_engine():
     assembled = AssembledContext(prepend_text="mock context")
     engine.on_message_inbound.return_value = assembled
     engine.on_turn_complete.return_value = None
+    engine.tag_turn.return_value = None
+    engine.compact_if_needed.return_value = None
     engine._turn_tag_index = MagicMock()
     engine._turn_tag_index.get_active_tags.return_value = {"auth", "api"}
     engine._turn_tag_index.get_tags_for_turn.return_value = None
@@ -336,11 +338,11 @@ class TestMetricsIntegration:
         # The key test is that create_app doesn't crash with metrics + dashboard.
 
     def test_proxy_state_emits_turn_complete_event(self):
-        """ProxyState._run_turn_complete emits turn_complete and compaction events."""
-        from virtual_context.types import CompactionReport, Message
+        """ProxyState._run_tag_turn emits turn_complete event."""
+        from virtual_context.types import Message
 
         engine = MagicMock()
-        engine.on_turn_complete.return_value = None
+        engine.tag_turn.return_value = None  # no compaction
         engine._turn_tag_index = MagicMock()
 
         entry = MagicMock()
@@ -355,7 +357,7 @@ class TestMetricsIntegration:
             Message(role="user", content="hello"),
             Message(role="assistant", content="hi"),
         ]
-        state._run_turn_complete(history)
+        state._run_tag_turn(history)
 
         events = metrics.events_since(-1)
         assert len(events) == 1
@@ -366,8 +368,8 @@ class TestMetricsIntegration:
         assert "complete_ms" in events[0]
 
     def test_proxy_state_emits_compaction_event(self):
-        """When on_turn_complete triggers compaction, a compaction event is emitted."""
-        from virtual_context.types import CompactionReport, CompactionResult, Message
+        """When compaction runs in background, a compaction event is emitted."""
+        from virtual_context.types import CompactionReport, CompactionResult, CompactionSignal, Message
 
         engine = MagicMock()
         results = [
@@ -382,7 +384,12 @@ class TestMetricsIntegration:
             tag_summaries_built=2,
             results=results,
         )
-        engine.on_turn_complete.return_value = report
+        signal = CompactionSignal(
+            priority="soft", current_tokens=4000,
+            budget_tokens=5000, overflow_tokens=0,
+        )
+        engine.tag_turn.return_value = signal
+        engine.compact_if_needed.return_value = report
         engine._compacted_through = 20
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.get_tags_for_turn.return_value = None
@@ -394,7 +401,10 @@ class TestMetricsIntegration:
             Message(role="user", content="hello"),
             Message(role="assistant", content="hi"),
         ]
-        state._run_turn_complete(history)
+        # Run tag turn (fires compact in background)
+        state._run_tag_turn(history)
+        # Wait for background compact to finish
+        state.wait_for_complete()
 
         events = metrics.events_since(-1)
         assert len(events) == 2  # turn_complete + compaction
@@ -411,7 +421,7 @@ class TestMetricsIntegration:
     def test_proxy_state_no_metrics(self):
         """ProxyState works without metrics (backwards compat)."""
         engine = MagicMock()
-        engine.on_turn_complete.return_value = None
+        engine.tag_turn.return_value = None
         state = ProxyState(engine)
         # Should not raise even without metrics
         from virtual_context.types import Message
@@ -419,8 +429,8 @@ class TestMetricsIntegration:
             Message(role="user", content="hello"),
             Message(role="assistant", content="hi"),
         ]
-        state._run_turn_complete(history)
-        engine.on_turn_complete.assert_called_once()
+        state._run_tag_turn(history)
+        engine.tag_turn.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

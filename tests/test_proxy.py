@@ -549,24 +549,61 @@ class TestExtractAssistantText:
 
 
 class TestProxyState:
+    def test_wait_for_tag_noop_when_no_pending(self):
+        engine = MagicMock()
+        state = ProxyState(engine)
+        state.wait_for_tag()  # should not raise
+
     def test_wait_for_complete_noop_when_no_pending(self):
         engine = MagicMock()
         state = ProxyState(engine)
         state.wait_for_complete()  # should not raise
 
-    def test_fire_and_wait(self):
+    def test_fire_and_wait_for_tag(self):
         engine = MagicMock()
+        engine.tag_turn.return_value = None  # no compaction needed
+        state = ProxyState(engine)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+        state.fire_turn_complete(history)
+        state.wait_for_tag()
+        engine.tag_turn.assert_called_once_with(history, payload_tokens=None)
+
+    def test_fire_and_wait_for_complete(self):
+        engine = MagicMock()
+        engine.tag_turn.return_value = None  # no compaction needed
         state = ProxyState(engine)
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()
-        engine.on_turn_complete.assert_called_once_with(history, payload_tokens=None)
+        engine.tag_turn.assert_called_once_with(history, payload_tokens=None)
 
-    def test_error_in_turn_complete_is_caught(self):
+    def test_compaction_fires_in_background(self):
         engine = MagicMock()
-        engine.on_turn_complete.side_effect = RuntimeError("boom")
+        signal = MagicMock()  # non-None → compaction needed
+        engine.tag_turn.return_value = signal
+        engine.compact_if_needed.return_value = None
+        state = ProxyState(engine)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+        state.fire_turn_complete(history)
+        state.wait_for_complete()  # waits for both tag + compact
+        engine.tag_turn.assert_called_once()
+        engine.compact_if_needed.assert_called_once_with(history, signal)
+
+    def test_error_in_tag_turn_is_caught(self):
+        engine = MagicMock()
+        engine.tag_turn.side_effect = RuntimeError("boom")
         state = ProxyState(engine)
         history = [Message(role="user", content="hi")]
+        state.fire_turn_complete(history)
+        state.wait_for_tag()  # should not raise
+
+    def test_error_in_compact_is_caught(self):
+        engine = MagicMock()
+        signal = MagicMock()
+        engine.tag_turn.return_value = signal
+        engine.compact_if_needed.side_effect = RuntimeError("compact boom")
+        state = ProxyState(engine)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()  # should not raise
 
@@ -583,6 +620,8 @@ def mock_engine():
     assembled = AssembledContext(prepend_text="mock context here")
     engine.on_message_inbound.return_value = assembled
     engine.on_turn_complete.return_value = None
+    engine.tag_turn.return_value = None
+    engine.compact_if_needed.return_value = None
     return engine
 
 
@@ -2000,6 +2039,7 @@ class TestDashboardSettings:
             engine.config = real_config
             engine.on_message_inbound.return_value = AssembledContext()
             engine.on_turn_complete.return_value = None
+            engine.tag_turn.return_value = None
             MockEngine.return_value = engine
             app = create_app(upstream="http://fake:9999", config_path=None)
         with TestClient(app) as client:
@@ -2076,6 +2116,7 @@ class TestCompactionConcurrencyGuard:
             engine.config = cfg
             engine.on_message_inbound.return_value = AssembledContext()
             engine.on_turn_complete.return_value = None
+            engine.tag_turn.return_value = None
             engine._turn_tag_index = MagicMock()
             engine._turn_tag_index.entries = []
             engine._compacted_through = 0
@@ -3284,6 +3325,7 @@ class TestPassthroughToggle:
             engine.config = real_config
             engine.on_message_inbound.return_value = AssembledContext()
             engine.on_turn_complete.return_value = None
+            engine.tag_turn.return_value = None
             engine._turn_tag_index = TurnTagIndex()
             MockEngine.return_value = engine
             app = create_app(upstream="http://fake:9999", config_path=None)
@@ -3695,6 +3737,7 @@ def paging_test_client(tmp_path):
         engine.config = real_config
         engine.on_message_inbound.return_value = AssembledContext()
         engine.on_turn_complete.return_value = None
+        engine.tag_turn.return_value = None
         engine._turn_tag_index = TurnTagIndex()
         engine._resolve_paging_mode.return_value = "autonomous"
         engine._compacted_through = 0

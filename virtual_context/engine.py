@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from .types import (
     ChunkEmbedding,
     CompactionReport,
     CompactionResult,
+    CompactionSignal,
     DepthLevel,
     EngineStateSnapshot,
     Message,
@@ -94,6 +96,8 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
+        self._last_tag_ms: float = 0.0
+        self._last_compact_ms: float = 0.0
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
         self._paging = PagingManager(
             store=self._store,
@@ -412,11 +416,15 @@ class VirtualContextEngine:
 
         if ptype == "generic_openai":
             from .providers.generic_openai import GenericOpenAIProvider
+            api_key_env = provider_config.get("api_key_env", "")
+            api_key = provider_config.get("api_key") or (
+                os.environ.get(api_key_env, "") if api_key_env else "not-needed"
+            )
             return GenericOpenAIProvider(
                 base_url=provider_config.get("base_url", "http://127.0.0.1:11434/v1"),
                 model=provider_config.get("model", self.config.summarization.model),
                 temperature=self.config.summarization.temperature,
-                api_key=provider_config.get("api_key", "not-needed"),
+                api_key=api_key,
             )
 
         if ptype == "anthropic":
@@ -554,18 +562,24 @@ class VirtualContextEngine:
 
         return assembled
 
-    def on_turn_complete(
+    def tag_turn(
         self,
         conversation_history: list[Message],
         payload_tokens: int | None = None,
-    ) -> CompactionReport | None:
-        """After LLM responds: check thresholds, compact if needed.
+    ) -> CompactionSignal | None:
+        """Phase 1 of turn processing: tag the latest turn and check thresholds.
+
+        Fast (~2-3s with LLM tagger). Must complete before the next inbound
+        request so the turn-tag index is up-to-date for retrieval.
+
+        Returns a CompactionSignal if compaction is needed, None otherwise.
 
         *payload_tokens* (proxy mode): actual client payload token count.
         Overrides the stripped conversation_history token count in the
         compaction monitor so thresholds trigger at the right level.
         """
         # Tag the latest round trip
+        _t_tag = time.monotonic()
         latest_pair = self._get_latest_turn_pair(conversation_history)
         if latest_pair:
             combined_text = " ".join(m.content for m in latest_pair)
@@ -613,6 +627,8 @@ class VirtualContextEngine:
                 fact_signals=tag_result.fact_signals,
             ))
 
+        self._last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
+
         # Check for overly-broad tags needing splitting
         if self._tag_splitter:
             self._check_and_split_broad_tags(conversation_history)
@@ -627,8 +643,24 @@ class VirtualContextEngine:
         signal = self._monitor.check(snapshot)
 
         if signal is None:
+            self._last_compact_ms = 0.0
             self._save_state(conversation_history)
-            return None
+
+        return signal
+
+    def compact_if_needed(
+        self,
+        conversation_history: list[Message],
+        signal: CompactionSignal,
+    ) -> CompactionReport | None:
+        """Phase 2 of turn processing: run compaction.
+
+        Slow (~10s with LLM summarizer). Can run in background after
+        tag_turn() completes — the next request only needs the tag index.
+
+        *signal*: the CompactionSignal returned by tag_turn().
+        """
+        _t_compact = time.monotonic()
 
         if self._compactor is None:
             logger.warning(
@@ -741,8 +773,25 @@ class VirtualContextEngine:
                 from datetime import timedelta
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
 
+        self._last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
         self._save_state(conversation_history)
         return report
+
+    def on_turn_complete(
+        self,
+        conversation_history: list[Message],
+        payload_tokens: int | None = None,
+    ) -> CompactionReport | None:
+        """Full tag+compact cycle (blocking).
+
+        Convenience wrapper that calls tag_turn() then compact_if_needed().
+        Used by CLI, tests, and non-proxy callers that don't need async
+        compaction.
+        """
+        signal = self.tag_turn(conversation_history, payload_tokens)
+        if signal is None:
+            return None
+        return self.compact_if_needed(conversation_history, signal)
 
     def _check_and_split_broad_tags(
         self, conversation_history: list[Message],

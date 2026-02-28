@@ -114,8 +114,11 @@ class ProxyState:
         self.conversation_history: list[Message] = []
         self.metrics = metrics
         self.upstream = upstream
-        self._pool = ThreadPoolExecutor(max_workers=1)
-        self._pending_complete: Future | None = None
+        self._pool = ThreadPoolExecutor(max_workers=1)       # tagging (serialized)
+        self._compact_pool = ThreadPoolExecutor(max_workers=1)  # compaction (background)
+        self._pending_tag: Future | None = None
+        self._pending_compact: Future | None = None
+        self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
         self._ingested_sessions: set[str] = set()
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
@@ -239,63 +242,67 @@ class ProxyState:
         }
         return snap
 
+    def wait_for_tag(self) -> None:
+        """Block until tagging finishes. Compaction may still be running."""
+        if self._pending_tag is not None:
+            self._pending_tag.result()
+            self._pending_tag = None
+
     def wait_for_complete(self) -> None:
-        """Block until the pending on_turn_complete finishes."""
-        if self._pending_complete is not None:
-            self._pending_complete.result()
-            self._pending_complete = None
+        """Block until tag + compact both finish (backward compat)."""
+        self.wait_for_tag()
+        if self._pending_compact is not None:
+            self._pending_compact.result()
+            self._pending_compact = None
 
     def fire_turn_complete(
         self,
         history_snapshot: list[Message],
         payload_tokens: int | None = None,
     ) -> None:
-        """Submit on_turn_complete to background thread."""
-        self._pending_complete = self._pool.submit(
-            self._run_turn_complete, history_snapshot, payload_tokens,
+        """Submit tagging to background thread.
+
+        Compaction (if needed) fires automatically in a separate pool
+        once tagging completes — the next request only waits for tagging.
+        """
+        self._pending_tag = self._pool.submit(
+            self._run_tag_turn, history_snapshot, payload_tokens,
         )
 
-    def _run_turn_complete(
+    def _run_tag_turn(
         self,
         history: list[Message],
         payload_tokens: int | None = None,
     ) -> None:
+        """Fast path: tag the turn, emit metrics, fire compaction if needed."""
         t0 = time.monotonic()
         turn = len(history) // 2 - 1
         session_id = self.engine.config.session_id
         try:
-            report = self.engine.on_turn_complete(
+            signal = self.engine.tag_turn(
                 history, payload_tokens=payload_tokens,
             )
+            self._last_compact_priority = signal.priority if signal else ""
 
-            complete_ms = round((time.monotonic() - t0) * 1000, 1)
+            tag_ms = round((time.monotonic() - t0) * 1000, 1)
             entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
             _tags = entry.tags if entry else []
             _primary = entry.primary_tag if entry else ""
+            _needs_compact = signal is not None
             print(
-                f"[T{turn}] COMPLETE {int(complete_ms)}ms "
+                f"[T{turn}] TAG {int(tag_ms)}ms "
                 f"tags=[{', '.join(_tags)}] primary={_primary}"
-                + (f" COMPACTION freed={report.tokens_freed}t" if report else "")
+                + (" → COMPACT queued" if _needs_compact else "")
             )
             logger.info(
-                "T%d complete (%dms) session=%s compacted_through=%d history=%d%s",
-                turn, int(complete_ms), session_id[:12],
+                "T%d tagged (%dms) session=%s compacted_through=%d history=%d%s",
+                turn, int(tag_ms), session_id[:12],
                 getattr(self.engine, "_compacted_through", 0),
                 len(history),
-                " COMPACTION" if report else "",
+                " compact_queued" if _needs_compact else "",
             )
 
-            if report is not None:
-                logger.info(
-                    "  compaction: %d segments, freed %d tokens, tags=%s, "
-                    "summaries_built=%d",
-                    report.segments_compacted,
-                    report.tokens_freed,
-                    report.tags,
-                    report.tag_summaries_built,
-                )
-
-            # Emit turn_complete event
+            # Emit turn_complete event (tag phase)
             if self.metrics:
                 entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
                 active_tags = list(
@@ -315,7 +322,8 @@ class ProxyState:
                     "turn": turn,
                     "tags": entry.tags if entry else [],
                     "primary_tag": entry.primary_tag if entry else "",
-                    "complete_ms": complete_ms,
+                    "complete_ms": tag_ms,
+                    "tag_ms": tag_ms,
                     "active_tags": active_tags,
                     "store_tag_count": len(self.engine._store.get_all_tags()),
                     "turn_pair_tokens": turn_pair_tokens,
@@ -346,30 +354,72 @@ class ProxyState:
                     })
                     self.engine._last_split_result = None  # consume
 
-                # Emit compaction event if compaction occurred
-                if report is not None:
-                    original_tokens = sum(
-                        r.original_tokens for r in report.results
-                    )
-                    summary_tokens = sum(
-                        r.summary_tokens for r in report.results
-                    )
-                    self.metrics.record({
-                        "type": "compaction",
-                        "turn": turn,
-                        "segments": report.segments_compacted,
-                        "tokens_freed": report.tokens_freed,
-                        "original_tokens": original_tokens,
-                        "summary_tokens": summary_tokens,
-                        "tags": report.tags,
-                        "tag_summaries_built": report.tag_summaries_built,
-                        "compacted_through": getattr(
-                            self.engine, "_compacted_through", 0
-                        ),
-                        "session_id": session_id,
-                    })
+            # Fire compaction in background if needed
+            if signal is not None:
+                self._pending_compact = self._compact_pool.submit(
+                    self._run_compact, history, signal, turn,
+                )
+
         except Exception as e:
-            logger.error("on_turn_complete error: %s", e, exc_info=True)
+            logger.error("tag_turn error: %s", e, exc_info=True)
+
+    def _run_compact(
+        self,
+        history: list[Message],
+        signal: object,
+        turn: int,
+    ) -> None:
+        """Background compaction — runs in _compact_pool, doesn't block next request."""
+        session_id = self.engine.config.session_id
+        with self._compaction_lock:
+            t0 = time.monotonic()
+            try:
+                report = self.engine.compact_if_needed(history, signal)
+                compact_ms = round((time.monotonic() - t0) * 1000, 1)
+
+                if report is not None:
+                    print(
+                        f"[T{turn}] COMPACT {int(compact_ms)}ms "
+                        f"freed={report.tokens_freed}t segments={report.segments_compacted}"
+                    )
+                    logger.info(
+                        "T%d compaction (%dms): %d segments, freed %d tokens, tags=%s, "
+                        "summaries_built=%d",
+                        turn, int(compact_ms),
+                        report.segments_compacted,
+                        report.tokens_freed,
+                        report.tags,
+                        report.tag_summaries_built,
+                    )
+
+                    # Emit compaction event
+                    if self.metrics:
+                        original_tokens = sum(
+                            r.original_tokens for r in report.results
+                        )
+                        summary_tokens = sum(
+                            r.summary_tokens for r in report.results
+                        )
+                        self.metrics.record({
+                            "type": "compaction",
+                            "turn": turn,
+                            "compact_ms": compact_ms,
+                            "segments": report.segments_compacted,
+                            "tokens_freed": report.tokens_freed,
+                            "original_tokens": original_tokens,
+                            "summary_tokens": summary_tokens,
+                            "tags": report.tags,
+                            "tag_summaries_built": report.tag_summaries_built,
+                            "compacted_through": getattr(
+                                self.engine, "_compacted_through", 0
+                            ),
+                            "session_id": session_id,
+                        })
+                else:
+                    logger.info("T%d compaction skipped (no messages to compact)", turn)
+
+            except Exception as e:
+                logger.error("compact_if_needed error: %s", e, exc_info=True)
 
     def _history_ingested(self) -> bool:
         """Whether the current session's history has been ingested."""
@@ -675,6 +725,7 @@ class ProxyState:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
+        self._compact_pool.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1271,7 +1322,12 @@ def create_app(
         if state:
             try:
                 t0 = time.monotonic()
-                await asyncio.to_thread(state.wait_for_complete)
+                await asyncio.to_thread(state.wait_for_tag)
+                # Backpressure: if last tag_turn hit the hard threshold,
+                # wait for pending compaction to finish before proceeding.
+                # Soft threshold → async (no wait), hard → block until caught up.
+                if state._last_compact_priority == "hard":
+                    await asyncio.to_thread(state.wait_for_complete)
                 wait_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 state.conversation_history.append(
