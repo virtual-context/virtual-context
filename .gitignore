@@ -18,31 +18,19 @@ build/
 *.swp
 *.swo
 
-# Storage (runtime data)
+# Runtime data
 .virtualcontext/
-.virtualcontext-compact-test/
+.virtualcontext-*/
 
-# Stress test run outputs
-100run*.json
-runcount_*.json
-vc-session.json
-prompts-coding-agent.json
+# Config files (may contain API keys)
+virtual-context-*.yaml
+!virtual-context.yaml.example
 
-# Config files with API keys
-virtual-context-openrouter.yaml
-
-# Benchmark data & results
-benchmarks/longmemeval/data/
-longmemeval_results_*.json
-
-# Temporary scratch/experiment files
-full_payload.json
-old_tags.json
-new_tags.json
-prev_tags.json
-longmemeval_q2_test.json
-retag_experiment.py
+# Scratch / temporary files
 *.bak
+*.json
+!pyproject.toml
+!package.json
 
 # OS
 .DS_Store
