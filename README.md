@@ -20,6 +20,22 @@ Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-e
 
 The result: an LLM that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.
 
+### Configurable Context Ceiling
+
+Most teams set `context_window` to whatever the model supports — 128K, 200K — and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 120K tokens of raw history are missed more often than the same facts concentrated in a managed 30K window.
+
+virtual-context lets you set an artificial context ceiling well below the model's maximum:
+
+```yaml
+context_window: 30000  # Run a 200K model at 30K
+```
+
+The compression hierarchy (raw turns → segment summaries → tag summaries) keeps the window within this budget. When the ceiling is hit, compaction fires: stale turns are summarized, facts are extracted and indexed, and the working set reshapes around what's active. The result is a smaller, denser context where every token carries signal.
+
+**Cost impact:** A 200K-capable model running at 30K uses ~85% fewer input tokens per request. Over thousands of requests, this is the difference between a viable product and a cost problem.
+
+**Quality impact:** Concentrated context means the model's attention isn't spread across 120K tokens of mostly-stale history. Relevant facts surface through targeted retrieval and structured tools rather than hoping the model notices them buried in a long window. The managed context window becomes a feature, not a limitation.
+
 ## Virtual-Context vs RAG vs Compaction
 
 These approaches are complementary, but optimize different failure modes.
@@ -33,6 +49,7 @@ These approaches are complementary, but optimize different failure modes.
 | **Time-scoped recall ("last week", "between June and July")** | Custom logic outside core RAG | Requires date fidelity in summaries | `vc_remember_when` with backend-resolved time ranges |
 | **Vocabulary mismatch tolerance** | Embedding-dependent | Low | Related-tag expansion + IDF-weighted ranking + quote search fallback |
 | **Context budget control** | Append retrieved chunks | Compression with limited selective rehydration | Explicit paging: expand/collapse topics and bounded assembly |
+| **Cost at scale** | Grows with corpus size (more chunks retrieved) | Grows with conversation length (summaries accumulate) | Configurable ceiling: run a 200K model at 30K, ~85% fewer input tokens |
 | **Interpretability** | Medium (scores/chunks) | Low-medium (summary quality dependent) | High (tags, tool calls, budgets, sections, stored summaries) |
 | **Failure mode** | Miss relevant chunk | Over-compress / lose detail | Requires tool-aware prompting + memory hygiene |
 | **Best fit** | Knowledge/doc retrieval | Simple long-chat cost reduction | Long-running agent memory with mixed query types |
@@ -217,13 +234,15 @@ The same codebase handles legal briefs, medical notes, coding sessions, recipe p
 
 ### Two-Tagger Architecture
 
-virtual-context splits inbound and response tagging into two distinct operations with different objectives.
+virtual-context separates tagging from fact extraction, and splits tagging itself into two distinct operations with different objectives. Most memory systems go straight from raw text to fact/knowledge extraction in a single LLM call, processing each chunk independently with no surrounding context. virtual-context treats these as separate concerns, each with its own extraction strategy and context window.
 
-**Inbound tagger** (embedding, runs before LLM responds): Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. Deterministic, subsecond, zero LLM cost.
+**Inbound tagger** (embedding, runs before LLM responds): Uses sentence-transformers (`all-MiniLM-L6-v2`) to compute cosine similarity between the user's message and the existing tag vocabulary. Closed-set: it can only return tags that already exist in the TurnTagIndex. Deterministic, subsecond, zero LLM cost. Because it can only match existing tags, it is structurally incapable of hallucinating novel topics into your context window.
 
-**Response tagger** (LLM, runs after LLM responds): Sees the full user+assistant pair and generates authoritative semantic tags. This is the creative, vocabulary-building pass, inventing new tags when new topics emerge, generating related tags for cross-vocabulary retrieval, and detecting temporal query intent. Runs in a background thread so it never blocks the next request.
+**Response tagger** (LLM, runs after LLM responds): Sees the full user+assistant turn pair plus N recent preceding turns (configurable via `context_lookback_pairs`, default 5) as surrounding context. A context bleed gate (embedding similarity threshold) prevents stale context from a previous topic from leaking in on topic shifts. This is the creative, vocabulary-building pass: inventing new tags when new topics emerge, generating related tags for cross-vocabulary retrieval, and extracting per-turn fact signals. Runs in a background thread so it never blocks the next request.
 
-The inbound tagger drives retrieval and filtering (what stored context to inject, which history turns to keep). The response tagger drives the permanent record (what tags describe this turn for all future queries). Each tagger is optimized for its task: the inbound tagger prizes safety (never contaminate the context), the response tagger prizes richness (capture every nuance for future recall).
+**Context-aware extraction.** The response tagger doesn't process turns in isolation. When the user says "yes, that one" or "can you expand on that?", a tagger seeing only that message has nothing to work with. By feeding surrounding turn pairs with bleed gating, the tagger correctly classifies ambiguous messages and extracts meaningful fact signals even from short, context-dependent replies. If the tagger still returns only `_general`, it retries with expanded context before falling back to tag inheritance from the TurnTagIndex.
+
+The inbound tagger drives retrieval and filtering (what stored context to inject, which history turns to keep). The response tagger drives the permanent record (what tags describe this turn, and what facts it contains, for all future queries). Each tagger is optimized for its task: the inbound tagger prizes safety (never contaminate the context), the response tagger prizes richness (capture every nuance for future recall).
 
 ### Broad Overview Tool (`vc_recall_all`)
 
@@ -285,11 +304,13 @@ This costs ~50-200 tokens and enables a natural drill-down loop: the user asks f
 
 ### Structured Fact Extraction (`vc_query_facts`)
 
-Summaries compress information but inevitably lose specific details. When the user says "I run 5K every morning" at turn 14, a summary might retain "runs regularly" but drop the exact distance and timing. virtual-context addresses this with a two-phase fact extraction pipeline.
+Summaries compress information but inevitably lose specific details. When the user says "I run 5K every morning" at turn 14, a summary might retain "runs regularly" but drop the exact distance and timing. Most memory systems extract facts in a single LLM pass and trust the output directly: raw text goes in, extracted facts come out, and those facts are stored as-is. virtual-context takes a fundamentally different approach with a two-phase pipeline where per-turn signals are treated as hints, not ground truth.
 
-**Phase 1: Fact signals (per-turn).** The response tagger extracts lightweight subject/verb/object triples from each turn as it's processed. "I run 5K every morning" becomes `{subject: "user", verb: "runs", object: "5K every morning"}`. These are fast, cheap, and stored on the TurnTagIndex.
+**Phase 1: Fact signals (per-turn).** The response tagger extracts lightweight subject/verb/object triples from each turn as it's processed, with full surrounding context (the same context lookback and bleed gating used for tagging). "I run 5K every morning" becomes `{subject: "user", verb: "runs", object: "5K every morning"}`. These are fast, cheap, and stored on the TurnTagIndex. Critically, they are not yet committed as permanent facts.
 
-**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are consolidated into structured `Fact` records with full provenance: subject, verb, what (the core assertion), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
+**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are verified and consolidated into structured `Fact` records with the full multi-turn segment as context. The consolidation pass can see the complete conversation flow across multiple turns: what the user asked, how the assistant responded, what was clarified or corrected. This means a fact signal from turn 14 gets validated against turns 12-18 before becoming a permanent record. The result is a structured `Fact` with full provenance: subject, verb, what (the core assertion), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
+
+**Why two phases matter.** A single-pass extractor processing "yes, let's go with PostgreSQL" in isolation has no idea what "yes" refers to. It might extract nothing, or hallucinate a fact. virtual-context's response tagger sees the surrounding turns ("Should we use PostgreSQL or MySQL for the user table?") and generates the correct signal. The consolidation pass then verifies it against the full segment before storing a permanent fact. Two chances to get it right, each with progressively more context.
 
 **Querying.** The `vc_query_facts` tool (proxy tool loop) provides structured fact lookup with filters:
 
@@ -433,6 +454,8 @@ tag_rules:
 
 Higher-priority tags get assembled first. If the budget runs out, lower-priority summaries are dropped. The budget breakdown is fully transparent: core context, context hint, tag sections, and conversation history each have their own allocation.
 
+This budget enforcement is what makes the configurable context ceiling work in practice. A 30K ceiling doesn't mean losing information — it means the assembler is forced to prioritize, and the compression hierarchy ensures everything is still available at some depth level. The model reasons over a dense, curated context instead of a sprawling raw history.
+
 ## Configuration
 
 Create `virtual-context.yaml` in your project root:
@@ -440,7 +463,7 @@ Create `virtual-context.yaml` in your project root:
 ```yaml
 version: "0.2"
 storage_root: ".virtualcontext"
-context_window: 120000
+context_window: 30000    # intentionally below model max — see "Configurable Context Ceiling"
 
 # Tags emerge from conversation - the LLM generates them
 tag_generator:
@@ -789,7 +812,13 @@ Retry logic with exponential backoff on both.
 
 **Sync-first.** Zero async/await in the engine. All I/O is synchronous httpx. Concurrent compaction uses `ThreadPoolExecutor`, not asyncio. Both engine entry points complete in under a second with a local Ollama model. The proxy uses FastAPI async for HTTP handling but calls the sync engine via `asyncio.to_thread`.
 
-**Two-tagger architecture.** Inbound tagging (before the LLM responds) and response tagging (after) use different models optimized for different tasks. The recommended configuration uses embedding cosine similarity for inbound (closed-set, deterministic, can't hallucinate novel tags) and an LLM for response (creative, vocabulary-building, generates related tags).
+**Tagging and fact extraction are separate concerns.** Tagging drives retrieval (which stored context to inject). Fact extraction captures structured knowledge (what the user said, decided, or asked for). Both happen during response processing, but they serve different purposes and are optimized independently. Most memory systems conflate retrieval indexing with knowledge extraction into a single LLM call.
+
+**Two-tagger architecture.** Inbound tagging (before the LLM responds) and response tagging (after) use different models optimized for different tasks. The recommended configuration uses embedding cosine similarity for inbound (closed-set, deterministic, can't hallucinate novel tags) and an LLM for response (creative, vocabulary-building, generates related tags). The response tagger sees surrounding conversation turns, not just the current message, so it can correctly handle ambiguous or context-dependent replies.
+
+**Two-phase fact verification.** Per-turn fact signals are treated as hints, not ground truth. They are verified and consolidated at compaction time with the full multi-turn segment as context. This catches extraction errors that single-pass systems commit permanently.
+
+**Compression improves reasoning, not just cost.** A 200K model running at a 30K ceiling doesn't just save tokens — it concentrates the model's attention on curated, high-signal context. Research on long-context attention degradation ("lost in the middle") shows that facts buried deep in long sequences are missed more often than the same facts presented in a shorter, structured window. The configurable ceiling turns context compression from a cost optimization into a quality improvement.
 
 **Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
 
