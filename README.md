@@ -830,6 +830,30 @@ Retry logic with exponential backoff on both.
 
 **Tool chain integrity.** The history filter preserves API-required message dependencies atomically. Every `tool_use` block in an assistant message is kept with its corresponding `tool_result`, and vice versa. Forward and backward scanning ensures multi-step tool chains are never broken, even when surrounding turns are filtered out.
 
+**The virtual memory analogy is literal, not metaphorical.** Every component in VC maps to a systems-level equivalent:
+
+```
+OS Virtual Memory                    virtual-context
+─────────────────                    ───────────────
+Physical RAM            ←→  Context window
+Disk / swap             ←→  SQLite (segments, facts, summaries)
+Page tables             ←→  TurnTagIndex (per-turn topic tracking)
+Page faults             ←→  vc_expand_topic (demand paging)
+Page eviction (LRU)     ←→  Compaction (topic-aware eviction)
+Working set             ←→  Active paging depths per tag
+Address space           ←→  Full conversation history (unbounded)
+Memory protection       ←→  Bleed gating (topic-shift isolation)
+madvise() hints         ←→  Model-tiered delegation (strong models manage, weak models get managed)
+```
+
+Before virtual memory, programs were limited to physical RAM. Developers manually segmented code into overlays and loaded them from disk. Virtual memory removed the constraint transparently — programs addressed more memory than physically existed, and the OS handled paging. This enabled modern multitasking, process isolation, and every program running today.
+
+LLMs have the same constraint: the context window is their RAM. The industry's current answers — bigger windows (just buy more RAM), RAG (manual overlay management), prompt caching (cheaper RAM) — mirror the pre-virtual-memory era. They work, but they're bounded. A 1M token window is still a ceiling. Manual retrieval requires the agent to know what it doesn't know.
+
+virtual-context removes the constraint. The agent sees what appears to be infinite context. Paging, compression, eviction, and retrieval happen transparently. The agent just reasons, and relevant context surfaces when needed. This is the same architectural decision, applied to a different substrate.
+
+The implication: any agent that needs to run continuously — across hundreds of turns, across sessions, across days — needs a memory management layer between itself and the LLM, the same way any program that needs more than physical RAM needs a memory management layer between itself and the hardware. Bigger windows don't solve this. External knowledge bases don't solve this. Only active, transparent, in-conversation context management solves this.
+
 ## Stress-Tested
 
 virtual-context has been validated across multiple dimensions: adversarial prompt suites, production traffic, and deliberate edge cases.
