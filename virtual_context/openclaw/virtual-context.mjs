@@ -32,7 +32,7 @@ export default {
         // Inject as system message at position 1 (after existing system)
         const injected = {
           role: "user",
-          content: `<virtual-context>\n${stdout}\n</virtual-context>`,
+          content: `<system-reminder>\n${stdout}\n</system-reminder>`,
           timestamp: Date.now(),
         };
 

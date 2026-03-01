@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -189,16 +190,24 @@ class SQLiteStore(ContextStore):
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: sqlite3.Connection | None = None
+        self._local = threading.local()
         self._ensure_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=5)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-        return self._conn
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is None:
+            # 30s busy timeout: tool_output_interceptor writes on the request
+            # path while compaction holds a write lock in a background thread.
+            # 5s was too short — caused sqlite3.OperationalError: database is
+            # locked, crashing the proxy with 500s (A/B test 2026-03-01).
+            conn = sqlite3.connect(
+                str(self.db_path), timeout=30, isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn = conn
+        return conn
 
     def _ensure_schema(self) -> None:
         conn = self._get_conn()
@@ -288,6 +297,33 @@ class SQLiteStore(ContextStore):
             """)
         except sqlite3.OperationalError:
             pass
+        # Tool output storage for intercepted large tool_result blocks
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tool_outputs (
+                ref TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                command TEXT NOT NULL DEFAULT '',
+                turn INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                original_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS tool_outputs_fts
+                USING fts5(content, content=tool_outputs, content_rowid=rowid);
+        """)
+        try:
+            conn.executescript("""
+                CREATE TRIGGER IF NOT EXISTS tool_outputs_ai AFTER INSERT ON tool_outputs BEGIN
+                    INSERT INTO tool_outputs_fts(rowid, content) VALUES (new.rowid, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS tool_outputs_ad AFTER DELETE ON tool_outputs BEGIN
+                    INSERT INTO tool_outputs_fts(tool_outputs_fts, rowid, content)
+                        VALUES('delete', old.rowid, old.content);
+                END;
+            """)
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -364,42 +400,47 @@ class SQLiteStore(ContextStore):
             metadata_dict["session_date"] = segment.metadata.session_date
         metadata_json = json.dumps(metadata_dict)
 
-        conn.execute(
-            """INSERT OR REPLACE INTO segments
-            (ref, session_id, primary_tag, summary, full_text, messages_json,
-             metadata_json, summary_tokens, full_tokens, compression_ratio,
-             compaction_model, created_at, start_timestamp, end_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                segment.ref,
-                segment.session_id,
-                primary_tag,
-                summary_text,
-                full_text,
-                json.dumps(segment.messages, default=str),
-                metadata_json,
-                segment.summary_tokens,
-                segment.full_tokens,
-                segment.compression_ratio,
-                segment.compaction_model,
-                _dt_to_str(segment.created_at),
-                _dt_to_str(segment.start_timestamp),
-                _dt_to_str(segment.end_timestamp),
-            ),
-        )
-
-        # Update tags
-        conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
-        for tag in segment.tags:
-            normalized_tag = (
-                tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=True, default=str)
-            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute(
-                "INSERT INTO segment_tags (segment_ref, tag) VALUES (?, ?)",
-                (segment.ref, normalized_tag),
+                """INSERT OR REPLACE INTO segments
+                (ref, session_id, primary_tag, summary, full_text, messages_json,
+                 metadata_json, summary_tokens, full_tokens, compression_ratio,
+                 compaction_model, created_at, start_timestamp, end_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    segment.ref,
+                    segment.session_id,
+                    primary_tag,
+                    summary_text,
+                    full_text,
+                    json.dumps(segment.messages, default=str),
+                    metadata_json,
+                    segment.summary_tokens,
+                    segment.full_tokens,
+                    segment.compression_ratio,
+                    segment.compaction_model,
+                    _dt_to_str(segment.created_at),
+                    _dt_to_str(segment.start_timestamp),
+                    _dt_to_str(segment.end_timestamp),
+                ),
             )
 
-        conn.commit()
+            # Update tags
+            conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
+            for tag in segment.tags:
+                normalized_tag = (
+                    tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=True, default=str)
+                )
+                conn.execute(
+                    "INSERT INTO segment_tags (segment_ref, tag) VALUES (?, ?)",
+                    (segment.ref, normalized_tag),
+                )
+
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         return segment.ref
 
     def get_segment(self, ref: str) -> StoredSegment | None:
@@ -964,43 +1005,48 @@ class SQLiteStore(ContextStore):
         if not facts:
             return 0
         conn = self._get_conn()
-        count = 0
-        for fact in facts:
-            conn.execute(
-                """INSERT OR REPLACE INTO facts
-                (id, subject, verb, object, status, what, who, when_date,
-                 "where", why, tags_json, segment_ref, session_id,
-                 turn_numbers_json, mentioned_at, superseded_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    fact.id,
-                    fact.subject,
-                    fact.verb,
-                    fact.object,
-                    fact.status,
-                    fact.what,
-                    fact.who,
-                    fact.when_date,
-                    fact.where,
-                    fact.why,
-                    json.dumps(fact.tags),
-                    fact.segment_ref,
-                    fact.session_id,
-                    json.dumps(fact.turn_numbers),
-                    _dt_to_str(fact.mentioned_at),
-                    fact.superseded_by,
-                ),
-            )
-            # Update fact_tags junction
-            conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
-            for tag in fact.tags:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            count = 0
+            for fact in facts:
                 conn.execute(
-                    "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
-                    (fact.id, tag),
+                    """INSERT OR REPLACE INTO facts
+                    (id, subject, verb, object, status, what, who, when_date,
+                     "where", why, tags_json, segment_ref, session_id,
+                     turn_numbers_json, mentioned_at, superseded_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        fact.id,
+                        fact.subject,
+                        fact.verb,
+                        fact.object,
+                        fact.status,
+                        fact.what,
+                        fact.who,
+                        fact.when_date,
+                        fact.where,
+                        fact.why,
+                        json.dumps(fact.tags),
+                        fact.segment_ref,
+                        fact.session_id,
+                        json.dumps(fact.turn_numbers),
+                        _dt_to_str(fact.mentioned_at),
+                        fact.superseded_by,
+                    ),
                 )
-            count += 1
-        conn.commit()
-        return count
+                # Update fact_tags junction
+                conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
+                for tag in fact.tags:
+                    conn.execute(
+                        "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
+                        (fact.id, tag),
+                    )
+                count += 1
+            conn.execute("COMMIT")
+            return count
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _row_to_fact(self, row: sqlite3.Row) -> Fact:
         """Convert a sqlite3.Row from the facts table to a Fact dataclass."""
@@ -1106,10 +1152,57 @@ class SQLiteStore(ContextStore):
         ).fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
 
+    def store_tool_output(
+        self,
+        ref: str,
+        session_id: str,
+        tool_name: str,
+        command: str,
+        turn: int,
+        content: str,
+        original_bytes: int,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO tool_outputs
+            (ref, session_id, tool_name, command, turn, content, original_bytes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (ref, session_id, tool_name, command, turn, content, original_bytes),
+        )
+        conn.commit()
+
+    def search_tool_outputs(self, query: str, limit: int = 5) -> list:
+        from ..types import QuoteResult
+
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT t.ref, t.tool_name,
+                          snippet(tool_outputs_fts, 0, '>>>', '<<<', '...', 100) as snippet
+                   FROM tool_outputs_fts fts
+                   JOIN tool_outputs t ON t.rowid = fts.rowid
+                   WHERE tool_outputs_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                [query, limit],
+            ).fetchall()
+        except Exception:
+            return []
+        return [
+            QuoteResult(
+                text=row["snippet"],
+                tag=row["tool_name"],
+                segment_ref=row["ref"],
+                match_type="tool_output",
+            )
+            for row in rows
+        ]
+
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn:
+            conn.close()
+            self._local.conn = None
 
     def __del__(self) -> None:
         try:

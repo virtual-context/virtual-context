@@ -1091,6 +1091,8 @@ def create_app(
         _app_title += f" [{instance_label}]"
     app = FastAPI(title=_app_title, lifespan=lifespan)
     app.state.instance_label = instance_label
+    # DIAGNOSTIC: set to True to bypass all VC processing (pure passthrough)
+    app.state._force_passthrough = bool(_os.environ.get("VC_FORCE_PASSTHROUGH"))
     # Pluggable session resolver: if set, called instead of the built-in
     # SessionRegistry.  Signature:
     #   (request, body, session_id) -> (ProxyState, is_new)
@@ -1107,11 +1109,14 @@ def create_app(
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     async def catch_all(request: Request, path: str):
-        url = f"{upstream}/{path}"
+        # Preserve query string (e.g. ?beta=true for Claude Code extended thinking)
+        _qs = request.url.query
+        _suffix = f"?{_qs}" if _qs else ""
+        url = f"{upstream}/{path}{_suffix}"
         # Per-request upstream override (e.g. subdomain routing in cloud)
         _req_upstream = getattr(request.state, "upstream", None)
         if _req_upstream:
-            url = f"{_req_upstream}/{path}"
+            url = f"{_req_upstream}/{path}{_suffix}"
         raw_headers = dict(request.headers)
         fwd_headers = _forward_headers(raw_headers)
 
@@ -1141,6 +1146,22 @@ def create_app(
                 req_log.write_bytes(body_bytes)
             except Exception:
                 pass  # never let logging break the request
+
+        # --- DIAGNOSTIC: full passthrough (bypass all VC processing) ---
+        # Remove this block after testing.
+        if getattr(app.state, "_force_passthrough", False):
+            import json as _json_pt
+            try:
+                _pt_body = _json_pt.loads(body_bytes)
+                _pt_stream = _pt_body.get("stream", "NOT SET")
+                _pt_msgs = len(_pt_body.get("messages", []))
+                _pt_cm = "YES" if _pt_body.get("context_management") else "NO"
+                _pt_kb = round(len(body_bytes) / 1024, 1)
+                print(f"[PASSTHROUGH] stream={_pt_stream} msgs={_pt_msgs} cm={_pt_cm} payload={_pt_kb}KB")
+            except Exception:
+                pass
+            return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
+        # --- END DIAGNOSTIC ---
 
         import json as _json
         try:
@@ -1288,6 +1309,25 @@ def create_app(
                     passthrough=True,
                 )
 
+                # Tool output interception applies even in passthrough —
+                # truncating large tool_result blocks reduces upstream tokens
+                # regardless of whether VC context is being injected.
+                if state.engine.config.tool_output.enabled:
+                    from .tool_output_interceptor import ToolOutputInterceptor
+
+                    _pt_interceptor = ToolOutputInterceptor(
+                        config=state.engine.config.tool_output,
+                        store=state.engine._store,
+                        session_id=state.engine.config.session_id,
+                    )
+                    _pt_interceptor._turn_counter = state._live_requests
+                    _pre_stats = _pt_interceptor.stats.total_intercepted
+                    body = _pt_interceptor.process(body, fmt)
+                    _post_stats = _pt_interceptor.stats.total_intercepted
+                    if _post_stats > _pre_stats:
+                        print(f"[TOOL-INTERCEPT] Passthrough: truncated {_post_stats - _pre_stats} tool_result(s), "
+                              f"saved {_pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned}B")
+
                 print(
                     f"[T{turn}] PASSTHROUGH {api_format} "
                     f"stream={is_streaming} state={current_state.value} "
@@ -1381,6 +1421,23 @@ def create_app(
                 fmt=fmt,
             )
 
+        # Tool output interception: truncate large tool_result blocks
+        if state and state.engine.config.tool_output.enabled:
+            from .tool_output_interceptor import ToolOutputInterceptor
+
+            interceptor = ToolOutputInterceptor(
+                config=state.engine.config.tool_output,
+                store=state.engine._store,
+                session_id=state.engine.config.session_id,
+            )
+            interceptor._turn_counter = state._live_requests
+            _pre = interceptor.stats.total_intercepted
+            body = interceptor.process(body, fmt)
+            _post = interceptor.stats.total_intercepted
+            if _post > _pre:
+                print(f"[TOOL-INTERCEPT] Active: truncated {_post - _pre} tool_result(s), "
+                      f"saved {interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned}B")
+
         enriched_body = _inject_context(body, prepend_text, api_format)
 
         # Inject VC paging tools for autonomous mode (formats that support it)
@@ -1416,6 +1473,22 @@ def create_app(
                 )
             else:
                 print(f"[PAGING] Mode={_paging_mode} for model={enriched_body.get('model', '?')} — tools NOT injected")
+
+        # Inject vc_find_quote for tool output retrieval (when paging didn't already inject it)
+        tool_output_find_quote = False
+        if (
+            not paging_enabled
+            and state
+            and fmt.supports_tool_interception
+            and state.engine.config.tool_output.enabled
+        ):
+            from ..core.tool_loop import vc_tool_definitions
+            _all_defs = vc_tool_definitions()
+            _fq_def = [d for d in _all_defs if d["name"] == "vc_find_quote"]
+            if _fq_def:
+                enriched_body = fmt.inject_tools(enriched_body, _fq_def)
+                tool_output_find_quote = True
+                print("[TOOL-OUTPUT] Injected vc_find_quote tool for truncated output retrieval")
 
         # Track enriched payload size
         import json as _json2
@@ -1499,13 +1572,15 @@ def create_app(
             session_id=_session_id,
         )
 
+        _intercept_vc_tools = paging_enabled or tool_output_find_quote
+
         if is_streaming:
             return await _handle_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
                 session_id=_session_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
-                paging_enabled=paging_enabled,
+                paging_enabled=_intercept_vc_tools,
                 request_log_dir=_request_log_dir,
                 log_prefix=_log_prefix if _request_log_dir else "",
             )
@@ -1548,7 +1623,7 @@ async def _passthrough_bytes(
     return JSONResponse(
         content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
         status_code=resp.status_code,
-        headers=dict(resp.headers),
+        headers=_forward_headers(dict(resp.headers)),
     )
 
 
@@ -2036,12 +2111,47 @@ async def _handle_streaming(
                                 "content": tool_results,
                             })
 
-                    # Send non-streaming continuation
-                    cont_resp = await client.post(
-                        url, headers=headers, json=cont_body,
-                    )
+                    # Send continuation — streaming for Responses API
+                    # (Codex requires stream=true), non-streaming otherwise.
+                    _cont_is_streaming = cont_body.get("stream", False)
+                    if _cont_is_streaming:
+                        cont_resp = await client.send(
+                            client.build_request(
+                                "POST", url, headers=headers, json=cont_body,
+                            ),
+                            stream=True,
+                        )
+                    else:
+                        cont_resp = await client.post(
+                            url, headers=headers, json=cont_body,
+                        )
 
                     # Log continuation request/response to disk
+                    _cont_resp_text: str | None = None
+                    if _cont_is_streaming and cont_resp.status_code == 200:
+                        # Collect SSE stream → extract response.completed
+                        _cont_chunks: list[str] = []
+                        cont_data = {}
+                        async for line in cont_resp.aiter_lines():
+                            _cont_chunks.append(line)
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                evt = _json.loads(payload)
+                            except _json.JSONDecodeError:
+                                continue
+                            if evt.get("type") == "response.completed":
+                                cont_data = evt.get("response", {})
+                        await cont_resp.aclose()
+                        _cont_resp_text = _json.dumps(cont_data, ensure_ascii=False)
+                    else:
+                        if _cont_is_streaming:
+                            await cont_resp.aread()
+                        _cont_resp_text = cont_resp.text
+
                     if request_log_dir and log_prefix:
                         _cn = loop_i + 1
                         try:
@@ -2056,7 +2166,7 @@ async def _handle_streaming(
                             _cdir.joinpath(
                                 f"{log_prefix}.continuation-{_cn}.response.json"
                             ).write_text(
-                                cont_resp.text, encoding="utf-8",
+                                _cont_resp_text or "", encoding="utf-8",
                             )
                         except Exception:
                             pass  # never let logging break the request
@@ -2066,9 +2176,15 @@ async def _handle_streaming(
                             "Continuation failed: %d",
                             cont_resp.status_code,
                         )
+                        if _cont_is_streaming:
+                            try:
+                                await cont_resp.aclose()
+                            except Exception:
+                                pass
                         break
 
-                    cont_data = cont_resp.json()
+                    if not _cont_is_streaming:
+                        cont_data = cont_resp.json()
 
                     if api_format == "openai_responses":
                         # Responses API: output array, no stop_reason

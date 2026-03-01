@@ -15,6 +15,7 @@ from virtual_context.core.compactor import DomainCompactor
 from virtual_context.core.monitor import ContextMonitor
 from virtual_context.core.retriever import ContextRetriever
 from virtual_context.core.segmenter import TopicSegmenter
+from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     CompactorConfig,
@@ -24,6 +25,7 @@ from virtual_context.types import (
     StoredSegment,
     StrategyConfig,
     TagResult,
+    TurnTagEntry,
 )
 
 
@@ -198,5 +200,176 @@ def test_full_pipeline():
         # 7. Monitor check
         snapshot = monitor.build_snapshot(messages)
         assert snapshot.total_tokens > 0
+
+        store.close()
+
+
+@pytest.mark.regression("BUG-034")
+def test_primary_tag_guarantee_ephemeral_gets_tag_summary():
+    """Ephemeral topics whose primary_tag is dropped by greedy set cover
+    must still get tag summaries via the primary tag guarantee.
+
+    Scenario: 5 turns of "baking" with 2 turns of "sourdough-starter" in
+    the middle. Greedy set cover picks "baking" (covers all 5), dropping
+    "sourdough-starter". Without the guarantee, sourdough-starter gets no
+    tag summary and becomes invisible to retrieval.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "store.db"
+
+        # Tag generator: baking for all, sourdough-starter for sourdough turns
+        tag_gen = MockTagGenerator(default_tag="baking")
+        tag_gen.set_override("sourdough", TagResult(
+            tags=["baking", "sourdough-starter"], primary="sourdough-starter", source="mock",
+        ))
+
+        store = SQLiteStore(db_path=db_path)
+        segmenter = TopicSegmenter(
+            tag_generator=tag_gen,
+            config=SegmenterConfig(),
+        )
+
+        class TagAwareLLM:
+            """Returns segment summaries and tag summaries."""
+            def complete(self, system: str, user: str, max_tokens: int) -> str:
+                import json
+                # Tag summary request
+                if "tag summary" in system.lower() or "rollup" in system.lower():
+                    return json.dumps({
+                        "summary": "Tag summary for testing",
+                        "key_themes": ["test"],
+                    })
+                # Segment compaction request
+                tags = ["baking"]
+                if "sourdough" in user.lower():
+                    tags = ["baking", "sourdough-starter"]
+                return json.dumps({
+                    "summary": "Test segment summary",
+                    "entities": [],
+                    "key_decisions": [],
+                    "action_items": [],
+                    "date_references": [],
+                    "refined_tags": tags,
+                })
+
+        compactor = DomainCompactor(
+            llm_provider=TagAwareLLM(),
+            config=CompactorConfig(
+                summary_ratio=0.15,
+                min_summary_tokens=50,
+            ),
+            model_name="test-model",
+        )
+
+        monitor = ContextMonitor(config=load_config(config_dict={
+            "context_window": 5000,
+            "compaction": {"soft_threshold": 0.5, "hard_threshold": 0.7},
+        }).monitor)
+
+        # Build a 5-turn conversation: baking, baking, sourdough, sourdough, baking
+        base = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        messages = []
+        baking_pairs = [
+            ("What flour is best for bread?", "Bread flour with 12-13% protein."),
+            ("How long to proof dough?", "1-2 hours at room temperature."),
+            ("How do I maintain my sourdough starter?", "Feed daily with equal parts flour and water."),
+            ("What hydration for sourdough bread?", "75-80% hydration gives good crumb."),
+            ("What temp to bake at?", "450F for the first 20 minutes, then 400F."),
+        ]
+        for i, (q, a) in enumerate(baking_pairs):
+            messages.append(Message(role="user", content=q, timestamp=base + timedelta(minutes=i * 2)))
+            messages.append(Message(role="assistant", content=a, timestamp=base + timedelta(minutes=i * 2 + 1)))
+
+        # Segment and compact
+        segments = segmenter.segment(messages)
+        results = compactor.compact(segments)
+
+        # Store results
+        for result in results:
+            stored = StoredSegment(
+                ref=result.segment_id,
+                session_id="test",
+                primary_tag=result.primary_tag,
+                tags=result.tags,
+                summary=result.summary,
+                summary_tokens=result.summary_tokens,
+                full_text=result.full_text,
+                full_tokens=result.original_tokens,
+                messages=result.messages,
+                metadata=result.metadata,
+                compaction_model="test-model",
+                compression_ratio=result.compression_ratio,
+                start_timestamp=result.timestamp,
+                end_timestamp=result.timestamp,
+            )
+            store.store_segment(stored)
+
+        # Verify we have a segment with sourdough-starter as primary_tag
+        has_sourdough_primary = any(r.primary_tag == "sourdough-starter" for r in results)
+        assert has_sourdough_primary, (
+            f"Expected a segment with primary_tag='sourdough-starter', "
+            f"got: {[r.primary_tag for r in results]}"
+        )
+
+        # Build a TurnTagIndex matching the segmenter's output
+        tti = TurnTagIndex()
+        for i, (q, a) in enumerate(baking_pairs):
+            tags = ["baking"]
+            primary = "baking"
+            if "sourdough" in q.lower():
+                tags = ["baking", "sourdough-starter"]
+                primary = "sourdough-starter"
+            tti.append(TurnTagEntry(
+                turn_number=i, message_hash=f"h{i}",
+                tags=tags, primary_tag=primary,
+            ))
+
+        # Verify greedy set cover DROPS sourdough-starter
+        raw_cover = tti.compute_cover_set()
+        assert "sourdough-starter" not in raw_cover, (
+            f"Expected greedy set cover to drop sourdough-starter, but got: {raw_cover}"
+        )
+
+        # Now apply the primary tag guarantee (same logic as engine.py lines 719-727)
+        compacted_tags = {tag for r in results for tag in r.tags}
+        cover_tags = [t for t in raw_cover if t in compacted_tags]
+
+        cover_set = set(cover_tags)
+        for r in results:
+            if r.primary_tag and r.primary_tag not in cover_set:
+                cover_tags.append(r.primary_tag)
+                cover_set.add(r.primary_tag)
+
+        # Primary tag guarantee must have added sourdough-starter back
+        assert "sourdough-starter" in cover_tags, (
+            f"Primary tag guarantee failed: sourdough-starter not in cover_tags={cover_tags}"
+        )
+
+        # Build tag summaries — sourdough-starter should get one
+        tag_to_summaries = {}
+        for tag in cover_tags:
+            summaries = store.get_summaries_by_tags(tags=[tag], min_overlap=1, limit=50)
+            if summaries:
+                tag_to_summaries[tag] = summaries
+
+        tag_to_turns = {}
+        for entry in tti.entries:
+            for tag in entry.tags:
+                if tag in cover_tags:
+                    tag_to_turns.setdefault(tag, []).append(entry.turn_number)
+
+        new_summaries = compactor.compact_tag_summaries(
+            cover_tags=cover_tags,
+            tag_to_summaries=tag_to_summaries,
+            tag_to_turns=tag_to_turns,
+            existing_tag_summaries={},
+            max_turn=max(e.turn_number for e in tti.entries),
+        )
+
+        summary_tags = {ts.tag for ts in new_summaries}
+        assert "sourdough-starter" in summary_tags, (
+            f"sourdough-starter should have a tag summary, "
+            f"but only got summaries for: {summary_tags}"
+        )
 
         store.close()

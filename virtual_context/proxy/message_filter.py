@@ -108,23 +108,26 @@ def filter_body_messages(
             elif "rule" in entry.tags or set(entry.tags) & tag_set:
                 keep_pair[pair_idx] = True
 
-    # Second pass: fix tool_use/tool_result dependencies.
-    # If assistant has tool_use, the next pair (with tool_result) must also be kept.
-    # If user has tool_result, the previous pair (with tool_use) must also be kept.
-    # Iterate until stable (handles multi-step tool chains).
-    changed = True
-    while changed:
-        changed = False
-        for pair_idx in range(total_pairs):
-            if not keep_pair[pair_idx]:
+    # Second pass: build tool_use_id → message index maps for precise
+    # referential integrity.  Every tool_use block has an "id" field;
+    # every tool_result block has a "tool_use_id" field that must match
+    # a tool_use in an earlier message.
+    #
+    # Map: tool_use_id → msg_idx that contains the tool_use
+    # Map: tool_use_id → msg_idx that contains the tool_result
+    tooluse_to_msg: dict[str, int] = {}   # id → assistant msg index
+    toolresult_to_msg: dict[str, int] = {}  # tool_use_id → user msg index
+    for msg_idx, msg in enumerate(chat_msgs):
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
                 continue
-            u_idx, a_idx = pairs[pair_idx]
-            if _has_tool_use(chat_msgs[a_idx]) and pair_idx + 1 < total_pairs and not keep_pair[pair_idx + 1]:
-                keep_pair[pair_idx + 1] = True
-                changed = True
-            if _has_tool_result(chat_msgs[u_idx]) and pair_idx > 0 and not keep_pair[pair_idx - 1]:
-                keep_pair[pair_idx - 1] = True
-                changed = True
+            if block.get("type") == "tool_use" and "id" in block:
+                tooluse_to_msg[block["id"]] = msg_idx
+            elif block.get("type") == "tool_result" and "tool_use_id" in block:
+                toolresult_to_msg[block["tool_use_id"]] = msg_idx
 
     # Build per-message keep set: unpaired messages always kept, pairs based on filter
     keep_msg: set[int] = set()
@@ -136,34 +139,86 @@ def filter_body_messages(
             keep_msg.add(u_idx)
             keep_msg.add(a_idx)
 
-    # Final tool chain safety: any kept assistant with tool_use must have its
-    # tool_result in the immediately following message(s) also kept, and vice versa.
+    # Build reverse map: msg_idx → its pair partner (if any)
+    msg_to_partner: dict[int, int] = {}
+    for u_idx, a_idx in pairs:
+        msg_to_partner[u_idx] = a_idx
+        msg_to_partner[a_idx] = u_idx
+
+    # Enforce tool_use_id referential integrity: if a message is kept,
+    # the message containing the matching tool_use or tool_result must
+    # also be kept.  When a force-kept message belongs to a pair, its
+    # pair partner is also kept (otherwise we'd have a half-pair that
+    # breaks role alternation).  Iterate until stable (chains can be long).
     changed = True
     while changed:
         changed = False
-        for msg_idx in range(len(chat_msgs)):
-            if msg_idx not in keep_msg:
+        for tid, use_idx in tooluse_to_msg.items():
+            result_idx = toolresult_to_msg.get(tid)
+            if result_idx is None:
                 continue
-            msg = chat_msgs[msg_idx]
-            if msg.get("role") == _asst_role and _has_tool_use(msg):
-                # Keep all following messages until we find the tool_result
-                for j in range(msg_idx + 1, len(chat_msgs)):
-                    if j not in keep_msg:
-                        keep_msg.add(j)
-                        changed = True
-                    if _has_tool_result(chat_msgs[j]):
-                        break
-            if _has_tool_result(msg):
-                # Keep all preceding messages back to the tool_use
-                for j in range(msg_idx - 1, -1, -1):
-                    if j not in keep_msg:
-                        keep_msg.add(j)
-                        changed = True
-                    if chat_msgs[j].get("role") == _asst_role and _has_tool_use(chat_msgs[j]):
-                        break
+            if use_idx in keep_msg and result_idx not in keep_msg:
+                keep_msg.add(result_idx)
+                changed = True
+            if result_idx in keep_msg and use_idx not in keep_msg:
+                keep_msg.add(use_idx)
+                changed = True
+        # Keep pair partners of any force-added messages
+        for msg_idx in list(keep_msg):
+            partner = msg_to_partner.get(msg_idx)
+            if partner is not None and partner not in keep_msg:
+                keep_msg.add(partner)
+                changed = True
+
+    # Ensure the first kept chat message is role=user.  When pair 0 is
+    # dropped but an unpaired assistant at index 2 is force-kept (via
+    # tool_use_id integrity), the filtered output starts with assistant —
+    # which the Anthropic API rejects.  Fix: walk kept messages in order
+    # and force-keep all earlier messages (and their pair partners) up to
+    # the first user message.
+    first_kept_indices = sorted(keep_msg)
+    for idx in first_kept_indices:
+        if chat_msgs[idx].get("role") == "user":
+            break  # first kept message is already user — no fix needed
+        # Force-keep this message and all messages before it
+        for backfill in range(idx + 1):
+            if backfill not in keep_msg:
+                keep_msg.add(backfill)
+                changed = True
+        # Also keep pair partners of anything we just added
+        for backfill in range(idx + 1):
+            partner = msg_to_partner.get(backfill)
+            if partner is not None and partner not in keep_msg:
+                keep_msg.add(partner)
+    # Re-run referential integrity if we added messages
+    if changed:
+        changed = True
+        while changed:
+            changed = False
+            for tid, use_idx in tooluse_to_msg.items():
+                result_idx = toolresult_to_msg.get(tid)
+                if result_idx is None:
+                    continue
+                if use_idx in keep_msg and result_idx not in keep_msg:
+                    keep_msg.add(result_idx)
+                    changed = True
+                if result_idx in keep_msg and use_idx not in keep_msg:
+                    keep_msg.add(use_idx)
+                    changed = True
+            for msg_idx in list(keep_msg):
+                partner = msg_to_partner.get(msg_idx)
+                if partner is not None and partner not in keep_msg:
+                    keep_msg.add(partner)
+                    changed = True
+
+    # Adjacent gap fill: when we keep messages A and C but not B,
+    # the dropped B may break role alternation or context flow.
+    # If all three are part of tool chains, keep B too.
+    # This is handled by the alternation enforcement below.
 
     # Build filtered message list preserving original order
     kept: list[dict] = list(prefix)
+    any_dropped = len(keep_msg) < len(chat_msgs)
     for msg_idx in range(len(chat_msgs)):
         if msg_idx in keep_msg:
             kept.append(chat_msgs[msg_idx])
@@ -171,12 +226,62 @@ def filter_body_messages(
     if current_user:
         kept.append(current_user)
 
+    # Strip thinking blocks when messages were dropped.  Thinking blocks
+    # carry cryptographic signatures that chain across turns; dropping a
+    # message mid-chain breaks the chain and the Anthropic API returns 500.
+    # Thinking blocks are ephemeral (LLM scratchpad) — the actual answer
+    # lives in the text/tool_use blocks, so stripping is safe.
+    if any_dropped:
+        kept = _strip_thinking_blocks(kept)
+
+    # Tag messages that carry tool_use/tool_result links — these must
+    # survive role alternation enforcement.  Uses a sentinel key that
+    # will be stripped before returning.
+    #
+    # PROXY-004c: We tag messages in `kept`, NOT in `chat_msgs`.
+    #
+    # Why: _strip_thinking_blocks (above) creates shallow copies of any
+    # assistant message that contains thinking blocks.  If we set
+    # _vc_critical on the original dict in chat_msgs, the COPY in `kept`
+    # won't have the sentinel.  The alternation enforcement step then
+    # can't see it and drops the copy — orphaning the tool_result.
+    #
+    # Evidence from A/B run 2026-03-01 (request_log/000038):
+    #   chat_msgs[49] = assistant [thinking, text]        (pair 24)
+    #   chat_msgs[50] = assistant [thinking, text, tool_use(X)]  (UNPAIRED)
+    #   chat_msgs[51] = user [tool_result(X)]             (pair 25)
+    # After _strip_thinking_blocks, msg[50] is a new dict.  Sentinel on
+    # original chat_msgs[50] is invisible to alternation → msg[50] dropped
+    # → tool_result(X) orphaned → Anthropic API 400.
+    #
+    # Fix: walk `kept` in parallel with keep_msg to find which kept-list
+    # positions correspond to critical chat_msgs indices, then tag the
+    # actual objects in `kept`.
+    _critical_indices: set[int] = set()
+    for tid, use_idx in tooluse_to_msg.items():
+        result_idx = toolresult_to_msg.get(tid)
+        if result_idx is not None and use_idx in keep_msg and result_idx in keep_msg:
+            _critical_indices.add(use_idx)
+            _critical_indices.add(result_idx)
+    _prefix_len = len(prefix)
+    _chat_kept_i = 0
+    for kept_i in range(_prefix_len, len(kept)):
+        if current_user and kept_i == len(kept) - 1:
+            break  # last entry is current_user, not from chat_msgs
+        while _chat_kept_i < len(chat_msgs) and _chat_kept_i not in keep_msg:
+            _chat_kept_i += 1
+        if _chat_kept_i < len(chat_msgs) and _chat_kept_i in _critical_indices:
+            kept[kept_i]["_vc_critical"] = True
+        _chat_kept_i += 1
+
     # PROXY-022: Enforce strict role alternation.
     # OpenClaw can send consecutive same-role messages (batched Telegram messages,
     # tool_result followed by new user text without intervening assistant). When
     # we drop pairs around these "unpaired" messages the result can have
     # consecutive same-role entries, which the Anthropic API rejects.
-    # Fix: walk the kept list and drop any message that repeats the previous role.
+    # Fix: walk the kept list and drop any message that repeats the previous role,
+    # UNLESS the message contains a tool_use/tool_result that is part of a kept
+    # referential pair — dropping it would orphan the partner.
     # Note: bare items (no role, e.g. function_call in Responses API) are always kept.
     alternating: list[dict] = []
     for msg in kept:
@@ -185,9 +290,51 @@ def filter_body_messages(
             alternating.append(msg)  # bare items always kept
             continue
         if alternating and role == alternating[-1].get("role"):
-            continue  # skip — would create consecutive same-role
-        alternating.append(msg)
+            if msg.get("_vc_critical"):
+                # This message has a tool_use/tool_result partner that's also
+                # kept — dropping it would create an orphan.  Instead, drop
+                # the PREVIOUS same-role message if it's not critical.
+                if not alternating[-1].get("_vc_critical"):
+                    alternating[-1] = msg  # replace previous with current
+                else:
+                    alternating.append(msg)  # both critical — keep both
+            else:
+                continue  # skip — would create consecutive same-role
+        else:
+            alternating.append(msg)
     kept = alternating
+
+    # Clean up sentinel keys before returning
+    for msg in kept:
+        msg.pop("_vc_critical", None)
+
+    # PROXY-004c: Final safety net — verify no orphaned tool_result blocks.
+    # The tagging fix above should prevent orphans, but if any slip through
+    # (e.g. a message layout we haven't seen yet), returning the unfiltered
+    # body is always better than sending a guaranteed 400 to the API.
+    _final_tu: set[str] = set()
+    _final_tr: set[str] = set()
+    for msg in kept:
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and "id" in block:
+                _final_tu.add(block["id"])
+            elif block.get("type") == "tool_result" and "tool_use_id" in block:
+                _final_tr.add(block["tool_use_id"])
+    _orphaned = _final_tr - _final_tu
+    if _orphaned:
+        import sys
+        print(
+            f"[MSG-FILTER] PROXY-004c safety: {len(_orphaned)} orphaned "
+            f"tool_result(s) after filtering — returning unfiltered body "
+            f"to avoid 400 (ids: {list(_orphaned)[:3]})",
+            file=sys.stderr,
+        )
+        return body, 0
 
     # Compute drops from final kept list (not incremental tracking, which
     # undercounts when alternation enforcement removes additional messages).
@@ -201,6 +348,31 @@ def filter_body_messages(
     body = dict(body)
     body[_msg_key] = kept
     return body, dropped
+
+
+def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
+    """Remove thinking blocks from assistant messages.
+
+    Thinking blocks carry chained cryptographic signatures.  When the
+    message filter drops any message, the chain is broken and the
+    Anthropic API returns 500.  Thinking blocks are ephemeral (LLM
+    scratchpad) — the actual answer lives in text/tool_use blocks.
+    Stripping also eliminates any prompt-caching benefit, but caching
+    is already invalidated by message filtering.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            out.append(msg)
+            continue
+        filtered = [b for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "thinking")]
+        if len(filtered) == len(content):
+            out.append(msg)  # no thinking blocks — keep original
+        else:
+            out.append({**msg, "content": filtered})
+    return out
 
 
 def _has_tool_use(msg: dict) -> bool:

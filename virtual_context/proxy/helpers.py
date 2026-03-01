@@ -41,6 +41,11 @@ _HOP_BY_HOP = frozenset({
     "host", "connection", "transfer-encoding", "keep-alive",
     "proxy-authenticate", "proxy-authorization", "te", "trailers",
     "upgrade", "content-length",
+    # content-encoding must be stripped because httpx automatically decompresses
+    # upstream responses but may forward the original content-encoding header.
+    # If the client sees "content-encoding: gzip" but receives uncompressed data,
+    # its decompressor (e.g. Node.js Gunzip) will crash with "terminated".
+    "content-encoding",
 })
 
 

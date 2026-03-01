@@ -664,7 +664,7 @@ async def _call_llm(
         }
         if system_text:
             context_block = (
-                f"<virtual-context>\n{system_text}\n</virtual-context>"
+                f"<system-reminder>\n{system_text}\n</system-reminder>"
             )
             payload["system"] = context_block
         resp = await client.post(prov["url"], headers=prov["headers"], json=payload)
@@ -677,7 +677,7 @@ async def _call_llm(
         msgs = []
         if system_text:
             context_block = (
-                f"<virtual-context>\n{system_text}\n</virtual-context>"
+                f"<system-reminder>\n{system_text}\n</system-reminder>"
             )
             msgs.append({"role": "system", "content": context_block})
         msgs.extend(messages)

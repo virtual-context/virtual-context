@@ -597,6 +597,34 @@ class ProxyConfig:
 
 
 @dataclass
+class ToolOutputRule:
+    match: str = "*"
+    truncate_threshold: int | None = None
+    head_ratio: float = 0.6
+    tail_ratio: float = 0.4
+    max_index_bytes: int | None = None
+
+
+@dataclass
+class ToolOutputConfig:
+    enabled: bool = False
+    default_truncate_threshold: int = 8192
+    max_index_bytes: int = 524_288
+    default_head_ratio: float = 0.6
+    default_tail_ratio: float = 0.4
+    rules: list[ToolOutputRule] = field(default_factory=list)
+
+
+@dataclass
+class ToolOutputStats:
+    total_intercepted: int = 0
+    total_bytes_original: int = 0
+    total_bytes_returned: int = 0
+    total_bytes_indexed: int = 0
+    by_tool: dict[str, dict] = field(default_factory=dict)
+
+
+@dataclass
 class VirtualContextConfig:
     version: str = "0.2"
     storage_root: str = ".virtualcontext"
@@ -614,5 +642,6 @@ class VirtualContextConfig:
     cost_tracking: CostTrackingConfig = field(default_factory=CostTrackingConfig)
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))

@@ -129,6 +129,23 @@ Use `pytest -m regression` to run all regression tests.
   - `test_proxy.py::TestFilterByTagAndBroad::test_tool_use_keeps_tool_result_pair`
   - `test_proxy.py::TestFilterByTagAndBroad::test_tool_result_keeps_preceding_tool_use_pair`
 
+### PROXY-004b — Consecutive assistant messages cause first-message-is-assistant
+
+- **Symptom**: 400 error when pair 0 is dropped but an unpaired assistant message is force-kept via tool chain integrity, making the filtered output start with `role: assistant`
+- **Root cause**: Claude Code extended thinking sends consecutive assistant messages: `user[0], assistant[1](thinking), assistant[2](tool_use)`. Pair 0 = (0,1). msg[2] is unpaired. If pair 0 is dropped but msg[2] is kept, filtered output starts with assistant — API requires first message to be user.
+- **Fix**: User-first enforcement — backfill-keep all messages before first kept user message
+- **Tests**:
+  - `test_proxy.py::TestFilterBodyMessages::test_consecutive_assistant_dropped_pair_keeps_user_first`
+
+### PROXY-004c — Thinking-strip creates dict copies, losing _vc_critical sentinel
+
+- **Symptom**: 8/15 turns 400 in Claude Code A/B test: `unexpected tool_use_id found in tool_result blocks`. Same `toolu_01LX5izFrvfLu2Robj47pXwT` orphaned on every failed turn.
+- **Root cause**: `_strip_thinking_blocks` creates shallow copies (`{**msg, "content": filtered}`) of assistant messages that have thinking blocks. `_vc_critical` was set on original `chat_msgs` dicts, not on the copies in `kept`. Alternation enforcement couldn't see the sentinel on the copy, dropped the critical assistant (which had the `tool_use`), orphaning its `tool_result`.
+- **Evidence**: `request_log/000038` from A/B run 2026-03-01. Inbound: msg[49] assistant[thinking,text] (pair 24), msg[50] assistant[thinking,text,tool_use(X)] (UNPAIRED, consecutive), msg[51] user[tool_result(X)] (pair 25). After thinking-strip, msg[50] is a new dict. Sentinel on original invisible → dropped → orphan → 400.
+- **Fix**: (1) Walk `kept` list in parallel with `keep_msg` to tag the actual objects in `kept` instead of originals in `chat_msgs`. (2) Final safety net: post-alternation orphan check falls back to unfiltered body.
+- **Tests**:
+  - `test_proxy.py::TestFilterBodyMessages::test_consecutive_assistant_thinking_strip_preserves_tool_chain`
+
 ### PROXY-005 — Streaming breaks on tool_result turns (web search, all tool use)
 
 - **Symptom**: "request ended without sending any chunks" when agent uses any tool (web search, file tools, etc.)
@@ -327,6 +344,14 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_verb_expansion.py::TestQueryFactsSemanticIntegration::test_semantic_search_respects_object_contains_filter`
 
+### BUG-034 — Greedy set cover drops ephemeral primary tags, killing retrieval
+
+- **Symptom**: Ephemeral topics (2-3 turns, e.g., sourdough-starter, wedding-toast) get 0% precision in stress tests. They exist as segments with correct tags but are invisible to retrieval.
+- **Root cause**: `compute_cover_set()` picks minimum tags to cover all turns. A broad tag like `baking` covers all 5 turns including the 2 sourdough turns, so `sourdough-starter` is dropped. No tag summary = invisible to embedding-based inbound retrieval.
+- **Fix**: Primary tag guarantee — after `compute_cover_set()`, force-include every segment's `primary_tag` even if the greedy cover dropped it.
+- **Tests**:
+  - `test_engine_integration.py::test_primary_tag_guarantee_ephemeral_gets_tag_summary`
+
 ---
 
 ## By Test File
@@ -341,10 +366,11 @@ Use `pytest -m regression` to run all regression tests.
 | `test_retriever.py` | BUG-008, BUG-009 |
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
-| `test_proxy.py` | BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
+| `test_proxy.py` | BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-004b, PROXY-004c, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
 | `test_paging.py` | PROXY-024 |
 | `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |
 | `test_tag_splitter.py` | BUG-011, BUG-012 |
 | `test_find_quote.py` | BUG-029, BUG-031 |
 | `test_verb_expansion.py` | BUG-032 |
+| `test_engine_integration.py` | BUG-034 |

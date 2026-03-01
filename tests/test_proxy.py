@@ -403,7 +403,7 @@ class TestInjectContext:
             {"role": "user", "content": "Hi"},
         ]}
         result = _inject_context(body, "context here", "openai")
-        assert result["messages"][0]["content"].startswith("<virtual-context>")
+        assert result["messages"][0]["content"].startswith("<system-reminder>")
         assert "context here" in result["messages"][0]["content"]
         assert "Be helpful" in result["messages"][0]["content"]
 
@@ -417,14 +417,14 @@ class TestInjectContext:
     def test_anthropic_string_system(self):
         body = {"system": "Be helpful", "messages": []}
         result = _inject_context(body, "context here", "anthropic")
-        assert result["system"].startswith("<virtual-context>")
+        assert result["system"].startswith("<system-reminder>")
         assert "context here" in result["system"]
         assert "Be helpful" in result["system"]
 
     def test_anthropic_no_system(self):
         body = {"messages": []}
         result = _inject_context(body, "context here", "anthropic")
-        assert "<virtual-context>" in result["system"]
+        assert "<system-reminder>" in result["system"]
         assert "context here" in result["system"]
 
     def test_anthropic_list_system(self):
@@ -434,9 +434,9 @@ class TestInjectContext:
         }
         result = _inject_context(body, "context here", "anthropic")
         assert isinstance(result["system"], list)
-        assert result["system"][0]["type"] == "text"
-        assert "context here" in result["system"][0]["text"]
-        assert result["system"][1]["text"] == "Existing system"
+        assert result["system"][0]["text"] == "Existing system"
+        assert result["system"][1]["type"] == "text"
+        assert "context here" in result["system"][1]["text"]
 
     def test_does_not_mutate_original(self):
         body = {"messages": [
@@ -751,7 +751,7 @@ class TestIntegration:
             assert resp.status_code == 200
             call_kwargs = mock_req.call_args
             forwarded_body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
-            assert "<virtual-context>" in forwarded_body["system"]
+            assert "<system-reminder>" in forwarded_body["system"]
             assert "mock context here" in forwarded_body["system"]
             assert "Be helpful" in forwarded_body["system"]
 
@@ -1737,6 +1737,304 @@ class TestFilterBodyMessages:
                 f"Consecutive same role at indices {i-1}->{i}: "
                 f"{msgs[i-1]['role']}, {msgs[i]['role']}"
             )
+
+    @pytest.mark.regression("PROXY-004")
+    def test_consecutive_assistant_msgs_preserve_tool_use(self):
+        """Consecutive assistant messages where the second has tool_use must not
+        be dropped by role alternation enforcement.
+
+        Claude Code with extended thinking can produce consecutive assistant
+        messages: msg N = [thinking, text] (no tool_use), msg N+1 = [text, tool_use].
+        The pairing logic pairs the user before msg N, leaving msg N+1 unpaired.
+        When pair (user, msg N) is dropped, msg N+1 becomes consecutive with the
+        previous assistant — role alternation would drop it, orphaning its
+        tool_result in the next message.
+        """
+        body = {
+            "messages": [
+                # Pair 0: normal turn (matched → kept)
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                # Pair 1: normal turn (no match → dropped)
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1-thinking-only"},
+                # Unpaired assistant: consecutive with pair 1's assistant
+                # Contains tool_use — critical for referential integrity
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Let me check"},
+                    {"type": "tool_use", "id": "tool_abc", "name": "Read",
+                     "input": {"path": "foo.py"}},
+                ]},
+                # Pair 2: tool_result (no match → but forced by tool chain)
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_abc",
+                     "content": "file contents"},
+                ]},
+                {"role": "assistant", "content": "I read the file"},
+                # Pair 3: normal turn (no match → dropped)
+                {"role": "user", "content": "Q3"},
+                {"role": "assistant", "content": "A3"},
+                # Pair 4: protected
+                {"role": "user", "content": "Q4"},
+                {"role": "assistant", "content": "A4"},
+                # Current user
+                {"role": "user", "content": "Current"},
+            ],
+        }
+        idx = self._build_index([
+            ["python"],     # pair 0 — matches
+            ["cooking"],    # pair 1 — no match → dropped
+            ["cooking"],    # pair 2 — no match but forced by tool chain
+            ["cooking"],    # pair 3 — no match
+            ["cooking"],    # pair 4 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+        )
+        msgs = filtered["messages"]
+
+        # The unpaired assistant with tool_use MUST survive.
+        # Verify no orphaned tool_result references.
+        tool_use_ids = set()
+        tool_result_refs = set()
+        for msg in msgs:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tool_use_ids.add(block["id"])
+                elif block.get("type") == "tool_result":
+                    tool_result_refs.add(block["tool_use_id"])
+
+        orphaned = tool_result_refs - tool_use_ids
+        assert not orphaned, (
+            f"Orphaned tool_result references: {orphaned}. "
+            f"Role alternation dropped a tool_use message."
+        )
+
+        # Also verify role alternation is valid
+        for i in range(1, len(msgs)):
+            assert msgs[i].get("role") != msgs[i - 1].get("role"), (
+                f"Consecutive same role at indices {i-1}->{i}: "
+                f"{msgs[i-1].get('role')}, {msgs[i].get('role')}"
+            )
+
+    @pytest.mark.regression("PROXY-004b")
+    def test_consecutive_assistant_dropped_pair_keeps_user_first(self):
+        """Dropping pair 0 when an unpaired assistant[2] is force-kept must not
+        leave the message list starting with role=assistant.
+
+        Claude Code with extended thinking sends:
+          msg[0]=user, msg[1]=assistant(thinking), msg[2]=assistant(tool_use),
+          msg[3]=user(tool_result), ...
+        Pair 0 is (0,1). msg[2] is unpaired. If pair 0 is dropped but msg[2]
+        is kept (via tool_use_id integrity), the filtered output starts with
+        assistant — which the Anthropic API rejects with 400.
+        """
+        body = {
+            "messages": [
+                # Pair 0: initial turn (no match → should be dropped)
+                {"role": "user", "content": [{"type": "text", "text": "init"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "thinking..."},
+                ]},
+                # Unpaired assistant: consecutive with pair 0's assistant
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "let me check"},
+                    {"type": "tool_use", "id": "tu_glob", "name": "Glob",
+                     "input": {"pattern": "*.py"}},
+                    {"type": "tool_use", "id": "tu_bash", "name": "Bash",
+                     "input": {"command": "ls"}},
+                ]},
+                # Pair 1: tool_result (no match → but forced by tool chain)
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_glob",
+                     "content": "a.py b.py"},
+                    {"type": "tool_result", "tool_use_id": "tu_bash",
+                     "content": "ok"},
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                # Pair 2: no match → dropped
+                {"role": "user", "content": "Q2"},
+                {"role": "assistant", "content": "A2"},
+                # Pair 3: no match → dropped
+                {"role": "user", "content": "Q3"},
+                {"role": "assistant", "content": "A3"},
+                # Pair 4: protected
+                {"role": "user", "content": "Q4"},
+                {"role": "assistant", "content": "A4"},
+                # Current user
+                {"role": "user", "content": "current"},
+            ],
+        }
+        idx = self._build_index([
+            ["setup"],       # pair 0 — no match
+            ["setup"],       # pair 1 — no match (forced by tool chain)
+            ["cooking"],     # pair 2 — no match
+            ["cooking"],     # pair 3 — no match
+            ["cooking"],     # pair 4 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["python"], recent_turns=1,
+        )
+        msgs = filtered["messages"]
+
+        # First message MUST be role=user (Anthropic API requirement)
+        first_chat = None
+        for msg in msgs:
+            if msg.get("role") in ("user", "assistant"):
+                first_chat = msg
+                break
+        assert first_chat is not None
+        assert first_chat["role"] == "user", (
+            f"First chat message is '{first_chat['role']}' — "
+            f"Anthropic API requires first message to be 'user'"
+        )
+
+        # No orphaned tool_results
+        tu_ids = set()
+        tr_ids = set()
+        for msg in msgs:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tu_ids.add(block["id"])
+                elif block.get("type") == "tool_result":
+                    tr_ids.add(block["tool_use_id"])
+        orphaned = tr_ids - tu_ids
+        assert not orphaned, f"Orphaned tool_result references: {orphaned}"
+
+    @pytest.mark.regression("PROXY-004c")
+    def test_consecutive_assistant_thinking_strip_preserves_tool_chain(self):
+        """Consecutive assistants with thinking blocks must not orphan tool_results.
+
+        Reproduces the exact layout from A/B run 2026-03-01, request_log/000038:
+
+          msg[48] user   [tool_result(prev)]       — pair N
+          msg[49] assistant [thinking, text]        — pair N (response without tool_use)
+          msg[50] assistant [thinking, text, tool_use(X)]  — UNPAIRED (consecutive asst)
+          msg[51] user   [tool_result(X)]           — pair N+1
+
+        _strip_thinking_blocks creates new dicts for msgs 49 and 50 (both have
+        thinking blocks).  If _vc_critical is set on original chat_msgs instead
+        of the copies in `kept`, alternation enforcement can't see the sentinel
+        on msg[50]'s copy → drops it → tool_result(X) orphaned → API 400.
+        """
+        body = {
+            "messages": [
+                # Pair 0: tag match → keep
+                {"role": "user", "content": "analyze the data"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "ok",
+                     "signature": "sig_a0"},
+                    {"type": "text", "text": "I'll analyze it"},
+                    {"type": "tool_use", "id": "tu_read1", "name": "Read",
+                     "input": {"file_path": "/data.csv"}},
+                ]},
+                # Pair 1: tag match → keep
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_read1",
+                     "content": "col1,col2\n1,2\n3,4"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "got it",
+                     "signature": "sig_a1"},
+                    {"type": "text", "text": "loaded data"},
+                    {"type": "tool_use", "id": "tu_bash1", "name": "Bash",
+                     "input": {"command": "python analyze.py"}},
+                ]},
+                # Pair 2: no match → dropped
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_bash1",
+                     "content": "analysis complete"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "done",
+                     "signature": "sig_a2"},
+                    {"type": "text", "text": "analysis done"},
+                ]},
+                # --- THE BUG PATTERN: consecutive assistants ---
+                # UNPAIRED assistant (consecutive with pair 2's assistant)
+                # Has thinking + tool_use — _strip_thinking_blocks will copy it
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "wait let me also run tests",
+                     "signature": "sig_a_unpaired"},
+                    {"type": "text", "text": "Let me also run the tests"},
+                    {"type": "tool_use", "id": "tu_target", "name": "Bash",
+                     "input": {"command": "pytest"}},
+                ]},
+                # Pair 3: no match → dropped, but tool_result forces keep
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_target",
+                     "content": "===== test session starts =====\n3 passed"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "All tests pass"},
+                ]},
+                # Pair 4: no match → dropped
+                {"role": "user", "content": "what about coverage?"},
+                {"role": "assistant", "content": "I can check coverage next"},
+                # Pair 5: no match → dropped
+                {"role": "user", "content": "and linting?"},
+                {"role": "assistant", "content": "will check linting too"},
+                # Pair 6: protected (recent)
+                {"role": "user", "content": "ok do it"},
+                {"role": "assistant", "content": "on it"},
+                # Current user turn
+                {"role": "user", "content": "status?"},
+            ],
+        }
+        idx = self._build_index([
+            ["data-analysis"],  # pair 0 — match
+            ["data-analysis"],  # pair 1 — match
+            ["testing"],        # pair 2 — no match
+            ["testing"],        # pair 3 — no match (forced by tool chain)
+            ["coverage"],       # pair 4 — no match
+            ["linting"],        # pair 5 — no match
+            ["linting"],        # pair 6 — protected
+        ])
+        filtered, dropped = _filter_body_messages(
+            body, idx, ["data-analysis"], recent_turns=1,
+        )
+        msgs = filtered["messages"]
+
+        # Thinking blocks must be stripped (some messages were dropped)
+        for msg in msgs:
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        assert block.get("type") != "thinking", \
+                            "Thinking blocks should be stripped after dropping"
+
+        # The critical check: no orphaned tool_results
+        tu_ids = set()
+        tr_ids = set()
+        for msg in msgs:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tu_ids.add(block["id"])
+                elif block.get("type") == "tool_result":
+                    tr_ids.add(block["tool_use_id"])
+        orphaned = tr_ids - tu_ids
+        assert not orphaned, (
+            f"Orphaned tool_result references: {orphaned}. "
+            f"PROXY-004c: _strip_thinking_blocks created a copy of the "
+            f"assistant with tool_use(tu_target) and the _vc_critical "
+            f"sentinel was lost on the copy."
+        )
 
     @pytest.mark.regression("PROXY-023")
     def test_compacted_turns_dropped_when_paging_active(self):

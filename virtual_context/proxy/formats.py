@@ -308,10 +308,10 @@ class AnthropicFormat(PayloadFormat):
         if not prepend_text:
             return body
         body = copy.deepcopy(body)
-        context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         existing = body.get("system", "")
         if isinstance(existing, list):
-            body["system"] = [{"type": "text", "text": context_block}] + existing
+            body["system"] = existing + [{"type": "text", "text": context_block}]
         else:
             body["system"] = f"{context_block}\n\n{existing}" if existing else context_block
         return body
@@ -435,7 +435,11 @@ class AnthropicFormat(PayloadFormat):
         tools = list(body.get("tools") or [])
         tools.extend(tool_defs)
         body["tools"] = tools
-        if require_tool_use and "tool_choice" not in body:
+        # Anthropic API rejects tool_choice=any when thinking is enabled.
+        # Skip forcing tool use in that case — tools are still available.
+        thinking = body.get("thinking")
+        thinking_enabled = isinstance(thinking, dict) and thinking.get("type") == "enabled"
+        if require_tool_use and "tool_choice" not in body and not thinking_enabled:
             body["tool_choice"] = {"type": "any"}
         return body
 
@@ -531,7 +535,7 @@ class OpenAIFormat(PayloadFormat):
         if not prepend_text:
             return body
         body = copy.deepcopy(body)
-        context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         messages = body.get("messages", [])
         if messages and messages[0].get("role") == "system":
             existing = messages[0].get("content", "")
@@ -758,7 +762,7 @@ class GeminiFormat(PayloadFormat):
         if not prepend_text:
             return body
         body = copy.deepcopy(body)
-        context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
 
         # Gemini uses system_instruction.parts[] for system prompt
         si = body.get("system_instruction", {})
@@ -1096,7 +1100,7 @@ class OpenAIResponsesFormat(PayloadFormat):
         if not prepend_text:
             return body
         body = copy.deepcopy(body)
-        context_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         existing = body.get("instructions", "")
         body["instructions"] = (
             f"{context_block}\n\n{existing}" if existing else context_block
@@ -1349,7 +1353,9 @@ class OpenAIResponsesFormat(PayloadFormat):
         tool_results: list[dict],
     ) -> dict:
         body = copy.deepcopy(original_body)
-        body["stream"] = False
+        # Responses API (Codex) requires stream=true; continuation handler
+        # collects the SSE stream and extracts the completed response.
+        body["stream"] = True
         inp = list(body.get("input", []))
         for block in assistant_content:
             if block.get("type") == "function_call":

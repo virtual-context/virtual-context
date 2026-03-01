@@ -159,3 +159,28 @@ class ContextStore(ABC):
     def get_fact_count_by_tags(self) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
         return {}
+
+    # ------------------------------------------------------------------
+    # Tool Output Storage
+    # ------------------------------------------------------------------
+
+    def store_tool_output(
+        self,
+        ref: str,
+        session_id: str,
+        tool_name: str,
+        command: str,
+        turn: int,
+        content: str,
+        original_bytes: int,
+    ) -> None:
+        """Store full tool output for FTS5 search via find_quote."""
+        pass
+
+    def search_tool_outputs(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list:
+        """Search indexed tool outputs by FTS. Returns list of QuoteResult."""
+        return []

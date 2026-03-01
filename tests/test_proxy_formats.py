@@ -162,7 +162,7 @@ class TestAnthropicFormat:
     def test_inject_context_string_system(self):
         body = {"system": "Be helpful.", "messages": []}
         result = self.fmt.inject_context(body, "topic summary")
-        assert "<virtual-context>" in result["system"]
+        assert "<system-reminder>" in result["system"]
         assert "topic summary" in result["system"]
         assert "Be helpful." in result["system"]
 
@@ -170,12 +170,13 @@ class TestAnthropicFormat:
         body = {"system": [{"type": "text", "text": "Be helpful."}], "messages": []}
         result = self.fmt.inject_context(body, "topic summary")
         assert isinstance(result["system"], list)
-        assert result["system"][0]["text"].startswith("<virtual-context>")
+        assert result["system"][0]["text"] == "Be helpful."
+        assert result["system"][-1]["text"].startswith("<system-reminder>")
 
     def test_inject_context_no_system(self):
         body = {"messages": []}
         result = self.fmt.inject_context(body, "ctx")
-        assert "<virtual-context>" in result.get("system", "")
+        assert "<system-reminder>" in result.get("system", "")
 
     def test_inject_context_empty_prepend(self):
         body = {"system": "original", "messages": []}
@@ -319,14 +320,14 @@ class TestOpenAIFormat:
             {"role": "user", "content": "hi"},
         ]}
         result = self.fmt.inject_context(body, "ctx text")
-        assert "<virtual-context>" in result["messages"][0]["content"]
+        assert "<system-reminder>" in result["messages"][0]["content"]
         assert "Be helpful." in result["messages"][0]["content"]
 
     def test_inject_context_without_system(self):
         body = {"messages": [{"role": "user", "content": "hi"}]}
         result = self.fmt.inject_context(body, "ctx text")
         assert result["messages"][0]["role"] == "system"
-        assert "<virtual-context>" in result["messages"][0]["content"]
+        assert "<system-reminder>" in result["messages"][0]["content"]
 
     def test_extract_session_id(self):
         body = {"messages": [
@@ -418,7 +419,7 @@ class TestGeminiFormat:
         ]}
         result = self.fmt.inject_context(body, "ctx text")
         si = result["system_instruction"]
-        assert si["parts"][0]["text"].startswith("<virtual-context>")
+        assert si["parts"][0]["text"].startswith("<system-reminder>")
 
     def test_inject_context_with_existing_system_instruction(self):
         body = {
@@ -428,7 +429,7 @@ class TestGeminiFormat:
         result = self.fmt.inject_context(body, "ctx")
         parts = result["system_instruction"]["parts"]
         assert len(parts) == 2
-        assert "<virtual-context>" in parts[0]["text"]
+        assert "<system-reminder>" in parts[0]["text"]
         assert parts[1]["text"] == "Be helpful."
 
     def test_inject_context_empty(self):
@@ -585,7 +586,7 @@ class TestServerWrappers:
         body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
         result = _inject_context(body, "context text", "gemini")
         assert "system_instruction" in result
-        assert "<virtual-context>" in result["system_instruction"]["parts"][0]["text"]
+        assert "<system-reminder>" in result["system_instruction"]["parts"][0]["text"]
 
     def test_extract_session_id_gemini(self):
         from virtual_context.proxy.server import _extract_session_id
@@ -642,7 +643,7 @@ class TestServerWrappers:
         from virtual_context.proxy.server import _inject_context
         body = {"instructions": "Be helpful.", "input": []}
         result = _inject_context(body, "context text", "openai_responses")
-        assert "<virtual-context>" in result["instructions"]
+        assert "<system-reminder>" in result["instructions"]
 
     def test_extract_session_id_responses(self):
         from virtual_context.proxy.server import _extract_session_id
@@ -820,14 +821,14 @@ class TestOpenAIResponsesFormat:
     def test_inject_context_into_instructions(self):
         body = {"instructions": "Be helpful.", "input": []}
         result = self.fmt.inject_context(body, "topic summary")
-        assert "<virtual-context>" in result["instructions"]
+        assert "<system-reminder>" in result["instructions"]
         assert "topic summary" in result["instructions"]
         assert "Be helpful." in result["instructions"]
 
     def test_inject_context_no_instructions(self):
         body = {"input": [{"role": "user", "content": "hi"}]}
         result = self.fmt.inject_context(body, "ctx")
-        assert "<virtual-context>" in result["instructions"]
+        assert "<system-reminder>" in result["instructions"]
         assert "ctx" in result["instructions"]
 
     def test_inject_context_empty_prepend(self):
@@ -1163,7 +1164,7 @@ class TestOpenAIResponsesFormat:
         ]
         result = self.fmt.build_continuation_request(original, assistant_content, tool_results)
         assert result["model"] == "codex-mini"
-        assert result["stream"] is False
+        assert result["stream"] is True  # Codex Responses API requires streaming
         assert result["instructions"] == "Be helpful."
         # Original input + function_call + function_call_output
         assert len(result["input"]) == 3
@@ -1439,7 +1440,7 @@ class TestPagingToolSupport:
         ]
         result = fmt.build_continuation_request(original, assistant_content, tool_results)
         assert result["model"] == "codex-mini"
-        assert result["stream"] is False
+        assert result["stream"] is True  # Codex Responses API requires streaming
         assert "input" in result
         assert result["input"][-2]["type"] == "function_call"
         assert result["input"][-1]["type"] == "function_call_output"
@@ -1476,7 +1477,7 @@ class TestPagingToolSupport:
         ]
         result = _build_continuation_request(body, assistant_content, tool_results)
         assert "input" in result
-        assert result["stream"] is False
+        assert result["stream"] is True  # Codex Responses API requires streaming
         assert result["input"][-2]["type"] == "function_call"
         assert result["input"][-1]["type"] == "function_call_output"
 
@@ -1694,7 +1695,7 @@ class TestResponsesStreamInterception:
             "input": [{"role": "user", "content": "What did we discuss about cooking?"}],
         }
         cont = fmt.build_continuation_request(original, output, formatted_results)
-        assert cont["stream"] is False
+        assert cont["stream"] is True  # Codex Responses API requires streaming
         # Should have: user + function_call + function_call_output
         assert len(cont["input"]) == 3
         assert cont["input"][1]["type"] == "function_call"

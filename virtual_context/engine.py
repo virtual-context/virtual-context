@@ -716,6 +716,15 @@ class VirtualContextEngine:
                 t for t in self._turn_tag_index.compute_cover_set()
                 if t in compacted_tags
             ]
+            # Primary tag guarantee: ensure every segment's primary_tag gets
+            # a tag summary, even if the greedy set cover dropped it.
+            # Without this, ephemeral topics (2-3 turns) lose their most
+            # specific tag to broader tags that cover more segments.
+            cover_set = set(cover_tags)
+            for r in results:
+                if r.primary_tag and r.primary_tag not in cover_set:
+                    cover_tags.append(r.primary_tag)
+                    cover_set.add(r.primary_tag)
             if cover_tags:
                 # Gather segment summaries per cover tag
                 tag_to_summaries: dict[str, list] = {}
@@ -1796,8 +1805,9 @@ class VirtualContextEngine:
             # The intent_context may be the full enriched prompt (context
             # summaries + question).  Strip the <virtual-context> block so
             # only the trailing question/instruction remains.
-            if "</virtual-context>" in query_str:
-                query_str = query_str.split("</virtual-context>")[-1].strip()
+            for _vc_end_tag in ("</system-reminder>", "</virtual-context>"):
+                if _vc_end_tag in query_str:
+                    query_str = query_str.split(_vc_end_tag)[-1].strip()
             # Strip leading preamble that the benchmark wraps around the
             # context block — only keep meaningful trailing text.
             import re

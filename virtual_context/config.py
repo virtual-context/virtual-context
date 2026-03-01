@@ -26,6 +26,8 @@ from .types import (
     TagGeneratorConfig,
     TagPromptRule,
     TagSplittingConfig,
+    ToolOutputConfig,
+    ToolOutputRule,
     VirtualContextConfig,
 )
 
@@ -242,6 +244,27 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         max_tool_loops=paging_raw.get("max_tool_loops", 10),
     )
 
+    # Tool output interception
+    to_raw = raw.get("tool_output", {})
+    tool_output_rules = [
+        ToolOutputRule(
+            match=r.get("match", "*"),
+            truncate_threshold=r.get("truncate_threshold"),
+            head_ratio=r.get("head_ratio", 0.6),
+            tail_ratio=r.get("tail_ratio", 0.4),
+            max_index_bytes=r.get("max_index_bytes"),
+        )
+        for r in to_raw.get("rules", [])
+    ]
+    tool_output_config = ToolOutputConfig(
+        enabled=to_raw.get("enabled", False),
+        default_truncate_threshold=to_raw.get("default_truncate_threshold", 8192),
+        max_index_bytes=to_raw.get("max_index_bytes", 524_288),
+        default_head_ratio=to_raw.get("default_head_ratio", 0.6),
+        default_tail_ratio=to_raw.get("default_tail_ratio", 0.4),
+        rules=tool_output_rules,
+    )
+
     cfg = VirtualContextConfig(
         version=raw.get("version", "0.2"),
         storage_root=storage_root,
@@ -259,6 +282,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         cost_tracking=cost_tracking,
         paging=paging_config,
         proxy=proxy_config,
+        tool_output=tool_output_config,
         providers=raw.get("providers", {}),
     )
     if "session_id" in raw:

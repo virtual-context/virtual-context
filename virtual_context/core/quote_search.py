@@ -329,6 +329,12 @@ def find_quote(
     # ---- Description-aware search ----
     results = supplement_from_descriptions(store, query, results, max_results)
 
+    # ---- Tool output search (truncated tool_result content) ----
+    tool_remaining = max_results - len(results)
+    if tool_remaining > 0:
+        tool_results = store.search_tool_outputs(query, limit=tool_remaining)
+        results.extend(tool_results)
+
     # ---- Span-union: merge overlapping excerpts from the same segment ----
     results = _merge_segment_excerpts(store, results)
 

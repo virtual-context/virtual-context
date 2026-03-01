@@ -1150,20 +1150,20 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "NEW expanded text")
-        assert "<virtual-context>\nNEW expanded text\n</virtual-context>" in body["system"]
+        assert "<system-reminder>\nNEW expanded text\n</system-reminder>" in body["system"]
         assert "old summaries" not in body["system"]
         assert "Be helpful." in body["system"]
 
     def test_no_existing_block_prepends(self):
         body = {"system": "Be helpful.", "messages": []}
         self.adapter.inject_context(body, "injected text")
-        assert body["system"].startswith("<virtual-context>\ninjected text\n</virtual-context>")
+        assert body["system"].startswith("<system-reminder>\ninjected text\n</system-reminder>")
         assert "Be helpful." in body["system"]
 
     def test_empty_system_sets_block(self):
         body = {"system": "", "messages": []}
         self.adapter.inject_context(body, "content")
-        assert body["system"] == "<virtual-context>\ncontent\n</virtual-context>"
+        assert body["system"] == "<system-reminder>\ncontent\n</system-reminder>"
 
     def test_list_system_replaces_existing(self):
         body = {
@@ -1174,7 +1174,7 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "new content")
-        assert "<virtual-context>\nnew content\n</virtual-context>" in body["system"][0]["text"]
+        assert "<system-reminder>\nnew content\n</system-reminder>" in body["system"][0]["text"]
         assert "old" not in body["system"][0]["text"]
 
     def test_list_system_no_existing_inserts(self):
@@ -1183,13 +1183,13 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "new content")
-        assert body["system"][0]["text"] == "<virtual-context>\nnew content\n</virtual-context>"
+        assert body["system"][0]["text"] == "<system-reminder>\nnew content\n</system-reminder>"
         assert body["system"][1]["text"] == "Other instructions"
 
     def test_no_system_key(self):
         body = {"messages": []}
         self.adapter.inject_context(body, "content")
-        assert body["system"] == "<virtual-context>\ncontent\n</virtual-context>"
+        assert body["system"] == "<system-reminder>\ncontent\n</system-reminder>"
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +1210,7 @@ class TestOpenAIAdapterInjectContext:
             ],
         }
         self.adapter.inject_context(body, "new text")
-        assert "<virtual-context>\nnew text\n</virtual-context>" in body["messages"][0]["content"]
+        assert "<system-reminder>\nnew text\n</system-reminder>" in body["messages"][0]["content"]
         assert "old" not in body["messages"][0]["content"]
         assert "Be helpful." in body["messages"][0]["content"]
 
@@ -1222,14 +1222,14 @@ class TestOpenAIAdapterInjectContext:
             ],
         }
         self.adapter.inject_context(body, "new text")
-        assert body["messages"][0]["content"].startswith("<virtual-context>\nnew text\n</virtual-context>")
+        assert body["messages"][0]["content"].startswith("<system-reminder>\nnew text\n</system-reminder>")
         assert "Be helpful." in body["messages"][0]["content"]
 
     def test_no_system_message_inserts(self):
         body = {"messages": [{"role": "user", "content": "hi"}]}
         self.adapter.inject_context(body, "new text")
         assert body["messages"][0]["role"] == "system"
-        assert body["messages"][0]["content"] == "<virtual-context>\nnew text\n</virtual-context>"
+        assert body["messages"][0]["content"] == "<system-reminder>\nnew text\n</system-reminder>"
         assert body["messages"][1]["role"] == "user"
 
 
@@ -1252,7 +1252,7 @@ class TestGeminiAdapterInjectContext:
         }
         self.adapter.inject_context(body, "new text")
         text = body["system_instruction"]["parts"][0]["text"]
-        assert "<virtual-context>\nnew text\n</virtual-context>" in text
+        assert "<system-reminder>\nnew text\n</system-reminder>" in text
         assert "old" not in text
         assert "Be helpful." in text
 
@@ -1262,13 +1262,13 @@ class TestGeminiAdapterInjectContext:
             "contents": [],
         }
         self.adapter.inject_context(body, "new text")
-        assert body["system_instruction"]["parts"][0]["text"] == "<virtual-context>\nnew text\n</virtual-context>"
+        assert body["system_instruction"]["parts"][0]["text"] == "<system-reminder>\nnew text\n</system-reminder>"
         assert body["system_instruction"]["parts"][1]["text"] == "Be helpful."
 
     def test_no_system_instruction_creates(self):
         body = {"contents": []}
         self.adapter.inject_context(body, "new text")
-        assert body["system_instruction"]["parts"][0]["text"] == "<virtual-context>\nnew text\n</virtual-context>"
+        assert body["system_instruction"]["parts"][0]["text"] == "<system-reminder>\nnew text\n</system-reminder>"
 
 
 # ---------------------------------------------------------------------------

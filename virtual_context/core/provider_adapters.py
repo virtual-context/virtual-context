@@ -15,9 +15,10 @@ import re
 import uuid
 from abc import ABC, abstractmethod
 
-# Regex to match an existing <virtual-context> block (including its content)
+# Regex to match an existing <virtual-context> or <system-reminder> block
 _VC_BLOCK_RE = re.compile(
-    r"<virtual-context>\n.*?\n</virtual-context>", re.DOTALL,
+    r"<(?:virtual-context|system-reminder)>\n.*?\n</(?:virtual-context|system-reminder)>",
+    re.DOTALL,
 )
 
 
@@ -221,7 +222,7 @@ class AnthropicAdapter(ProviderAdapter):
             return cont_body
 
     def inject_context(self, body, prepend_text):
-        new_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         system = body.get("system", "")
         if isinstance(system, str):
             if _VC_BLOCK_RE.search(system):
@@ -385,7 +386,7 @@ class OpenAIAdapter(ProviderAdapter):
         return body
 
     def inject_context(self, body, prepend_text):
-        new_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         messages = body.get("messages", [])
         if messages and messages[0].get("role") == "system":
             content = messages[0].get("content", "")
@@ -546,7 +547,7 @@ class OpenAICodexAdapter(ProviderAdapter):
         return body
 
     def inject_context(self, body, prepend_text):
-        new_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         instructions = body.get("instructions", "")
         if isinstance(instructions, str) and _VC_BLOCK_RE.search(instructions):
             body["instructions"] = _VC_BLOCK_RE.sub(new_block, instructions, count=1)
@@ -702,7 +703,7 @@ class GeminiAdapter(ProviderAdapter):
         return body
 
     def inject_context(self, body, prepend_text):
-        new_block = f"<virtual-context>\n{prepend_text}\n</virtual-context>"
+        new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         si = body.get("system_instruction")
         if isinstance(si, dict):
             parts = si.get("parts", [])

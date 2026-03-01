@@ -115,14 +115,16 @@ def vc_tool_definitions() -> list[dict]:
         {
             "name": "vc_find_quote",
             "description": (
-                "Search the full original conversation text for a specific word, "
-                "phrase, or detail. Use this as your first tool when the user asks "
-                "about a specific fact — a name, number, dosage, recommendation, "
-                "date, or decision — especially when no topic summary mentions it "
-                "or you don't know which topic it falls under. This bypasses tags "
-                "entirely and searches raw text, so it finds content even when "
-                "it's filed under an unexpected topic. Returns short excerpts — "
-                "use vc_expand_topic on a matching tag if you need more context."
+                "Search the full original conversation text and truncated tool "
+                "outputs for a specific word, phrase, or detail. Use this when "
+                "you see '... N bytes truncated — call vc_find_quote(query) ...' "
+                "in a tool result, or when the user asks about a specific fact — "
+                "a name, number, dosage, recommendation, date, or decision — "
+                "especially when no topic summary mentions it or you don't know "
+                "which topic it falls under. This bypasses tags entirely and "
+                "searches raw text, so it finds content even when it's filed "
+                "under an unexpected topic. Returns short excerpts — use "
+                "vc_expand_topic on a matching tag if you need more context."
             ),
             "input_schema": {
                 "type": "object",
@@ -505,6 +507,49 @@ def execute_vc_tool(
 # ---------------------------------------------------------------------------
 
 _MAX_LOOPS = 10
+_REDUNDANT_SEARCH_THRESHOLD = 3  # force-stop after this many all-found find_quote rounds
+_EMPTY_STREAK_HINT_THRESHOLD = 3  # suggest strategy change after this many empty results
+
+
+def _is_empty_result(result_json: str) -> bool:
+    """Return True if a tool result indicates nothing was found."""
+    try:
+        data = json.loads(result_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if data.get("found") is False:
+        return True
+    if data.get("count") == 0 or data.get("facts") == []:
+        return True
+    results = data.get("results")
+    if isinstance(results, list) and len(results) == 0:
+        return True
+    return False
+
+
+_STRATEGY_HINTS: dict[str, str] = {
+    "vc_query_facts": (
+        "[HINT] vc_query_facts has returned no results {n} times in a row. "
+        "Try a different approach: use vc_find_quote(query) to search raw "
+        "conversation text, or vc_expand_topic(tag) to browse a relevant "
+        "topic directly."
+    ),
+    "vc_find_quote": (
+        "[HINT] vc_find_quote has returned no results {n} times in a row. "
+        "Try a different approach: use vc_query_facts to search structured "
+        "facts, vc_expand_topic(tag) to browse a topic, or try broader/"
+        "different search terms."
+    ),
+    "vc_remember_when": (
+        "[HINT] vc_remember_when has returned no results {n} times in a row. "
+        "Try a different approach: use vc_find_quote(query) to search raw "
+        "text, or broaden your time range."
+    ),
+}
+_DEFAULT_STRATEGY_HINT = (
+    "[HINT] This tool has returned no results {n} times in a row. "
+    "Try a different tool or approach."
+)
 
 
 def _parse_sse_response(text: str) -> dict:
@@ -621,6 +666,14 @@ def run_tool_loop(
     intent_context = _extract_last_user_text(original_request)
     _find_session_injected = False
 
+    # Short reminder appended to each tool result so the model
+    # doesn't lose sight of the original question during long loops.
+    _question_reminder = (
+        f"\n\n[REMINDER] Question: {intent_context}\n"
+        "If you have enough information, stop calling tools and respond."
+        if intent_context else ""
+    )
+
     with httpx.Client(timeout=300.0) as client:
         for loop_i in range(max_loops):
             # Execute VC tools
@@ -642,8 +695,25 @@ def run_tool_loop(
                     duration_ms=duration_ms,
                 ))
 
+                # Check for consecutive empty results from the same tool
+                # and append a strategy hint if the streak is long enough.
+                strategy_hint = ""
+                if _is_empty_result(result_str):
+                    streak = 0
+                    for prev in reversed(result.tool_calls):
+                        if prev.tool_name == tc["name"] and _is_empty_result(prev.result_json):
+                            streak += 1
+                        else:
+                            break
+                    if streak >= _EMPTY_STREAK_HINT_THRESHOLD:
+                        tpl = _STRATEGY_HINTS.get(tc["name"], _DEFAULT_STRATEGY_HINT)
+                        strategy_hint = "\n\n" + tpl.format(n=streak)
+
                 tool_results.append(
-                    adapter.build_tool_result(tc["id"], tc["name"], result_str)
+                    adapter.build_tool_result(
+                        tc["id"], tc["name"],
+                        result_str + strategy_hint + _question_reminder,
+                    )
                 )
 
             # Re-assemble context only when working-set tools were used
@@ -708,6 +778,39 @@ def run_tool_loop(
 
             if (adapter.is_tool_use_stop(cont_data)
                     and vc_tools and not non_vc_in_cont):
+                # Detect redundant search loops: if the last N rounds
+                # were all vc_find_quote calls that returned found:true,
+                # the model already has the answer — strip tools and
+                # force a text response.
+                if loop_i >= _REDUNDANT_SEARCH_THRESHOLD - 1:
+                    recent = result.tool_calls[-(_REDUNDANT_SEARCH_THRESHOLD * max(len(vc_tools), 1)):]
+                    all_find = all(r.tool_name == "vc_find_quote" for r in recent)
+                    all_found = all('"found": true' in r.result_json for r in recent)
+                    if all_find and all_found and len(recent) >= _REDUNDANT_SEARCH_THRESHOLD:
+                        logger.info(
+                            "Redundant search loop detected after %d rounds "
+                            "— forcing text answer",
+                            loop_i + 1,
+                        )
+                        adapter.strip_tools(cont_body)
+                        result.continuation_count += 1
+                        result.raw_requests.append(copy.deepcopy(cont_body))
+                        resp = client.post(url, headers=headers, json=cont_body)
+                        if resp.status_code < 300:
+                            forced_data = _parse_provider_http_response(resp)
+                            result.raw_responses.append(forced_data)
+                            fi, fo = adapter.extract_usage(forced_data)
+                            result.input_tokens += fi
+                            result.output_tokens += fo
+                            result.text += adapter.extract_text(forced_data)
+                            result.stop_reason = "redundant_loop"
+                        else:
+                            logger.error(
+                                "Forced text after redundant loop failed: HTTP %d",
+                                resp.status_code,
+                            )
+                            result.stop_reason = "error"
+                        break
                 continue  # loop again
 
             # Done
