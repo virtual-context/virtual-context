@@ -115,3 +115,123 @@ class TestTaggerParsing:
         result = gen.generate_tags("I prefer French cuisine")
         assert result.fact_signals[0].fact_type == "personal"
         assert result.fact_signals[0].what == ""
+
+
+class TestCompactorPromptEnrichment:
+    def test_compactor_prompt_has_fact_type(self):
+        from virtual_context.core.compactor import DEFAULT_SUMMARY_PROMPT
+        assert "fact_type" in DEFAULT_SUMMARY_PROMPT
+
+    def test_compactor_prompt_has_specifics_instruction(self):
+        from virtual_context.core.compactor import DEFAULT_SUMMARY_PROMPT
+        assert "ALL specifics" in DEFAULT_SUMMARY_PROMPT
+
+    def test_compactor_prompt_has_dedup_instruction(self):
+        from virtual_context.core.compactor import DEFAULT_SUMMARY_PROMPT
+        assert "same event" in DEFAULT_SUMMARY_PROMPT or "duplicate" in DEFAULT_SUMMARY_PROMPT.lower()
+
+    def test_compactor_prompt_requires_all_dimensions(self):
+        from virtual_context.core.compactor import DEFAULT_SUMMARY_PROMPT
+        for dim in ("what", "who", "when", "where", "why"):
+            assert f'"{dim}"' in DEFAULT_SUMMARY_PROMPT
+
+
+class TestCompactorFactParsing:
+    def test_compactor_parses_fact_type(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, Message, TaggedSegment
+        from datetime import datetime, timedelta, timezone
+
+        response = (
+            '{"summary": "Test", "entities": [], "key_decisions": [], '
+            '"action_items": [], "date_references": [], "refined_tags": ["running"], '
+            '"facts": [{"subject": "user", "verb": "runs", "object": "5K", '
+            '"status": "active", "fact_type": "experience", '
+            '"what": "User runs 5K races.", "who": "", "when": "", "where": "", "why": ""}]}'
+        )
+        llm = MockLLMProvider(response=response)
+        compactor = DomainCompactor(
+            llm_provider=llm,
+            config=CompactorConfig(summary_ratio=0.15, min_summary_tokens=50, max_summary_tokens=500),
+            model_name="test-model",
+        )
+        ts = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        seg = TaggedSegment(
+            primary_tag="running", tags=["running"],
+            messages=[
+                Message(role="user", content="I run 5K races", timestamp=ts),
+                Message(role="assistant", content="Great!", timestamp=ts + timedelta(seconds=30)),
+            ],
+            token_count=20, start_timestamp=ts, end_timestamp=ts + timedelta(seconds=30), turn_count=1,
+        )
+        results = compactor.compact([seg])
+        assert len(results[0].facts) == 1
+        assert results[0].facts[0].fact_type == "experience"
+
+    def test_compactor_defaults_fact_type_to_personal(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, Message, TaggedSegment
+        from datetime import datetime, timedelta, timezone
+
+        response = (
+            '{"summary": "Test", "entities": [], "key_decisions": [], '
+            '"action_items": [], "date_references": [], "refined_tags": ["cooking"], '
+            '"facts": [{"subject": "user", "verb": "prefers", "object": "French cuisine", '
+            '"status": "active", "what": "User prefers French cuisine.", "who": "", "when": "", "where": "", "why": ""}]}'
+        )
+        llm = MockLLMProvider(response=response)
+        compactor = DomainCompactor(
+            llm_provider=llm,
+            config=CompactorConfig(summary_ratio=0.15, min_summary_tokens=50, max_summary_tokens=500),
+            model_name="test-model",
+        )
+        ts = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        seg = TaggedSegment(
+            primary_tag="cooking", tags=["cooking"],
+            messages=[
+                Message(role="user", content="I prefer French cuisine", timestamp=ts),
+                Message(role="assistant", content="Noted!", timestamp=ts + timedelta(seconds=30)),
+            ],
+            token_count=20, start_timestamp=ts, end_timestamp=ts + timedelta(seconds=30), turn_count=1,
+        )
+        results = compactor.compact([seg])
+        assert results[0].facts[0].fact_type == "personal"
+
+
+class TestCompactorSignalHints:
+    def test_signal_hints_include_fact_type_and_what(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, Message, TaggedSegment, FactSignal
+        from datetime import datetime, timedelta, timezone
+
+        response = (
+            '{"summary": "Test", "entities": [], "key_decisions": [], '
+            '"action_items": [], "date_references": [], "refined_tags": ["running"], "facts": []}'
+        )
+        llm = MockLLMProvider(response=response)
+        compactor = DomainCompactor(
+            llm_provider=llm,
+            config=CompactorConfig(summary_ratio=0.15, min_summary_tokens=50, max_summary_tokens=500),
+            model_name="test-model",
+        )
+        ts = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        seg = TaggedSegment(
+            primary_tag="running", tags=["running"],
+            messages=[
+                Message(role="user", content="I run 5K", timestamp=ts),
+                Message(role="assistant", content="Great!", timestamp=ts + timedelta(seconds=30)),
+            ],
+            token_count=20, start_timestamp=ts, end_timestamp=ts + timedelta(seconds=30), turn_count=1,
+        )
+        signals = [FactSignal(
+            subject="user", verb="runs", object="5K races",
+            status="active", fact_type="personal",
+            what="User runs 5K charity races every spring.",
+        )]
+        compactor.compact([seg], fact_signals_by_segment={seg.id: signals})
+        prompt_sent = llm.calls[0]["user"]
+        assert "[personal]" in prompt_sent
+        assert "User runs 5K charity races every spring." in prompt_sent

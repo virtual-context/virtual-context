@@ -110,13 +110,20 @@ concepts later (e.g. if discussing "materialized views", related_tags might incl
 Also extract facts from the conversation. For each fact:
 - "subject": who (usually "user"; proper names for others)
 - "verb": the exact action verb (e.g. "led", "built", "prefers", "lives in", "ordered")
-- "object": what (specific noun phrase)
+- "object": what (specific noun phrase — preserve ALL numbers, names, dates, amounts exactly)
 - "status": one of: active, completed, planned, abandoned, recurring
-- "what": one-sentence summary of the fact
-- "who": people involved (omit if n/a)
-- "when": date if mentioned (ISO format, omit if n/a)
-- "where": location (omit if n/a)
-- "why": context/significance (omit if n/a)
+- "fact_type": classify as "personal" (user's life, identity, preferences, plans),
+  "experience" (assistant-provided info the user engaged with), or
+  "world" (facts about other people, places, things in the user's world)
+- "what": one full sentence capturing the complete fact with ALL specifics preserved.
+  WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
+- "who": people involved (populate when present, empty string if n/a)
+- "when": date if mentioned (ISO format or free-form, empty string if n/a)
+- "where": location (populate when present, empty string if n/a)
+- "why": context or significance (populate when present, empty string if n/a)
+Extract the FACT behind the question, not the conversational act.
+WRONG: "user asks about Cairo restaurants" RIGHT: "user wants to try authentic Egyptian food in Cairo"
+If two signals describe the same event, emit one fact with the richest details.
 Include "facts" in the JSON response.
 Only extract facts with genuine substance. Skip greetings and filler."""
 
@@ -228,7 +235,10 @@ class DomainCompactor:
             hint_lines = []
             for s in fact_signals:
                 if s.subject and s.object:
-                    hint_lines.append(f"- {s.subject} {s.verb} {s.object} ({s.status})")
+                    line = f"- [{s.fact_type}] {s.subject} {s.verb} {s.object} ({s.status})"
+                    if s.what:
+                        line += f" — {s.what}"
+                    hint_lines.append(line)
             if hint_lines:
                 signals_text = (
                     "\n\nPer-turn fact signals (verify and consolidate with full context):\n"
@@ -339,6 +349,7 @@ class DomainCompactor:
                     when_date=_str(f.get("when", "")),
                     where=_str(f.get("where", "")),
                     why=_str(f.get("why", "")),
+                    fact_type=f.get("fact_type", "personal"),
                     tags=refined_tags,
                 ))
 
