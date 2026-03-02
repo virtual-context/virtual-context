@@ -67,3 +67,51 @@ class TestSQLiteFactType:
         personal = store.query_facts(subject="user", fact_type="personal")
         assert len(personal) == 1
         assert personal[0].verb == "runs"
+
+
+class TestTaggerPromptEnrichment:
+    def test_detailed_prompt_has_fact_type(self):
+        from virtual_context.core.tag_generator import TAG_GENERATOR_PROMPT_DETAILED
+        assert "fact_type" in TAG_GENERATOR_PROMPT_DETAILED
+        assert "personal|experience|world" in TAG_GENERATOR_PROMPT_DETAILED
+
+    def test_detailed_prompt_has_what_field(self):
+        from virtual_context.core.tag_generator import TAG_GENERATOR_PROMPT_DETAILED
+        assert '"what"' in TAG_GENERATOR_PROMPT_DETAILED
+
+    def test_detailed_prompt_suppresses_meta_verbs(self):
+        from virtual_context.core.tag_generator import TAG_GENERATOR_PROMPT_DETAILED
+        assert "conversational act" in TAG_GENERATOR_PROMPT_DETAILED or "asks about" in TAG_GENERATOR_PROMPT_DETAILED
+
+    def test_compact_prompt_has_fact_type(self):
+        from virtual_context.core.tag_generator import TAG_GENERATOR_PROMPT_COMPACT
+        assert "fact_type" in TAG_GENERATOR_PROMPT_COMPACT
+
+    def test_compact_prompt_has_what_field(self):
+        from virtual_context.core.tag_generator import TAG_GENERATOR_PROMPT_COMPACT
+        assert '"what"' in TAG_GENERATOR_PROMPT_COMPACT
+
+
+class TestTaggerParsing:
+    def test_parses_fact_type_from_response(self):
+        from virtual_context.core.tag_generator import LLMTagGenerator
+        from virtual_context.types import TagGeneratorConfig
+        llm = type('MockLLM', (), {
+            'complete': lambda self, **kw: '{"tags": ["running"], "primary": "running", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "runs", "object": "5K", "status": "active", "fact_type": "experience", "what": "User runs 5K races."}]}'
+        })()
+        gen = LLMTagGenerator(llm, TagGeneratorConfig(type="llm"))
+        result = gen.generate_tags("I run 5K races")
+        assert len(result.fact_signals) == 1
+        assert result.fact_signals[0].fact_type == "experience"
+        assert result.fact_signals[0].what == "User runs 5K races."
+
+    def test_fact_type_defaults_to_personal(self):
+        from virtual_context.core.tag_generator import LLMTagGenerator
+        from virtual_context.types import TagGeneratorConfig
+        llm = type('MockLLM', (), {
+            'complete': lambda self, **kw: '{"tags": ["cooking"], "primary": "cooking", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "prefers", "object": "French cuisine", "status": "active"}]}'
+        })()
+        gen = LLMTagGenerator(llm, TagGeneratorConfig(type="llm"))
+        result = gen.generate_tags("I prefer French cuisine")
+        assert result.fact_signals[0].fact_type == "personal"
+        assert result.fact_signals[0].what == ""

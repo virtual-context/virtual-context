@@ -86,10 +86,22 @@ Rules:
   at least one tag for the concrete noun or topic the user asked about.
 - Tag both what the conversation is about AND what the user reveals about
   their own life, experiences, or situation — even if mentioned in passing.
-- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase", "status": "active|completed|planned|abandoned|recurring"}}
-  The verb should be the actual action from the conversation (e.g. "led", "ordered", "rearranged", "prefers", "lives in"). Do not categorize — use the real verb.
+- Extract facts about the user's life, experiences, preferences, plans, and world.
+  For each fact, classify:
+  - "fact_type": "personal" (user's life/identity/preferences), "experience" (assistant-provided info the user engaged with), or "world" (facts about other people, places, things in the user's world)
+  - "subject": who (usually "user"; proper names for others)
+  - "verb": the exact action verb from the conversation (e.g. "led", "ordered", "prefers", "lives in")
+  - "object": what (specific noun phrase — preserve ALL numbers, names, dates, amounts)
+  - "status": one of: active, completed, planned, abandoned, recurring
+  - "what": one full sentence capturing the complete fact with ALL specifics preserved.
+    WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
+    WRONG: "User paid a parking ticket." RIGHT: "User paid a $40 parking ticket."
+  Extract the FACT behind the question, not the conversational act.
+  WRONG: "user asks about Cairo restaurants" RIGHT: "user wants to try authentic Egyptian food in Cairo"
+  DO NOT extract: mere asks, mentions, discusses, requests for information.
   Only extract facts with genuine substance. Skip greetings and filler.
-- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"], "facts": [{{"subject": "user", "verb": "...", "object": "...", "status": "..."}}]}}
+  When a pronoun refers to a named person mentioned earlier, resolve it: "Emily (user's college roommate)".
+- Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"], "facts": [{{"subject": "user", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "..."}}]}}
 - The "primary" tag is the single most relevant tag
 - No markdown fences, no extra text
 """
@@ -109,8 +121,9 @@ Rules:
 - Tag the concrete subject, not conversational framing. "What do you think of trees?" → "trees", NOT "introspection".
 - Tag both what the conversation is about AND what the user reveals about
   their own life, experiences, or situation — even if mentioned in passing.
-- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase", "status": "active|completed|planned|abandoned|recurring"}}
-  Use the real verb from the conversation (e.g. "led", "ordered", "prefers"). Do not categorize.
+- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase with ALL specifics", "status": "active|completed|planned|abandoned|recurring", "fact_type": "personal|experience|world", "what": "full sentence with ALL specifics"}}
+  Use the real verb (e.g. "led", "ordered", "prefers"). Extract the fact behind the question, not the conversational act.
+  DO NOT extract mere asks/mentions/discusses. Preserve ALL numbers, names, dates, amounts.
 - Generate 2-5 related_tags: alternate words for future recall.
 - Return JSON only: {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1", "alt2"], "facts": [...]}}
 - No markdown fences, no extra text
@@ -404,6 +417,8 @@ class LLMTagGenerator:
                         verb=f.get("verb", f.get("role", "")),
                         object=f.get("object", ""),
                         status=f.get("status", "active"),
+                        fact_type=f.get("fact_type", "personal"),
+                        what=f.get("what", ""),
                     ))
 
         # Update vocabulary
