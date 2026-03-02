@@ -30,6 +30,8 @@ class FactSignal:
     verb: str = ""       # free-form action verb
     object: str = ""
     status: str = ""     # TemporalStatus value
+    fact_type: str = "personal"  # personal|experience|world
+    what: str = ""               # full-sentence memory with ALL specifics
 
 
 @dataclass
@@ -45,15 +47,17 @@ class Fact:
     # Dimensions
     what: str = ""
     who: str = ""
-    when_date: str = ""         # session date or specific date (ISO)
+    when_date: str = ""         # specific date referenced in the fact (ISO or free-form)
     where: str = ""
     why: str = ""
+    fact_type: str = "personal"  # personal|experience|world
     # Provenance
     tags: list[str] = field(default_factory=list)
     segment_ref: str = ""
     session_id: str = ""
     turn_numbers: list[int] = field(default_factory=list)
     mentioned_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    session_date: str = ""  # original conversation date, e.g. "2023/05/25 (Thu) 10:04"
     # Knowledge update chain
     superseded_by: str | None = None  # fact_id that replaces this fact
 
@@ -462,6 +466,7 @@ class AssembledContext:
     matched_tags: list[str] = field(default_factory=list)
     context_hint: str = ""  # Topic list injected post-compaction
     temporal: bool = False  # True when query references a time position
+    presented_segment_refs: set[str] = field(default_factory=set)  # segment refs already shown to reader
 
 
 # ---------------------------------------------------------------------------
