@@ -630,6 +630,13 @@ class ToolOutputStats:
 
 
 @dataclass
+class SupersessionConfig:
+    """Configuration for fact supersession checking."""
+    enabled: bool = False
+    batch_size: int = 20
+
+
+@dataclass
 class VirtualContextConfig:
     version: str = "0.2"
     storage_root: str = ".virtualcontext"

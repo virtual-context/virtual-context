@@ -274,3 +274,46 @@ class TestSetFactSuperseded:
         conn = store._get_conn()
         row = conn.execute("SELECT superseded_by FROM facts WHERE id = ?", (old.id,)).fetchone()
         assert row["superseded_by"] == new.id
+
+
+class TestSupersessionPrompt:
+    def test_prompt_asks_about_duplicates(self):
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(Path(tempfile.mkdtemp()) / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="has PB", object="25:50")
+        candidates = [Fact(subject="user", verb="has PB", object="27:12")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        assert "DUPLICATE" in prompt or "duplicate" in prompt
+
+    def test_prompt_includes_what_field(self):
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(Path(tempfile.mkdtemp()) / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="has PB", object="25:50",
+                        what="User has a personal best 5K time of 25:50.")
+        candidates = [Fact(subject="user", verb="has PB", object="27:12",
+                           what="User set a personal best time of 27:12.")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        assert "25:50" in prompt
+        assert "27:12" in prompt
