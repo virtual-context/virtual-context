@@ -328,3 +328,61 @@ class TestSupersessionPrompt:
         prompt = llm.calls[0]["user"]
         assert "25:50" in prompt
         assert "27:12" in prompt
+
+
+class TestFactEnrichmentIntegration:
+    def test_enriched_fact_roundtrip(self, tmp_path):
+        """Store enriched fact -> query it back -> verify all fields."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        fact = Fact(
+            subject="user",
+            verb="has",
+            object="personal best 5K time of 25:50",
+            status="completed",
+            fact_type="personal",
+            what="User has a personal best 5K time of 25:50.",
+            who="user",
+            when_date="2026-01-15",
+            where="Central Park",
+            why="Training for a charity run",
+        )
+        store.store_facts([fact])
+        results = store.query_facts(subject="user", fact_type="personal")
+        assert len(results) == 1
+        r = results[0]
+        assert r.fact_type == "personal"
+        assert r.what == "User has a personal best 5K time of 25:50."
+        assert r.where == "Central Park"
+        assert r.why == "Training for a charity run"
+        assert "25:50" in r.object
+
+    def test_supersession_filters_old_facts(self, tmp_path):
+        """Old fact superseded -> query only returns new fact."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="has PB", object="27:12",
+                   fact_type="personal", what="User has a PB of 27:12.")
+        new = Fact(subject="user", verb="has PB", object="25:50",
+                   fact_type="personal", what="User has a PB of 25:50.")
+        store.store_facts([old, new])
+        store.set_fact_superseded(old.id, new.id)
+        results = store.query_facts(subject="user")
+        assert len(results) == 1
+        assert "25:50" in results[0].object
+
+    def test_fact_type_filter_excludes_experience(self, tmp_path):
+        """Experience facts should be filterable separately."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        store.store_facts([
+            Fact(subject="user", verb="runs", object="5K", fact_type="personal"),
+            Fact(subject="user", verb="learned about", object="interval training", fact_type="experience"),
+        ])
+        personal_only = store.query_facts(subject="user", fact_type="personal")
+        all_facts = store.query_facts(subject="user")
+        assert len(personal_only) == 1
+        assert len(all_facts) == 2
