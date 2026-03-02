@@ -142,6 +142,7 @@ class ContextStore(ABC):
         verbs: list[str] | None = None,
         object_contains: str | None = None,
         status: str | None = None,
+        fact_type: str | None = None,
         tags: list[str] | None = None,
         limit: int = 50,
     ) -> list[Fact]:
@@ -154,6 +155,10 @@ class ContextStore(ABC):
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         """Get all facts extracted from a given segment."""
+        return []
+
+    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
+        """FTS search across fact fields. Returns non-superseded facts."""
         return []
 
     def get_fact_count_by_tags(self) -> dict[str, int]:

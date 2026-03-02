@@ -132,6 +132,35 @@ CREATE TRIGGER IF NOT EXISTS segments_ft_au AFTER UPDATE ON segments BEGIN
 END;
 """
 
+FACTS_FTS_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+    id UNINDEXED,
+    subject,
+    verb,
+    object,
+    what,
+    content='facts',
+    content_rowid='rowid'
+);
+"""
+
+FACTS_FTS_TRIGGER_SQL = """\
+CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO facts_fts(rowid, id, subject, verb, object, what)
+    VALUES (new.rowid, new.id, new.subject, new.verb, new.object, new.what);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, id, subject, verb, object, what)
+    VALUES('delete', old.rowid, old.id, old.subject, old.verb, old.object, old.what);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_fts_au AFTER UPDATE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, id, subject, verb, object, what)
+    VALUES('delete', old.rowid, old.id, old.subject, old.verb, old.object, old.what);
+    INSERT INTO facts_fts(rowid, id, subject, verb, object, what)
+    VALUES (new.rowid, new.id, new.subject, new.verb, new.object, new.what);
+END;
+"""
+
 
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
@@ -266,6 +295,7 @@ class SQLiteStore(ContextStore):
                 when_date TEXT NOT NULL DEFAULT '',
                 "where" TEXT NOT NULL DEFAULT '',
                 why TEXT NOT NULL DEFAULT '',
+                fact_type TEXT NOT NULL DEFAULT 'personal',
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 segment_ref TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL DEFAULT '',
@@ -288,6 +318,12 @@ class SQLiteStore(ContextStore):
             );
             CREATE INDEX IF NOT EXISTS idx_fact_tags_tag ON fact_tags(tag);
         """)
+        # D1: migrate — add fact_type column to existing facts tables
+        try:
+            conn.execute("SELECT fact_type FROM facts LIMIT 1")
+        except Exception:
+            conn.execute("ALTER TABLE facts ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'personal'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_fact_type ON facts(fact_type)")
         # Cascade delete facts when parent segment is deleted
         try:
             conn.execute("""
@@ -295,6 +331,17 @@ class SQLiteStore(ContextStore):
                     DELETE FROM facts WHERE segment_ref = old.ref;
                 END;
             """)
+        except sqlite3.OperationalError:
+            pass
+        # FTS index on facts (searches subject, verb, object, what)
+        try:
+            conn.executescript(FACTS_FTS_SQL)
+            conn.executescript(FACTS_FTS_TRIGGER_SQL)
+            # Content-sync FTS tables need 'rebuild' to populate from
+            # existing rows (direct INSERT doesn't work for content= tables).
+            fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            if fact_count > 0:
+                conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
         except sqlite3.OperationalError:
             pass
         # Tool output storage for intercepted large tool_result blocks
@@ -1012,9 +1059,9 @@ class SQLiteStore(ContextStore):
                 conn.execute(
                     """INSERT OR REPLACE INTO facts
                     (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, tags_json, segment_ref, session_id,
+                     "where", why, fact_type, tags_json, segment_ref, session_id,
                      turn_numbers_json, mentioned_at, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         fact.id,
                         fact.subject,
@@ -1026,6 +1073,7 @@ class SQLiteStore(ContextStore):
                         fact.when_date,
                         fact.where,
                         fact.why,
+                        fact.fact_type,
                         json.dumps(fact.tags),
                         fact.segment_ref,
                         fact.session_id,
@@ -1061,6 +1109,7 @@ class SQLiteStore(ContextStore):
             when_date=row["when_date"],
             where=row["where"],
             why=row["why"],
+            fact_type=row["fact_type"] if "fact_type" in row.keys() else "personal",
             tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
             segment_ref=row["segment_ref"],
             session_id=row["session_id"],
@@ -1068,6 +1117,18 @@ class SQLiteStore(ContextStore):
             mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
             superseded_by=row["superseded_by"],
         )
+
+    def _row_to_fact_with_session_date(self, row: sqlite3.Row) -> Fact:
+        """Like _row_to_fact but also extracts session_date from a joined segment."""
+        fact = self._row_to_fact(row)
+        seg_meta = row["_seg_meta"] if "_seg_meta" in row.keys() else None
+        if seg_meta:
+            try:
+                meta = json.loads(seg_meta)
+                fact.session_date = meta.get("session_date", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return fact
 
     def get_unique_fact_verbs(self) -> list[str]:
         """Return all distinct non-empty verbs from non-superseded facts."""
@@ -1085,6 +1146,7 @@ class SQLiteStore(ContextStore):
         verbs: list[str] | None = None,
         object_contains: str | None = None,
         status: str | None = None,
+        fact_type: str | None = None,
         tags: list[str] | None = None,
         limit: int = 50,
     ) -> list[Fact]:
@@ -1110,6 +1172,9 @@ class SQLiteStore(ContextStore):
         if status is not None:
             conditions.append("f.status = ?")
             params.append(status)
+        if fact_type is not None:
+            conditions.append("f.fact_type = ?")
+            params.append(fact_type)
         # Only return non-superseded facts by default
         conditions.append("f.superseded_by IS NULL")
 
@@ -1143,6 +1208,46 @@ class SQLiteStore(ContextStore):
             (segment_ref,),
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
+
+    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
+        """FTS search across fact subject, verb, object, what fields.
+
+        Only returns non-superseded facts. Falls back to LIKE if FTS
+        is unavailable. Populates session_date from the parent segment.
+        """
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
+                JOIN facts_fts fts ON f.id = fts.id
+                LEFT JOIN segments s ON f.segment_ref = s.ref
+                WHERE facts_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (query, limit)).fetchall()
+            return [self._row_to_fact_with_session_date(row) for row in rows]
+        except sqlite3.OperationalError:
+            # FTS not available — fall back to LIKE across key fields
+            terms = [t.strip() for t in query.split() if len(t.strip()) > 2]
+            if not terms:
+                return []
+            conditions = []
+            params: list[object] = []
+            for term in terms[:5]:
+                conditions.append(
+                    "(f.subject LIKE ? OR f.verb LIKE ? OR f.object LIKE ? OR f.what LIKE ?)"
+                )
+                params.extend([f"%{term}%"] * 4)
+            where = " OR ".join(conditions)
+            sql = f"""
+                SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
+                LEFT JOIN segments s ON f.segment_ref = s.ref
+                WHERE ({where})
+                ORDER BY f.mentioned_at DESC LIMIT ?
+            """
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_fact_with_session_date(row) for row in rows]
 
     def get_fact_count_by_tags(self) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
