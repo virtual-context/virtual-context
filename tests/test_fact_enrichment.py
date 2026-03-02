@@ -237,6 +237,19 @@ class TestCompactorSignalHints:
         assert "User runs 5K charity races every spring." in prompt_sent
 
 
+class TestEngineSupersessionWiring:
+    def test_engine_has_supersession_checker_attribute(self, tmp_path):
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "store": {"type": "sqlite", "path": str(tmp_path / "test.db")},
+            "tag_generator": {"type": "keyword", "keyword_fallback": {"tag_keywords": {"test": ["test"]}}},
+        })
+        engine = VirtualContextEngine(config=config)
+        assert hasattr(engine, '_supersession_checker')
+
+
 class TestSetFactSuperseded:
     def test_set_fact_superseded(self, tmp_path):
         from virtual_context.storage.sqlite import SQLiteStore

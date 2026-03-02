@@ -107,6 +107,7 @@ class VirtualContextEngine:
             paging_enabled=self.config.paging.enabled,
         )
         self._split_processed_tags: set[str] = set()
+        self._supersession_checker = None  # Initialized when supersession provider is available
         self._last_split_result: SplitResult | None = None
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
 
@@ -327,6 +328,17 @@ class VirtualContextEngine:
                         "  Stored %d facts for segment %s",
                         len(result.facts), result.primary_tag,
                     )
+                    # D1: Run supersession check on new facts
+                    if self._supersession_checker:
+                        try:
+                            superseded = self._supersession_checker.check_and_supersede(result.facts)
+                            if superseded:
+                                logger.info(
+                                    "  Superseded %d facts for segment %s",
+                                    superseded, result.primary_tag,
+                                )
+                        except Exception as e:
+                            logger.warning("Supersession check failed: %s", e)
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
                     "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
@@ -559,6 +571,7 @@ class VirtualContextEngine:
         self._last_retrieval_result = retrieval_result
         self._last_conversation_history = conversation_history
         self._last_model_name = model_name
+        self._presented_segment_refs = set(assembled.presented_segment_refs)
 
         return assembled
 
@@ -2020,12 +2033,26 @@ class VirtualContextEngine:
                     body["tool_choice"] = "required"
                 else:
                     body.pop("tool_choice", None)
+            elif provider == "gemini":
+                if require_tools:
+                    body["tool_config"] = {
+                        "function_calling_config": {"mode": "ANY"}
+                    }
+                else:
+                    body.pop("tool_config", None)
 
         url = adapter.get_url(model)
         headers = adapter.get_headers()
 
         with httpx.Client(timeout=300.0) as client:
             resp = client.post(url, headers=headers, json=body)
+            # Retry on 503 (Gemini overloaded) up to 2 times
+            for _retry in range(2):
+                if resp.status_code != 503:
+                    break
+                import time as _time
+                _time.sleep(5)
+                resp = client.post(url, headers=headers, json=body)
 
         if resp.status_code >= 300:
             raise RuntimeError(
