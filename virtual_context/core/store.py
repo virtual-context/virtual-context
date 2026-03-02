@@ -161,6 +161,10 @@ class ContextStore(ABC):
         """FTS search across fact fields. Returns non-superseded facts."""
         return []
 
+    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+        """Mark old_fact_id as superseded by new_fact_id."""
+        pass
+
     def get_fact_count_by_tags(self) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
         return {}

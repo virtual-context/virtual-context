@@ -1249,6 +1249,15 @@ class SQLiteStore(ContextStore):
             rows = conn.execute(sql, params).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
 
+    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+        """Mark old_fact_id as superseded by new_fact_id."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE facts SET superseded_by = ? WHERE id = ?",
+            (new_fact_id, old_fact_id),
+        )
+        conn.commit()
+
     def get_fact_count_by_tags(self) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
         conn = self._get_conn()

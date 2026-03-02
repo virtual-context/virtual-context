@@ -235,3 +235,29 @@ class TestCompactorSignalHints:
         prompt_sent = llm.calls[0]["user"]
         assert "[personal]" in prompt_sent
         assert "User runs 5K charity races every spring." in prompt_sent
+
+
+class TestSetFactSuperseded:
+    def test_set_fact_superseded(self, tmp_path):
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="has PB", object="27:12", status="completed")
+        new = Fact(subject="user", verb="has PB", object="25:50", status="completed")
+        store.store_facts([old, new])
+        store.set_fact_superseded(old.id, new.id)
+        results = store.query_facts(subject="user")
+        assert len(results) == 1
+        assert results[0].id == new.id
+
+    def test_set_fact_superseded_updates_field(self, tmp_path):
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="has PB", object="27:12")
+        new = Fact(subject="user", verb="has PB", object="25:50")
+        store.store_facts([old, new])
+        store.set_fact_superseded(old.id, new.id)
+        conn = store._get_conn()
+        row = conn.execute("SELECT superseded_by FROM facts WHERE id = ?", (old.id,)).fetchone()
+        assert row["superseded_by"] == new.id
