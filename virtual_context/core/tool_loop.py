@@ -187,6 +187,11 @@ def vc_tool_definitions() -> list[dict]:
                         "enum": ["active", "completed", "planned", "abandoned", "recurring"],
                         "description": "Temporal status filter. Omit for counting queries to get all statuses at once.",
                     },
+                    "fact_type": {
+                        "type": "string",
+                        "enum": ["personal", "experience", "world"],
+                        "description": "Filter by fact type. Omit to get all types.",
+                    },
                 },
             },
         },
@@ -343,14 +348,204 @@ def _extract_last_user_text(original_request: dict) -> str:
     return ""
 
 
+def _attach_related_facts(
+    engine: VirtualContextEngine, result: object, query: str,
+    presented_fact_ids: set[str] | None = None,
+) -> object:
+    """Search facts by the find_quote query and attach matching ones.
+
+    Uses FTS on the facts table to find only facts relevant to the
+    specific query, not all facts for matched tags.
+
+    TODO: session_date is currently resolved via a JOIN from
+    fact.segment_ref → segments.metadata_json at query time.  This is
+    fragile — compacted segments may lose the date, and it requires an
+    extra join on every read.  Longer-term, facts should store
+    session_date directly (either as a column on the facts table or via
+    a dedicated sessions table that all entities FK into).  See roadmap.
+    """
+    if not isinstance(result, dict) or not result.get("found"):
+        return result
+    if not query.strip():
+        return result
+
+    try:
+        facts = engine._store.search_facts(query=query, limit=10)
+    except Exception:
+        return result
+
+    if not facts:
+        return result
+
+    # Deduplicate: skip facts already returned in a previous tool call.
+    if presented_fact_ids is not None:
+        facts = [f for f in facts if f.id not in presented_fact_ids]
+        if not facts:
+            return result
+
+    # Build a lookup of older facts that each returned fact supersedes.
+    # search_facts only returns non-superseded facts, so superseded_by
+    # is always NULL.  The useful signal is the *reverse* direction:
+    # "this current fact replaced these older ones."
+    supersedes_map: dict[str, list[dict[str, str]]] = {}
+    try:
+        conn = engine._store._get_conn()
+        fact_ids = [f.id for f in facts if f.id]
+        if fact_ids:
+            placeholders = ",".join("?" * len(fact_ids))
+            rows = conn.execute(
+                f"SELECT superseded_by, subject, verb, object FROM facts "
+                f"WHERE superseded_by IN ({placeholders})",
+                fact_ids,
+            ).fetchall()
+            for row in rows:
+                target_id = row[0]
+                old_entry = {
+                    "subject": row[1],
+                    "verb": row[2],
+                    "object": row[3],
+                }
+                supersedes_map.setdefault(target_id, []).append(old_entry)
+    except Exception:
+        pass  # non-critical enrichment
+
+    fact_entries = []
+    for f in facts:
+        entry: dict[str, str] = {}
+        if f.session_date:
+            entry["session_date"] = f.session_date
+        if f.subject:
+            entry["subject"] = f.subject
+        if f.verb:
+            entry["verb"] = f.verb
+        if f.object:
+            entry["object"] = f.object
+        if f.status:
+            entry["status"] = f.status
+        if f.when_date:
+            entry["when"] = f.when_date
+        if f.what:
+            entry["what"] = f.what
+        if f.superseded_by:
+            entry["superseded_by"] = f.superseded_by
+        # Attach what this fact replaced (reverse supersession)
+        old_facts = supersedes_map.get(f.id, [])
+        if old_facts:
+            # Deduplicate by object (multiple duplicate old facts are common)
+            seen_objects: set[str] = set()
+            unique_old: list[dict[str, str]] = []
+            for of in old_facts:
+                key = of.get("object", "")
+                if key not in seen_objects:
+                    seen_objects.add(key)
+                    unique_old.append(of)
+            entry["replaces_older_facts"] = unique_old
+        fact_entries.append(entry)
+
+    result["related_facts"] = fact_entries
+    result["related_facts_count"] = len(fact_entries)
+
+    # Pull source excerpts for facts whose segments aren't already in
+    # the find_quote results.  This ensures the model sees the raw
+    # conversation backing each fact — even when the original query
+    # didn't surface that segment.
+    existing_results = result.get("results", [])
+    existing_session_topics = {
+        (r.get("session", ""), r.get("topic", ""))
+        for r in existing_results if isinstance(r, dict)
+    }
+    try:
+        seen_refs: set[str] = set()
+        for f in facts:
+            if not f.segment_ref or f.segment_ref in seen_refs:
+                continue
+            seen_refs.add(f.segment_ref)
+            seg = engine._store.get_segment(f.segment_ref)
+            if not seg or not seg.full_text:
+                continue
+            # Derive session label from segment metadata
+            meta = seg.metadata
+            session_label = getattr(meta, "session_date", "") if meta else ""
+            if (session_label, seg.primary_tag) in existing_session_topics:
+                continue  # already have an excerpt from this session+topic
+            # Truncate to a reasonable size
+            text = seg.full_text
+            if len(text) > 800:
+                text = text[:800] + "..."
+            existing_results.append({
+                "excerpt": text,
+                "topic": seg.primary_tag,
+                "session": session_label,
+                "source": "fact_segment",
+            })
+            existing_session_topics.add((session_label, seg.primary_tag))
+    except Exception:
+        pass  # non-critical enrichment
+
+    # Track these facts so they won't be repeated in subsequent calls.
+    if presented_fact_ids is not None:
+        for f in facts:
+            presented_fact_ids.add(f.id)
+
+    return result
+
+
+def _suppress_presented_segments(
+    result: object, presented: set[str] | None,
+) -> object:
+    """Remove find_quote results from segments already shown to the reader.
+
+    Also adds newly seen segment_refs to the presented set so subsequent
+    tool calls won't repeat them either.
+    """
+    if presented is None or not isinstance(result, dict):
+        return result
+    results = result.get("results")
+    if not isinstance(results, list):
+        return result
+
+    filtered = []
+    for item in results:
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        ref = item.get("segment_ref") or ""
+        refs = item.get("segment_refs") or []
+        # Check if this result's segment(s) were already presented.
+        # Use any() for merged results: if any constituent segment was
+        # already shown, the merged excerpt contains duplicate content.
+        if ref and ref in presented:
+            continue
+        if refs and any(r in presented for r in refs):
+            continue
+        filtered.append(item)
+        # Track newly presented segments
+        if ref:
+            presented.add(ref)
+        for r in refs:
+            presented.add(r)
+
+    result["results"] = filtered
+    if not filtered:
+        result["found"] = False
+    return result
+
+
 def execute_vc_tool(
     engine: VirtualContextEngine,
     name: str,
     tool_input: dict,
     *,
     intent_context: str = "",
+    presented_segment_refs: set[str] | None = None,
+    presented_fact_ids: set[str] | None = None,
 ) -> str:
-    """Execute a VC paging tool and return a JSON result string."""
+    """Execute a VC paging tool and return a JSON result string.
+
+    presented_segment_refs: segment refs already shown to the reader
+    (from assembly or prior tool calls).  find_quote results from these
+    segments are suppressed to avoid repeating the same content.
+    """
     def _trim_find_quote_payload(raw: object) -> object:
         """Return only model-relevant find_quote fields for tool output."""
         if not isinstance(raw, dict):
@@ -422,12 +617,15 @@ def execute_vc_tool(
                 depth=tool_input.get("depth", "summary"),
             )
         elif name == "vc_find_quote":
+            fq_query = tool_input.get("query", "")
             result = engine.find_quote(
-                query=tool_input.get("query", ""),
+                query=fq_query,
                 max_results=VC_FIND_QUOTE_MAX_RESULTS,
                 intent_context=intent_context,
             )
+            result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
+            result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
         elif name == "vc_find_session":
             result = engine.find_quote(
                 query=tool_input.get("query", ""),
@@ -435,6 +633,7 @@ def execute_vc_tool(
                 intent_context=intent_context,
                 session_filter=tool_input.get("session", ""),
             )
+            result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
@@ -444,6 +643,7 @@ def execute_vc_tool(
                 verb=tool_input.get("verb"),
                 object_contains=tool_input.get("object_contains"),
                 status=tool_input.get("status"),
+                fact_type=tool_input.get("fact_type"),
                 _return_meta=True,
                 _intent_context=intent_context,
             )
@@ -456,6 +656,7 @@ def execute_vc_tool(
                         "verb": f.verb,
                         "object": f.object,
                         "status": f.status,
+                        "fact_type": f.fact_type,
                         "what": f.what,
                         "who": f.who,
                         "when": f.when_date,
@@ -631,6 +832,13 @@ def run_tool_loop(
     if not url:
         url = adapter.get_url()
 
+    # Anti-repetition: track segments returned by tool calls so the same
+    # segment isn't repeated across multiple find_quote rounds.
+    # Starts empty — assembly summaries are a *different view* (compressed)
+    # of the data, so tool results from those segments are NOT suppressed.
+    presented_refs: set[str] = set()
+    presented_facts: set[str] = set()
+
     result = ToolLoopResult()
     result.raw_responses.append(initial_response)
 
@@ -685,6 +893,8 @@ def run_tool_loop(
                     tc["name"],
                     tc["input"],
                     intent_context=intent_context,
+                    presented_segment_refs=presented_refs,
+                    presented_fact_ids=presented_facts,
                 )
                 duration_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -729,6 +939,21 @@ def run_tool_loop(
                 cont_body, original_request, current_response, tool_results,
             )
 
+            # Compress previous rounds' tool results + assistant text
+            # to avoid content repetition across continuations.
+            # Extract call IDs from the tool_results we just appended.
+            current_call_ids: set[str] = set()
+            for tr in tool_results:
+                cid = tr.get("call_id") or tr.get("tool_call_id") or ""
+                if cid:
+                    current_call_ids.add(cid)
+                # Anthropic nests tool_use_id inside content blocks
+                if isinstance(tr.get("content"), list):
+                    for block in tr["content"]:
+                        if isinstance(block, dict) and block.get("tool_use_id"):
+                            current_call_ids.add(block["tool_use_id"])
+            adapter.compress_previous_results(cont_body, current_call_ids)
+
             # Inject updated context into system prompt
             if new_prepend:
                 adapter.inject_context(cont_body, new_prepend)
@@ -745,8 +970,13 @@ def run_tool_loop(
             # Capture the continuation request body (deep copy to freeze state)
             result.raw_requests.append(copy.deepcopy(cont_body))
 
-            # Send continuation
+            # Send continuation (retry on 503)
             resp = client.post(url, headers=headers, json=cont_body)
+            for _retry in range(2):
+                if resp.status_code != 503:
+                    break
+                time.sleep(5)
+                resp = client.post(url, headers=headers, json=cont_body)
             if resp.status_code >= 300:
                 logger.error(
                     "Continuation %d failed: HTTP %d",
@@ -789,10 +1019,43 @@ def run_tool_loop(
                     if all_find and all_found and len(recent) >= _REDUNDANT_SEARCH_THRESHOLD:
                         logger.info(
                             "Redundant search loop detected after %d rounds "
-                            "— forcing text answer",
+                            "— executing pending tools then forcing text",
                             loop_i + 1,
                         )
+                        # Execute the model's pending tool calls so the
+                        # forced-text request has ALL collected data.
+                        forced_results: list[dict] = []
+                        for tc in vc_tools:
+                            t0 = time.monotonic()
+                            r_str = execute_vc_tool(
+                                engine, tc["name"], tc["input"],
+                                intent_context=intent_context,
+                                presented_segment_refs=presented_refs,
+                                presented_fact_ids=presented_facts,
+                            )
+                            dur = round((time.monotonic() - t0) * 1000, 1)
+                            result.tool_calls.append(ToolCallRecord(
+                                tool_name=tc["name"],
+                                tool_input=tc["input"],
+                                result_json=r_str, duration_ms=dur,
+                            ))
+                            forced_results.append(
+                                adapter.build_tool_result(tc["id"], tc["name"], r_str)
+                            )
+
+                        # Build continuation with all tool data, then strip tools
+                        cont_body = adapter.build_continuation(
+                            cont_body, original_request, current_response,
+                            forced_results,
+                        )
+                        forced_ids: set[str] = set()
+                        for tr in forced_results:
+                            cid = tr.get("call_id") or tr.get("tool_call_id") or ""
+                            if cid:
+                                forced_ids.add(cid)
+                        adapter.compress_previous_results(cont_body, forced_ids)
                         adapter.strip_tools(cont_body)
+
                         result.continuation_count += 1
                         result.raw_requests.append(copy.deepcopy(cont_body))
                         resp = client.post(url, headers=headers, json=cont_body)
@@ -834,6 +1097,8 @@ def run_tool_loop(
                         tc["name"],
                         tc["input"],
                         intent_context=intent_context,
+                        presented_segment_refs=presented_refs,
+                        presented_fact_ids=presented_facts,
                     )
                     duration_ms = round((time.monotonic() - t0) * 1000, 1)
                     result.tool_calls.append(ToolCallRecord(
@@ -848,17 +1113,40 @@ def run_tool_loop(
                         )
                     )
 
-                # Re-assemble context with updated working set
-                forced_prepend = engine.reassemble_context()
-
-                # Build continuation WITHOUT tools to force text output
+                # Build continuation WITHOUT tools to force text output.
+                # Do NOT reassemble context — the working set hasn't
+                # changed, and reassembly can re-inject expanded summaries
+                # that increase repetition.
                 cont_body = adapter.build_continuation(
                     cont_body, original_request, current_response,
                     tool_results_final,
                 )
-                if forced_prepend:
-                    adapter.inject_context(cont_body, forced_prepend)
+                # Compress prior rounds before the forced send
+                forced_call_ids: set[str] = set()
+                for tr in tool_results_final:
+                    cid = tr.get("call_id") or tr.get("tool_call_id") or ""
+                    if cid:
+                        forced_call_ids.add(cid)
+                adapter.compress_previous_results(cont_body, forced_call_ids)
                 adapter.strip_tools(cont_body)
+
+                # For Gemini thinking models: minimize thinking budget on
+                # the forced answer so tokens go to actual output text.
+                gen_cfg = cont_body.get("generationConfig")
+                if isinstance(gen_cfg, dict) and "thinkingConfig" in gen_cfg:
+                    gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
+
+                # Append a user nudge so the model responds with text
+                # instead of burning tokens on internal reasoning.
+                contents = cont_body.get("contents")
+                if isinstance(contents, list):
+                    contents.append({
+                        "role": "user",
+                        "parts": [{"text": (
+                            "You have gathered enough information. "
+                            "Answer the original question now in 1-2 sentences."
+                        )}],
+                    })
 
                 result.continuation_count += 1
                 result.raw_requests.append(copy.deepcopy(cont_body))

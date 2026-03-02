@@ -276,6 +276,17 @@ class TestSetFactSuperseded:
         assert row["superseded_by"] == new.id
 
 
+class TestToolLoopFactType:
+    def test_tool_schema_has_fact_type_param(self):
+        from virtual_context.core.tool_loop import vc_tool_definitions
+        tools = vc_tool_definitions()
+        query_tool = next(t for t in tools if t["name"] == "vc_query_facts")
+        props = query_tool["input_schema"]["properties"]
+        assert "fact_type" in props
+        assert "enum" in props["fact_type"]
+        assert set(props["fact_type"]["enum"]) == {"personal", "experience", "world"}
+
+
 class TestSupersessionPrompt:
     def test_prompt_asks_about_duplicates(self):
         import tempfile
