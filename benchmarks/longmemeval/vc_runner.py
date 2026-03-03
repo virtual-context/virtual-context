@@ -770,6 +770,8 @@ def run_vc(
         # The assembler trims these to fit the token budget, but the runner
         # was previously ignoring them — meaning the protected-zone tail of
         # each session was lost.
+        if assembled.facts_text:
+            system_parts.append(assembled.facts_text)
         if assembled.conversation_history:
             conv_lines = [
                 f"{msg.role.capitalize()}: {msg.content}"
