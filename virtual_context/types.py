@@ -448,7 +448,7 @@ class PagingConfig:
     ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
-    max_tool_loops: int = 10    # max continuation rounds in tool loop
+    max_tool_loops: int = 7    # max continuation rounds in tool loop
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +459,7 @@ class PagingConfig:
 class AssembledContext:
     core_context: str = ""
     tag_sections: dict[str, str] = field(default_factory=dict)
+    facts_text: str = ""  # Formatted facts block
     conversation_history: list[Message] = field(default_factory=list)
     total_tokens: int = 0
     budget_breakdown: dict[str, int] = field(default_factory=dict)
@@ -556,6 +557,7 @@ class RetrieverConfig:
 class AssemblerConfig:
     core_context_max_tokens: int = 18_000
     tag_context_max_tokens: int = 30_000
+    facts_max_tokens: int = 20_000
     core_files: list[dict] = field(default_factory=list)
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
@@ -632,8 +634,19 @@ class ToolOutputStats:
 @dataclass
 class SupersessionConfig:
     """Configuration for fact supersession checking."""
-    enabled: bool = False
+    enabled: bool = True
+    provider: str = ""   # provider name from providers dict, or "" to use summarization provider
+    model: str = ""      # model override, or "" to use summarization model
     batch_size: int = 20
+
+
+@dataclass
+class CurationConfig:
+    """Configuration for LLM-based fact curation."""
+    enabled: bool = False
+    provider: str = ""   # provider name from providers dict, or "" to use summarization provider
+    model: str = ""      # model override, or "" to use summarization model
+    max_response_tokens: int = 2048
 
 
 @dataclass
@@ -655,5 +668,7 @@ class VirtualContextConfig:
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
+    supersession: SupersessionConfig = field(default_factory=SupersessionConfig)
+    curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
