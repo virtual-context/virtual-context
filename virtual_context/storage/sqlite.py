@@ -301,6 +301,7 @@ class SQLiteStore(ContextStore):
                 session_id TEXT NOT NULL DEFAULT '',
                 turn_numbers_json TEXT NOT NULL DEFAULT '[]',
                 mentioned_at TEXT NOT NULL DEFAULT '',
+                session_date TEXT NOT NULL DEFAULT '',
                 superseded_by TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
@@ -324,6 +325,10 @@ class SQLiteStore(ContextStore):
         except Exception:
             conn.execute("ALTER TABLE facts ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'personal'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_fact_type ON facts(fact_type)")
+        try:
+            conn.execute("SELECT session_date FROM facts LIMIT 1")
+        except Exception:
+            conn.execute("ALTER TABLE facts ADD COLUMN session_date TEXT NOT NULL DEFAULT ''")
         # Cascade delete facts when parent segment is deleted
         try:
             conn.execute("""
@@ -1060,8 +1065,8 @@ class SQLiteStore(ContextStore):
                     """INSERT OR REPLACE INTO facts
                     (id, subject, verb, object, status, what, who, when_date,
                      "where", why, fact_type, tags_json, segment_ref, session_id,
-                     turn_numbers_json, mentioned_at, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     turn_numbers_json, mentioned_at, session_date, superseded_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         fact.id,
                         fact.subject,
@@ -1079,6 +1084,7 @@ class SQLiteStore(ContextStore):
                         fact.session_id,
                         json.dumps(fact.turn_numbers),
                         _dt_to_str(fact.mentioned_at),
+                        fact.session_date or "",
                         fact.superseded_by,
                     ),
                 )
@@ -1115,6 +1121,7 @@ class SQLiteStore(ContextStore):
             session_id=row["session_id"],
             turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
             mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
+            session_date=row["session_date"] if "session_date" in row.keys() else "",
             superseded_by=row["superseded_by"],
         )
 
@@ -1255,6 +1262,22 @@ class SQLiteStore(ContextStore):
         conn.execute(
             "UPDATE facts SET superseded_by = ? WHERE id = ?",
             (new_fact_id, old_fact_id),
+        )
+        conn.commit()
+
+    def update_fact_fields(
+        self, fact_id: str, verb: str, object: str, status: str, what: str
+    ) -> None:
+        """Update structured fields on a fact (used after supersession merge)."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
+            (verb, object, status, what, fact_id),
+        )
+        # Keep FTS index in sync
+        conn.execute(
+            "UPDATE facts_fts SET verb = ?, object = ?, what = ? WHERE id = ?",
+            (verb, object, what, fact_id),
         )
         conn.commit()
 
