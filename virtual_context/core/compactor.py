@@ -351,6 +351,7 @@ class DomainCompactor:
                     why=_str(f.get("why", "")),
                     fact_type=f.get("fact_type", "personal"),
                     tags=refined_tags,
+                    session_date=segment.session_date or "",
                 ))
 
         return CompactionResult(
