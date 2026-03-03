@@ -110,7 +110,7 @@ class FactSupersessionChecker:
             # Object-similarity candidates — catches cross-session duplicates
             # whose tags don't overlap with the new fact's tags
             keyword = _extract_object_keyword(fact.object)
-            if keyword:
+            if keyword and fact.tags:
                 obj_candidates = self.store.query_facts(
                     subject=fact.subject,
                     object_contains=keyword,
