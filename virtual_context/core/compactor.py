@@ -66,6 +66,8 @@ Respond with JSON:
 
 
 DEFAULT_SUMMARY_PROMPT = """\
+SESSION DATE: {session_date}
+
 Summarize the following conversation segment (tags: {tags}).
 Preserve: key decisions, action items, entities mentioned, specific data points,
 and specific feature/concept names exactly as discussed (e.g. "cook mode", "dark theme", "rate limiter" —
@@ -118,7 +120,12 @@ Also extract facts from the conversation. For each fact:
 - "what": one full sentence capturing the complete fact with ALL specifics preserved.
   WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
 - "who": people involved (populate when present, empty string if n/a)
-- "when": date if mentioned (ISO format or free-form, empty string if n/a)
+- "when": the date this event occurred.
+  DATE RULES — read carefully:
+  "today" / "this morning" / "just now" = {session_date} (use the session date above).
+  "recently" / "last week" / "a while ago" / "just got back" = date UNKNOWN,
+  event happened BEFORE today but we don't know when — use "".
+  If no temporal language at all, use "".
 - "where": location (populate when present, empty string if n/a)
 - "why": context or significance (populate when present, empty string if n/a)
 Extract the FACT behind the question, not the conversational act.
@@ -262,6 +269,7 @@ class DomainCompactor:
                 tags=tags_str,
                 target_tokens=target_tokens,
                 conversation_text=conversation_text,
+                session_date=segment.session_date or "(unknown)",
             )
             if signals_text:
                 prompt += signals_text

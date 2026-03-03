@@ -778,3 +778,70 @@ class TestFactSessionDate:
         result = compactor.compact([segment])
         assert len(result[0].facts) == 1
         assert result[0].facts[0].session_date == "2023/03/10 (Fri) 23:32"
+
+    def test_v4_prompt_injects_session_date(self, tmp_path):
+        """session_date must appear in the compactor prompt."""
+        from unittest.mock import MagicMock
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, TaggedSegment, Message
+        import json
+
+        captured_prompts = []
+
+        llm = MagicMock()
+        def capture_and_return(**kwargs):
+            captured_prompts.append(kwargs.get("user", ""))
+            return json.dumps({
+                "summary": "User recently returned from Yosemite.",
+                "entities": [], "key_decisions": [], "action_items": [],
+                "date_references": [], "refined_tags": ["hiking"], "related_tags": [],
+                "facts": [{
+                    "subject": "user", "verb": "returned from",
+                    "object": "solo camping trip to Yosemite",
+                    "status": "completed", "fact_type": "personal",
+                    "what": "User recently returned from Yosemite.",
+                    "who": "", "when": "", "where": "", "why": "",
+                }],
+            })
+        llm.complete.side_effect = capture_and_return
+
+        segment = TaggedSegment(
+            id="seg-002", primary_tag="camping", tags=["camping"],
+            messages=[Message(role="user", content="I recently returned from Yosemite.")],
+            session_date="2023/04/20 (Thu) 04:17",
+        )
+        compactor = DomainCompactor(llm_provider=llm, config=CompactorConfig())
+        compactor.compact([segment])
+
+        assert len(captured_prompts) == 1
+        assert "2023/04/20" in captured_prompts[0], "session_date not injected into prompt"
+
+    def test_v4_prompt_today_gives_session_date_when(self, tmp_path):
+        """'today' in LLM response should produce when=session_date (preserved as-is)."""
+        from unittest.mock import MagicMock
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, TaggedSegment, Message
+        import json
+
+        llm = MagicMock()
+        llm.complete.return_value = json.dumps({
+            "summary": "User hiked Big Sur today.",
+            "entities": [], "key_decisions": [], "action_items": [],
+            "date_references": [], "refined_tags": ["hiking"], "related_tags": [],
+            "facts": [{
+                "subject": "user", "verb": "hiked",
+                "object": "Big Sur",
+                "status": "completed", "fact_type": "personal",
+                "what": "User hiked Big Sur today.",
+                "who": "", "when": "2023/04/20", "where": "", "why": "",
+            }],
+        })
+
+        segment = TaggedSegment(
+            id="seg-003", primary_tag="hiking", tags=["hiking"],
+            messages=[Message(role="user", content="I hiked Big Sur today.")],
+            session_date="2023/04/20 (Thu) 04:17",
+        )
+        compactor = DomainCompactor(llm_provider=llm, config=CompactorConfig())
+        result = compactor.compact([segment])
+        assert result[0].facts[0].when_date == "2023/04/20"
