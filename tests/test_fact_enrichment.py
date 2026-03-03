@@ -560,6 +560,76 @@ class TestSupersessionResponseParsing:
         assert result == ["a"]
 
 
+class TestEngineCuration:
+    def test_curator_filters_facts_before_assembly(self, tmp_path):
+        """When curation is enabled, engine passes curated facts to assembler."""
+        from tests.conftest import MockLLMProvider
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import VirtualContextConfig, CurationConfig, Message
+
+        cfg = VirtualContextConfig(
+            storage_root=str(tmp_path / ".vc"),
+            curation=CurationConfig(enabled=True),
+        )
+        engine = VirtualContextEngine(config=cfg)
+
+        # Inject a curator with a mock that returns index 0 only
+        from virtual_context.ingest.curator import FactCurator
+        from virtual_context.types import Fact
+        mock_llm = MockLLMProvider(response="0")
+        engine._fact_curator = FactCurator(
+            llm_provider=mock_llm,
+            model="test",
+            config=cfg.curation,
+        )
+
+        # Store two facts
+        from virtual_context.types import Fact
+        facts = [
+            Fact(subject="user", verb="hiked", object="Dipsea Trail"),
+            Fact(subject="user", verb="studied", object="automata theory"),
+        ]
+        engine._store.store_facts(facts)
+
+        assembled = engine.on_message_inbound(
+            "Where did I hike?",
+            conversation_history=[],
+        )
+        # Curator was called (mock recorded a call)
+        assert mock_llm.calls, "Curator LLM was not called"
+        # Only 1 fact survived curation — exactly one of the two facts is in facts_text
+        assert assembled.facts_text is not None
+        has_dipsea = "Dipsea Trail" in assembled.facts_text
+        has_automata = "automata theory" in assembled.facts_text
+        # Exactly one should survive (index 0 was selected, whichever order the DB returned)
+        assert has_dipsea != has_automata, (
+            f"Expected exactly one fact, got facts_text={assembled.facts_text!r}"
+        )
+
+    def test_curator_disabled_passes_all_facts(self, tmp_path):
+        """When curation is disabled, all facts reach the assembler."""
+        from tests.conftest import MockLLMProvider
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import VirtualContextConfig, CurationConfig, Fact
+
+        cfg = VirtualContextConfig(
+            storage_root=str(tmp_path / ".vc"),
+            curation=CurationConfig(enabled=False),
+        )
+        engine = VirtualContextEngine(config=cfg)
+        assert engine._fact_curator is None
+
+        facts = [
+            Fact(subject="user", verb="hiked", object="trail"),
+            Fact(subject="user", verb="studied", object="math"),
+        ]
+        engine._store.store_facts(facts)
+        assembled = engine.on_message_inbound("test", conversation_history=[])
+        # Both facts present (curation never ran)
+        assert "trail" in (assembled.facts_text or "")
+        assert "math" in (assembled.facts_text or "")
+
+
 class _SequentialMockLLM:
     """Mock LLM that returns responses in order."""
     def __init__(self, responses: list[str]):
