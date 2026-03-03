@@ -884,6 +884,75 @@ class TestExtractObjectKeyword:
         assert _extract_object_keyword("visited Yosemite") == "Yosemite"
 
 
+class TestSupersessionObjectSimilarity:
+    """Cross-session duplicates are found via object keyword, not just tags."""
+
+    def test_cross_session_duplicate_is_superseded(self, tmp_path):
+        """Fact from different session/tags IS found when object keyword matches."""
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+
+        # Old fact: different tags (session 1, tags=['backpack'])
+        old = Fact(
+            subject="user", verb="returned",
+            object="from solo camping trip to Yosemite National Park",
+            status="completed", tags=["backpack"],
+            what="User recently returned from solo camping trip to Yosemite.",
+        )
+        store.store_facts([old])
+
+        # New fact: different tags (session 2, tags=['bear-safety'])
+        new_fact = Fact(
+            subject="user", verb="started",
+            object="solo camping trip to Yosemite National Park",
+            status="completed", tags=["bear-safety"],
+            what="User started solo camping trip to Yosemite National Park.",
+        )
+        store.store_facts([new_fact])
+
+        # LLM says index 0 is superseded
+        llm = MockLLMProvider(response="[0]")
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store,
+            config=SupersessionConfig(enabled=True, batch_size=20),
+        )
+        count = checker.check_and_supersede([new_fact])
+
+        assert count == 1
+        # Old fact is now marked superseded
+        remaining = store.query_facts(subject="user")
+        assert all(f.id != old.id for f in remaining)
+
+    def test_no_object_keyword_skips_object_search(self, tmp_path):
+        """Fact with generic object (no keyword) uses only tag-based candidates."""
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        new_fact = Fact(
+            subject="user", verb="went", object="back",
+            status="completed", tags=["misc"],
+        )
+        store.store_facts([new_fact])
+
+        llm = MockLLMProvider(response="[]")
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store,
+            config=SupersessionConfig(enabled=True, batch_size=20),
+        )
+        # Should not crash; 0 superseded since no candidates
+        count = checker.check_and_supersede([new_fact])
+        assert count == 0
+
+
 class TestFormatFacts:
     def _make_assembler(self):
         from virtual_context.core.assembler import ContextAssembler
