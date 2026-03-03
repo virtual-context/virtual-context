@@ -565,11 +565,12 @@ class TestEngineCuration:
         """When curation is enabled, engine passes curated facts to assembler."""
         from tests.conftest import MockLLMProvider
         from virtual_context.engine import VirtualContextEngine
-        from virtual_context.types import VirtualContextConfig, CurationConfig, Message
+        from virtual_context.types import VirtualContextConfig, CurationConfig, StorageConfig, Message
 
         cfg = VirtualContextConfig(
             storage_root=str(tmp_path / ".vc"),
             curation=CurationConfig(enabled=True),
+            storage=StorageConfig(sqlite_path=str(tmp_path / "test.db")),
         )
         engine = VirtualContextEngine(config=cfg)
 
@@ -610,11 +611,12 @@ class TestEngineCuration:
         """When curation is disabled, all facts reach the assembler."""
         from tests.conftest import MockLLMProvider
         from virtual_context.engine import VirtualContextEngine
-        from virtual_context.types import VirtualContextConfig, CurationConfig, Fact
+        from virtual_context.types import VirtualContextConfig, CurationConfig, StorageConfig, Fact
 
         cfg = VirtualContextConfig(
             storage_root=str(tmp_path / ".vc"),
             curation=CurationConfig(enabled=False),
+            storage=StorageConfig(sqlite_path=str(tmp_path / "test.db")),
         )
         engine = VirtualContextEngine(config=cfg)
         assert engine._fact_curator is None
