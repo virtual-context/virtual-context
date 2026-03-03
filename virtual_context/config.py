@@ -23,6 +23,8 @@ from .types import (
     StorageConfig,
     StrategyConfig,
     SummarizationConfig,
+    CurationConfig,
+    SupersessionConfig,
     TagGeneratorConfig,
     TagPromptRule,
     TagSplittingConfig,
@@ -241,7 +243,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         ]),
         auto_promote=paging_raw.get("auto_promote", True),
         auto_evict=paging_raw.get("auto_evict", True),
-        max_tool_loops=paging_raw.get("max_tool_loops", 10),
+        max_tool_loops=paging_raw.get("max_tool_loops", PagingConfig.max_tool_loops),
     )
 
     # Tool output interception
@@ -265,6 +267,24 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         rules=tool_output_rules,
     )
 
+    # Supersession config
+    ss_raw = raw.get("supersession", {})
+    supersession_config = SupersessionConfig(
+        enabled=ss_raw.get("enabled", False),
+        provider=ss_raw.get("provider", ""),
+        model=ss_raw.get("model", ""),
+        batch_size=ss_raw.get("batch_size", 20),
+    )
+
+    # Curation config
+    cur_raw = raw.get("curation", {})
+    curation_config = CurationConfig(
+        enabled=cur_raw.get("enabled", False),
+        provider=cur_raw.get("provider", ""),
+        model=cur_raw.get("model", ""),
+        max_response_tokens=cur_raw.get("max_response_tokens", 2048),
+    )
+
     cfg = VirtualContextConfig(
         version=raw.get("version", "0.2"),
         storage_root=storage_root,
@@ -283,6 +303,8 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         paging=paging_config,
         proxy=proxy_config,
         tool_output=tool_output_config,
+        supersession=supersession_config,
+        curation=curation_config,
         providers=raw.get("providers", {}),
     )
     if "session_id" in raw:
