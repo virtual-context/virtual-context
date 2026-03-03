@@ -1026,3 +1026,77 @@ class TestFormatFacts:
         result = assembler._format_facts([f], max_tokens=500)
         assert "[when:" not in result
         assert "[session:" not in result
+
+
+class TestFactCurator:
+    def test_filters_facts_by_llm_response(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import Fact, CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        facts = [
+            Fact(subject="user", verb="hiked", object="Dipsea Trail at Muir Woods"),
+            Fact(subject="user", verb="studied", object="automata theory chapter 4"),
+            Fact(subject="user", verb="road tripped", object="with friends to Big Sur"),
+        ]
+        # LLM says facts 0 and 2 are relevant
+        llm = MockLLMProvider(response="0, 2")
+        curator = FactCurator(llm_provider=llm, model="test",
+                              config=CurationConfig(enabled=True, max_response_tokens=256))
+        result = curator.curate(facts, question="What trips did I take?")
+        assert len(result) == 2
+        assert result[0].object == "Dipsea Trail at Muir Woods"
+        assert result[1].object == "with friends to Big Sur"
+
+    def test_falls_back_to_all_facts_on_empty_response(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import Fact, CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        facts = [Fact(subject="user", verb="hiked", object="somewhere")]
+        llm = MockLLMProvider(response="")
+        curator = FactCurator(llm_provider=llm, model="test",
+                              config=CurationConfig(enabled=True))
+        result = curator.curate(facts, question="Where did I hike?")
+        assert result == facts  # unchanged
+
+    def test_falls_back_on_llm_exception(self):
+        from virtual_context.types import Fact, CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        class FailingProvider:
+            def complete(self, system, user, max_tokens):
+                raise RuntimeError("API down")
+
+        facts = [Fact(subject="user", verb="visited", object="Paris")]
+        curator = FactCurator(llm_provider=FailingProvider(), model="test",
+                              config=CurationConfig(enabled=True))
+        result = curator.curate(facts, question="Where have I traveled?")
+        assert result == facts  # fallback to original
+
+    def test_includes_when_date_in_prompt(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import Fact, CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        facts = [Fact(subject="user", verb="started", object="camping trip",
+                      when_date="2023/05/15")]
+        llm = MockLLMProvider(response="0")
+        curator = FactCurator(llm_provider=llm, model="test",
+                              config=CurationConfig(enabled=True))
+        curator.curate(facts, question="When did I go camping?")
+        user_prompt = llm.calls[0]["user"]
+        assert "2023/05/15" in user_prompt
+        assert "[when:" in user_prompt
+
+    def test_returns_empty_list_when_no_facts(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        llm = MockLLMProvider(response="")
+        curator = FactCurator(llm_provider=llm, model="test",
+                              config=CurationConfig(enabled=True))
+        result = curator.curate([], question="Any question")
+        assert result == []
+        assert llm.calls == []  # no LLM call for empty input
