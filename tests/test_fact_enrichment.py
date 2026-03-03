@@ -857,6 +857,35 @@ class TestFactSessionDate:
         assert result[0].facts[0].when_date == "2023/04/20"
 
 
+class TestExtractObjectKeyword:
+    def test_extracts_proper_noun_from_destination(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        assert _extract_object_keyword("solo camping trip to Yosemite National Park") == "Yosemite"
+
+    def test_extracts_from_big_sur(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        result = _extract_object_keyword("Big Sur and Monterey")
+        assert result in ("Monterey", "Sur")
+
+    def test_extracts_from_muir_woods(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        result = _extract_object_keyword("Dipsea Trail at Muir Woods")
+        assert result in ("Dipsea", "Trail", "Woods")
+
+    def test_returns_none_for_generic_object(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        assert _extract_object_keyword("back") is None
+        assert _extract_object_keyword("from solo trip") is None
+
+    def test_returns_none_for_short_words_only(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        assert _extract_object_keyword("went to gym") is None
+
+    def test_visited_yosemite(self):
+        from virtual_context.ingest.supersession import _extract_object_keyword
+        assert _extract_object_keyword("visited Yosemite") == "Yosemite"
+
+
 class TestFormatFacts:
     def _make_assembler(self):
         from virtual_context.core.assembler import ContextAssembler
