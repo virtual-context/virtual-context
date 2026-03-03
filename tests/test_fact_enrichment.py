@@ -864,13 +864,11 @@ class TestExtractObjectKeyword:
 
     def test_extracts_from_big_sur(self):
         from virtual_context.ingest.supersession import _extract_object_keyword
-        result = _extract_object_keyword("Big Sur and Monterey")
-        assert result in ("Monterey", "Sur")
+        assert _extract_object_keyword("Big Sur and Monterey") == "Monterey"
 
     def test_extracts_from_muir_woods(self):
         from virtual_context.ingest.supersession import _extract_object_keyword
-        result = _extract_object_keyword("Dipsea Trail at Muir Woods")
-        assert result in ("Dipsea", "Trail", "Woods")
+        assert _extract_object_keyword("Dipsea Trail at Muir Woods") == "Dipsea"
 
     def test_returns_none_for_generic_object(self):
         from virtual_context.ingest.supersession import _extract_object_keyword
