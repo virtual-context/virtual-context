@@ -101,11 +101,26 @@ class FactSupersessionChecker:
             # Query existing non-superseded facts with same subject.
             # When tags are available, filter by them to avoid sending
             # unrelated facts to the LLM (reduces false supersessions).
+            # Tag-based candidates (existing behaviour)
             candidates = self.store.query_facts(
                 subject=fact.subject,
                 tags=fact.tags if fact.tags else None,
                 limit=self.config.batch_size,
             )
+            # Object-similarity candidates — catches cross-session duplicates
+            # whose tags don't overlap with the new fact's tags
+            keyword = _extract_object_keyword(fact.object)
+            if keyword:
+                obj_candidates = self.store.query_facts(
+                    subject=fact.subject,
+                    object_contains=keyword,
+                    limit=self.config.batch_size,
+                )
+                seen_ids = {c.id for c in candidates}
+                for c in obj_candidates:
+                    if c.id not in seen_ids:
+                        candidates.append(c)
+                        seen_ids.add(c.id)
             candidates = [c for c in candidates if c.id != fact.id]
             if not candidates:
                 continue
