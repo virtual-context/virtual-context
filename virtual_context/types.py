@@ -448,7 +448,7 @@ class PagingConfig:
     ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
-    max_tool_loops: int = 7    # max continuation rounds in tool loop
+    max_tool_loops: int = 10    # max continuation rounds in tool loop
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +634,7 @@ class ToolOutputStats:
 @dataclass
 class SupersessionConfig:
     """Configuration for fact supersession checking."""
-    enabled: bool = True
+    enabled: bool = False
     provider: str = ""   # provider name from providers dict, or "" to use summarization provider
     model: str = ""      # model override, or "" to use summarization model
     batch_size: int = 20
