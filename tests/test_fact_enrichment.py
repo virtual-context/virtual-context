@@ -742,3 +742,39 @@ class TestFactSessionDate:
         store.store_facts([f])
         results = store.query_facts(subject="user")
         assert results[0].session_date == ""
+
+    def test_compactor_sets_session_date_on_facts(self, tmp_path):
+        """Compactor should stamp each extracted fact with the segment's session_date."""
+        from unittest.mock import MagicMock
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, TaggedSegment, Message
+        import json
+
+        llm = MagicMock()
+        llm.complete.return_value = json.dumps({
+            "summary": "User hiked Muir Woods.",
+            "entities": [], "key_decisions": [], "action_items": [],
+            "date_references": [], "refined_tags": ["hiking"],
+            "related_tags": [],
+            "facts": [{
+                "subject": "user", "verb": "hiked", "object": "Muir Woods",
+                "status": "completed", "fact_type": "personal",
+                "what": "User hiked Muir Woods.", "who": "", "when": "", "where": "", "why": "",
+            }],
+        })
+
+        segment = TaggedSegment(
+            id="seg-001",
+            primary_tag="hiking",
+            tags=["hiking"],
+            messages=[Message(role="user", content="I hiked Muir Woods today.")],
+            session_date="2023/03/10 (Fri) 23:32",
+        )
+
+        compactor = DomainCompactor(
+            llm_provider=llm,
+            config=CompactorConfig(),
+        )
+        result = compactor.compact([segment])
+        assert len(result[0].facts) == 1
+        assert result[0].facts[0].session_date == "2023/03/10 (Fri) 23:32"
