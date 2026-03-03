@@ -1100,3 +1100,20 @@ class TestFactCurator:
         result = curator.curate([], question="Any question")
         assert result == []
         assert llm.calls == []  # no LLM call for empty input
+
+    def test_deduplicates_repeated_indices(self):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import Fact, CurationConfig
+        from virtual_context.ingest.curator import FactCurator
+
+        facts = [
+            Fact(subject="user", verb="hiked", object="trail"),
+            Fact(subject="user", verb="studied", object="math"),
+        ]
+        llm = MockLLMProvider(response="0, 0, 1")  # 0 repeated
+        curator = FactCurator(llm_provider=llm, model="test",
+                              config=CurationConfig(enabled=True))
+        result = curator.curate(facts, question="any question")
+        assert len(result) == 2  # not 3
+        assert result[0].object == "trail"
+        assert result[1].object == "math"

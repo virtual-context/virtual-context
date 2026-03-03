@@ -81,4 +81,5 @@ class FactCurator:
         # Strip thinking tags (e.g. Qwen3)
         response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         nums = re.findall(r"\d+", response)
-        return [int(n) for n in nums if 0 <= int(n) < total]
+        indices = [int(n) for n in nums if 0 <= int(n) < total]
+        return list(dict.fromkeys(indices))  # deduplicate preserving order
