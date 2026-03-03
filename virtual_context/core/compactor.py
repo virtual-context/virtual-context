@@ -269,7 +269,7 @@ class DomainCompactor:
                 tags=tags_str,
                 target_tokens=target_tokens,
                 conversation_text=conversation_text,
-                session_date=segment.session_date or "(unknown)",
+                session_date=segment.session_date or "",
             )
             if signals_text:
                 prompt += signals_text
