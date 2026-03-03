@@ -511,6 +511,17 @@ class TestGeminiAdapter:
         assert body["contents"][0]["parts"] == [{"text": "hi"}]
         assert body["system_instruction"]["parts"] == [{"text": "Be helpful."}]
         assert body["generationConfig"]["maxOutputTokens"] == 1024
+        assert "thinkingConfig" not in body["generationConfig"]
+
+    def test_build_request_body_thinking_model(self):
+        body = self.adapter.build_request_body(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            system=None, max_tokens=1024, temperature=0.5, tools=None,
+        )
+        # Thinking models enforce 8192 minimum and include thinkingConfig
+        assert body["generationConfig"]["maxOutputTokens"] == 8192
+        assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 2048}
 
     def test_convert_tool_defs(self):
         defs = [{"name": "vc_find_quote", "description": "Search", "input_schema": {"type": "object"}}]

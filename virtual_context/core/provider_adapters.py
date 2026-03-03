@@ -107,6 +107,17 @@ class ProviderAdapter(ABC):
     def strip_tools(self, body: dict) -> None:
         """Remove tool definitions from a request body (in-place)."""
 
+    def compress_previous_results(
+        self, body: dict, current_tool_call_ids: set[str],
+    ) -> None:
+        """Compress tool results from prior rounds to avoid content repetition.
+
+        Replaces verbose tool result content from earlier rounds with a short
+        marker.  Only the *current* round's results (identified by
+        ``current_tool_call_ids``) are kept intact.  Subclasses override
+        for their specific message/input format.
+        """
+
     def add_tool_defs(self, body: dict, anthropic_defs: list[dict]) -> None:
         """Add tool definitions to a request body (in-place).
 
@@ -221,12 +232,50 @@ class AnthropicAdapter(ProviderAdapter):
             cont_body["messages"].append({"role": "user", "content": tool_results})
             return cont_body
 
+    def compress_previous_results(self, body, current_tool_call_ids):
+        """Compress model reasoning from prior rounds.
+
+        Tool result data (tool_result blocks) is NOT compressed — it
+        contains unique, deduplicated information from anti-repetition.
+        """
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return
+
+        # Find where current round starts (user message with current tool_use_ids)
+        current_start = len(messages)
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and block.get("tool_use_id") in current_tool_call_ids):
+                    current_start = idx
+                    break
+            if current_start != len(messages):
+                break
+
+        for msg in messages[:current_start]:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict) and block.get("type") == "text"
+                                and not block.get("text", "").startswith("[Previous")):
+                            block["text"] = "[Previous reasoning compressed]"
+
     def inject_context(self, body, prepend_text):
         new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         system = body.get("system", "")
         if isinstance(system, str):
             if _VC_BLOCK_RE.search(system):
-                body["system"] = _VC_BLOCK_RE.sub(new_block, system, count=1)
+                body["system"] = _VC_BLOCK_RE.sub(lambda m: new_block, system, count=1)
             else:
                 body["system"] = f"{new_block}\n\n{system}" if system else new_block
         elif isinstance(system, list):
@@ -235,7 +284,7 @@ class AnthropicAdapter(ProviderAdapter):
                 if isinstance(entry, dict) and entry.get("type") == "text":
                     text = entry.get("text", "")
                     if _VC_BLOCK_RE.search(text):
-                        entry["text"] = _VC_BLOCK_RE.sub(new_block, text, count=1)
+                        entry["text"] = _VC_BLOCK_RE.sub(lambda m: new_block, text, count=1)
                         replaced = True
                         break
             if not replaced:
@@ -385,6 +434,42 @@ class OpenAIAdapter(ProviderAdapter):
         body["messages"].extend(tool_results)
         return body
 
+    def compress_previous_results(self, body, current_tool_call_ids):
+        """Compress model reasoning and queries from prior rounds.
+
+        Tool result data (role=tool) is NOT compressed — it contains
+        unique, deduplicated information from anti-repetition.
+        """
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return
+
+        # Find where current round starts
+        current_start = len(messages)
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if (msg.get("role") == "tool"
+                    and msg.get("tool_call_id") in current_tool_call_ids):
+                current_start = idx
+                break
+
+        for msg in messages[:current_start]:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            if role == "assistant":
+                content = msg.get("content")
+                if isinstance(content, str) and content and not content.startswith("[Previous"):
+                    msg["content"] = "[Previous reasoning compressed]"
+                # Compress tool_call arguments (model's search queries)
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        if isinstance(fn, dict) and fn.get("arguments", "") != "{}":
+                            fn["arguments"] = "{}"
+
     def inject_context(self, body, prepend_text):
         new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         messages = body.get("messages", [])
@@ -392,7 +477,7 @@ class OpenAIAdapter(ProviderAdapter):
             content = messages[0].get("content", "")
             if isinstance(content, str) and _VC_BLOCK_RE.search(content):
                 messages[0]["content"] = _VC_BLOCK_RE.sub(
-                    new_block, content, count=1,
+                    lambda m: new_block, content, count=1,
                 )
             elif isinstance(content, str):
                 messages[0]["content"] = (
@@ -546,11 +631,57 @@ class OpenAICodexAdapter(ProviderAdapter):
         body["input"].extend(tool_results)
         return body
 
+    def compress_previous_results(self, body, current_tool_call_ids):
+        """Compress model reasoning and queries from prior rounds.
+
+        Tool result data (function_call_output) is NOT compressed — it
+        contains unique, deduplicated information from anti-repetition.
+        Only the model's own text (reasoning) and function_call arguments
+        (search queries) are compressed to prevent the model's own
+        echoing from accumulating.
+        """
+        inputs = body.get("input")
+        if not isinstance(inputs, list):
+            return
+
+        # Find where current round starts (first item with a current call_id)
+        current_start = len(inputs)
+        for idx, item in enumerate(inputs):
+            if not isinstance(item, dict):
+                continue
+            if (item.get("type") == "function_call_output"
+                    and item.get("call_id") in current_tool_call_ids):
+                current_start = idx
+                break
+
+        # Compress model output before the current round (NOT tool results)
+        for item in inputs[:current_start]:
+            if not isinstance(item, dict):
+                continue
+            typ = item.get("type", "")
+
+            # Compress old function_call arguments (model's search queries)
+            if typ == "function_call":
+                args = item.get("arguments", "")
+                if isinstance(args, str) and args == "{}":
+                    continue
+                item["arguments"] = "{}"
+
+            # Compress old assistant text (model's reasoning)
+            elif typ == "message" and item.get("role") == "assistant":
+                content = item.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "output_text":
+                            text = block.get("text", "")
+                            if text and not text.startswith("[Previous"):
+                                block["text"] = "[Previous reasoning compressed]"
+
     def inject_context(self, body, prepend_text):
         new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         instructions = body.get("instructions", "")
         if isinstance(instructions, str) and _VC_BLOCK_RE.search(instructions):
-            body["instructions"] = _VC_BLOCK_RE.sub(new_block, instructions, count=1)
+            body["instructions"] = _VC_BLOCK_RE.sub(lambda m: new_block, instructions, count=1)
         elif isinstance(instructions, str):
             body["instructions"] = (
                 f"{new_block}\n\n{instructions}" if instructions else new_block
@@ -605,12 +736,22 @@ class GeminiAdapter(ProviderAdapter):
                 parts = [{"text": str(raw_content)}]
             contents.append({"role": role, "parts": parts})
 
+        # Gemini thinking models (2.5+, 3+) count thinking tokens against
+        # maxOutputTokens.  Ensure the limit is high enough for both
+        # internal reasoning and the visible response.
+        is_thinking_model = "2.5" in model or "3." in model
+        effective_max = max(max_tokens, 8192) if is_thinking_model else max_tokens
+
+        generation_config: dict = {
+            "maxOutputTokens": effective_max,
+            "temperature": temperature,
+        }
+        if is_thinking_model:
+            generation_config["thinkingConfig"] = {"thinkingBudget": 2048}
+
         body: dict = {
             "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": temperature,
-            },
+            "generationConfig": generation_config,
         }
         if system:
             body["system_instruction"] = {"parts": [{"text": system}]}
@@ -678,10 +819,20 @@ class GeminiAdapter(ProviderAdapter):
         return reason.lower()
 
     def build_tool_result(self, tool_call_id, tool_name, content):
+        # Gemini expects response to be a JSON object, not a string.
+        # The tool loop appends strategy hints + [REMINDER] text after the
+        # JSON body.  Use raw_decode to grab only the leading JSON object.
+        if isinstance(content, str):
+            try:
+                response_obj, _ = json.JSONDecoder().raw_decode(content)
+            except (json.JSONDecodeError, ValueError):
+                response_obj = {"content": content}
+        else:
+            response_obj = content
         return {
             "functionResponse": {
                 "name": tool_name,
-                "response": {"content": content},
+                "response": response_obj,
             },
         }
 
@@ -695,12 +846,37 @@ class GeminiAdapter(ProviderAdapter):
 
         if cont_body is None:
             body = copy.deepcopy(original_body)
+            # Remove forced tool-calling mode so the model can freely
+            # choose to respond with text once it has enough information.
+            body.pop("tool_config", None)
         else:
             body = cont_body
 
         body["contents"].append({"role": "model", "parts": model_parts})
         body["contents"].append({"role": "user", "parts": tool_results})
         return body
+
+    def compress_previous_results(self, body, current_tool_call_ids):
+        """Compress model reasoning from prior rounds.
+
+        Tool result data (functionResponse) is NOT compressed — it
+        contains unique, deduplicated information from anti-repetition.
+        Only model text output is compressed.
+        """
+        contents = body.get("contents")
+        if not isinstance(contents, list):
+            return
+        for entry in contents[:-1]:  # skip last (current round)
+            if not isinstance(entry, dict) or entry.get("role") != "model":
+                continue
+            parts = entry.get("parts", [])
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                # Only compress model text, not functionCall parts
+                if "text" in part and "functionCall" not in part:
+                    if not part["text"].startswith("[Previous"):
+                        part["text"] = "[Previous reasoning compressed]"
 
     def inject_context(self, body, prepend_text):
         new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
@@ -712,7 +888,7 @@ class GeminiAdapter(ProviderAdapter):
                 if isinstance(part, dict) and "text" in part:
                     if _VC_BLOCK_RE.search(part["text"]):
                         part["text"] = _VC_BLOCK_RE.sub(
-                            new_block, part["text"], count=1,
+                            lambda m: new_block, part["text"], count=1,
                         )
                         replaced = True
                         break
@@ -723,6 +899,7 @@ class GeminiAdapter(ProviderAdapter):
 
     def strip_tools(self, body):
         body.pop("tools", None)
+        body.pop("tool_config", None)
 
     def add_tool_defs(self, body, anthropic_defs):
         """Add tool definitions, merging into existing functionDeclarations."""
