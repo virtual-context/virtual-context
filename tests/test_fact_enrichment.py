@@ -855,3 +855,43 @@ class TestFactSessionDate:
         assert "2023/04/20" in captured_prompts[0], "session_date not injected into prompt"
         # LLM returned the session date as when_date — compactor should preserve it
         assert result[0].facts[0].when_date == "2023/04/20"
+
+
+class TestFormatFacts:
+    def _make_assembler(self):
+        from virtual_context.core.assembler import ContextAssembler
+        from virtual_context.types import AssemblerConfig
+        return ContextAssembler(config=AssemblerConfig())
+
+    def test_format_facts_shows_when_date(self):
+        assembler = self._make_assembler()
+        f = Fact(
+            subject="user", verb="hiked", object="Big Sur",
+            what="User hiked Big Sur.",
+            when_date="2023/04/20", session_date="2023/04/20 (Thu) 04:17",
+        )
+        result = assembler._format_facts([f], max_tokens=500)
+        assert "[when: 2023/04/20]" in result
+        assert "[session:" not in result  # when_date takes precedence
+
+    def test_format_facts_shows_session_date_when_no_when(self):
+        assembler = self._make_assembler()
+        f = Fact(
+            subject="user", verb="hiked", object="Muir Woods",
+            what="User hiked Muir Woods.",
+            when_date="", session_date="2023/03/10 (Fri) 23:32",
+        )
+        result = assembler._format_facts([f], max_tokens=500)
+        assert "[session: 2023/03/10 (Fri) 23:32]" in result
+        assert "[when:" not in result
+
+    def test_format_facts_no_suffix_when_no_dates(self):
+        assembler = self._make_assembler()
+        f = Fact(
+            subject="user", verb="prefers", object="dark theme",
+            what="User prefers dark theme.",
+            when_date="", session_date="",
+        )
+        result = assembler._format_facts([f], max_tokens=500)
+        assert "[when:" not in result
+        assert "[session:" not in result

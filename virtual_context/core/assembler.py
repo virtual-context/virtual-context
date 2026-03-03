@@ -10,6 +10,7 @@ from ..types import (
     AssembledContext,
     AssemblerConfig,
     DepthLevel,
+    Fact,
     Message,
     RetrievalResult,
     StoredSegment,
@@ -128,14 +129,33 @@ class ContextAssembler:
             tag_sections[tag] = section
             tag_tokens += section_tokens
 
+        # Collect segment refs that were included in the assembled context
+        presented_refs: set[str] = set()
+        for s in retrieval_result.summaries:
+            if s.primary_tag in tag_sections and s.ref:
+                presented_refs.add(s.ref)
+        if full_segments:
+            for tag, segs in full_segments.items():
+                if tag in tag_sections:
+                    for seg in segs:
+                        if seg.ref:
+                            presented_refs.add(seg.ref)
+
+        # Facts budget tier — between tags and conversation
+        facts_budget = self.config.facts_max_tokens
+        facts_text = self._format_facts(retrieval_result.facts, facts_budget)
+        facts_tokens = self.token_counter(facts_text) if facts_text else 0
+
         # Conversation budget = remaining tokens
-        conversation_budget = token_budget - core_tokens - tag_tokens - hint_tokens
+        conversation_budget = (
+            token_budget - core_tokens - tag_tokens - hint_tokens - facts_tokens
+        )
 
         # Trim conversation to budget
         trimmed = self._trim_conversation(conversation_history, conversation_budget)
         conv_tokens = sum(self.token_counter(m.content) for m in trimmed)
 
-        # Build prepend text (core + context hint + tag sections)
+        # Build prepend text (core + context hint + tag sections + facts)
         prepend_parts: list[str] = []
         if core:
             prepend_parts.append(core)
@@ -144,24 +164,55 @@ class ContextAssembler:
         for tag in sorted_tags:
             if tag in tag_sections:
                 prepend_parts.append(tag_sections[tag])
+        if facts_text:
+            prepend_parts.append(facts_text)
 
         prepend_text = "\n\n".join(prepend_parts)
 
-        total_tokens = core_tokens + tag_tokens + conv_tokens
+        total_tokens = core_tokens + tag_tokens + facts_tokens + conv_tokens
 
         return AssembledContext(
             core_context=core,
             tag_sections=tag_sections,
+            facts_text=facts_text,
             conversation_history=trimmed,
             total_tokens=total_tokens,
             budget_breakdown={
                 "core": core_tokens,
                 "context_hint": hint_tokens,
                 "tags": tag_tokens,
+                "facts": facts_tokens,
                 "conversation": conv_tokens,
             },
             prepend_text=prepend_text,
+            presented_segment_refs=presented_refs,
         )
+
+    def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
+        """Format facts as a <facts> block within token budget."""
+        if not facts:
+            return ""
+        lines: list[str] = []
+        tokens_used = 0
+        # Reserve tokens for the XML wrapper
+        wrapper_overhead = self.token_counter("<facts>\n</facts>")
+        tokens_used += wrapper_overhead
+        for fact in facts:
+            line = f"- {fact.subject} | {fact.verb} | {fact.object}"
+            if fact.what:
+                line += f" — {fact.what}"
+            if fact.when_date:
+                line += f" [when: {fact.when_date}]"
+            elif fact.session_date:
+                line += f" [session: {fact.session_date}]"
+            line_tokens = self.token_counter(line)
+            if tokens_used + line_tokens > max_tokens:
+                break
+            lines.append(line)
+            tokens_used += line_tokens
+        if not lines:
+            return ""
+        return "<facts>\n" + "\n".join(lines) + "\n</facts>"
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
         """Format summaries for a tag as XML-tagged section (SUMMARY depth)."""
