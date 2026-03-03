@@ -107,7 +107,10 @@ class VirtualContextEngine:
             paging_enabled=self.config.paging.enabled,
         )
         self._split_processed_tags: set[str] = set()
-        self._supersession_checker = None  # Initialized when supersession provider is available
+        self._supersession_checker = None
+        self._init_supersession_checker()
+        self._fact_curator = None
+        self._init_fact_curator()
         self._last_split_result: SplitResult | None = None
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
 
@@ -422,18 +425,65 @@ class VirtualContextEngine:
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
 
+    def _init_supersession_checker(self) -> None:
+        """Initialize the supersession checker from config if enabled."""
+        sc = self.config.supersession
+        if not sc.enabled:
+            return
+        provider_name = sc.provider or self.config.summarization.provider
+        model = sc.model or self.config.summarization.model
+        provider_config = self.config.providers.get(provider_name, {})
+        llm = self._build_provider(provider_name, provider_config)
+        if not llm:
+            logger.warning("Supersession enabled but provider '%s' could not be built", provider_name)
+            return
+        from .ingest.supersession import FactSupersessionChecker
+        self._supersession_checker = FactSupersessionChecker(
+            llm_provider=llm,
+            model=model,
+            store=self._store,
+            config=sc,
+        )
+        logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
+
+    def _init_fact_curator(self) -> None:
+        """Initialize the fact curator from config if enabled."""
+        cc = self.config.curation
+        if not cc.enabled:
+            return
+        provider_name = cc.provider or self.config.summarization.provider
+        model = cc.model or self.config.summarization.model
+        provider_config = self.config.providers.get(provider_name, {})
+        llm = self._build_provider(provider_name, provider_config)
+        if not llm:
+            logger.warning("Curation enabled but provider '%s' could not be built", provider_name)
+            return
+        from .ingest.curator import FactCurator
+        self._fact_curator = FactCurator(
+            llm_provider=llm,
+            model=model,
+            config=cc,
+        )
+        logger.info("Fact curator initialized (provider=%s, model=%s)", provider_name, model)
+
     def _build_provider(self, provider_name: str, provider_config: dict):
         """Build an LLM provider from config."""
         ptype = provider_config.get("type", provider_name)
 
-        if ptype == "generic_openai":
+        if ptype in ("generic_openai", "openrouter"):
             from .providers.generic_openai import GenericOpenAIProvider
-            api_key_env = provider_config.get("api_key_env", "")
+            if ptype == "openrouter":
+                default_url = "https://openrouter.ai/api/v1"
+                default_key_env = "OPENROUTER_API_KEY"
+            else:
+                default_url = "http://127.0.0.1:11434/v1"
+                default_key_env = ""
+            api_key_env = provider_config.get("api_key_env", default_key_env)
             api_key = provider_config.get("api_key") or (
                 os.environ.get(api_key_env, "") if api_key_env else "not-needed"
             )
             return GenericOpenAIProvider(
-                base_url=provider_config.get("base_url", "http://127.0.0.1:11434/v1"),
+                base_url=provider_config.get("base_url", default_url),
                 model=provider_config.get("model", self.config.summarization.model),
                 temperature=self.config.summarization.temperature,
                 api_key=api_key,
@@ -449,6 +499,16 @@ class VirtualContextEngine:
                     model=provider_config.get("model", self.config.summarization.model),
                     temperature=self.config.summarization.temperature,
                 )
+
+        if ptype == "ollama_native":
+            from .providers.ollama_native import OllamaNativeProvider
+            return OllamaNativeProvider(
+                base_url=provider_config.get("base_url", "http://127.0.0.1:11434"),
+                model=provider_config.get("model", self.config.summarization.model),
+                temperature=self.config.summarization.temperature,
+                num_predict=provider_config.get("num_predict", 500),
+                force_json=provider_config.get("force_json", True),
+            )
 
         return None
 
@@ -492,6 +552,13 @@ class VirtualContextEngine:
             context_turns=context,
         )
 
+        # D2: Curate facts down to query-relevant subset before assembly
+        if self._fact_curator and retrieval_result.facts:
+            retrieval_result.facts = self._fact_curator.curate(
+                retrieval_result.facts,
+                question=message,
+            )
+
         # Build context awareness hint (post-compaction only)
         _paging_mode = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
         context_hint = self._build_context_hint(paging_mode=_paging_mode)
@@ -518,11 +585,12 @@ class VirtualContextEngine:
                 if tag in query_tags:
                     entry.last_accessed_turn = len(self._turn_tag_index.entries)
 
-        # Assemble enriched context
+        # Assemble enriched context — only pass uncompacted messages
+        uncompacted = conversation_history[self._compacted_through:]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=retrieval_result,
-            conversation_history=conversation_history,
+            conversation_history=uncompacted,
             token_budget=self.config.context_window,
             context_hint=context_hint,
             working_set=ws_param,
@@ -1481,10 +1549,11 @@ class VirtualContextEngine:
                     if segs:
                         full_segments_param[tag] = segs
 
+        uncompacted = (history or [])[self._compacted_through:]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
-            conversation_history=history or [],
+            conversation_history=uncompacted,
             token_budget=self.config.context_window,
             context_hint=context_hint,
             working_set=ws_param,
