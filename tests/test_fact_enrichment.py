@@ -287,6 +287,41 @@ class TestToolLoopFactType:
         assert set(props["fact_type"]["enum"]) == {"personal", "experience", "world"}
 
 
+class TestCurationConfig:
+    def test_defaults(self):
+        from virtual_context.types import CurationConfig
+        c = CurationConfig()
+        assert c.enabled is False
+        assert c.provider == ""
+        assert c.model == ""
+        assert c.max_response_tokens == 2048
+
+    def test_curation_in_vc_config(self):
+        from virtual_context.types import VirtualContextConfig, CurationConfig
+        cfg = VirtualContextConfig()
+        assert isinstance(cfg.curation, CurationConfig)
+        assert cfg.curation.enabled is False
+
+    def test_curation_loads_from_yaml(self, tmp_path):
+        from virtual_context.config import load_config
+        yaml_text = """
+version: "0.2"
+storage_root: .vc
+curation:
+  enabled: true
+  provider: openrouter
+  model: qwen/qwen3-30b-a3b
+  max_response_tokens: 4096
+"""
+        p = tmp_path / "vc.yaml"
+        p.write_text(yaml_text)
+        cfg = load_config(str(p))
+        assert cfg.curation.enabled is True
+        assert cfg.curation.provider == "openrouter"
+        assert cfg.curation.model == "qwen/qwen3-30b-a3b"
+        assert cfg.curation.max_response_tokens == 4096
+
+
 class TestSupersessionPrompt:
     def test_prompt_asks_about_duplicates(self):
         import tempfile
