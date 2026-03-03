@@ -386,3 +386,359 @@ class TestFactEnrichmentIntegration:
         all_facts = store.query_facts(subject="user")
         assert len(personal_only) == 1
         assert len(all_facts) == 2
+
+
+class TestSupersessionTagFiltering:
+    """Supersession uses tags to filter candidates, not random subject match."""
+
+    def test_tag_filtered_candidates(self, tmp_path):
+        """check_and_supersede passes fact.tags to query_facts."""
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        # Store facts with different tags
+        running_fact = Fact(
+            subject="user", verb="set", object="5K PB of 27:12",
+            tags=["running", "5k-run", "personal-best"],
+        )
+        cooking_fact = Fact(
+            subject="user", verb="prefers", object="Italian cuisine",
+            tags=["cooking", "food-preference"],
+        )
+        store.store_facts([running_fact, cooking_fact])
+
+        # New running fact — should get running candidates, not cooking
+        llm = MockLLMProvider(response="[]")
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(
+            subject="user", verb="set", object="5K PB of 25:50",
+            tags=["running", "5k-run", "personal-best"],
+        )
+        store.store_facts([new_fact])
+        checker.check_and_supersede([new_fact])
+
+        # LLM should have been called with only running-related candidates
+        assert len(llm.calls) == 1
+        prompt = llm.calls[0]["user"]
+        assert "27:12" in prompt
+        assert "Italian" not in prompt
+
+    def test_no_tags_falls_back_to_subject_only(self, tmp_path):
+        """Facts without tags still get subject-based candidates."""
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="likes", object="coffee", tags=[])
+        store.store_facts([old])
+
+        llm = MockLLMProvider(response="[]")
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new = Fact(subject="user", verb="prefers", object="tea", tags=[])
+        store.store_facts([new])
+        checker.check_and_supersede([new])
+
+        # Should still call LLM (fallback to subject-only query)
+        assert len(llm.calls) == 1
+        prompt = llm.calls[0]["user"]
+        assert "coffee" in prompt
+
+
+class TestSupersessionResponseParsing:
+    """Supersession handles various LLM response formats."""
+
+    def _make_checker(self, response, tmp_path):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response=response)
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        return FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+
+    def test_parse_bare_array(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("[0, 2]", tmp_path)
+        candidates = [
+            Fact(id="a", subject="user", verb="v1", object="o1"),
+            Fact(id="b", subject="user", verb="v2", object="o2"),
+            Fact(id="c", subject="user", verb="v3", object="o3"),
+        ]
+        result = checker._parse_response("[0, 2]", candidates)
+        assert result == ["a", "c"]
+
+    def test_parse_qwen3_updated_format(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("", tmp_path)
+        candidates = [
+            Fact(id="a", subject="user", verb="v1", object="o1"),
+            Fact(id="b", subject="user", verb="v2", object="o2"),
+        ]
+        result = checker._parse_response('{"contradicted": [], "updated": [0]}', candidates)
+        assert result == ["a"]
+
+    def test_parse_superseded_key(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("", tmp_path)
+        candidates = [Fact(id="x", subject="user", verb="v", object="o")]
+        result = checker._parse_response('{"superseded": [0]}', candidates)
+        assert result == ["x"]
+
+    def test_parse_empty_array(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("", tmp_path)
+        candidates = [Fact(id="a", subject="user", verb="v", object="o")]
+        result = checker._parse_response("[]", candidates)
+        assert result == []
+
+    def test_parse_with_thinking_tags(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("", tmp_path)
+        candidates = [Fact(id="a", subject="user", verb="v", object="o")]
+        response = '<think>Let me think...</think>{"updated": [0]}'
+        result = checker._parse_response(response, candidates)
+        assert result == ["a"]
+
+    def test_parse_out_of_range_index_ignored(self, tmp_path):
+        from virtual_context.types import Fact
+        checker = self._make_checker("", tmp_path)
+        candidates = [Fact(id="a", subject="user", verb="v", object="o")]
+        result = checker._parse_response("[0, 5, 99]", candidates)
+        assert result == ["a"]
+
+
+class _SequentialMockLLM:
+    """Mock LLM that returns responses in order."""
+    def __init__(self, responses: list[str]):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    def complete(self, system: str, user: str, max_tokens: int) -> str:
+        self.calls.append({"system": system, "user": user, "max_tokens": max_tokens})
+        return self._responses.pop(0) if self._responses else "[]"
+
+
+class TestSupersessionDetectionPrompt:
+    """The improved prompt detects temporal progressions."""
+
+    def test_prompt_includes_underlying_attribute_guidance(self, tmp_path):
+        from tests.conftest import MockLLMProvider
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="hoping to beat",
+                        object="personal best time of 25:50")
+        candidates = [Fact(subject="user", verb="achieved",
+                           object="personal best 5K time of 27:12")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        assert "underlying attribute" in prompt
+        assert "earlier value" in prompt
+
+
+class TestSupersessionMerge:
+    """When supersession fires, the winning fact is merged with old fact's knowledge."""
+
+    def test_merge_updates_fact_fields_in_store(self, tmp_path):
+        """After supersession, winning fact's verb/object/what are updated in DB."""
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="achieved",
+                   object="personal best 5K time of 27:12",
+                   status="completed",
+                   what="User achieved a personal best 5K time of 27:12.",
+                   tags=["5k-run"])
+        new = Fact(subject="user", verb="hoping to beat",
+                   object="personal best time of 25:50",
+                   status="active",
+                   what="User is hoping to beat personal best time of 25:50.",
+                   tags=["5k-run"])
+        store.store_facts([old, new])
+
+        # Detection returns [0] (old fact superseded), merge returns updated fields
+        llm = _SequentialMockLLM([
+            '[0]',  # detection response
+            '{"verb": "holds", "object": "personal best 5K time of 25:50", '
+            '"status": "active", '
+            '"what": "User improved their 5K personal best from 27:12 to 25:50."}',
+        ])
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        count = checker.check_and_supersede([new])
+
+        assert count == 1
+        # Old fact should be superseded
+        all_facts = store.query_facts(subject="user")
+        assert len(all_facts) == 1
+        merged = all_facts[0]
+        assert merged.id == new.id
+        assert merged.verb == "holds"
+        assert "25:50" in merged.object
+        assert "27:12" in merged.what
+        assert "25:50" in merged.what
+
+    def test_merge_called_with_correct_prompts(self, tmp_path):
+        """Merge LLM call includes durable knowledge principle."""
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="achieved", object="27:12",
+                   what="User achieved 27:12.", tags=["running"])
+        new = Fact(subject="user", verb="hoping to beat", object="25:50",
+                   what="User hoping to beat 25:50.", tags=["running"])
+        store.store_facts([old, new])
+
+        llm = _SequentialMockLLM([
+            '[0]',
+            '{"verb": "holds", "object": "25:50", "status": "active", "what": "Merged."}',
+        ])
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        checker.check_and_supersede([new])
+
+        # Should have 2 LLM calls: detection + merge
+        assert len(llm.calls) == 2
+        merge_user = llm.calls[1]["user"]
+        assert "durable knowledge" in merge_user.lower()
+        assert "27:12" in merge_user
+        assert "25:50" in merge_user
+        assert "SUPERSEDED" in merge_user
+
+    def test_merge_failure_does_not_crash(self, tmp_path):
+        """If merge LLM returns garbage, supersession still succeeds."""
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="has", object="27:12", tags=["run"])
+        new = Fact(subject="user", verb="has", object="25:50", tags=["run"])
+        store.store_facts([old, new])
+
+        llm = _SequentialMockLLM([
+            '[0]',
+            'invalid json garbage',
+        ])
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        count = checker.check_and_supersede([new])
+
+        # Supersession still counted, just no merge
+        assert count == 1
+        results = store.query_facts(subject="user")
+        assert len(results) == 1
+        # Verb unchanged (merge failed gracefully)
+        assert results[0].verb == "has"
+
+    def test_merge_updates_in_memory_fact(self, tmp_path):
+        """After merge, the in-memory Fact object is updated for subsequent merges."""
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        old = Fact(subject="user", verb="v1", object="o1", tags=["t"])
+        new = Fact(subject="user", verb="v2", object="o2", tags=["t"])
+        store.store_facts([old, new])
+
+        llm = _SequentialMockLLM([
+            '[0]',
+            '{"verb": "merged_v", "object": "merged_o", "status": "active", "what": "merged_w"}',
+        ])
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        checker.check_and_supersede([new])
+
+        # In-memory object should be updated
+        assert new.verb == "merged_v"
+        assert new.object == "merged_o"
+        assert new.what == "merged_w"
+
+
+class TestUpdateFactFields:
+    """Store.update_fact_fields persists changes and syncs FTS."""
+
+    def test_update_persists_to_db(self, tmp_path):
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        fact = Fact(subject="user", verb="old_verb", object="old_obj",
+                    status="active", what="old what")
+        store.store_facts([fact])
+
+        store.update_fact_fields(fact.id, "new_verb", "new_obj", "completed", "new what")
+
+        results = store.query_facts(subject="user")
+        assert len(results) == 1
+        assert results[0].verb == "new_verb"
+        assert results[0].object == "new_obj"
+        assert results[0].status == "completed"
+        assert results[0].what == "new what"
+
+    def test_update_syncs_fts(self, tmp_path):
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        fact = Fact(subject="user", verb="original", object="before",
+                    what="original text")
+        store.store_facts([fact])
+
+        store.update_fact_fields(fact.id, "updated", "after", "active", "updated text")
+
+        # FTS search should find the updated text
+        results = store.search_facts("updated text")
+        assert len(results) == 1
+        assert results[0].id == fact.id
+
+
+class TestFactSessionDate:
+    def test_fact_session_date_default(self):
+        f = Fact(subject="user", verb="hiked", object="Muir Woods")
+        assert f.session_date == ""
+
+    def test_store_and_retrieve_session_date(self, tmp_path):
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        f = Fact(
+            subject="user", verb="hiked", object="Muir Woods",
+            session_date="2023/03/10 (Fri) 23:32",
+        )
+        store.store_facts([f])
+        results = store.query_facts(subject="user")
+        assert len(results) == 1
+        assert results[0].session_date == "2023/03/10 (Fri) 23:32"
+
+    def test_session_date_defaults_to_empty_in_db(self, tmp_path):
+        store = SQLiteStore(str(tmp_path / "test.db"))
+        f = Fact(subject="user", verb="visited", object="Paris")
+        store.store_facts([f])
+        results = store.query_facts(subject="user")
+        assert results[0].session_date == ""
