@@ -429,8 +429,8 @@ class TestGeminiFormat:
         result = self.fmt.inject_context(body, "ctx")
         parts = result["system_instruction"]["parts"]
         assert len(parts) == 2
-        assert "<system-reminder>" in parts[0]["text"]
-        assert parts[1]["text"] == "Be helpful."
+        assert parts[0]["text"] == "Be helpful."
+        assert "<system-reminder>" in parts[1]["text"]
 
     def test_inject_context_empty(self):
         body = {"contents": []}
@@ -586,7 +586,7 @@ class TestServerWrappers:
         body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
         result = _inject_context(body, "context text", "gemini")
         assert "system_instruction" in result
-        assert "<system-reminder>" in result["system_instruction"]["parts"][0]["text"]
+        assert "<system-reminder>" in result["system_instruction"]["parts"][-1]["text"]
 
     def test_extract_session_id_gemini(self):
         from virtual_context.proxy.server import _extract_session_id

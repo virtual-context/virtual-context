@@ -737,83 +737,16 @@ class TestSupersessionDetectionPrompt:
         assert "earlier value" in prompt
 
 
-class TestSupersessionMerge:
-    """When supersession fires, the winning fact is merged with old fact's knowledge."""
+class TestSupersessionNoMerge:
+    """Supersession marks old facts dead but does NOT merge/rewrite the winner.
 
-    def test_merge_updates_fact_fields_in_store(self, tmp_path):
-        """After supersession, winning fact's verb/object/what are updated in DB."""
-        from virtual_context.types import Fact, SupersessionConfig
-        from virtual_context.ingest.supersession import FactSupersessionChecker
+    _merge_facts() is intentionally skipped (supersession.py line 136) because
+    merging rewrites the winner's verb/object/what via LLM, destroying precise
+    extraction results. Only the superseded flag matters.
+    """
 
-        store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="achieved",
-                   object="personal best 5K time of 27:12",
-                   status="completed",
-                   what="User achieved a personal best 5K time of 27:12.",
-                   tags=["5k-run"])
-        new = Fact(subject="user", verb="hoping to beat",
-                   object="personal best time of 25:50",
-                   status="active",
-                   what="User is hoping to beat personal best time of 25:50.",
-                   tags=["5k-run"])
-        store.store_facts([old, new])
-
-        # Detection returns [0] (old fact superseded), merge returns updated fields
-        llm = _SequentialMockLLM([
-            '[0]',  # detection response
-            '{"verb": "holds", "object": "personal best 5K time of 25:50", '
-            '"status": "active", '
-            '"what": "User improved their 5K personal best from 27:12 to 25:50."}',
-        ])
-        checker = FactSupersessionChecker(
-            llm_provider=llm, model="test",
-            store=store, config=SupersessionConfig(enabled=True),
-        )
-        count = checker.check_and_supersede([new])
-
-        assert count == 1
-        # Old fact should be superseded
-        all_facts = store.query_facts(subject="user")
-        assert len(all_facts) == 1
-        merged = all_facts[0]
-        assert merged.id == new.id
-        assert merged.verb == "holds"
-        assert "25:50" in merged.object
-        assert "27:12" in merged.what
-        assert "25:50" in merged.what
-
-    def test_merge_called_with_correct_prompts(self, tmp_path):
-        """Merge LLM call includes durable knowledge principle."""
-        from virtual_context.types import Fact, SupersessionConfig
-        from virtual_context.ingest.supersession import FactSupersessionChecker
-
-        store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="achieved", object="27:12",
-                   what="User achieved 27:12.", tags=["running"])
-        new = Fact(subject="user", verb="hoping to beat", object="25:50",
-                   what="User hoping to beat 25:50.", tags=["running"])
-        store.store_facts([old, new])
-
-        llm = _SequentialMockLLM([
-            '[0]',
-            '{"verb": "holds", "object": "25:50", "status": "active", "what": "Merged."}',
-        ])
-        checker = FactSupersessionChecker(
-            llm_provider=llm, model="test",
-            store=store, config=SupersessionConfig(enabled=True),
-        )
-        checker.check_and_supersede([new])
-
-        # Should have 2 LLM calls: detection + merge
-        assert len(llm.calls) == 2
-        merge_user = llm.calls[1]["user"]
-        assert "durable knowledge" in merge_user.lower()
-        assert "27:12" in merge_user
-        assert "25:50" in merge_user
-        assert "SUPERSEDED" in merge_user
-
-    def test_merge_failure_does_not_crash(self, tmp_path):
-        """If merge LLM returns garbage, supersession still succeeds."""
+    def test_supersession_preserves_winner_fields(self, tmp_path):
+        """After supersession, the winning fact retains its original fields."""
         from virtual_context.types import Fact, SupersessionConfig
         from virtual_context.ingest.supersession import FactSupersessionChecker
 
@@ -822,47 +755,22 @@ class TestSupersessionMerge:
         new = Fact(subject="user", verb="has", object="25:50", tags=["run"])
         store.store_facts([old, new])
 
-        llm = _SequentialMockLLM([
-            '[0]',
-            'invalid json garbage',
-        ])
+        llm = _SequentialMockLLM(['[0]'])
         checker = FactSupersessionChecker(
             llm_provider=llm, model="test",
             store=store, config=SupersessionConfig(enabled=True),
         )
         count = checker.check_and_supersede([new])
 
-        # Supersession still counted, just no merge
         assert count == 1
+        # Only 1 LLM call (detection), no merge call
+        assert len(llm.calls) == 1
         results = store.query_facts(subject="user")
         assert len(results) == 1
-        # Verb unchanged (merge failed gracefully)
+        # Winner keeps its original fields — no LLM rewrite
+        assert results[0].id == new.id
         assert results[0].verb == "has"
-
-    def test_merge_updates_in_memory_fact(self, tmp_path):
-        """After merge, the in-memory Fact object is updated for subsequent merges."""
-        from virtual_context.types import Fact, SupersessionConfig
-        from virtual_context.ingest.supersession import FactSupersessionChecker
-
-        store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="v1", object="o1", tags=["t"])
-        new = Fact(subject="user", verb="v2", object="o2", tags=["t"])
-        store.store_facts([old, new])
-
-        llm = _SequentialMockLLM([
-            '[0]',
-            '{"verb": "merged_v", "object": "merged_o", "status": "active", "what": "merged_w"}',
-        ])
-        checker = FactSupersessionChecker(
-            llm_provider=llm, model="test",
-            store=store, config=SupersessionConfig(enabled=True),
-        )
-        checker.check_and_supersede([new])
-
-        # In-memory object should be updated
-        assert new.verb == "merged_v"
-        assert new.object == "merged_o"
-        assert new.what == "merged_w"
+        assert results[0].object == "25:50"
 
 
 class TestUpdateFactFields:

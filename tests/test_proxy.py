@@ -403,9 +403,12 @@ class TestInjectContext:
             {"role": "user", "content": "Hi"},
         ]}
         result = _inject_context(body, "context here", "openai")
-        assert result["messages"][0]["content"].startswith("<system-reminder>")
-        assert "context here" in result["messages"][0]["content"]
-        assert "Be helpful" in result["messages"][0]["content"]
+        content = result["messages"][0]["content"]
+        assert "Be helpful" in content
+        assert "<system-reminder>" in content
+        assert "context here" in content
+        # VC block appended after existing system prompt for cache friendliness
+        assert content.index("Be helpful") < content.index("<system-reminder>")
 
     def test_openai_without_system_message(self):
         body = {"messages": [{"role": "user", "content": "Hi"}]}
@@ -417,9 +420,11 @@ class TestInjectContext:
     def test_anthropic_string_system(self):
         body = {"system": "Be helpful", "messages": []}
         result = _inject_context(body, "context here", "anthropic")
-        assert result["system"].startswith("<system-reminder>")
-        assert "context here" in result["system"]
         assert "Be helpful" in result["system"]
+        assert "<system-reminder>" in result["system"]
+        assert "context here" in result["system"]
+        # VC block appended after existing system prompt for cache friendliness
+        assert result["system"].index("Be helpful") < result["system"].index("<system-reminder>")
 
     def test_anthropic_no_system(self):
         body = {"messages": []}
