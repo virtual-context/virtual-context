@@ -167,7 +167,7 @@ class FactSupersessionChecker:
         prompt = self._build_prompt(new_fact, candidates)
         try:
             t0 = time.time()
-            response = self.llm.complete(
+            response, _usage = self.llm.complete(
                 system="You are a fact comparison assistant. Respond only with a JSON array.",
                 user=prompt,
                 max_tokens=200,
@@ -239,7 +239,7 @@ class FactSupersessionChecker:
             new_what=winning_fact.what or f"{winning_fact.subject} {winning_fact.verb} {winning_fact.object}",
         )
         try:
-            response = self.llm.complete(
+            response, _ = self.llm.complete(
                 system=_MERGE_SYSTEM,
                 user=prompt,
                 max_tokens=256,
@@ -279,15 +279,29 @@ class FactSupersessionChecker:
             if isinstance(data, dict) and "verb" in data:
                 return data
         except (json.JSONDecodeError, ValueError):
-            # Try extracting JSON object from response
-            match = re.search(r'\{[^}]+\}', text, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group())
-                    if isinstance(data, dict) and "verb" in data:
-                        return data
-                except (json.JSONDecodeError, ValueError):
-                    pass
+            # Try extracting JSON object by scanning for balanced braces
+            for i, ch in enumerate(text):
+                if ch == '{':
+                    try:
+                        obj = json.loads(text[i:])
+                        if isinstance(obj, dict) and "verb" in obj:
+                            return obj
+                    except json.JSONDecodeError:
+                        pass
+                    # Try to find a balanced-brace substring
+                    depth = 0
+                    for j in range(i, len(text)):
+                        if text[j] == '{':
+                            depth += 1
+                        elif text[j] == '}':
+                            depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(text[i:j + 1])
+                                if isinstance(obj, dict) and "verb" in obj:
+                                    return obj
+                            except (json.JSONDecodeError, ValueError):
+                                break
         logger.warning("Failed to parse merge response: %s", text[:200])
         return None
 

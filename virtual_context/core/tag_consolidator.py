@@ -12,10 +12,10 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 
+from .llm_utils import parse_llm_json
 from .store import ContextStore
 from ..types import LLMProvider
 
@@ -147,7 +147,7 @@ def consolidate_tags(
         prompt = _CONSOLIDATION_PROMPT.format(tag_list=tag_list)
 
         try:
-            response = llm.complete(system=_SYSTEM, user=prompt, max_tokens=4096)
+            response, _ = llm.complete(system=_SYSTEM, user=prompt, max_tokens=4096)
             groups = _parse_response(response)
             all_groups.extend(groups)
         except Exception as e:
@@ -193,25 +193,12 @@ def _get_orphan_tag_descriptions(
 ) -> dict[str, str]:
     """Get descriptions for tags that have no tag_summary entry.
 
-    Uses a single SQL query to fetch one segment summary snippet per orphan
-    tag, so the LLM has context for consolidation decisions.
+    Delegates to the store's ``get_orphan_tag_snippets`` method to fetch
+    one segment summary snippet per orphan tag, so the LLM has context
+    for consolidation decisions.
     """
-    # Access the underlying SQLite connection if available
-    conn = getattr(store, "_get_conn", None)
-    if conn is None:
-        return {}
-
     try:
-        db = conn()
-        # Single query: for each tag NOT in tag_summaries, get the first
-        # segment's summary text (truncated to 100 chars).
-        rows = db.execute("""
-            SELECT st.tag, substr(s.summary, 1, 100) as snippet
-            FROM segment_tags st
-            JOIN segments s ON s.ref = st.segment_ref
-            WHERE st.tag NOT IN (SELECT tag FROM tag_summaries)
-            GROUP BY st.tag
-        """).fetchall()
+        rows = store.get_orphan_tag_snippets(limit=1000)
         return {row["tag"]: row["snippet"] for row in rows}
     except Exception as e:
         logger.warning("Failed to fetch orphan tag descriptions: %s", e)
@@ -337,33 +324,10 @@ def _backfill_segment_tags(
 
 def _parse_response(response: str) -> list[ConsolidationGroup]:
     """Parse LLM JSON response into ConsolidationGroup list."""
-    import re
-
-    text = response.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines)
-
-    # Strip thinking tags
-    if "<think>" in text:
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                data = json.loads(text[start:end])
-            except json.JSONDecodeError:
-                logger.error("Failed to parse consolidation response.")
-                return []
-        else:
-            return []
+    data = parse_llm_json(response)
+    if not data:
+        logger.error("Failed to parse consolidation response.")
+        return []
 
     groups = []
     for g in data.get("groups", []):

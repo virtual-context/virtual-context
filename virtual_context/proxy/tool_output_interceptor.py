@@ -116,20 +116,6 @@ class ToolOutputInterceptor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _find_last_user_msg(messages: list[dict]) -> dict | None:
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                return msg
-        return None
-
-    @staticmethod
-    def _find_last_assistant_msg(messages: list[dict]) -> dict | None:
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                return msg
-        return None
-
-    @staticmethod
     def _build_tool_use_map(assistant_msg: dict | None) -> dict[str, dict]:
         """Map tool_use_id -> {name, input} from assistant message blocks."""
         result: dict[str, dict] = {}

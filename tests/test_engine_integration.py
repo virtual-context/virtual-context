@@ -99,7 +99,7 @@ def test_full_pipeline():
 
         # Use a mock that echoes back refined_tags based on content
         class EchoTagsLLM:
-            def complete(self, system: str, user: str, max_tokens: int) -> str:
+            def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
                 import json
                 # Determine tags from conversation content
                 tags = []
@@ -116,7 +116,7 @@ def test_full_pipeline():
                     "action_items": [],
                     "date_references": [],
                     "refined_tags": tags,
-                })
+                }), {}
 
         compactor = DomainCompactor(
             llm_provider=EchoTagsLLM(),
@@ -231,14 +231,14 @@ def test_primary_tag_guarantee_ephemeral_gets_tag_summary():
 
         class TagAwareLLM:
             """Returns segment summaries and tag summaries."""
-            def complete(self, system: str, user: str, max_tokens: int) -> str:
+            def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
                 import json
                 # Tag summary request
                 if "tag summary" in system.lower() or "rollup" in system.lower():
                     return json.dumps({
                         "summary": "Tag summary for testing",
                         "key_themes": ["test"],
-                    })
+                    }), {}
                 # Segment compaction request
                 tags = ["baking"]
                 if "sourdough" in user.lower():
@@ -250,7 +250,7 @@ def test_primary_tag_guarantee_ephemeral_gets_tag_summary():
                     "action_items": [],
                     "date_references": [],
                     "refined_tags": tags,
-                })
+                }), {}
 
         compactor = DomainCompactor(
             llm_provider=TagAwareLLM(),

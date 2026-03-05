@@ -1,0 +1,684 @@
+"""Proxy session state management.
+
+Contains ProxyState, SessionState, and _IngestionCancelled — the core
+state machine for non-blocking ingestion and turn-complete processing.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+
+from ..engine import VirtualContextEngine
+from ..types import Message, SplitResult
+
+from .helpers import (
+    _strip_openclaw_envelope,
+    _extract_history_pairs,
+)
+from .metrics import ProxyMetrics
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SessionState — state machine for non-blocking ingestion
+# ---------------------------------------------------------------------------
+
+class SessionState(enum.Enum):
+    PASSTHROUGH = "passthrough"  # forwarding without enrichment (ingestion pending/running)
+    INGESTING = "ingesting"     # background thread tagging historical turns
+    ACTIVE = "active"           # normal enrichment mode
+
+
+class _IngestionCancelled(Exception):
+    """Raised inside progress callback to abort a running ingestion."""
+    def __init__(self, done: int, total: int) -> None:
+        self.done = done
+        self.total = total
+        super().__init__(f"Cancelled at {done}/{total}")
+
+
+# ---------------------------------------------------------------------------
+# ProxyState — mirrors HeadlessRunner threading pattern
+# ---------------------------------------------------------------------------
+
+class ProxyState:
+    """Shared mutable state for the proxy lifetime.
+
+    Thread-safety notes for ``conversation_history``:
+        - Wholesale replacement (``conversation_history = list(...)``) only
+          occurs during INGESTING state, which is single-threaded.
+        - ``fire_turn_complete`` receives a snapshot via ``list()`` copy, so
+          the background tagging thread operates on its own list instance.
+        - Append-only mutations (``conversation_history.append(...)``) happen
+          on the async request path, which is serialized by ``wait_for_tag()``.
+        - This combination is safe: ingestion is single-threaded, live
+          requests are serialized, and turn-complete always gets its own copy.
+    """
+
+    def __init__(
+        self,
+        engine: VirtualContextEngine,
+        metrics: ProxyMetrics | None = None,
+        upstream: str = "",
+    ) -> None:
+        self.engine = engine
+        self.conversation_history: list[Message] = []
+        self.metrics = metrics
+        self.upstream = upstream
+        self._pool = ThreadPoolExecutor(max_workers=1)       # tagging (serialized)
+        self._compact_pool = ThreadPoolExecutor(max_workers=1)  # compaction (background)
+        self._pending_tag: Future | None = None
+        self._pending_compact: Future | None = None
+        self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
+        self._ingested_sessions: set[str] = set()
+        self._ingestion_lock = threading.Lock()
+        self._compaction_lock = threading.Lock()
+        # State machine for non-blocking ingestion
+        self._state = SessionState.ACTIVE
+        self._latest_body: dict | None = None
+        self._ingestion_progress: tuple[int, int] = (0, 0)
+        self._manual_passthrough = False
+        self._ingestion_thread: threading.Thread | None = None
+        self._ingestion_cancel = threading.Event()
+        # Initial snapshot: captured at first ingestion start for growth tracking
+        self._initial_turns: int | None = None
+        self._initial_tag_count: int | None = None
+        # Payload size tracking (KB + tokens)
+        self._initial_payload_kb: float | None = None
+        self._last_payload_kb: float = 0.0
+        self._last_enriched_payload_kb: float = 0.0
+        self._initial_payload_tokens: int | None = None
+        self._last_payload_tokens: int = 0
+        self._last_enriched_payload_tokens: int = 0
+        # Live request counter: incremented on each user turn processed through proxy
+        self._live_requests: int = 0
+
+    @property
+    def turn_offset(self) -> int:
+        """Starting turn number from persisted engine state.
+
+        When the proxy restarts, conversation_history is empty but the
+        TurnTagIndex may have been restored from the store.  Use the
+        highest indexed turn + 1 as the offset so turn numbering
+        continues from the previous session.
+        """
+        try:
+            entries = self.engine._turn_tag_index.entries
+            if entries and len(entries) > 0:
+                return max(e.turn_number for e in entries) + 1
+        except (TypeError, AttributeError):
+            pass
+        return 0
+
+    @property
+    def session_state(self) -> SessionState:
+        """Current session state, accounting for manual passthrough override."""
+        if self._manual_passthrough:
+            return SessionState.PASSTHROUGH
+        return self._state
+
+    def set_manual_passthrough(self, enabled: bool) -> None:
+        """Toggle manual passthrough mode from the dashboard."""
+        self._manual_passthrough = enabled
+
+    def _transition_to(self, new_state: SessionState) -> None:
+        """Update internal state and emit a metric event."""
+        old = self._state
+        self._state = new_state
+        if self.metrics and old != new_state:
+            self.metrics.record({
+                "type": "session_state_change",
+                "from": old.value,
+                "to": new_state.value,
+                "session_id": self.engine.config.session_id,
+            })
+        logger.info(
+            "Session %s: %s → %s",
+            self.engine.config.session_id[:12], old.value, new_state.value,
+        )
+
+    def live_snapshot(self) -> dict:
+        """Build a snapshot dict of this session's live state for the dashboard."""
+        engine = self.engine
+        idx = engine._turn_tag_index
+
+        # KB stats: tag summaries
+        tag_summary_count = 0
+        tag_summary_tokens = 0
+        try:
+            summaries = engine._store.get_all_tag_summaries()
+            tag_summary_count = len(summaries)
+            tag_summary_tokens = sum(ts.summary_tokens for ts in summaries)
+        except Exception:
+            pass
+
+        # Estimate history size in tokens (chars / 4)
+        history_tokens = 0
+        for m in self.conversation_history:
+            history_tokens += len(m.content) // 4
+
+        context_window = engine.config.monitor.context_window
+        utilization_pct = round(history_tokens / context_window * 100, 1) if context_window > 0 else 0
+
+        # Distinct tag count from TurnTagIndex
+        all_tags: set[str] = set()
+        for entry in idx.entries:
+            all_tags.update(entry.tags)
+        all_tags.discard("_general")
+
+        snap = {
+            "session_id": engine.config.session_id,
+            "turn_count": len(self.conversation_history) // 2,
+            "live_requests": self._live_requests,
+            "compacted_through": getattr(engine, "_compacted_through", 0),
+            "tag_count": len(idx.entries),
+            "distinct_tags": len(all_tags),
+            "active_tags": list(idx.get_active_tags(lookback=6)),
+            "session_state": self.session_state.value,
+            "ingestion_progress": list(self._ingestion_progress),
+            "manual_passthrough": self._manual_passthrough,
+            "context_window": context_window,
+            "history_tokens": history_tokens,
+            "utilization_pct": utilization_pct,
+            "tag_summary_count": tag_summary_count,
+            "tag_summary_tokens": tag_summary_tokens,
+            "initial_turns": self._initial_turns,
+            "initial_tag_count": self._initial_tag_count,
+            "initial_payload_kb": self._initial_payload_kb,
+            "last_payload_kb": self._last_payload_kb,
+            "last_enriched_payload_kb": self._last_enriched_payload_kb,
+            "initial_payload_tokens": self._initial_payload_tokens,
+            "last_payload_tokens": self._last_payload_tokens,
+            "last_enriched_payload_tokens": self._last_enriched_payload_tokens,
+        }
+        return snap
+
+    def wait_for_tag(self) -> None:
+        """Block until tagging finishes. Compaction may still be running."""
+        if self._pending_tag is not None:
+            self._pending_tag.result()
+            self._pending_tag = None
+
+    def wait_for_complete(self) -> None:
+        """Block until tag + compact both finish (backward compat)."""
+        self.wait_for_tag()
+        if self._pending_compact is not None:
+            self._pending_compact.result()
+            self._pending_compact = None
+
+    def fire_turn_complete(
+        self,
+        history_snapshot: list[Message],
+        payload_tokens: int | None = None,
+    ) -> None:
+        """Submit tagging to background thread.
+
+        Compaction (if needed) fires automatically in a separate pool
+        once tagging completes — the next request only waits for tagging.
+        """
+        self._pending_tag = self._pool.submit(
+            self._run_tag_turn, history_snapshot, payload_tokens,
+        )
+
+    def _run_tag_turn(
+        self,
+        history: list[Message],
+        payload_tokens: int | None = None,
+    ) -> None:
+        """Fast path: tag the turn, emit metrics, fire compaction if needed."""
+        t0 = time.monotonic()
+        turn = len(history) // 2 - 1
+        session_id = self.engine.config.session_id
+        try:
+            signal = self.engine.tag_turn(
+                history, payload_tokens=payload_tokens,
+            )
+            self._last_compact_priority = signal.priority if signal else ""
+
+            tag_ms = round((time.monotonic() - t0) * 1000, 1)
+            entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
+            _tags = entry.tags if entry else []
+            _primary = entry.primary_tag if entry else ""
+            _needs_compact = signal is not None
+            print(
+                f"[T{turn}] TAG {int(tag_ms)}ms "
+                f"tags=[{', '.join(_tags)}] primary={_primary}"
+                + (" → COMPACT queued" if _needs_compact else "")
+            )
+            logger.info(
+                "T%d tagged (%dms) session=%s compacted_through=%d history=%d%s",
+                turn, int(tag_ms), session_id[:12],
+                getattr(self.engine, "_compacted_through", 0),
+                len(history),
+                " compact_queued" if _needs_compact else "",
+            )
+
+            # Emit turn_complete event (tag phase)
+            if self.metrics:
+                entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
+                active_tags = list(
+                    self.engine._turn_tag_index.get_active_tags(lookback=6)
+                )
+                turn_pair_tokens = (
+                    sum(len(m.content) for m in history[-2:]) // 4
+                    if len(history) >= 2 else 0
+                )
+                # Write response tags to captured request
+                response_tags = entry.tags if entry else []
+                self.metrics.update_request_tags(
+                    turn, response_tags=response_tags,
+                )
+                self.metrics.record({
+                    "type": "turn_complete",
+                    "turn": turn,
+                    "tags": entry.tags if entry else [],
+                    "primary_tag": entry.primary_tag if entry else "",
+                    "complete_ms": tag_ms,
+                    "tag_ms": tag_ms,
+                    "active_tags": active_tags,
+                    "store_tag_count": len(self.engine._store.get_all_tags()),
+                    "turn_pair_tokens": turn_pair_tokens,
+                    "session_id": session_id,
+                })
+
+                # Emit tag split event if splitting occurred
+                split_result = getattr(self.engine, '_last_split_result', None)
+                if isinstance(split_result, SplitResult):
+                    if split_result.splittable:
+                        new_tags = list(split_result.groups.keys())
+                        print(
+                            f"[T{turn}] SPLIT \"{split_result.tag}\" → "
+                            f"{new_tags} ({sum(len(v) for v in split_result.groups.values())} turns)"
+                        )
+                    else:
+                        print(
+                            f"[T{turn}] SUMMARIZED \"{split_result.tag}\" "
+                            f"(unsplittable: {split_result.reason})"
+                        )
+                    self.metrics.record({
+                        "type": "tag_split",
+                        "turn": turn,
+                        "tag": split_result.tag,
+                        "splittable": split_result.splittable,
+                        "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
+                        "session_id": session_id,
+                    })
+                    self.engine._last_split_result = None  # consume
+
+            # Fire compaction in background if needed
+            if signal is not None:
+                self._pending_compact = self._compact_pool.submit(
+                    self._run_compact, history, signal, turn,
+                )
+
+        except Exception as e:
+            logger.error("tag_turn error: %s", e, exc_info=True)
+
+    def _run_compact(
+        self,
+        history: list[Message],
+        signal: object,
+        turn: int,
+    ) -> None:
+        """Background compaction — runs in _compact_pool, doesn't block next request."""
+        session_id = self.engine.config.session_id
+        with self._compaction_lock:
+            t0 = time.monotonic()
+            try:
+                report = self.engine.compact_if_needed(history, signal)
+                compact_ms = round((time.monotonic() - t0) * 1000, 1)
+
+                if report is not None:
+                    print(
+                        f"[T{turn}] COMPACT {int(compact_ms)}ms "
+                        f"freed={report.tokens_freed}t segments={report.segments_compacted}"
+                    )
+                    logger.info(
+                        "T%d compaction (%dms): %d segments, freed %d tokens, tags=%s, "
+                        "summaries_built=%d",
+                        turn, int(compact_ms),
+                        report.segments_compacted,
+                        report.tokens_freed,
+                        report.tags,
+                        report.tag_summaries_built,
+                    )
+
+                    # Emit compaction event
+                    if self.metrics:
+                        original_tokens = sum(
+                            r.original_tokens for r in report.results
+                        )
+                        summary_tokens = sum(
+                            r.summary_tokens for r in report.results
+                        )
+                        self.metrics.record({
+                            "type": "compaction",
+                            "turn": turn,
+                            "compact_ms": compact_ms,
+                            "segments": report.segments_compacted,
+                            "tokens_freed": report.tokens_freed,
+                            "original_tokens": original_tokens,
+                            "summary_tokens": summary_tokens,
+                            "tags": report.tags,
+                            "tag_summaries_built": report.tag_summaries_built,
+                            "compacted_through": getattr(
+                                self.engine, "_compacted_through", 0
+                            ),
+                            "session_id": session_id,
+                        })
+                else:
+                    logger.info("T%d compaction skipped (no messages to compact)", turn)
+
+            except Exception as e:
+                logger.error("compact_if_needed error: %s", e, exc_info=True)
+
+    def _history_ingested(self) -> bool:
+        """Whether the current session's history has been ingested."""
+        return self.engine.config.session_id in self._ingested_sessions
+
+    def ingest_if_needed(self, history_pairs: list[Message]) -> None:
+        """Bootstrap TurnTagIndex from pre-existing history (once per session).
+
+        Double-checked locking: fast path skips the lock entirely.
+        """
+        session_id = self.engine.config.session_id
+        if session_id in self._ingested_sessions:
+            return
+        with self._ingestion_lock:
+            if session_id in self._ingested_sessions:
+                return
+            t0 = time.monotonic()
+            turns = self.engine.ingest_history(history_pairs)
+            elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+            self._ingested_sessions.add(session_id)
+
+            print(
+                f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
+                f"(session={session_id[:12]})"
+            )
+            logger.info(
+                "History ingestion: %d turns in %dms (session=%s)",
+                turns, int(elapsed_ms), session_id[:12],
+            )
+
+            if self.metrics:
+                # Emit per-turn events so the dashboard grid shows history
+                baseline_history_tokens = 0
+                for i in range(0, len(history_pairs) - 1, 2):
+                    turn_num = i // 2
+                    entry = self.engine._turn_tag_index.get_tags_for_turn(
+                        turn_num,
+                    )
+                    raw_content = history_pairs[i].content
+                    preview = _strip_openclaw_envelope(raw_content)[:60]
+                    # Estimate turn pair tokens for baseline calculation
+                    pair_chars = len(history_pairs[i].content) + len(history_pairs[i + 1].content)
+                    tpt = pair_chars // 4
+                    baseline_history_tokens += tpt
+                    self.metrics.record({
+                        "type": "ingested_turn",
+                        "turn": turn_num,
+                        "tags": entry.tags if entry else [],
+                        "primary_tag": entry.primary_tag if entry else "",
+                        "message_preview": preview,
+                        "turn_pair_tokens": tpt,
+                        "session_id": session_id,
+                    })
+                self.metrics.record({
+                    "type": "history_ingestion",
+                    "turns_ingested": turns,
+                    "pairs_received": len(history_pairs) // 2,
+                    "elapsed_ms": elapsed_ms,
+                    "session_id": session_id,
+                    "baseline_history_tokens": baseline_history_tokens,
+                })
+
+    # ------------------------------------------------------------------
+    # Non-blocking ingestion (background thread)
+    # ------------------------------------------------------------------
+
+    def start_ingestion_if_needed(self, history_pairs: list[Message]) -> None:
+        """Start non-blocking history ingestion in a background thread.
+
+        Returns immediately — the session stays in INGESTING while the
+        background thread tags historical turns.  If called while ingestion
+        is already running, cancels the old thread and resumes from the
+        last tagged turn (PROXY-013).
+        """
+        session_id = self.engine.config.session_id
+        if session_id in self._ingested_sessions:
+            return
+        with self._ingestion_lock:
+            if session_id in self._ingested_sessions:
+                return
+
+            if not history_pairs:
+                self._ingested_sessions.add(session_id)
+                return
+
+            # Skip if persisted TurnTagIndex already covers history
+            existing_turns = len(self.engine._turn_tag_index.entries)
+            needed_turns = len(history_pairs) // 2
+            if existing_turns >= needed_turns:
+                self._ingested_sessions.add(session_id)
+                logger.info(
+                    "Skipping ingestion: persisted index (%d) covers history (%d)",
+                    existing_turns, needed_turns,
+                )
+                return
+
+            # ---- PROXY-013: cancel-and-resume if already running ----
+            if (
+                self._ingestion_thread is not None
+                and self._ingestion_thread.is_alive()
+            ):
+                done, total = self._ingestion_progress
+                logger.info(
+                    "Cancelling running ingestion at turn %d/%d "
+                    "(new request has %d pairs)",
+                    done, total, needed_turns,
+                )
+                self._ingestion_cancel.set()
+                self._ingestion_thread.join(timeout=5.0)
+                if self._ingestion_thread.is_alive():
+                    logger.warning("Old ingestion thread did not exit in 5s")
+                # Reset cancel event for the new thread
+                self._ingestion_cancel.clear()
+
+                # Re-read existing_turns AFTER old thread stopped —
+                # the thread may have appended one more entry between
+                # the last callback and the cancel taking effect.
+                existing_turns = len(self.engine._turn_tag_index.entries)
+
+                print(
+                    f"[INGEST] Cancel at T{done}/{total}, "
+                    f"resuming from T{existing_turns} "
+                    f"(session={session_id[:12]})"
+                )
+
+                # Verify hash at handoff point
+                self._verify_handoff_hash(history_pairs, existing_turns)
+
+                # Slice to remaining pairs only
+                history_pairs = list(history_pairs[existing_turns * 2:])
+                if not history_pairs:
+                    self._ingested_sessions.add(session_id)
+                    self._transition_to(SessionState.ACTIVE)
+                    return
+                needed_turns = len(history_pairs) // 2 + existing_turns
+
+            total = needed_turns
+            self._ingestion_progress = (existing_turns, total)
+
+            # Capture initial snapshot once (first ingestion start only)
+            if self._initial_turns is None:
+                self._initial_turns = existing_turns
+                self._initial_tag_count = len(self.engine._turn_tag_index.entries)
+
+            self._transition_to(SessionState.INGESTING)
+
+            # Separate daemon thread (not the _pool) so on_turn_complete
+            # can use the pool once we transition to ACTIVE.
+            self._ingestion_thread = threading.Thread(
+                target=self._run_ingestion_with_catchup,
+                args=(list(history_pairs),),
+                daemon=True,
+                name="vc-ingest",
+            )
+            self._ingestion_thread.start()
+
+    def _verify_handoff_hash(
+        self, new_pairs: list[Message], handoff_turn: int,
+    ) -> None:
+        """Verify the last tagged turn matches the same content in new history.
+
+        Logs a warning if the hash doesn't match — indicates potential data
+        loss or history divergence between requests.
+        """
+        import hashlib as _hl
+        if handoff_turn <= 0:
+            return
+        prev_turn = handoff_turn - 1
+        entry = self.engine._turn_tag_index.get_tags_for_turn(prev_turn)
+        if entry is None:
+            return
+        pair_idx = prev_turn * 2
+        if pair_idx + 1 >= len(new_pairs):
+            logger.warning(
+                "Handoff verification: turn %d not in new history "
+                "(new history has %d pairs) — potential data loss",
+                prev_turn, len(new_pairs) // 2,
+            )
+            return
+        combined = f"{new_pairs[pair_idx].content} {new_pairs[pair_idx + 1].content}"
+        new_hash = _hl.sha256(combined.encode()).hexdigest()[:16]
+        if new_hash != entry.message_hash:
+            logger.warning(
+                "Handoff hash MISMATCH at turn %d: "
+                "indexed=%s new=%s — history may have diverged",
+                prev_turn, entry.message_hash, new_hash,
+            )
+            print(
+                f"[INGEST] WARNING: hash mismatch at T{prev_turn} "
+                f"(indexed={entry.message_hash} vs new={new_hash})"
+            )
+        else:
+            logger.info(
+                "Handoff hash verified at turn %d: %s",
+                prev_turn, new_hash,
+            )
+
+    def _run_ingestion_with_catchup(self, initial_pairs: list[Message]) -> None:
+        """Background thread: ingest initial pairs, then catch up any gap."""
+        session_id = self.engine.config.session_id
+        cancelled = False
+        try:
+            # Phase 1: tag all initial history
+            self._ingest_pairs_with_progress(initial_pairs)
+
+            # Phase 2: catch-up loop — tag any turns that arrived during ingestion
+            for _ in range(10):  # bounded to avoid infinite loops
+                if self._ingestion_cancel.is_set():
+                    break
+                latest = self._latest_body
+                if latest is None:
+                    break
+                latest_pairs = _extract_history_pairs(latest)
+                needed = len(latest_pairs) // 2
+                have = len(self.engine._turn_tag_index.entries)
+                if needed <= have:
+                    break
+                # Tag the gap
+                gap_pairs = latest_pairs[have * 2:]
+                if not gap_pairs:
+                    break
+                logger.info(
+                    "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
+                    len(gap_pairs) // 2, have, needed,
+                )
+                self._ingest_pairs_with_progress(gap_pairs)
+
+        except _IngestionCancelled as e:
+            # New request is taking over — exit cleanly without
+            # transitioning to ACTIVE or marking as ingested.
+            # NOTE: Python's finally block runs even after return,
+            # so we use a flag to skip the finalization actions.
+            cancelled = True
+            logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
+        except Exception as e:
+            logger.error("Ingestion error: %s", e, exc_info=True)
+        finally:
+            if not cancelled:
+                self._ingested_sessions.add(session_id)
+                self._transition_to(SessionState.ACTIVE)
+
+    def _ingest_pairs_with_progress(self, pairs: list[Message]) -> None:
+        """Call engine.ingest_history with a progress callback that emits events.
+
+        Raises ``_IngestionCancelled`` if ``_ingestion_cancel`` is set.
+        """
+        session_id = self.engine.config.session_id
+        t0 = time.monotonic()
+        baseline_history_tokens = 0
+
+        def on_progress(done: int, total: int, entry) -> None:
+            nonlocal baseline_history_tokens
+            # Check cancellation before updating progress
+            if self._ingestion_cancel.is_set():
+                raise _IngestionCancelled(done, total)
+            self._ingestion_progress = (done, total)
+            if self.metrics:
+                # Find the pair for this turn to compute preview + tokens
+                turn_num = entry.turn_number
+                pair_idx = turn_num * 2
+                preview = ""
+                tpt = 0
+                if pair_idx < len(pairs):
+                    raw_content = pairs[pair_idx].content
+                    preview = _strip_openclaw_envelope(raw_content)[:60]
+                    if pair_idx + 1 < len(pairs):
+                        pair_chars = len(pairs[pair_idx].content) + len(pairs[pair_idx + 1].content)
+                        tpt = pair_chars // 4
+                        baseline_history_tokens += tpt
+                self.metrics.record({
+                    "type": "ingested_turn",
+                    "turn": turn_num,
+                    "tags": entry.tags if entry else [],
+                    "primary_tag": entry.primary_tag if entry else "",
+                    "message_preview": preview,
+                    "turn_pair_tokens": tpt,
+                    "session_id": session_id,
+                    "done": done,
+                    "total": total,
+                })
+
+        turns = self.engine.ingest_history(pairs, progress_callback=on_progress)
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+
+        print(
+            f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
+            f"(session={session_id[:12]})"
+        )
+        logger.info(
+            "History ingestion: %d turns in %dms (session=%s)",
+            turns, int(elapsed_ms), session_id[:12],
+        )
+
+        if self.metrics:
+            self.metrics.record({
+                "type": "history_ingestion",
+                "turns_ingested": turns,
+                "pairs_received": len(pairs) // 2,
+                "elapsed_ms": elapsed_ms,
+                "session_id": session_id,
+                "baseline_history_tokens": baseline_history_tokens,
+            })
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=True)
+        self._compact_pool.shutdown(wait=True)

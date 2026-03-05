@@ -16,7 +16,7 @@ class TestBasicCompletion:
     """Verify the provider can talk to Ollama and return sensible results."""
 
     def test_basic_completion(self, ollama_provider: GenericOpenAIProvider):
-        result = ollama_provider.complete(
+        result, usage = ollama_provider.complete(
             system="You are a helpful assistant.",
             user="What is 2 + 2? Answer with just the number.",
             max_tokens=THINKING_OVERHEAD,
@@ -24,7 +24,7 @@ class TestBasicCompletion:
         assert result, "Expected non-empty response"
 
     def test_response_is_string(self, ollama_provider: GenericOpenAIProvider):
-        result = ollama_provider.complete(
+        result, usage = ollama_provider.complete(
             system="You are helpful.",
             user="Say hello.",
             max_tokens=THINKING_OVERHEAD,
@@ -32,7 +32,7 @@ class TestBasicCompletion:
         assert isinstance(result, str)
 
     def test_system_prompt_respected(self, ollama_provider: GenericOpenAIProvider):
-        result = ollama_provider.complete(
+        result, usage = ollama_provider.complete(
             system="Respond only with the word PONG. Nothing else.",
             user="Ping",
             max_tokens=THINKING_OVERHEAD,
@@ -41,7 +41,7 @@ class TestBasicCompletion:
 
     def test_max_tokens_limits_content(self, ollama_provider: GenericOpenAIProvider):
         """With enough tokens for thinking + content, the content should be short."""
-        result = ollama_provider.complete(
+        result, usage = ollama_provider.complete(
             system="You are a helpful assistant. Be very brief.",
             user="What is the capital of France? One word answer.",
             max_tokens=THINKING_OVERHEAD,
@@ -57,10 +57,10 @@ class TestBasicCompletion:
             temperature=0.0,
         )
         prompt = "What is 2+2? Answer with just the number."
-        r1 = provider.complete(
+        r1, _ = provider.complete(
             system="Answer concisely.", user=prompt, max_tokens=THINKING_OVERHEAD
         )
-        r2 = provider.complete(
+        r2, _ = provider.complete(
             system="Answer concisely.", user=prompt, max_tokens=THINKING_OVERHEAD
         )
         # Strip any residual thinking tags for comparison

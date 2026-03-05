@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from ..types import PagingConfig, ToolCallRecord, ToolLoopResult
+from ..types import ToolCallRecord, ToolLoopResult
 
 # Re-export adapter classes for backward compatibility
 from .provider_adapters import (  # noqa: F401
@@ -389,21 +389,15 @@ def _attach_related_facts(
     # "this current fact replaced these older ones."
     supersedes_map: dict[str, list[dict[str, str]]] = {}
     try:
-        conn = engine._store._get_conn()
         fact_ids = [f.id for f in facts if f.id]
         if fact_ids:
-            placeholders = ",".join("?" * len(fact_ids))
-            rows = conn.execute(
-                f"SELECT superseded_by, subject, verb, object FROM facts "
-                f"WHERE superseded_by IN ({placeholders})",
-                fact_ids,
-            ).fetchall()
+            rows = engine._store.get_superseded_facts(fact_ids)
             for row in rows:
-                target_id = row[0]
+                target_id = row["superseded_by"]
                 old_entry = {
-                    "subject": row[1],
-                    "verb": row[2],
-                    "object": row[3],
+                    "subject": row["subject"],
+                    "verb": row["verb"],
+                    "object": row["object"],
                 }
                 supersedes_map.setdefault(target_id, []).append(old_entry)
     except Exception:
@@ -717,7 +711,7 @@ def execute_vc_tool(
 # Synchronous tool loop
 # ---------------------------------------------------------------------------
 
-_MAX_LOOPS = PagingConfig.max_tool_loops
+_DEFAULT_MAX_LOOPS = 10
 _REDUNDANT_SEARCH_THRESHOLD = 3  # force-stop after this many all-found find_quote rounds
 _EMPTY_STREAK_HINT_THRESHOLD = 3  # suggest strategy change after this many empty results
 
@@ -811,7 +805,7 @@ def run_tool_loop(
     adapter: ProviderAdapter,
     *,
     url: str = "",
-    max_loops: int = _MAX_LOOPS,
+    max_loops: int = _DEFAULT_MAX_LOOPS,
 ) -> ToolLoopResult:
     """Run a synchronous non-streaming tool loop.
 
@@ -832,7 +826,7 @@ def run_tool_loop(
     url : str
         API endpoint URL (if empty, uses ``adapter.get_url()``).
     max_loops : int
-        Maximum continuation rounds (default 5).
+        Maximum continuation rounds (default 10).
 
     Returns
     -------

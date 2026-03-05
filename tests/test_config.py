@@ -131,7 +131,7 @@ class TestValidateConfig:
     def test_llm_requires_provider(self):
         config = load_config(config_dict={
             "tag_generator": {"type": "llm"},
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("provider" in e for e in errors)
 
@@ -145,14 +145,14 @@ class TestValidateConfig:
     def test_soft_gte_hard(self):
         config = load_config(config_dict={
             "compaction": {"soft_threshold": 0.9, "hard_threshold": 0.85},
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("soft_threshold" in e for e in errors)
 
     def test_protected_recent_turns_zero(self):
         config = load_config(config_dict={
             "compaction": {"protected_recent_turns": 0},
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("protected_recent_turns" in e for e in errors)
 
@@ -211,7 +211,7 @@ class TestMultiInstanceConfig:
                     {"port": 5757, "label": "broken"},
                 ],
             },
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("upstream is required" in e for e in errors)
 
@@ -223,7 +223,7 @@ class TestMultiInstanceConfig:
                     {"port": 5757, "upstream": "https://api.openai.com/v1"},
                 ],
             },
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("duplicates" in e for e in errors)
 
@@ -253,7 +253,7 @@ class TestMultiInstanceConfig:
                     },
                 ],
             },
-        })
+        }, validate=False)
         assert config.proxy.instances[0].config == "/tmp/vc-anthropic.yaml"
 
     def test_config_field_defaults_empty(self):
@@ -280,7 +280,7 @@ class TestMultiInstanceConfig:
                     },
                 ],
             },
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("config file not found" in e for e in errors)
 
@@ -312,6 +312,6 @@ class TestMultiInstanceConfig:
                     {"port": 5758, "upstream": "https://api.openai.com/v1", "label": "myproxy"},
                 ],
             },
-        })
+        }, validate=False)
         errors = validate_config(config)
         assert any("label 'myproxy' duplicates" in e for e in errors)

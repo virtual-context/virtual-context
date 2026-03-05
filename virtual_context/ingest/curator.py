@@ -53,7 +53,7 @@ class FactCurator:
 
         t0 = time.time()
         try:
-            response = self.llm.complete(
+            response, usage = self.llm.complete(
                 system=_SYSTEM,
                 user=user_prompt,
                 max_tokens=self.config.max_response_tokens,
@@ -66,7 +66,6 @@ class FactCurator:
 
         # Log telemetry
         if self._telemetry:
-            usage = getattr(self.llm, "last_usage", {})
             input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
             output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
             self._telemetry.log(

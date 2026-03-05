@@ -21,7 +21,8 @@ class ProxyMetrics:
     def __init__(self, context_window: int = 120_000, telemetry_ledger=None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
-        self._events: list[dict] = []
+        self._events: deque[dict] = deque(maxlen=2000)
+        self._buckets: dict[str, int] = {}
         self._lock = threading.Lock()
         self._seq = 0
         self._request_bodies: deque[dict] = deque(maxlen=50)
@@ -36,6 +37,9 @@ class ProxyMetrics:
                 event["ts"] = datetime.now(timezone.utc).isoformat()
             self._seq += 1
             self._events.append(event)
+            event_type = event.get("type", "")
+            if event_type:
+                self._buckets[event_type] = self._buckets.get(event_type, 0) + 1
 
     def events_since(self, seq: int) -> list[dict]:
         """Return events with ``_seq`` > *seq*."""

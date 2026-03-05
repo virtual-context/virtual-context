@@ -6,7 +6,13 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+
+# ---------------------------------------------------------------------------
+# Default models
+# ---------------------------------------------------------------------------
+
+DEFAULT_CHAT_MODEL: str = "claude-sonnet-4-5-20250929"
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +515,7 @@ class LLMProviderError(Exception):
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    def complete(self, system: str, user: str, max_tokens: int) -> str: ...
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]: ...
 
 
 # ---------------------------------------------------------------------------

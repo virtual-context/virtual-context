@@ -84,19 +84,20 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
         max_splits_per_turn=split_raw.get("max_splits_per_turn", 1),
     )
 
+    _defaults = TagGeneratorConfig()
     return TagGeneratorConfig(
-        type=raw.get("type", "keyword"),
-        provider=raw.get("provider", ""),
-        model=raw.get("model", ""),
-        max_tags=raw.get("max_tags", 5),
-        min_tags=raw.get("min_tags", 1),
-        max_tokens=raw.get("max_tokens", 1000),
-        prompt_mode=raw.get("prompt_mode", "detailed"),
+        type=raw.get("type", _defaults.type),
+        provider=raw.get("provider", _defaults.provider),
+        model=raw.get("model", _defaults.model),
+        max_tags=raw.get("max_tags", _defaults.max_tags),
+        min_tags=raw.get("min_tags", _defaults.min_tags),
+        max_tokens=raw.get("max_tokens", _defaults.max_tokens),
+        prompt_mode=raw.get("prompt_mode", _defaults.prompt_mode),
         keyword_fallback=keyword_fallback,
-        context_lookback_pairs=raw.get("context_lookback_pairs", 5),
-        context_bleed_threshold=raw.get("context_bleed_threshold", 0.1),
-        disable_thinking=raw.get("disable_thinking", False),
-        temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", True),
+        context_lookback_pairs=raw.get("context_lookback_pairs", _defaults.context_lookback_pairs),
+        context_bleed_threshold=raw.get("context_bleed_threshold", _defaults.context_bleed_threshold),
+        disable_thinking=raw.get("disable_thinking", _defaults.disable_thinking),
+        temporal_heuristic_enabled=raw.get("temporal_heuristic_enabled", _defaults.temporal_heuristic_enabled),
         tag_splitting=tag_splitting,
         **pattern_kwargs,
     )
@@ -130,7 +131,7 @@ def _parse_strategy_configs(raw: dict[str, Any]) -> dict[str, StrategyConfig]:
     return configs
 
 
-def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
+def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualContextConfig:
     """Build a VirtualContextConfig from a raw dict."""
     # Tag generator
     tag_gen_raw = raw.get("tag_generator", {})
@@ -309,6 +310,14 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
     )
     if "session_id" in raw:
         cfg.session_id = raw["session_id"]
+
+    if validate:
+        errors = validate_config(cfg)
+        if errors:
+            raise ValueError(
+                "Invalid configuration:\n  - " + "\n  - ".join(errors)
+            )
+
     return cfg
 
 
@@ -417,10 +426,23 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
 def load_config(
     config_path: str | Path | None = None,
     config_dict: dict | None = None,
+    *,
+    validate: bool = True,
 ) -> VirtualContextConfig:
-    """Load config from dict, explicit path, or auto-discover."""
+    """Load config from dict, explicit path, or auto-discover.
+
+    Parameters
+    ----------
+    config_path : str | Path | None
+        Explicit path to a YAML/JSON config file.
+    config_dict : dict | None
+        Raw config dictionary (overrides ``config_path``).
+    validate : bool
+        If True (default), run ``validate_config()`` and raise
+        ``ValueError`` on invalid configuration.
+    """
     if config_dict is not None:
-        return _build_config(config_dict)
+        return _build_config(config_dict, validate=validate)
 
     if config_path is not None:
         path = Path(config_path)
@@ -429,7 +451,7 @@ def load_config(
 
     if path is None:
         # Return defaults
-        return _build_config({})
+        return _build_config({}, validate=validate)
 
     if not path.is_file():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -440,4 +462,4 @@ def load_config(
     else:
         raw = yaml.safe_load(text) or {}
 
-    return _build_config(raw)
+    return _build_config(raw, validate=validate)

@@ -138,9 +138,9 @@ class MockLLMProvider:
             '"date_references": [], "refined_tags": ["test-tag"]}'
         )
 
-    def complete(self, system: str, user: str, max_tokens: int) -> str:
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
         self.calls.append({"system": system, "user": user, "max_tokens": max_tokens})
-        return self.response
+        return self.response, {}
 
 
 class MockTagGenerator:

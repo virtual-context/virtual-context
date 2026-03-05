@@ -19,11 +19,11 @@ class ThreadTrackingLLM:
         self.call_count = 0
         self._lock = threading.Lock()
 
-    def complete(self, system: str, user: str, max_tokens: int) -> str:
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
         with self._lock:
             self.thread_ids.append(threading.get_ident())
             self.call_count += 1
-        return '{"summary": "Test summary", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["test"]}'
+        return '{"summary": "Test summary", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["test"]}', {}
 
 
 def _make_segment(tag: str, content: str = "Hello world") -> TaggedSegment:
@@ -107,7 +107,7 @@ class TestConcurrentCompaction:
                 call_count += 1
                 if "fail" in user:
                     raise RuntimeError("LLM error")
-                return '{"summary": "OK", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["test"]}'
+                return '{"summary": "OK", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["test"]}', {}
 
         compactor = DomainCompactor(
             llm_provider=FailingLLM(),

@@ -705,15 +705,15 @@ class GeminiAdapter(ProviderAdapter):
         super().__init__(api_key, api_url)
 
     def get_headers(self) -> dict:
-        return {"Content-Type": "application/json"}
+        return {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
 
     def get_url(self, model: str = "") -> str:
         if self._base_url:
             return self._base_url
-        return (
-            f"{self._DEFAULT_BASE}/{model}:generateContent"
-            f"?key={self.api_key}"
-        )
+        return f"{self._DEFAULT_BASE}/{model}:generateContent"
 
     def build_request_body(self, *, model, messages, system, max_tokens,
                            temperature, tools):

@@ -744,7 +744,7 @@ class TestPagingConfigParsing:
 
     def test_autonomous_models_validation(self):
         from virtual_context.config import validate_config
-        cfg = _build_config({"paging": {"autonomous_models": "not-a-list"}})
+        cfg = _build_config({"paging": {"autonomous_models": "not-a-list"}}, validate=False)
         errors = validate_config(cfg)
         model_errors = [e for e in errors if "autonomous_models" in e]
         assert len(model_errors) == 1

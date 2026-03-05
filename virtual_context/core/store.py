@@ -127,6 +127,36 @@ class ContextStore(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Cross-cutting queries (used by consolidator, tool loop, etc.)
+    # ------------------------------------------------------------------
+
+    def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
+        """Return snippet descriptions for tags that have no tag_summary entry.
+
+        Each dict has keys: ``tag`` (str), ``snippet`` (str -- first ~100
+        chars of the segment summary for one segment carrying that tag).
+
+        Used by the tag consolidator to provide descriptions for orphan
+        tags so the LLM can make informed consolidation decisions.
+
+        Backends that do not support this may return an empty list.
+        """
+        return []
+
+    def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
+        """Return facts that were superseded *by* the given fact IDs.
+
+        Each dict has keys: ``superseded_by`` (str — the ID of the newer
+        fact), ``subject``, ``verb``, ``object`` (all str).
+
+        This is the reverse lookup: given a set of current (non-superseded)
+        fact IDs, find the older facts they replaced.
+
+        Backends that do not support facts may return an empty list.
+        """
+        return []
+
+    # ------------------------------------------------------------------
     # D1: Fact Extraction
     # ------------------------------------------------------------------
 
