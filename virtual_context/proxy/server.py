@@ -1008,6 +1008,7 @@ def create_app(
         else:
             metrics = ProxyMetrics(
                 context_window=engine.config.monitor.context_window,
+                telemetry_ledger=engine._telemetry,
             )
         # Create the default session (used by dashboard and first requests)
         default_state = ProxyState(engine, metrics=metrics, upstream=upstream)

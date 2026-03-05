@@ -18,13 +18,14 @@ class ProxyMetrics:
 
     BASELINE_RATIO = 0.30  # typical summarization compression (3.3x)
 
-    def __init__(self, context_window: int = 120_000) -> None:
+    def __init__(self, context_window: int = 120_000, telemetry_ledger=None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
         self._events: list[dict] = []
         self._lock = threading.Lock()
         self._seq = 0
         self._request_bodies: deque[dict] = deque(maxlen=50)
+        self._telemetry_ledger = telemetry_ledger
 
     def record(self, event: dict) -> None:
         """Append an event (thread-safe). Adds ``_seq`` and ``ts``."""
@@ -105,6 +106,18 @@ class ProxyMetrics:
                 else cumulative_baseline
             )
 
+            # Telemetry
+            telemetry = {}
+            if self._telemetry_ledger:
+                try:
+                    telem_dict = self._telemetry_ledger.to_dict()
+                    if isinstance(telem_dict, dict):
+                        # Remove raw events for snapshot (too large for SSE)
+                        telem_dict.pop("events", None)
+                        telemetry = telem_dict
+                except Exception:
+                    pass
+
             return {
                 "type": "snapshot",
                 "uptime_s": round(time.time() - self.start_time, 1),
@@ -132,6 +145,7 @@ class ProxyMetrics:
                 ),
                 "tool_intercepts": list(tool_intercepts),
                 "total_tool_intercepts": len(tool_intercepts),
+                "telemetry": telemetry,
             }
 
     def capture_request(
