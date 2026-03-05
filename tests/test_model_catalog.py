@@ -191,7 +191,7 @@ class TestDefaultCatalog:
     def test_default_opus_pricing(self):
         """Default catalog has correct Opus pricing."""
         catalog = ModelCatalog.default()
-        assert catalog.get_pricing("opus") == (15.00, 75.00)
+        assert catalog.get_pricing("opus") == (5.00, 25.00)
 
 
 class TestModelInfo:
