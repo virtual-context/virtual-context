@@ -20,49 +20,14 @@ import re
 from abc import ABC, abstractmethod
 
 # ---------------------------------------------------------------------------
-# Shared helpers (provider-agnostic)
+# Shared helpers (provider-agnostic) — canonical definitions in _envelope.py
 # ---------------------------------------------------------------------------
 
-_VC_PROMPT_MARKER = "[vc:prompt]\n"
-_MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
-
-_VC_SESSION_RE = re.compile(r"<!-- vc:session=([a-f0-9-]+) -->")
-
-_VC_USER_RE = re.compile(r"^\[vc:user\](.*?)\[/vc:user\]", re.DOTALL)
-_SYSTEM_EVENT_RE = re.compile(r"^(?:System:\s*\[[^\]]*\][^\n]*\n+)+")
-_CHANNEL_HEADER_RE = re.compile(r"^\[[A-Z][a-zA-Z]*\s[^\]]*\bid:-?\d+\b[^\]]*\]\s*")
-_MESSAGE_ID_RE = re.compile(r"\n?\[message_id:\s*\d+\]\s*$")
-
-
-def _last_text_block(content: list) -> str:
-    """Return the text of the last ``type: "text"`` block in *content*."""
-    for block in reversed(content):
-        if isinstance(block, dict) and block.get("type") == "text":
-            return block.get("text", "")
-    return ""
-
-
-def _strip_openclaw_envelope(text: str) -> str:
-    """Strip OpenClaw channel metadata from a message."""
-    if not text:
-        return text
-
-    if text.startswith(_VC_PROMPT_MARKER):
-        text = text[len(_VC_PROMPT_MARKER):].lstrip()
-
-    if text.startswith("# Role"):
-        idx = text.find(_MEMOS_QUERY_DELIM)
-        if idx != -1:
-            text = text[idx + len(_MEMOS_QUERY_DELIM):].lstrip()
-
-    m = _VC_USER_RE.match(text)
-    if m:
-        return m.group(1).strip()
-
-    text = _SYSTEM_EVENT_RE.sub("", text)
-    text = _CHANNEL_HEADER_RE.sub("", text)
-    text = _MESSAGE_ID_RE.sub("", text)
-    return text.strip()
+from ._envelope import (  # noqa: E402
+    _VC_SESSION_RE,
+    _last_text_block,
+    _strip_openclaw_envelope,
+)
 
 
 # ---------------------------------------------------------------------------
