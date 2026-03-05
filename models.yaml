@@ -1,0 +1,49 @@
+models:
+  claude-haiku-4-5-20251001:
+    provider: anthropic
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+    context_window: 200000
+    aliases: [haiku, claude-haiku, claude-haiku-4-5]
+
+  claude-sonnet-4-5-20250929:
+    provider: anthropic
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    context_window: 200000
+    aliases: [sonnet, claude-sonnet, claude-sonnet-4-5]
+
+  claude-opus-4-6:
+    provider: anthropic
+    input_per_mtok: 15.00
+    output_per_mtok: 75.00
+    context_window: 200000
+    aliases: [opus, claude-opus]
+
+  gpt-5-mini:
+    provider: openai
+    input_per_mtok: 0.25
+    output_per_mtok: 2.00
+    context_window: 128000
+    aliases: [gpt5-mini]
+
+  gpt-4.1-nano:
+    provider: openai
+    input_per_mtok: 0.10
+    output_per_mtok: 0.40
+    context_window: 128000
+    aliases: [gpt4-nano, gpt-4.1-nano]
+
+  gpt-4.1-mini:
+    provider: openai
+    input_per_mtok: 0.40
+    output_per_mtok: 1.60
+    context_window: 128000
+    aliases: [gpt4-mini, gpt-4.1-mini]
+
+  qwen3:4b-instruct-2507-fp16:
+    provider: ollama
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+    context_window: 32768
+    aliases: [qwen3-4b]
