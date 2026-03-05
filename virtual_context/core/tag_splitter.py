@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 
 from ..types import LLMProvider, SplitResult, TagSplittingConfig
+from .llm_utils import normalize_tag, parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +82,7 @@ class TagSplitter:
         )
 
         try:
-            response = self.llm.complete(
+            response, _ = self.llm.complete(
                 system=TAG_SPLIT_SYSTEM_PROMPT,
                 user=prompt,
                 max_tokens=2048,
@@ -101,33 +100,9 @@ class TagSplitter:
         existing_tags: set[str],
     ) -> SplitResult:
         """Parse LLM response into a validated SplitResult."""
-        text = response.strip()
-
-        # Strip markdown fences
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # Strip thinking tags
-        if "<think>" in text:
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        # Parse JSON
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    data = json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    return SplitResult(tag=tag, splittable=False, reason="JSON parse error")
-            else:
-                return SplitResult(tag=tag, splittable=False, reason="No JSON found")
+        data = parse_llm_json(response)
+        if not data:
+            return SplitResult(tag=tag, splittable=False, reason="JSON parse error")
 
         splittable = data.get("splittable", False)
         if not splittable:
@@ -151,7 +126,7 @@ class TagSplitter:
 
         for new_tag, turn_nums in groups_raw.items():
             # Normalize tag name
-            normalized = self._normalize_tag(new_tag)
+            normalized = normalize_tag(new_tag)
             if not normalized:
                 continue
 
@@ -190,10 +165,3 @@ class TagSplitter:
 
         return SplitResult(tag=tag, splittable=True, groups=groups)
 
-    @staticmethod
-    def _normalize_tag(tag: str) -> str:
-        """Normalize a tag name: lowercase, hyphenated, no special chars."""
-        tag = tag.lower().strip()
-        tag = re.sub(r"[^a-z0-9-]", "-", tag)
-        tag = re.sub(r"-+", "-", tag).strip("-")
-        return tag

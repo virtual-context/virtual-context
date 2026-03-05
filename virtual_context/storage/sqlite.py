@@ -162,6 +162,11 @@ END;
 """
 
 
+def _escape_like(text: str) -> str:
+    """Escape ``%`` and ``_`` wildcards for use in LIKE clauses with ``ESCAPE '\\'``."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
@@ -424,6 +429,25 @@ class SQLiteStore(ContextStore):
         ).fetchall()
         return [r["tag"] for r in rows]
 
+    def _batch_get_tags(self, refs: list[str]) -> dict[str, list[str]]:
+        """Fetch tags for multiple segment refs in a single query.
+
+        Returns a dict mapping each ref to its sorted tag list.
+        Refs with no tags will map to an empty list.
+        """
+        if not refs:
+            return {}
+        conn = self._get_conn()
+        placeholders = ",".join("?" * len(refs))
+        rows = conn.execute(
+            f"SELECT segment_ref, tag FROM segment_tags WHERE segment_ref IN ({placeholders}) ORDER BY segment_ref, tag",
+            refs,
+        ).fetchall()
+        result: dict[str, list[str]] = {ref: [] for ref in refs}
+        for row in rows:
+            result[row["segment_ref"]].append(row["tag"])
+        return result
+
     def store_segment(self, segment: StoredSegment) -> str:
         conn = self._get_conn()
         primary_tag = (
@@ -550,10 +574,11 @@ class SQLiteStore(ContextStore):
 
         rows = conn.execute(query, params).fetchall()
 
+        refs = [row["ref"] for row in rows]
+        tags_map = self._batch_get_tags(refs)
         results = []
         for row in rows:
-            seg_tags = self._get_tags_for_ref(row["ref"])
-            results.append(_row_to_summary(row, seg_tags))
+            results.append(_row_to_summary(row, tags_map[row["ref"]]))
         return results
 
     def search(
@@ -609,10 +634,11 @@ class SQLiteStore(ContextStore):
                     [like_query, limit],
                 ).fetchall()
 
+        refs = [row["ref"] for row in rows]
+        tags_map = self._batch_get_tags(refs)
         results = []
         for row in rows:
-            seg_tags = self._get_tags_for_ref(row["ref"])
-            results.append(_row_to_summary(row, seg_tags))
+            results.append(_row_to_summary(row, tags_map[row["ref"]]))
         return results
 
     def search_full_text(
@@ -635,13 +661,15 @@ class SQLiteStore(ContextStore):
                    LIMIT ?""",
                 [query, limit],
             ).fetchall()
+            fts_refs = [row[0] for row in rows]
+            fts_tags_map = self._batch_get_tags(fts_refs)
             for row in rows:
                 meta = json.loads(row[2]) if row[2] else {}
                 results.append(QuoteResult(
                     text=row[3],
                     tag=row[1],
                     segment_ref=row[0],
-                    tags=self._get_tags_for_ref(row[0]),
+                    tags=fts_tags_map[row[0]],
                     match_type="fts",
                     session_date=meta.get("session_date", ""),
                 ))
@@ -659,6 +687,8 @@ class SQLiteStore(ContextStore):
                LIMIT ?""",
             [like_query, limit],
         ).fetchall()
+        like_refs = [row[0] for row in rows]
+        like_tags_map = self._batch_get_tags(like_refs)
         for row in rows:
             excerpt = _extract_excerpt(row[2], query, context_chars=200)
             meta = json.loads(row[3]) if row[3] else {}
@@ -666,7 +696,7 @@ class SQLiteStore(ContextStore):
                 text=excerpt,
                 tag=row[1],
                 segment_ref=row[0],
-                tags=self._get_tags_for_ref(row[0]),
+                tags=like_tags_map[row[0]],
                 match_type="like",
                 session_date=meta.get("session_date", ""),
             ))
@@ -883,21 +913,27 @@ class SQLiteStore(ContextStore):
         """
         params: list = list(tags) + [min_overlap, limit]
         rows = conn.execute(query, params).fetchall()
+        refs = [row["ref"] for row in rows]
+        tags_map = self._batch_get_tags(refs)
         results = []
         for row in rows:
-            seg_tags = self._get_tags_for_ref(row["ref"])
-            results.append(_row_to_segment(row, seg_tags))
+            results.append(_row_to_segment(row, tags_map[row["ref"]]))
         return results
 
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
         conn = self._get_conn()
-        conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
-        for chunk in chunks:
-            conn.execute(
-                "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
-                (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
-            )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
+            for chunk in chunks:
+                conn.execute(
+                    "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
+                    (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         conn = self._get_conn()
@@ -1167,15 +1203,15 @@ class SQLiteStore(ContextStore):
             params.append(subject)
         if verbs is not None:
             # Disjunctive LIKE match across multiple expanded verbs
-            like_clauses = ["f.verb LIKE ?" for _ in verbs]
+            like_clauses = ["f.verb LIKE ? ESCAPE '\\'" for _ in verbs]
             conditions.append("(" + " OR ".join(like_clauses) + ")")
-            params.extend(f"%{v}%" for v in verbs)
+            params.extend(f"%{_escape_like(v)}%" for v in verbs)
         elif verb is not None:
-            conditions.append("f.verb LIKE ?")
-            params.append(f"%{verb}%")
+            conditions.append("f.verb LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(verb)}%")
         if object_contains is not None:
-            conditions.append("f.object LIKE ?")
-            params.append(f"%{object_contains}%")
+            conditions.append("f.object LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(object_contains)}%")
         if status is not None:
             conditions.append("f.status = ?")
             params.append(status)
@@ -1241,10 +1277,12 @@ class SQLiteStore(ContextStore):
             conditions = []
             params: list[object] = []
             for term in terms[:5]:
+                escaped = _escape_like(term)
                 conditions.append(
-                    "(f.subject LIKE ? OR f.verb LIKE ? OR f.object LIKE ? OR f.what LIKE ?)"
+                    "(f.subject LIKE ? ESCAPE '\\' OR f.verb LIKE ? ESCAPE '\\'"
+                    " OR f.object LIKE ? ESCAPE '\\' OR f.what LIKE ? ESCAPE '\\')"
                 )
-                params.extend([f"%{term}%"] * 4)
+                params.extend([f"%{escaped}%"] * 4)
             where = " OR ".join(conditions)
             sql = f"""
                 SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
@@ -1274,11 +1312,7 @@ class SQLiteStore(ContextStore):
             "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
             (verb, object, status, what, fact_id),
         )
-        # Keep FTS index in sync
-        conn.execute(
-            "UPDATE facts_fts SET verb = ?, object = ?, what = ? WHERE id = ?",
-            (verb, object, what, fact_id),
-        )
+        # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
         conn.commit()
 
     def get_fact_count_by_tags(self) -> dict[str, int]:
@@ -1288,6 +1322,62 @@ class SQLiteStore(ContextStore):
             "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
         ).fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
+
+    # ------------------------------------------------------------------
+    # Cross-cutting queries
+    # ------------------------------------------------------------------
+
+    def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
+        """Return snippet info for orphan tags (no tag_summary entry).
+
+        For each tag NOT already in tag_summaries, fetches the first
+        segment's summary text (truncated to 100 chars) as a description
+        hint for the consolidator.
+        """
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT st.tag, substr(s.summary, 1, 100) as snippet
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE st.tag NOT IN (SELECT tag FROM tag_summaries)
+                GROUP BY st.tag
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [{"tag": row["tag"], "snippet": row["snippet"]} for row in rows]
+        except Exception:
+            return []
+
+    def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
+        """Return old facts that were superseded by the given IDs."""
+        if not fact_ids:
+            return []
+        conn = self._get_conn()
+        try:
+            placeholders = ",".join("?" * len(fact_ids))
+            rows = conn.execute(
+                f"SELECT superseded_by, subject, verb, object FROM facts "
+                f"WHERE superseded_by IN ({placeholders})",
+                fact_ids,
+            ).fetchall()
+            return [
+                {
+                    "superseded_by": row["superseded_by"],
+                    "subject": row["subject"],
+                    "verb": row["verb"],
+                    "object": row["object"],
+                }
+                for row in rows
+            ]
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # Tool Output Storage
+    # ------------------------------------------------------------------
 
     def store_tool_output(
         self,

@@ -7,6 +7,8 @@ from typing import Callable
 
 def estimate_tokens(text: str) -> int:
     """Rough estimate: ~4 chars per token."""
+    if not text:
+        return 0
     return max(1, len(text) // 4)
 
 
@@ -16,7 +18,6 @@ def create_token_counter(mode: str = "estimate") -> Callable[[str], int]:
     Modes:
         "estimate" - len(text) // 4 (zero deps)
         "tiktoken" - requires tiktoken package (v0.2)
-        "callable:module.path:func" - custom callable (v0.2)
     """
     if mode == "estimate":
         return estimate_tokens
@@ -32,13 +33,9 @@ def create_token_counter(mode: str = "estimate") -> Callable[[str], int]:
             )
 
     if mode.startswith("callable:"):
-        # Format: callable:module.path:func_name
-        parts = mode[len("callable:"):].rsplit(":", 1)
-        if len(parts) != 2:
-            raise ValueError(f"Invalid callable spec: {mode}. Expected callable:module:func")
-        module_path, func_name = parts
-        import importlib
-        mod = importlib.import_module(module_path)
-        return getattr(mod, func_name)
+        raise ValueError(
+            f"The 'callable:' token counter mode has been removed for security reasons. "
+            f"Use 'estimate' or 'tiktoken' instead."
+        )
 
     raise ValueError(f"Unknown token counter mode: {mode}")

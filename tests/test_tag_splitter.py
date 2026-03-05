@@ -30,7 +30,7 @@ class TestTagSplitter:
     def _make_splitter(self, llm_response: str) -> TagSplitter:
         """Create a TagSplitter with a mock LLM that returns the given response."""
         llm = MagicMock()
-        llm.complete.return_value = llm_response
+        llm.complete.return_value = (llm_response, {})
         config = TagSplittingConfig(enabled=True)
         return TagSplitter(llm=llm, config=config)
 
@@ -121,10 +121,10 @@ class TestTagSplitter:
     def test_turn_text_truncated_in_prompt(self):
         """Verify long text is truncated to 200 chars in the prompt."""
         llm = MagicMock()
-        llm.complete.return_value = json.dumps({
+        llm.complete.return_value = (json.dumps({
             "splittable": False,
             "reason": "uniform topic",
-        })
+        }), {})
         config = TagSplittingConfig(enabled=True)
         splitter = TagSplitter(llm=llm, config=config)
 
@@ -384,7 +384,7 @@ class TestEngineTagSplitting:
             from virtual_context.core.tag_splitter import TagSplitter
 
             mock_llm = MagicMock()
-            mock_llm.complete.return_value = llm_response
+            mock_llm.complete.return_value = (llm_response, {})
             engine._tag_splitter = TagSplitter(
                 llm=mock_llm,
                 config=config.tag_generator.tag_splitting,

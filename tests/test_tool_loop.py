@@ -492,13 +492,17 @@ class TestGeminiAdapter:
     def test_headers(self):
         h = self.adapter.get_headers()
         assert h["Content-Type"] == "application/json"
+        assert h["x-goog-api-key"] == "AIza-test-key"
         assert "Authorization" not in h
 
-    def test_url_includes_model_and_key(self):
+    def test_url_includes_model_and_key_in_header(self):
         url = self.adapter.get_url("gemini-2.0-flash")
         assert "gemini-2.0-flash" in url
-        assert "AIza-test-key" in url
         assert "generateContent" in url
+        # API key should be in headers, not URL (security fix S6)
+        assert "AIza-test-key" not in url
+        headers = self.adapter.get_headers()
+        assert headers.get("x-goog-api-key") == "AIza-test-key"
 
     def test_build_request_body(self):
         body = self.adapter.build_request_body(

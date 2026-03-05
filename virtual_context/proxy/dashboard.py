@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -80,6 +81,20 @@ def get_dashboard_html() -> str:
     return _DASHBOARD_HTML
 
 
+def _check_dashboard_auth(request: Request, dashboard_token: str) -> JSONResponse | None:
+    """Validate ``X-VC-Dashboard-Token`` header for mutating endpoints.
+
+    Returns a 403 response if authentication fails, or ``None`` to allow access.
+    If *dashboard_token* is empty, auth is skipped (backward compatible).
+    """
+    if not dashboard_token:
+        return None
+    provided = request.headers.get("X-VC-Dashboard-Token", "")
+    if provided != dashboard_token:
+        return JSONResponse({"error": "Invalid or missing dashboard token"}, status_code=403)
+    return None
+
+
 def register_dashboard_routes(
     app: "FastAPI",
     metrics: "ProxyMetrics",
@@ -88,10 +103,12 @@ def register_dashboard_routes(
     *,
     registry: "object | None" = None,
     instance_label: str = "",
+    dashboard_token: str = "",
 ) -> None:
     """Register ``/dashboard`` and ``/dashboard/events`` routes."""
 
     _static_dir = Path(__file__).parent / "static"
+    _token = dashboard_token or os.environ.get("VC_DASHBOARD_TOKEN", "")
 
     @app.get("/dashboard")
     async def dashboard_page():
@@ -225,8 +242,10 @@ def register_dashboard_routes(
         })
 
     @app.delete("/dashboard/sessions/{session_id}")
-    async def dashboard_delete_session(session_id: str):
+    async def dashboard_delete_session(session_id: str, request: Request):
         """Delete all stored segments for a session."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         if not state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
@@ -267,6 +286,8 @@ def register_dashboard_routes(
     @app.post("/dashboard/sessions/{session_id}/passthrough")
     async def dashboard_toggle_passthrough(session_id: str, request: Request):
         """Toggle manual passthrough mode for a session."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         if not registry or not hasattr(registry, "_sessions"):
             return JSONResponse(
                 {"error": "No registry"}, status_code=503,
@@ -374,6 +395,8 @@ def register_dashboard_routes(
     @app.post("/dashboard/replay/start")
     async def replay_start(request: Request):
         """Start a replay run from a prompts file."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         if not state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
@@ -398,6 +421,13 @@ def register_dashboard_routes(
             )
 
         p = Path(file_path).resolve()
+
+        # Prevent path traversal: resolved path must be under CWD
+        allowed_root = Path.cwd().resolve()
+        if not str(p).startswith(str(allowed_root) + os.sep) and p != allowed_root:
+            return JSONResponse(
+                {"error": "Path is outside the allowed directory"}, status_code=403,
+            )
 
         # Restrict to files with expected replay extensions to prevent
         # arbitrary file reads via this endpoint.
@@ -458,8 +488,10 @@ def register_dashboard_routes(
         })
 
     @app.post("/dashboard/replay/stop")
-    async def replay_stop():
+    async def replay_stop(request: Request):
         """Stop the running replay."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         cancel = _replay_state.get("cancel")
         if cancel:
             cancel.set()
@@ -477,9 +509,10 @@ def register_dashboard_routes(
         return JSONResponse({"running": False})
 
     @app.post("/dashboard/shutdown")
-    async def dashboard_shutdown():
+    async def dashboard_shutdown(request: Request):
         """Shut down the proxy server."""
-        import os
+        if err := _check_dashboard_auth(request, _token):
+            return err
         import signal
 
         logger.info("Shutdown requested via dashboard")
@@ -492,8 +525,10 @@ def register_dashboard_routes(
     # -------------------------------------------------------------------
 
     @app.post("/dashboard/compact")
-    async def dashboard_compact():
+    async def dashboard_compact(request: Request):
         """Trigger manual compaction regardless of thresholds."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         if not state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
@@ -569,6 +604,8 @@ def register_dashboard_routes(
     @app.put("/dashboard/settings")
     async def dashboard_settings_put(request: Request):
         """Apply partial config updates to the running engine."""
+        if err := _check_dashboard_auth(request, _token):
+            return err
         if not state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,

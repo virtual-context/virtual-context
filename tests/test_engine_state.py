@@ -281,7 +281,7 @@ class TestVocabularyBootstrap:
                 "base_url": "http://fake:9999",
                 "model": "test-model",
             }},
-        })
+        }, validate=False)
         config2.session_id = session_id
         engine2 = VirtualContextEngine(config=config2)
 

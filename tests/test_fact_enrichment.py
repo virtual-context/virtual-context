@@ -97,7 +97,7 @@ class TestTaggerParsing:
         from virtual_context.core.tag_generator import LLMTagGenerator
         from virtual_context.types import TagGeneratorConfig
         llm = type('MockLLM', (), {
-            'complete': lambda self, **kw: '{"tags": ["running"], "primary": "running", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "runs", "object": "5K", "status": "active", "fact_type": "experience", "what": "User runs 5K races."}]}'
+            'complete': lambda self, **kw: ('{"tags": ["running"], "primary": "running", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "runs", "object": "5K", "status": "active", "fact_type": "experience", "what": "User runs 5K races."}]}', {})
         })()
         gen = LLMTagGenerator(llm, TagGeneratorConfig(type="llm"))
         result = gen.generate_tags("I run 5K races")
@@ -109,7 +109,7 @@ class TestTaggerParsing:
         from virtual_context.core.tag_generator import LLMTagGenerator
         from virtual_context.types import TagGeneratorConfig
         llm = type('MockLLM', (), {
-            'complete': lambda self, **kw: '{"tags": ["cooking"], "primary": "cooking", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "prefers", "object": "French cuisine", "status": "active"}]}'
+            'complete': lambda self, **kw: ('{"tags": ["cooking"], "primary": "cooking", "temporal": false, "related_tags": [], "facts": [{"subject": "user", "verb": "prefers", "object": "French cuisine", "status": "active"}]}', {})
         })()
         gen = LLMTagGenerator(llm, TagGeneratorConfig(type="llm"))
         result = gen.generate_tags("I prefer French cuisine")
@@ -708,9 +708,9 @@ class _SequentialMockLLM:
         self._responses = list(responses)
         self.calls: list[dict] = []
 
-    def complete(self, system: str, user: str, max_tokens: int) -> str:
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
         self.calls.append({"system": system, "user": user, "max_tokens": max_tokens})
-        return self._responses.pop(0) if self._responses else "[]"
+        return self._responses.pop(0) if self._responses else "[]", {}
 
 
 class TestSupersessionDetectionPrompt:
@@ -836,7 +836,7 @@ class TestFactSessionDate:
         import json
 
         llm = MagicMock()
-        llm.complete.return_value = json.dumps({
+        llm.complete.return_value = (json.dumps({
             "summary": "User hiked Muir Woods.",
             "entities": [], "key_decisions": [], "action_items": [],
             "date_references": [], "refined_tags": ["hiking"],
@@ -846,7 +846,7 @@ class TestFactSessionDate:
                 "status": "completed", "fact_type": "personal",
                 "what": "User hiked Muir Woods.", "who": "", "when": "", "where": "", "why": "",
             }],
-        })
+        }), {})
 
         segment = TaggedSegment(
             id="seg-001",
@@ -913,7 +913,7 @@ class TestFactSessionDate:
         llm = MagicMock()
         def capture_and_return(**kwargs):
             captured_prompts.append(kwargs.get("user", ""))
-            return json.dumps({
+            return (json.dumps({
                 "summary": "User hiked Big Sur today.",
                 "entities": [], "key_decisions": [], "action_items": [],
                 "date_references": [], "refined_tags": ["hiking"], "related_tags": [],
@@ -924,7 +924,7 @@ class TestFactSessionDate:
                     "what": "User hiked Big Sur today.",
                     "who": "", "when": "2023/04/20", "where": "", "why": "",
                 }],
-            })
+            }), {})
         llm.complete.side_effect = capture_and_return
 
         segment = TaggedSegment(

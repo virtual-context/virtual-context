@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -173,10 +175,13 @@ class FilesystemStore(ContextStore):
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self._index_path = self.root / "_index.json"
+        self._aliases_path = self.root / "_aliases.json"
         self._index: dict[str, dict] = {}
         self._aliases: dict[str, str] = {}
+        self._lock = threading.Lock()
         self._ensure_root()
         self._load_index()
+        self._load_aliases()
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -192,9 +197,25 @@ class FilesystemStore(ContextStore):
             self._index = {}
 
     def _save_index(self) -> None:
-        self._index_path.write_text(
+        tmp_path = self._index_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(list(self._index.values()), indent=2, default=str)
         )
+        os.replace(str(tmp_path), str(self._index_path))
+
+    def _load_aliases(self) -> None:
+        if self._aliases_path.is_file():
+            try:
+                self._aliases = json.loads(self._aliases_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                self._aliases = {}
+        else:
+            self._aliases = {}
+
+    def _save_aliases(self) -> None:
+        tmp_path = self._aliases_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(self._aliases, indent=2))
+        os.replace(str(tmp_path), str(self._aliases_path))
 
     def _segment_path(self, primary_tag: str, ref: str) -> Path:
         # Sanitize tag and ref to prevent path traversal
@@ -210,8 +231,9 @@ class FilesystemStore(ContextStore):
     def store_segment(self, segment: StoredSegment) -> str:
         path = self._segment_path(segment.primary_tag, segment.ref)
         path.write_text(_segment_to_markdown(segment))
-        self._index[segment.ref] = _segment_to_index_entry(segment)
-        self._save_index()
+        with self._lock:
+            self._index[segment.ref] = _segment_to_index_entry(segment)
+            self._save_index()
         return segment.ref
 
     def get_segment(self, ref: str) -> StoredSegment | None:
@@ -403,17 +425,20 @@ class FilesystemStore(ContextStore):
         return dict(self._aliases)
 
     def set_tag_alias(self, alias: str, canonical: str) -> None:
-        self._aliases[alias] = canonical
+        with self._lock:
+            self._aliases[alias] = canonical
+            self._save_aliases()
 
     def delete_segment(self, ref: str) -> bool:
-        entry = self._index.pop(ref, None)
-        if not entry:
-            return False
-        path = self._segment_path(entry["primary_tag"], ref)
-        if path.is_file():
-            path.unlink()
-        self._save_index()
-        return True
+        with self._lock:
+            entry = self._index.pop(ref, None)
+            if not entry:
+                return False
+            path = self._segment_path(entry["primary_tag"], ref)
+            if path.is_file():
+                path.unlink()
+            self._save_index()
+            return True
 
     def cleanup(
         self,
@@ -660,3 +685,39 @@ class FilesystemStore(ContextStore):
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
         return result
+
+    # ------------------------------------------------------------------
+    # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
+    # ------------------------------------------------------------------
+
+    def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
+        """Return snippet info for orphan tags.
+
+        FilesystemStore iterates the in-memory index to approximate
+        the SQL query used by SQLiteStore.
+        """
+        # Collect tags that have a tag_summary on disk
+        summarized_tags: set[str] = set()
+        ts_dir = self.root / "_tag_summaries"
+        if ts_dir.is_dir():
+            for p in ts_dir.glob("*.json"):
+                summarized_tags.add(p.stem)
+
+        results: list[dict] = []
+        seen_tags: set[str] = set()
+        for entry in self._index.values():
+            for t in entry.get("tags", []):
+                if t in summarized_tags or t in seen_tags:
+                    continue
+                seg = self.get_segment(entry["ref"])
+                if seg:
+                    snippet = seg.summary[:100] if seg.summary else ""
+                    results.append({"tag": t, "snippet": snippet})
+                    seen_tags.add(t)
+                    if len(results) >= limit:
+                        return results
+        return results
+
+    def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
+        """FilesystemStore does not support facts — return empty list."""
+        return []

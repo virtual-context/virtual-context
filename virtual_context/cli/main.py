@@ -173,7 +173,6 @@ def cmd_telemetry(args):
 
 
 # Backward compat alias
-cmd_cost_report = cmd_telemetry
 
 
 def cmd_init(args):
@@ -769,17 +768,26 @@ def _install_systemd_user_daemon(config_path: Path, upstream: str | None, start:
         print("systemd not found. Skipping daemon install.")
         return
 
+    import shutil
+
     user_dir = Path.home() / ".config" / "systemd" / "user"
     user_dir.mkdir(parents=True, exist_ok=True)
     service_path = user_dir / "virtual-context.service"
-    cmd = _proxy_command(config_path, upstream)
+
+    # Resolve the executable path to avoid shell injection
+    vc_exe = shutil.which("virtual-context") or "virtual-context"
+    exec_parts = [vc_exe, "-c", str(config_path), "proxy"]
+    if upstream:
+        exec_parts.extend(["--upstream", upstream])
+    exec_start = " ".join(exec_parts)
+
     service_text = f"""[Unit]
 Description=virtual-context proxy
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -lc '{cmd}'
+ExecStart={exec_start}
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
@@ -801,11 +809,15 @@ WantedBy=default.target
 
 
 def _install_windows_task_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+    import base64
+
     task_name = "virtual-context-proxy"
     cmd = _proxy_command(config_path, upstream)
+    # Encode the command as base64 UTF-16LE for PowerShell -EncodedCommand
+    # This prevents command injection through special characters
+    encoded = base64.b64encode(cmd.encode("utf-16-le")).decode("ascii")
     task_cmd = (
-        'powershell.exe -NoProfile -WindowStyle Hidden -Command '
-        f'"{cmd}"'
+        f'powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand {encoded}'
     )
     subprocess.run(
         [
@@ -990,6 +1002,10 @@ def main():
         description="Virtual memory for LLM session context management",
     )
     parser.add_argument("--config", "-c", help="Path to config file")
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {__import__('virtual_context').__version__}",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1052,12 +1068,12 @@ def main():
     # retrieve
     retrieve_parser = subparsers.add_parser("retrieve", help="Retrieve context for a message")
     retrieve_parser.add_argument("--message", "-m", required=True, help="Inbound message")
-    retrieve_parser.add_argument("--active-tags", help="Comma-separated active tags to skip")
+    retrieve_parser.add_argument("--active-tags", help="Comma-separated currently active tags")
 
     # transform
     transform_parser = subparsers.add_parser("transform", help="Retrieve + assemble context block")
     transform_parser.add_argument("--message", "-m", required=True, help="Inbound message")
-    transform_parser.add_argument("--active-tags", help="Comma-separated active tags to skip")
+    transform_parser.add_argument("--active-tags", help="Comma-separated currently active tags")
     transform_parser.add_argument("--budget", type=int, help="Token budget override")
 
     # aliases

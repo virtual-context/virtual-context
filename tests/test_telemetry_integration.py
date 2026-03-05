@@ -78,7 +78,7 @@ class TestTelemetryIntegration:
     def test_compactor_logs_usage_on_segment_summarization(self, ledger):
         """Compactor._compact_one should log to telemetry ledger after LLM call."""
         llm = MagicMock()
-        llm.complete.return_value = '{"summary": "test", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["a"]}'
+        llm.complete.return_value = ('{"summary": "test", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["a"]}', {"input_tokens": 500, "output_tokens": 120})
         llm.last_usage = {"input_tokens": 500, "output_tokens": 120}
 
         compactor = DomainCompactor(
@@ -116,7 +116,7 @@ class TestTelemetryIntegration:
         from virtual_context.types import StoredSummary, TagSummary
 
         llm = MagicMock()
-        llm.complete.return_value = '{"summary": "rolled up", "description": "test desc"}'
+        llm.complete.return_value = ('{"summary": "rolled up", "description": "test desc"}', {"input_tokens": 300, "output_tokens": 80})
         llm.last_usage = {"input_tokens": 300, "output_tokens": 80}
 
         compactor = DomainCompactor(
@@ -149,7 +149,7 @@ class TestTelemetryIntegration:
     def test_tag_generator_logs_usage(self, ledger):
         """LLMTagGenerator.generate_tags should log to telemetry ledger."""
         llm = MagicMock()
-        llm.complete.return_value = '{"tags": ["python", "coding"], "primary": "python", "broad": false, "temporal": false, "related_tags": ["programming"]}'
+        llm.complete.return_value = ('{"tags": ["python", "coding"], "primary": "python", "broad": false, "temporal": false, "related_tags": ["programming"]}', {"input_tokens": 200, "output_tokens": 50})
         llm.last_usage = {"input_tokens": 200, "output_tokens": 50}
         llm.model = "claude-haiku-4-5"
 
@@ -175,7 +175,7 @@ class TestTelemetryIntegration:
     def test_compactor_no_ledger_no_crash(self):
         """Compactor works fine without telemetry_ledger (backward compat)."""
         llm = MagicMock()
-        llm.complete.return_value = '{"summary": "ok", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["x"]}'
+        llm.complete.return_value = ('{"summary": "ok", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["x"]}', {"input_tokens": 100, "output_tokens": 30})
         llm.last_usage = {"input_tokens": 100, "output_tokens": 30}
 
         compactor = DomainCompactor(
@@ -194,7 +194,7 @@ class TestTelemetryIntegration:
     def test_openai_style_usage_keys(self, ledger):
         """Verify _log_usage handles OpenAI-style keys (prompt_tokens/completion_tokens)."""
         llm = MagicMock()
-        llm.complete.return_value = '{"tags": ["test"], "primary": "test", "broad": false, "temporal": false, "related_tags": []}'
+        llm.complete.return_value = ('{"tags": ["test"], "primary": "test", "broad": false, "temporal": false, "related_tags": []}', {"prompt_tokens": 400, "completion_tokens": 100})
         llm.last_usage = {"prompt_tokens": 400, "completion_tokens": 100}
         llm.model = "qwen3:4b"
 
@@ -212,7 +212,7 @@ class TestTelemetryIntegration:
     def test_backward_compat_cost_tracker_kwarg_ignored(self, ledger):
         """Passing deprecated cost_tracker kwarg should not crash."""
         llm = MagicMock()
-        llm.complete.return_value = '{"summary": "ok", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["x"]}'
+        llm.complete.return_value = ('{"summary": "ok", "entities": [], "key_decisions": [], "action_items": [], "date_references": [], "refined_tags": ["x"]}', {"input_tokens": 100, "output_tokens": 30})
         llm.last_usage = {"input_tokens": 100, "output_tokens": 30}
 
         # Should not raise even though cost_tracker is passed
@@ -236,7 +236,7 @@ class TestTelemetryIntegration:
         from virtual_context.types import CurationConfig, Fact
 
         llm = MagicMock()
-        llm.complete.return_value = "0"
+        llm.complete.return_value = ("0", {"input_tokens": 300, "output_tokens": 10})
         llm.last_usage = {"input_tokens": 300, "output_tokens": 10}
 
         curator = FactCurator(

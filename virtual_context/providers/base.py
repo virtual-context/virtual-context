@@ -21,6 +21,25 @@ class BaseProvider(ABC):
 
     def __init__(self) -> None:
         self.last_usage: dict = {}
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        """Return the shared httpx.Client, creating it lazily on first use."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=self._timeout)
+        return self._client
+
+    def close(self) -> None:
+        """Close the underlying httpx.Client and release resources."""
+        if self._client is not None and not self._client.is_closed:
+            self._client.close()
+            self._client = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # -- hook methods subclasses must implement --
 
@@ -41,23 +60,36 @@ class BaseProvider(ABC):
 
     # -- shared retry logic --
 
-    def complete(self, system: str, user: str, max_tokens: int) -> str:
-        """Send a completion request with automatic retry on transient errors."""
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, dict]:
+        """Send a completion request with automatic retry on transient errors.
+
+        Returns:
+            A ``(text, usage)`` tuple where *usage* is the token usage dict
+            from the API response (keys vary by provider but typically include
+            ``input_tokens``/``prompt_tokens`` and ``output_tokens``/
+            ``completion_tokens``).
+
+        .. deprecated::
+            The ``last_usage`` instance attribute is still written for
+            backward compatibility but should not be relied upon in
+            concurrent contexts.  Use the returned *usage* dict instead.
+        """
         url = self._get_url()
         headers = self._get_headers()
         payload = self._build_payload(system, user, max_tokens)
+        client = self._get_client()
 
         last_error: Exception | None = None
 
         for attempt in range(MAX_RETRIES):
             try:
-                with httpx.Client(timeout=self._timeout) as client:
-                    response = client.post(url, headers=headers, json=payload)
+                response = client.post(url, headers=headers, json=payload)
 
                 if response.status_code == 200:
                     data = response.json()
-                    self.last_usage = data.get("usage", {})
-                    return self._extract_text(data)
+                    usage = data.get("usage", {})
+                    self.last_usage = usage  # deprecated -- kept for backward compat
+                    return self._extract_text(data), usage
 
                 if response.status_code == 429 or response.status_code >= 500:
                     last_error = LLMProviderError(

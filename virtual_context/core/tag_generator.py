@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -16,6 +15,7 @@ from ..types import (
     TagGeneratorConfig,
     TagResult,
 )
+from .llm_utils import normalize_tag, parse_llm_json
 from .telemetry import TelemetryLedger
 from .tag_canonicalizer import TagCanonicalizer
 
@@ -238,7 +238,7 @@ class LLMTagGenerator:
 
         try:
             t0 = time.time()
-            response = self.llm.complete(
+            response, _usage = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_tokens,
@@ -383,34 +383,7 @@ class LLMTagGenerator:
 
     def _parse_response(self, response: str) -> TagResult:
         """Parse LLM JSON response into TagResult."""
-        text = response.strip()
-
-        # Strip markdown fences
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # Strip thinking tags (qwen3 often wraps in <think>...</think>)
-        if "<think>" in text:
-            # Remove everything between <think> and </think>
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            # Try to extract JSON object
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    data = json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    data = {}
-            else:
-                data = {}
+        data = parse_llm_json(response)
 
         tags = data.get("tags", [])
         primary = data.get("primary", "")
@@ -474,9 +447,7 @@ class LLMTagGenerator:
 
     def _normalize_tag(self, tag: str) -> str:
         """Normalize a single tag: lowercase, hyphenate, resolve aliases."""
-        tag = tag.lower().strip()
-        tag = re.sub(r"[^a-z0-9-]", "-", tag)
-        tag = re.sub(r"-+", "-", tag).strip("-")
+        tag = normalize_tag(tag)
         if self._canonicalizer:
             tag = self._canonicalizer.canonicalize(tag)
         return tag
