@@ -338,6 +338,19 @@ def register_dashboard_routes(
         return JSONResponse(snap)
 
     # -----------------------------------------------------------------------
+    # Telemetry endpoint
+    # -----------------------------------------------------------------------
+
+    @app.get("/dashboard/telemetry")
+    async def dashboard_telemetry():
+        """Return current telemetry rollup (lightweight, no raw events)."""
+        if metrics._telemetry_ledger:
+            telem = metrics._telemetry_ledger.to_dict()
+            telem.pop("events", None)
+            return JSONResponse(telem)
+        return JSONResponse({})
+
+    # -----------------------------------------------------------------------
     # Request inspection endpoints
     # -----------------------------------------------------------------------
 
