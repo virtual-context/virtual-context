@@ -435,11 +435,16 @@ class AnthropicFormat(PayloadFormat):
         tools = list(body.get("tools") or [])
         tools.extend(tool_defs)
         body["tools"] = tools
-        # Anthropic API rejects tool_choice=any when thinking is enabled.
-        # Skip forcing tool use in that case — tools are still available.
+        # Anthropic API rejects tool_choice=any/tool when thinking is enabled.
+        # Downgrade any forcing tool_choice to auto in that case — tools are
+        # still available, the model just isn't forced to call one.
         thinking = body.get("thinking")
-        thinking_enabled = isinstance(thinking, dict) and thinking.get("type") == "enabled"
-        if require_tool_use and "tool_choice" not in body and not thinking_enabled:
+        thinking_enabled = isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive")
+        if thinking_enabled:
+            existing_tc = body.get("tool_choice")
+            if isinstance(existing_tc, dict) and existing_tc.get("type") in ("any", "tool"):
+                body["tool_choice"] = {"type": "auto"}
+        elif require_tool_use and "tool_choice" not in body:
             body["tool_choice"] = {"type": "any"}
         return body
 

@@ -364,6 +364,76 @@ class TestSupersessionPrompt:
         assert "25:50" in prompt
         assert "27:12" in prompt
 
+    def test_prompt_includes_when_date_for_new_fact(self):
+        """Prompt must show the new fact's session date so LLM knows its recency."""
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(Path(tempfile.mkdtemp()) / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="visited", object="Monterey",
+                        when_date="2023/04/20")
+        candidates = [Fact(subject="user", verb="recently returned",
+                           object="from road trip to Big Sur and Monterey",
+                           when_date="2023/04/27")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        assert "2023/04/20" in prompt
+
+    def test_prompt_includes_when_date_for_candidates(self):
+        """Each candidate in the prompt must show its session date."""
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(Path(tempfile.mkdtemp()) / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="visited", object="Monterey",
+                        when_date="2023/04/20")
+        candidates = [Fact(subject="user", verb="recently returned",
+                           object="from road trip to Big Sur and Monterey",
+                           when_date="2023/04/27")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        assert "2023/04/27" in prompt
+
+    def test_prompt_instructs_not_to_supersede_newer_candidates(self):
+        """Prompt must tell LLM never to supersede a candidate newer than the new fact."""
+        import tempfile
+        from pathlib import Path
+        from tests.conftest import MockLLMProvider
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import Fact, SupersessionConfig
+        from virtual_context.ingest.supersession import FactSupersessionChecker
+        llm = MockLLMProvider(response="[]")
+        store = SQLiteStore(str(Path(tempfile.mkdtemp()) / "test.db"))
+        checker = FactSupersessionChecker(
+            llm_provider=llm, model="test",
+            store=store, config=SupersessionConfig(enabled=True),
+        )
+        new_fact = Fact(subject="user", verb="visited", object="Monterey",
+                        when_date="2023/04/20")
+        candidates = [Fact(subject="user", verb="recently returned",
+                           object="from road trip to Big Sur and Monterey",
+                           when_date="2023/04/27")]
+        checker._check_batch(new_fact, candidates)
+        prompt = llm.calls[0]["user"]
+        # Prompt must warn LLM not to supersede facts that are newer than the new fact
+        assert "newer" in prompt.lower() or "later" in prompt.lower() or "older" in prompt.lower()
+
 
 class TestFactEnrichmentIntegration:
     def test_enriched_fact_roundtrip(self, tmp_path):
