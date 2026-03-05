@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import time
 from typing import Callable
 
 from ..types import (
@@ -21,7 +22,7 @@ from ..types import (
     TagSummary,
     TemporalStatus,
 )
-from .cost_tracker import CostTracker
+from .telemetry import TelemetryLedger
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,11 @@ where "{tag}" was discussed. Roll them up into a single coherent summary that
 preserves all key decisions, action items, entities, and names.
 Keep the chronological progression. The summary should be comprehensive enough
 that someone could resume the conversation from it.
+
+IMPORTANT: When a segment mentions something personal the user disclosed about
+themselves (experiences, preferences, life events, possessions, relationships),
+ALWAYS preserve that disclosure in the summary even if it is tangential to the
+tag's main topic. Personal disclosures are high-value context that must survive rollup.
 
 CRITICAL — Any text involving numbers is mandatory and absolutely essential to the summary, always include them exactly as in the source.
 Dates, prices, any number is important and should not be modified.
@@ -83,6 +89,12 @@ preserve that as a direct assertion, not as a plan or intention.
 For example, "I'm storing my sneakers in a shoe rack" should be summarized as
 "User stores/is storing sneakers in shoe rack", NOT "User plans to store sneakers in shoe rack."
 
+Conversely, when the conversation is about planning, discussing, or researching a future
+activity (e.g. drafting an itinerary, comparing options, asking for recommendations),
+the summary must clearly indicate this is planning/discussion, not a completed activity.
+Use language like "User planned...", "User discussed planning...", "User drafted an itinerary for..."
+rather than "User provided..." or "User traveled to...".
+
 Always preserve the user's role and relationship to the topic — phrases like
 "I led", "my project", "solo project", "I built", "I'm responsible for" are
 critical personal context. Never paraphrase these into passive voice or drop them
@@ -113,6 +125,9 @@ Also extract facts from the conversation. For each fact:
 - "subject": who (usually "user"; proper names for others)
 - "verb": the exact action verb (e.g. "led", "built", "prefers", "lives in", "ordered")
 - "object": what (specific noun phrase — preserve ALL numbers, names, dates, amounts exactly)
+  For experience facts: derive the object from the user's own declarative sentence
+  ("I went to X", "I visited X", "I got back from X"). A place or activity mentioned
+  in a question or comparison is not a standalone experience fact — it is context.
 - "status": one of: active, completed, planned, abandoned, recurring
 - "fact_type": classify as "personal" (user's life, identity, preferences, plans),
   "experience" (assistant-provided info the user engaged with), or
@@ -123,11 +138,14 @@ Also extract facts from the conversation. For each fact:
 - "when": the date this event occurred.
   DATE RULES — read carefully:
   "today" / "this morning" / "just now" = {session_date} (use the session date above).
-  "recently" / "last week" / "a while ago" / "just got back" = date UNKNOWN,
-  event happened BEFORE today but we don't know when — use "".
+  "today" always wins over other return/completion phrases in the same sentence.
+  "recently" / "last week" / "a while ago" WITHOUT "today" = date UNKNOWN, use "".
   If no temporal language at all, use "".
 - "where": location (populate when present, empty string if n/a)
 - "why": context or significance (populate when present, empty string if n/a)
+When the same event is disclosed directly in the current turn AND referenced in passing
+(e.g. asking a follow-up question about it), emit ONE fact using the direct disclosure
+as the primary source, enriched with any additional detail from the reference.
 Extract the FACT behind the question, not the conversational act.
 WRONG: "user asks about Cairo restaurants" RIGHT: "user wants to try authentic Egyptian food in Cairo"
 If two signals describe the same event, emit one fact with the richest details.
@@ -145,14 +163,15 @@ class DomainCompactor:
         token_counter: Callable[[str], int] | None = None,
         model_name: str = "",
         tag_rules: list[TagPromptRule] | None = None,
-        cost_tracker: CostTracker | None = None,
+        telemetry_ledger: TelemetryLedger | None = None,
+        cost_tracker=None,  # deprecated, ignored — kept for backward compat
     ) -> None:
         self.llm = llm_provider
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self.model_name = model_name
         self.tag_rules = tag_rules or []
-        self._cost_tracker = cost_tracker
+        self._telemetry = telemetry_ledger
 
     def compact(
         self,
@@ -280,12 +299,14 @@ class DomainCompactor:
         )
 
         try:
+            t0 = time.time()
             response_text = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
-            self._log_usage("compaction")
+            duration_ms = (time.time() - t0) * 1000
+            self._log_usage("segment_summarize", duration_ms=duration_ms)
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
@@ -354,7 +375,7 @@ class DomainCompactor:
                     status=status,
                     what=_str(f.get("what", "")),
                     who=_str(f.get("who", "")),
-                    when_date=_str(f.get("when", "")),
+                    when_date=_str(f.get("when", "")) or (segment.session_date or ""),
                     where=_str(f.get("where", "")),
                     why=_str(f.get("why", "")),
                     fact_type=f.get("fact_type", "personal"),
@@ -399,9 +420,9 @@ class DomainCompactor:
                     return rule.summary_prompt
         return None
 
-    def _log_usage(self, event_type: str) -> None:
-        """Log LLM token usage from the provider's last_usage to the cost tracker."""
-        if not self._cost_tracker:
+    def _log_usage(self, event_type: str, duration_ms: float = 0.0) -> None:
+        """Log LLM token usage from the provider's last_usage to the telemetry ledger."""
+        if not self._telemetry:
             return
         usage = getattr(self.llm, "last_usage", {})
         if not usage:
@@ -409,10 +430,13 @@ class DomainCompactor:
         input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         if input_tokens or output_tokens:
-            self._cost_tracker.log_compaction(
+            self._telemetry.log(
+                component="compactor",
+                model=self.model_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                provider=self.model_name,
+                duration_ms=duration_ms,
+                detail=event_type,
             )
 
     def _format_conversation(self, messages: list[Message]) -> str:
@@ -577,12 +601,14 @@ class DomainCompactor:
         )
 
         try:
+            t0 = time.time()
             response_text = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
-            self._log_usage("compaction")
+            duration_ms = (time.time() - t0) * 1000
+            self._log_usage("tag_rollup", duration_ms=duration_ms)
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM tag summary rollup failed for '{tag}': {e}")

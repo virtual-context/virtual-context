@@ -15,7 +15,8 @@ from .config import load_config
 from .core.assembler import ContextAssembler
 from .core.hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
 from .core.compactor import DomainCompactor
-from .core.cost_tracker import CostTracker
+from .core.model_catalog import ModelCatalog
+from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
 from .core.segmenter import TopicSegmenter
@@ -37,7 +38,6 @@ from .types import (
     QuoteResult,
     RetrievalResult,
     SegmentMetadata,
-    SessionCostSummary,
     SplitResult,
     StoredSegment,
     StoredSummary,
@@ -86,7 +86,7 @@ class VirtualContextEngine:
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
         self._init_store()
-        self._init_cost_tracker()
+        self._init_telemetry()
         self._init_canonicalizer()
         self._init_tag_generator()
         self._init_monitor()
@@ -172,7 +172,7 @@ class VirtualContextEngine:
 
         self._tag_generator: TagGenerator = build_tag_generator(
             self.config.tag_generator, llm_provider,
-            canonicalizer=self._canonicalizer, cost_tracker=self._cost_tracker,
+            canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
             embed_fn_factory=self._get_embed_fn,
         )
 
@@ -248,7 +248,7 @@ class VirtualContextEngine:
                 token_counter=self._token_counter,
                 model_name=self.config.summarization.model,
                 tag_rules=self.config.tag_rules,
-                cost_tracker=self._cost_tracker,
+                telemetry_ledger=self._telemetry,
             )
 
     def _init_tag_splitter(self) -> None:
@@ -262,8 +262,9 @@ class VirtualContextEngine:
                 config=cfg,
             )
 
-    def _init_cost_tracker(self) -> None:
-        self._cost_tracker = CostTracker(config=self.config.cost_tracking)
+    def _init_telemetry(self) -> None:
+        self._model_catalog = ModelCatalog.default()
+        self._telemetry = TelemetryLedger(self._model_catalog)
 
     _COMPACT_BATCH_SIZE = 20  # segments per compaction batch → DB after each batch
 
@@ -2161,9 +2162,13 @@ class VirtualContextEngine:
         result.text = adapter.extract_text(data)
         return result
 
-    def get_cost_report(self) -> SessionCostSummary:
-        """Return current session cost summary."""
-        return self._cost_tracker.get_summary()
+    def get_telemetry(self) -> TelemetryLedger:
+        """Return the telemetry ledger for this session."""
+        return self._telemetry
+
+    def get_cost_report(self):
+        """Backward compat: return a TelemetryRollup from the ledger."""
+        return self._telemetry.total()
 
     def cleanup(self, max_age_days: int | None = None, max_total_tokens: int | None = None) -> int:
         """Run cleanup on the store. Returns count of segments deleted."""

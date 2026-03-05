@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from ..patterns import DEFAULT_TEMPORAL_PATTERNS
@@ -15,7 +16,7 @@ from ..types import (
     TagGeneratorConfig,
     TagResult,
 )
-from .cost_tracker import CostTracker
+from .telemetry import TelemetryLedger
 from .tag_canonicalizer import TagCanonicalizer
 
 logger = logging.getLogger(__name__)
@@ -129,9 +130,43 @@ Rules:
 - No markdown fences, no extra text
 """
 
+# Optimised for smaller models (Qwen3-30B-A3B, Phi-4, etc.) that struggle with
+# long multi-section prompts.  Tagging instructions are lean; fact extraction
+# uses proven V8 rules with positive framing and concrete examples.
+TAG_GENERATOR_PROMPT_SMALL_MODEL = """\
+You are a semantic tagger and fact extractor. Given a conversation segment:
+1. Generate {min_tags}-{max_tags} short, lowercase tags for the key topics.
+2. Extract personal facts about the user.
+
+=== TAGGING RULES ===
+- Prefer specific tags ("reservation-timing" not "timing").
+- Reuse existing tags when possible.  Do NOT create near-synonyms.
+- Set "temporal" to true ONLY when the query references a time position in the conversation ("the first thing we discussed", "at the beginning").
+- Ignore channel metadata. Do NOT tag the communication medium ("chat", "messaging").
+- Tag the concrete subject, not conversational framing.
+
+=== FACT EXTRACTION RULES ===
+- Extract facts where the user reveals something about themselves: achievements, plans, preferences, habits, relationships, activities, opinions.
+- Copy all numbers exactly: dates, prices, times, quantities.
+- If the user asks a question, extract the personal fact BEHIND the question.
+  Example: "What do you think of my new car?" → fact: user has a new car.
+  Example: "Can you help me train for the marathon?" → fact: user is training for a marathon.
+- Skip ONLY pure information requests with no personal revelation.
+- For each fact: subject, verb (exact action verb), object (with ALL numbers preserved), status (active/completed/planned), fact_type (personal/experience/world), what (one full sentence with all specifics).
+  WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
+- Populate who/when/where/why when the conversation mentions them. Leave "" if not mentioned.
+
+=== OUTPUT ===
+Return JSON only:
+{{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1"], "facts": [{{"subject": "user", "verb": "...", "object": "...", "status": "...", "fact_type": "personal", "what": "...", "who": "", "when": "", "where": "", "why": ""}}]}}
+No markdown fences, no extra text.
+"""
+
 TAG_GENERATOR_PROMPTS = {
     "detailed": TAG_GENERATOR_PROMPT_DETAILED,
     "compact": TAG_GENERATOR_PROMPT_COMPACT,
+    "small_model": TAG_GENERATOR_PROMPT_SMALL_MODEL,
+    "qwen3": TAG_GENERATOR_PROMPT_SMALL_MODEL,
 }
 
 
@@ -170,14 +205,15 @@ class LLMTagGenerator:
         llm_provider: LLMProvider,
         config: TagGeneratorConfig,
         canonicalizer: TagCanonicalizer | None = None,
-        cost_tracker: CostTracker | None = None,
+        telemetry_ledger: TelemetryLedger | None = None,
         embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
+        cost_tracker=None,  # deprecated, ignored — kept for backward compat
     ) -> None:
         self.llm = llm_provider
         self.config = config
         self._tag_vocabulary: dict[str, int] = {}
         self._canonicalizer = canonicalizer
-        self._cost_tracker = cost_tracker
+        self._telemetry = telemetry_ledger
         self._embed_fn_factory = embed_fn_factory
         self._temporal_patterns = _compile_temporal_patterns(config.temporal_patterns)
 
@@ -201,12 +237,14 @@ class LLMTagGenerator:
             prompt = "/no_think\n" + prompt
 
         try:
+            t0 = time.time()
             response = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_tokens,
             )
-            self._log_usage()
+            duration_ms = (time.time() - t0) * 1000
+            self._log_usage(duration_ms=duration_ms)
             result = self._parse_response(response)
         except Exception as e:
             logger.warning(f"LLM tag generation failed: {e}")
@@ -460,9 +498,9 @@ class LLMTagGenerator:
         """Bootstrap vocabulary from existing stored tag counts."""
         self._tag_vocabulary.update(tag_counts)
 
-    def _log_usage(self) -> None:
-        """Log LLM token usage from the provider's last_usage to the cost tracker."""
-        if not self._cost_tracker:
+    def _log_usage(self, duration_ms: float = 0.0) -> None:
+        """Log LLM token usage from the provider's last_usage to the telemetry ledger."""
+        if not self._telemetry:
             return
         usage = getattr(self.llm, "last_usage", {})
         if not usage:
@@ -470,10 +508,13 @@ class LLMTagGenerator:
         input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
         output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
         if input_tokens or output_tokens:
-            self._cost_tracker.log_tag_generation(
+            self._telemetry.log(
+                component="tagger",
+                model=getattr(self.llm, "model", ""),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                provider=getattr(self.llm, "model", ""),
+                duration_ms=duration_ms,
+                detail="generate_tags",
             )
 
 
@@ -538,14 +579,15 @@ def build_tag_generator(
     config: TagGeneratorConfig,
     llm_provider: LLMProvider | None = None,
     canonicalizer: TagCanonicalizer | None = None,
-    cost_tracker: CostTracker | None = None,
+    telemetry_ledger: TelemetryLedger | None = None,
     embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
+    cost_tracker=None,  # deprecated, ignored — kept for backward compat
 ) -> TagGenerator:
     """Build a tag generator from config. Falls back to keyword if no LLM available."""
     if config.type == "llm" and llm_provider is not None:
         return LLMTagGenerator(
             llm_provider=llm_provider, config=config,
-            canonicalizer=canonicalizer, cost_tracker=cost_tracker,
+            canonicalizer=canonicalizer, telemetry_ledger=telemetry_ledger,
             embed_fn_factory=embed_fn_factory,
         )
 

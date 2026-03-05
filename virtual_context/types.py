@@ -580,9 +580,13 @@ class StorageConfig:
 
 
 @dataclass
-class CostTrackingConfig:
+class TelemetryConfig:
     enabled: bool = False
-    pricing: dict[str, dict[str, float]] = field(default_factory=dict)
+    models_file: str = "models.yaml"
+
+
+# Backward compat alias — old configs may reference CostTrackingConfig
+CostTrackingConfig = TelemetryConfig
 
 
 @dataclass
@@ -664,7 +668,7 @@ class VirtualContextConfig:
     assembler: AssemblerConfig = field(default_factory=AssemblerConfig)
     summarization: SummarizationConfig = field(default_factory=SummarizationConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
-    cost_tracking: CostTrackingConfig = field(default_factory=CostTrackingConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
@@ -672,3 +676,8 @@ class VirtualContextConfig:
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    @property
+    def cost_tracking(self) -> TelemetryConfig:
+        """Backward compat alias for ``telemetry``."""
+        return self.telemetry

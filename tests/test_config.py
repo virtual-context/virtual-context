@@ -86,17 +86,26 @@ class TestLoadConfig:
         assert "legal" in fb.tag_keywords
         assert "legal" in fb.tag_patterns
 
-    def test_load_cost_tracking(self):
+    def test_load_telemetry(self):
+        config = load_config(config_dict={
+            "telemetry": {
+                "enabled": True,
+                "models_file": "custom_models.yaml",
+            },
+        })
+        assert config.telemetry.enabled is True
+        assert config.telemetry.models_file == "custom_models.yaml"
+        # Backward compat alias
+        assert config.cost_tracking.enabled is True
+
+    def test_load_telemetry_from_legacy_cost_tracking_key(self):
+        """Backward compat: 'cost_tracking' YAML key maps to telemetry."""
         config = load_config(config_dict={
             "cost_tracking": {
                 "enabled": True,
-                "pricing": {
-                    "ollama": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-                },
             },
         })
-        assert config.cost_tracking.enabled is True
-        assert "ollama" in config.cost_tracking.pricing
+        assert config.telemetry.enabled is True
 
     def test_default_strategy_added(self):
         config = load_config(config_dict={})
