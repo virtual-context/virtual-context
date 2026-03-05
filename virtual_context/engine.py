@@ -464,6 +464,7 @@ class VirtualContextEngine:
             llm_provider=llm,
             model=model,
             config=cc,
+            telemetry_ledger=self._telemetry,
         )
         logger.info("Fact curator initialized (provider=%s, model=%s)", provider_name, model)
 
