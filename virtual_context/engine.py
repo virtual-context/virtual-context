@@ -80,6 +80,7 @@ class VirtualContextEngine:
         config_path: str | Path | None = None,
         config: VirtualContextConfig | None = None,
     ) -> None:
+        self._config_path = str(config_path) if config_path else None
         self.config = config or load_config(config_path)
         self._token_counter = create_token_counter(self.config.token_counter)
 
@@ -263,7 +264,20 @@ class VirtualContextEngine:
             )
 
     def _init_telemetry(self) -> None:
-        self._model_catalog = ModelCatalog.default()
+        models_file = self.config.telemetry.models_file
+        if not os.path.isabs(models_file):
+            if self._config_path:
+                config_dir = os.path.dirname(os.path.abspath(self._config_path))
+            else:
+                config_dir = os.getcwd()
+            models_path = os.path.join(config_dir, models_file)
+        else:
+            models_path = models_file
+        # Fall back to bundled default if resolved path doesn't exist
+        if not os.path.exists(models_path):
+            self._model_catalog = ModelCatalog.default()
+        else:
+            self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
 
     _COMPACT_BATCH_SIZE = 20  # segments per compaction batch → DB after each batch
