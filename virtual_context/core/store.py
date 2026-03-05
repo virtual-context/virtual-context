@@ -165,6 +165,12 @@ class ContextStore(ABC):
         """Mark old_fact_id as superseded by new_fact_id."""
         pass
 
+    def update_fact_fields(
+        self, fact_id: str, verb: str, object: str, status: str, what: str
+    ) -> None:
+        """Update structured fields on a fact (used after supersession merge)."""
+        pass
+
     def get_fact_count_by_tags(self) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
         return {}

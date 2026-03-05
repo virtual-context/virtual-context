@@ -59,6 +59,13 @@ class ContextRetriever:
             for ts in all_tags
         }
 
+    def _fetch_all_facts(self) -> list:
+        """Fetch all non-superseded facts from the store."""
+        try:
+            return self.store.query_facts(limit=9999)
+        except Exception:
+            return []
+
     def _load_all_tag_summaries(self, token_budget: int) -> tuple[list[StoredSummary], int]:
         """Load all tag summaries within *token_budget*.
 
@@ -169,6 +176,7 @@ class ContextRetriever:
                         tags_matched=[],
                         summaries=floor_summaries,
                         total_tokens=floor_tokens,
+                        facts=self._fetch_all_facts(),
                         retrieval_metadata={
                             "elapsed_ms": round(elapsed * 1000, 1),
                             "tags_from_message": tag_result.tags,
@@ -187,6 +195,7 @@ class ContextRetriever:
                 tags_matched=[],
                 summaries=[],
                 total_tokens=0,
+                facts=self._fetch_all_facts(),
                 retrieval_metadata={
                     "elapsed_ms": round(elapsed * 1000, 1),
                     "tags_from_message": tag_result.tags,
@@ -252,12 +261,32 @@ class ContextRetriever:
 
         # Apply token budget
         selected: list[StoredSummary] = []
+        selected_refs: set[str] = set()
         total_tokens = 0
         for summary in ranked:
             if total_tokens + summary.summary_tokens > token_budget:
                 break
             selected.append(summary)
+            selected_refs.add(summary.ref)
             total_tokens += summary.summary_tokens
+
+        # Alias ride-along: if a query tag made it into the selected results,
+        # find additional segments via its aliases that didn't make max_results.
+        # These ride free — they don't count against max_results.
+        if selected:
+            alias_extras = _alias_ride_along(
+                self.store, query_tag_set, selected, selected_refs,
+                token_budget, total_tokens,
+            )
+            if alias_extras:
+                selected.extend(alias_extras)
+                selected_refs.update(s.ref for s in alias_extras)
+                total_tokens += sum(s.summary_tokens for s in alias_extras)
+                logger.info(
+                    "Alias ride-along: +%d segments (%d tokens)",
+                    len(alias_extras),
+                    sum(s.summary_tokens for s in alias_extras),
+                )
 
         # FTS fallback: tag overlap missed — try full-text search on stored segments
         # Convert tags to FTS query terms: "cook-mode" → "cook mode"
@@ -319,6 +348,7 @@ class ContextRetriever:
             summaries=selected,
             full_detail=full_detail,
             total_tokens=total_tokens,
+            facts=self._fetch_all_facts(),
             retrieval_metadata=retrieval_metadata,
             cost_report=RetrievalCostReport(
                 tokens_retrieved=total_tokens,
@@ -328,3 +358,73 @@ class ContextRetriever:
                 tags_skipped=skipped_tags,
             ),
         )
+
+
+def _alias_ride_along(
+    store: ContextStore,
+    query_tag_set: set[str],
+    selected: list[StoredSummary],
+    selected_refs: set[str],
+    token_budget: int,
+    tokens_used: int,
+) -> list[StoredSummary]:
+    """Find extra segments via aliases for tags that already made the cut.
+
+    If query tag X qualified (appears in selected results), find all tags
+    in X's alias group and retrieve segments that match those aliases but
+    weren't already selected. These ride free — no max_results cap.
+    """
+    aliases = store.get_tag_aliases()
+    if not aliases:
+        return []
+
+    # Build reverse: canonical → {aliases}
+    reverse: dict[str, set[str]] = {}
+    for alias, canonical in aliases.items():
+        reverse.setdefault(canonical, set()).add(alias)
+
+    # Which query tags actually matched in the selected results?
+    qualified_tags: set[str] = set()
+    for s in selected:
+        qualified_tags.update(set(s.tags) & query_tag_set)
+
+    if not qualified_tags:
+        return []
+
+    # For each qualified tag, collect its full alias group
+    alias_tags: set[str] = set()
+    for qt in qualified_tags:
+        # qt might be an alias → get its canonical + siblings
+        if qt in aliases:
+            canon = aliases[qt]
+            alias_tags.add(canon)
+            alias_tags.update(reverse.get(canon, set()))
+        # qt might be a canonical → get all its aliases
+        if qt in reverse:
+            alias_tags.update(reverse[qt])
+
+    # Remove tags we already queried with
+    alias_tags -= query_tag_set
+    if not alias_tags:
+        return []
+
+    # Fetch segments matching alias tags
+    alias_summaries = store.get_summaries_by_tags(
+        tags=list(alias_tags),
+        min_overlap=1,
+        limit=50,
+    )
+
+    # Add new segments within token budget
+    extras: list[StoredSummary] = []
+    remaining = token_budget - tokens_used
+    for s in alias_summaries:
+        if s.ref in selected_refs:
+            continue
+        if s.summary_tokens > remaining:
+            continue
+        extras.append(s)
+        selected_refs.add(s.ref)
+        remaining -= s.summary_tokens
+
+    return extras

@@ -129,10 +129,13 @@ class FactSupersessionChecker:
             for old_id in superseded_ids:
                 self.store.set_fact_superseded(old_id, fact.id)
                 superseded_count += 1
-                # Merge the old fact's knowledge into the surviving fact
-                old_fact = next((c for c in candidates if c.id == old_id), None)
-                if old_fact:
-                    self._merge_facts(fact, old_fact)
+                # NOTE: We intentionally skip _merge_facts() here.
+                # Merging rewrites the winning fact's verb/object/status/what
+                # via an LLM call, which can destroy precise extraction results
+                # (e.g. a planned trip "superseding" a completed trip mutates
+                # the winner into a summary that loses the original event).
+                # The flag alone is sufficient — the old fact is marked dead,
+                # the winner survives with its original extracted fields.
 
         return superseded_count
 
@@ -152,19 +155,22 @@ class FactSupersessionChecker:
 
     def _build_prompt(self, new_fact: Fact, candidates: list[Fact]) -> str:
         """Build prompt asking which candidates are superseded or duplicated."""
+        new_date = new_fact.when_date or "(unknown)"
         lines = [
             "A new fact has been extracted from a conversation:",
             f"  Subject: {new_fact.subject}",
             f"  Verb: {new_fact.verb}",
             f"  Object: {new_fact.object}",
             f"  Status: {new_fact.status}",
+            f"  Session date: {new_date}",
         ]
         if new_fact.what:
             lines.append(f"  What: {new_fact.what}")
         lines.append("")
         lines.append("Existing facts with the same subject:")
         for i, c in enumerate(candidates):
-            line = f"  [{i}] {c.verb} {c.object} (status: {c.status})"
+            c_date = c.when_date or "(unknown)"
+            line = f"  [{i}] (session: {c_date}) {c.verb} {c.object} (status: {c.status})"
             if c.what:
                 line += f" — {c.what}"
             lines.append(line)
@@ -177,6 +183,9 @@ class FactSupersessionChecker:
             "A fact is SUPERSEDED when it describes an earlier value of the same "
             "attribute (e.g. a previous record, an old address, a former preference). "
             "Look at the underlying attribute being described, not just the verb phrasing. "
+            "IMPORTANT: Only mark a candidate as superseded if its session date is OLDER "
+            "than the new fact's session date, or if the dates are unknown/equal. "
+            "Never supersede a candidate whose session date is newer (later) than the new fact. "
             "Reply with a JSON array of indices, e.g. [0, 2]. "
             "Reply [] if none are superseded or duplicated."
         )
@@ -210,6 +219,8 @@ class FactSupersessionChecker:
             logger.warning("Supersession merge LLM call failed: %s", e)
             return
 
+        if not response:
+            return
         merged = self._parse_merge_response(response)
         if not merged:
             return
@@ -251,8 +262,10 @@ class FactSupersessionChecker:
         logger.warning("Failed to parse merge response: %s", text[:200])
         return None
 
-    def _parse_response(self, response: str, candidates: list[Fact]) -> list[str]:
+    def _parse_response(self, response: str | None, candidates: list[Fact]) -> list[str]:
         """Extract superseded fact IDs from LLM response."""
+        if not response:
+            return []
         text = response.strip()
         # Strip thinking tags from models like Qwen3
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()

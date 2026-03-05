@@ -69,7 +69,14 @@ def build_autonomous_hint(
         "If a search already returned the answer, stop and respond.\n"
         "For counting/listing questions: scan [all topics] for every topic "
         "that could relate — items are often spread across unrelated topics.\n"
-        "Never answer without searching first."
+        "Never answer without searching first.\n"
+        "FACT vs SUMMARY: The <facts> block contains structured events with "
+        "statuses (completed, planned, active). Summaries describe topics "
+        "DISCUSSED — they include plans, itineraries, and ideas that may "
+        "never have been executed. For questions about what the user DID or "
+        "experienced, trust facts with status=completed. Do not treat "
+        "detailed planning discussions (itineraries, schedules, bookings) "
+        "as evidence that a trip or event actually happened."
     )
 
     _COMPACT_RULES = (
@@ -198,7 +205,14 @@ def build_supervised_hint(
             "If a search already returned the answer, stop and respond.\n"
             "For counting/listing questions: scan [all topics] for every topic "
             "that could relate — items are often spread across unrelated topics.\n"
-            "Never answer without searching first.\n\n"
+            "Never answer without searching first.\n"
+            "FACT vs SUMMARY: The <facts> block contains structured events with "
+            "statuses (completed, planned, active). Summaries describe topics "
+            "DISCUSSED — they include plans, itineraries, and ideas that may "
+            "never have been executed. For questions about what the user DID or "
+            "experienced, trust facts with status=completed. Do not treat "
+            "detailed planning discussions (itineraries, schedules, bookings) "
+            "as evidence that a trip or event actually happened.\n\n"
             f"{body}\n"
             "</context-topics>"
         )
