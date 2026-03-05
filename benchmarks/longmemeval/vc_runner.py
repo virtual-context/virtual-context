@@ -146,6 +146,10 @@ def _build_vc_config(
     tagger_mode: str = "combined",
     fact_provider: str | None = None,
     fact_model: str | None = None,
+    curation_enabled: bool = False,
+    curation_provider: str | None = None,
+    curation_model: str | None = None,
+    supersession: bool = False,
 ) -> dict:
     """Build a VC config dict for benchmark use."""
     chosen_summarizer_provider = summarizer_provider or tagger_provider
@@ -190,6 +194,31 @@ def _build_vc_config(
                 "num_predict": 500,
                 "force_json": True,
             }
+        elif fact_provider == "openrouter":
+            providers["openrouter"] = {
+                "type": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "model": fact_model or tagger_model,
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
+    # Curation provider (if different from others already registered)
+    chosen_curation_provider = curation_provider or chosen_summarizer_provider
+    chosen_curation_model = curation_model or chosen_summarizer_model
+    if chosen_curation_provider and chosen_curation_provider not in providers:
+        if chosen_curation_provider == "openai":
+            providers["openai"] = {
+                "type": "generic_openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": chosen_curation_model,
+                "api_key": openai_bearer_token or os.environ.get("OPENAI_API_KEY", ""),
+            }
+        elif chosen_curation_provider == "openrouter":
+            providers["openrouter"] = {
+                "type": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "model": chosen_curation_model,
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
 
     cfg: dict = {
         "version": "0.2",
@@ -229,6 +258,18 @@ def _build_vc_config(
             "model": chosen_summarizer_model,
             "max_tokens": 500,
             "temperature": 0.3,
+        },
+        "curation": {
+            "enabled": curation_enabled,
+            "provider": chosen_curation_provider,
+            "model": chosen_curation_model,
+            "max_response_tokens": 2048,
+        },
+        "supersession": {
+            "enabled": supersession,
+            "provider": chosen_summarizer_provider,
+            "model": chosen_summarizer_model,
+            "batch_size": 25,
         },
         "providers": providers,
         "storage": {
@@ -496,6 +537,10 @@ def run_vc(
     fact_provider: str | None = None,
     fact_model: str | None = None,
     cache_dir: Path | None = None,
+    curation_enabled: bool = False,
+    curation_provider: str | None = None,
+    curation_model: str | None = None,
+    supersession: bool = False,
 ) -> dict:
     """Run the VC pipeline for a single question.
 
@@ -581,6 +626,10 @@ def run_vc(
         tagger_mode=tagger_mode,
         fact_provider=fact_provider,
         fact_model=fact_model,
+        curation_enabled=curation_enabled,
+        curation_provider=curation_provider,
+        curation_model=curation_model,
+        supersession=supersession,
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
@@ -667,16 +716,24 @@ def run_vc(
         engine._save_state(messages)
         logger.info("VC [%s]: saved state to %s", question.question_id, storage_dir)
 
+    # 3d. Supersession pass — deduplicate facts across sessions
+    if supersession and engine._supersession_checker:
+        t0 = time.time()
+        all_facts = engine._store.query_facts(limit=9999)
+        logger.info("VC [%s]: running supersession over %d facts...", question.question_id, len(all_facts))
+        superseded_count = engine._supersession_checker.check_and_supersede(all_facts)
+        timings["supersession_s"] = round(time.time() - t0, 1)
+        logger.info("VC [%s]: supersession done — %d facts superseded in %.1fs",
+                    question.question_id, superseded_count, timings["supersession_s"])
+
     cached = fully_cached  # backward compat for downstream references
 
-    # Snapshot engine cost tracker BEFORE reader call — captures actual Haiku tokens
+    # Snapshot engine telemetry BEFORE reader call — captures actual Haiku tokens
     # from ingestion + compaction (0 for cached questions, which is correct)
-    pre_reader_cost = engine.get_cost_report()
-    haiku_input = pre_reader_cost.total_input_tokens
-    haiku_output = pre_reader_cost.total_output_tokens
-    haiku_calls = (pre_reader_cost.total_tag_generations
-                   + pre_reader_cost.total_compactions
-                   + pre_reader_cost.total_retrievals)
+    pre_reader_telem = engine.get_telemetry().total()
+    haiku_input = pre_reader_telem.input_tokens
+    haiku_output = pre_reader_telem.output_tokens
+    haiku_calls = pre_reader_telem.call_count
 
     # Persist/restore pre-reader LLM cost data so cached reruns don't lose it.
     # Store the actual provider so we don't misattribute Ollama/Qwen tokens as Anthropic.
@@ -813,7 +870,7 @@ def run_vc(
         messages=[{"role": "user", "content": user_prompt}],
         model=reader_model,
         system=system_prompt,
-        max_tokens=1024,
+        max_tokens=8192,
         api_key=api_key,
         api_url=reader_api_url,
         temperature=0.0,
@@ -936,6 +993,7 @@ def run_vc_ingest_only(
     fact_provider: str | None = None,
     fact_model: str | None = None,
     cache_dir: Path | None = None,
+    supersession: bool = False,
 ) -> dict:
     """Run ingest + compact only, skip reader and judge. Returns stats dict."""
     timings: dict[str, float] = {}
@@ -969,6 +1027,7 @@ def run_vc_ingest_only(
         tagger_mode=tagger_mode,
         fact_provider=fact_provider,
         fact_model=fact_model,
+        supersession=supersession,
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
@@ -981,47 +1040,66 @@ def run_vc_ingest_only(
 
     if fully_cached:
         logger.info("VC [%s]: CACHE HIT — skipping ingest+compact", question.question_id)
+        turns_ingested = n_index_entries
+        compaction_events = 0
+        timings["ingest_s"] = 0.0
+        timings["compact_s"] = 0.0
+    else:
+        # Ingest
+        tags_only = n_index_entries > 0
+        if tags_only:
+            timings["ingest_s"] = 0.0
+            turns_ingested = n_index_entries
+        else:
+            t0 = time.time()
+            _ingest_start = time.time()
+
+            def _progress(done: int, total: int, entry: object) -> None:
+                if done % 20 == 0 or done == total:
+                    elapsed = time.time() - _ingest_start
+                    rate = done / elapsed if elapsed > 0 else 0
+                    logger.info("  Ingest [%s]: %d/%d (%.1f/s)", question.question_id, done, total, rate)
+
+            turns_ingested = engine.ingest_history(messages, progress_callback=_progress)
+            timings["ingest_s"] = round(time.time() - t0, 1)
+
+        # Compact
+        t0 = time.time()
+        compaction_events = 0
+        while True:
+            report = engine.compact_manual(messages)
+            if report is None:
+                break
+            compaction_events += 1
+        timings["compact_s"] = round(time.time() - t0, 1)
+
+        engine._save_state(messages)
+
+    # Supersession pass — runs on cached or freshly compacted stores
+    superseded_count = 0
+    if supersession and engine._supersession_checker:
+        t0 = time.time()
+        all_facts = engine._store.query_facts(limit=9999)
+        logger.info("VC [%s]: running supersession over %d facts...", question.question_id, len(all_facts))
+        superseded_count = engine._supersession_checker.check_and_supersede(all_facts)
+        timings["supersession_s"] = round(time.time() - t0, 1)
+        logger.info("VC [%s]: supersession done — %d facts superseded in %.1fs",
+                    question.question_id, superseded_count, timings["supersession_s"])
+    elif not supersession and fully_cached:
+        engine.close()
         return {
-            "turns_ingested": n_index_entries,
+            "turns_ingested": turns_ingested,
             "compaction_events": 0,
             "cached": True,
-            "timings": {"ingest_s": 0.0, "compact_s": 0.0},
+            "timings": timings,
         }
 
-    # Ingest
-    tags_only = not fully_cached and n_index_entries > 0
-    if tags_only:
-        timings["ingest_s"] = 0.0
-        turns_ingested = n_index_entries
-    else:
-        t0 = time.time()
-        _ingest_start = time.time()
-
-        def _progress(done: int, total: int, entry: object) -> None:
-            if done % 20 == 0 or done == total:
-                elapsed = time.time() - _ingest_start
-                rate = done / elapsed if elapsed > 0 else 0
-                logger.info("  Ingest [%s]: %d/%d (%.1f/s)", question.question_id, done, total, rate)
-
-        turns_ingested = engine.ingest_history(messages, progress_callback=_progress)
-        timings["ingest_s"] = round(time.time() - t0, 1)
-
-    # Compact
-    t0 = time.time()
-    compaction_events = 0
-    while True:
-        report = engine.compact_manual(messages)
-        if report is None:
-            break
-        compaction_events += 1
-    timings["compact_s"] = round(time.time() - t0, 1)
-
-    engine._save_state(messages)
     engine.close()
 
     return {
         "turns_ingested": turns_ingested,
         "compaction_events": compaction_events,
-        "cached": False,
+        "superseded_facts": superseded_count,
+        "cached": fully_cached,
         "timings": timings,
     }
