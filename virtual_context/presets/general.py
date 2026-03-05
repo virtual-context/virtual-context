@@ -80,11 +80,8 @@ GENERAL_CONFIG: dict = {
             },
         },
     },
-    "cost_tracking": {
+    "telemetry": {
         "enabled": True,
-        "pricing": {
-            "ollama": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-        },
     },
 }
 
@@ -178,12 +175,8 @@ retrieval:
       max_budget_fraction: 0.25
       include_related: true
 
-cost_tracking:
+telemetry:
   enabled: true
-  pricing:
-    ollama:
-      input_per_1k: 0.0
-      output_per_1k: 0.0
 """
 
 
