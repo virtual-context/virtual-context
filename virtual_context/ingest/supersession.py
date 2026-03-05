@@ -212,6 +212,9 @@ class FactSupersessionChecker:
             "IMPORTANT: Only mark a candidate as superseded if its session date is OLDER "
             "than the new fact's session date, or if the dates are unknown/equal. "
             "Never supersede a candidate whose session date is newer (later) than the new fact. "
+            "NEVER mark an existing fact as superseded if it is MORE specific than the new fact. "
+            "A fact with concrete details (locations, items, methods) must survive over a "
+            "vague fact about the same topic. "
             "Reply with a JSON array of indices, e.g. [0, 2]. "
             "Reply [] if none are superseded or duplicated."
         )
