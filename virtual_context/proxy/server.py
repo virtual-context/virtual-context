@@ -41,8 +41,6 @@ from .formats import (
     PayloadFormat,
     detect_format,
     get_format,
-    _strip_openclaw_envelope as _strip_openclaw_envelope_fmt,
-    _last_text_block as _last_text_block_fmt,
 )
 from .helpers import (  # noqa: F401 — re-exported for tests
     _VC_PROMPT_MARKER,
