@@ -1,4 +1,4 @@
-"""CLI: virtual-context status, recall, compact, tags, config validate, init, cost-report, retrieve, transform."""
+"""CLI: virtual-context status, recall, compact, tags, config validate, init, telemetry, retrieve, transform."""
 
 from __future__ import annotations
 
@@ -143,21 +143,37 @@ def cmd_compact(args):
         print("No compaction performed.")
 
 
-def cmd_cost_report(args):
-    """Show session cost report."""
+def cmd_telemetry(args):
+    """Show session telemetry report."""
     from ..engine import VirtualContextEngine
 
     engine = VirtualContextEngine(config_path=args.config)
-    summary = engine.get_cost_report()
+    ledger = engine.get_telemetry()
+    total = ledger.total()
+    by_comp = ledger.by_component()
 
-    print("Session Cost Report")
-    print("=" * 40)
-    print(f"Retrievals:      {summary.total_retrievals}")
-    print(f"Compactions:     {summary.total_compactions}")
-    print(f"Tag Generations: {summary.total_tag_generations}")
-    print(f"Input Tokens:    {summary.total_input_tokens:,}")
-    print(f"Output Tokens:   {summary.total_output_tokens:,}")
-    print(f"Est. Cost:       ${summary.estimated_cost_usd:.4f}")
+    print("Session Telemetry Report")
+    print("=" * 72)
+    header = f"{'Component':<18} {'Calls':>6} {'Input':>10} {'Output':>10} {'Cost':>10} {'Time':>10}"
+    print(header)
+    print("-" * 72)
+
+    for comp_name in sorted(by_comp):
+        r = by_comp[comp_name]
+        print(
+            f"{comp_name:<18} {r.call_count:>6} {r.input_tokens:>10,} "
+            f"{r.output_tokens:>10,} ${r.cost_usd:>9.4f} {r.duration_ms:>8.0f}ms"
+        )
+
+    print("-" * 72)
+    print(
+        f"{'TOTAL':<18} {total.call_count:>6} {total.input_tokens:>10,} "
+        f"{total.output_tokens:>10,} ${total.cost_usd:>9.4f} {total.duration_ms:>8.0f}ms"
+    )
+
+
+# Backward compat alias
+cmd_cost_report = cmd_telemetry
 
 
 def cmd_init(args):
@@ -505,6 +521,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-6"],
     "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-nano"],
     "ollama": ["qwen3:4b-instruct-2507-fp16", "llama3.1:8b", "mistral:7b"],
+    "openrouter": ["qwen/qwen3-30b-a3b", "qwen/qwen3-32b", "google/gemini-2.5-flash-preview"],
 }
 
 
@@ -512,7 +529,7 @@ def _prompt_tagging_provider() -> tuple[str, str]:
     """Ask for a tagging/summarization provider and model. Returns (provider, model)."""
     provider = _prompt_choice(
         "Tagging/summarization provider:",
-        ["anthropic", "openai", "ollama", "custom"],
+        ["anthropic", "openai", "ollama", "openrouter", "custom"],
         default="ollama",
     )
     models = _PROVIDER_MODELS.get(provider)
@@ -532,6 +549,8 @@ def _provider_defaults(provider: str) -> tuple[str, str]:
         return "gemini", "https://generativelanguage.googleapis.com"
     if provider == "ollama":
         return "ollama", "http://127.0.0.1:11434"
+    if provider == "openrouter":
+        return "openrouter", "https://openrouter.ai/api/v1"
     return "custom", "https://api.example.com"
 
 
@@ -553,6 +572,8 @@ def _write_instance_config(
         provider_block = {provider_label: {"type": "anthropic"}}
     elif provider == "openai":
         provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
+    elif provider == "openrouter":
+        provider_block = {provider_label: {"type": "openrouter", "base_url": base_url, "api_key_env": "OPENROUTER_API_KEY"}}
     else:
         provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
 
@@ -1024,8 +1045,9 @@ def main():
         help="Run interactive setup wizard (instances, ports, providers)",
     )
 
-    # cost-report
-    subparsers.add_parser("cost-report", help="Show session cost report")
+    # telemetry (+ cost-report backward compat alias)
+    subparsers.add_parser("telemetry", help="Show session telemetry report")
+    subparsers.add_parser("cost-report", help="Show session cost report (alias for telemetry)")
 
     # retrieve
     retrieve_parser = subparsers.add_parser("retrieve", help="Retrieve context for a message")
@@ -1121,8 +1143,8 @@ def main():
         cmd_recall(args)
     elif args.command == "compact":
         cmd_compact(args)
-    elif args.command == "cost-report":
-        cmd_cost_report(args)
+    elif args.command in ("telemetry", "cost-report"):
+        cmd_telemetry(args)
     elif args.command == "retrieve":
         cmd_retrieve(args)
     elif args.command == "transform":

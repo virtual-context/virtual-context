@@ -12,7 +12,7 @@ import yaml
 from .types import (
     AssemblerConfig,
     CompactorConfig,
-    CostTrackingConfig,
+    TelemetryConfig,
     KeywordTagConfig,
     MonitorConfig,
     PagingConfig,
@@ -204,11 +204,11 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         embedding_threshold=retrieval_raw.get("embedding_threshold", 0.3),
     )
 
-    # Cost tracking
-    cost_raw = raw.get("cost_tracking", {})
-    cost_tracking = CostTrackingConfig(
-        enabled=cost_raw.get("enabled", False),
-        pricing=cost_raw.get("pricing", {}),
+    # Telemetry (backward compat: also accept "cost_tracking")
+    telemetry_raw = raw.get("telemetry", raw.get("cost_tracking", {}))
+    telemetry_config = TelemetryConfig(
+        enabled=telemetry_raw.get("enabled", False),
+        models_file=telemetry_raw.get("models_file", "models.yaml"),
     )
 
     # Proxy settings
@@ -299,7 +299,7 @@ def _build_config(raw: dict[str, Any]) -> VirtualContextConfig:
         assembler=assembler_config,
         summarization=summarization,
         storage=storage_config,
-        cost_tracking=cost_tracking,
+        telemetry=telemetry_config,
         paging=paging_config,
         proxy=proxy_config,
         tool_output=tool_output_config,

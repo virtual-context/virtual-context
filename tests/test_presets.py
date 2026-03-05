@@ -112,8 +112,11 @@ def test_coding_storage_sqlite():
     assert config.storage.backend == "sqlite"
 
 
-def test_coding_cost_tracking():
+def test_coding_telemetry():
     config = load_config(config_dict=CODING_CONFIG)
+    # Backward compat: presets still use "cost_tracking" key, parsed as telemetry
+    assert config.telemetry.enabled is True
+    # Alias still works
     assert config.cost_tracking.enabled is True
 
 
