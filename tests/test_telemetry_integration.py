@@ -230,6 +230,31 @@ class TestTelemetryIntegration:
         )
         assert tagger._telemetry is None
 
+    def test_fact_curator_logs_telemetry(self, ledger):
+        """FactCurator.curate() should log telemetry after LLM call."""
+        from virtual_context.ingest.curator import FactCurator
+        from virtual_context.types import CurationConfig, Fact
+
+        llm = MagicMock()
+        llm.complete.return_value = "0"
+        llm.last_usage = {"input_tokens": 300, "output_tokens": 10}
+
+        curator = FactCurator(
+            llm_provider=llm,
+            model="haiku",
+            config=CurationConfig(),
+            telemetry_ledger=ledger,
+        )
+        facts = [Fact(verb="likes", object="Python")]
+        curator.curate(facts, "What language do they prefer?")
+
+        events = ledger.events()
+        assert len(events) == 1
+        assert events[0].component == "fact_curator"
+        assert events[0].detail == "fact_curation"
+        assert events[0].duration_ms > 0
+        assert events[0].input_tokens == 300
+
 
 class TestToolLoopTelemetry:
     """Verify that run_tool_loop logs telemetry events."""
