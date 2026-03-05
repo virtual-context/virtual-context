@@ -9,7 +9,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Static
 
 from ..engine import VirtualContextEngine
-from ..types import AssembledContext, Message
+from ..types import AssembledContext, DEFAULT_CHAT_MODEL, Message
 from .chat_provider import ChatProvider
 from .modals.turn_inspector import TurnInspector
 from .state import TurnRecord, save_session
@@ -39,7 +39,7 @@ class VChatApp(App):
         self,
         config_path: str | None = None,
         api_key: str | None = None,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = DEFAULT_CHAT_MODEL,
         replay_prompts: list[str] | None = None,
     ) -> None:
         super().__init__()
@@ -297,8 +297,8 @@ class VChatApp(App):
                 f"Stream error: {e}",
             )
             return
-
-        self.call_from_thread(self._chat_view.end_assistant_message)
+        finally:
+            self.call_from_thread(self._chat_view.end_assistant_message)
 
         assistant_text = "".join(full_response)
         self._conversation_history.append(
@@ -316,15 +316,13 @@ class VChatApp(App):
                 compaction = self.engine.on_turn_complete(self._conversation_history)
 
                 # Get tags from latest turn tag index entry (richer: user+assistant pair)
-                entries = self.engine._turn_tag_index.entries
-                if entries:
-                    latest = entries[-1]
+                tc_tags, tc_primary = self.engine.get_latest_turn_tags()
+                if tc_tags:
                     # Merge: turn-complete tags + any inbound tags not already covered
-                    tc_tags = list(latest.tags)
                     inbound_set = set(assembled.matched_tags or [])
                     extra = [t for t in inbound_set if t not in set(tc_tags)]
                     tags = tc_tags + extra
-                    primary_tag = latest.primary_tag
+                    primary_tag = tc_primary
             except Exception as e:
                 self.call_from_thread(
                     self._chat_view.add_system_message,

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 
 import httpx
 
-from ..types import LLMProviderError
+from ..types import DEFAULT_CHAT_MODEL, LLMProviderError
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -20,7 +20,7 @@ class ChatProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = DEFAULT_CHAT_MODEL,
     ) -> None:
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.model = model

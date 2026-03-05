@@ -614,12 +614,25 @@ class TestDashboardReplay:
             )
             assert resp.status_code == 503
 
-    def test_replay_start_file_not_found(self, test_client):
-        """Start replay with non-existent file returns 400."""
+    def test_replay_start_path_traversal(self, test_client):
+        """Start replay with path outside CWD returns 403."""
         client, _ = test_client
         resp = client.post(
             "/dashboard/replay/start",
             json={"file": "/no/such/file.txt"},
+        )
+        assert resp.status_code == 403
+        assert "outside" in resp.json()["error"].lower()
+
+    def test_replay_start_file_not_found(self, test_client):
+        """Start replay with non-existent file in CWD returns 400."""
+        client, _ = test_client
+        import os
+        # Use a path under CWD that doesn't exist
+        fake = os.path.join(os.getcwd(), "nonexistent_replay_file.txt")
+        resp = client.post(
+            "/dashboard/replay/start",
+            json={"file": fake},
         )
         assert resp.status_code == 400
         assert "not found" in resp.json()["error"].lower()

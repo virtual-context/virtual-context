@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "virtual-context"
-version = "0.2.0"
+version = "0.2.1"
 description = "OS-style virtual memory for LLM session context management"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -23,7 +23,7 @@ bridge = ["uvicorn>=0.30", "fastapi>=0.115"]
 mcp = ["mcp>=1.0"]
 tui = ["textual>=3.0", "rich>=13.0"]
 all = [
-    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,tui]",
+    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,mcp,tui]",
 ]
 dev = [
     "pytest>=8.0",

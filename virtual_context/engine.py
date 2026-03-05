@@ -9,6 +9,7 @@ import re
 import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import load_config
@@ -32,6 +33,7 @@ from .types import (
     CompactionReport,
     CompactionResult,
     CompactionSignal,
+    DEFAULT_CHAT_MODEL,
     DepthLevel,
     EngineStateSnapshot,
     Message,
@@ -73,6 +75,19 @@ class VirtualContextEngine:
 
         # After LLM responds
         report = engine.on_turn_complete(history)
+
+    Threading contract:
+        - ``tag_turn`` and ``on_message_inbound`` must NOT run concurrently
+          with each other.  They mutate shared state (TurnTagIndex, watermark)
+          without internal locking.
+        - ``compact_if_needed`` MAY run concurrently with inbound methods.
+          Stale watermark reads are benign by design: worst case the assembler
+          includes slightly extra context, never less.
+        - Direct usage of the engine without the proxy's sequencing guarantees
+          is NOT thread-safe.  Callers are responsible for serializing calls.
+        - The proxy layer (``ProxyState``) enforces safe sequencing via
+          ``wait_for_tag()`` -- each inbound request waits for the previous
+          tag_turn to complete before proceeding.
     """
 
     def __init__(
@@ -292,17 +307,23 @@ class VirtualContextEngine:
         all_results: list[CompactionResult] = []
         batch_size = self._COMPACT_BATCH_SIZE
 
-        # D1: Gather fact signals from TurnTagIndex for compacted turns.
-        # Build a flat list per segment.  Since we don't have a direct
-        # segment→turn mapping, collect all signals and let the compactor
-        # verify against the segment's conversation text.
+        # D1: Gather fact signals from TurnTagIndex scoped per segment.
+        # Build a segment-to-turn mapping using turn_offset and each segment's
+        # turn_count, then collect only the fact signals for each segment's
+        # source turns.
         turn_offset = self._compacted_through // 2
-        compact_turns = compact_messages_len // 2
-        all_signals: list[FactSignal] = []
-        for t in range(turn_offset, turn_offset + compact_turns):
-            entry = self._turn_tag_index.get_tags_for_turn(t)
-            if entry and entry.fact_signals:
-                all_signals.extend(entry.fact_signals)
+        seg_cursor = turn_offset
+        segment_signals: dict[str, list[FactSignal]] = {}
+        for seg in segments:
+            seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
+            signals: list[FactSignal] = []
+            for t in range(seg_cursor, seg_cursor + seg_turn_count):
+                entry = self._turn_tag_index.get_tags_for_turn(t)
+                if entry and entry.fact_signals:
+                    signals.extend(entry.fact_signals)
+            if signals:
+                segment_signals[seg.id] = signals
+            seg_cursor += seg_turn_count
 
         for start in range(0, len(segments), batch_size):
             batch = segments[start:start + batch_size]
@@ -312,9 +333,11 @@ class VirtualContextEngine:
                 "Compacting batch %d/%d (%d segments)...",
                 batch_num, total_batches, len(batch),
             )
-            # D1: Pass all signals to the compactor; each segment's prompt
-            # will include them as hints for verification.
-            fact_signals_by_segment = {seg.id: all_signals for seg in batch} if all_signals else None
+            # D1: Pass per-segment signals to the compactor for verification.
+            fact_signals_by_segment = {
+                seg.id: segment_signals[seg.id]
+                for seg in batch if seg.id in segment_signals
+            } or None
             results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
             # Store each result to DB right away
             for i, result in enumerate(results):
@@ -746,49 +769,19 @@ class VirtualContextEngine:
 
         return signal
 
-    def compact_if_needed(
+    def _run_compaction(
         self,
         conversation_history: list[Message],
-        signal: CompactionSignal,
-    ) -> CompactionReport | None:
-        """Phase 2 of turn processing: run compaction.
+        compact_messages: list[Message],
+    ) -> CompactionReport:
+        """Shared compaction core: segment, compact, store, build tag summaries.
 
-        Slow (~10s with LLM summarizer). Can run in background after
-        tag_turn() completes — the next request only needs the tag index.
+        Called by both ``compact_if_needed`` (threshold-triggered) and
+        ``compact_manual`` (explicit) after their respective guard checks
+        have selected *compact_messages*.
 
-        *signal*: the CompactionSignal returned by tag_turn().
+        Returns a CompactionReport (never None — callers handle None guards).
         """
-        _t_compact = time.monotonic()
-
-        if self._compactor is None:
-            logger.warning(
-                "Compaction triggered but no LLM provider configured. "
-                "Configure a provider in the providers section."
-            )
-            return None
-
-        logger.info(
-            f"Compaction triggered ({signal.priority}): "
-            f"{signal.current_tokens}/{signal.budget_tokens} tokens, "
-            f"overflow={signal.overflow_tokens}"
-        )
-
-        # Select messages to compact (not in protected zone)
-        protected_turns = self.config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2  # user + assistant per turn
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        # Messages to compact: everything between watermark and protected zone.
-        # Compact all available messages (not just the minimum) so compaction
-        # fires infrequently — one big batch instead of many small ones.
-        compact_messages = conversation_history[self._compacted_through:-protected_count]
-
-        if not compact_messages:
-            return None
-
         # Segment and compact in batches (results stored to DB incrementally)
         turn_offset = self._compacted_through // 2
         segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
@@ -847,19 +840,20 @@ class VirtualContextEngine:
                     if ts:
                         existing_tag_summaries[tag] = ts
 
-                max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
+                if self._turn_tag_index.entries:
+                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
 
-                new_tag_summaries = self._compactor.compact_tag_summaries(
-                    cover_tags=cover_tags,
-                    tag_to_summaries=tag_to_summaries,
-                    tag_to_turns=tag_to_turns,
-                    existing_tag_summaries=existing_tag_summaries,
-                    max_turn=max_turn,
-                )
+                    new_tag_summaries = self._compactor.compact_tag_summaries(
+                        cover_tags=cover_tags,
+                        tag_to_summaries=tag_to_summaries,
+                        tag_to_turns=tag_to_turns,
+                        existing_tag_summaries=existing_tag_summaries,
+                        max_turn=max_turn,
+                    )
 
-                for ts in new_tag_summaries:
-                    self._store.save_tag_summary(ts)
-                tag_summaries_built = len(new_tag_summaries)
+                    for ts in new_tag_summaries:
+                        self._store.save_tag_summary(ts)
+                    tag_summaries_built = len(new_tag_summaries)
 
         report = CompactionReport(
             segments_compacted=len(results),
@@ -877,8 +871,54 @@ class VirtualContextEngine:
                 default=None,
             )
             if min_ttl is not None:
-                from datetime import timedelta
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
+
+        return report
+
+    def compact_if_needed(
+        self,
+        conversation_history: list[Message],
+        signal: CompactionSignal,
+    ) -> CompactionReport | None:
+        """Phase 2 of turn processing: run compaction.
+
+        Slow (~10s with LLM summarizer). Can run in background after
+        tag_turn() completes — the next request only needs the tag index.
+
+        *signal*: the CompactionSignal returned by tag_turn().
+        """
+        _t_compact = time.monotonic()
+
+        if self._compactor is None:
+            logger.warning(
+                "Compaction triggered but no LLM provider configured. "
+                "Configure a provider in the providers section."
+            )
+            return None
+
+        logger.info(
+            f"Compaction triggered ({signal.priority}): "
+            f"{signal.current_tokens}/{signal.budget_tokens} tokens, "
+            f"overflow={signal.overflow_tokens}"
+        )
+
+        # Select messages to compact (not in protected zone)
+        protected_turns = self.config.monitor.protected_recent_turns
+        protected_count = protected_turns * 2  # user + assistant per turn
+
+        if len(conversation_history) <= protected_count:
+            logger.info("Not enough messages outside protected zone to compact")
+            return None
+
+        # Messages to compact: everything between watermark and protected zone.
+        # Compact all available messages (not just the minimum) so compaction
+        # fires infrequently — one big batch instead of many small ones.
+        compact_messages = conversation_history[self._compacted_through:-protected_count]
+
+        if not compact_messages:
+            return None
+
+        report = self._run_compaction(conversation_history, compact_messages)
 
         self._last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
         self._save_state(conversation_history)
@@ -1308,88 +1348,7 @@ class VirtualContextEngine:
         if not compact_messages:
             return None
 
-        # Segment and compact in batches (results stored to DB incrementally)
-        turn_offset = self._compacted_through // 2
-        logger.info(
-            "compact_manual: about to segment %d messages (watermark=%d, turn_offset=%d)",
-            len(compact_messages), self._compacted_through, turn_offset,
-        )
-        segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
-        logger.info(
-            "compact_manual: segmented into %d segments",
-            len(segments),
-        )
-        results = self._compact_and_store(segments, len(compact_messages))
-
-        # Advance watermark past compacted messages
-        self._compacted_through += len(compact_messages)
-
-        tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
-        tags = list({tag for r in results for tag in r.tags})
-
-        # Build/update tag summaries — only for tags in newly compacted segments
-        tag_summaries_built = 0
-        cover_tags: list[str] = []
-        if results:
-            compacted_tags = {tag for r in results for tag in r.tags}
-            cover_tags = [
-                t for t in self._turn_tag_index.compute_cover_set()
-                if t in compacted_tags
-            ]
-            if cover_tags:
-                tag_to_summaries: dict[str, list] = {}
-                for tag in cover_tags:
-                    summaries = self._store.get_summaries_by_tags(
-                        tags=[tag], min_overlap=1, limit=50
-                    )
-                    if summaries:
-                        tag_to_summaries[tag] = summaries
-
-                tag_to_turns: dict[str, list[int]] = {}
-                for entry in self._turn_tag_index.entries:
-                    for tag in entry.tags:
-                        if tag in cover_tags:
-                            tag_to_turns.setdefault(tag, []).append(entry.turn_number)
-
-                existing_tag_summaries = {}
-                for tag in cover_tags:
-                    ts = self._store.get_tag_summary(tag)
-                    if ts:
-                        existing_tag_summaries[tag] = ts
-
-                if self._turn_tag_index.entries:
-                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
-
-                    new_tag_summaries = self._compactor.compact_tag_summaries(
-                        cover_tags=cover_tags,
-                        tag_to_summaries=tag_to_summaries,
-                        tag_to_turns=tag_to_turns,
-                        existing_tag_summaries=existing_tag_summaries,
-                        max_turn=max_turn,
-                    )
-
-                    for ts in new_tag_summaries:
-                        self._store.save_tag_summary(ts)
-                    tag_summaries_built = len(new_tag_summaries)
-
-        report = CompactionReport(
-            segments_compacted=len(results),
-            tokens_freed=tokens_freed,
-            tags=tags,
-            results=results,
-            tag_summaries_built=tag_summaries_built,
-            cover_tags=cover_tags,
-        )
-
-        # Enforce TTL from tag rules
-        if self.config.tag_rules:
-            min_ttl = min(
-                (r.ttl_days for r in self.config.tag_rules if r.ttl_days is not None),
-                default=None,
-            )
-            if min_ttl is not None:
-                from datetime import timedelta
-                self._store.cleanup(max_age=timedelta(days=min_ttl))
+        report = self._run_compaction(conversation_history, compact_messages)
 
         self._save_state(conversation_history)
         return report
@@ -1397,7 +1356,7 @@ class VirtualContextEngine:
     def ingest_history(
         self,
         history_pairs: list[Message],
-        progress_callback: callable | None = None,
+        progress_callback: Callable[..., None] | None = None,
     ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
@@ -1909,7 +1868,6 @@ class VirtualContextEngine:
                     query_str = query_str.split(_vc_end_tag)[-1].strip()
             # Strip leading preamble that the benchmark wraps around the
             # context block — only keep meaningful trailing text.
-            import re
             m = re.search(r"(?:^|\n)\s*Question:\s*(.+)", query_str, re.IGNORECASE)
             if m:
                 query_str = m.group(1).strip()
@@ -2017,7 +1975,7 @@ class VirtualContextEngine:
         self,
         messages: list[dict],
         *,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = DEFAULT_CHAT_MODEL,
         system: str = "",
         max_tokens: int = 4096,
         api_key: str = "",
@@ -2188,6 +2146,16 @@ class VirtualContextEngine:
 
     def cleanup(self, max_age_days: int | None = None, max_total_tokens: int | None = None) -> int:
         """Run cleanup on the store. Returns count of segments deleted."""
-        from datetime import timedelta
         max_age = timedelta(days=max_age_days) if max_age_days else None
         return self._store.cleanup(max_age=max_age, max_total_tokens=max_total_tokens)
+
+    def get_latest_turn_tags(self) -> tuple[list[str], str]:
+        """Return (tags, primary_tag) from the latest TurnTagIndex entry.
+
+        Returns ``([], "_general")`` if the index is empty.
+        """
+        entries = self._turn_tag_index.entries
+        if entries:
+            latest = entries[-1]
+            return list(latest.tags), latest.primary_tag
+        return [], "_general"

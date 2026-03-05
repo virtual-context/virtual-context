@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 import logging
 import time
 from typing import Callable
@@ -22,6 +21,7 @@ from ..types import (
     TagSummary,
     TemporalStatus,
 )
+from .llm_utils import normalize_tag, parse_llm_json
 from .telemetry import TelemetryLedger
 
 logger = logging.getLogger(__name__)
@@ -300,13 +300,13 @@ class DomainCompactor:
 
         try:
             t0 = time.time()
-            response_text = self.llm.complete(
+            response_text, usage = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
             duration_ms = (time.time() - t0) * 1000
-            self._log_usage("segment_summarize", duration_ms=duration_ms)
+            self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
@@ -400,14 +400,11 @@ class DomainCompactor:
     @staticmethod
     def _normalize_tag_list(tags: list) -> list[str]:
         """Normalize a list of raw tag strings: lowercase, hyphenate, strip special chars."""
-        import re
         result = []
         for tag in tags:
             if not isinstance(tag, str):
                 continue
-            t = tag.lower().strip()
-            t = re.sub(r"[^a-z0-9-]", "-", t)
-            t = re.sub(r"-+", "-", t).strip("-")
+            t = normalize_tag(tag)
             if t:
                 result.append(t)
         return result
@@ -420,11 +417,16 @@ class DomainCompactor:
                     return rule.summary_prompt
         return None
 
-    def _log_usage(self, event_type: str, duration_ms: float = 0.0) -> None:
-        """Log LLM token usage from the provider's last_usage to the telemetry ledger."""
+    def _log_usage(self, event_type: str, duration_ms: float = 0.0, usage: dict | None = None) -> None:
+        """Log LLM token usage to the telemetry ledger.
+
+        *usage* should be the usage dict returned by ``complete()``.
+        Falls back to ``self.llm.last_usage`` (deprecated) when not provided.
+        """
         if not self._telemetry:
             return
-        usage = getattr(self.llm, "last_usage", {})
+        if usage is None:
+            usage = getattr(self.llm, "last_usage", {})
         if not usage:
             return
         input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
@@ -451,35 +453,9 @@ class DomainCompactor:
 
     def _parse_response(self, response: str) -> dict:
         """Parse LLM JSON response with fallback for malformed output."""
-        import re
-        text = response.strip()
-
-        # Strip markdown fences if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # Strip thinking tags
-        if "<think>" in text:
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # Try to extract JSON object
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(text[start:end])
-            except json.JSONDecodeError:
-                pass
-
+        result = parse_llm_json(response)
+        if result:
+            return result
         return {
             "summary": response.strip(),
             "entities": [],
@@ -602,13 +578,13 @@ class DomainCompactor:
 
         try:
             t0 = time.time()
-            response_text = self.llm.complete(
+            response_text, usage = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
             )
             duration_ms = (time.time() - t0) * 1000
-            self._log_usage("tag_rollup", duration_ms=duration_ms)
+            self._log_usage("tag_rollup", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
         except Exception as e:
             logger.warning(f"LLM tag summary rollup failed for '{tag}': {e}")

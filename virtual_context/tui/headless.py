@@ -233,11 +233,10 @@ class HeadlessRunner:
             compaction = self.engine.on_turn_complete(history)
             elapsed = round((time.perf_counter() - t0) * 1000, 1)
             turn.timing["turn_complete_ms"] = elapsed
-            entries = self.engine._turn_tag_index.entries
-            if entries:
-                latest = entries[-1]
-                turn.tags = latest.tags
-                turn.primary_tag = latest.primary_tag
+            tc_tags, tc_primary = self.engine.get_latest_turn_tags()
+            if tc_tags:
+                turn.tags = tc_tags
+                turn.primary_tag = tc_primary
             turn.compaction = compaction
         except Exception as e:
             print(f"Turn-complete error: {e}", file=sys.stderr)
