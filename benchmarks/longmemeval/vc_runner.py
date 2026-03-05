@@ -747,6 +747,9 @@ def run_vc(
             "haiku_calls": haiku_calls,
             "provider": pre_reader_provider,
         }))
+        # Persist full telemetry breakdown (by component, by model, all events)
+        telemetry_path = q_cache_dir / "telemetry.json"
+        telemetry_path.write_text(json.dumps(engine.get_telemetry().to_dict(), indent=2))
     elif cost_snapshot_path.exists():
         # Cache hit — restore costs from snapshot
         snap = json.loads(cost_snapshot_path.read_text())
@@ -1093,6 +1096,15 @@ def run_vc_ingest_only(
             "cached": True,
             "timings": timings,
         }
+
+    # Persist full telemetry breakdown
+    telem = engine.get_telemetry()
+    telem_total = telem.total()
+    if telem_total.call_count > 0:
+        telemetry_path = cache_dir / "telemetry.json"
+        telemetry_path.write_text(json.dumps(telem.to_dict(), indent=2))
+        logger.info("VC [%s]: telemetry saved to %s (%d calls, $%.4f)",
+                     question.question_id, telemetry_path, telem_total.call_count, telem_total.cost_usd)
 
     engine.close()
 
