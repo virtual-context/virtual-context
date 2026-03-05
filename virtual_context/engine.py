@@ -458,6 +458,7 @@ class VirtualContextEngine:
             model=model,
             store=self._store,
             config=sc,
+            telemetry_ledger=self._telemetry,
         )
         logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 

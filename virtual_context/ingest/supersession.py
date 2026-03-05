@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 from ..core.store import ContextStore
+from ..core.telemetry import TelemetryLedger
 from ..types import Fact, LLMProvider, SupersessionConfig
 
 logger = logging.getLogger(__name__)
@@ -80,11 +82,13 @@ class FactSupersessionChecker:
         model: str,
         store: ContextStore,
         config: SupersessionConfig,
+        telemetry_ledger: TelemetryLedger | None = None,
     ):
         self.llm = llm_provider
         self.model = model
         self.store = store
         self.config = config
+        self._telemetry = telemetry_ledger
 
     def check_and_supersede(self, new_facts: list[Fact]) -> int:
         """For each new fact, find candidates by subject, ask LLM, mark superseded.
@@ -139,15 +143,37 @@ class FactSupersessionChecker:
 
         return superseded_count
 
+    def _log_usage(self, detail: str, duration_ms: float = 0.0) -> None:
+        """Log LLM token usage to the telemetry ledger."""
+        if not self._telemetry:
+            return
+        usage = getattr(self.llm, "last_usage", {})
+        if not usage:
+            return
+        input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+        if input_tokens or output_tokens:
+            self._telemetry.log(
+                component="supersession",
+                model=self.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                detail=detail,
+            )
+
     def _check_batch(self, new_fact: Fact, candidates: list[Fact]) -> list[str]:
         """Ask LLM which candidates are superseded by new_fact."""
         prompt = self._build_prompt(new_fact, candidates)
         try:
+            t0 = time.time()
             response = self.llm.complete(
                 system="You are a fact comparison assistant. Respond only with a JSON array.",
                 user=prompt,
                 max_tokens=200,
             )
+            duration_ms = (time.time() - t0) * 1000
+            self._log_usage("check_batch", duration_ms=duration_ms)
         except Exception as e:
             logger.warning("Supersession LLM call failed: %s", e)
             return []
