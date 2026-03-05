@@ -752,6 +752,8 @@ The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dash
 
 **Request capture.** A ring buffer stores the last 50 raw request bodies (the actual `messages` array sent to the upstream LLM). Inspect any captured request through the dashboard or export as JSON for offline analysis. Essential for diagnosing tagger accuracy: you can see exactly what text the embedding matcher evaluated.
 
+**Dashboard authentication.** Mutating endpoints (DELETE, POST, PUT) are gated by an `X-VC-Dashboard-Token` header when configured. Set via `dashboard_token` in config or `VC_DASHBOARD_TOKEN` env var. Read-only GET endpoints remain open.
+
 **Live updates.** SSE-powered: new events appear the instant they happen. No polling, no refresh.
 
 **JSON export.** Download the full session state (all events, all stats) as a single JSON file for offline analysis or bug reporting.
@@ -824,18 +826,22 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **FactCurator** | `ingest/curator.py` | LLM-based fact relevance filtering on inbound queries |
 | **SupersessionChecker** | `ingest/supersession.py` | Cross-session fact deduplication via object-keyword similarity |
 | **ToolLoop** | `core/tool_loop.py` | Multi-provider multi-round tool execution for reader model (Anthropic/OpenAI/Gemini) |
-| **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
+| **ContextStore** | `core/store.py` | Storage ABC (SQLite or filesystem) with tag snippet and fact supersession queries |
 | **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
-| **ProxyServer** | `proxy/server.py` | HTTP proxy: enrichment, filtering, history ingestion, session continuity |
+| **LLMUtils** | `core/llm_utils.py` | Shared JSON parsing (markdown fences, think tags) + tag normalization |
+| **ProxyServer** | `proxy/server.py` | HTTP proxy factory (`create_app`), delegates to state/registry/handlers |
+| **ProxyState** | `proxy/state.py` | Session state machine: ingestion, tagging, compaction lifecycle |
+| **SessionRegistry** | `proxy/registry.py` | Multi-session routing with fingerprint matching |
+| **ProxyHandlers** | `proxy/handlers.py` | Streaming/non-streaming/passthrough HTTP request handlers |
 | **MultiInstance** | `proxy/multi.py` | Multi-instance launcher: N uvicorn listeners, shared or per-port engine/store |
-| **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats |
-| **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector + request capture ring buffer |
+| **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats (auth-gated mutations) |
+| **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector with bounded deque + request capture ring buffer |
 
 ### Storage Backends
 
 **SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search, structured fact tables with provenance tracking. Single file, no external dependencies.
 
-**FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly.
+**FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly. Thread-safe with atomic index writes and persisted tag aliases.
 
 Both implement the same abstract interface; swap backends without changing application code.
 
@@ -845,7 +851,7 @@ Both implement the same abstract interface; swap backends without changing appli
 
 **AnthropicProvider**: Direct Anthropic API via httpx. No SDK dependency.
 
-Retry logic with exponential backoff on both.
+Both providers reuse a persistent `httpx.Client` across calls (connection pooling) and return `(text, usage)` tuples for thread-safe usage tracking. Retry logic with exponential backoff on both.
 
 ## Design Decisions
 
@@ -932,7 +938,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # ~1260 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # ~1500 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 
