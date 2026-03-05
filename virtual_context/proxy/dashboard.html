@@ -273,6 +273,14 @@
   .cost-table td { padding: 4px 8px; border-bottom: 1px solid var(--bg); }
   .cost-table td.saved { color: var(--green); font-weight: 600; }
 
+  /* Telemetry panel */
+  .telemetry-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .telemetry-table th { text-align: left; padding: 4px 8px; color: var(--text-dim); border-bottom: 1px solid var(--border); font-weight: 500; }
+  .telemetry-table td { padding: 4px 8px; border-bottom: 1px solid var(--bg); }
+  .telemetry-table .total-row td { border-top: 1px solid var(--border); font-weight: 600; color: var(--accent); }
+  .telemetry-table td.cost-cell { color: var(--green); }
+  .telemetry-empty { color: var(--text-dim); font-size: 12px; }
+
   /* Compact button */
   .compact-btn {
     background: transparent; border: 1px solid var(--yellow); color: var(--yellow);
@@ -558,6 +566,24 @@
       <tr id="cost-row-placeholder"><td colspan="6" style="color:var(--text-dim)">awaiting first request</td></tr>
     </tbody>
   </table>
+</div>
+
+<div class="panel">
+  <div class="section-header"><h2>LLM Telemetry</h2><button class="help-btn" data-help="telemetry" onclick="toggleHelp(this)">?</button></div>
+  <div class="help-content" data-help-for="telemetry" style="display:none">
+    <p>Breakdown of LLM API calls by internal component. Shows token usage, estimated cost (via ModelCatalog pricing), and wall-clock time for each pipeline stage. Cost is calculated from input/output token counts at the model's list price.</p>
+    <dl>
+      <dt>Component</dt><dd>The VC pipeline stage making the LLM call (compactor, tagger, tool_loop, fact_curator, etc.).</dd>
+      <dt>Calls</dt><dd>Number of LLM API calls made by this component.</dd>
+      <dt>Input Tok</dt><dd>Total input tokens sent to the LLM across all calls for this component.</dd>
+      <dt>Output Tok</dt><dd>Total output tokens received from the LLM across all calls for this component.</dd>
+      <dt>Cost</dt><dd>Estimated USD cost based on ModelCatalog pricing. Actual billing may differ from list prices.</dd>
+      <dt>Time</dt><dd>Total wall-clock time spent waiting for LLM responses for this component.</dd>
+    </dl>
+  </div>
+  <div id="telemetry-content">
+    <span class="telemetry-empty">no LLM calls yet</span>
+  </div>
 </div>
 
 <div class="panel">
@@ -880,6 +906,86 @@
     }
   }
 
+  // Telemetry data from snapshot
+  var latestTelemetry = null;
+
+  function updateTelemetry(telem) {
+    latestTelemetry = telem;
+    var container = $('telemetry-content');
+    if (!telem || !telem.by_component || Object.keys(telem.by_component).length === 0) {
+      container.innerHTML = '<span class="telemetry-empty">no LLM calls yet</span>';
+      return;
+    }
+    var comps = telem.by_component;
+    var total = telem.total || {};
+    var html = '<table class="telemetry-table"><thead><tr>' +
+      '<th>Component</th><th>Calls</th><th>Input Tok</th><th>Output Tok</th><th>Cost (USD)</th><th>Time</th>' +
+      '</tr></thead><tbody>';
+    var names = Object.keys(comps).sort();
+    for (var i = 0; i < names.length; i++) {
+      var c = comps[names[i]];
+      html += '<tr>' +
+        '<td>' + names[i] + '</td>' +
+        '<td>' + fmtTelNum(c.call_count) + '</td>' +
+        '<td>' + fmtTelNum(c.input_tokens) + '</td>' +
+        '<td>' + fmtTelNum(c.output_tokens) + '</td>' +
+        '<td class="cost-cell">' + fmtTelCost(c.cost_usd) + '</td>' +
+        '<td>' + fmtTelTime(c.duration_ms) + '</td>' +
+        '</tr>';
+    }
+    // Total row
+    html += '<tr class="total-row">' +
+      '<td>TOTAL</td>' +
+      '<td>' + fmtTelNum(total.call_count || 0) + '</td>' +
+      '<td>' + fmtTelNum(total.input_tokens || 0) + '</td>' +
+      '<td>' + fmtTelNum(total.output_tokens || 0) + '</td>' +
+      '<td class="cost-cell">' + fmtTelCost(total.cost_usd || 0) + '</td>' +
+      '<td>' + fmtTelTime(total.duration_ms || 0) + '</td>' +
+      '</tr>';
+    html += '</tbody></table>';
+
+    // By-model breakdown (compact)
+    if (telem.by_model && Object.keys(telem.by_model).length > 0) {
+      var models = telem.by_model;
+      var mnames = Object.keys(models).sort();
+      html += '<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">By model: ';
+      var parts = [];
+      for (var j = 0; j < mnames.length; j++) {
+        var m = models[mnames[j]];
+        parts.push(mnames[j] + ' (' + fmtTelNum(m.call_count) + ' calls, ' + fmtTelCost(m.cost_usd) + ')');
+      }
+      html += parts.join(' &middot; ') + '</div>';
+    }
+
+    container.innerHTML = html;
+  }
+
+  function refreshTelemetry() {
+    fetch('/dashboard/telemetry')
+      .then(function(r) { return r.json(); })
+      .then(function(t) { updateTelemetry(t); })
+      .catch(function() {});
+  }
+
+  function fmtTelNum(n) {
+    if (n === undefined || n === null) return '0';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  function fmtTelCost(usd) {
+    if (usd === undefined || usd === null || usd === 0) return '$0.0000';
+    if (usd < 0.0001) return '<$0.0001';
+    return '$' + usd.toFixed(4);
+  }
+
+  function fmtTelTime(ms) {
+    if (ms === undefined || ms === null || ms === 0) return '0s';
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms / 1000).toFixed(1) + 's';
+  }
+
   function setTags(tags) {
     const cloud = $('tag-cloud');
     if (!tags || tags.length === 0) {
@@ -1139,6 +1245,7 @@
     updatePipeline();
     updateMemory();
     updateSavings();
+    updateTelemetry(data.telemetry || null);
     fetchSessions();
     setTags(data.active_tags || []);
     if (data.store_tag_count !== undefined) {
@@ -1781,6 +1888,7 @@
         handleResponse(data);
       } else if (data.type === 'turn_complete') {
         handleTurnComplete(data);
+        refreshTelemetry();
       } else if (data.type === 'compaction') {
         totalCompactions++;
         totalFreed += data.tokens_freed || 0;
@@ -1790,6 +1898,7 @@
         updateStats();
         updateSavings();
         fetchSessions();
+        refreshTelemetry();
       } else if (data.type === 'tool_intercept') {
         totalIntercepts++;
         addToolIntercept(data);
