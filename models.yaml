@@ -32,14 +32,14 @@ models:
     input_per_mtok: 0.10
     output_per_mtok: 0.40
     context_window: 128000
-    aliases: [gpt4-nano, gpt-4.1-nano]
+    aliases: [gpt4-nano]
 
   gpt-4.1-mini:
     provider: openai
     input_per_mtok: 0.40
     output_per_mtok: 1.60
     context_window: 128000
-    aliases: [gpt4-mini, gpt-4.1-mini]
+    aliases: [gpt4-mini]
 
   qwen3:4b-instruct-2507-fp16:
     provider: ollama
