@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from ..types import ToolCallRecord, ToolLoopResult
+from ..types import PagingConfig, ToolCallRecord, ToolLoopResult
 
 # Re-export adapter classes for backward compatibility
 from .provider_adapters import (  # noqa: F401
@@ -505,6 +505,7 @@ def _suppress_presented_segments(
         return result
 
     filtered = []
+    deduped_count = 0
     for item in results:
         if not isinstance(item, dict):
             filtered.append(item)
@@ -515,8 +516,10 @@ def _suppress_presented_segments(
         # Use any() for merged results: if any constituent segment was
         # already shown, the merged excerpt contains duplicate content.
         if ref and ref in presented:
+            deduped_count += 1
             continue
         if refs and any(r in presented for r in refs):
+            deduped_count += 1
             continue
         filtered.append(item)
         # Track newly presented segments
@@ -526,7 +529,14 @@ def _suppress_presented_segments(
             presented.add(r)
 
     result["results"] = filtered
-    if not filtered:
+    if not filtered and deduped_count > 0:
+        result["found"] = "already_provided"
+        result["message"] = (
+            f"Found {deduped_count} matching result(s) but they were already "
+            "returned in a previous search. The answer is in your context — "
+            "re-read the earlier search results."
+        )
+    elif not filtered:
         result["found"] = False
     return result
 
@@ -707,7 +717,7 @@ def execute_vc_tool(
 # Synchronous tool loop
 # ---------------------------------------------------------------------------
 
-_MAX_LOOPS = 10
+_MAX_LOOPS = PagingConfig.max_tool_loops
 _REDUNDANT_SEARCH_THRESHOLD = 3  # force-stop after this many all-found find_quote rounds
 _EMPTY_STREAK_HINT_THRESHOLD = 3  # suggest strategy change after this many empty results
 
@@ -847,6 +857,15 @@ def run_tool_loop(
     result.input_tokens += input_toks
     result.output_tokens += output_toks
 
+    model = original_request.get("model", "unknown")
+    if hasattr(engine, '_telemetry') and engine._telemetry:
+        engine._telemetry.log(
+            "tool_loop", model,
+            input_toks, output_toks,
+            duration_ms=0.0,
+            detail="initial",
+        )
+
     # Collect text from the initial response
     result.text += adapter.extract_text(initial_response)
 
@@ -970,13 +989,23 @@ def run_tool_loop(
             # Capture the continuation request body (deep copy to freeze state)
             result.raw_requests.append(copy.deepcopy(cont_body))
 
-            # Send continuation (retry on 503)
+            # Send continuation (retry on 429/503 with backoff)
+            _cont_t0 = time.monotonic()
             resp = client.post(url, headers=headers, json=cont_body)
-            for _retry in range(2):
-                if resp.status_code != 503:
+            for _retry in range(3):
+                if resp.status_code < 300:
                     break
-                time.sleep(5)
+                if resp.status_code not in (429, 503):
+                    break
+                wait = 2 ** (_retry + 1)  # 2, 4, 8 seconds
+                logger.warning(
+                    "Continuation %d got HTTP %d, retrying in %ds (%d/3)",
+                    result.continuation_count, resp.status_code,
+                    wait, _retry + 1,
+                )
+                time.sleep(wait)
                 resp = client.post(url, headers=headers, json=cont_body)
+            _cont_dur = round((time.monotonic() - _cont_t0) * 1000, 1)
             if resp.status_code >= 300:
                 logger.error(
                     "Continuation %d failed: HTTP %d",
@@ -993,6 +1022,14 @@ def run_tool_loop(
             input_toks, output_toks = adapter.extract_usage(cont_data)
             result.input_tokens += input_toks
             result.output_tokens += output_toks
+
+            if hasattr(engine, '_telemetry') and engine._telemetry:
+                engine._telemetry.log(
+                    "tool_loop", model,
+                    input_toks, output_toks,
+                    duration_ms=_cont_dur,
+                    detail=f"round_{loop_i + 1}",
+                )
 
             # Extract text
             result.text += adapter.extract_text(cont_data)
@@ -1056,20 +1093,64 @@ def run_tool_loop(
                         adapter.compress_previous_results(cont_body, forced_ids)
                         adapter.strip_tools(cont_body)
 
+                        # Minimize thinking budget on forced answer
+                        gen_cfg = cont_body.get("generationConfig")
+                        if isinstance(gen_cfg, dict) and "thinkingConfig" in gen_cfg:
+                            gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
+
+                        # Append nudge so the model responds with text
+                        _nudge = (
+                            "You have gathered enough information. "
+                            "Answer the original question now in 1-2 sentences."
+                        )
+                        _contents = cont_body.get("contents")
+                        if isinstance(_contents, list):
+                            _contents.append({
+                                "role": "user",
+                                "parts": [{"text": _nudge}],
+                            })
+                        _messages = cont_body.get("messages")
+                        if isinstance(_messages, list):
+                            _messages.append({
+                                "role": "user",
+                                "content": _nudge,
+                            })
+
                         result.continuation_count += 1
                         result.raw_requests.append(copy.deepcopy(cont_body))
+                        _forced_t0 = time.monotonic()
                         resp = client.post(url, headers=headers, json=cont_body)
+                        for _retry in range(3):
+                            if resp.status_code < 300:
+                                break
+                            wait = 2 ** (_retry + 1)
+                            logger.warning(
+                                "Forced text after redundant loop failed "
+                                "(HTTP %d), retrying in %ds (%d/3)",
+                                resp.status_code, wait, _retry + 1,
+                            )
+                            time.sleep(wait)
+                            resp = client.post(url, headers=headers, json=cont_body)
+                        _forced_dur = round((time.monotonic() - _forced_t0) * 1000, 1)
                         if resp.status_code < 300:
                             forced_data = _parse_provider_http_response(resp)
                             result.raw_responses.append(forced_data)
                             fi, fo = adapter.extract_usage(forced_data)
                             result.input_tokens += fi
                             result.output_tokens += fo
+                            if hasattr(engine, '_telemetry') and engine._telemetry:
+                                engine._telemetry.log(
+                                    "tool_loop", model,
+                                    fi, fo,
+                                    duration_ms=_forced_dur,
+                                    detail="forced_final",
+                                )
                             result.text += adapter.extract_text(forced_data)
                             result.stop_reason = "redundant_loop"
                         else:
                             logger.error(
-                                "Forced text after redundant loop failed: HTTP %d",
+                                "Forced text after redundant loop failed "
+                                "after retries: HTTP %d",
                                 resp.status_code,
                             )
                             result.stop_reason = "error"
@@ -1138,32 +1219,55 @@ def run_tool_loop(
 
                 # Append a user nudge so the model responds with text
                 # instead of burning tokens on internal reasoning.
+                # Works for all providers: Gemini uses "contents"/"parts",
+                # Anthropic/OpenAI use "messages"/"content".
+                _nudge_text = (
+                    "You have gathered enough information. "
+                    "Answer the original question now in 1-2 sentences."
+                )
                 contents = cont_body.get("contents")
                 if isinstance(contents, list):
                     contents.append({
                         "role": "user",
-                        "parts": [{"text": (
-                            "You have gathered enough information. "
-                            "Answer the original question now in 1-2 sentences."
-                        )}],
+                        "parts": [{"text": _nudge_text}],
+                    })
+                messages = cont_body.get("messages")
+                if isinstance(messages, list):
+                    messages.append({
+                        "role": "user",
+                        "content": _nudge_text,
                     })
 
                 result.continuation_count += 1
                 result.raw_requests.append(copy.deepcopy(cont_body))
+                _forced_t0 = time.monotonic()
                 resp = client.post(url, headers=headers, json=cont_body)
-                if resp.status_code >= 300:
+                # Retry with exponential backoff (handles 429 rate limits)
+                for _retry in range(3):
+                    if resp.status_code < 300:
+                        break
+                    wait = 2 ** (_retry + 1)  # 2, 4, 8 seconds
                     logger.warning(
-                        "Forced text continuation failed (HTTP %d), retrying once",
-                        resp.status_code,
+                        "Forced text continuation failed (HTTP %d), "
+                        "retrying in %ds (%d/3)",
+                        resp.status_code, wait, _retry + 1,
                     )
-                    time.sleep(1.0)
+                    time.sleep(wait)
                     resp = client.post(url, headers=headers, json=cont_body)
+                _forced_dur = round((time.monotonic() - _forced_t0) * 1000, 1)
                 if resp.status_code < 300:
                     forced_data = _parse_provider_http_response(resp)
                     result.raw_responses.append(forced_data)
                     fi, fo = adapter.extract_usage(forced_data)
                     result.input_tokens += fi
                     result.output_tokens += fo
+                    if hasattr(engine, '_telemetry') and engine._telemetry:
+                        engine._telemetry.log(
+                            "tool_loop", model,
+                            fi, fo,
+                            duration_ms=_forced_dur,
+                            detail="forced_final",
+                        )
                     result.text += adapter.extract_text(forced_data)
                     result.stop_reason = adapter.get_stop_reason(forced_data)
                 else:
