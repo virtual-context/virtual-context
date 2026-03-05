@@ -208,6 +208,11 @@ Response tagging - LLM tags the full user+assistant pair (background thread)
     │  └─ Compactor generates related_tags at write time (vocabulary bridging)
     │
     ▼
+Fact curation (on inbound, before assembly)
+    │  └─ LLM scores retrieved facts for relevance to current query
+    │     Low-relevance facts dropped before assembly
+    │
+    ▼
 Check token thresholds (soft 70%, hard 85%)
     │
     ▼ (if threshold exceeded)
@@ -308,7 +313,7 @@ Summaries compress information but inevitably lose specific details. When the us
 
 **Phase 1: Fact signals (per-turn).** The response tagger extracts lightweight subject/verb/object triples from each turn as it's processed, with full surrounding context (the same context lookback and bleed gating used for tagging). "I run 5K every morning" becomes `{subject: "user", verb: "runs", object: "5K every morning"}`. These are fast, cheap, and stored on the TurnTagIndex. Critically, they are not yet committed as permanent facts.
 
-**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are verified and consolidated into structured `Fact` records with the full multi-turn segment as context. The consolidation pass can see the complete conversation flow across multiple turns: what the user asked, how the assistant responded, what was clarified or corrected. This means a fact signal from turn 14 gets validated against turns 12-18 before becoming a permanent record. The result is a structured `Fact` with full provenance: subject, verb, what (the core assertion), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
+**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are verified and consolidated into structured `Fact` records with the full multi-turn segment as context. The consolidation pass can see the complete conversation flow across multiple turns: what the user asked, how the assistant responded, what was clarified or corrected. This means a fact signal from turn 14 gets validated against turns 12-18 before becoming a permanent record. The result is a structured `Fact` with full provenance: subject, verb, what (the core assertion), `fact_type` classification (`preference`, `biographical`, `decision`, `plan`, `opinion`, `routine`, `relationship`, `skill`, `medical`, `financial`, `general`), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
 
 **Why two phases matter.** A single-pass extractor processing "yes, let's go with PostgreSQL" in isolation has no idea what "yes" refers to. It might extract nothing, or hallucinate a fact. virtual-context's response tagger sees the surrounding turns ("Should we use PostgreSQL or MySQL for the user table?") and generates the correct signal. The consolidation pass then verifies it against the full segment before storing a permanent fact. Two chances to get it right, each with progressively more context.
 
@@ -318,7 +323,12 @@ Summaries compress information but inevitably lose specific details. When the us
 vc_query_facts(subject="user", verb="runs")
 vc_query_facts(object_contains="5K")
 vc_query_facts(status="active")
+vc_query_facts(fact_type="preference")
 ```
+
+**Phase 3: Fact curation (on inbound query).** Before assembling context, the `FactCurator` filters retrieved facts for relevance to the current query. An LLM pass scores each candidate fact against the user's message and drops low-relevance facts that would consume budget without adding signal. This prevents the reader from seeing 40 facts when only 3 matter, reducing noise and improving answer precision. Configurable via `curation.enabled` and `curation.model`.
+
+**Fact supersession.** When new information contradicts or updates a previously stored fact ("I moved from NYC to LA"), the supersession checker detects the conflict and marks the old fact as superseded. Detection uses object-keyword similarity to find cross-session candidates that share the same subject and semantic domain, then an LLM verifies whether the new fact genuinely replaces the old one. Superseded facts are retained in storage (for audit) but excluded from query results.
 
 **Semantic verb expansion.** Queries like `verb="runs"` automatically expand to morphologically similar verbs in the database (e.g., "running", "run", "jogs") via sentence-transformer embedding similarity. This means the reader doesn't need to guess the exact verb form used during extraction.
 
@@ -498,6 +508,11 @@ tag_rules:
     priority: 5
     ttl_days: 30
 
+# Telemetry (LLM cost, token, and timing tracking)
+telemetry:
+  enabled: true
+  models_file: models.yaml
+
 # Compaction triggers
 compaction:
   soft_threshold: 0.70                       # proactive
@@ -563,7 +578,9 @@ virtual-context daemon stop                    # stop daemon
 virtual-context daemon restart                 # stop + start daemon
 virtual-context daemon uninstall               # remove daemon definition
 virtual-context config validate                # check config syntax
-virtual-context cost-report                    # show session LLM usage
+virtual-context telemetry                     # per-component LLM cost, tokens, and timing
+virtual-context telemetry --verbose           # per-call event log
+virtual-context telemetry --json              # machine-readable output
 ```
 
 ## Interactive Chat (TUI)
@@ -739,6 +756,25 @@ The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dash
 
 **JSON export.** Download the full session state (all events, all stats) as a single JSON file for offline analysis or bug reporting.
 
+**Telemetry panel.** Per-component LLM cost and timing breakdown (compactor, tagger, tool_loop, fact_curator, proxy_upstream) with call counts, token volumes, total cost, and cumulative time. Auto-refreshes via AJAX.
+
+#### Telemetry
+
+Every LLM call across the pipeline is instrumented with token counts, cost, and wall-clock timing. A `models.yaml` catalog (project root) provides pricing for all supported models — Anthropic, OpenAI, Google, Xiaomi, Ollama — with alias resolution so `"haiku"`, `"claude-haiku"`, and `"claude-haiku-4-5-20251001"` all resolve correctly.
+
+The telemetry ledger tracks five components: `compactor`, `tagger`, `tool_loop`, `fact_curator`, and `proxy_upstream`. Data is available three ways:
+
+- **Dashboard**: the telemetry panel shows live per-component breakdown (calls, tokens, cost, time)
+- **CLI**: `virtual-context telemetry` prints a formatted table; `--verbose` shows every individual call
+- **Programmatic**: `engine.get_telemetry().to_dict()` returns the full event log and rollups
+
+```yaml
+# Override the default bundled catalog:
+telemetry:
+  enabled: true
+  models_file: models.yaml  # resolved relative to config directory
+```
+
 ### MCP Server (Model Context Protocol)
 
 ```bash
@@ -783,7 +819,10 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
 | **Compactor** | `core/compactor.py` | LLM summarization + fact extraction + tag summary rollup, concurrent via ThreadPoolExecutor |
-| **CostTracker** | `core/cost_tracker.py` | Per-session LLM usage and cost tracking |
+| **ModelCatalog** | `core/model_catalog.py` | YAML-based model pricing catalog with alias resolution |
+| **TelemetryLedger** | `core/telemetry.py` | Per-call event log with per-component rollup (cost, tokens, timing) |
+| **FactCurator** | `ingest/curator.py` | LLM-based fact relevance filtering on inbound queries |
+| **SupersessionChecker** | `ingest/supersession.py` | Cross-session fact deduplication via object-keyword similarity |
 | **ToolLoop** | `core/tool_loop.py` | Multi-provider multi-round tool execution for reader model (Anthropic/OpenAI/Gemini) |
 | **ContextStore** | `core/store.py` | Storage interface (SQLite or filesystem) |
 | **PayloadFormat** | `proxy/formats.py` | Strategy pattern for Anthropic/OpenAI/Gemini request/response handling |
@@ -880,6 +919,12 @@ The proxy has been validated in production with OpenClaw (Telegram bot) handling
 - **Embedding inbound matching**: Live tag vocabularies of 40+ tags correctly matched ("help me with css styling" → `[css, design]`, "what about font-weight" → `[css]` via semantic similarity)
 - **History ingestion**: 43 pre-existing conversation turns tagged and indexed in a single pass, vocabulary immediately available for subsequent requests
 
+### LongMemEval Benchmark
+
+A built-in benchmark harness (`benchmarks/longmemeval/`) evaluates virtual-context against the [LongMemEval dataset](https://arxiv.org/abs/2410.10813) (ICLR 2025) — 500 questions requiring recall across long conversation histories.
+
+The harness runs each question through both a baseline (full-haystack) reader and a virtual-context reader, then judges correctness via LLM evaluation. Supports Anthropic, OpenAI, Google, and OpenAI Codex as reader backends. Budget tracking via ModelCatalog ensures cost visibility per run.
+
 ## Development
 
 ```bash
@@ -887,7 +932,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # ~1170 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # ~1260 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
 ```
 
