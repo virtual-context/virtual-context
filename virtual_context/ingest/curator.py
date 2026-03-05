@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
+from ..core.telemetry import TelemetryLedger
 from ..types import CurationConfig, Fact, LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -26,10 +28,12 @@ class FactCurator:
         llm_provider: LLMProvider,
         model: str,
         config: CurationConfig,
+        telemetry_ledger: TelemetryLedger | None = None,
     ) -> None:
         self.llm = llm_provider
         self.model = model
         self.config = config
+        self._telemetry = telemetry_ledger
 
     def curate(self, facts: list[Fact], question: str) -> list[Fact]:
         """Return the subset of facts relevant to the question.
@@ -47,6 +51,7 @@ class FactCurator:
             f"Facts:\n{facts_text}"
         )
 
+        t0 = time.time()
         try:
             response = self.llm.complete(
                 system=_SYSTEM,
@@ -56,6 +61,20 @@ class FactCurator:
         except Exception as e:
             logger.warning("Fact curation LLM call failed: %s — returning all facts", e)
             return facts
+
+        duration_ms = (time.time() - t0) * 1000
+
+        # Log telemetry
+        if self._telemetry:
+            usage = getattr(self.llm, "last_usage", {})
+            input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+            self._telemetry.log(
+                "fact_curator", self.model,
+                input_tokens, output_tokens,
+                duration_ms=duration_ms,
+                detail="fact_curation",
+            )
 
         selected = self._parse_response(response, len(facts))
         if not selected:
