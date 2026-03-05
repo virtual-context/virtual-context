@@ -313,7 +313,9 @@ class AnthropicFormat(PayloadFormat):
         if isinstance(existing, list):
             body["system"] = existing + [{"type": "text", "text": context_block}]
         else:
-            body["system"] = f"{context_block}\n\n{existing}" if existing else context_block
+            # Append VC block AFTER existing system prompt so the stable prefix
+            # remains cacheable by Anthropic prompt caching.
+            body["system"] = f"{existing}\n\n{context_block}" if existing else context_block
         return body
 
     def extract_session_id(self, body: dict) -> str | None:
@@ -545,8 +547,10 @@ class OpenAIFormat(PayloadFormat):
         if messages and messages[0].get("role") == "system":
             existing = messages[0].get("content", "")
             messages[0] = dict(messages[0])
+            # Append VC block AFTER existing system prompt so the stable prefix
+            # remains cacheable by OpenAI prefix caching.
             messages[0]["content"] = (
-                f"{context_block}\n\n{existing}" if existing else context_block
+                f"{existing}\n\n{context_block}" if existing else context_block
             )
         else:
             messages.insert(0, {"role": "system", "content": context_block})
@@ -772,7 +776,9 @@ class GeminiFormat(PayloadFormat):
         # Gemini uses system_instruction.parts[] for system prompt
         si = body.get("system_instruction", {})
         existing_parts = si.get("parts", []) if isinstance(si, dict) else []
-        new_parts = [{"text": context_block}] + list(existing_parts)
+        # Append VC block AFTER existing system instruction so the stable prefix
+        # remains cacheable by Gemini context caching.
+        new_parts = list(existing_parts) + [{"text": context_block}]
         body["system_instruction"] = {"parts": new_parts}
         return body
 
@@ -1107,8 +1113,10 @@ class OpenAIResponsesFormat(PayloadFormat):
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         existing = body.get("instructions", "")
+        # Append VC block AFTER existing instructions so the stable prefix
+        # remains cacheable by OpenAI prefix caching.
         body["instructions"] = (
-            f"{context_block}\n\n{existing}" if existing else context_block
+            f"{existing}\n\n{context_block}" if existing else context_block
         )
         return body
 

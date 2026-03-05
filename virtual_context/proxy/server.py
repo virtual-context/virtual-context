@@ -1723,6 +1723,19 @@ async def _handle_streaming(
                 "session_id": session_id,
             })
         assistant_text = "".join(text_chunks)
+        # Log upstream LLM call to telemetry ledger
+        if state and hasattr(state.engine, '_telemetry'):
+            _model = body.get("model", "unknown")
+            _out_tok = len(assistant_text) // 4 if assistant_text else 0
+            _in_tok = state._last_enriched_payload_tokens or 0
+            state.engine._telemetry.log(
+                component="proxy_upstream",
+                model=_model,
+                input_tokens=_in_tok,
+                output_tokens=_out_tok,
+                duration_ms=upstream_ms,
+                detail="streaming",
+            )
         print(
             f"[T{turn}] RESPONSE stream={True} "
             f"llm={int(upstream_ms)}ms "
@@ -2524,6 +2537,20 @@ async def _handle_non_streaming(
             "streaming": False,
             "session_id": session_id,
         })
+
+    # Log upstream LLM call to telemetry ledger
+    if state and hasattr(state.engine, '_telemetry'):
+        _model = body.get("model", "unknown")
+        _out_tok = len(assistant_text) // 4 if assistant_text else 0
+        _in_tok = getattr(state, '_last_enriched_payload_tokens', 0) or 0
+        state.engine._telemetry.log(
+            component="proxy_upstream",
+            model=_model,
+            input_tokens=_in_tok,
+            output_tokens=_out_tok,
+            duration_ms=upstream_ms,
+            detail="non_streaming",
+        )
 
     print(
         f"[T{turn}] RESPONSE stream=False "

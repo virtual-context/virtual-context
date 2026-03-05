@@ -17,7 +17,7 @@ models:
     input_per_mtok: 3.00
     output_per_mtok: 15.00
     context_window: 200000
-    aliases: [claude-sonnet-4-5]
+    aliases: [claude-sonnet-4-5, claude-sonnet-4-20250514]
 
   claude-sonnet-4-6:
     provider: anthropic
@@ -31,7 +31,7 @@ models:
     input_per_mtok: 5.00
     output_per_mtok: 25.00
     context_window: 200000
-    aliases: []
+    aliases: [claude-opus-4-20250514]
 
   claude-opus-4-6:
     provider: anthropic
@@ -122,6 +122,20 @@ models:
     output_per_mtok: 2.50
     context_window: 1000000
     aliases: [gemini-flash, gemini-2.5-flash-preview-04-17]
+
+  gemini-3.1-pro-preview:
+    provider: google
+    input_per_mtok: 2.00
+    output_per_mtok: 12.00
+    context_window: 1000000
+    aliases: [gemini-3.1-pro]
+
+  gemini-3-pro-preview:
+    provider: google
+    input_per_mtok: 2.00
+    output_per_mtok: 12.00
+    context_window: 1000000
+    aliases: [gemini-3-pro]
 
   gemini-2.0-flash:
     provider: google
