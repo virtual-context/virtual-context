@@ -74,7 +74,8 @@ class TestPagingConfig:
     def test_defaults(self):
         cfg = PagingConfig()
         assert cfg.enabled is False
-        assert cfg.autonomous_models == ["opus", "sonnet", "gpt-4", "gpt-4o"]
+        assert "claude-opus-4" in cfg.autonomous_models
+        assert "gpt-4o" in cfg.autonomous_models
         assert cfg.auto_promote is True
         assert cfg.auto_evict is True
 
@@ -724,7 +725,8 @@ class TestPagingConfigParsing:
     def test_default_config(self):
         cfg = _build_config({})
         assert cfg.paging.enabled is False
-        assert cfg.paging.autonomous_models == ["opus", "sonnet", "gpt-4", "gpt-4o"]
+        assert "claude-opus-4" in cfg.paging.autonomous_models
+        assert "gpt-4o" in cfg.paging.autonomous_models
         assert cfg.paging.auto_promote is True
         assert cfg.paging.auto_evict is True
 
@@ -772,31 +774,32 @@ class TestResolvePagingMode:
         assert engine._resolve_paging_mode("claude-opus-4") == "supervised"
 
     def test_opus_matches(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
         assert engine._resolve_paging_mode("claude-opus-4") == "autonomous"
 
     def test_sonnet_matches(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["claude-sonnet-4"])
         assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
-    def test_gpt4_matches(self, tmp_path):
+    def test_prefix_match(self, tmp_path):
+        """Prefix match: 'gpt-4' matches 'gpt-4-turbo'."""
         engine = self._make_engine(tmp_path, autonomous_models=["gpt-4"])
         assert engine._resolve_paging_mode("gpt-4-turbo") == "autonomous"
 
     def test_haiku_not_in_list(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
         assert engine._resolve_paging_mode("claude-haiku-3") == "supervised"
 
     def test_unknown_model_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
         assert engine._resolve_paging_mode("qwen3:4b") == "supervised"
 
     def test_empty_model_name_supervised(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["opus", "sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
         assert engine._resolve_paging_mode("") == "supervised"
 
     def test_case_insensitive(self, tmp_path):
-        engine = self._make_engine(tmp_path, autonomous_models=["Sonnet"])
+        engine = self._make_engine(tmp_path, autonomous_models=["Claude-Sonnet-4"])
         assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
 

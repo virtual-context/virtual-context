@@ -241,7 +241,12 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     paging_config = PagingConfig(
         enabled=paging_raw.get("enabled", False),
         autonomous_models=paging_raw.get("autonomous_models", [
-            "opus", "sonnet", "gpt-4", "gpt-4o",
+            "claude-3-opus", "claude-3-5-sonnet", "claude-3.5-sonnet",
+            "claude-3-7-sonnet", "claude-3.7-sonnet",
+            "claude-4", "claude-sonnet-4", "claude-opus-4",
+            "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-4.5", "gpt-5",
+            "o1", "o3", "o4-mini",
+            "gemini-2", "gemini-pro",
         ]),
         auto_promote=paging_raw.get("auto_promote", True),
         auto_evict=paging_raw.get("auto_evict", True),
@@ -378,7 +383,7 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
     # Paging autonomous_models
     if not isinstance(config.paging.autonomous_models, list):
         errors.append(
-            "paging.autonomous_models must be a list of model-name substrings"
+            "paging.autonomous_models must be a list of model-name prefixes"
         )
 
     # Proxy instances validation
