@@ -178,3 +178,79 @@ def test_context_hint_in_budget(assembler, retrieval_result):
         context_hint=hint,
     )
     assert result.budget_breakdown["context_hint"] > 0
+
+
+def test_budget_cap_truncates_least_relevant_tags():
+    """When assembled prepend_text exceeds token_budget, drop least-relevant tags."""
+    now = datetime.now(timezone.utc)
+    assembler = ContextAssembler(
+        config=AssemblerConfig(
+            core_context_max_tokens=1000,
+            tag_context_max_tokens=5000,
+        )
+    )
+    summaries = []
+    for i, tag in enumerate(["high-priority", "medium-priority", "low-priority"]):
+        summaries.append(StoredSummary(
+            ref=f"ref-{i}",
+            primary_tag=tag,
+            tags=[tag],
+            summary="x" * 400,  # ~100 tokens each
+            summary_tokens=100,
+            full_tokens=400,
+            metadata=SegmentMetadata(),
+            created_at=now,
+            start_timestamp=now,
+            end_timestamp=now,
+        ))
+    rr = RetrievalResult(
+        tags_matched=["high-priority", "medium-priority", "low-priority"],
+        summaries=summaries,
+        total_tokens=300,
+    )
+    result = assembler.assemble(
+        core_context="core",
+        retrieval_result=rr,
+        conversation_history=[],
+        token_budget=250,
+    )
+    prepend_tokens = assembler.token_counter(result.prepend_text)
+    assert prepend_tokens <= 250
+
+
+def test_budget_cap_logs_error(caplog):
+    """Exceeding token_budget logs an ERROR with config guidance."""
+    import logging
+    now = datetime.now(timezone.utc)
+    assembler = ContextAssembler(
+        config=AssemblerConfig(
+            core_context_max_tokens=1000,
+            tag_context_max_tokens=5000,
+        )
+    )
+    summaries = [StoredSummary(
+        ref="ref-0",
+        primary_tag="big-tag",
+        tags=["big-tag"],
+        summary="x" * 400,
+        summary_tokens=100,
+        full_tokens=400,
+        metadata=SegmentMetadata(),
+        created_at=now,
+        start_timestamp=now,
+        end_timestamp=now,
+    )]
+    rr = RetrievalResult(
+        tags_matched=["big-tag"],
+        summaries=summaries,
+        total_tokens=100,
+    )
+    with caplog.at_level(logging.ERROR):
+        assembler.assemble(
+            core_context="core",
+            retrieval_result=rr,
+            conversation_history=[],
+            token_budget=5,
+        )
+    assert any("exceeds token_budget" in r.message for r in caplog.records)
+    assert any("tag_context_max_tokens" in r.message for r in caplog.records)
