@@ -816,7 +816,7 @@ class TestContextHintModes:
             paging=PagingConfig(enabled=paging_enabled),
             assembler=AssemblerConfig(
                 context_hint_enabled=True,
-                context_hint_max_tokens=500,
+                context_hint_max_tokens=800,
                 tag_context_max_tokens=10_000,
             ),
         )
