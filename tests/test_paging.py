@@ -1554,3 +1554,174 @@ class TestCrossTagSegmentDedup:
         assert all_refs.count("shared-seg-1") == 1
         # "auth" tag should get an empty list (shared seg already claimed by "api")
         assert "auth" not in full_segments_param
+
+
+# ---------------------------------------------------------------------------
+# BUG-035: Payload structure invariants — system-reminder wrapping,
+# inject_context replacement (not stacking), segment dedup
+# ---------------------------------------------------------------------------
+
+class TestPayloadStructureInvariants:
+    """End-to-end invariants for the request payload across tool loop rounds.
+
+    Verifies BUG-035 fixes stay intact:
+    1. Initial body wraps system prompt in <system-reminder>
+    2. inject_context replaces (not stacks) the <system-reminder> block
+    3. Stable system prompt prefix is preserved after replacement
+    4. No duplicate <virtual-context> or <system-reminder> blocks after
+       multiple inject_context calls (simulating multi-round tool loop)
+    """
+
+    def test_initial_body_wraps_system_in_system_reminder(self):
+        """query_with_tools wrapping logic: system → <system-reminder>."""
+        system = "You are a helpful assistant.\n\nHere is context about topics."
+        # Replicate the wrapping from engine.py:2065-2067
+        wrapped_system = f"<system-reminder>\n{system}\n</system-reminder>"
+
+        from virtual_context.core.provider_adapters import AnthropicAdapter
+        adapter = AnthropicAdapter("test-key")
+        body = adapter.build_request_body(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "hello"}],
+            system=wrapped_system,
+            max_tokens=4096,
+            temperature=0.0,
+            tools=None,
+        )
+
+        # System must contain exactly one <system-reminder> block
+        import re
+        blocks = re.findall(r"<system-reminder>", body["system"])
+        assert len(blocks) == 1, f"Expected 1 <system-reminder> block, found {len(blocks)}"
+        assert system in body["system"], "Original system text must be inside the block"
+
+    def test_inject_context_replaces_not_stacks(self):
+        """Simulates tool loop reassembly: inject_context must replace, not prepend."""
+        from virtual_context.core.provider_adapters import AnthropicAdapter
+        adapter = AnthropicAdapter("test-key")
+
+        # Initial body with wrapped system (as query_with_tools produces)
+        initial_system = "<system-reminder>\nInitial assembled context with tags.\n</system-reminder>"
+        body = adapter.build_request_body(
+            model="claude-sonnet-4-20250514",
+            messages=[{"role": "user", "content": "hello"}],
+            system=initial_system,
+            max_tokens=4096,
+            temperature=0.0,
+            tools=None,
+        )
+
+        # Simulate reassembly — inject_context called with new context
+        adapter.inject_context(body, "Reassembled context after expand_topic.")
+
+        import re
+        blocks = re.findall(r"<system-reminder>", body["system"])
+        assert len(blocks) == 1, (
+            f"Expected 1 <system-reminder> after inject, found {len(blocks)}. "
+            f"inject_context is stacking instead of replacing!"
+        )
+        assert "Reassembled context after expand_topic." in body["system"]
+        assert "Initial assembled context" not in body["system"]
+
+    def test_stable_prefix_survives_multiple_reassemblies(self):
+        """Proxy-like scenario: user instructions before VC block survive N reassemblies."""
+        from virtual_context.core.provider_adapters import AnthropicAdapter
+        adapter = AnthropicAdapter("test-key")
+
+        stable_prefix = "You are a helpful assistant. Always be concise."
+        initial_vc = "Tag summaries from initial assembly."
+        system = f"{stable_prefix}\n\n<system-reminder>\n{initial_vc}\n</system-reminder>"
+
+        body = {"system": system, "messages": [{"role": "user", "content": "hi"}]}
+
+        # Simulate 5 rounds of reassembly (worst case from q31 was 8)
+        for i in range(5):
+            adapter.inject_context(body, f"Reassembled context round {i + 1}.")
+
+        import re
+        blocks = re.findall(r"<system-reminder>", body["system"])
+        assert len(blocks) == 1, (
+            f"After 5 reassemblies: expected 1 block, found {len(blocks)}"
+        )
+        assert stable_prefix in body["system"], "Stable prefix lost after reassembly"
+        assert "Reassembled context round 5." in body["system"]
+        # None of the earlier rounds' content should persist
+        assert "Reassembled context round 4." not in body["system"]
+        assert "initial assembly" not in body["system"]
+
+    def test_no_duplicate_virtual_context_blocks_after_reassembly(self):
+        """The old <virtual-context> tag format must also not duplicate."""
+        from virtual_context.core.provider_adapters import AnthropicAdapter
+        adapter = AnthropicAdapter("test-key")
+
+        body = {
+            "system": "<virtual-context>\nOld format block.\n</virtual-context>",
+            "messages": [],
+        }
+
+        adapter.inject_context(body, "New content via system-reminder.")
+
+        import re
+        vc_blocks = re.findall(r"<virtual-context>", body["system"])
+        sr_blocks = re.findall(r"<system-reminder>", body["system"])
+        assert len(vc_blocks) == 0, "Old <virtual-context> block should be replaced"
+        assert len(sr_blocks) == 1, "Exactly one <system-reminder> block expected"
+        assert "New content via system-reminder." in body["system"]
+
+    def test_all_providers_wrap_and_replace_correctly(self):
+        """All 4 provider adapters must support find-and-replace on <system-reminder>."""
+        from virtual_context.core.provider_adapters import (
+            AnthropicAdapter, GeminiAdapter, OpenAIAdapter, OpenAICodexAdapter,
+        )
+        import re
+
+        adapters_and_extractors = [
+            (
+                AnthropicAdapter("k"),
+                lambda b: b["system"],
+            ),
+            (
+                OpenAIAdapter("k"),
+                lambda b: b["messages"][0]["content"]
+                if b["messages"] and b["messages"][0]["role"] == "system"
+                else "",
+            ),
+            (
+                GeminiAdapter("k"),
+                lambda b: b.get("system_instruction", {})
+                .get("parts", [{}])[0]
+                .get("text", ""),
+            ),
+            (
+                OpenAICodexAdapter("k"),
+                lambda b: b.get("instructions", ""),
+            ),
+        ]
+
+        for adapter, extract_system in adapters_and_extractors:
+            name = type(adapter).__name__
+            # Build initial body with wrapped system
+            wrapped = "<system-reminder>\nInitial context.\n</system-reminder>"
+            body = adapter.build_request_body(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                system=wrapped,
+                max_tokens=1024,
+                temperature=0.0,
+                tools=None,
+            )
+
+            # Inject new context (simulating reassembly)
+            adapter.inject_context(body, "Round 2 context.")
+
+            system_text = extract_system(body)
+            sr_count = len(re.findall(r"<system-reminder>", system_text))
+            assert sr_count == 1, (
+                f"{name}: expected 1 <system-reminder> after inject, found {sr_count}"
+            )
+            assert "Round 2 context." in system_text, (
+                f"{name}: new context not found in system"
+            )
+            assert "Initial context." not in system_text, (
+                f"{name}: old context still present — inject_context stacked!"
+            )
