@@ -184,6 +184,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     assembler_config = AssemblerConfig(
         core_context_max_tokens=assembly_raw.get("core_context_max_tokens", 18_000),
         tag_context_max_tokens=assembly_raw.get("tag_context_max_tokens", 30_000),
+        facts_max_tokens=assembly_raw.get("facts_max_tokens", 20_000),
         core_files=assembly_raw.get("core_files", []),
         recent_turns_always_included=assembly_raw.get("recent_turns_always_included", 3),
         context_hint_enabled=assembly_raw.get("context_hint_enabled", True),

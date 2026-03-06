@@ -96,7 +96,7 @@ class ProxyState:
         self._last_payload_tokens: int = 0
         self._last_enriched_payload_tokens: int = 0
         # Live request counter: incremented on each user turn processed through proxy
-        self._live_requests: int = 0
+        self._total_requests: int = 0
 
     @property
     def turn_offset(self) -> int:
@@ -174,7 +174,7 @@ class ProxyState:
         snap = {
             "session_id": engine.config.session_id,
             "turn_count": len(self.conversation_history) // 2,
-            "live_requests": self._live_requests,
+            "total_requests": self._total_requests,
             "compacted_through": getattr(engine, "_compacted_through", 0),
             "tag_count": len(idx.entries),
             "distinct_tags": len(all_tags),

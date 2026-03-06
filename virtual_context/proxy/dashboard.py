@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 # Module-level replay state (one replay at a time)
 _replay_state: dict = {}
+_replay_lock: asyncio.Lock | None = None  # created lazily inside the event loop
+
+
+def _get_replay_lock() -> asyncio.Lock:
+    """Return the module-level replay lock, creating it lazily."""
+    global _replay_lock
+    if _replay_lock is None:
+        _replay_lock = asyncio.Lock()
+    return _replay_lock
 
 
 def _build_settings_response(cfg) -> dict:
@@ -109,6 +118,12 @@ def register_dashboard_routes(
 
     _static_dir = Path(__file__).parent / "static"
     _token = dashboard_token or os.environ.get("VC_DASHBOARD_TOKEN", "")
+    if not _token:
+        logger.warning(
+            "Dashboard token not configured — mutating endpoints "
+            "(shutdown, compact, replay, settings) are unprotected. "
+            "Set VC_DASHBOARD_TOKEN or pass dashboard_token to secure them."
+        )
 
     @app.get("/dashboard")
     async def dashboard_page():
@@ -401,86 +416,89 @@ def register_dashboard_routes(
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
-        if _replay_state.get("running"):
-            return JSONResponse(
-                {"error": "Replay already running"}, status_code=409,
+
+        # I4: serialize check-and-set to prevent double-start race
+        async with _get_replay_lock():
+            if _replay_state.get("running"):
+                return JSONResponse(
+                    {"error": "Replay already running"}, status_code=409,
+                )
+
+            if not getattr(state.engine, "_llm_provider", None):
+                return JSONResponse(
+                    {"error": "No LLM provider configured in engine"},
+                    status_code=503,
+                )
+
+            body = await request.json()
+            file_path = body.get("file", "")
+
+            if not file_path:
+                return JSONResponse(
+                    {"error": "Missing 'file' field"}, status_code=400,
+                )
+
+            p = Path(file_path).resolve()
+
+            # Prevent path traversal: resolved path must be under CWD
+            allowed_root = Path.cwd().resolve()
+            if not str(p).startswith(str(allowed_root) + os.sep) and p != allowed_root:
+                return JSONResponse(
+                    {"error": "Path is outside the allowed directory"}, status_code=403,
+                )
+
+            # Restrict to files with expected replay extensions to prevent
+            # arbitrary file reads via this endpoint.
+            allowed_extensions = {".txt", ".md", ".yaml", ".yml", ".json", ".jsonl"}
+            if p.suffix.lower() not in allowed_extensions:
+                return JSONResponse(
+                    {"error": f"File type not allowed: {p.suffix}"}, status_code=400,
+                )
+
+            if not p.exists():
+                return JSONResponse(
+                    {"error": "File not found"}, status_code=400,
+                )
+
+            try:
+                prompts = load_replay_prompts(p)
+            except Exception as e:
+                logger.error("Failed to load prompts from %s: %s", p, e)
+                return JSONResponse(
+                    {"error": "Failed to load prompts file"}, status_code=400,
+                )
+
+            if not prompts:
+                return JSONResponse(
+                    {"error": "No prompts found in file"}, status_code=400,
+                )
+
+            cancel = asyncio.Event()
+            task = asyncio.create_task(
+                _replay_worker(prompts, state, metrics, cancel)
             )
 
-        if not getattr(state.engine, "_llm_provider", None):
-            return JSONResponse(
-                {"error": "No LLM provider configured in engine"},
-                status_code=503,
-            )
+            def _on_replay_done(t: asyncio.Task) -> None:
+                exc = t.exception() if not t.cancelled() else None
+                if exc:
+                    logger.error("Replay task failed: %s", exc, exc_info=exc)
+                    metrics.record({
+                        "type": "replay_done",
+                        "turns_completed": 0,
+                        "total": len(prompts),
+                        "status": "error",
+                        "error": str(exc),
+                    })
+                    _replay_state.clear()
 
-        body = await request.json()
-        file_path = body.get("file", "")
-
-        if not file_path:
-            return JSONResponse(
-                {"error": "Missing 'file' field"}, status_code=400,
-            )
-
-        p = Path(file_path).resolve()
-
-        # Prevent path traversal: resolved path must be under CWD
-        allowed_root = Path.cwd().resolve()
-        if not str(p).startswith(str(allowed_root) + os.sep) and p != allowed_root:
-            return JSONResponse(
-                {"error": "Path is outside the allowed directory"}, status_code=403,
-            )
-
-        # Restrict to files with expected replay extensions to prevent
-        # arbitrary file reads via this endpoint.
-        allowed_extensions = {".txt", ".md", ".yaml", ".yml", ".json", ".jsonl"}
-        if p.suffix.lower() not in allowed_extensions:
-            return JSONResponse(
-                {"error": f"File type not allowed: {p.suffix}"}, status_code=400,
-            )
-
-        if not p.exists():
-            return JSONResponse(
-                {"error": "File not found"}, status_code=400,
-            )
-
-        try:
-            prompts = load_replay_prompts(p)
-        except Exception as e:
-            logger.error("Failed to load prompts from %s: %s", p, e)
-            return JSONResponse(
-                {"error": "Failed to load prompts file"}, status_code=400,
-            )
-
-        if not prompts:
-            return JSONResponse(
-                {"error": "No prompts found in file"}, status_code=400,
-            )
-
-        cancel = asyncio.Event()
-        task = asyncio.create_task(
-            _replay_worker(prompts, state, metrics, cancel)
-        )
-
-        def _on_replay_done(t: asyncio.Task) -> None:
-            exc = t.exception() if not t.cancelled() else None
-            if exc:
-                logger.error("Replay task failed: %s", exc, exc_info=exc)
-                metrics.record({
-                    "type": "replay_done",
-                    "turns_completed": 0,
-                    "total": len(prompts),
-                    "status": "error",
-                    "error": str(exc),
-                })
-                _replay_state.clear()
-
-        task.add_done_callback(_on_replay_done)
-        _replay_state.update({
-            "running": True,
-            "task": task,
-            "cancel": cancel,
-            "turn": 0,
-            "total": len(prompts),
-        })
+            task.add_done_callback(_on_replay_done)
+            _replay_state.update({
+                "running": True,
+                "task": task,
+                "cancel": cancel,
+                "turn": 0,
+                "total": len(prompts),
+            })
 
         return JSONResponse({
             "status": "started",
@@ -706,7 +724,14 @@ async def _call_llm(
     messages: list[dict],
 ) -> str:
     """Call the LLM in the correct format (OpenAI or Anthropic)."""
+    # Build auth headers at call time from _raw_key (headers dict has redacted keys)
+    raw_key = prov.get("_raw_key", "")
     if prov["format"] == "anthropic":
+        call_headers = {
+            "x-api-key": raw_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
         payload = {
             "model": prov["model"],
             "max_tokens": 4096,
@@ -717,13 +742,17 @@ async def _call_llm(
                 f"<system-reminder>\n{system_text}\n</system-reminder>"
             )
             payload["system"] = context_block
-        resp = await client.post(prov["url"], headers=prov["headers"], json=payload)
+        resp = await client.post(prov["url"], headers=call_headers, json=payload)
         data = resp.json()
         content = data.get("content", [])
         parts = [b["text"] for b in content if b.get("type") == "text"]
         return "".join(parts)
     else:
         # OpenAI-compatible
+        call_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {raw_key}",
+        }
         msgs = []
         if system_text:
             context_block = (
@@ -736,7 +765,7 @@ async def _call_llm(
             "messages": msgs,
             "stream": False,
         }
-        resp = await client.post(prov["url"], headers=prov["headers"], json=payload)
+        resp = await client.post(prov["url"], headers=call_headers, json=payload)
         data = resp.json()
         choices = data.get("choices", [])
         return choices[0].get("message", {}).get("content", "") if choices else ""
@@ -747,6 +776,13 @@ def _get_provider_config(engine) -> dict:
     from ..providers.generic_openai import GenericOpenAIProvider
 
     provider = engine._llm_provider
+
+    def _redact(key: str) -> str:
+        """Mask API key for safe inclusion in dicts that may be serialized."""
+        if not key or len(key) <= 8:
+            return "***"
+        return key[:4] + "..." + key[-4:]
+
     try:
         from ..providers.anthropic import AnthropicProvider
         if isinstance(provider, AnthropicProvider):
@@ -755,10 +791,11 @@ def _get_provider_config(engine) -> dict:
                 "url": "https://api.anthropic.com/v1/messages",
                 "model": provider.model,
                 "headers": {
-                    "x-api-key": provider.api_key,
+                    "x-api-key": _redact(provider.api_key),
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 },
+                "_raw_key": provider.api_key,
             }
     except ImportError:
         pass
@@ -770,8 +807,9 @@ def _get_provider_config(engine) -> dict:
         "model": provider.model,
         "headers": {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {provider.api_key}",
+            "Authorization": f"Bearer {_redact(provider.api_key)}",
         },
+        "_raw_key": provider.api_key,
     }
 
 
