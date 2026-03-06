@@ -20,14 +20,29 @@ _SESSION_RE = re.compile(r'\[Session from ([^\]]+)\]')
 
 
 def _parse_session_date(pair: TurnPair) -> str:
-    """Extract session date from first user message, or empty string."""
+    """Extract session date from any message in the pair, or empty string.
+
+    Session headers (``[Session from ...]``) may appear in user *or*
+    assistant messages — e.g. when the same speaker has consecutive turns
+    across a session boundary.
+    """
     for msg in pair.messages:
-        if msg.role == "user":
-            m = _SESSION_RE.search(msg.content)
-            if m:
-                return m.group(1)
-            break
+        m = _SESSION_RE.search(msg.content)
+        if m:
+            return m.group(1)
     return ""
+
+
+def _latest_timestamp(pair: TurnPair) -> datetime | None:
+    """Return the latest message timestamp in a turn pair, or None."""
+    timestamps = [m.timestamp for m in pair.messages if m.timestamp is not None]
+    return max(timestamps) if timestamps else None
+
+
+def _earliest_timestamp(pair: TurnPair) -> datetime | None:
+    """Return the earliest message timestamp in a turn pair, or None."""
+    timestamps = [m.timestamp for m in pair.messages if m.timestamp is not None]
+    return min(timestamps) if timestamps else None
 
 
 class TopicSegmenter:
@@ -79,7 +94,8 @@ class TopicSegmenter:
                 tag_result = self.tag_generator.generate_tags(combined)
             tagged.append((pair, tag_result))
 
-        # Step 3: group contiguous same-primary-tag pairs, split on session date change
+        # Step 3: group contiguous same-primary-tag pairs,
+        #         split on session date change or temporal gap
         segments: list[TaggedSegment] = []
         current_group: list[tuple[TurnPair, TagResult]] = []
         running_session: str = ""  # tracks session date across all pairs
@@ -91,10 +107,16 @@ class TopicSegmenter:
                 running_session = parsed
             if current_group:
                 tag_changed = current_group[0][1].primary != result.primary
-                session_changed = parsed and group_session and parsed != group_session
-                if tag_changed or session_changed:
+                session_changed = parsed and parsed != group_session
+                temporal_gap = self._has_temporal_gap(current_group[-1][0], pair)
+                if tag_changed or session_changed or temporal_gap:
                     segments.append(self._build_segment(current_group, group_session))
                     current_group = []
+                    # Derive session date from timestamp if no header present
+                    if temporal_gap and not parsed:
+                        ts = _earliest_timestamp(pair)
+                        if ts:
+                            running_session = ts.strftime("%Y-%m-%dT%H:%M:%S")
                     group_session = running_session
             if not current_group:
                 group_session = running_session
@@ -105,11 +127,42 @@ class TopicSegmenter:
 
         return segments
 
+    @staticmethod
+    def _split_session_boundaries(messages: list[Message]) -> list[Message]:
+        """Split messages that contain a mid-content ``[Session from ...]`` header.
+
+        In some conversation formats (e.g. LoCoMo), the same speaker talks at
+        the end of one session and the start of the next, producing a single
+        message with an embedded session header.  Splitting ensures the session
+        boundary falls between messages so the turn-pairer and segmenter can
+        detect it.
+        """
+        out: list[Message] = []
+        for msg in messages:
+            parts = _SESSION_RE.split(msg.content, maxsplit=1)
+            if len(parts) == 3 and parts[0].strip():
+                # parts = [before, captured_date, after]
+                out.append(Message(
+                    role=msg.role,
+                    content=parts[0].strip(),
+                    timestamp=msg.timestamp,
+                ))
+                out.append(Message(
+                    role=msg.role,
+                    content=f"[Session from {parts[1]}]{parts[2]}",
+                    timestamp=msg.timestamp,
+                ))
+            else:
+                out.append(msg)
+        return out
+
     def _pair_turns(self, messages: list[Message]) -> list[TurnPair]:
         """Group messages into (user, assistant) pairs.
 
         System/tool messages attach to the current pair.
+        Messages with mid-content session boundaries are split first.
         """
+        messages = self._split_session_boundaries(messages)
         pairs: list[TurnPair] = []
         current_pair: list[Message] = []
 
@@ -164,3 +217,18 @@ class TopicSegmenter:
             turn_count=len(group),
             session_date=session_date,
         )
+
+    def _has_temporal_gap(self, last_pair: TurnPair, new_pair: TurnPair) -> bool:
+        """Check if there's a significant time gap between two turn pairs.
+
+        Uses ``config.session_gap_minutes`` as threshold.  Returns False when
+        either pair lacks timestamps (graceful no-op for benchmark data).
+        """
+        threshold = self.config.session_gap_minutes
+        if threshold <= 0:
+            return False
+        last_ts = _latest_timestamp(last_pair)
+        new_ts = _earliest_timestamp(new_pair)
+        if last_ts is None or new_ts is None:
+            return False
+        return (new_ts - last_ts).total_seconds() > threshold * 60
