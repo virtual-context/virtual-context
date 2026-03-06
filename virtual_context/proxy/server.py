@@ -196,7 +196,7 @@ def create_app(
                 _request_log_dir = Path(proxy_cfg.request_log_dir)
                 _request_log_max = proxy_cfg.request_log_max_files
 
-                _request_log_dir.mkdir(parents=True, exist_ok=True)
+                _request_log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
                 # Prune old files on startup — keep only the newest N sets
                 # (each request produces up to 6 files: 1-inbound, 2-to-llm,

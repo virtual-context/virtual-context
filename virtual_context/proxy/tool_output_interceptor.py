@@ -266,9 +266,11 @@ class ToolOutputInterceptor:
         self.stats.total_bytes_original += original_bytes
         self.stats.total_bytes_returned += returned_bytes
         self.stats.total_bytes_indexed += indexed_bytes
-        tool_stats = self.stats.by_tool.setdefault(tool_name, {
-            "count": 0, "original_bytes": 0, "returned_bytes": 0,
-        })
-        tool_stats["count"] += 1
-        tool_stats["original_bytes"] += original_bytes
-        tool_stats["returned_bytes"] += returned_bytes
+        # Cap by_tool entries to prevent unbounded growth in long sessions
+        if tool_name in self.stats.by_tool or len(self.stats.by_tool) < 200:
+            tool_stats = self.stats.by_tool.setdefault(tool_name, {
+                "count": 0, "original_bytes": 0, "returned_bytes": 0,
+            })
+            tool_stats["count"] += 1
+            tool_stats["original_bytes"] += original_bytes
+            tool_stats["returned_bytes"] += returned_bytes
