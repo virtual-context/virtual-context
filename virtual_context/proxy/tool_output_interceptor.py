@@ -26,11 +26,11 @@ class ToolOutputInterceptor:
         self,
         config: ToolOutputConfig,
         store: ContextStore,
-        session_id: str,
+        conversation_id: str,
     ) -> None:
         self.config = config
         self.store = store
-        self.session_id = session_id
+        self.conversation_id = conversation_id
         self.stats = ToolOutputStats()
         self._turn_counter = 0
 
@@ -224,7 +224,7 @@ class ToolOutputInterceptor:
         cap = rule.max_index_bytes if rule.max_index_bytes is not None else self.config.max_index_bytes
         self.store.store_tool_output(
             ref=ref,
-            session_id=self.session_id,
+            conversation_id=self.conversation_id,
             tool_name=tool_name,
             command="",
             turn=self._turn_counter,

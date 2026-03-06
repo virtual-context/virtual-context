@@ -12,13 +12,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, Fact, FactSignal, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
     ref TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL DEFAULT '',
     primary_tag TEXT NOT NULL DEFAULT '_general',
     summary TEXT NOT NULL DEFAULT '',
     full_text TEXT NOT NULL DEFAULT '',
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS engine_state (
-    session_id TEXT PRIMARY KEY,
+    conversation_id TEXT PRIMARY KEY,
     compacted_through INTEGER NOT NULL,
     turn_count INTEGER NOT NULL,
     turn_tag_entries TEXT NOT NULL,
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
-CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id);
+CREATE INDEX IF NOT EXISTS idx_segments_conversation_id ON segments(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_segment_tags_tag ON segment_tags(tag);
 """
 
@@ -182,7 +182,7 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
         ref=row["ref"],
-        session_id=row["session_id"],
+        conversation_id=row["conversation_id"],
         primary_tag=row["primary_tag"],
         tags=tags,
         summary=row["summary"],
@@ -256,6 +256,14 @@ class SQLiteStore(ContextStore):
 
     def _ensure_schema(self) -> None:
         conn = self._get_conn()
+        # Migration: rename session_id → conversation_id (idempotent).
+        # Must run BEFORE SCHEMA_SQL because SCHEMA_SQL creates indexes
+        # on conversation_id that would fail on pre-migration tables.
+        for table in ("segments", "engine_state", "facts", "tool_outputs"):
+            try:
+                conn.execute(f"ALTER TABLE {table} RENAME COLUMN session_id TO conversation_id")
+            except sqlite3.OperationalError:
+                pass  # Column already renamed or table doesn't exist
         conn.executescript(SCHEMA_SQL)
         try:
             conn.executescript(FTS_SQL)
@@ -314,7 +322,7 @@ class SQLiteStore(ContextStore):
                 fact_type TEXT NOT NULL DEFAULT 'personal',
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 segment_ref TEXT NOT NULL DEFAULT '',
-                session_id TEXT NOT NULL DEFAULT '',
+                conversation_id TEXT NOT NULL DEFAULT '',
                 turn_numbers_json TEXT NOT NULL DEFAULT '[]',
                 mentioned_at TEXT NOT NULL DEFAULT '',
                 session_date TEXT NOT NULL DEFAULT '',
@@ -325,7 +333,7 @@ class SQLiteStore(ContextStore):
             CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status);
             CREATE INDEX IF NOT EXISTS idx_facts_subject_verb ON facts(subject, verb);
             CREATE INDEX IF NOT EXISTS idx_facts_segment_ref ON facts(segment_ref);
-            CREATE INDEX IF NOT EXISTS idx_facts_session_id ON facts(session_id);
+            CREATE INDEX IF NOT EXISTS idx_facts_conversation_id ON facts(conversation_id);
 
             CREATE TABLE IF NOT EXISTS fact_tags (
                 fact_id TEXT NOT NULL,
@@ -369,7 +377,7 @@ class SQLiteStore(ContextStore):
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tool_outputs (
                 ref TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 command TEXT NOT NULL DEFAULT '',
                 turn INTEGER NOT NULL,
@@ -491,13 +499,13 @@ class SQLiteStore(ContextStore):
         try:
             conn.execute(
                 """INSERT OR REPLACE INTO segments
-                (ref, session_id, primary_tag, summary, full_text, messages_json,
+                (ref, conversation_id, primary_tag, summary, full_text, messages_json,
                  metadata_json, summary_tokens, full_tokens, compression_ratio,
                  compaction_model, created_at, start_timestamp, end_timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     segment.ref,
-                    segment.session_id,
+                    segment.conversation_id,
                     primary_tag,
                     summary_text,
                     full_text,
@@ -740,10 +748,10 @@ class SQLiteStore(ContextStore):
             for row in rows
         ]
 
-    def get_session_stats(self) -> list[SessionStats]:
+    def get_conversation_stats(self) -> list[ConversationStats]:
         conn = self._get_conn()
         rows = conn.execute("""
-            SELECT s.session_id,
+            SELECT s.conversation_id,
                    COUNT(*) as segment_count,
                    COALESCE(SUM(s.full_tokens), 0) as total_full_tokens,
                    COALESCE(SUM(s.summary_tokens), 0) as total_summary_tokens,
@@ -751,8 +759,8 @@ class SQLiteStore(ContextStore):
                    MAX(s.created_at) as newest,
                    s.compaction_model
             FROM segments s
-            WHERE s.session_id != ''
-            GROUP BY s.session_id
+            WHERE s.conversation_id != ''
+            GROUP BY s.conversation_id
             ORDER BY newest DESC
         """).fetchall()
 
@@ -766,12 +774,12 @@ class SQLiteStore(ContextStore):
                 SELECT DISTINCT st.tag
                 FROM segment_tags st
                 JOIN segments s ON s.ref = st.segment_ref
-                WHERE s.session_id = ?
+                WHERE s.conversation_id = ?
                 ORDER BY st.tag
-            """, (row["session_id"],)).fetchall()
+            """, (row["conversation_id"],)).fetchall()
 
-            results.append(SessionStats(
-                session_id=row["session_id"],
+            results.append(ConversationStats(
+                conversation_id=row["conversation_id"],
                 segment_count=row["segment_count"],
                 total_full_tokens=total_full,
                 total_summary_tokens=total_summary,
@@ -803,11 +811,11 @@ class SQLiteStore(ContextStore):
         conn.commit()
         return cursor.rowcount > 0
 
-    def delete_session(self, session_id: str) -> int:
-        """Delete all segments for a given session_id. Returns count deleted."""
+    def delete_conversation(self, conversation_id: str) -> int:
+        """Delete all segments for a given conversation_id. Returns count deleted."""
         conn = self._get_conn()
         cursor = conn.execute(
-            "DELETE FROM segments WHERE session_id = ?", (session_id,),
+            "DELETE FROM segments WHERE conversation_id = ?", (conversation_id,),
         )
         conn.commit()
         return cursor.rowcount
@@ -997,10 +1005,10 @@ class SQLiteStore(ContextStore):
         })
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
-            (session_id, compacted_through, turn_count, turn_tag_entries, saved_at)
+            (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
             VALUES (?, ?, ?, ?, ?)""",
             (
-                state.session_id,
+                state.conversation_id,
                 state.compacted_through,
                 state.turn_count,
                 state_blob,
@@ -1053,7 +1061,7 @@ class SQLiteStore(ContextStore):
             for ws in working_set_raw
         ]
         return EngineStateSnapshot(
-            session_id=row["session_id"],
+            conversation_id=row["conversation_id"],
             compacted_through=row["compacted_through"],
             turn_tag_entries=entries,
             turn_count=row["turn_count"],
@@ -1063,10 +1071,10 @@ class SQLiteStore(ContextStore):
             trailing_fingerprint=trailing_fingerprint,
         )
 
-    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
+    def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT * FROM engine_state WHERE session_id = ?", (session_id,)
+            "SELECT * FROM engine_state WHERE conversation_id = ?", (conversation_id,)
         ).fetchone()
         if not row:
             return None
@@ -1082,15 +1090,15 @@ class SQLiteStore(ContextStore):
         return self._parse_engine_state_row(row)
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
-        """Return {trailing_fingerprint: session_id} for all persisted sessions."""
+        """Return {trailing_fingerprint: conversation_id} for all persisted conversations."""
         conn = self._get_conn()
         result: dict[str, str] = {}
-        for row in conn.execute("SELECT session_id, turn_tag_entries FROM engine_state").fetchall():
+        for row in conn.execute("SELECT conversation_id, turn_tag_entries FROM engine_state").fetchall():
             try:
                 raw = json.loads(row["turn_tag_entries"])
                 fp = raw.get("trailing_fingerprint", "") if isinstance(raw, dict) else ""
                 if fp:
-                    result[fp] = row["session_id"]
+                    result[fp] = row["conversation_id"]
             except (json.JSONDecodeError, TypeError):
                 continue
         return result
@@ -1111,7 +1119,7 @@ class SQLiteStore(ContextStore):
                 conn.execute(
                     """INSERT OR REPLACE INTO facts
                     (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, fact_type, tags_json, segment_ref, session_id,
+                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
                      turn_numbers_json, mentioned_at, session_date, superseded_by)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
@@ -1128,7 +1136,7 @@ class SQLiteStore(ContextStore):
                         fact.fact_type,
                         json.dumps(fact.tags),
                         fact.segment_ref,
-                        fact.session_id,
+                        fact.conversation_id,
                         json.dumps(fact.turn_numbers),
                         _dt_to_str(fact.mentioned_at),
                         fact.session_date or "",
@@ -1165,7 +1173,7 @@ class SQLiteStore(ContextStore):
             fact_type=row["fact_type"] if "fact_type" in row.keys() else "personal",
             tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
             segment_ref=row["segment_ref"],
-            session_id=row["session_id"],
+            conversation_id=row["conversation_id"],
             turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
             mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
             session_date=row["session_date"] if "session_date" in row.keys() else "",
@@ -1395,7 +1403,7 @@ class SQLiteStore(ContextStore):
     def store_tool_output(
         self,
         ref: str,
-        session_id: str,
+        conversation_id: str,
         tool_name: str,
         command: str,
         turn: int,
@@ -1405,9 +1413,9 @@ class SQLiteStore(ContextStore):
         conn = self._get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO tool_outputs
-            (ref, session_id, tool_name, command, turn, content, original_bytes)
+            (ref, conversation_id, tool_name, command, turn, content, original_bytes)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (ref, session_id, tool_name, command, turn, content, original_bytes),
+            (ref, conversation_id, tool_name, command, turn, content, original_bytes),
         )
         conn.commit()
 

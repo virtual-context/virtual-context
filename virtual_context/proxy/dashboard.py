@@ -164,19 +164,19 @@ def register_dashboard_routes(
                         )
                         snap["history_len"] = len(state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
-                        snap["current_session_id"] = engine.config.session_id
+                        snap["current_conversation_id"] = engine.config.conversation_id
                     except Exception:
                         pass
 
-                # Add live sessions from registry
-                live_sessions = []
-                if registry and hasattr(registry, "_sessions"):
-                    for sid, s in registry._sessions.items():
+                # Add live conversations from registry
+                live_conversations = []
+                if registry and hasattr(registry, "_conversations"):
+                    for sid, s in registry._conversations.items():
                         try:
-                            live_sessions.append(s.live_snapshot())
+                            live_conversations.append(s.live_snapshot())
                         except Exception:
                             pass
-                snap["live_sessions"] = live_sessions
+                snap["live_conversations"] = live_conversations
 
                 if instance_label:
                     snap["instance_label"] = instance_label
@@ -221,22 +221,22 @@ def register_dashboard_routes(
             },
         )
 
-    @app.get("/dashboard/sessions")
-    async def dashboard_sessions():
-        """Return per-session stats from the store as JSON."""
+    @app.get("/dashboard/conversations")
+    async def dashboard_conversations():
+        """Return per-conversation stats from the store as JSON."""
         if not state:
-            return JSONResponse({"sessions": [], "current_session_id": ""})
+            return JSONResponse({"conversations": [], "current_conversation_id": ""})
 
-        sessions_raw = await asyncio.to_thread(
-            state.engine._store.get_session_stats
+        conversations_raw = await asyncio.to_thread(
+            state.engine._store.get_conversation_stats
         )
-        current_id = state.engine.config.session_id
+        current_id = state.engine.config.conversation_id
 
-        sessions = []
-        for s in sessions_raw:
-            sessions.append({
-                "session_id": s.session_id,
-                "is_current": s.session_id == current_id,
+        conversations = []
+        for s in conversations_raw:
+            conversations.append({
+                "conversation_id": s.conversation_id,
+                "is_current": s.conversation_id == current_id,
                 "segment_count": s.segment_count,
                 "total_full_tokens": s.total_full_tokens,
                 "total_summary_tokens": s.total_summary_tokens,
@@ -252,13 +252,13 @@ def register_dashboard_routes(
             })
 
         return JSONResponse({
-            "sessions": sessions,
-            "current_session_id": current_id,
+            "conversations": conversations,
+            "current_conversation_id": current_id,
         })
 
-    @app.delete("/dashboard/sessions/{session_id}")
-    async def dashboard_delete_session(session_id: str, request: Request):
-        """Delete all stored segments for a session."""
+    @app.delete("/dashboard/conversations/{conversation_id}")
+    async def dashboard_delete_conversation(conversation_id: str, request: Request):
+        """Delete all stored segments for a conversation."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not state:
@@ -266,51 +266,51 @@ def register_dashboard_routes(
                 {"error": "Engine not initialized"}, status_code=503,
             )
         store = state.engine._store
-        if not hasattr(store, "delete_session"):
+        if not hasattr(store, "delete_conversation"):
             return JSONResponse(
-                {"error": "Store does not support session deletion"},
+                {"error": "Store does not support conversation deletion"},
                 status_code=501,
             )
         try:
-            deleted = await asyncio.to_thread(store.delete_session, session_id)
-            # Also clean up tag aliases referencing this session
-            if hasattr(store, "delete_tag_aliases_for_session"):
+            deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
+            # Also clean up tag aliases referencing this conversation
+            if hasattr(store, "delete_tag_aliases_for_conversation"):
                 await asyncio.to_thread(
-                    store.delete_tag_aliases_for_session, session_id,
+                    store.delete_tag_aliases_for_conversation, conversation_id,
                 )
-            logger.info("Deleted session %s: %d segments removed", session_id, deleted)
+            logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
         except Exception as exc:
-            logger.error("Failed to delete session %s: %s", session_id, exc, exc_info=True)
+            logger.error("Failed to delete conversation %s: %s", conversation_id, exc, exc_info=True)
             return JSONResponse(
                 {"error": "Internal server error"}, status_code=500,
             )
 
-    @app.get("/dashboard/sessions/live")
-    async def dashboard_sessions_live():
-        """Return real-time session data from the registry (not the store)."""
-        live_sessions = []
-        if registry and hasattr(registry, "_sessions"):
-            for sid, s in registry._sessions.items():
+    @app.get("/dashboard/conversations/live")
+    async def dashboard_conversations_live():
+        """Return real-time conversation data from the registry (not the store)."""
+        live_conversations = []
+        if registry and hasattr(registry, "_conversations"):
+            for sid, s in registry._conversations.items():
                 try:
-                    live_sessions.append(s.live_snapshot())
+                    live_conversations.append(s.live_snapshot())
                 except Exception:
                     pass
-        return JSONResponse(live_sessions)
+        return JSONResponse(live_conversations)
 
-    @app.post("/dashboard/sessions/{session_id}/passthrough")
-    async def dashboard_toggle_passthrough(session_id: str, request: Request):
-        """Toggle manual passthrough mode for a session."""
+    @app.post("/dashboard/conversations/{conversation_id}/passthrough")
+    async def dashboard_toggle_passthrough(conversation_id: str, request: Request):
+        """Toggle manual passthrough mode for a conversation."""
         if err := _check_dashboard_auth(request, _token):
             return err
-        if not registry or not hasattr(registry, "_sessions"):
+        if not registry or not hasattr(registry, "_conversations"):
             return JSONResponse(
                 {"error": "No registry"}, status_code=503,
             )
-        s = registry._sessions.get(session_id)
+        s = registry._conversations.get(conversation_id)
         if not s:
             return JSONResponse(
-                {"error": "Session not found"}, status_code=404,
+                {"error": "Conversation not found"}, status_code=404,
             )
         body = await request.json()
         enabled = body.get("enabled", False)
@@ -351,7 +351,7 @@ def register_dashboard_routes(
                 # Config summary
                 cfg = engine.config
                 snap["config"] = {
-                    "session_id": cfg.session_id,
+                    "conversation_id": cfg.conversation_id,
                     "context_window": cfg.monitor.context_window,
                     "soft_threshold": cfg.monitor.soft_threshold,
                     "hard_threshold": cfg.monitor.hard_threshold,

@@ -23,7 +23,7 @@ def _make_fact(verb: str, obj: str, **kwargs) -> Fact:
         status="active",
         tags=["projects"],
         segment_ref="seg-1",
-        session_id="session-1",
+        conversation_id="session-1",
         turn_numbers=[1],
         mentioned_at=datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
     )

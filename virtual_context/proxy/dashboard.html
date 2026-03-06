@@ -443,7 +443,7 @@
 <div class="stats-wrapper">
   <div class="section-header"><h2 style="font-size:12px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.05em">Overview</h2><button class="help-btn" data-help="overview" onclick="toggleHelp(this)">?</button></div>
   <div class="help-content" data-help-for="overview" style="display:none">
-    <p>High-level counters for the current proxy session. These update in real time as requests flow through the proxy.</p>
+    <p>High-level counters for the current proxy conversation. These update in real time as requests flow through the proxy.</p>
     <dl>
       <dt>Uptime</dt><dd>How long the proxy server has been running since it was started.</dd>
       <dt>Requests</dt><dd>Total number of LLM requests intercepted and enriched by the proxy. Each request has virtual-context summaries injected before forwarding to the upstream provider.</dd>
@@ -502,7 +502,7 @@
   <div class="panel">
     <div class="section-header"><h2>Pipeline (avg)</h2><button class="help-btn" data-help="pipeline" onclick="toggleHelp(this)">?</button></div>
     <div class="help-content" data-help-for="pipeline" style="display:none">
-      <p>Average latency breakdown for each stage of the request processing pipeline, computed across all requests in this session.</p>
+      <p>Average latency breakdown for each stage of the request processing pipeline, computed across all requests in this conversation.</p>
       <dl>
         <dt>wait</dt><dd>Time spent waiting for the previous on_turn_complete to finish (runs in a background thread). High values mean compaction or tagging from the prior turn is slow.</dd>
         <dt>inbound</dt><dd>Time for on_message_inbound: tagging the user message, retrieving matching summaries from the store, and assembling the context block. This is the core virtual-context overhead added to each request.</dd>
@@ -587,19 +587,19 @@
 </div>
 
 <div class="panel">
-  <div class="section-header"><h2>Sessions</h2><button class="help-btn" data-help="sessions" onclick="toggleHelp(this)">?</button></div>
-  <div class="help-content" data-help-for="sessions" style="display:none">
-    <p>Each proxy run creates a session. When compaction fires, it stores segments tagged with the session ID. This panel shows all sessions that have stored segments, along with their compression stats and tag coverage. The current session is highlighted in green.</p>
+  <div class="section-header"><h2>Conversations</h2><button class="help-btn" data-help="conversations" onclick="toggleHelp(this)">?</button></div>
+  <div class="help-content" data-help-for="conversations" style="display:none">
+    <p>Each proxy run creates a conversation. When compaction fires, it stores segments tagged with the conversation ID. This panel shows all conversations that have stored segments, along with their compression stats and tag coverage. The current conversation is highlighted in green.</p>
     <dl>
-      <dt>Segments</dt><dd>Number of compacted segments stored for this session. Each segment represents a group of conversation turns summarized together.</dd>
+      <dt>Segments</dt><dd>Number of compacted segments stored for this conversation. Each segment represents a group of conversation turns summarized together.</dd>
       <dt>Full Tokens</dt><dd>Total original token count across all segments before compaction.</dd>
       <dt>Compression</dt><dd>Summary-to-original ratio. Lower means more aggressive compression.</dd>
-      <dt>Freed</dt><dd>Tokens saved (full tokens minus summary tokens) for this session.</dd>
-      <dt>Delete</dt><dd>Remove all stored segments for a past session. Cannot delete the current session.</dd>
+      <dt>Freed</dt><dd>Tokens saved (full tokens minus summary tokens) for this conversation.</dd>
+      <dt>Delete</dt><dd>Remove all stored segments for a past conversation. Cannot delete the current conversation.</dd>
     </dl>
   </div>
   <div class="session-list" id="session-list">
-    <span class="empty-state">loading sessions...</span>
+    <span class="empty-state">loading conversations...</span>
   </div>
 </div>
 
@@ -617,8 +617,8 @@
   <div class="help-content" data-help-for="reqlog" style="display:none">
     <p>Chronological log of every LLM request processed by the proxy (newest first, max 200 rows). Each row shows one conversation turn from the moment the user message arrives through context injection.</p>
     <dl>
-      <dt>T#</dt><dd>Turn number (0-indexed). Corresponds to the conversation turn in the session.</dd>
-      <dt>Session</dt><dd>Short prefix of the session UUID this request belongs to. Click to filter the log to just that session. Multiple sessions appear when the proxy serves concurrent conversations.</dd>
+      <dt>T#</dt><dd>Turn number (0-indexed). Corresponds to the conversation turn.</dd>
+      <dt>Conversation</dt><dd>Short prefix of the conversation UUID this request belongs to. Click to filter the log to just that conversation. Multiple conversations appear when the proxy serves concurrent conversations.</dd>
       <dt>Tags</dt><dd>Semantic tags assigned to this turn by the tagger. Tags update after on_turn_complete finishes.</dd>
       <dt>Message</dt><dd>Preview of the user message (first 50 characters).</dd>
       <dt>Payload</dt><dd>How many turns were included in the LLM payload after tag-based filtering (filtered/total).</dd>
@@ -629,7 +629,7 @@
     </dl>
   </div>
   <div id="session-filter" style="display:none; margin-bottom:8px; color:var(--text-dim)">
-    Showing session: <code id="session-filter-id"></code>
+    Showing conversation: <code id="conversation-filter-id"></code>
     <a href="#" onclick="clearSessionFilter();return false" style="margin-left:8px;color:var(--accent)">show all</a>
   </div>
   <div class="log-scroll" id="log-scroll">
@@ -678,7 +678,7 @@
     <div class="modal-header">
       <div>
         <h2>Settings</h2>
-        <div class="modal-subtitle">Changes apply to current session only</div>
+        <div class="modal-subtitle">Changes apply to current conversation only</div>
       </div>
       <button class="modal-close" onclick="closeSettings()">&times;</button>
     </div>
@@ -725,8 +725,8 @@
   let cumActualInput = 0, cumBaselineInput = 0, baselineHistoryTokens = 0;
   let latestSystemTokens = 0;
   const BASELINE_RATIO = 0.30;
-  let activeSessionFilter = null;
-  let liveSessions = [];
+  let activeConversationFilter = null;
+  let liveConversations = [];
   let gridManager = null;
   let unitMode = 'kt'; // 'kt' or '$'
   let lastCompactionEvt = null;
@@ -1002,17 +1002,17 @@
     return (tags || []).join(', ');
   }
 
-  function rowId(sessionId, turn) {
-    return 'req-' + (sessionId || '').substring(0, 8) + '-' + turn;
+  function rowId(conversationId, turn) {
+    return 'req-' + (conversationId || '').substring(0, 8) + '-' + turn;
   }
 
   function addRequestRow(evt) {
     const body = $('log-body');
     const tr = document.createElement('tr');
     tr.className = evt.passthrough ? 'passthrough-row' : 'flash';
-    var sid = evt.session_id || '';
+    var sid = evt.conversation_id || '';
     tr.id = rowId(sid, evt.turn);
-    tr.dataset.session = sid;
+    tr.dataset.conversation = sid;
     if (evt.broad) tr.dataset.broad = '1';
     // Store raw values for kt/$ toggle
     tr.dataset.inputTokens = evt.input_tokens || 0;
@@ -1035,7 +1035,7 @@
     const modelTip = evt.model ? ' title="' + evt.model + '"' : '';
     tr.innerHTML =
       '<td' + modelTip + '>' + (evt.turn ?? '') + '</td>' +
-      '<td class="session-cell" title="' + sid + '" onclick="filterBySession(\'' + sid + '\');return false">' + sid + '</td>' +
+      '<td class="session-cell" title="' + sid + '" onclick="filterByConversation(\'' + sid + '\');return false">' + sid + '</td>' +
       '<td class="tags-cell">' + tagStr + '</td>' +
       '<td class="tags-cell resp-tags"></td>' +
       '<td class="msg-cell" title="' + preview.replace(/"/g,'&quot;') + '">' + preview + '</td>' +
@@ -1057,7 +1057,7 @@
     }
     // Keep max 200 rows
     while (body.children.length > 200) body.removeChild(body.lastChild);
-    if (activeSessionFilter && sid !== activeSessionFilter) tr.style.display = 'none';
+    if (activeConversationFilter && sid !== activeConversationFilter) tr.style.display = 'none';
     if (autoScroll) logScroll.scrollTop = 0;
   }
 
@@ -1065,9 +1065,9 @@
     const body = $('log-body');
     const tr = document.createElement('tr');
     tr.className = 'ingested-row';
-    var sid = evt.session_id || '';
+    var sid = evt.conversation_id || '';
     tr.id = rowId(sid, evt.turn);
-    tr.dataset.session = sid;
+    tr.dataset.conversation = sid;
     const preview = (evt.message_preview || '').substring(0, 50);
     // Tags go in response column (generated from user+assistant pair)
     var tagHtml = '';
@@ -1080,7 +1080,7 @@
     }
     tr.innerHTML =
       '<td>' + (evt.turn ?? '') + '</td>' +
-      '<td class="session-cell" title="' + sid + '" onclick="filterBySession(\'' + sid + '\');return false">' + sid + '</td>' +
+      '<td class="session-cell" title="' + sid + '" onclick="filterByConversation(\'' + sid + '\');return false">' + sid + '</td>' +
       '<td class="tags-cell"><span class="ingested-badge">HISTORY</span></td>' +
       '<td class="tags-cell resp-tags">' + tagHtml + '</td>' +
       '<td class="msg-cell" title="' + preview.replace(/"/g,'&quot;') + '">' + preview + '</td>' +
@@ -1088,7 +1088,7 @@
       '<td></td><td></td><td></td><td></td>';
     if (gridManager) gridManager.reorderNewRow(tr);
     body.insertBefore(tr, body.firstChild);
-    if (activeSessionFilter && sid !== activeSessionFilter) tr.style.display = 'none';
+    if (activeConversationFilter && sid !== activeConversationFilter) tr.style.display = 'none';
   }
 
   let lastSessionFetchTurn = -1;
@@ -1104,7 +1104,7 @@
   }
 
   function handleTurnComplete(evt) {
-    const row = $(rowId(evt.session_id, evt.turn));
+    const row = $(rowId(evt.conversation_id, evt.turn));
     if (row) {
       fillResponseTags(row, evt.tags, evt.primary_tag);
       row.className = 'flash';
@@ -1141,12 +1141,12 @@
     // Refresh sessions every 5 turns (compaction may have stored new segments)
     if (evt.turn - lastSessionFetchTurn >= 5) {
       lastSessionFetchTurn = evt.turn;
-      fetchSessions();
+      fetchConversations();
     }
   }
 
   function handleResponse(evt) {
-    const row = $(rowId(evt.session_id, evt.turn));
+    const row = $(rowId(evt.conversation_id, evt.turn));
     if (!row) return;
     const llmCell = row.querySelector('.timing-llm');
     const totalCell = row.querySelector('.timing-total');
@@ -1217,7 +1217,7 @@
       latestSystemTokens = data.recent_requests[data.recent_requests.length - 1].system_tokens || 0;
     }
 
-    liveSessions = data.live_sessions || [];
+    liveConversations = data.live_conversations || [];
 
     // Instance label (multi-instance mode)
     if (data.instance_label) {
@@ -1246,7 +1246,7 @@
     updateMemory();
     updateSavings();
     updateTelemetry(data.telemetry || null);
-    fetchSessions();
+    fetchConversations();
     setTags(data.active_tags || []);
     if (data.store_tag_count !== undefined) {
       $('store-info').textContent = data.store_tag_count + ' tags in store';
@@ -1268,7 +1268,7 @@
     // Process turn_completes: fill response tags + fallback baseline for cells
     // not already populated by raw_input_tokens from the request event.
     (data.turn_completes || []).forEach(function(tc) {
-      var row = $(rowId(tc.session_id, tc.turn));
+      var row = $(rowId(tc.conversation_id, tc.turn));
       if (row && tc.tags && tc.tags.length) {
         fillResponseTags(row, tc.tags, tc.primary_tag);
       }
@@ -1299,47 +1299,47 @@
   }
 
   // Sessions
-  var storedSessions = [];
+  var storedConversations = [];
 
-  function fetchSessions() {
-    fetch('/dashboard/sessions')
+  function fetchConversations() {
+    fetch('/dashboard/conversations')
       .then(r => r.json())
       .then(data => {
-        storedSessions = data.sessions || [];
-        renderSessionsPanel();
+        storedConversations = data.conversations || [];
+        renderConversationsPanel();
       })
       .catch(() => {});
   }
 
-  function fetchLiveSessions() {
-    fetch('/dashboard/sessions/live')
+  function fetchLiveConversations() {
+    fetch('/dashboard/conversations/live')
       .then(r => r.json())
       .then(data => {
-        liveSessions = data || [];
-        renderSessionsPanel();
+        liveConversations = data || [];
+        renderConversationsPanel();
       })
       .catch(() => {});
   }
 
-  function renderSessionsPanel() {
+  function renderConversationsPanel() {
     var list = $('session-list');
     var storedMap = {};
-    (storedSessions || []).forEach(function(s) { storedMap[s.session_id] = s; });
+    (storedConversations || []).forEach(function(s) { storedMap[s.conversation_id] = s; });
     var liveMap = {};
-    (liveSessions || []).forEach(function(s) { liveMap[s.session_id] = s; });
+    (liveConversations || []).forEach(function(s) { liveMap[s.conversation_id] = s; });
 
     // Merge: all live sessions + stored-only sessions
     var allIds = [];
     var seen = {};
-    (liveSessions || []).forEach(function(s) {
-      if (!seen[s.session_id]) { allIds.push(s.session_id); seen[s.session_id] = true; }
+    (liveConversations || []).forEach(function(s) {
+      if (!seen[s.conversation_id]) { allIds.push(s.conversation_id); seen[s.conversation_id] = true; }
     });
-    (storedSessions || []).forEach(function(s) {
-      if (!seen[s.session_id]) { allIds.push(s.session_id); seen[s.session_id] = true; }
+    (storedConversations || []).forEach(function(s) {
+      if (!seen[s.conversation_id]) { allIds.push(s.conversation_id); seen[s.conversation_id] = true; }
     });
 
     if (allIds.length === 0) {
-      list.innerHTML = '<span class="empty-state">no sessions yet</span>';
+      list.innerHTML = '<span class="empty-state">no conversations yet</span>';
       return;
     }
 
@@ -1350,7 +1350,7 @@
       var isLiveOnly = live && !stored;
 
       var html = '<div class="session-card' + (isCurrent ? ' current' : '') +
-        '" style="cursor:pointer" onclick="filterBySession(\'' + sid + '\')">' +
+        '" style="cursor:pointer" onclick="filterByConversation(\'' + sid + '\')">' +
         '<div class="session-header">' +
           '<span class="session-id">' + sid + '</span>' +
           '<div class="session-header-right">';
@@ -1541,7 +1541,7 @@
     if (fills.length === 0 && !_ingestionFetchPending) {
       // Progress bar not rendered yet — fetch live sessions to create it
       _ingestionFetchPending = true;
-      fetchLiveSessions();
+      fetchLiveConversations();
       setTimeout(function() { _ingestionFetchPending = false; }, 1000);
       return;
     }
@@ -1578,24 +1578,24 @@
       $('replay-status').textContent = 'Error: ' + (data.error || 'unknown');
     }
     // Final refresh after replay ends
-    fetchSessions();
+    fetchConversations();
     updateSavings();
   }
 
   // Session filter
-  window.filterBySession = function(sessionId) {
-    if (!sessionId) return;
-    activeSessionFilter = sessionId;
+  window.filterByConversation = function(conversationId) {
+    if (!conversationId) return;
+    activeConversationFilter = conversationId;
     $('session-filter').style.display = '';
-    $('session-filter-id').textContent = sessionId;
+    $('conversation-filter-id').textContent = conversationId;
     var rows = $('log-body').children;
     for (var i = 0; i < rows.length; i++) {
-      rows[i].style.display = (rows[i].dataset.session === sessionId) ? '' : 'none';
+      rows[i].style.display = (rows[i].dataset.conversation === conversationId) ? '' : 'none';
     }
   };
 
   window.clearSessionFilter = function() {
-    activeSessionFilter = null;
+    activeConversationFilter = null;
     $('session-filter').style.display = 'none';
     var rows = $('log-body').children;
     for (var i = 0; i < rows.length; i++) rows[i].style.display = '';
@@ -1897,7 +1897,7 @@
         addCompaction(data);
         updateStats();
         updateSavings();
-        fetchSessions();
+        fetchConversations();
         refreshTelemetry();
       } else if (data.type === 'tool_intercept') {
         totalIntercepts++;
@@ -1909,7 +1909,7 @@
       } else if (data.type === 'history_ingestion') {
         handleHistoryIngestion(data);
       } else if (data.type === 'session_state_change') {
-        fetchLiveSessions();
+        fetchLiveConversations();
       } else if (data.type === 'replay_progress') {
         handleReplayProgress(data);
       } else if (data.type === 'replay_done') {
@@ -1919,21 +1919,21 @@
   }
 
   window.deleteSession = function(sid) {
-    if (!confirm('Delete all stored segments for session ' + sid + '?')) return;
-    fetch('/dashboard/sessions/' + sid, {method: 'DELETE'})
+    if (!confirm('Delete all stored segments for conversation ' + sid + '?')) return;
+    fetch('/dashboard/conversations/' + sid, {method: 'DELETE'})
       .then(r => r.json())
-      .then(data => { fetchSessions(); })
+      .then(data => { fetchConversations(); })
       .catch(() => {});
   };
 
   window.togglePassthrough = function(sid, enabled) {
-    fetch('/dashboard/sessions/' + sid + '/passthrough', {
+    fetch('/dashboard/conversations/' + sid + '/passthrough', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: enabled}),
     })
     .then(r => r.json())
-    .then(() => { fetchLiveSessions(); })
+    .then(() => { fetchLiveConversations(); })
     .catch(() => {});
   };
 
@@ -2338,9 +2338,9 @@
   // Tick uptime every second
   setInterval(updateStats, 1000);
   // Refresh sessions periodically (catches compaction results even if events missed)
-  setInterval(fetchSessions, 15000);
+  setInterval(fetchConversations, 15000);
   // Refresh live sessions periodically
-  setInterval(fetchLiveSessions, 10000);
+  setInterval(fetchLiveConversations, 10000);
   connect();
 })();
 </script>

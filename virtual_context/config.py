@@ -314,8 +314,11 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         curation=curation_config,
         providers=raw.get("providers", {}),
     )
-    if "session_id" in raw:
-        cfg.session_id = raw["session_id"]
+    # Accept both "conversation_id" (preferred) and "session_id" (legacy)
+    if "conversation_id" in raw:
+        cfg.conversation_id = raw["conversation_id"]
+    elif "session_id" in raw:
+        cfg.conversation_id = raw["session_id"]
 
     if validate:
         errors = validate_config(cfg)

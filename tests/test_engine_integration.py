@@ -162,7 +162,7 @@ def test_full_pipeline():
         for result in results:
             stored = StoredSegment(
                 ref=result.segment_id,
-                session_id="test",
+                conversation_id="test",
                 primary_tag=result.primary_tag,
                 tags=result.tags,
                 summary=result.summary,
@@ -288,7 +288,7 @@ def test_primary_tag_guarantee_ephemeral_gets_tag_summary():
         for result in results:
             stored = StoredSegment(
                 ref=result.segment_id,
-                session_id="test",
+                conversation_id="test",
                 primary_tag=result.primary_tag,
                 tags=result.tags,
                 summary=result.summary,

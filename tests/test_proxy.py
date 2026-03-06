@@ -19,17 +19,17 @@ from virtual_context.proxy.server import (
     _extract_assistant_text,
     _extract_delta_text,
     _extract_history_pairs,
-    _extract_session_id,
+    _extract_conversation_id,
     _extract_user_message,
     _filter_body_messages,
     _forward_headers,
     _inject_context,
-    _inject_session_marker,
+    _inject_conversation_marker,
     _inject_vc_tools,
     _last_text_block,
     _parse_sse_events,
     _strip_openclaw_envelope,
-    _strip_session_markers,
+    _strip_conversation_markers,
     _strip_vc_prompt,
     create_app,
 )
@@ -1188,9 +1188,9 @@ class TestExtractHistoryPairs:
 
 
 class TestProxyStateIngestion:
-    def _make_engine(self, session_id="test-session"):
+    def _make_engine(self, conversation_id="test-session"):
         engine = MagicMock()
-        engine.config.session_id = session_id
+        engine.config.conversation_id = conversation_id
         return engine
 
     def test_ingest_runs_once(self):
@@ -1235,7 +1235,7 @@ class TestProxyStateIngestion:
         assert engine.ingest_history.call_count == 1
 
         # Switch session
-        engine.config.session_id = "session-2"
+        engine.config.conversation_id = "session-2"
         state.ingest_if_needed(pairs)
         assert engine.ingest_history.call_count == 2
 
@@ -1265,7 +1265,7 @@ class TestProxyStateIngestion:
         evt = [e for e in events if e["type"] == "history_ingestion"][0]
         assert evt["turns_ingested"] == 3
         assert evt["pairs_received"] == 3
-        assert evt["session_id"] == "test-session"
+        assert evt["conversation_id"] == "test-session"
         assert "elapsed_ms" in evt
 
     def test_conversation_history_backfilled(self):
@@ -2384,7 +2384,7 @@ class TestCompactionConcurrencyGuard:
         import threading
         engine = MagicMock()
         engine.config = MagicMock()
-        engine.config.session_id = "test"
+        engine.config.conversation_id = "test"
         state = ProxyState(engine)
         assert hasattr(state, "_compaction_lock")
         assert isinstance(state._compaction_lock, type(threading.Lock()))
@@ -2394,7 +2394,7 @@ class TestCompactionConcurrencyGuard:
         """Lock is a plain Lock (not RLock) so double-acquire blocks."""
         engine = MagicMock()
         engine.config = MagicMock()
-        engine.config.session_id = "test"
+        engine.config.conversation_id = "test"
         state = ProxyState(engine)
         # First acquire succeeds
         assert state._compaction_lock.acquire(blocking=False) is True
@@ -2470,21 +2470,21 @@ class TestExtractSessionId:
     def test_extracts_from_string_content(self):
         body = {"messages": [
             {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there\n<!-- vc:session=a3f8b2c1-4d5e-6f7a-8b9c-0d1e2f3a4b5c -->"},
+            {"role": "assistant", "content": "Hi there\n<!-- vc:conversation=a3f8b2c1-4d5e-6f7a-8b9c-0d1e2f3a4b5c -->"},
             {"role": "user", "content": "Next question"},
         ]}
-        assert _extract_session_id(body) == "a3f8b2c1-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
+        assert _extract_conversation_id(body) == "a3f8b2c1-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
 
     def test_extracts_from_content_blocks(self):
         body = {"messages": [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": [
                 {"type": "text", "text": "thinking..."},
-                {"type": "text", "text": "answer\n<!-- vc:session=dead-beef-1234 -->"},
+                {"type": "text", "text": "answer\n<!-- vc:conversation=dead-beef-1234 -->"},
             ]},
             {"role": "user", "content": "Next"},
         ]}
-        assert _extract_session_id(body) == "dead-beef-1234"
+        assert _extract_conversation_id(body) == "dead-beef-1234"
 
     def test_returns_none_when_no_marker(self):
         body = {"messages": [
@@ -2492,30 +2492,30 @@ class TestExtractSessionId:
             {"role": "assistant", "content": "Hi there"},
             {"role": "user", "content": "Next"},
         ]}
-        assert _extract_session_id(body) is None
+        assert _extract_conversation_id(body) is None
 
     def test_returns_none_for_empty_messages(self):
-        assert _extract_session_id({"messages": []}) is None
-        assert _extract_session_id({}) is None
+        assert _extract_conversation_id({"messages": []}) is None
+        assert _extract_conversation_id({}) is None
 
     def test_finds_most_recent_marker(self):
         """When multiple assistant messages have markers, returns the most recent."""
         body = {"messages": [
             {"role": "user", "content": "Q1"},
-            {"role": "assistant", "content": "A1\n<!-- vc:session=aaa00000-0000-0000-0000-000000000001 -->"},
+            {"role": "assistant", "content": "A1\n<!-- vc:conversation=aaa00000-0000-0000-0000-000000000001 -->"},
             {"role": "user", "content": "Q2"},
-            {"role": "assistant", "content": "A2\n<!-- vc:session=bbb00000-0000-0000-0000-000000000002 -->"},
+            {"role": "assistant", "content": "A2\n<!-- vc:conversation=bbb00000-0000-0000-0000-000000000002 -->"},
             {"role": "user", "content": "Q3"},
         ]}
-        assert _extract_session_id(body) == "bbb00000-0000-0000-0000-000000000002"
+        assert _extract_conversation_id(body) == "bbb00000-0000-0000-0000-000000000002"
 
     def test_ignores_user_messages(self):
         """Markers in user messages are not extracted."""
         body = {"messages": [
-            {"role": "user", "content": "<!-- vc:session=fake-id --> hello"},
+            {"role": "user", "content": "<!-- vc:conversation=fake-id --> hello"},
             {"role": "assistant", "content": "Hi"},
         ]}
-        assert _extract_session_id(body) is None
+        assert _extract_conversation_id(body) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2527,43 +2527,43 @@ class TestStripSessionMarkers:
     def test_strips_from_string_content(self):
         body = {"messages": [
             {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there\n<!-- vc:session=abc00000-0000-0000-0000-000000000123 -->"},
+            {"role": "assistant", "content": "Hi there\n<!-- vc:conversation=abc00000-0000-0000-0000-000000000123 -->"},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert result["messages"][1]["content"] == "Hi there"
 
     def test_strips_from_content_blocks(self):
         body = {"messages": [
             {"role": "assistant", "content": [
-                {"type": "text", "text": "Answer\n<!-- vc:session=abc00000-0000-0000-0000-000000000123 -->"},
+                {"type": "text", "text": "Answer\n<!-- vc:conversation=abc00000-0000-0000-0000-000000000123 -->"},
             ]},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert result["messages"][0]["content"][0]["text"] == "Answer"
 
     def test_no_marker_returns_same_body(self):
         body = {"messages": [
             {"role": "assistant", "content": "clean text"},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert result is body  # no copy made
 
     def test_preserves_user_messages(self):
         body = {"messages": [
             {"role": "user", "content": "question"},
-            {"role": "assistant", "content": "answer\n<!-- vc:session=aaa00000-0000-0000-0000-000000000001 -->"},
+            {"role": "assistant", "content": "answer\n<!-- vc:conversation=aaa00000-0000-0000-0000-000000000001 -->"},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert result["messages"][0]["content"] == "question"
         assert result["messages"][1]["content"] == "answer"
 
     def test_strips_multiple_assistant_messages(self):
         body = {"messages": [
-            {"role": "assistant", "content": "A1\n<!-- vc:session=aaa00000-0000-0000-0000-000000000001 -->"},
+            {"role": "assistant", "content": "A1\n<!-- vc:conversation=aaa00000-0000-0000-0000-000000000001 -->"},
             {"role": "user", "content": "Q2"},
-            {"role": "assistant", "content": "A2\n<!-- vc:session=bbb00000-0000-0000-0000-000000000002 -->"},
+            {"role": "assistant", "content": "A2\n<!-- vc:conversation=bbb00000-0000-0000-0000-000000000002 -->"},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert result["messages"][0]["content"] == "A1"
         assert result["messages"][2]["content"] == "A2"
 
@@ -2576,27 +2576,27 @@ class TestStripSessionMarkers:
 class TestInjectSessionMarker:
     def test_openai_format(self):
         resp = {"choices": [{"message": {"content": "Hello"}}]}
-        result = _inject_session_marker(resp, "\n<!-- vc:session=abc -->", "openai")
-        assert result["choices"][0]["message"]["content"] == "Hello\n<!-- vc:session=abc -->"
+        result = _inject_conversation_marker(resp, "\n<!-- vc:conversation=abc -->", "openai")
+        assert result["choices"][0]["message"]["content"] == "Hello\n<!-- vc:conversation=abc -->"
 
     def test_anthropic_format(self):
         resp = {"content": [{"type": "text", "text": "Hello"}]}
-        result = _inject_session_marker(resp, "\n<!-- vc:session=abc -->", "anthropic")
-        assert result["content"][0]["text"] == "Hello\n<!-- vc:session=abc -->"
+        result = _inject_conversation_marker(resp, "\n<!-- vc:conversation=abc -->", "anthropic")
+        assert result["content"][0]["text"] == "Hello\n<!-- vc:conversation=abc -->"
 
     def test_anthropic_multiple_blocks_appends_to_last(self):
         resp = {"content": [
             {"type": "text", "text": "Thinking..."},
             {"type": "text", "text": "Answer"},
         ]}
-        result = _inject_session_marker(resp, "\n<!-- vc:session=abc -->", "anthropic")
+        result = _inject_conversation_marker(resp, "\n<!-- vc:conversation=abc -->", "anthropic")
         assert result["content"][0]["text"] == "Thinking..."
-        assert result["content"][1]["text"] == "Answer\n<!-- vc:session=abc -->"
+        assert result["content"][1]["text"] == "Answer\n<!-- vc:conversation=abc -->"
 
     def test_does_not_mutate_original(self):
         resp = {"choices": [{"message": {"content": "Hello"}}]}
         original_content = resp["choices"][0]["message"]["content"]
-        _inject_session_marker(resp, "\n<!-- vc:session=abc -->", "openai")
+        _inject_conversation_marker(resp, "\n<!-- vc:conversation=abc -->", "openai")
         assert resp["choices"][0]["message"]["content"] == original_content
 
 
@@ -2644,7 +2644,7 @@ class TestStreamingSessionMarker:
 
                 assert resp.status_code == 200
                 body = resp.content.decode("utf-8", errors="replace")
-                assert "vc:session=" in body
+                assert "vc:conversation=" in body
                 # The session ID should be a UUID from the engine
                 assert "content_block_delta" in body
 
@@ -2677,7 +2677,7 @@ class TestStreamingSessionMarker:
             data = resp.json()
             # The last text block should contain the session marker
             text = data["content"][-1]["text"]
-            assert "<!-- vc:session=" in text
+            assert "<!-- vc:conversation=" in text
 
 
 # ---------------------------------------------------------------------------
@@ -2697,15 +2697,15 @@ class TestSessionRegistry:
 
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             engine = MagicMock()
-            engine.config.session_id = "new-uuid-1234"
+            engine.config.conversation_id = "new-uuid-1234"
             MockEngine.return_value = engine
 
             state, is_new = registry.get_or_create(None)
 
         assert is_new is True
         assert state is not None
-        assert state.engine.config.session_id == "new-uuid-1234"
-        assert registry.session_count == 1
+        assert state.engine.config.conversation_id == "new-uuid-1234"
+        assert registry.conversation_count == 1
 
     def test_reuses_session_via_fingerprint(self, tmp_path):
         """No session ID + tail-1 fingerprint match → reuses existing session.
@@ -2715,7 +2715,7 @@ class TestSessionRegistry:
         """
         metrics = ProxyMetrics()
         engine = MagicMock()
-        engine.config.session_id = "default-session"
+        engine.config.conversation_id = "default-session"
         default = ProxyState(engine, metrics=metrics)
 
         # Request N: 3 user messages.  history_user = [u0, u1], fp = hash(u1)
@@ -2743,7 +2743,7 @@ class TestSessionRegistry:
             upstream="http://fake:9999",
             metrics=metrics,
         )
-        registry._sessions["default-session"] = default
+        registry._conversations["default-session"] = default
         # Simulate catch_all: store fp from request N at offset=0
         fp = SessionRegistry._compute_fingerprint(body_prev)
         registry._fingerprints[fp] = "default-session"
@@ -2757,7 +2757,7 @@ class TestSessionRegistry:
         """Known session ID in memory → returns existing state."""
         metrics = ProxyMetrics()
         engine = MagicMock()
-        engine.config.session_id = "existing-session"
+        engine.config.conversation_id = "existing-session"
         state = ProxyState(engine, metrics=metrics)
 
         registry = SessionRegistry(
@@ -2765,7 +2765,7 @@ class TestSessionRegistry:
             upstream="http://fake:9999",
             metrics=metrics,
         )
-        registry._sessions["existing-session"] = state
+        registry._conversations["existing-session"] = state
 
         result, is_new = registry.get_or_create("existing-session")
         assert is_new is False
@@ -2782,13 +2782,13 @@ class TestSessionRegistry:
 
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             engine = MagicMock()
-            engine.config.session_id = "restored-session"
+            engine.config.conversation_id = "restored-session"
             MockEngine.return_value = engine
 
             state, is_new = registry.get_or_create("restored-session")
 
         assert is_new is True
-        assert state.engine.config.session_id == "restored-session"
+        assert state.engine.config.conversation_id == "restored-session"
         # Engine should have had _load_persisted_state called
         engine._load_persisted_state.assert_called_once()
 
@@ -2805,18 +2805,18 @@ class TestSessionRegistry:
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             for sid in ["session-a", "session-b", "session-c"]:
                 engine = MagicMock()
-                engine.config.session_id = sid
+                engine.config.conversation_id = sid
                 MockEngine.return_value = engine
                 engines.append(engine)
                 registry.get_or_create(None if sid == "session-a" else sid)
 
-        assert registry.session_count == 3
+        assert registry.conversation_count == 3
 
     def test_shutdown_all_clears_sessions(self, tmp_path):
         """shutdown_all() cleans up all sessions."""
         metrics = ProxyMetrics()
         engine = MagicMock()
-        engine.config.session_id = "s1"
+        engine.config.conversation_id = "s1"
         state = ProxyState(engine, metrics=metrics)
 
         registry = SessionRegistry(
@@ -2824,44 +2824,44 @@ class TestSessionRegistry:
             upstream="http://fake:9999",
             metrics=metrics,
         )
-        registry._sessions["s1"] = state
+        registry._conversations["s1"] = state
 
         registry.shutdown_all()
-        assert registry.session_count == 0
+        assert registry.conversation_count == 0
 
 
 # ---------------------------------------------------------------------------
-# Session awareness: request events include session_id
+# Session awareness: request events include conversation_id
 # ---------------------------------------------------------------------------
 
 
 class TestRequestEventSessionId:
-    def test_request_event_includes_session_id(self):
-        """Request event dict should carry session_id."""
+    def test_request_event_includes_conversation_id(self):
+        """Request event dict should carry conversation_id."""
         m = ProxyMetrics()
         m.record({
             "type": "request",
             "turn": 0,
-            "session_id": "abc-123",
+            "conversation_id": "abc-123",
             "tags": ["test"],
         })
         events = m.events_since(-1)
         assert len(events) == 1
-        assert events[0]["session_id"] == "abc-123"
+        assert events[0]["conversation_id"] == "abc-123"
 
-    def test_captured_request_includes_session_id(self):
-        """capture_request() with session_id appears in summary."""
+    def test_captured_request_includes_conversation_id(self):
+        """capture_request() with conversation_id appears in summary."""
         m = ProxyMetrics()
         m.capture_request(
             0, {"messages": []}, "anthropic",
-            session_id="sess-xyz",
+            conversation_id="sess-xyz",
         )
         summaries = m.get_captured_requests_summary()
         assert len(summaries) == 1
-        assert summaries[0]["session_id"] == "sess-xyz"
+        assert summaries[0]["conversation_id"] == "sess-xyz"
 
         req = m.get_captured_request(0)
-        assert req["session_id"] == "sess-xyz"
+        assert req["conversation_id"] == "sess-xyz"
 
 
 # ---------------------------------------------------------------------------
@@ -2882,7 +2882,7 @@ class TestLiveSessions:
         # that gets included in the SSE snapshot.
         metrics = ProxyMetrics()
         engine = MagicMock()
-        engine.config.session_id = "live-session-1"
+        engine.config.conversation_id = "live-session-1"
         engine._compacted_through = 0
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.entries = []
@@ -2899,13 +2899,13 @@ class TestLiveSessions:
             upstream="http://fake:9999",
             metrics=metrics,
         )
-        registry._sessions["live-session-1"] = state
+        registry._conversations["live-session-1"] = state
 
         # Simulate what the SSE snapshot builder does
         live_sessions = []
-        for sid, s in registry._sessions.items():
+        for sid, s in registry._conversations.items():
             live_sessions.append({
-                "session_id": sid,
+                "conversation_id": sid,
                 "turn_count": len(s.conversation_history) // 2,
                 "compacted_through": getattr(s.engine, "_compacted_through", 0),
                 "tag_count": len(s.engine._turn_tag_index.entries),
@@ -2916,7 +2916,7 @@ class TestLiveSessions:
 
         assert len(live_sessions) == 1
         ls = live_sessions[0]
-        assert ls["session_id"] == "live-session-1"
+        assert ls["conversation_id"] == "live-session-1"
         assert ls["turn_count"] == 1
         assert ls["active_tags"] == ["tag-a"]
 
@@ -2962,13 +2962,13 @@ class TestContentFingerprintRouting:
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             # First call: conversation A
             engine_a = MagicMock()
-            engine_a.config.session_id = "session-aaa"
+            engine_a.config.conversation_id = "session-aaa"
             MockEngine.return_value = engine_a
             state_a, is_new_a = registry.get_or_create(None, body=body_a)
 
             # Second call: conversation B — must get a DIFFERENT session
             engine_b = MagicMock()
-            engine_b.config.session_id = "session-bbb"
+            engine_b.config.conversation_id = "session-bbb"
             MockEngine.return_value = engine_b
             state_b, is_new_b = registry.get_or_create(None, body=body_b)
 
@@ -2977,7 +2977,7 @@ class TestContentFingerprintRouting:
         assert state_a is not state_b, (
             "Different conversations must get different sessions"
         )
-        assert registry.session_count == 2
+        assert registry.conversation_count == 2
 
     @pytest.mark.regression("PROXY-010")
     def test_same_conversation_reuses_session_via_fingerprint(self):
@@ -3010,7 +3010,7 @@ class TestContentFingerprintRouting:
 
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             engine = MagicMock()
-            engine.config.session_id = "session-xxx"
+            engine.config.conversation_id = "session-xxx"
             MockEngine.return_value = engine
             state_1, is_new_1 = registry.get_or_create(None, body=body_v1)
 
@@ -3021,7 +3021,7 @@ class TestContentFingerprintRouting:
         assert state_1 is state_2, (
             "Same conversation with appended messages must reuse session"
         )
-        assert registry.session_count == 1
+        assert registry.conversation_count == 1
 
     @pytest.mark.regression("PROXY-010")
     def test_marker_takes_priority_over_fingerprint(self):
@@ -3034,9 +3034,9 @@ class TestContentFingerprintRouting:
         )
 
         engine = MagicMock()
-        engine.config.session_id = "marker-session"
+        engine.config.conversation_id = "marker-session"
         state = ProxyState(engine, metrics=metrics)
-        registry._sessions["marker-session"] = state
+        registry._conversations["marker-session"] = state
 
         # Body from a different conversation — but marker overrides
         body = self._make_body(["completely different conversation"])
@@ -3125,7 +3125,7 @@ class TestTrailingFingerprint:
 
         from virtual_context.types import EngineStateSnapshot
         snap = EngineStateSnapshot(
-            session_id="sess-1",
+            conversation_id="sess-1",
             compacted_through=10,
             turn_tag_entries=[],
             turn_count=5,
@@ -3148,7 +3148,7 @@ class TestTrailingFingerprint:
 
         from virtual_context.types import EngineStateSnapshot
         snap = EngineStateSnapshot(
-            session_id="sess-2",
+            conversation_id="sess-2",
             compacted_through=5,
             turn_tag_entries=[],
             turn_count=3,
@@ -3170,7 +3170,7 @@ class TestTrailingFingerprint:
 
         from virtual_context.types import EngineStateSnapshot
         snap = EngineStateSnapshot(
-            session_id="sess-no-fp",
+            conversation_id="sess-no-fp",
             compacted_through=0,
             turn_tag_entries=[],
             turn_count=0,
@@ -3190,7 +3190,7 @@ class TestTrailingFingerprint:
 
         from virtual_context.types import EngineStateSnapshot
         snap = EngineStateSnapshot(
-            session_id="persisted-sess",
+            conversation_id="persisted-sess",
             compacted_through=0,
             turn_tag_entries=[],
             turn_count=4,
@@ -3239,7 +3239,7 @@ class TestTrailingFingerprint:
             # Turn 1: each conversation sends first 3 messages (creates session)
             for sid, msgs in convos.items():
                 engine = MagicMock()
-                engine.config.session_id = sid
+                engine.config.conversation_id = sid
                 MockEngine.return_value = engine
                 body = self._make_body(msgs[:3])
                 state, is_new = registry.get_or_create(None, body=body)
@@ -3249,7 +3249,7 @@ class TestTrailingFingerprint:
                 if fp:
                     registry._fingerprints[fp] = sid
 
-        assert registry.session_count == 3
+        assert registry.conversation_count == 3
 
         # Turn 2: each conversation grows by one message — must route back
         # to its own session via tail-1 fingerprint match
@@ -3272,7 +3272,7 @@ class TestTrailingFingerprint:
             assert state is states[sid], f"{sid} turn 3 routed to wrong session"
 
         # No extra sessions created
-        assert registry.session_count == 3
+        assert registry.conversation_count == 3
 
     def test_multi_session_restart_with_persisted_fingerprints(self, tmp_path):
         """On restart, 3 persisted sessions are correctly restored via fps."""
@@ -3292,7 +3292,7 @@ class TestTrailingFingerprint:
             body = self._make_body(msgs[:4])  # 4 msgs, last is "current"
             fp = SessionRegistry._compute_fingerprint(body, offset=0)
             snap = EngineStateSnapshot(
-                session_id=sid,
+                conversation_id=sid,
                 compacted_through=0,
                 turn_tag_entries=[],
                 turn_count=4,
@@ -3326,9 +3326,9 @@ class TestTrailingFingerprint:
 class TestSessionStateMachine:
     """Tests for the non-blocking ingestion state machine."""
 
-    def _make_state(self, *, session_id="test-session", metrics=None):
+    def _make_state(self, *, conversation_id="test-session", metrics=None):
         engine = MagicMock()
-        engine.config.session_id = session_id
+        engine.config.conversation_id = conversation_id
         engine._turn_tag_index = TurnTagIndex()
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
@@ -3561,8 +3561,8 @@ class TestSessionStateMachine:
         # KEY CHECK: the cancelled first thread's finally block should
         # NOT have marked the session as ingested.  If it did, this call
         # will silently return without cancelling the second thread.
-        session_id = state.engine.config.session_id
-        was_marked = session_id in state._ingested_sessions
+        conversation_id = state.engine.config.conversation_id
+        was_marked = conversation_id in state._ingested_conversations
         state.start_ingestion_if_needed(pairs)
         thread_after_third = state._ingestion_thread
 
@@ -3637,9 +3637,9 @@ class TestPassthroughToggle:
 
     def test_toggle_on(self, toggle_client):
         client, engine = toggle_client
-        sid = engine.config.session_id
+        sid = engine.config.conversation_id
         resp = client.post(
-            f"/dashboard/sessions/{sid}/passthrough",
+            f"/dashboard/conversations/{sid}/passthrough",
             json={"enabled": True},
         )
         assert resp.status_code == 200
@@ -3647,14 +3647,14 @@ class TestPassthroughToggle:
 
     def test_toggle_off(self, toggle_client):
         client, engine = toggle_client
-        sid = engine.config.session_id
+        sid = engine.config.conversation_id
         # Enable then disable
         client.post(
-            f"/dashboard/sessions/{sid}/passthrough",
+            f"/dashboard/conversations/{sid}/passthrough",
             json={"enabled": True},
         )
         resp = client.post(
-            f"/dashboard/sessions/{sid}/passthrough",
+            f"/dashboard/conversations/{sid}/passthrough",
             json={"enabled": False},
         )
         assert resp.status_code == 200
@@ -3663,7 +3663,7 @@ class TestPassthroughToggle:
     def test_toggle_unknown_session_404(self, toggle_client):
         client, _ = toggle_client
         resp = client.post(
-            "/dashboard/sessions/nonexistent-session/passthrough",
+            "/dashboard/conversations/nonexistent-session/passthrough",
             json={"enabled": True},
         )
         assert resp.status_code == 404

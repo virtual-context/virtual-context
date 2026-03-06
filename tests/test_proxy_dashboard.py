@@ -9,7 +9,7 @@ import pytest
 
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.server import ProxyState, create_app
-from virtual_context.types import AssembledContext, SessionStats
+from virtual_context.types import AssembledContext, ConversationStats
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ def mock_engine():
     engine._compacted_through = 0
     engine.config = MagicMock()
     engine.config.monitor.context_window = 120000
-    engine.config.session_id = "test-session"
+    engine.config.conversation_id = "test-session"
     engine.config.monitor.soft_threshold = 0.7
     engine.config.monitor.hard_threshold = 0.85
     engine.config.tag_generator.type = "keyword"
@@ -286,14 +286,14 @@ class TestDashboardRoutes:
         )
         assert result.returncode == 0, f"JS syntax error: {result.stderr}"
 
-    def test_dashboard_html_contains_sessions_panel(self, test_client):
-        """HTML includes the Sessions panel."""
+    def test_dashboard_html_contains_conversations_panel(self, test_client):
+        """HTML includes the Conversations panel."""
         client, _ = test_client
         resp = client.get("/dashboard")
         body = resp.text
-        assert "Sessions" in body
+        assert "Conversations" in body
         assert "session-list" in body
-        assert "fetchSessions" in body
+        assert "fetchConversations" in body
 
     def test_dashboard_routes_before_catchall(self, test_client):
         """Ensure /dashboard is not captured by the proxy catch-all."""
@@ -440,13 +440,13 @@ class TestMetricsIntegration:
 
 class TestDashboardSessions:
     def test_sessions_endpoint(self, test_client):
-        """GET /dashboard/sessions returns session stats from the store."""
+        """GET /dashboard/conversations returns session stats from the store."""
         client, engine = test_client
         from datetime import datetime, timezone
 
-        engine._store.get_session_stats.return_value = [
-            SessionStats(
-                session_id="sess-abc",
+        engine._store.get_conversation_stats.return_value = [
+            ConversationStats(
+                conversation_id="sess-abc",
                 segment_count=3,
                 total_full_tokens=9000,
                 total_summary_tokens=2000,
@@ -457,16 +457,16 @@ class TestDashboardSessions:
                 compaction_model="haiku",
             ),
         ]
-        engine.config.session_id = "sess-abc"
+        engine.config.conversation_id = "sess-abc"
 
-        resp = client.get("/dashboard/sessions")
+        resp = client.get("/dashboard/conversations")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["current_session_id"] == "sess-abc"
-        assert len(data["sessions"]) == 1
+        assert data["current_conversation_id"] == "sess-abc"
+        assert len(data["conversations"]) == 1
 
-        s = data["sessions"][0]
-        assert s["session_id"] == "sess-abc"
+        s = data["conversations"][0]
+        assert s["conversation_id"] == "sess-abc"
         assert s["is_current"] is True
         assert s["segment_count"] == 3
         assert s["total_full_tokens"] == 9000
@@ -479,17 +479,17 @@ class TestDashboardSessions:
         """Multiple sessions are returned with correct is_current flag."""
         client, engine = test_client
 
-        engine._store.get_session_stats.return_value = [
-            SessionStats(session_id="current-sess", segment_count=2),
-            SessionStats(session_id="old-sess", segment_count=5),
+        engine._store.get_conversation_stats.return_value = [
+            ConversationStats(conversation_id="current-sess", segment_count=2),
+            ConversationStats(conversation_id="old-sess", segment_count=5),
         ]
-        engine.config.session_id = "current-sess"
+        engine.config.conversation_id = "current-sess"
 
-        resp = client.get("/dashboard/sessions")
+        resp = client.get("/dashboard/conversations")
         data = resp.json()
-        assert len(data["sessions"]) == 2
-        assert data["sessions"][0]["is_current"] is True
-        assert data["sessions"][1]["is_current"] is False
+        assert len(data["conversations"]) == 2
+        assert data["conversations"][0]["is_current"] is True
+        assert data["conversations"][1]["is_current"] is False
 
     def test_sessions_endpoint_no_engine(self):
         """When state is None, sessions endpoint returns empty."""
@@ -502,18 +502,18 @@ class TestDashboardSessions:
 
         from starlette.testclient import TestClient
         with TestClient(app) as client:
-            resp = client.get("/dashboard/sessions")
+            resp = client.get("/dashboard/conversations")
             assert resp.status_code == 200
             data = resp.json()
-            assert data["sessions"] == []
-            assert data["current_session_id"] == ""
+            assert data["conversations"] == []
+            assert data["current_conversation_id"] == ""
 
     def test_sessions_not_captured_by_catchall(self, test_client):
-        """GET /dashboard/sessions is not captured by the proxy catch-all."""
+        """GET /dashboard/conversations is not captured by the proxy catch-all."""
         client, engine = test_client
-        engine._store.get_session_stats.return_value = []
-        engine.config.session_id = "x"
-        resp = client.get("/dashboard/sessions")
+        engine._store.get_conversation_stats.return_value = []
+        engine.config.conversation_id = "x"
+        resp = client.get("/dashboard/conversations")
         assert resp.status_code == 200
         engine.on_message_inbound.assert_not_called()
 
@@ -524,16 +524,16 @@ class TestDashboardSessions:
 
 
 class TestDashboardDeleteSession:
-    def test_delete_session(self, test_client):
-        """DELETE /dashboard/sessions/{session_id} removes segments."""
+    def test_delete_conversation(self, test_client):
+        """DELETE /dashboard/conversations/{conversation_id} removes segments."""
         client, engine = test_client
-        engine._store.delete_session = MagicMock(return_value=3)
-        resp = client.delete("/dashboard/sessions/sess-old")
+        engine._store.delete_conversation = MagicMock(return_value=3)
+        resp = client.delete("/dashboard/conversations/sess-old")
         assert resp.status_code == 200
         assert resp.json()["deleted"] == 3
-        engine._store.delete_session.assert_called_once_with("sess-old")
+        engine._store.delete_conversation.assert_called_once_with("sess-old")
 
-    def test_delete_session_no_state(self):
+    def test_delete_conversation_no_state(self):
         """DELETE when state is None returns 503."""
         from virtual_context.proxy.dashboard import register_dashboard_routes
 
@@ -544,23 +544,23 @@ class TestDashboardDeleteSession:
 
         from starlette.testclient import TestClient
         with TestClient(app) as client:
-            resp = client.delete("/dashboard/sessions/sess-x")
+            resp = client.delete("/dashboard/conversations/sess-x")
             assert resp.status_code == 503
 
-    def test_delete_session_store_unsupported(self, test_client):
-        """DELETE when store lacks delete_session returns 501."""
+    def test_delete_conversation_store_unsupported(self, test_client):
+        """DELETE when store lacks delete_conversation returns 501."""
         client, engine = test_client
         # Remove the method to simulate an unsupported store
-        if hasattr(engine._store, "delete_session"):
-            del engine._store.delete_session
-        resp = client.delete("/dashboard/sessions/sess-x")
+        if hasattr(engine._store, "delete_conversation"):
+            del engine._store.delete_conversation
+        resp = client.delete("/dashboard/conversations/sess-x")
         assert resp.status_code == 501
 
-    def test_delete_session_not_captured_by_catchall(self, test_client):
-        """DELETE /dashboard/sessions/... is not captured by the proxy catch-all."""
+    def test_delete_conversation_not_captured_by_catchall(self, test_client):
+        """DELETE /dashboard/conversations/... is not captured by the proxy catch-all."""
         client, engine = test_client
-        engine._store.delete_session = MagicMock(return_value=0)
-        resp = client.delete("/dashboard/sessions/sess-x")
+        engine._store.delete_conversation = MagicMock(return_value=0)
+        resp = client.delete("/dashboard/conversations/sess-x")
         assert resp.status_code == 200
         engine.on_message_inbound.assert_not_called()
 
@@ -1049,7 +1049,7 @@ class TestDashboardExport:
         assert "turn_tag_index" in data
         assert "store_tags" in data
         assert "config" in data
-        assert data["config"]["session_id"] == "test-session"
+        assert data["config"]["conversation_id"] == "test-session"
         # Should not have type=snapshot
         assert "type" not in data
 

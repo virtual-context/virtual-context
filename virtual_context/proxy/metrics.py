@@ -159,7 +159,7 @@ class ProxyMetrics:
         api_format: str,
         *,
         inbound_tags: list[str] | None = None,
-        session_id: str = "",
+        conversation_id: str = "",
         passthrough: bool = False,
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
@@ -175,7 +175,7 @@ class ProxyMetrics:
                 "message_count": len(body.get("messages", [])),
                 "inbound_tags": inbound_tags or [],
                 "response_tags": [],
-                "session_id": session_id,
+                "conversation_id": conversation_id,
                 "passthrough": passthrough,
             })
 
@@ -207,5 +207,5 @@ class ProxyMetrics:
                 "api_format": r["api_format"],
                 "model": r["model"],
                 "message_count": r["message_count"],
-                "session_id": r.get("session_id", ""),
+                "conversation_id": r.get("conversation_id", ""),
             } for r in self._request_bodies]

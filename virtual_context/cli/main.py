@@ -144,7 +144,7 @@ def cmd_compact(args):
 
 
 def cmd_telemetry(args):
-    """Show session telemetry report."""
+    """Show conversation telemetry report."""
     from ..engine import VirtualContextEngine
 
     engine = VirtualContextEngine(config_path=args.config)
@@ -999,7 +999,7 @@ def cmd_daemon(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="virtual-context",
-        description="Virtual memory for LLM session context management",
+        description="Virtual memory for LLM conversation context management",
     )
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument(
@@ -1062,8 +1062,8 @@ def main():
     )
 
     # telemetry (+ cost-report backward compat alias)
-    subparsers.add_parser("telemetry", help="Show session telemetry report")
-    subparsers.add_parser("cost-report", help="Show session cost report (alias for telemetry)")
+    subparsers.add_parser("telemetry", help="Show conversation telemetry report")
+    subparsers.add_parser("cost-report", help="Show conversation cost report (alias for telemetry)")
 
     # retrieve
     retrieve_parser = subparsers.add_parser("retrieve", help="Retrieve context for a message")

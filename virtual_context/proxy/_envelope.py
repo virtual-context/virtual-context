@@ -16,8 +16,9 @@ _VC_PROMPT_MARKER = "[vc:prompt]\n"
 # MemOS preamble: starts with "# Role", ends with this delimiter line (zero-width spaces)
 _MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
 
-# Session marker: injected into assistant responses, extracted from inbound history
-_VC_SESSION_RE = re.compile(r"<!-- vc:session=([a-f0-9-]+) -->")
+# Conversation marker: injected into assistant responses, extracted from inbound history
+# Accepts both legacy "vc:session" and current "vc:conversation" for backward compat
+_VC_CONVERSATION_RE = re.compile(r"<!-- vc:(?:session|conversation)=([a-f0-9-]+) -->")
 
 # OpenClaw envelope patterns — consistent across all channels
 _VC_USER_RE = re.compile(r"^\[vc:user\](.*?)\[/vc:user\]", re.DOTALL)

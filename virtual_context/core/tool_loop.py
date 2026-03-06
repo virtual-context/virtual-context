@@ -666,7 +666,7 @@ def execute_vc_tool(
                         "when": f.when_date,
                         "where": f.where,
                         "why": f.why,
-                        "session_id": f.session_id,
+                        "conversation_id": f.conversation_id,
                         "tags": f.tags,
                     }
                     for f in facts

@@ -614,7 +614,7 @@ class TestSplitPersistence:
         store = SQLiteStore(db_path=db)
 
         snap = EngineStateSnapshot(
-            session_id="test-session",
+            conversation_id="test-session",
             compacted_through=4,
             turn_tag_entries=[
                 TurnTagEntry(
@@ -639,7 +639,7 @@ class TestSplitPersistence:
         store = FilesystemStore(root=tmp_path / "store")
 
         snap = EngineStateSnapshot(
-            session_id="test-session",
+            conversation_id="test-session",
             compacted_through=4,
             turn_tag_entries=[
                 TurnTagEntry(
@@ -677,7 +677,7 @@ class TestSplitPersistence:
         ])
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
-            (session_id, compacted_through, turn_count, turn_tag_entries, saved_at)
+            (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
             VALUES (?, ?, ?, ?, ?)""",
             ("old-session", 0, 1, entries_json, "2026-01-15T10:00:00+00:00"),
         )

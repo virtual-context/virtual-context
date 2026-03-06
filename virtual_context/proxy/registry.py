@@ -1,7 +1,7 @@
-"""Session registry for multi-session proxy routing.
+"""Conversation registry for multi-conversation proxy routing.
 
 Contains SessionRegistry — manages multiple concurrent ProxyState instances,
-one per session, with fingerprint-based routing and persistence.
+one per conversation, with fingerprint-based routing and persistence.
 """
 
 from __future__ import annotations
@@ -21,14 +21,14 @@ logger = logging.getLogger(__name__)
 
 
 class SessionRegistry:
-    """Manages multiple concurrent ProxyState instances, one per session.
+    """Manages multiple concurrent ProxyState instances, one per conversation.
 
     Routing priority:
-    1. Session marker (``<!-- vc:session=UUID -->``) in assistant messages
+    1. Conversation marker (``<!-- vc:conversation=UUID -->``) in assistant messages
     2. Trailing fingerprint — hash of last N user messages (before current
        turn) in the request body, matched against in-memory or persisted
-       fingerprints from previous sessions
-    3. Fallback — claim unclaimed session or create new
+       fingerprints from previous conversations
+    3. Fallback — claim unclaimed conversation or create new
 
     Trailing fingerprints survive client-side compaction (which rewrites
     early messages) because they sample from the tail of the history.
@@ -49,8 +49,8 @@ class SessionRegistry:
         self._config_path = config_path
         self._upstream = upstream
         self._metrics = metrics
-        self._sessions: dict[str, ProxyState] = {}
-        self._fingerprints: dict[str, str] = {}  # fingerprint → session_id
+        self._conversations: dict[str, ProxyState] = {}
+        self._fingerprints: dict[str, str] = {}  # fingerprint → conversation_id
         self._lock = threading.Lock()
         self._store = store  # for loading persisted fingerprints on restart
 
@@ -87,13 +87,13 @@ class SessionRegistry:
         return fmt.compute_fingerprint(body, offset)
 
     def _match_persisted_fingerprint(self, body: dict) -> str | None:
-        """Match inbound request against persisted session fingerprints.
+        """Match inbound request against persisted conversation fingerprints.
 
         Compares the request's tail-1 fingerprint (offset=1) against stored
         tail fingerprints (offset=0).  The one-turn shift between the last
         save and the next inbound request is exactly bridged by offset=1.
 
-        Returns the matched session_id, or None.
+        Returns the matched conversation_id, or None.
         """
         if not self._store:
             return None
@@ -109,7 +109,7 @@ class SessionRegistry:
             matched = persisted[fp]
             if isinstance(matched, str) and matched:
                 logger.info(
-                    "Persisted fingerprint match: fp=%s → session=%s",
+                    "Persisted fingerprint match: fp=%s → conversation=%s",
                     fp[:8], matched[:12],
                 )
                 return matched
@@ -117,20 +117,20 @@ class SessionRegistry:
 
     def get_or_create(
         self,
-        session_id: str | None,
+        conversation_id: str | None,
         *,
         body: dict | None = None,
     ) -> tuple[ProxyState, bool]:
-        """Look up or create a ProxyState for the given session ID.
+        """Look up or create a ProxyState for the given conversation ID.
 
         Returns (state, is_new).
 
-        Routing priority: marker (session_id) > in-memory fingerprint >
+        Routing priority: marker (conversation_id) > in-memory fingerprint >
         persisted fingerprint > claim unclaimed session > create new session.
         """
-        # Fast path: session marker found and session already in memory
-        if session_id and session_id in self._sessions:
-            return self._sessions[session_id], False
+        # Fast path: conversation marker found and conversation already in memory
+        if conversation_id and conversation_id in self._conversations:
+            return self._conversations[conversation_id], False
 
         # Compute tail-1 fingerprint for matching (offset=1).
         # The incoming request's tail-1 matches the previous request's tail
@@ -139,48 +139,48 @@ class SessionRegistry:
         # match here uses offset=1 to align with the stored value.
         fp_match = ""  # offset=1 — for matching against stored tail
         fp_store = ""  # offset=0 — saved in _fingerprints after session created
-        if session_id is None and body is not None:
+        if conversation_id is None and body is not None:
             fp_match = self._compute_fingerprint(body, offset=1)
             fp_store = self._compute_fingerprint(body)
             # Fast path: in-memory fingerprint match
             if fp_match and fp_match in self._fingerprints:
                 matched_sid = self._fingerprints[fp_match]
-                if matched_sid in self._sessions:
-                    return self._sessions[matched_sid], False
+                if matched_sid in self._conversations:
+                    return self._conversations[matched_sid], False
 
         with self._lock:
             # Double-check after acquiring lock
-            if session_id and session_id in self._sessions:
-                return self._sessions[session_id], False
+            if conversation_id and conversation_id in self._conversations:
+                return self._conversations[conversation_id], False
 
             if fp_match and fp_match in self._fingerprints:
                 matched_sid = self._fingerprints[fp_match]
-                if matched_sid in self._sessions:
-                    return self._sessions[matched_sid], False
+                if matched_sid in self._conversations:
+                    return self._conversations[matched_sid], False
 
             # Check persisted fingerprints (survives proxy restart +
-            # client-side compaction that destroys session markers)
-            if session_id is None and body is not None:
+            # client-side compaction that destroys conversation markers)
+            if conversation_id is None and body is not None:
                 persisted_sid = self._match_persisted_fingerprint(body)
                 if persisted_sid:
-                    session_id = persisted_sid
+                    conversation_id = persisted_sid
 
-            # No marker, no fingerprint match — claim an unclaimed session
+            # No marker, no fingerprint match — claim an unclaimed conversation
             # if one exists.  This handles the startup case: create_app makes
-            # a default session before any request arrives.  The first
+            # a default conversation before any request arrives.  The first
             # conversation claims it; a second distinct conversation creates
-            # a new session.
-            if session_id is None:
+            # a new one.
+            if conversation_id is None:
                 claimed_sids = set(self._fingerprints.values())
-                for sid, st in self._sessions.items():
+                for sid, st in self._conversations.items():
                     if sid not in claimed_sids:
                         if fp_store:
                             self._fingerprints[fp_store] = sid
                         logger.info(
-                            "Session claimed: %s (fp=%s, total=%d)",
+                            "Conversation claimed: %s (fp=%s, total=%d)",
                             sid[:12],
                             fp_store[:8] if fp_store else "none",
-                            len(self._sessions),
+                            len(self._conversations),
                         )
                         return st, False
 
@@ -191,40 +191,40 @@ class SessionRegistry:
             from . import server as _srv  # noqa: avoid circular at module level
             engine = _srv.VirtualContextEngine(config_path=self._config_path)
 
-            if session_id:
-                # Override the auto-generated session_id so load_engine_state
+            if conversation_id:
+                # Override the auto-generated conversation_id so load_engine_state
                 # can find the persisted state for this session.
-                engine.config.session_id = session_id
+                engine.config.conversation_id = conversation_id
                 # Trigger state reload (engine.__init__ already called
-                # _load_persisted_state but with the wrong session_id).
+                # _load_persisted_state but with the wrong conversation_id).
                 engine._load_persisted_state()
                 engine._bootstrap_vocabulary()
 
-            actual_id = engine.config.session_id
+            actual_id = engine.config.conversation_id
             state = ProxyState(
                 engine, metrics=self._metrics, upstream=self._upstream,
             )
-            self._sessions[actual_id] = state
+            self._conversations[actual_id] = state
 
-            # Record fingerprint → session mapping (offset=0 = tail)
+            # Record fingerprint → conversation mapping (offset=0 = tail)
             if fp_store:
                 self._fingerprints[fp_store] = actual_id
 
             logger.info(
-                "Session %s: %s (fp=%s, total=%d)",
-                "resumed" if session_id else "created",
+                "Conversation %s: %s (fp=%s, total=%d)",
+                "resumed" if conversation_id else "created",
                 actual_id[:12],
                 fp_store[:8] if fp_store else "none",
-                len(self._sessions),
+                len(self._conversations),
             )
             return state, True
 
     @property
-    def session_count(self) -> int:
-        return len(self._sessions)
+    def conversation_count(self) -> int:
+        return len(self._conversations)
 
     def shutdown_all(self) -> None:
         """Shut down all session states."""
-        for state in self._sessions.values():
+        for state in self._conversations.values():
             state.shutdown()
-        self._sessions.clear()
+        self._conversations.clear()
