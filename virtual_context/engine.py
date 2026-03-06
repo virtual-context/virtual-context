@@ -130,6 +130,12 @@ class VirtualContextEngine:
         self._last_split_result: SplitResult | None = None
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
 
+        # Cached state from last on_message_inbound call (used by reassemble_context)
+        self._last_retrieval_result: RetrievalResult | None = None
+        self._last_conversation_history: list[Message] | None = None
+        self._last_model_name: str = ""
+        self._presented_segment_refs: set[str] = set()
+
         # Restore persisted state if available
         self._load_persisted_state()
         # Re-sync segmenter's index reference — _load_persisted_state replaces
@@ -396,6 +402,7 @@ class VirtualContextEngine:
         try:
             saved = self._store.load_engine_state(self.config.session_id)
         except Exception:
+            logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
             return
         if not saved:
             return
@@ -539,6 +546,10 @@ class VirtualContextEngine:
                     model=provider_config.get("model", self.config.summarization.model),
                     temperature=self.config.summarization.temperature,
                 )
+            logger.warning(
+                "Anthropic provider '%s' skipped: no API key (checked env var '%s')",
+                provider_name, api_key_env,
+            )
 
         if ptype == "ollama_native":
             from .providers.ollama_native import OllamaNativeProvider
@@ -550,6 +561,7 @@ class VirtualContextEngine:
                 force_json=provider_config.get("force_json", True),
             )
 
+        logger.warning("Unknown provider type '%s' for provider '%s'", ptype, provider_name)
         return None
 
     def on_message_inbound(

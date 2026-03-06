@@ -135,12 +135,16 @@ Also extract facts from the conversation. For each fact:
 - "what": one full sentence capturing the complete fact with ALL specifics preserved.
   WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
 - "who": people involved (populate when present, empty string if n/a)
-- "when": the date this event occurred.
-  DATE RULES — read carefully:
-  "today" / "this morning" / "just now" = {session_date} (use the session date above).
-  "today" always wins over other return/completion phrases in the same sentence.
-  "recently" / "last week" / "a while ago" WITHOUT "today" = date UNKNOWN, use "".
-  If no temporal language at all, use "".
+- "when": the calendar date this event occurred, resolved from context.
+  DATE RULES — use SESSION DATE ({session_date}) as your reference point:
+  "today" / "this morning" / "just now" → use {session_date}.
+  "yesterday" → the day before {session_date}.
+  "last Saturday" → the most recent Saturday before {session_date}.
+  "last week" → approximately 7 days before {session_date}.
+  "next month" → the month after {session_date}.
+  "last year" → the year before {session_date}.
+  Always write the RESOLVED calendar date (e.g. "2023-05-20"), NOT the relative term.
+  If truly unresolvable ("recently", "a while ago", no temporal reference) → use "".
 - "where": location (populate when present, empty string if n/a)
 - "why": context or significance (populate when present, empty string if n/a)
 When the same event is disclosed directly in the current turn AND referenced in passing
@@ -356,6 +360,12 @@ class DomainCompactor:
         valid_statuses = {e.value for e in TemporalStatus}
         raw_facts = parsed.get("facts", [])
         facts: list[Fact] = []
+
+        def _str(val) -> str:
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val)
+            return str(val) if val else ""
+
         if isinstance(raw_facts, list):
             for f in raw_facts:
                 if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
@@ -363,24 +373,35 @@ class DomainCompactor:
                 status = f.get("status", "active")
                 if status not in valid_statuses:
                     status = "active"
-                def _str(val) -> str:
-                    if isinstance(val, list):
-                        return ", ".join(str(v) for v in val)
-                    return str(val) if val else ""
+
+                # Resolve when_date: LLM first, then deterministic fallback
+                raw_when = _str(f.get("when", ""))
+                sess_date = segment.session_date or ""
+                raw_what = _str(f.get("what", ""))
+                from virtual_context.ingest.date_resolver import (
+                    resolve_relative_date, normalize_fact_text,
+                )
+                if not raw_when or raw_when == sess_date:
+                    resolved = resolve_relative_date(raw_what, sess_date)
+                    when_date = resolved or raw_when or sess_date
+                else:
+                    when_date = raw_when
+                # Always normalize relative terms in the fact text
+                fact_what = normalize_fact_text(raw_what, sess_date)
 
                 facts.append(Fact(
                     subject=_str(f.get("subject", "")),
                     verb=_str(f.get("verb", f.get("role", ""))),
                     object=_str(f.get("object", "")),
                     status=status,
-                    what=_str(f.get("what", "")),
+                    what=fact_what,
                     who=_str(f.get("who", "")),
-                    when_date=_str(f.get("when", "")) or (segment.session_date or ""),
+                    when_date=when_date,
                     where=_str(f.get("where", "")),
                     why=_str(f.get("why", "")),
                     fact_type=f.get("fact_type", "personal"),
                     tags=refined_tags,
-                    session_date=segment.session_date or "",
+                    session_date=sess_date,
                 ))
 
         return CompactionResult(

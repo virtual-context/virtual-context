@@ -167,6 +167,17 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _sanitize_fts_query(query: str) -> str:
+    """Quote user input so FTS5 treats it as a phrase, not operator syntax.
+
+    FTS5 supports operators like AND, OR, NOT, NEAR, *, column filters (col:val),
+    etc.  Wrapping the query in double quotes forces phrase matching and prevents
+    users from injecting FTS5 syntax.
+    """
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
@@ -602,7 +613,7 @@ class SQLiteStore(ContextStore):
                     GROUP BY s.ref
                     ORDER BY rank
                     LIMIT ?""",
-                    [query, *tags, limit],
+                    [_sanitize_fts_query(query), *tags, limit],
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -611,7 +622,7 @@ class SQLiteStore(ContextStore):
                     WHERE segments_fts MATCH ?
                     ORDER BY rank
                     LIMIT ?""",
-                    [query, limit],
+                    [_sanitize_fts_query(query), limit],
                 ).fetchall()
         except sqlite3.OperationalError:
             # FTS5 not available, fall back to LIKE
@@ -659,7 +670,7 @@ class SQLiteStore(ContextStore):
                    WHERE segments_fts_full MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                [query, limit],
+                [_sanitize_fts_query(query), limit],
             ).fetchall()
             fts_refs = [row[0] for row in rows]
             fts_tags_map = self._batch_get_tags(fts_refs)
@@ -1265,9 +1276,10 @@ class SQLiteStore(ContextStore):
                 JOIN facts_fts fts ON f.id = fts.id
                 LEFT JOIN segments s ON f.segment_ref = s.ref
                 WHERE facts_fts MATCH ?
+                AND f.superseded_by IS NULL
                 ORDER BY rank
                 LIMIT ?
-            """, (query, limit)).fetchall()
+            """, (_sanitize_fts_query(query), limit)).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
         except sqlite3.OperationalError:
             # FTS not available — fall back to LIKE across key fields
@@ -1288,6 +1300,7 @@ class SQLiteStore(ContextStore):
                 SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
                 LEFT JOIN segments s ON f.segment_ref = s.ref
                 WHERE ({where})
+                AND f.superseded_by IS NULL
                 ORDER BY f.mentioned_at DESC LIMIT ?
             """
             params.append(limit)
@@ -1411,7 +1424,7 @@ class SQLiteStore(ContextStore):
                    WHERE tool_outputs_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                [query, limit],
+                [_sanitize_fts_query(query), limit],
             ).fetchall()
         except Exception:
             return []

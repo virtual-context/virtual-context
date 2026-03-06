@@ -1410,7 +1410,7 @@
         var initT = live.initial_turns != null ? live.initial_turns : '--';
         var initTags = live.initial_tag_count != null ? live.initial_tag_count : '--';
         // Row 1: live requests, turns, tags, compacted
-        html += mc('Live', live.live_requests || 0);
+        html += mc('Requests', live.total_requests || 0);
         html += mc('Turns', initT + '\u2192' + live.turn_count);
         html += mc('Tags', initTags + '\u2192' + live.tag_count);
         html += mc('Compacted', 'T' + Math.floor(live.compacted_through / 2));
