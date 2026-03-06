@@ -11,14 +11,14 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 
 def _segment_to_index_entry(seg: StoredSegment) -> dict:
     return {
         "ref": seg.ref,
-        "session_id": seg.session_id,
+        "conversation_id": seg.conversation_id,
         "primary_tag": seg.primary_tag,
         "tags": seg.tags,
         "summary_tokens": seg.summary_tokens,
@@ -35,7 +35,7 @@ def _segment_to_index_entry(seg: StoredSegment) -> dict:
 def _segment_to_markdown(seg: StoredSegment) -> str:
     frontmatter = {
         "ref": seg.ref,
-        "session_id": seg.session_id,
+        "conversation_id": seg.conversation_id,
         "primary_tag": seg.primary_tag,
         "tags": seg.tags,
         "summary_tokens": seg.summary_tokens,
@@ -137,7 +137,7 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
 
     return StoredSegment(
         ref=fm.get("ref", ref),
-        session_id=fm.get("session_id", ""),
+        conversation_id=fm.get("conversation_id", fm.get("session_id", "")),
         primary_tag=fm.get("primary_tag", "_general"),
         tags=fm.get("tags", []),
         summary=summary,
@@ -378,18 +378,18 @@ class FilesystemStore(ContextStore):
 
         return sorted(tag_map.values(), key=lambda s: s.usage_count, reverse=True)
 
-    def get_session_stats(self) -> list[SessionStats]:
-        session_map: dict[str, SessionStats] = {}
+    def get_conversation_stats(self) -> list[ConversationStats]:
+        conversation_map: dict[str, ConversationStats] = {}
 
         for entry in self._index.values():
-            sid = entry.get("session_id", "")
-            if not sid:
+            cid = entry.get("conversation_id", entry.get("session_id", ""))
+            if not cid:
                 continue
 
-            if sid not in session_map:
-                session_map[sid] = SessionStats(session_id=sid)
+            if cid not in conversation_map:
+                conversation_map[cid] = ConversationStats(conversation_id=cid)
 
-            stats = session_map[sid]
+            stats = conversation_map[cid]
             stats.segment_count += 1
             stats.total_full_tokens += entry.get("full_tokens", 0)
             stats.total_summary_tokens += entry.get("summary_tokens", 0)
@@ -408,7 +408,7 @@ class FilesystemStore(ContextStore):
                 if tag not in stats.distinct_tags:
                     stats.distinct_tags.append(tag)
 
-        for stats in session_map.values():
+        for stats in conversation_map.values():
             if stats.total_full_tokens > 0:
                 stats.compression_ratio = round(
                     stats.total_summary_tokens / stats.total_full_tokens, 3
@@ -416,7 +416,7 @@ class FilesystemStore(ContextStore):
             stats.distinct_tags.sort()
 
         return sorted(
-            session_map.values(),
+            conversation_map.values(),
             key=lambda s: s.newest_segment or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
@@ -571,10 +571,10 @@ class FilesystemStore(ContextStore):
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         state_dir = self.root / "_engine_state"
         state_dir.mkdir(parents=True, exist_ok=True)
-        safe_id = state.session_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+        safe_id = state.conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
         path = state_dir / f"{safe_id}.json"
         data = {
-            "session_id": state.session_id,
+            "conversation_id": state.conversation_id,
             "compacted_through": state.compacted_through,
             "turn_count": state.turn_count,
             "saved_at": _dt_to_str(state.saved_at),
@@ -626,7 +626,7 @@ class FilesystemStore(ContextStore):
             for ws in data.get("working_set", [])
         ]
         return EngineStateSnapshot(
-            session_id=data["session_id"],
+            conversation_id=data.get("conversation_id", data.get("session_id", "")),
             compacted_through=data.get("compacted_through", 0),
             turn_tag_entries=entries,
             turn_count=data.get("turn_count", 0),
@@ -636,8 +636,8 @@ class FilesystemStore(ContextStore):
             trailing_fingerprint=data.get("trailing_fingerprint", ""),
         )
 
-    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
-        safe_id = session_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+    def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
+        safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
         path = self.root / "_engine_state" / f"{safe_id}.json"
         if not path.is_file():
             return None
@@ -671,7 +671,7 @@ class FilesystemStore(ContextStore):
             return None
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
-        """Return {trailing_fingerprint: session_id} for all persisted sessions."""
+        """Return {trailing_fingerprint: conversation_id} for all persisted conversations."""
         state_dir = self.root / "_engine_state"
         if not state_dir.is_dir():
             return {}
@@ -681,7 +681,7 @@ class FilesystemStore(ContextStore):
                 data = json.loads(path.read_text())
                 fp = data.get("trailing_fingerprint", "")
                 if fp:
-                    result[fp] = data["session_id"]
+                    result[fp] = data.get("conversation_id", data.get("session_id", ""))
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
         return result

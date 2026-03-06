@@ -89,7 +89,7 @@ class TestPagingConfig:
 class TestEngineStateSnapshotPaging:
     def test_working_set_defaults_to_empty(self):
         snap = EngineStateSnapshot(
-            session_id="test",
+            conversation_id="test",
             compacted_through=0,
             turn_tag_entries=[],
             turn_count=0,
@@ -102,7 +102,7 @@ class TestEngineStateSnapshotPaging:
             WorkingSetEntry(tag="api", depth=DepthLevel.SUMMARY, tokens=200, last_accessed_turn=8),
         ]
         snap = EngineStateSnapshot(
-            session_id="test",
+            conversation_id="test",
             compacted_through=4,
             turn_tag_entries=[],
             turn_count=5,
@@ -115,7 +115,7 @@ class TestEngineStateSnapshotPaging:
     def test_backward_compat_missing_working_set(self):
         """Old snapshots without working_set should load with empty list."""
         snap = EngineStateSnapshot(
-            session_id="old-session",
+            conversation_id="old-session",
             compacted_through=2,
             turn_tag_entries=[],
             turn_count=3,

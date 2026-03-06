@@ -75,7 +75,7 @@ class ProxyState:
         self._pending_tag: Future | None = None
         self._pending_compact: Future | None = None
         self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
-        self._ingested_sessions: set[str] = set()
+        self._ingested_conversations: set[str] = set()
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
         # State machine for non-blocking ingestion
@@ -135,11 +135,11 @@ class ProxyState:
                 "type": "session_state_change",
                 "from": old.value,
                 "to": new_state.value,
-                "session_id": self.engine.config.session_id,
+                "conversation_id": self.engine.config.conversation_id,
             })
         logger.info(
-            "Session %s: %s → %s",
-            self.engine.config.session_id[:12], old.value, new_state.value,
+            "Conversation %s: %s → %s",
+            self.engine.config.conversation_id[:12], old.value, new_state.value,
         )
 
     def live_snapshot(self) -> dict:
@@ -172,7 +172,7 @@ class ProxyState:
         all_tags.discard("_general")
 
         snap = {
-            "session_id": engine.config.session_id,
+            "conversation_id": engine.config.conversation_id,
             "turn_count": len(self.conversation_history) // 2,
             "total_requests": self._total_requests,
             "compacted_through": getattr(engine, "_compacted_through", 0),
@@ -233,7 +233,7 @@ class ProxyState:
         """Fast path: tag the turn, emit metrics, fire compaction if needed."""
         t0 = time.monotonic()
         turn = len(history) // 2 - 1
-        session_id = self.engine.config.session_id
+        conversation_id = self.engine.config.conversation_id
         try:
             signal = self.engine.tag_turn(
                 history, payload_tokens=payload_tokens,
@@ -251,8 +251,8 @@ class ProxyState:
                 + (" → COMPACT queued" if _needs_compact else "")
             )
             logger.info(
-                "T%d tagged (%dms) session=%s compacted_through=%d history=%d%s",
-                turn, int(tag_ms), session_id[:12],
+                "T%d tagged (%dms) conversation=%s compacted_through=%d history=%d%s",
+                turn, int(tag_ms), conversation_id[:12],
                 getattr(self.engine, "_compacted_through", 0),
                 len(history),
                 " compact_queued" if _needs_compact else "",
@@ -283,7 +283,7 @@ class ProxyState:
                     "active_tags": active_tags,
                     "store_tag_count": len(self.engine._store.get_all_tags()),
                     "turn_pair_tokens": turn_pair_tokens,
-                    "session_id": session_id,
+                    "conversation_id": conversation_id,
                 })
 
                 # Emit tag split event if splitting occurred
@@ -306,7 +306,7 @@ class ProxyState:
                         "tag": split_result.tag,
                         "splittable": split_result.splittable,
                         "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
-                        "session_id": session_id,
+                        "conversation_id": conversation_id,
                     })
                     self.engine._last_split_result = None  # consume
 
@@ -326,7 +326,7 @@ class ProxyState:
         turn: int,
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request."""
-        session_id = self.engine.config.session_id
+        conversation_id = self.engine.config.conversation_id
         with self._compaction_lock:
             t0 = time.monotonic()
             try:
@@ -369,7 +369,7 @@ class ProxyState:
                             "compacted_through": getattr(
                                 self.engine, "_compacted_through", 0
                             ),
-                            "session_id": session_id,
+                            "conversation_id": conversation_id,
                         })
                 else:
                     logger.info("T%d compaction skipped (no messages to compact)", turn)
@@ -379,31 +379,31 @@ class ProxyState:
 
     def _history_ingested(self) -> bool:
         """Whether the current session's history has been ingested."""
-        return self.engine.config.session_id in self._ingested_sessions
+        return self.engine.config.conversation_id in self._ingested_conversations
 
     def ingest_if_needed(self, history_pairs: list[Message]) -> None:
         """Bootstrap TurnTagIndex from pre-existing history (once per session).
 
         Double-checked locking: fast path skips the lock entirely.
         """
-        session_id = self.engine.config.session_id
-        if session_id in self._ingested_sessions:
+        conversation_id = self.engine.config.conversation_id
+        if conversation_id in self._ingested_conversations:
             return
         with self._ingestion_lock:
-            if session_id in self._ingested_sessions:
+            if conversation_id in self._ingested_conversations:
                 return
             t0 = time.monotonic()
             turns = self.engine.ingest_history(history_pairs)
             elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-            self._ingested_sessions.add(session_id)
+            self._ingested_conversations.add(conversation_id)
 
             print(
                 f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
-                f"(session={session_id[:12]})"
+                f"(conversation={conversation_id[:12]})"
             )
             logger.info(
-                "History ingestion: %d turns in %dms (session=%s)",
-                turns, int(elapsed_ms), session_id[:12],
+                "History ingestion: %d turns in %dms (conversation=%s)",
+                turns, int(elapsed_ms), conversation_id[:12],
             )
 
             if self.metrics:
@@ -427,14 +427,14 @@ class ProxyState:
                         "primary_tag": entry.primary_tag if entry else "",
                         "message_preview": preview,
                         "turn_pair_tokens": tpt,
-                        "session_id": session_id,
+                        "conversation_id": conversation_id,
                     })
                 self.metrics.record({
                     "type": "history_ingestion",
                     "turns_ingested": turns,
                     "pairs_received": len(history_pairs) // 2,
                     "elapsed_ms": elapsed_ms,
-                    "session_id": session_id,
+                    "conversation_id": conversation_id,
                     "baseline_history_tokens": baseline_history_tokens,
                 })
 
@@ -450,22 +450,22 @@ class ProxyState:
         is already running, cancels the old thread and resumes from the
         last tagged turn (PROXY-013).
         """
-        session_id = self.engine.config.session_id
-        if session_id in self._ingested_sessions:
+        conversation_id = self.engine.config.conversation_id
+        if conversation_id in self._ingested_conversations:
             return
         with self._ingestion_lock:
-            if session_id in self._ingested_sessions:
+            if conversation_id in self._ingested_conversations:
                 return
 
             if not history_pairs:
-                self._ingested_sessions.add(session_id)
+                self._ingested_conversations.add(conversation_id)
                 return
 
             # Skip if persisted TurnTagIndex already covers history
             existing_turns = len(self.engine._turn_tag_index.entries)
             needed_turns = len(history_pairs) // 2
             if existing_turns >= needed_turns:
-                self._ingested_sessions.add(session_id)
+                self._ingested_conversations.add(conversation_id)
                 logger.info(
                     "Skipping ingestion: persisted index (%d) covers history (%d)",
                     existing_turns, needed_turns,
@@ -498,7 +498,7 @@ class ProxyState:
                 print(
                     f"[INGEST] Cancel at T{done}/{total}, "
                     f"resuming from T{existing_turns} "
-                    f"(session={session_id[:12]})"
+                    f"(conversation={conversation_id[:12]})"
                 )
 
                 # Verify hash at handoff point
@@ -507,7 +507,7 @@ class ProxyState:
                 # Slice to remaining pairs only
                 history_pairs = list(history_pairs[existing_turns * 2:])
                 if not history_pairs:
-                    self._ingested_sessions.add(session_id)
+                    self._ingested_conversations.add(conversation_id)
                     self._transition_to(SessionState.ACTIVE)
                     return
                 needed_turns = len(history_pairs) // 2 + existing_turns
@@ -575,7 +575,7 @@ class ProxyState:
 
     def _run_ingestion_with_catchup(self, initial_pairs: list[Message]) -> None:
         """Background thread: ingest initial pairs, then catch up any gap."""
-        session_id = self.engine.config.session_id
+        conversation_id = self.engine.config.conversation_id
         cancelled = False
         try:
             # Phase 1: tag all initial history
@@ -614,7 +614,7 @@ class ProxyState:
             logger.error("Ingestion error: %s", e, exc_info=True)
         finally:
             if not cancelled:
-                self._ingested_sessions.add(session_id)
+                self._ingested_conversations.add(conversation_id)
                 self._transition_to(SessionState.ACTIVE)
 
     def _ingest_pairs_with_progress(self, pairs: list[Message]) -> None:
@@ -622,7 +622,7 @@ class ProxyState:
 
         Raises ``_IngestionCancelled`` if ``_ingestion_cancel`` is set.
         """
-        session_id = self.engine.config.session_id
+        conversation_id = self.engine.config.conversation_id
         t0 = time.monotonic()
         baseline_history_tokens = 0
 
@@ -652,7 +652,7 @@ class ProxyState:
                     "primary_tag": entry.primary_tag if entry else "",
                     "message_preview": preview,
                     "turn_pair_tokens": tpt,
-                    "session_id": session_id,
+                    "conversation_id": conversation_id,
                     "done": done,
                     "total": total,
                 })
@@ -662,11 +662,11 @@ class ProxyState:
 
         print(
             f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
-            f"(session={session_id[:12]})"
+            f"(conversation={conversation_id[:12]})"
         )
         logger.info(
-            "History ingestion: %d turns in %dms (session=%s)",
-            turns, int(elapsed_ms), session_id[:12],
+            "History ingestion: %d turns in %dms (conversation=%s)",
+            turns, int(elapsed_ms), conversation_id[:12],
         )
 
         if self.metrics:
@@ -675,7 +675,7 @@ class ProxyState:
                 "turns_ingested": turns,
                 "pairs_received": len(pairs) // 2,
                 "elapsed_ms": elapsed_ms,
-                "session_id": session_id,
+                "conversation_id": conversation_id,
                 "baseline_history_tokens": baseline_history_tokens,
             })
 

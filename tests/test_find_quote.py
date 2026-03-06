@@ -42,7 +42,7 @@ def _make_segment(
 ) -> StoredSegment:
     return StoredSegment(
         ref=ref,
-        session_id="session-1",
+        conversation_id="session-1",
         primary_tag=primary_tag,
         tags=tags or [primary_tag],
         summary=summary,
@@ -899,7 +899,7 @@ class TestSupplementFromDescriptionsWordBoundary:
         ]
         seg = StoredSegment(
             ref="seg1",
-            session_id="s1",
+            conversation_id="s1",
             primary_tag="messenger-bag",
             tags=["messenger-bag"],
             summary="",

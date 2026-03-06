@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "virtual-context",
-    instructions="Domain-aware virtual memory for persistent context across long sessions",
+    instructions="Domain-aware virtual memory for persistent context across long conversations",
 )
 
 # Lazy engine singleton
@@ -254,8 +254,8 @@ def recall(topic: str) -> str:
 
 
 @mcp.prompt()
-def summarize_session() -> str:
-    """Request a session summary for compaction.
+def summarize_conversation() -> str:
+    """Request a conversation summary for compaction.
 
     Use this to trigger compaction of the current conversation.
     """

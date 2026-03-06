@@ -16,7 +16,7 @@ from virtual_context.types import EngineStateSnapshot, TurnTagEntry
 
 
 def _make_snapshot(
-    session_id: str = "test-session-abc",
+    conversation_id: str = "test-session-abc",
     compacted_through: int = 4,
     turn_count: int = 10,
 ) -> EngineStateSnapshot:
@@ -32,7 +32,7 @@ def _make_snapshot(
         for i in range(turn_count)
     ]
     return EngineStateSnapshot(
-        session_id=session_id,
+        conversation_id=conversation_id,
         compacted_through=compacted_through,
         turn_tag_entries=entries,
         turn_count=turn_count,
@@ -55,7 +55,7 @@ class TestEngineStateSQLite:
 
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
-        assert loaded.session_id == snap.session_id
+        assert loaded.conversation_id == snap.conversation_id
         assert loaded.compacted_through == snap.compacted_through
         assert loaded.turn_count == snap.turn_count
         assert len(loaded.turn_tag_entries) == len(snap.turn_tag_entries)
@@ -77,7 +77,7 @@ class TestEngineStateSQLite:
         assert result is None
 
     def test_upsert_gets_latest(self, tmp_path):
-        """Saving twice with same session_id overwrites — load gets latest."""
+        """Saving twice with same conversation_id overwrites — load gets latest."""
         db = tmp_path / "test.db"
         store = SQLiteStore(db_path=db)
 
@@ -109,7 +109,7 @@ class TestEngineStateFilesystem:
 
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
-        assert loaded.session_id == snap.session_id
+        assert loaded.conversation_id == snap.conversation_id
         assert loaded.compacted_through == snap.compacted_through
         assert loaded.turn_count == snap.turn_count
         assert len(loaded.turn_tag_entries) == len(snap.turn_tag_entries)
@@ -148,11 +148,11 @@ class TestEngineStateFilesystem:
         snap = _make_snapshot(turn_count=3)
         store.save_engine_state(snap)
 
-        path = tmp_path / "store" / "_engine_state" / f"{snap.session_id}.json"
+        path = tmp_path / "store" / "_engine_state" / f"{snap.conversation_id}.json"
         assert path.is_file()
 
         data = json.loads(path.read_text())
-        assert data["session_id"] == snap.session_id
+        assert data["conversation_id"] == snap.conversation_id
         assert data["compacted_through"] == snap.compacted_through
         assert len(data["turn_tag_entries"]) == 3
 
@@ -178,7 +178,7 @@ class TestEngineStateIntegration:
         # First engine: populate state and save
         config1 = load_config(config_dict=config_dict)
         engine1 = VirtualContextEngine(config=config1)
-        session_id = engine1.config.session_id
+        conversation_id = engine1.config.conversation_id
 
         # Manually add some turns to the index
         for i in range(5):
@@ -196,13 +196,13 @@ class TestEngineStateIntegration:
         engine1._save_state(history)
         engine1._store.close()
 
-        # Second engine: same store, same session_id
+        # Second engine: same store, same conversation_id
         config2 = load_config(config_dict=config_dict)
-        config2.session_id = session_id
+        config2.conversation_id = conversation_id
         engine2 = VirtualContextEngine(config=config2)
 
         # State should be restored
-        assert engine2.config.session_id == session_id
+        assert engine2.config.conversation_id == conversation_id
         assert engine2._compacted_through == 4
         assert len(engine2._turn_tag_index.entries) == 5
         assert engine2._turn_tag_index.entries[0].tags == ["tag-0"]
@@ -251,7 +251,7 @@ class TestVocabularyBootstrap:
         # First engine: populate and save state
         config1 = load_config(config_dict=config_dict)
         engine1 = VirtualContextEngine(config=config1)
-        session_id = engine1.config.session_id
+        conversation_id = engine1.config.conversation_id
         entries = []
         for i in range(5):
             entry = TurnTagEntry(
@@ -264,7 +264,7 @@ class TestVocabularyBootstrap:
             entries.append(entry)
         # Save state directly via store to avoid silent failure in _save_state
         engine1._store.save_engine_state(EngineStateSnapshot(
-            session_id=session_id,
+            conversation_id=conversation_id,
             compacted_through=0,
             turn_tag_entries=entries,
             turn_count=5,
@@ -282,7 +282,7 @@ class TestVocabularyBootstrap:
                 "model": "test-model",
             }},
         }, validate=False)
-        config2.session_id = session_id
+        config2.conversation_id = conversation_id
         engine2 = VirtualContextEngine(config=config2)
 
         # LLMTagGenerator should have vocabulary populated
