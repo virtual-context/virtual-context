@@ -29,6 +29,9 @@ virtual-context-*.yaml
 # Internal docs
 CHANGELOG.md
 
+# Worktrees
+.worktrees/
+
 # Scratch / temporary files
 *.bak
 *.json
