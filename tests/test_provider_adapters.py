@@ -160,11 +160,20 @@ class TestAnthropicAdapter:
         assert len(cont["messages"]) == 3  # original + assistant + empty user
 
     def test_inject_context_no_existing_block(self, adapter):
-        body = {"system": "Original system prompt."}
-        adapter.inject_context(body, "VC context here")
+        body = {"system": "<system-reminder>\nOriginal VC context.\n</system-reminder>"}
+        adapter.inject_context(body, "New VC context")
         assert "<system-reminder>" in body["system"]
-        assert "VC context here" in body["system"]
-        assert "Original system prompt." in body["system"]
+        assert "New VC context" in body["system"]
+        assert "Original VC context." not in body["system"]
+
+    def test_inject_context_preserves_stable_prefix(self, adapter):
+        body = {
+            "system": "You are a helpful assistant.\n\n<system-reminder>\nOld VC context\n</system-reminder>"
+        }
+        adapter.inject_context(body, "Updated VC context")
+        assert "You are a helpful assistant." in body["system"]
+        assert "Updated VC context" in body["system"]
+        assert "Old VC context" not in body["system"]
 
     def test_inject_context_replaces_existing_block(self, adapter):
         body = {"system": "<virtual-context>\nold context\n</virtual-context>\nRest of prompt."}

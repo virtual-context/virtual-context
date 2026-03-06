@@ -746,6 +746,7 @@ class VirtualContextEngine:
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
                 fact_signals=tag_result.fact_signals,
+                session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             ))
 
         self._last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
@@ -2055,11 +2056,15 @@ class VirtualContextEngine:
         # Convert tool definitions to provider format
         converted_tools = adapter.convert_tool_defs(all_tools) if all_tools else None
 
+        # Wrap VC context in <system-reminder> so inject_context can
+        # find-and-replace on reassembly instead of stacking.
+        wrapped_system = f"<system-reminder>\n{system}\n</system-reminder>" if system else ""
+
         # Build provider-specific request body
         body = adapter.build_request_body(
             model=model,
             messages=messages,
-            system=system,
+            system=wrapped_system,
             max_tokens=max_tokens,
             temperature=temperature,
             tools=converted_tools,
