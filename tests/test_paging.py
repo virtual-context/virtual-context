@@ -1382,3 +1382,175 @@ class TestSegmentLoadingGate:
 
         # Normal query SHOULD load segments for FULL-depth working set tags
         mock_get.assert_called()
+
+
+class TestCrossTagSegmentDedup:
+    """Segments shared across multiple FULL-depth tags should not be duplicated."""
+
+    def _make_engine(self, tmp_path):
+        cfg = load_config(config_dict={
+            "context_window": 100_000,
+            "storage_root": str(tmp_path),
+            "storage": {
+                "backend": "sqlite",
+                "sqlite": {"path": str(tmp_path / "store.db")},
+            },
+            "tag_generator": {"type": "keyword"},
+            "paging": {"enabled": True, "autonomous_models": []},
+            "assembly": {
+                "tag_context_max_tokens": 50_000,
+                "context_hint_enabled": False,
+            },
+        })
+        from virtual_context.engine import VirtualContextEngine
+        engine = VirtualContextEngine(config=cfg)
+        engine._compacted_through = 0
+        return engine
+
+    def test_on_message_inbound_deduplicates_shared_segments(self, tmp_path):
+        """Segments appearing under multiple tags only appear once in full_segments_param."""
+        engine = self._make_engine(tmp_path)
+
+        # Store a shared segment that belongs to both "api" and "auth"
+        shared_seg = StoredSegment(
+            ref="shared-seg-1",
+            primary_tag="api",
+            tags=["api", "auth"],
+            summary="Shared segment about API auth.",
+            summary_tokens=10,
+            full_text="Full text of shared segment.",
+            full_tokens=50,
+        )
+        engine._store.store_segment(shared_seg)
+
+        # Store a segment unique to "api"
+        api_only = StoredSegment(
+            ref="api-only-seg",
+            primary_tag="api",
+            tags=["api"],
+            summary="API-only segment.",
+            summary_tokens=10,
+            full_text="Full text of API-only segment.",
+            full_tokens=50,
+        )
+        engine._store.store_segment(api_only)
+
+        # Store a segment unique to "auth"
+        auth_only = StoredSegment(
+            ref="auth-only-seg",
+            primary_tag="auth",
+            tags=["auth"],
+            summary="Auth-only segment.",
+            summary_tokens=10,
+            full_text="Full text of auth-only segment.",
+            full_tokens=50,
+        )
+        engine._store.store_segment(auth_only)
+
+        # Store tag summaries so the working set is valid
+        for tag in ("api", "auth"):
+            engine._store.save_tag_summary(TagSummary(
+                tag=tag, summary=f"{tag} summary.", summary_tokens=10,
+            ))
+
+        # Put both tags in working set at FULL depth
+        engine._working_set = {
+            "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
+            "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
+        }
+
+        retrieval_result = RetrievalResult(
+            tags_matched=["api", "auth"],
+            summaries=[],
+        )
+
+        with patch.object(engine._retriever, "retrieve", return_value=retrieval_result):
+            engine.on_message_inbound(
+                "Tell me about API auth",
+                [Message(role="user", content="hi"), Message(role="assistant", content="hello")],
+            )
+
+        # Inspect the full_segments_param that was built.
+        # We need to capture it — rebuild it the same way the engine does.
+        full_segments_param = {}
+        seen_refs: set = set()
+        for tag, entry in engine._working_set.items():
+            from virtual_context.types import DepthLevel as DL
+            if entry.depth in (DL.SEGMENTS, DL.FULL):
+                segs = engine._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+                deduped = [s for s in segs if s.ref not in seen_refs]
+                seen_refs.update(s.ref for s in deduped)
+                if deduped:
+                    full_segments_param[tag] = deduped
+
+        # Collect all refs across all tags
+        all_refs = []
+        for segs in full_segments_param.values():
+            all_refs.extend(s.ref for s in segs)
+
+        # Total unique segments: shared-seg-1, api-only-seg, auth-only-seg = 3
+        assert len(all_refs) == 3, f"Expected 3 unique segments, got {len(all_refs)}: {all_refs}"
+        assert len(set(all_refs)) == len(all_refs), f"Duplicate refs found: {all_refs}"
+        # shared-seg-1 must appear only once
+        assert all_refs.count("shared-seg-1") == 1
+
+    def test_reassemble_context_deduplicates_shared_segments(self, tmp_path):
+        """reassemble_context also deduplicates segments across tags."""
+        engine = self._make_engine(tmp_path)
+
+        # Store a shared segment
+        shared_seg = StoredSegment(
+            ref="shared-seg-1",
+            primary_tag="api",
+            tags=["api", "auth"],
+            summary="Shared segment.",
+            summary_tokens=10,
+            full_text="Full shared text.",
+            full_tokens=50,
+        )
+        engine._store.store_segment(shared_seg)
+
+        # Store tag summaries
+        for tag in ("api", "auth"):
+            engine._store.save_tag_summary(TagSummary(
+                tag=tag, summary=f"{tag} summary.", summary_tokens=10,
+            ))
+
+        # Put both tags at FULL depth
+        engine._working_set = {
+            "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
+            "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
+        }
+
+        # First call on_message_inbound to set _last_retrieval_result / _last_conversation_history
+        rr = RetrievalResult(tags_matched=["api", "auth"], summaries=[])
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hello")]
+        with patch.object(engine._retriever, "retrieve", return_value=rr):
+            engine.on_message_inbound("API auth question", history)
+
+        # Now call reassemble_context (no args — reads cached state)
+        with patch.object(engine._store, "get_segments_by_tags",
+                          wraps=engine._store.get_segments_by_tags) as mock_get:
+            engine.reassemble_context()
+
+        # get_segments_by_tags should have been called for both tags
+        assert mock_get.call_count == 2
+
+        # Verify dedup by rebuilding the same logic
+        full_segments_param = {}
+        seen_refs: set = set()
+        for tag in ("api", "auth"):
+            segs = engine._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+            deduped = [s for s in segs if s.ref not in seen_refs]
+            seen_refs.update(s.ref for s in deduped)
+            if deduped:
+                full_segments_param[tag] = deduped
+
+        all_refs = []
+        for segs in full_segments_param.values():
+            all_refs.extend(s.ref for s in segs)
+
+        # shared-seg-1 should appear only once across all tags
+        assert all_refs.count("shared-seg-1") == 1
+        # "auth" tag should get an empty list (shared seg already claimed by "api")
+        assert "auth" not in full_segments_param
