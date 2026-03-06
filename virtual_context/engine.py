@@ -1235,15 +1235,17 @@ class VirtualContextEngine:
         )
 
     def _resolve_paging_mode(self, model_name: str = "") -> str:
-        """Check if *model_name* matches any ``autonomous_models`` entry.
+        """Check if *model_name* is trusted for autonomous paging.
 
-        Returns ``"autonomous"`` if the model is trusted to page itself
-        (tools + budget dashboard injected), ``"supervised"`` otherwise
-        (VC manages paging silently via auto_promote / auto_evict).
+        Uses prefix matching against the config's ``autonomous_models``
+        entries (which default to a sensible built-in set).  Returns
+        ``"autonomous"`` if matched, ``"supervised"`` otherwise.
         """
         model = model_name.lower()
+        if not model:
+            return "supervised"
         for pattern in self.config.paging.autonomous_models:
-            if pattern.lower() in model:
+            if model.startswith(pattern.lower()):
                 return "autonomous"
         return "supervised"
 

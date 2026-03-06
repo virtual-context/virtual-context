@@ -441,16 +441,21 @@ class WorkingSetEntry:
 class PagingConfig:
     """Configuration for virtual memory paging.
 
-    ``autonomous_models`` lists model-name substrings (case-insensitive) that
+    ``autonomous_models`` lists model-name prefixes (case-insensitive) that
     are trusted to manage their own context via tool calls.  When the request's
-    model matches any entry, the proxy injects ``vc_expand_topic`` /
-    ``vc_collapse_topic`` tools and a budget dashboard.  Models that don't
-    match run in *supervised* mode: VC manages paging silently via
-    ``auto_promote`` / ``auto_evict``.
+    model matches any entry (prefix match), the proxy injects
+    ``vc_expand_topic`` / ``vc_collapse_topic`` tools and a budget dashboard.
+    Models that don't match run in *supervised* mode: VC manages paging
+    silently via ``auto_promote`` / ``auto_evict``.
     """
     enabled: bool = False
     autonomous_models: list[str] = field(default_factory=lambda: [
-        "opus", "sonnet", "gpt-4", "gpt-4o",
+        "claude-3-opus", "claude-3-5-sonnet", "claude-3.5-sonnet",
+        "claude-3-7-sonnet", "claude-3.7-sonnet",
+        "claude-4", "claude-sonnet-4", "claude-opus-4",
+        "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-4.5", "gpt-5",
+        "o1", "o3", "o4-mini",
+        "gemini-2", "gemini-pro",
     ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
@@ -532,7 +537,7 @@ class MonitorConfig:
 
 @dataclass
 class SegmenterConfig:
-    pass
+    session_gap_minutes: int = 30  # split segments when messages are >N min apart (0=disabled)
 
 
 @dataclass
