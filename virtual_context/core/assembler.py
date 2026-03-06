@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 from pathlib import Path
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from ..types import (
     AssembledContext,
@@ -168,6 +171,42 @@ class ContextAssembler:
             prepend_parts.append(facts_text)
 
         prepend_text = "\n\n".join(prepend_parts)
+
+        # Hard budget cap: if prepend_text exceeds token_budget,
+        # drop least-relevant tag sections until it fits.
+        prepend_tokens = self.token_counter(prepend_text)
+        if prepend_tokens > token_budget:
+            logger.error(
+                "Assembled context (%d tokens) exceeds token_budget (%d). "
+                "Consider increasing context_window or reducing assembly config "
+                "values (tag_context_max_tokens=%d, facts_max_tokens=%d). "
+                "Truncating least-relevant tag sections to fit.",
+                prepend_tokens, token_budget,
+                self.config.tag_context_max_tokens,
+                self.config.facts_max_tokens,
+            )
+            # Drop tags from end (least relevant — sorted_tags is priority-ordered)
+            for drop_tag in reversed(sorted_tags):
+                if drop_tag not in tag_sections:
+                    continue
+                dropped_tokens = self.token_counter(tag_sections[drop_tag])
+                del tag_sections[drop_tag]
+                tag_tokens -= dropped_tokens
+                # Rebuild prepend_text
+                prepend_parts = []
+                if core:
+                    prepend_parts.append(core)
+                if context_hint:
+                    prepend_parts.append(context_hint)
+                for tag in sorted_tags:
+                    if tag in tag_sections:
+                        prepend_parts.append(tag_sections[tag])
+                if facts_text:
+                    prepend_parts.append(facts_text)
+                prepend_text = "\n\n".join(prepend_parts)
+                prepend_tokens = self.token_counter(prepend_text)
+                if prepend_tokens <= token_budget:
+                    break
 
         total_tokens = core_tokens + tag_tokens + facts_tokens + conv_tokens
 
