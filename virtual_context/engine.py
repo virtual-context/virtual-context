@@ -615,11 +615,14 @@ class VirtualContextEngine:
             ws_param = self._working_set
             # Load full segments for tags at SEGMENTS or FULL depth
             full_segments_param = {}
+            seen_refs: set[str] = set()
             for tag, entry in self._working_set.items():
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
                     segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
-                    if segs:
-                        full_segments_param[tag] = segs
+                    deduped = [s for s in segs if s.ref not in seen_refs]
+                    seen_refs.update(s.ref for s in deduped)
+                    if deduped:
+                        full_segments_param[tag] = deduped
                 # Update last_accessed_turn for tags matched by current query
                 query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
                 if tag in query_tags:
@@ -1518,13 +1521,16 @@ class VirtualContextEngine:
         if self.config.paging.enabled and self._working_set:
             ws_param = self._working_set
             full_segments_param = {}
+            seen_refs: set[str] = set()
             for tag, entry in self._working_set.items():
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
                     segs = self._store.get_segments_by_tags(
                         tags=[tag], min_overlap=1, limit=50,
                     )
-                    if segs:
-                        full_segments_param[tag] = segs
+                    deduped = [s for s in segs if s.ref not in seen_refs]
+                    seen_refs.update(s.ref for s in deduped)
+                    if deduped:
+                        full_segments_param[tag] = deduped
 
         uncompacted = (history or [])[self._compacted_through:]
         assembled = self._assembler.assemble(
