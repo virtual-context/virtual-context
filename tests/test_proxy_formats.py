@@ -188,66 +188,66 @@ class TestAnthropicFormat:
         result = self.fmt.inject_context(body, "ctx")
         assert body["system"] == "original"
 
-    def test_extract_session_id(self):
+    def test_extract_conversation_id(self):
         body = {"messages": [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello <!-- vc:session=abc-123-def -->"},
+            {"role": "assistant", "content": "hello <!-- vc:conversation=abc-123-def -->"},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123-def"
+        assert self.fmt.extract_conversation_id(body) == "abc-123-def"
 
-    def test_extract_session_id_content_blocks(self):
+    def test_extract_conversation_id_content_blocks(self):
         body = {"messages": [
             {"role": "assistant", "content": [
-                {"type": "text", "text": "hello <!-- vc:session=abc-123 -->"},
+                {"type": "text", "text": "hello <!-- vc:conversation=abc-123 -->"},
             ]},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123"
+        assert self.fmt.extract_conversation_id(body) == "abc-123"
 
-    def test_extract_session_id_none(self):
+    def test_extract_conversation_id_none(self):
         body = {"messages": [{"role": "user", "content": "hi"}]}
-        assert self.fmt.extract_session_id(body) is None
+        assert self.fmt.extract_conversation_id(body) is None
 
-    def test_strip_session_markers_string(self):
+    def test_strip_conversation_markers_string(self):
         body = {"messages": [
-            {"role": "assistant", "content": "hello <!-- vc:session=abc-123 -->"},
+            {"role": "assistant", "content": "hello <!-- vc:conversation=abc-123 -->"},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert "vc:session" not in result["messages"][0]["content"]
 
-    def test_strip_session_markers_blocks(self):
+    def test_strip_conversation_markers_blocks(self):
         body = {"messages": [
             {"role": "assistant", "content": [
-                {"type": "text", "text": "hello <!-- vc:session=abc-123 -->"},
+                {"type": "text", "text": "hello <!-- vc:conversation=abc-123 -->"},
             ]},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert "vc:session" not in result["messages"][0]["content"][0]["text"]
 
-    def test_strip_session_markers_no_markers(self):
+    def test_strip_conversation_markers_no_markers(self):
         body = {"messages": [
             {"role": "assistant", "content": "hello"},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert result is body  # no copy needed
 
-    def test_inject_session_marker(self):
+    def test_inject_conversation_marker(self):
         response = {"content": [{"type": "text", "text": "hello"}]}
-        marker = "\n<!-- vc:session=test-123 -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test-123 -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert result["content"][0]["text"].endswith(marker)
         # original not mutated
         assert response["content"][0]["text"] == "hello"
 
-    def test_inject_session_marker_no_text_block(self):
+    def test_inject_conversation_marker_no_text_block(self):
         response = {"content": []}
-        marker = "\n<!-- vc:session=test -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert result["content"][-1]["text"] == marker
 
-    def test_emit_session_marker_sse(self):
-        data = self.fmt.emit_session_marker_sse("test-session-id")
+    def test_emit_conversation_marker_sse(self):
+        data = self.fmt.emit_conversation_marker_sse("test-session-id")
         assert b"content_block_delta" in data
-        assert b"vc:session=test-session-id" in data
+        assert b"vc:conversation=test-session-id" in data
 
     def test_extract_delta_text(self):
         data = {
@@ -329,21 +329,21 @@ class TestOpenAIFormat:
         assert result["messages"][0]["role"] == "system"
         assert "<system-reminder>" in result["messages"][0]["content"]
 
-    def test_extract_session_id(self):
+    def test_extract_conversation_id(self):
         body = {"messages": [
-            {"role": "assistant", "content": "hi <!-- vc:session=abc-123 -->"},
+            {"role": "assistant", "content": "hi <!-- vc:conversation=abc-123 -->"},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123"
+        assert self.fmt.extract_conversation_id(body) == "abc-123"
 
-    def test_inject_session_marker(self):
+    def test_inject_conversation_marker(self):
         response = {"choices": [{"message": {"content": "hello"}}]}
-        marker = "\n<!-- vc:session=test -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert result["choices"][0]["message"]["content"].endswith(marker)
 
-    def test_emit_session_marker_sse(self):
-        data = self.fmt.emit_session_marker_sse("test-id")
-        assert b"vc:session=test-id" in data
+    def test_emit_conversation_marker_sse(self):
+        data = self.fmt.emit_conversation_marker_sse("test-id")
+        assert b"vc:conversation=test-id" in data
         assert data.startswith(b"data: ")
 
     def test_extract_delta_text(self):
@@ -437,40 +437,40 @@ class TestGeminiFormat:
         result = self.fmt.inject_context(body, "")
         assert result is body
 
-    def test_extract_session_id(self):
+    def test_extract_conversation_id(self):
         body = {"contents": [
             {"role": "user", "parts": [{"text": "hi"}]},
-            {"role": "model", "parts": [{"text": "hello <!-- vc:session=abc-123 -->"}]},
+            {"role": "model", "parts": [{"text": "hello <!-- vc:conversation=abc-123 -->"}]},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123"
+        assert self.fmt.extract_conversation_id(body) == "abc-123"
 
-    def test_extract_session_id_none(self):
+    def test_extract_conversation_id_none(self):
         body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
-        assert self.fmt.extract_session_id(body) is None
+        assert self.fmt.extract_conversation_id(body) is None
 
-    def test_strip_session_markers(self):
+    def test_strip_conversation_markers(self):
         body = {"contents": [
             {"role": "model", "parts": [
-                {"text": "hello <!-- vc:session=abc-123 -->"},
+                {"text": "hello <!-- vc:conversation=abc-123 -->"},
             ]},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert "vc:session" not in result["contents"][0]["parts"][0]["text"]
 
-    def test_strip_session_markers_no_markers(self):
+    def test_strip_conversation_markers_no_markers(self):
         body = {"contents": [{"role": "model", "parts": [{"text": "hello"}]}]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert result is body
 
-    def test_inject_session_marker(self):
+    def test_inject_conversation_marker(self):
         response = {"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}
-        marker = "\n<!-- vc:session=test -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert result["candidates"][0]["content"]["parts"][0]["text"].endswith(marker)
 
-    def test_emit_session_marker_sse(self):
-        data = self.fmt.emit_session_marker_sse("test-id")
-        assert b"vc:session=test-id" in data
+    def test_emit_conversation_marker_sse(self):
+        data = self.fmt.emit_conversation_marker_sse("test-id")
+        assert b"vc:conversation=test-id" in data
         decoded = json.loads(data.decode().split("data: ")[1])
         assert decoded["candidates"][0]["content"]["role"] == "model"
 
@@ -588,19 +588,19 @@ class TestServerWrappers:
         assert "system_instruction" in result
         assert "<system-reminder>" in result["system_instruction"]["parts"][-1]["text"]
 
-    def test_extract_session_id_gemini(self):
-        from virtual_context.proxy.server import _extract_session_id
+    def test_extract_conversation_id_gemini(self):
+        from virtual_context.proxy.server import _extract_conversation_id
         body = {"contents": [
-            {"role": "model", "parts": [{"text": "hi <!-- vc:session=abc-123 -->"}]},
+            {"role": "model", "parts": [{"text": "hi <!-- vc:conversation=abc-123 -->"}]},
         ]}
-        assert _extract_session_id(body) == "abc-123"
+        assert _extract_conversation_id(body) == "abc-123"
 
-    def test_strip_session_markers_gemini(self):
-        from virtual_context.proxy.server import _strip_session_markers
+    def test_strip_conversation_markers_gemini(self):
+        from virtual_context.proxy.server import _strip_conversation_markers
         body = {"contents": [
-            {"role": "model", "parts": [{"text": "hi <!-- vc:session=abc -->"}]},
+            {"role": "model", "parts": [{"text": "hi <!-- vc:conversation=abc -->"}]},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert "vc:session" not in result["contents"][0]["parts"][0]["text"]
 
     def test_extract_delta_text_gemini(self):
@@ -613,11 +613,11 @@ class TestServerWrappers:
         response = {"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}
         assert _extract_assistant_text(response, "gemini") == "answer"
 
-    def test_inject_session_marker_gemini(self):
-        from virtual_context.proxy.server import _inject_session_marker
+    def test_inject_conversation_marker_gemini(self):
+        from virtual_context.proxy.server import _inject_conversation_marker
         response = {"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}
-        marker = "\n<!-- vc:session=test -->"
-        result = _inject_session_marker(response, marker, "gemini")
+        marker = "\n<!-- vc:conversation=test -->"
+        result = _inject_conversation_marker(response, marker, "gemini")
         assert result["candidates"][0]["content"]["parts"][0]["text"].endswith(marker)
 
     def test_extract_user_message_responses(self):
@@ -645,19 +645,19 @@ class TestServerWrappers:
         result = _inject_context(body, "context text", "openai_responses")
         assert "<system-reminder>" in result["instructions"]
 
-    def test_extract_session_id_responses(self):
-        from virtual_context.proxy.server import _extract_session_id
+    def test_extract_conversation_id_responses(self):
+        from virtual_context.proxy.server import _extract_conversation_id
         body = {"input": [
-            {"role": "assistant", "content": "hi <!-- vc:session=abc-123 -->"},
+            {"role": "assistant", "content": "hi <!-- vc:conversation=abc-123 -->"},
         ]}
-        assert _extract_session_id(body) == "abc-123"
+        assert _extract_conversation_id(body) == "abc-123"
 
-    def test_strip_session_markers_responses(self):
-        from virtual_context.proxy.server import _strip_session_markers
+    def test_strip_conversation_markers_responses(self):
+        from virtual_context.proxy.server import _strip_conversation_markers
         body = {"input": [
-            {"role": "assistant", "content": "hi <!-- vc:session=abc -->"},
+            {"role": "assistant", "content": "hi <!-- vc:conversation=abc -->"},
         ]}
-        result = _strip_session_markers(body)
+        result = _strip_conversation_markers(body)
         assert "vc:session" not in result["input"][0]["content"]
 
     def test_extract_delta_text_responses(self):
@@ -674,15 +674,15 @@ class TestServerWrappers:
         ]}
         assert _extract_assistant_text(response, "openai_responses") == "answer"
 
-    def test_inject_session_marker_responses(self):
-        from virtual_context.proxy.server import _inject_session_marker
+    def test_inject_conversation_marker_responses(self):
+        from virtual_context.proxy.server import _inject_conversation_marker
         response = {"output": [
             {"type": "message", "role": "assistant", "content": [
                 {"type": "output_text", "text": "hello"},
             ]},
         ]}
-        marker = "\n<!-- vc:session=test -->"
-        result = _inject_session_marker(response, marker, "openai_responses")
+        marker = "\n<!-- vc:conversation=test -->"
+        result = _inject_conversation_marker(response, marker, "openai_responses")
         assert result["output"][0]["content"][0]["text"].endswith(marker)
 
 
@@ -844,75 +844,75 @@ class TestOpenAIResponsesFormat:
 
     # -- Session markers --
 
-    def test_extract_session_id(self):
+    def test_extract_conversation_id(self):
         body = {"input": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [
-                {"type": "output_text", "text": "hello <!-- vc:session=abc-123-def -->"},
+                {"type": "output_text", "text": "hello <!-- vc:conversation=abc-123-def -->"},
             ]},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123-def"
+        assert self.fmt.extract_conversation_id(body) == "abc-123-def"
 
-    def test_extract_session_id_string_content(self):
+    def test_extract_conversation_id_string_content(self):
         body = {"input": [
-            {"role": "assistant", "content": "hello <!-- vc:session=abc-123 -->"},
+            {"role": "assistant", "content": "hello <!-- vc:conversation=abc-123 -->"},
         ]}
-        assert self.fmt.extract_session_id(body) == "abc-123"
+        assert self.fmt.extract_conversation_id(body) == "abc-123"
 
-    def test_extract_session_id_none(self):
+    def test_extract_conversation_id_none(self):
         body = {"input": [{"role": "user", "content": "hi"}]}
-        assert self.fmt.extract_session_id(body) is None
+        assert self.fmt.extract_conversation_id(body) is None
 
-    def test_extract_session_id_no_input(self):
+    def test_extract_conversation_id_no_input(self):
         body = {}
-        assert self.fmt.extract_session_id(body) is None
+        assert self.fmt.extract_conversation_id(body) is None
 
-    def test_strip_session_markers_content_blocks(self):
+    def test_strip_conversation_markers_content_blocks(self):
         body = {"input": [
             {"role": "assistant", "content": [
-                {"type": "output_text", "text": "hello <!-- vc:session=abc-123 -->"},
+                {"type": "output_text", "text": "hello <!-- vc:conversation=abc-123 -->"},
             ]},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert "vc:session" not in result["input"][0]["content"][0]["text"]
 
-    def test_strip_session_markers_string(self):
+    def test_strip_conversation_markers_string(self):
         body = {"input": [
-            {"role": "assistant", "content": "hello <!-- vc:session=abc-123 -->"},
+            {"role": "assistant", "content": "hello <!-- vc:conversation=abc-123 -->"},
         ]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert "vc:session" not in result["input"][0]["content"]
 
-    def test_strip_session_markers_no_markers(self):
+    def test_strip_conversation_markers_no_markers(self):
         body = {"input": [{"role": "assistant", "content": "hello"}]}
-        result = self.fmt.strip_session_markers(body)
+        result = self.fmt.strip_conversation_markers(body)
         assert result is body
 
-    def test_inject_session_marker(self):
+    def test_inject_conversation_marker(self):
         response = {"output": [
             {"type": "message", "role": "assistant", "content": [
                 {"type": "output_text", "text": "hello"},
             ]},
         ]}
-        marker = "\n<!-- vc:session=test-123 -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test-123 -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert result["output"][0]["content"][0]["text"].endswith(marker)
         # original not mutated
         assert response["output"][0]["content"][0]["text"] == "hello"
 
-    def test_inject_session_marker_no_output_text(self):
+    def test_inject_conversation_marker_no_output_text(self):
         response = {"output": []}
-        marker = "\n<!-- vc:session=test -->"
-        result = self.fmt.inject_session_marker(response, marker)
+        marker = "\n<!-- vc:conversation=test -->"
+        result = self.fmt.inject_conversation_marker(response, marker)
         assert len(result["output"]) == 1
         assert result["output"][0]["content"][0]["text"] == marker
 
     # -- SSE emission --
 
-    def test_emit_session_marker_sse(self):
-        data = self.fmt.emit_session_marker_sse("test-session-id")
+    def test_emit_conversation_marker_sse(self):
+        data = self.fmt.emit_conversation_marker_sse("test-session-id")
         assert b"response.output_text.delta" in data
-        assert b"vc:session=test-session-id" in data
+        assert b"vc:conversation=test-session-id" in data
         # Verify it's valid SSE
         assert data.startswith(b"event: response.output_text.delta\n")
 

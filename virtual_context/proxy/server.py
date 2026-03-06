@@ -46,20 +46,20 @@ from .formats import (
 )
 from .helpers import (  # noqa: F401 — re-exported for tests
     _VC_PROMPT_MARKER,
-    _VC_SESSION_RE,
+    _VC_CONVERSATION_RE,
     _HOP_BY_HOP,
     _last_text_block,
     _strip_vc_prompt,
     _strip_openclaw_envelope,
     _forward_headers,
     _detect_api_format,
-    _extract_session_id,
-    _strip_session_markers,
+    _extract_conversation_id,
+    _strip_conversation_markers,
     _extract_user_message,
     _extract_message_text,
     _extract_history_pairs,
     _inject_context,
-    _inject_session_marker,
+    _inject_conversation_marker,
     _extract_delta_text,
     _extract_assistant_text,
     _inject_vc_tools,
@@ -122,7 +122,7 @@ def create_app(
             engine = VirtualContextEngine(config_path=config_path)
 
             # Lossless restart: if engine has no persisted state for its
-            # auto-generated session_id, try loading the most recent session.
+            # auto-generated conversation_id, try loading the most recent conversation.
             # This avoids re-ingestion on proxy restart.
             if (
                 hasattr(engine, '_store')
@@ -136,10 +136,10 @@ def create_app(
                         and isinstance(getattr(latest, 'turn_tag_entries', None), list)
                         and latest.turn_tag_entries
                     ):
-                        engine.config.session_id = latest.session_id
+                        engine.config.conversation_id = latest.conversation_id
                         engine._load_persisted_state()
                         print(
-                            f"Lossless restart: restored session {latest.session_id[:12]} "
+                            f"Lossless restart: restored conversation {latest.conversation_id[:12]} "
                             f"({len(latest.turn_tag_entries)} turns, compacted={latest.compacted_through})",
                             flush=True,
                         )
@@ -159,7 +159,7 @@ def create_app(
         # If lossless restart recovered state, mark session as already ingested
         # so the proxy doesn't re-ingest history on first request.
         if engine._turn_tag_index.entries:
-            default_state._ingested_sessions.add(engine.config.session_id)
+            default_state._ingested_conversations.add(engine.config.conversation_id)
 
         # Build registry and pre-register the default session
         registry = SessionRegistry(
@@ -168,11 +168,11 @@ def create_app(
             metrics=metrics,
             store=engine._store,
         )
-        registry._sessions[engine.config.session_id] = default_state
+        registry._conversations[engine.config.conversation_id] = default_state
 
         logger.info(
-            "Engine ready — session_id=%s, window=%d, storage=%s%s",
-            engine.config.session_id,
+            "Engine ready — conversation_id=%s, window=%d, storage=%s%s",
+            engine.config.conversation_id,
             engine.config.monitor.context_window,
             engine.config.storage.backend,
             f", label={instance_label}" if instance_label else "",
@@ -237,7 +237,7 @@ def create_app(
     app.state._force_passthrough = bool(os.environ.get("VC_FORCE_PASSTHROUGH"))
     # Pluggable session resolver: if set, called instead of the built-in
     # SessionRegistry.  Signature:
-    #   (request, body, session_id) -> (ProxyState, is_new)
+    #   (request, body, conversation_id) -> (ProxyState, is_new)
     # Cloud wrappers (e.g. virtual-context-cloud) set this to route
     # requests to per-tenant engines.  Default None = use local registry.
     app.state.state_resolver = None
@@ -317,21 +317,21 @@ def create_app(
         if not fmt.has_messages(body):
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
-        # Extract session ID from markers before stripping them
-        inbound_session_id = _extract_session_id(body)
+        # Extract conversation ID from markers before stripping them
+        inbound_conversation_id = _extract_conversation_id(body)
 
-        # Strip session markers from assistant messages before any processing.
+        # Strip conversation markers from assistant messages before any processing.
         # The LLM should never see stale markers.
-        body = _strip_session_markers(body)
+        body = _strip_conversation_markers(body)
 
         # Route to the correct session
         state: ProxyState | None = None
         _resolver = getattr(app.state, "state_resolver", None)
         if _resolver is not None:
-            state, is_new = _resolver(request, body, inbound_session_id)
+            state, is_new = _resolver(request, body, inbound_conversation_id)
         elif registry:
             state, is_new = registry.get_or_create(
-                inbound_session_id, body=body,
+                inbound_conversation_id, body=body,
             )
             # Update trailing fingerprint on the engine so it gets persisted
             # with the next _save_state() call (inside on_turn_complete).
@@ -339,7 +339,7 @@ def create_app(
                 fp = SessionRegistry._compute_fingerprint(body)
                 if fp:
                     state.engine._trailing_fingerprint = fp
-                    registry._fingerprints[fp] = state.engine.config.session_id
+                    registry._fingerprints[fp] = state.engine.config.conversation_id
 
         api_format = fmt.name
         user_message = fmt.extract_user_message(body)
@@ -358,25 +358,25 @@ def create_app(
         import datetime as _dt
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         _msg_count = len(fmt.get_messages(body))
-        _sid = state.engine.config.session_id[:12] if state else "none"
-        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming} session={_sid} payload={_payload_kb}KB")
+        _sid = state.engine.config.conversation_id[:12] if state else "none"
+        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming} conversation={_sid} payload={_payload_kb}KB")
 
         if not user_message:
             # Tool-result or non-text turn — skip VC enrichment but
             # preserve streaming so the client SDK doesn't break.
-            _skip_sid = state.engine.config.session_id if state else ""
+            _skip_sid = state.engine.config.conversation_id if state else ""
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
                     metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
-                    session_id=_skip_sid, response_log_path=_response_log_path,
+                    conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
                     metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
-                    session_id=_skip_sid, response_log_path=_response_log_path,
+                    conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_request_log_dir, log_prefix=_log_prefix,
                 )
@@ -392,7 +392,7 @@ def create_app(
             # redirect to passthrough path if there's history to ingest.
             if (
                 current_state == SessionState.ACTIVE
-                and state.engine.config.session_id not in state._ingested_sessions
+                and state.engine.config.conversation_id not in state._ingested_conversations
             ):
                 history_pairs = _extract_history_pairs(body)
                 needed = len(history_pairs) // 2
@@ -418,7 +418,7 @@ def create_app(
                             timestamp=datetime.now(timezone.utc))
                 )
 
-                _session_id = state.engine.config.session_id
+                _conversation_id = state.engine.config.conversation_id
                 turn = state.turn_offset + len(state.conversation_history) // 2
 
                 # Record passthrough request event
@@ -443,13 +443,13 @@ def create_app(
                     "raw_input_tokens": 0,
                     "system_tokens": 0,
                     "turns_dropped": 0,
-                    "session_id": _session_id,
+                    "conversation_id": _conversation_id,
                     "passthrough": True,
                 })
 
                 metrics.capture_request(
                     turn, body, api_format,
-                    session_id=_session_id,
+                    conversation_id=_conversation_id,
                     passthrough=True,
                 )
 
@@ -462,7 +462,7 @@ def create_app(
                     _pt_interceptor = ToolOutputInterceptor(
                         config=state.engine.config.tool_output,
                         store=state.engine._store,
-                        session_id=state.engine.config.session_id,
+                        conversation_id=state.engine.config.conversation_id,
                     )
                     _pt_interceptor._turn_counter = state._total_requests
                     _pre_stats = _pt_interceptor.stats.total_intercepted
@@ -482,7 +482,7 @@ def create_app(
                     return await _handle_streaming(
                         client, url, fwd_headers, body, api_format, state,
                         metrics=metrics, turn=turn,
-                        session_id=_session_id,
+                        conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
                     )
@@ -490,7 +490,7 @@ def create_app(
                     return await _handle_non_streaming(
                         client, url, fwd_headers, body, api_format, state,
                         metrics=metrics, turn=turn,
-                        session_id=_session_id,
+                        conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
                         request_log_dir=_request_log_dir, log_prefix=_log_prefix,
@@ -577,7 +577,7 @@ def create_app(
             interceptor = ToolOutputInterceptor(
                 config=state.engine.config.tool_output,
                 store=state.engine._store,
-                session_id=state.engine.config.session_id,
+                conversation_id=state.engine.config.conversation_id,
             )
             interceptor._turn_counter = state._total_requests
             _pre = interceptor.stats.total_intercepted
@@ -674,7 +674,7 @@ def create_app(
         context_tokens = len(prepend_text) // 4 if prepend_text else 0
         total_turns = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
         overhead_ms = round(wait_ms + inbound_ms, 1)
-        _session_id = state.engine.config.session_id if state else ""
+        _conversation_id = state.engine.config.conversation_id if state else ""
         metrics.record({
             "type": "request",
             "turn": turn,
@@ -698,7 +698,7 @@ def create_app(
             "raw_input_tokens": raw_input_tokens,
             "system_tokens": system_tokens,
             "turns_dropped": turns_dropped,
-            "session_id": _session_id,
+            "conversation_id": _conversation_id,
         })
 
         # Log request to terminal for debugging
@@ -717,7 +717,7 @@ def create_app(
         metrics.capture_request(
             turn, _pre_filter_body, api_format,
             inbound_tags=assembled.matched_tags if assembled else [],
-            session_id=_session_id,
+            conversation_id=_conversation_id,
         )
 
         _intercept_vc_tools = paging_enabled or tool_output_find_quote
@@ -726,7 +726,7 @@ def create_app(
             return await _handle_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
-                session_id=_session_id, response_log_path=_response_log_path,
+                conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
                 paging_enabled=_intercept_vc_tools,
                 request_log_dir=_request_log_dir,
@@ -736,7 +736,7 @@ def create_app(
             return await _handle_non_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
                 metrics=metrics, turn=turn, overhead_ms=overhead_ms,
-                session_id=_session_id, response_log_path=_response_log_path,
+                conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
                 request_log_dir=_request_log_dir, log_prefix=_log_prefix,
             )

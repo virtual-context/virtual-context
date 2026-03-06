@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 # ---------------------------------------------------------------------------
 
 from ._envelope import (  # noqa: E402
-    _VC_SESSION_RE,
+    _VC_CONVERSATION_RE,
     _last_text_block,
     _strip_openclaw_envelope,
 )
@@ -74,23 +74,23 @@ class PayloadFormat(ABC):
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         """Inject <virtual-context> block into a deep-copied request body."""
 
-    # -- Session markers -----------------------------------------------------
+    # -- Conversation markers -----------------------------------------------------
 
     @abstractmethod
-    def extract_session_id(self, body: dict) -> str | None:
-        """Scan assistant messages for vc:session marker."""
+    def extract_conversation_id(self, body: dict) -> str | None:
+        """Scan assistant messages for vc:conversation marker."""
 
     @abstractmethod
-    def strip_session_markers(self, body: dict) -> dict:
-        """Strip vc:session markers from all assistant messages."""
+    def strip_conversation_markers(self, body: dict) -> dict:
+        """Strip vc:conversation markers from all assistant messages."""
 
     @abstractmethod
-    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
-        """Append session marker to the last text block in a non-streaming response."""
+    def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
+        """Append conversation marker to the last text block in a non-streaming response."""
 
     @abstractmethod
-    def emit_session_marker_sse(self, session_id: str) -> bytes:
-        """Return a single SSE event bytes that injects a session marker."""
+    def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
+        """Return a single SSE event bytes that injects a conversation marker."""
 
     # -- SSE / response parsing ----------------------------------------------
 
@@ -283,24 +283,24 @@ class AnthropicFormat(PayloadFormat):
             body["system"] = f"{existing}\n\n{context_block}" if existing else context_block
         return body
 
-    def extract_session_id(self, body: dict) -> str | None:
+    def extract_conversation_id(self, body: dict) -> str | None:
         for msg in reversed(body.get("messages", [])):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                m = _VC_SESSION_RE.search(content)
+                m = _VC_CONVERSATION_RE.search(content)
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
                 for block in reversed(content):
                     if isinstance(block, dict) and block.get("type") == "text":
-                        m = _VC_SESSION_RE.search(block.get("text", ""))
+                        m = _VC_CONVERSATION_RE.search(block.get("text", ""))
                         if m:
                             return m.group(1)
         return None
 
-    def strip_session_markers(self, body: dict) -> dict:
+    def strip_conversation_markers(self, body: dict) -> dict:
         messages = body.get("messages")
         if not messages:
             return body
@@ -314,7 +314,7 @@ class AnthropicFormat(PayloadFormat):
 
             content = msg.get("content", "")
             if isinstance(content, str):
-                cleaned = _VC_SESSION_RE.sub("", content).rstrip()
+                cleaned = _VC_CONVERSATION_RE.sub("", content).rstrip()
                 if cleaned != content:
                     msg = dict(msg)
                     msg["content"] = cleaned
@@ -324,7 +324,7 @@ class AnthropicFormat(PayloadFormat):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
-                        cleaned = _VC_SESSION_RE.sub("", text).rstrip()
+                        cleaned = _VC_CONVERSATION_RE.sub("", text).rstrip()
                         if cleaned != text:
                             block = dict(block)
                             block["text"] = cleaned
@@ -342,7 +342,7 @@ class AnthropicFormat(PayloadFormat):
         body["messages"] = new_messages
         return body
 
-    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
+    def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
         response_body = copy.deepcopy(response_body)
         content = response_body.get("content", [])
         for block in reversed(content):
@@ -352,8 +352,8 @@ class AnthropicFormat(PayloadFormat):
         content.append({"type": "text", "text": marker})
         return response_body
 
-    def emit_session_marker_sse(self, session_id: str) -> bytes:
-        marker = f"\n<!-- vc:session={session_id} -->"
+    def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
         marker_event = json.dumps({
             "type": "content_block_delta",
             "index": 0,
@@ -522,24 +522,24 @@ class OpenAIFormat(PayloadFormat):
         body["messages"] = messages
         return body
 
-    def extract_session_id(self, body: dict) -> str | None:
+    def extract_conversation_id(self, body: dict) -> str | None:
         for msg in reversed(body.get("messages", [])):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                m = _VC_SESSION_RE.search(content)
+                m = _VC_CONVERSATION_RE.search(content)
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
                 for block in reversed(content):
                     if isinstance(block, dict) and block.get("type") == "text":
-                        m = _VC_SESSION_RE.search(block.get("text", ""))
+                        m = _VC_CONVERSATION_RE.search(block.get("text", ""))
                         if m:
                             return m.group(1)
         return None
 
-    def strip_session_markers(self, body: dict) -> dict:
+    def strip_conversation_markers(self, body: dict) -> dict:
         messages = body.get("messages")
         if not messages:
             return body
@@ -553,7 +553,7 @@ class OpenAIFormat(PayloadFormat):
 
             content = msg.get("content", "")
             if isinstance(content, str):
-                cleaned = _VC_SESSION_RE.sub("", content).rstrip()
+                cleaned = _VC_CONVERSATION_RE.sub("", content).rstrip()
                 if cleaned != content:
                     msg = dict(msg)
                     msg["content"] = cleaned
@@ -563,7 +563,7 @@ class OpenAIFormat(PayloadFormat):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
-                        cleaned = _VC_SESSION_RE.sub("", text).rstrip()
+                        cleaned = _VC_CONVERSATION_RE.sub("", text).rstrip()
                         if cleaned != text:
                             block = dict(block)
                             block["text"] = cleaned
@@ -581,7 +581,7 @@ class OpenAIFormat(PayloadFormat):
         body["messages"] = new_messages
         return body
 
-    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
+    def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
         response_body = copy.deepcopy(response_body)
         choices = response_body.get("choices", [])
         if choices:
@@ -590,8 +590,8 @@ class OpenAIFormat(PayloadFormat):
             msg["content"] = existing + marker
         return response_body
 
-    def emit_session_marker_sse(self, session_id: str) -> bytes:
-        marker = f"\n<!-- vc:session={session_id} -->"
+    def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
         marker_event = json.dumps({
             "choices": [{"index": 0, "delta": {"content": marker}}],
         })
@@ -747,21 +747,21 @@ class GeminiFormat(PayloadFormat):
         body["system_instruction"] = {"parts": new_parts}
         return body
 
-    # -- Session markers --
+    # -- Conversation markers --
 
-    def extract_session_id(self, body: dict) -> str | None:
+    def extract_conversation_id(self, body: dict) -> str | None:
         for msg in reversed(body.get("contents", [])):
             if msg.get("role") != "model":
                 continue
             parts = msg.get("parts", [])
             for part in reversed(parts):
                 if isinstance(part, dict) and "text" in part:
-                    m = _VC_SESSION_RE.search(part["text"])
+                    m = _VC_CONVERSATION_RE.search(part["text"])
                     if m:
                         return m.group(1)
         return None
 
-    def strip_session_markers(self, body: dict) -> dict:
+    def strip_conversation_markers(self, body: dict) -> dict:
         contents = body.get("contents")
         if not contents:
             return body
@@ -777,7 +777,7 @@ class GeminiFormat(PayloadFormat):
             new_parts = []
             for part in parts:
                 if isinstance(part, dict) and "text" in part:
-                    cleaned = _VC_SESSION_RE.sub("", part["text"]).rstrip()
+                    cleaned = _VC_CONVERSATION_RE.sub("", part["text"]).rstrip()
                     if cleaned != part["text"]:
                         part = dict(part)
                         part["text"] = cleaned
@@ -794,7 +794,7 @@ class GeminiFormat(PayloadFormat):
         body["contents"] = new_contents
         return body
 
-    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
+    def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
         response_body = copy.deepcopy(response_body)
         candidates = response_body.get("candidates", [])
         if candidates:
@@ -807,8 +807,8 @@ class GeminiFormat(PayloadFormat):
             parts.append({"text": marker})
         return response_body
 
-    def emit_session_marker_sse(self, session_id: str) -> bytes:
-        marker = f"\n<!-- vc:session={session_id} -->"
+    def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
         # Gemini SSE format: candidates[0].content.parts[0].text
         event_data = json.dumps({
             "candidates": [{
@@ -1085,9 +1085,9 @@ class OpenAIResponsesFormat(PayloadFormat):
         )
         return body
 
-    # -- Session markers --
+    # -- Conversation markers --
 
-    def extract_session_id(self, body: dict) -> str | None:
+    def extract_conversation_id(self, body: dict) -> str | None:
         items = body.get("input", [])
         if not isinstance(items, list):
             return None
@@ -1096,7 +1096,7 @@ class OpenAIResponsesFormat(PayloadFormat):
                 continue
             content = item.get("content", "")
             if isinstance(content, str):
-                m = _VC_SESSION_RE.search(content)
+                m = _VC_CONVERSATION_RE.search(content)
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
@@ -1104,12 +1104,12 @@ class OpenAIResponsesFormat(PayloadFormat):
                     if isinstance(block, dict):
                         text = block.get("text", "")
                         if text:
-                            m = _VC_SESSION_RE.search(text)
+                            m = _VC_CONVERSATION_RE.search(text)
                             if m:
                                 return m.group(1)
         return None
 
-    def strip_session_markers(self, body: dict) -> dict:
+    def strip_conversation_markers(self, body: dict) -> dict:
         items = body.get("input")
         if not isinstance(items, list) or not items:
             return body
@@ -1123,7 +1123,7 @@ class OpenAIResponsesFormat(PayloadFormat):
 
             content = item.get("content", "")
             if isinstance(content, str):
-                cleaned = _VC_SESSION_RE.sub("", content).rstrip()
+                cleaned = _VC_CONVERSATION_RE.sub("", content).rstrip()
                 if cleaned != content:
                     item = dict(item)
                     item["content"] = cleaned
@@ -1133,7 +1133,7 @@ class OpenAIResponsesFormat(PayloadFormat):
                 for block in content:
                     if isinstance(block, dict) and block.get("text"):
                         text = block["text"]
-                        cleaned = _VC_SESSION_RE.sub("", text).rstrip()
+                        cleaned = _VC_CONVERSATION_RE.sub("", text).rstrip()
                         if cleaned != text:
                             block = dict(block)
                             block["text"] = cleaned
@@ -1151,7 +1151,7 @@ class OpenAIResponsesFormat(PayloadFormat):
         body["input"] = new_items
         return body
 
-    def inject_session_marker(self, response_body: dict, marker: str) -> dict:
+    def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
         response_body = copy.deepcopy(response_body)
         output = response_body.get("output", [])
         # Find last output_text block in output items
@@ -1173,8 +1173,8 @@ class OpenAIResponsesFormat(PayloadFormat):
         })
         return response_body
 
-    def emit_session_marker_sse(self, session_id: str) -> bytes:
-        marker = f"\n<!-- vc:session={session_id} -->"
+    def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
         marker_event = json.dumps({
             "type": "response.output_text.delta",
             "delta": marker,

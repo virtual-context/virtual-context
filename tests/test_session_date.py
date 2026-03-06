@@ -191,7 +191,7 @@ class TestSessionDateStorage:
         store = SQLiteStore(db_path=tmp_path / "test.db")
         seg = StoredSegment(
             ref="test-ref-1",
-            session_id="sess-1",
+            conversation_id="sess-1",
             primary_tag="topic-a",
             tags=["topic-a"],
             summary="test summary",
@@ -221,7 +221,7 @@ class TestSessionDateStorage:
         store = FilesystemStore(root=tmp_path / "store")
         seg = StoredSegment(
             ref="test-ref-2",
-            session_id="sess-1",
+            conversation_id="sess-1",
             primary_tag="topic-b",
             tags=["topic-b"],
             summary="fs test summary",
@@ -251,7 +251,7 @@ class TestFindQuoteSessionDate:
         store = SQLiteStore(db_path=tmp_path / "test.db")
         seg = StoredSegment(
             ref="quote-ref-1",
-            session_id="sess-1",
+            conversation_id="sess-1",
             primary_tag="shoes",
             tags=["shoes"],
             summary="shoes summary",
@@ -276,7 +276,7 @@ class TestFindQuoteSessionDate:
         store = FilesystemStore(root=tmp_path / "store")
         seg = StoredSegment(
             ref="quote-ref-2",
-            session_id="sess-1",
+            conversation_id="sess-1",
             primary_tag="shoes",
             tags=["shoes"],
             summary="shoes summary",

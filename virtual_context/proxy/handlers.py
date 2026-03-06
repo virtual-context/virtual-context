@@ -28,7 +28,7 @@ from .helpers import (
     _extract_delta_text,
     _extract_assistant_text,
     _inject_context,
-    _inject_session_marker,
+    _inject_conversation_marker,
     _parse_sse_events,
     _build_continuation_request,
     _emit_text_as_sse,
@@ -91,7 +91,7 @@ async def _handle_streaming(
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
     overhead_ms: float = 0.0,
-    session_id: str = "",
+    conversation_id: str = "",
     passthrough: bool = False,
     response_log_path: object | None = None,
     session_log_path: object | None = None,
@@ -137,7 +137,7 @@ async def _handle_streaming(
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
                 "error": True,
-                "session_id": session_id,
+                "conversation_id": conversation_id,
             })
         print(
             f"[T{turn}] ERROR {upstream.status_code} "
@@ -170,7 +170,7 @@ async def _handle_streaming(
                 "upstream_ms": upstream_ms,
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
-                "session_id": session_id,
+                "conversation_id": conversation_id,
             })
         assistant_text = "".join(text_chunks)
         # Log upstream LLM call to telemetry ledger
@@ -512,7 +512,7 @@ async def _handle_streaming(
                                 "result": result_str[:200],
                                 "duration_ms": tool_ms,
                                 "continuation_count": loop_i + 1,
-                                "session_id": session_id,
+                                "conversation_id": conversation_id,
                             })
                         if api_format == "openai_responses":
                             tool_results.append({
@@ -838,9 +838,9 @@ async def _handle_streaming(
                         list(state.conversation_history),
                         payload_tokens=state._last_payload_tokens or None,
                     )
-                _marker_sid = state.engine.config.session_id
+                _marker_sid = state.engine.config.conversation_id
                 _fmt = get_format(api_format)
-                yield _fmt.emit_session_marker_sse(_marker_sid)
+                yield _fmt.emit_conversation_marker_sse(_marker_sid)
 
             if session_log_path and state:
                 _dump_session_state(state, session_log_path)
@@ -889,9 +889,9 @@ async def _handle_streaming(
 
                 # Inject session marker as a final SSE delta so the client SDK
                 # accumulates it into the stored assistant message.
-                _marker_sid = state.engine.config.session_id
+                _marker_sid = state.engine.config.conversation_id
                 _fmt = get_format(api_format)
-                yield _fmt.emit_session_marker_sse(_marker_sid)
+                yield _fmt.emit_conversation_marker_sse(_marker_sid)
 
             # Session state dump (after response + history update)
             if session_log_path and state:
@@ -931,7 +931,7 @@ async def _handle_non_streaming(
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
     overhead_ms: float = 0.0,
-    session_id: str = "",
+    conversation_id: str = "",
     passthrough: bool = False,
     response_log_path: object | None = None,
     session_log_path: object | None = None,
@@ -974,9 +974,9 @@ async def _handle_non_streaming(
             )
 
         # Inject session marker into the response body so the client stores it
-        session_id = state.engine.config.session_id
-        marker = f"\n<!-- vc:session={session_id} -->"
-        response_body = _inject_session_marker(response_body, marker, api_format)
+        conversation_id = state.engine.config.conversation_id
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        response_body = _inject_conversation_marker(response_body, marker, api_format)
 
     if metrics:
         metrics.record({
@@ -985,7 +985,7 @@ async def _handle_non_streaming(
             "upstream_ms": upstream_ms,
             "total_ms": round(overhead_ms + upstream_ms, 1),
             "streaming": False,
-            "session_id": session_id,
+            "conversation_id": conversation_id,
         })
 
     # Log upstream LLM call to telemetry ledger

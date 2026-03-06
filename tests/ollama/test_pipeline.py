@@ -129,7 +129,7 @@ class TestFullPipeline:
             for result in results:
                 stored = StoredSegment(
                     ref=result.segment_id,
-                    session_id="test-session",
+                    conversation_id="test-session",
                     primary_tag=result.primary_tag,
                     tags=result.tags,
                     summary=result.summary,
@@ -308,7 +308,7 @@ class TestFullPipeline:
             for result in results:
                 stored = StoredSegment(
                     ref=result.segment_id,
-                    session_id="test-session",
+                    conversation_id="test-session",
                     primary_tag=result.primary_tag,
                     tags=result.tags,
                     summary=result.summary,

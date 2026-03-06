@@ -60,7 +60,7 @@ class Fact:
     # Provenance
     tags: list[str] = field(default_factory=list)
     segment_ref: str = ""
-    session_id: str = ""
+    conversation_id: str = ""
     turn_numbers: list[int] = field(default_factory=list)
     mentioned_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     session_date: str = ""  # original conversation date, e.g. "2023/05/25 (Thu) 10:04"
@@ -164,7 +164,7 @@ class TurnTagEntry:
 @dataclass
 class EngineStateSnapshot:
     """Serializable snapshot of engine state for persistence across restarts."""
-    session_id: str
+    conversation_id: str
     compacted_through: int
     turn_tag_entries: list[TurnTagEntry]
     turn_count: int  # len(conversation_history) // 2
@@ -284,7 +284,7 @@ class CompactionReport:
 @dataclass
 class StoredSegment:
     ref: str = field(default_factory=lambda: str(uuid.uuid4()))
-    session_id: str = ""
+    conversation_id: str = ""
     primary_tag: str = "_general"
     tags: list[str] = field(default_factory=list)
     summary: str = ""
@@ -362,9 +362,9 @@ class TagStats:
 
 
 @dataclass
-class SessionStats:
-    """Aggregate statistics for a single engine session."""
-    session_id: str = ""
+class ConversationStats:
+    """Aggregate statistics for a single conversation."""
+    conversation_id: str = ""
     segment_count: int = 0
     total_full_tokens: int = 0
     total_summary_tokens: int = 0
@@ -686,7 +686,7 @@ class VirtualContextConfig:
     supersession: SupersessionConfig = field(default_factory=SupersessionConfig)
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
-    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     @property
     def cost_tracking(self) -> TelemetryConfig:

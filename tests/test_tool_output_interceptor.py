@@ -69,10 +69,10 @@ class FakeStore:
     def __init__(self):
         self.stored: list[dict] = []
 
-    def store_tool_output(self, ref, session_id, tool_name, command, turn, content, original_bytes):
+    def store_tool_output(self, ref, conversation_id, tool_name, command, turn, content, original_bytes):
         self.stored.append({
             "ref": ref,
-            "session_id": session_id,
+            "conversation_id": conversation_id,
             "tool_name": tool_name,
             "command": command,
             "turn": turn,

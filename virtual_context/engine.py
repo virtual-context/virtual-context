@@ -349,7 +349,7 @@ class VirtualContextEngine:
             for i, result in enumerate(results):
                 stored = StoredSegment(
                     ref=result.segment_id,
-                    session_id=self.config.session_id,
+                    conversation_id=self.config.conversation_id,
                     primary_tag=result.primary_tag,
                     tags=result.tags,
                     summary=result.summary,
@@ -369,7 +369,7 @@ class VirtualContextEngine:
                 if result.facts:
                     for fact in result.facts:
                         fact.segment_ref = stored.ref
-                        fact.session_id = self.config.session_id
+                        fact.conversation_id = self.config.conversation_id
                     self._store.store_facts(result.facts)
                     logger.info(
                         "  Stored %d facts for segment %s",
@@ -400,13 +400,13 @@ class VirtualContextEngine:
     def _load_persisted_state(self) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available."""
         try:
-            saved = self._store.load_engine_state(self.config.session_id)
+            saved = self._store.load_engine_state(self.config.conversation_id)
         except Exception:
             logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
             return
         if not saved:
             return
-        self.config.session_id = saved.session_id
+        self.config.conversation_id = saved.conversation_id
         self._compacted_through = saved.compacted_through
         self._turn_tag_index = TurnTagIndex()
         for entry in saved.turn_tag_entries:
@@ -416,8 +416,8 @@ class VirtualContextEngine:
         self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
         self._trailing_fingerprint = saved.trailing_fingerprint
         logger.info(
-            "Restored engine state: session=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
-            saved.session_id[:12], saved.compacted_through,
+            "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
+            saved.conversation_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
             len(self._working_set),
         )
@@ -459,7 +459,7 @@ class VirtualContextEngine:
         """Persist current engine state to store."""
         try:
             self._store.save_engine_state(EngineStateSnapshot(
-                session_id=self.config.session_id,
+                conversation_id=self.config.conversation_id,
                 compacted_through=self._compacted_through,
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=len(conversation_history) // 2,

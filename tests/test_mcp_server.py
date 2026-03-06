@@ -123,7 +123,7 @@ class TestMCPPrompts:
         result = recall("database schema")
         assert "database schema" in result
 
-    def test_summarize_session_prompt(self):
-        from virtual_context.mcp.server import summarize_session
-        result = summarize_session()
+    def test_summarize_conversation_prompt(self):
+        from virtual_context.mcp.server import summarize_conversation
+        result = summarize_conversation()
         assert "compact" in result.lower()

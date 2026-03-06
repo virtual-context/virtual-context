@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, DepthLevel, EngineStateSnapshot, Fact, QuoteResult, SessionStats, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -48,8 +48,8 @@ class ContextStore(ABC):
         """List all tags with statistics."""
 
     @abstractmethod
-    def get_session_stats(self) -> list[SessionStats]:
-        """Return aggregate statistics grouped by session_id, newest first."""
+    def get_conversation_stats(self) -> list[ConversationStats]:
+        """Return aggregate statistics grouped by conversation_id, newest first."""
 
     @abstractmethod
     def get_tag_aliases(self) -> dict[str, str]:
@@ -111,19 +111,19 @@ class ContextStore(ABC):
         return []
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
-        """Persist engine state (TurnTagIndex + watermark). Upsert by session_id."""
+        """Persist engine state (TurnTagIndex + watermark). Upsert by conversation_id."""
 
-    def load_engine_state(self, session_id: str) -> EngineStateSnapshot | None:
-        """Load persisted engine state for a session. None if not found."""
+    def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
+        """Load persisted engine state for a conversation. None if not found."""
 
     def load_latest_engine_state(self) -> EngineStateSnapshot | None:
-        """Load the most recently saved engine state (any session). None if empty."""
+        """Load the most recently saved engine state (any conversation). None if empty."""
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
-        """Return {trailing_fingerprint: session_id} for all persisted sessions.
+        """Return {trailing_fingerprint: conversation_id} for all persisted conversations.
 
         Used by SessionRegistry on restart to match inbound requests to
-        existing sessions when session markers are unavailable.
+        existing conversations when conversation markers are unavailable.
         """
 
     # ------------------------------------------------------------------
@@ -212,7 +212,7 @@ class ContextStore(ABC):
     def store_tool_output(
         self,
         ref: str,
-        session_id: str,
+        conversation_id: str,
         tool_name: str,
         command: str,
         turn: int,

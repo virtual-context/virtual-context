@@ -36,7 +36,7 @@ def _make_segment(
 ) -> StoredSegment:
     return StoredSegment(
         ref=ref,
-        session_id="session-1",
+        conversation_id="session-1",
         primary_tag=primary_tag,
         tags=tags or [primary_tag],
         summary=summary,

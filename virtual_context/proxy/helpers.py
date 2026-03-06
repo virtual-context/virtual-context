@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 from ._envelope import (  # noqa: E402
     _VC_PROMPT_MARKER,
-    _VC_SESSION_RE,
+    _VC_CONVERSATION_RE,
     _last_text_block,
     _strip_vc_prompt,
     _strip_openclaw_envelope,
@@ -65,16 +65,16 @@ def _detect_api_format(body: dict) -> str:
     return detect_format(body).name
 
 
-def _extract_session_id(body: dict) -> str | None:
-    """Scan assistant messages for vc:session marker. Returns UUID or None."""
+def _extract_conversation_id(body: dict) -> str | None:
+    """Scan assistant messages for vc:conversation marker. Returns UUID or None."""
     fmt = detect_format(body)
-    return fmt.extract_session_id(body)
+    return fmt.extract_conversation_id(body)
 
 
-def _strip_session_markers(body: dict) -> dict:
-    """Strip vc:session markers from all assistant messages in the request body."""
+def _strip_conversation_markers(body: dict) -> dict:
+    """Strip vc:conversation markers from all assistant messages in the request body."""
     fmt = detect_format(body)
-    return fmt.strip_session_markers(body)
+    return fmt.strip_conversation_markers(body)
 
 
 def _extract_user_message(body: dict) -> str:
@@ -99,9 +99,9 @@ def _inject_context(body: dict, prepend_text: str, api_format: str) -> dict:
     return get_format(api_format).inject_context(body, prepend_text)
 
 
-def _inject_session_marker(response_body: dict, marker: str, api_format: str) -> dict:
-    """Append session marker text to the last text content block."""
-    return get_format(api_format).inject_session_marker(response_body, marker)
+def _inject_conversation_marker(response_body: dict, marker: str, api_format: str) -> dict:
+    """Append conversation marker text to the last text content block."""
+    return get_format(api_format).inject_conversation_marker(response_body, marker)
 
 
 def _extract_delta_text(data: dict, api_format: str) -> str:
@@ -506,7 +506,7 @@ def _dump_session_state(
                 })
 
         dump = {
-            "session_id": engine.config.session_id,
+            "conversation_id": engine.config.conversation_id,
             "session_state": state._state.value if hasattr(state._state, "value") else str(state._state),  # type: ignore[attr-defined]
             "turn_count": len(state.conversation_history) // 2,  # type: ignore[attr-defined]
             "compacted_through": getattr(engine, "_compacted_through", 0),
