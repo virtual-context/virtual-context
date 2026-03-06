@@ -380,23 +380,3 @@ def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _has_tool_use(msg: dict) -> bool:
-    """Check if an assistant message contains tool_use blocks."""
-    content = msg.get("content", [])
-    if isinstance(content, list):
-        return any(
-            isinstance(b, dict) and b.get("type") == "tool_use"
-            for b in content
-        )
-    return False
-
-
-def _has_tool_result(msg: dict) -> bool:
-    """Check if a user message contains tool_result blocks."""
-    content = msg.get("content", [])
-    if isinstance(content, list):
-        return any(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in content
-        )
-    return False
