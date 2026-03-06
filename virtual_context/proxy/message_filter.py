@@ -263,6 +263,10 @@ def filter_body_messages(
         if result_idx is not None and use_idx in keep_msg and result_idx in keep_msg:
             _critical_indices.add(use_idx)
             _critical_indices.add(result_idx)
+    # Build a set of kept-list positions that are critical (have tool_use/result
+    # partners).  Uses an index set instead of mutating message dicts with sentinel
+    # keys — avoids leaking temporary keys if an exception interrupts cleanup.
+    _critical_kept: set[int] = set()
     _prefix_len = len(prefix)
     _chat_kept_i = 0
     for kept_i in range(_prefix_len, len(kept)):
@@ -271,7 +275,7 @@ def filter_body_messages(
         while _chat_kept_i < len(chat_msgs) and _chat_kept_i not in keep_msg:
             _chat_kept_i += 1
         if _chat_kept_i < len(chat_msgs) and _chat_kept_i in _critical_indices:
-            kept[kept_i]["_vc_critical"] = True
+            _critical_kept.add(kept_i)
         _chat_kept_i += 1
 
     # PROXY-022: Enforce strict role alternation.
@@ -284,29 +288,30 @@ def filter_body_messages(
     # referential pair — dropping it would orphan the partner.
     # Note: bare items (no role, e.g. function_call in Responses API) are always kept.
     alternating: list[dict] = []
-    for msg in kept:
+    _alt_critical: list[bool] = []  # parallel list tracking criticality
+    for kept_i, msg in enumerate(kept):
         role = msg.get("role")
         if role is None:
-            alternating.append(msg)  # bare items always kept
+            alternating.append(msg)
+            _alt_critical.append(kept_i in _critical_kept)
             continue
         if alternating and role == alternating[-1].get("role"):
-            if msg.get("_vc_critical"):
+            if kept_i in _critical_kept:
                 # This message has a tool_use/tool_result partner that's also
                 # kept — dropping it would create an orphan.  Instead, drop
                 # the PREVIOUS same-role message if it's not critical.
-                if not alternating[-1].get("_vc_critical"):
+                if not _alt_critical[-1]:
                     alternating[-1] = msg  # replace previous with current
+                    _alt_critical[-1] = True
                 else:
                     alternating.append(msg)  # both critical — keep both
+                    _alt_critical.append(True)
             else:
                 continue  # skip — would create consecutive same-role
         else:
             alternating.append(msg)
+            _alt_critical.append(kept_i in _critical_kept)
     kept = alternating
-
-    # Clean up sentinel keys before returning
-    for msg in kept:
-        msg.pop("_vc_critical", None)
 
     # PROXY-004c: Final safety net — verify no orphaned tool_result blocks.
     # The tagging fix above should prevent orphans, but if any slip through

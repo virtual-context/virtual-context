@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..core.tool_loop import (
     is_vc_tool,
@@ -61,13 +62,21 @@ async def _passthrough_bytes(
     url: str,
     headers: dict[str, str],
     body: bytes,
-) -> StreamingResponse:
-    """Forward raw bytes to upstream and stream back."""
+) -> JSONResponse | Response:
+    """Forward raw bytes to upstream and return the response."""
     resp = await client.request(method, url, headers=headers, content=body)
-    return JSONResponse(
-        content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
+    fwd = _forward_headers(dict(resp.headers))
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        return JSONResponse(
+            content=resp.json(),
+            status_code=resp.status_code,
+            headers=fwd,
+        )
+    return Response(
+        content=resp.content,
         status_code=resp.status_code,
-        headers=_forward_headers(dict(resp.headers)),
+        media_type=resp.headers.get("content-type"),
+        headers=fwd,
     )
 
 
@@ -821,7 +830,8 @@ async def _handle_streaming(
             assistant_text, _ = _post_stream(text_chunks, raw_events)
             if state and assistant_text:
                 state.conversation_history.append(
-                    Message(role="assistant", content=assistant_text),
+                    Message(role="assistant", content=assistant_text,
+                            timestamp=datetime.now(timezone.utc)),
                 )
                 if not passthrough:
                     state.fire_turn_complete(
@@ -868,7 +878,8 @@ async def _handle_streaming(
             assistant_text, _ = _post_stream(text_chunks, raw_events)
             if state and assistant_text:
                 state.conversation_history.append(
-                    Message(role="assistant", content=assistant_text)
+                    Message(role="assistant", content=assistant_text,
+                            timestamp=datetime.now(timezone.utc))
                 )
                 if not passthrough:
                     state.fire_turn_complete(
@@ -953,7 +964,8 @@ async def _handle_non_streaming(
     assistant_text = _extract_assistant_text(response_body, api_format)
     if state and assistant_text:
         state.conversation_history.append(
-            Message(role="assistant", content=assistant_text)
+            Message(role="assistant", content=assistant_text,
+                    timestamp=datetime.now(timezone.utc))
         )
         if not passthrough:
             state.fire_turn_complete(

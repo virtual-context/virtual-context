@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -216,7 +217,8 @@ def create_app(
         except Exception:
             pass  # engine may be a mock in tests
 
-    _log_seq = 0  # monotonic counter for filenames
+    import itertools as _itertools
+    _log_seq = _itertools.count(1)  # atomic monotonic counter for filenames
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
@@ -256,7 +258,11 @@ def create_app(
         # Per-request upstream override (e.g. subdomain routing in cloud)
         _req_upstream = getattr(request.state, "upstream", None)
         if _req_upstream:
-            url = f"{_req_upstream}/{path}{_suffix}"
+            if _req_upstream != upstream:
+                logger.warning("Rejected upstream override: %s (allowed: %s)", _req_upstream, upstream)
+                _req_upstream = None
+            else:
+                url = f"{_req_upstream}/{path}{_suffix}"
         raw_headers = dict(request.headers)
         fwd_headers = _forward_headers(raw_headers)
 
@@ -269,15 +275,14 @@ def create_app(
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
         # --- Raw request log: dump entire payload before any processing ---
-        nonlocal _log_seq
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
         if _request_log_dir and body_bytes:
-            _log_seq += 1
+            _seq = next(_log_seq)
             import datetime as _dt_log
             ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            _log_prefix = f"{_log_seq:06d}_{ts}_{path.replace('/', '_')}"
+            _log_prefix = f"{_seq:06d}_{ts}_{path.replace('/', '_')}"
             # 1-inbound: raw request from client
             req_log = _request_log_dir / f"{_log_prefix}.1-inbound.json"
             _response_log_path = _request_log_dir / f"{_log_prefix}.3-from-llm.json"
@@ -380,7 +385,7 @@ def create_app(
         # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
         # ---------------------------------------------------------------
         if state:
-            state._live_requests += 1
+            state._total_requests += 1
             current_state = state.session_state
 
             # Fresh session starts ACTIVE but may need ingestion — check and
@@ -409,7 +414,8 @@ def create_app(
                     )
 
                 state.conversation_history.append(
-                    Message(role="user", content=user_message)
+                    Message(role="user", content=user_message,
+                            timestamp=datetime.now(timezone.utc))
                 )
 
                 _session_id = state.engine.config.session_id
@@ -458,7 +464,7 @@ def create_app(
                         store=state.engine._store,
                         session_id=state.engine.config.session_id,
                     )
-                    _pt_interceptor._turn_counter = state._live_requests
+                    _pt_interceptor._turn_counter = state._total_requests
                     _pre_stats = _pt_interceptor.stats.total_intercepted
                     body = _pt_interceptor.process(body, fmt)
                     _post_stats = _pt_interceptor.stats.total_intercepted
@@ -509,7 +515,8 @@ def create_app(
                 wait_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 state.conversation_history.append(
-                    Message(role="user", content=user_message)
+                    Message(role="user", content=user_message,
+                            timestamp=datetime.now(timezone.utc))
                 )
 
                 # Compute available headroom for VC context injection
@@ -559,8 +566,12 @@ def create_app(
                 fmt=fmt,
             )
 
-        # Tool output interception: truncate large tool_result blocks
+        # Tool output interception: truncate large tool_result blocks.
+        # I6: deepcopy before interceptor so mutations don't affect the
+        # original body dict (which _inject_context also reads).
         if state and state.engine.config.tool_output.enabled:
+            import copy
+
             from .tool_output_interceptor import ToolOutputInterceptor
 
             interceptor = ToolOutputInterceptor(
@@ -568,9 +579,9 @@ def create_app(
                 store=state.engine._store,
                 session_id=state.engine.config.session_id,
             )
-            interceptor._turn_counter = state._live_requests
+            interceptor._turn_counter = state._total_requests
             _pre = interceptor.stats.total_intercepted
-            body = interceptor.process(body, fmt)
+            body = interceptor.process(copy.deepcopy(body), fmt)
             _post = interceptor.stats.total_intercepted
             if _post > _pre:
                 print(f"[TOOL-INTERCEPT] Active: truncated {_post - _pre} tool_result(s), "
