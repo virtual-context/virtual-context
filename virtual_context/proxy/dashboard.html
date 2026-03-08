@@ -46,6 +46,9 @@
     cursor: pointer; font-family: inherit;
   }
   .shutdown-btn:hover { background: var(--red); color: #fff; }
+  .budget-banner { display:none; padding:8px 14px; margin:0 0 10px; border-radius:6px; font-size:12px; line-height:1.5; }
+  .budget-banner.promoted { background:rgba(209,134,22,0.15); border:1px solid var(--orange); color:var(--orange); }
+  .budget-banner.exceeded { background:rgba(248,81,73,0.12); border:1px solid var(--red); color:var(--red); }
 
   /* Stat cards */
   .stats-wrapper { margin-bottom: 16px; }
@@ -439,6 +442,9 @@
   </button>
   <button class="shutdown-btn" onclick="shutdownProxy()">Shutdown</button>
 </header>
+
+<div id="budget-promoted-banner" class="budget-banner promoted"></div>
+<div id="budget-exceeded-banner" class="budget-banner exceeded"></div>
 
 <div class="stats-wrapper">
   <div class="section-header"><h2 style="font-size:12px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.05em">Overview</h2><button class="help-btn" data-help="overview" onclick="toggleHelp(this)">?</button></div>
@@ -1241,6 +1247,24 @@
       lastCompactionEvt = snapCompactions[snapCompactions.length - 1];
     }
 
+    // Restore budget banners from snapshot
+    if (data.budget_promoted) {
+      var bp = $('budget-promoted-banner');
+      bp.textContent = '\u26a0 Budget auto-promoted: client overhead (' +
+        (data.budget_promoted.overhead||0).toLocaleString() + 't) exceeds context_window (' +
+        (data.budget_promoted.original||0).toLocaleString() + 't). Effective budget: ' +
+        (data.budget_promoted.promoted||0).toLocaleString() + 't.';
+      bp.style.display = 'block';
+    }
+    if (data.budget_exceeded) {
+      var be = $('budget-exceeded-banner');
+      be.textContent = '\u26a0 Over budget: payload ' +
+        (data.budget_exceeded.total||0).toLocaleString() + 't exceeds budget ' +
+        (data.budget_exceeded.budget||0).toLocaleString() + 't by ' +
+        (data.budget_exceeded.excess||0).toLocaleString() + 't. Uncompacted turns pending.';
+      be.style.display = 'block';
+    }
+
     updateStats();
     updatePipeline();
     updateMemory();
@@ -1910,6 +1934,20 @@
         handleHistoryIngestion(data);
       } else if (data.type === 'session_state_change') {
         fetchLiveConversations();
+      } else if (data.type === 'budget_auto_promoted') {
+        var bp = $('budget-promoted-banner');
+        bp.textContent = '\u26a0 Budget auto-promoted: client overhead (' +
+          (data.overhead||0).toLocaleString() + 't) exceeds context_window (' +
+          (data.original||0).toLocaleString() + 't). Effective budget: ' +
+          (data.promoted||0).toLocaleString() + 't.';
+        bp.style.display = 'block';
+      } else if (data.type === 'budget_exceeded') {
+        var be = $('budget-exceeded-banner');
+        be.textContent = '\u26a0 Over budget: payload ' +
+          (data.total||0).toLocaleString() + 't exceeds budget ' +
+          (data.budget||0).toLocaleString() + 't by ' +
+          (data.excess||0).toLocaleString() + 't. Uncompacted turns pending.';
+        be.style.display = 'block';
       } else if (data.type === 'replay_progress') {
         handleReplayProgress(data);
       } else if (data.type === 'replay_done') {
