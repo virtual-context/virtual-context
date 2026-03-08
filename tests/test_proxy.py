@@ -5058,6 +5058,80 @@ class TestStubCompactedMessages:
         assert stub_count == 0
         assert result["messages"][0]["content"] == "Unique message not in index"
 
+    def test_stub_eliminates_tool_chain_integrity_issue(self):
+        """Stubbing compacted turns eliminates tool_use_id references.
+
+        Simulates PROXY-025: compacted turns with tool_use/tool_result chains
+        that would normally be force-kept by referential integrity. After stubbing,
+        no tool_use_id survives, so the integrity loop has nothing to chase.
+        """
+        import hashlib
+
+        # Turn 0: user asks, assistant uses a tool, tool returns result
+        user_text_0 = "Read the config file"
+        asst_text_0 = "Let me read that."
+        h0 = hashlib.sha256(f"{user_text_0} {asst_text_0}".encode()).hexdigest()[:16]
+
+        # Turn 1: user asks about result, assistant responds with another tool
+        user_text_1 = "Now edit it"
+        asst_text_1 = "I'll edit the file."
+        h1 = hashlib.sha256(f"{user_text_1} {asst_text_1}".encode()).hexdigest()[:16]
+
+        body = {"messages": [
+            # Turn 0 (compacted)
+            {"role": "user", "content": [{"type": "text", "text": user_text_0}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": asst_text_0},
+                {"type": "tool_use", "id": "toolu_001", "name": "Read", "input": {"path": "/config"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_001", "content": "config data here"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Config contains X."}]},
+            # Turn 1 (compacted)
+            {"role": "user", "content": [{"type": "text", "text": user_text_1}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": asst_text_1},
+                {"type": "tool_use", "id": "toolu_002", "name": "Edit", "input": {"path": "/config"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_002", "content": "edited"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Done editing."}]},
+            # Turn 2 (not compacted — current)
+            {"role": "user", "content": "What did we change?"},
+        ]}
+
+        idx = TurnTagIndex()
+        idx.append(TurnTagEntry(turn_number=0, message_hash=h0,
+                                tags=["config", "file-reading"], primary_tag="config"))
+        idx.append(TurnTagEntry(turn_number=1, message_hash=h1,
+                                tags=["config", "file-editing"], primary_tag="config"))
+
+        from virtual_context.proxy.message_filter import stub_compacted_messages
+        result, stub_count = stub_compacted_messages(
+            body, idx, compacted_through=4,  # turns 0-1 compacted (4 internal messages)
+        )
+        msgs = result["messages"]
+
+        assert stub_count == 2
+
+        # Verify NO tool_use or tool_result blocks anywhere in stubbed messages
+        for m in msgs[:-1]:  # exclude current user message
+            content = m.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    assert block.get("type") != "tool_use", f"tool_use survived: {block}"
+                    assert block.get("type") != "tool_result", f"tool_result survived: {block}"
+
+        # Verify role alternation
+        roles = [m["role"] for m in msgs]
+        expected_roles = ["user", "assistant", "user", "assistant", "user"]
+        assert roles == expected_roles, f"Role alternation broken: {roles}"
+
+        # Verify current turn preserved
+        assert msgs[-1]["content"] == "What did we change?"
+
 
 # ---------------------------------------------------------------------------
 # _compute_effective_budget
