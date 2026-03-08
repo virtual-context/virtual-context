@@ -90,6 +90,26 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Budget helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_effective_budget(
+    context_window: int,
+    system_tokens: int,
+    tools_tokens: int,
+) -> tuple[int, bool]:
+    """Compute effective token budget, auto-promoting if client overhead exceeds window.
+
+    Returns (effective_budget, was_promoted).
+    """
+    overhead = system_tokens + tools_tokens
+    if overhead >= context_window:
+        return overhead + 10_000, True
+    return context_window, False
+
+
+# ---------------------------------------------------------------------------
 # create_app
 # ---------------------------------------------------------------------------
 
