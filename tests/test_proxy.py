@@ -4894,3 +4894,26 @@ class TestTurnTagIndexHashLookup:
         assert idx.get_entry_by_hash("def456").turn_number == 1
         assert idx.get_entry_by_hash("ghi789").turn_number == 2
         assert idx.get_entry_by_hash("nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
+# estimate_tools_tokens
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateToolsTokens:
+    def test_estimate_tools_tokens(self):
+        """PayloadFormat.estimate_tools_tokens counts tool definition tokens."""
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        body = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "read", "description": "Read a file", "input_schema": {"type": "object"}},
+                {"name": "write", "description": "Write a file", "input_schema": {"type": "object"}},
+            ],
+        }
+        tokens = fmt.estimate_tools_tokens(body)
+        assert tokens > 0
+        # Empty tools → 0
+        assert fmt.estimate_tools_tokens({"messages": []}) == 0
