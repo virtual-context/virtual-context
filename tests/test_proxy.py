@@ -4937,6 +4937,7 @@ class TestStubCompactedMessages:
             ))
         return idx
 
+    @pytest.mark.regression("PROXY-025")
     def test_stubs_compacted_turn_simple_pair(self):
         """A simple user+assistant pair is stubbed when its hash matches a compacted turn."""
         import hashlib
@@ -4968,6 +4969,7 @@ class TestStubCompactedMessages:
         # Follow-up preserved
         assert msgs[2]["content"] == "Follow up question"
 
+    @pytest.mark.regression("PROXY-025")
     def test_stubs_turn_with_tool_chain(self):
         """A turn with tool_use/tool_result chain is collapsed to user+assistant stubs."""
         import hashlib
@@ -5058,6 +5060,7 @@ class TestStubCompactedMessages:
         assert stub_count == 0
         assert result["messages"][0]["content"] == "Unique message not in index"
 
+    @pytest.mark.regression("PROXY-025")
     def test_stub_eliminates_tool_chain_integrity_issue(self):
         """Stubbing compacted turns eliminates tool_use_id references.
 
@@ -5150,6 +5153,7 @@ class TestComputeEffectiveBudget:
         assert budget == 120_000
         assert promoted is False
 
+    @pytest.mark.regression("PROXY-025")
     def test_compute_effective_budget_auto_promotes(self):
         """When overhead >= context_window, budget auto-promotes to overhead + 10k."""
         from virtual_context.proxy.server import _compute_effective_budget
