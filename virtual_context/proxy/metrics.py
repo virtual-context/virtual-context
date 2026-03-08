@@ -150,6 +150,14 @@ class ProxyMetrics:
                 "tool_intercepts": list(tool_intercepts),
                 "total_tool_intercepts": len(tool_intercepts),
                 "telemetry": telemetry,
+                "budget_promoted": next(
+                    (e for e in reversed(self._events)
+                     if e.get("type") == "budget_auto_promoted"), None,
+                ),
+                "budget_exceeded": next(
+                    (e for e in reversed(self._events)
+                     if e.get("type") == "budget_exceeded"), None,
+                ),
             }
 
     def capture_request(
