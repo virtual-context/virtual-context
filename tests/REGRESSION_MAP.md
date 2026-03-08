@@ -352,6 +352,18 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_engine_integration.py::test_primary_tag_guarantee_ephemeral_gets_tag_summary`
 
+### PROXY-025 — Budget-enforced message stubbing (context_window not enforced)
+
+- **Symptom**: With `context_window: 5000`, proxy sends 28k+ tokens upstream. Tool chain referential integrity keeps compacted messages.
+- **Root cause**: Turn counting mismatch between VC internal history and client payloads with dense tool chains.
+- **Fix**: Hash-based stub replacement via `stub_compacted_messages()`. Budget auto-promotion when overhead exceeds window. Over-budget alerting.
+- **Tests**:
+  - `test_proxy.py::TestStubCompactedMessages::test_stubs_compacted_turn_simple_pair`
+  - `test_proxy.py::TestStubCompactedMessages::test_stubs_turn_with_tool_chain`
+  - `test_proxy.py::TestStubCompactedMessages::test_stub_eliminates_tool_chain_integrity_issue`
+  - `test_proxy.py::TestComputeEffectiveBudget::test_compute_effective_budget_auto_promotes`
+  - `test_proxy.py::TestTurnTagIndexHashLookup::test_turn_tag_index_hash_lookup`
+
 ---
 
 ## By Test File
@@ -366,7 +378,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_retriever.py` | BUG-008, BUG-009 |
 | `test_context_bleed.py` | BUG-010 |
 | `test_turn_tag_index.py` | PROXY-002 |
-| `test_proxy.py` | BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-004b, PROXY-004c, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023 |
+| `test_proxy.py` | BUG-008, PROXY-001, PROXY-002, PROXY-003, PROXY-004, PROXY-004b, PROXY-004c, PROXY-005, PROXY-010, PROXY-013, PROXY-014, PROXY-015, PROXY-022, PROXY-023, PROXY-025 |
 | `test_paging.py` | PROXY-024 |
 | `test_monitor.py` | PROXY-021 |
 | `test_empty_turn_skip.py` | BUG-013 |
