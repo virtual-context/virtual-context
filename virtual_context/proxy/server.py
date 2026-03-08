@@ -563,6 +563,49 @@ def create_app(
             except Exception as e:
                 logger.error("Engine error (forwarding unmodified): %s", e)
 
+        # PROXY-025: Budget auto-promotion
+        _effective_budget = 0
+        _budget_promoted = False
+        try:
+            if state:
+                _cw = int(state.engine.config.context_window)
+                _effective_budget = _cw
+                _sys_tok = fmt._estimate_system_tokens(body)
+                _tools_tok = fmt.estimate_tools_tokens(body)
+                _effective_budget, _budget_promoted = _compute_effective_budget(
+                    _cw, _sys_tok, _tools_tok,
+                )
+                if _budget_promoted:
+                    print(
+                        f"[BUDGET] Client overhead ({_sys_tok + _tools_tok}t) exceeds "
+                        f"context_window ({_cw}t). "
+                        f"Auto-promoted to {_effective_budget}t."
+                    )
+                    metrics.record({
+                        "type": "budget_auto_promoted",
+                        "original": _cw,
+                        "promoted": _effective_budget,
+                        "overhead": _sys_tok + _tools_tok,
+                    })
+        except (TypeError, ValueError, AttributeError):
+            _effective_budget = 0
+
+        # PROXY-025: Stub compacted messages via hash matching
+        turns_stubbed = 0
+        try:
+            if state and int(state.engine._compacted_through) > 0:
+                from .message_filter import stub_compacted_messages
+                body, turns_stubbed = stub_compacted_messages(
+                    body,
+                    state.engine._turn_tag_index,
+                    state.engine._compacted_through,
+                    fmt=fmt,
+                )
+                if turns_stubbed:
+                    print(f"[STUB] Stubbed {turns_stubbed} compacted turns")
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         # Filter irrelevant history turns from the request body
         _pre_filter_body = body  # preserve for request capture
         turns_dropped = 0
@@ -689,6 +732,21 @@ def create_app(
         if state:
             state._last_enriched_payload_tokens = input_tokens
 
+        # PROXY-025: Over-budget alert
+        if state and _effective_budget > 0 and input_tokens > _effective_budget:
+            _excess = input_tokens - _effective_budget
+            print(
+                f"[BUDGET] Payload {input_tokens}t exceeds budget "
+                f"{_effective_budget}t by {_excess}t. "
+                f"Uncompacted turns pending compaction."
+            )
+            metrics.record({
+                "type": "budget_exceeded",
+                "total": input_tokens,
+                "budget": _effective_budget,
+                "excess": _excess,
+            })
+
         # Record request event
         turn = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
         context_tokens = len(prepend_text) // 4 if prepend_text else 0
@@ -718,6 +776,7 @@ def create_app(
             "raw_input_tokens": raw_input_tokens,
             "system_tokens": system_tokens,
             "turns_dropped": turns_dropped,
+            "turns_stubbed": turns_stubbed,
             "conversation_id": _conversation_id,
         })
 
@@ -729,6 +788,7 @@ def create_app(
             f"tags=[{_tags_str}]{_flag_str} "
             f"msgs={len(body.get('messages', []))} "
             f"dropped={turns_dropped} "
+            f"stubbed={turns_stubbed} "
             f"ctx={context_tokens}t input={input_tokens}t "
             f"vc={overhead_ms}ms | {user_message[:60]}"
         )
