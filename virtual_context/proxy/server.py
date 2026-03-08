@@ -361,6 +361,12 @@ def create_app(
                     state.engine._trailing_fingerprint = fp
                     registry._fingerprints[fp] = state.engine.config.conversation_id
 
+        # Use accurate token counter from engine when available (e.g. tiktoken)
+        if state and hasattr(state.engine, "_token_counter"):
+            _tc = state.engine._token_counter
+            if callable(_tc) and not hasattr(_tc, '_mock_name'):
+                fmt.set_token_counter(_tc)
+
         api_format = fmt.name
         user_message = fmt.extract_user_message(body)
         is_streaming = body.get("stream", False)
