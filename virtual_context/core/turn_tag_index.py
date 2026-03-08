@@ -17,10 +17,13 @@ class TurnTagIndex:
     def __init__(self) -> None:
         self.entries: list[TurnTagEntry] = []
         self._by_turn: dict[int, TurnTagEntry] = {}
+        self._by_hash: dict[str, TurnTagEntry] = {}
 
     def append(self, entry: TurnTagEntry) -> None:
         self.entries.append(entry)
         self._by_turn[entry.turn_number] = entry
+        if entry.message_hash:
+            self._by_hash[entry.message_hash] = entry
 
     def get_active_tags(self, lookback: int = 4) -> set[str]:
         """Tags present in the last N turns."""
@@ -33,6 +36,10 @@ class TurnTagIndex:
     def get_tags_for_turn(self, turn_number: int) -> TurnTagEntry | None:
         """Look up pre-computed tags for a specific turn (O(1) via dict)."""
         return self._by_turn.get(turn_number)
+
+    def get_entry_by_hash(self, message_hash: str) -> TurnTagEntry | None:
+        """Look up entry by message_hash (O(1) via dict)."""
+        return self._by_hash.get(message_hash)
 
     def get_tag_velocity(self, tag: str, window_hours: float = 72) -> float:
         """Compute velocity: entries per hour for a tag over a time window."""
