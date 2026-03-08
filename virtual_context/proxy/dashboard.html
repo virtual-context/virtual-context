@@ -46,9 +46,11 @@
     cursor: pointer; font-family: inherit;
   }
   .shutdown-btn:hover { background: var(--red); color: #fff; }
-  .budget-banner { display:none; padding:8px 14px; margin:0 0 10px; border-radius:6px; font-size:12px; line-height:1.5; }
+  .budget-banner { display:none; padding:8px 14px; margin:0 0 10px; border-radius:6px; font-size:12px; line-height:1.5; position:relative; padding-right:32px; }
   .budget-banner.promoted { background:rgba(209,134,22,0.15); border:1px solid var(--orange); color:var(--orange); }
   .budget-banner.exceeded { background:rgba(248,81,73,0.12); border:1px solid var(--red); color:var(--red); }
+  .budget-banner .dismiss { position:absolute; right:8px; top:50%; transform:translateY(-50%); background:none; border:none; color:inherit; cursor:pointer; font-size:16px; padding:2px 6px; opacity:0.7; }
+  .budget-banner .dismiss:hover { opacity:1; }
 
   /* Stat cards */
   .stats-wrapper { margin-bottom: 16px; }
@@ -1247,23 +1249,8 @@
       lastCompactionEvt = snapCompactions[snapCompactions.length - 1];
     }
 
-    // Restore budget banners from snapshot
-    if (data.budget_promoted) {
-      var bp = $('budget-promoted-banner');
-      bp.textContent = '\u26a0 Budget auto-promoted: client overhead (' +
-        (data.budget_promoted.overhead||0).toLocaleString() + 't) exceeds context_window (' +
-        (data.budget_promoted.original||0).toLocaleString() + 't). Effective budget: ' +
-        (data.budget_promoted.promoted||0).toLocaleString() + 't.';
-      bp.style.display = 'block';
-    }
-    if (data.budget_exceeded) {
-      var be = $('budget-exceeded-banner');
-      be.textContent = '\u26a0 Over budget: payload ' +
-        (data.budget_exceeded.total||0).toLocaleString() + 't exceeds budget ' +
-        (data.budget_exceeded.budget||0).toLocaleString() + 't by ' +
-        (data.budget_exceeded.excess||0).toLocaleString() + 't. Uncompacted turns pending.';
-      be.style.display = 'block';
-    }
+    if (data.budget_promoted) showBudgetPromoted(data.budget_promoted);
+    if (data.budget_exceeded) showBudgetExceeded(data.budget_exceeded);
 
     updateStats();
     updatePipeline();
@@ -1873,6 +1860,30 @@
     }, 0);
   };
 
+  // Budget banner helpers
+  function showBudgetPromoted(d) {
+    var el = $('budget-promoted-banner');
+    var sys = (d.system_tokens||0).toLocaleString();
+    var tools = (d.tools_tokens||0).toLocaleString();
+    var orig = (d.original||0).toLocaleString();
+    var promoted = (d.promoted||0).toLocaleString();
+    el.innerHTML = '<span>\u26a0 The system prompt (' + sys + 't) + tool definitions (' + tools +
+      't) exceed the configured context_window (' + orig +
+      't). Budget auto-promoted to ' + promoted + 't.</span>' +
+      '<button class="dismiss" onclick="this.parentElement.style.display=\'none\'">\u00d7</button>';
+    el.style.display = 'block';
+  }
+  function showBudgetExceeded(d) {
+    var el = $('budget-exceeded-banner');
+    var total = (d.total||0).toLocaleString();
+    var budget = (d.budget||0).toLocaleString();
+    var excess = (d.excess||0).toLocaleString();
+    el.innerHTML = '<span>\u26a0 Outbound payload (' + total + 't) exceeds budget (' + budget +
+      't) by ' + excess + 't. Uncompacted turns still pending — budget converges as compaction catches up.</span>' +
+      '<button class="dismiss" onclick="this.parentElement.style.display=\'none\'">\u00d7</button>';
+    el.style.display = 'block';
+  }
+
   // SSE connection
   function connect() {
     $('conn-status').textContent = 'connecting...';
@@ -1935,19 +1946,9 @@
       } else if (data.type === 'session_state_change') {
         fetchLiveConversations();
       } else if (data.type === 'budget_auto_promoted') {
-        var bp = $('budget-promoted-banner');
-        bp.textContent = '\u26a0 Budget auto-promoted: client overhead (' +
-          (data.overhead||0).toLocaleString() + 't) exceeds context_window (' +
-          (data.original||0).toLocaleString() + 't). Effective budget: ' +
-          (data.promoted||0).toLocaleString() + 't.';
-        bp.style.display = 'block';
+        showBudgetPromoted(data);
       } else if (data.type === 'budget_exceeded') {
-        var be = $('budget-exceeded-banner');
-        be.textContent = '\u26a0 Over budget: payload ' +
-          (data.total||0).toLocaleString() + 't exceeds budget ' +
-          (data.budget||0).toLocaleString() + 't by ' +
-          (data.excess||0).toLocaleString() + 't. Uncompacted turns pending.';
-        be.style.display = 'block';
+        showBudgetExceeded(data);
       } else if (data.type === 'replay_progress') {
         handleReplayProgress(data);
       } else if (data.type === 'replay_done') {
