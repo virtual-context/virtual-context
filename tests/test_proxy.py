@@ -4917,3 +4917,143 @@ class TestEstimateToolsTokens:
         assert tokens > 0
         # Empty tools → 0
         assert fmt.estimate_tools_tokens({"messages": []}) == 0
+
+
+# ---------------------------------------------------------------------------
+# stub_compacted_messages
+# ---------------------------------------------------------------------------
+
+
+class TestStubCompactedMessages:
+    """Test hash-based stub replacement for compacted turns."""
+
+    def _build_index_with_hashes(self, entries: list[tuple[int, str, list[str]]]) -> TurnTagIndex:
+        """Build index: list of (turn_number, message_hash, tags)."""
+        idx = TurnTagIndex()
+        for turn, hash_, tags in entries:
+            idx.append(TurnTagEntry(
+                turn_number=turn, message_hash=hash_, tags=tags,
+                primary_tag=tags[0] if tags else "_general",
+            ))
+        return idx
+
+    def test_stubs_compacted_turn_simple_pair(self):
+        """A simple user+assistant pair is stubbed when its hash matches a compacted turn."""
+        import hashlib
+        user_text = "What is pregnancy testing?"
+        asst_text = "Pregnancy testing involves..."
+        combined = f"{user_text} {asst_text}"
+        h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+        body = {"messages": [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": asst_text},
+            {"role": "user", "content": "Follow up question"},
+        ]}
+        idx = self._build_index_with_hashes([
+            (0, h, ["pregnancy-test"]),
+            (1, "other_hash", ["general"]),
+        ])
+        from virtual_context.proxy.message_filter import stub_compacted_messages
+        result, stub_count = stub_compacted_messages(
+            body, idx, compacted_through=2,  # turn 0 is compacted
+        )
+        msgs = result["messages"]
+        assert stub_count == 1
+        # User message stubbed
+        assert "[Compacted turn 0" in msgs[0]["content"]
+        # Assistant message stubbed
+        assert isinstance(msgs[1]["content"], list)
+        assert "[Compacted turn 0" in msgs[1]["content"][0]["text"]
+        # Follow-up preserved
+        assert msgs[2]["content"] == "Follow up question"
+
+    def test_stubs_turn_with_tool_chain(self):
+        """A turn with tool_use/tool_result chain is collapsed to user+assistant stubs."""
+        import hashlib
+        user_text = "Read the config file"
+        asst_text = "Let me read that for you."
+        combined = f"{user_text} {asst_text}"
+        h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+        body = {"messages": [
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": asst_text},
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "/etc/config"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents here..."},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "The config contains..."},
+            ]},
+            # Next turn (not compacted)
+            {"role": "user", "content": "What does it mean?"},
+            {"role": "assistant", "content": "It means..."},
+            {"role": "user", "content": "Current question"},
+        ]}
+        idx = self._build_index_with_hashes([
+            (0, h, ["config", "file-reading"]),
+            (1, "hash_turn1", ["interpretation"]),
+        ])
+        from virtual_context.proxy.message_filter import stub_compacted_messages
+        result, stub_count = stub_compacted_messages(
+            body, idx, compacted_through=2,  # turn 0 compacted
+        )
+        msgs = result["messages"]
+        assert stub_count == 1
+        # Tool chain collapsed: 4 messages → 2 stubs
+        # First msg: user stub
+        assert msgs[0]["role"] == "user"
+        assert "[Compacted turn 0" in str(msgs[0]["content"])
+        # Second msg: assistant stub
+        assert msgs[1]["role"] == "assistant"
+        assert "[Compacted turn 0" in str(msgs[1]["content"])
+        # No tool_use_id or tool_result blocks survive
+        all_content = json.dumps(msgs[:2])
+        assert "tool_use" not in all_content
+        assert "tool_result" not in all_content
+        # Uncompacted turn preserved
+        assert msgs[2]["content"] == "What does it mean?"
+
+    def test_uncompacted_turn_hash_match_preserved(self):
+        """A turn whose hash matches but is above watermark is NOT stubbed."""
+        import hashlib
+        user_text = "Hello"
+        asst_text = "Hi there"
+        combined = f"{user_text} {asst_text}"
+        h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+        body = {"messages": [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": asst_text},
+            {"role": "user", "content": "Current"},
+        ]}
+        idx = self._build_index_with_hashes([
+            (0, h, ["greeting"]),
+        ])
+        from virtual_context.proxy.message_filter import stub_compacted_messages
+        # compacted_through=0 means nothing is compacted
+        result, stub_count = stub_compacted_messages(
+            body, idx, compacted_through=0,
+        )
+        assert stub_count == 0
+        assert result["messages"][0]["content"] == user_text
+
+    def test_hash_miss_preserves_message(self):
+        """Messages whose hash doesn't match any entry are preserved."""
+        body = {"messages": [
+            {"role": "user", "content": "Unique message not in index"},
+            {"role": "assistant", "content": "Response"},
+            {"role": "user", "content": "Current"},
+        ]}
+        idx = self._build_index_with_hashes([
+            (0, "some_other_hash", ["topic"]),
+        ])
+        from virtual_context.proxy.message_filter import stub_compacted_messages
+        result, stub_count = stub_compacted_messages(
+            body, idx, compacted_through=2,
+        )
+        assert stub_count == 0
+        assert result["messages"][0]["content"] == "Unique message not in index"
