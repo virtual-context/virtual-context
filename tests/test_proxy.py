@@ -5057,3 +5057,32 @@ class TestStubCompactedMessages:
         )
         assert stub_count == 0
         assert result["messages"][0]["content"] == "Unique message not in index"
+
+
+# ---------------------------------------------------------------------------
+# _compute_effective_budget
+# ---------------------------------------------------------------------------
+
+
+class TestComputeEffectiveBudget:
+    def test_compute_effective_budget_within_limit(self):
+        """When overhead < context_window, budget is unchanged."""
+        from virtual_context.proxy.server import _compute_effective_budget
+        budget, promoted = _compute_effective_budget(
+            context_window=120_000,
+            system_tokens=19_000,
+            tools_tokens=7_500,
+        )
+        assert budget == 120_000
+        assert promoted is False
+
+    def test_compute_effective_budget_auto_promotes(self):
+        """When overhead >= context_window, budget auto-promotes to overhead + 10k."""
+        from virtual_context.proxy.server import _compute_effective_budget
+        budget, promoted = _compute_effective_budget(
+            context_window=5_000,
+            system_tokens=19_000,
+            tools_tokens=7_500,
+        )
+        assert budget == 19_000 + 7_500 + 10_000  # 36,500
+        assert promoted is True
