@@ -37,6 +37,13 @@ from ._envelope import (  # noqa: E402
 class PayloadFormat(ABC):
     """Strategy interface for provider-specific request/response handling."""
 
+    def __init__(self) -> None:
+        self._count: Callable[[str], int] = lambda text: max(1, len(text) // 4) if text else 0
+
+    def set_token_counter(self, counter: Callable[[str], int]) -> None:
+        """Replace the default chars//4 estimator with an accurate counter (e.g. tiktoken)."""
+        self._count = counter
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -105,15 +112,15 @@ class PayloadFormat(ABC):
     # -- Payload token estimation --------------------------------------------
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        """Estimate total input tokens from a request body (chars // 4)."""
+        """Estimate total input tokens from a request body."""
         total = 0
         for m in self.get_messages(body):
             c = m.get("content", "")
             if isinstance(c, str):
-                total += len(c) // 4
+                total += self._count(c)
             elif isinstance(c, list):
                 total += sum(
-                    len(b.get("text", "")) // 4
+                    self._count(b.get("text", ""))
                     for b in c if isinstance(b, dict)
                 )
         total += self._estimate_system_tokens(body)
@@ -128,7 +135,7 @@ class PayloadFormat(ABC):
         tools = body.get("tools", [])
         if not tools:
             return 0
-        return len(json.dumps(tools)) // 4
+        return self._count(json.dumps(tools))
 
     # -- Fingerprinting ------------------------------------------------------
 
@@ -382,12 +389,12 @@ class AnthropicFormat(PayloadFormat):
     def _estimate_system_tokens(self, body: dict) -> int:
         sys_raw = body.get("system", "")
         if isinstance(sys_raw, str):
-            return len(sys_raw) // 4
+            return self._count(sys_raw)
         if isinstance(sys_raw, list):
             return sum(
-                len(b.get("text", "")) // 4
+                self._count(b.get("text", ""))
                 for b in sys_raw if isinstance(b, dict)
-            ) // 1  # integer
+            )
         return 0
 
     @property
@@ -623,10 +630,10 @@ class OpenAIFormat(PayloadFormat):
         if msgs and msgs[0].get("role") == "system":
             sc = msgs[0].get("content", "")
             if isinstance(sc, str):
-                return len(sc) // 4
+                return self._count(sc)
             if isinstance(sc, list):
                 return sum(
-                    len(b.get("text", "")) // 4
+                    self._count(b.get("text", ""))
                     for b in sc if isinstance(b, dict)
                 )
         return 0
@@ -852,7 +859,7 @@ class GeminiFormat(PayloadFormat):
         if isinstance(si, dict):
             parts = si.get("parts", [])
             return sum(
-                len(p.get("text", "")) // 4
+                self._count(p.get("text", ""))
                 for p in parts if isinstance(p, dict)
             )
         return 0
@@ -1214,7 +1221,7 @@ class OpenAIResponsesFormat(PayloadFormat):
     def _estimate_system_tokens(self, body: dict) -> int:
         instructions = body.get("instructions", "")
         if isinstance(instructions, str):
-            return len(instructions) // 4
+            return self._count(instructions)
         return 0
 
     def estimate_payload_tokens(self, body: dict) -> int:
@@ -1223,19 +1230,17 @@ class OpenAIResponsesFormat(PayloadFormat):
         for item in self.get_messages(body):
             if not isinstance(item, dict):
                 continue
-            # Bare function_call/function_call_output items have different structure
             if self._is_bare_item(item):
-                # Estimate from name + arguments/output
                 name = item.get("name", "") or item.get("call_id", "")
                 args = item.get("arguments", "") or item.get("output", "")
-                total += (len(str(name)) + len(str(args))) // 4
+                total += self._count(str(name) + str(args))
                 continue
             content = item.get("content", "")
             if isinstance(content, str):
-                total += len(content) // 4
+                total += self._count(content)
             elif isinstance(content, list):
                 total += sum(
-                    len(b.get("text", "")) // 4
+                    self._count(b.get("text", ""))
                     for b in content if isinstance(b, dict)
                 )
         total += self._estimate_system_tokens(body)
