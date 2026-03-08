@@ -123,6 +123,13 @@ class PayloadFormat(ABC):
         """Estimate system prompt tokens."""
         return 0
 
+    def estimate_tools_tokens(self, body: dict) -> int:
+        """Estimate tokens consumed by tool definitions in the request."""
+        tools = body.get("tools", [])
+        if not tools:
+            return 0
+        return len(json.dumps(tools)) // 4
+
     # -- Fingerprinting ------------------------------------------------------
 
     def compute_fingerprint(self, body: dict, offset: int = 0) -> str:
