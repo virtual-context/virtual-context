@@ -586,6 +586,8 @@ def create_app(
                         "original": _cw,
                         "promoted": _effective_budget,
                         "overhead": _sys_tok + _tools_tok,
+                        "system_tokens": _sys_tok,
+                        "tools_tokens": _tools_tok,
                     })
         except (TypeError, ValueError, AttributeError):
             _effective_budget = 0
