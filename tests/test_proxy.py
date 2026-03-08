@@ -4866,3 +4866,31 @@ class TestCreateAppSharedEngine:
         )
         assert app.title == "virtual-context proxy"
         assert app.state.instance_label == ""
+
+
+# ---------------------------------------------------------------------------
+# TurnTagIndex hash lookup
+# ---------------------------------------------------------------------------
+
+
+class TestTurnTagIndexHashLookup:
+    def test_turn_tag_index_hash_lookup(self):
+        """TurnTagIndex supports O(1) lookup by message_hash."""
+        idx = TurnTagIndex()
+        idx.append(TurnTagEntry(
+            turn_number=0, message_hash="abc123", tags=["python"],
+            primary_tag="python",
+        ))
+        idx.append(TurnTagEntry(
+            turn_number=1, message_hash="def456", tags=["cooking"],
+            primary_tag="cooking",
+        ))
+        idx.append(TurnTagEntry(
+            turn_number=2, message_hash="ghi789", tags=["music"],
+            primary_tag="music",
+        ))
+
+        assert idx.get_entry_by_hash("abc123").turn_number == 0
+        assert idx.get_entry_by_hash("def456").turn_number == 1
+        assert idx.get_entry_by_hash("ghi789").turn_number == 2
+        assert idx.get_entry_by_hash("nonexistent") is None
