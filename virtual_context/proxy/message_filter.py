@@ -5,6 +5,8 @@ Pure functions — no ProxyState dependency. Extracted from proxy/server.py.
 
 from __future__ import annotations
 
+import hashlib
+
 from ..core.turn_tag_index import TurnTagIndex
 from .formats import PayloadFormat, detect_format
 
@@ -380,3 +382,149 @@ def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _extract_text_for_stub_hash(msg: dict) -> str:
+    """Extract the first user-visible text from a message for hashing.
+
+    Handles both plain-string content and content-block arrays.
+    Skips tool_use / tool_result blocks.  Gracefully strips OpenClaw
+    envelope if available.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        try:
+            from ._envelope import _strip_openclaw_envelope
+            return _strip_openclaw_envelope(content).strip()
+        except ImportError:
+            return content.strip()
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                try:
+                    from ._envelope import _strip_openclaw_envelope
+                    return _strip_openclaw_envelope(text).strip()
+                except ImportError:
+                    return text.strip()
+    return ""
+
+
+def stub_compacted_messages(
+    body: dict,
+    turn_tag_index: TurnTagIndex,
+    compacted_through: int,
+    *,
+    fmt: PayloadFormat | None = None,
+) -> tuple[dict, int]:
+    """Replace compacted turns with lightweight stubs using hash-based identification.
+
+    Walks user-text messages in the client payload, computes SHA-256 hash
+    (matching engine's combined_text), looks up in TurnTagIndex.  If the
+    matched entry's turn < compacted_through // 2, stubs the entire
+    message group (user + assistant + any tool chain messages).
+
+    Returns (modified_body, stub_count).
+    """
+    if compacted_through <= 0:
+        return body, 0
+    if not turn_tag_index.entries:
+        return body, 0
+
+    watermark_turn = compacted_through // 2
+
+    messages = body.get("messages", [])
+    if not messages:
+        return body, 0
+
+    # Phase 1: identify user-text message indices (messages with extractable text
+    # that are NOT tool_result-only).
+    user_text_indices: list[int] = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        # Skip tool_result-only user messages (they're part of a tool chain,
+        # not the start of a new turn).
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            has_text = any(
+                isinstance(b, dict) and b.get("type") == "text"
+                for b in content
+            )
+            has_tool_result = any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            )
+            if has_tool_result and not has_text:
+                continue
+        text = _extract_text_for_stub_hash(msg)
+        if text:
+            user_text_indices.append(i)
+
+    if not user_text_indices:
+        return body, 0
+
+    # Phase 2: group messages into turns.
+    # Each turn spans from one user-text message to the next.
+    turn_groups: list[tuple[int, int]] = []  # (start_idx, end_idx_exclusive)
+    for g, uti in enumerate(user_text_indices):
+        if g + 1 < len(user_text_indices):
+            end = user_text_indices[g + 1]
+        else:
+            end = len(messages)
+        turn_groups.append((uti, end))
+
+    # Phase 3: hash each turn group and match against the index.
+    stubs: list[tuple[int, int, object]] = []  # (start, end, TurnTagEntry)
+    for start, end in turn_groups:
+        msg = messages[start]
+        user_text = _extract_text_for_stub_hash(msg)
+        if not user_text:
+            continue
+
+        # Find first assistant message in group for combined hash
+        asst_text = ""
+        for j in range(start + 1, end):
+            if messages[j].get("role") == "assistant":
+                asst_text = _extract_text_for_stub_hash(messages[j])
+                break
+
+        combined = f"{user_text} {asst_text}"
+        h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+        entry = turn_tag_index.get_entry_by_hash(h)
+        if entry is not None and entry.turn_number < watermark_turn:
+            stubs.append((start, end, entry))
+
+    if not stubs:
+        return body, 0
+
+    # Phase 4: build new message list, replacing stub ranges with lightweight markers.
+    stub_ranges = sorted(stubs, key=lambda s: s[0])
+    new_messages: list[dict] = []
+    i = 0
+    while i < len(messages):
+        stubbed = False
+        for start, end, entry in stub_ranges:
+            if i == start:
+                tags_str = ", ".join(entry.tags[:5])
+                new_messages.append({
+                    "role": "user",
+                    "content": f"[Compacted turn {entry.turn_number}]",
+                })
+                new_messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text":
+                        f"[Compacted turn {entry.turn_number}: "
+                        f"topics={tags_str}. "
+                        f"Content stored in virtual-context.]"
+                    }],
+                })
+                i = end
+                stubbed = True
+                break
+        if not stubbed:
+            new_messages.append(messages[i])
+            i += 1
+
+    body = dict(body)
+    body["messages"] = new_messages
+    return body, len(stubs)
