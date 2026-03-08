@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 
 from ..core.turn_tag_index import TurnTagIndex
+from ._envelope import _strip_openclaw_envelope
 from .formats import PayloadFormat, detect_format
 
 
@@ -383,28 +384,23 @@ def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
 
 
 def _extract_text_for_stub_hash(msg: dict) -> str:
-    """Extract the first user-visible text from a message for hashing.
+    """Extract the last user-visible text from a message for hashing.
 
     Handles both plain-string content and content-block arrays.
-    Skips tool_use / tool_result blocks.  Gracefully strips OpenClaw
-    envelope if available.
+    Skips tool_use / tool_result blocks.  Strips OpenClaw envelope.
+
+    Uses reversed iteration over content blocks so that multi-text-block
+    messages (common in Anthropic tool_use responses) return the **last**
+    text block — matching the engine's ``_last_text_block`` behaviour.
     """
     content = msg.get("content", "")
     if isinstance(content, str):
-        try:
-            from ._envelope import _strip_openclaw_envelope
-            return _strip_openclaw_envelope(content).strip()
-        except ImportError:
-            return content.strip()
+        return _strip_openclaw_envelope(content).strip()
     if isinstance(content, list):
-        for block in content:
+        for block in reversed(content):
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "")
-                try:
-                    from ._envelope import _strip_openclaw_envelope
-                    return _strip_openclaw_envelope(text).strip()
-                except ImportError:
-                    return text.strip()
+                return _strip_openclaw_envelope(text).strip()
     return ""
 
 
@@ -429,9 +425,22 @@ def stub_compacted_messages(
     if not turn_tag_index.entries:
         return body, 0
 
+    if fmt is None:
+        fmt = detect_format(body)
+
+    if fmt.name == "gemini":
+        _msg_key = "contents"
+        _asst_role = "model"
+    elif fmt.name == "openai_responses":
+        _msg_key = "input"
+        _asst_role = "assistant"
+    else:
+        _msg_key = "messages"
+        _asst_role = "assistant"
+
     watermark_turn = compacted_through // 2
 
-    messages = body.get("messages", [])
+    messages = body.get(_msg_key, [])
     if not messages:
         return body, 0
 
@@ -483,7 +492,7 @@ def stub_compacted_messages(
         # Find first assistant message in group for combined hash
         asst_text = ""
         for j in range(start + 1, end):
-            if messages[j].get("role") == "assistant":
+            if messages[j].get("role") == _asst_role:
                 asst_text = _extract_text_for_stub_hash(messages[j])
                 break
 
@@ -498,33 +507,33 @@ def stub_compacted_messages(
         return body, 0
 
     # Phase 4: build new message list, replacing stub ranges with lightweight markers.
-    stub_ranges = sorted(stubs, key=lambda s: s[0])
+    stub_starts: dict[int, tuple[int, int, object]] = {
+        s[0]: s for s in sorted(stubs, key=lambda s: s[0])
+    }
     new_messages: list[dict] = []
     i = 0
     while i < len(messages):
-        stubbed = False
-        for start, end, entry in stub_ranges:
-            if i == start:
-                tags_str = ", ".join(entry.tags[:5])
-                new_messages.append({
-                    "role": "user",
-                    "content": f"[Compacted turn {entry.turn_number}]",
-                })
-                new_messages.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text":
-                        f"[Compacted turn {entry.turn_number}: "
-                        f"topics={tags_str}. "
-                        f"Content stored in virtual-context.]"
-                    }],
-                })
-                i = end
-                stubbed = True
-                break
-        if not stubbed:
+        stub = stub_starts.get(i)
+        if stub:
+            start, end, entry = stub
+            tags_str = ", ".join(entry.tags[:5])
+            new_messages.append({
+                "role": "user",
+                "content": f"[Compacted turn {entry.turn_number}]",
+            })
+            new_messages.append({
+                "role": _asst_role,
+                "content": [{"type": "text", "text":
+                    f"[Compacted turn {entry.turn_number}: "
+                    f"topics={tags_str}. "
+                    f"Content stored in virtual-context.]"
+                }],
+            })
+            i = end
+        else:
             new_messages.append(messages[i])
             i += 1
 
     body = dict(body)
-    body["messages"] = new_messages
+    body[_msg_key] = new_messages
     return body, len(stubs)
