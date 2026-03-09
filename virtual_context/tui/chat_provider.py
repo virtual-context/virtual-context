@@ -36,7 +36,6 @@ class ChatProvider:
         messages: list[dict],
         max_tokens: int = 4096,
     ) -> Iterator[str]:
-        """Yield text delta chunks from Anthropic streaming API."""
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": API_VERSION,

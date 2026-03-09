@@ -6,7 +6,6 @@ from pathlib import Path
 
 
 def parse_pdf(path: Path) -> str:
-    """Extract text from PDF using pymupdf (fitz)."""
     try:
         import fitz  # pymupdf
     except ImportError:
@@ -16,7 +15,6 @@ def parse_pdf(path: Path) -> str:
 
 
 def parse_docx(path: Path) -> str:
-    """Extract text from DOCX using python-docx."""
     try:
         from docx import Document
     except ImportError:
@@ -26,7 +24,6 @@ def parse_docx(path: Path) -> str:
 
 
 def parse_xlsx(path: Path) -> str:
-    """Extract text from XLSX using openpyxl."""
     try:
         import openpyxl
     except ImportError:
@@ -49,7 +46,6 @@ def parse_xlsx(path: Path) -> str:
 
 
 def parse_text(path: Path) -> str:
-    """Read plain text file."""
     return path.read_text(encoding="utf-8", errors="replace")
 
 
@@ -67,7 +63,6 @@ DISPATCH: dict[str, Callable] = {
 
 
 def parse_document(path: Path) -> str:
-    """Auto-dispatch based on file extension."""
     ext = path.suffix.lower()
     parser = DISPATCH.get(ext)
     if not parser:

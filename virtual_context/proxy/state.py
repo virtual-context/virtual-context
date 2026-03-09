@@ -123,7 +123,6 @@ class ProxyState:
         return self._state
 
     def set_manual_passthrough(self, enabled: bool) -> None:
-        """Toggle manual passthrough mode from the dashboard."""
         self._manual_passthrough = enabled
 
     def _transition_to(self, new_state: SessionState) -> None:
@@ -143,7 +142,6 @@ class ProxyState:
         )
 
     def live_snapshot(self) -> dict:
-        """Build a snapshot dict of this session's live state for the dashboard."""
         engine = self.engine
         idx = engine._turn_tag_index
 
@@ -215,6 +213,7 @@ class ProxyState:
         self,
         history_snapshot: list[Message],
         payload_tokens: int | None = None,
+        turn_id: str = "",
     ) -> None:
         """Submit tagging to background thread.
 
@@ -222,17 +221,18 @@ class ProxyState:
         once tagging completes — the next request only waits for tagging.
         """
         self._pending_tag = self._pool.submit(
-            self._run_tag_turn, history_snapshot, payload_tokens,
+            self._run_tag_turn, history_snapshot, payload_tokens, turn_id,
         )
 
     def _run_tag_turn(
         self,
         history: list[Message],
         payload_tokens: int | None = None,
+        turn_id: str = "",
     ) -> None:
         """Fast path: tag the turn, emit metrics, fire compaction if needed."""
         t0 = time.monotonic()
-        turn = len(history) // 2 - 1
+        turn = len(self.engine._turn_tag_index.entries)
         conversation_id = self.engine.config.conversation_id
         try:
             signal = self.engine.tag_turn(
@@ -241,7 +241,8 @@ class ProxyState:
             self._last_compact_priority = signal.priority if signal else ""
 
             tag_ms = round((time.monotonic() - t0) * 1000, 1)
-            entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
+            _tti = self.engine._turn_tag_index.entries
+            entry = _tti[-1] if len(_tti) > turn else None
             _tags = entry.tags if entry else []
             _primary = entry.primary_tag if entry else ""
             _needs_compact = signal is not None
@@ -260,7 +261,7 @@ class ProxyState:
 
             # Emit turn_complete event (tag phase)
             if self.metrics:
-                entry = self.engine._turn_tag_index.get_tags_for_turn(turn)
+                # Reuse entry from above (already the latest appended).
                 active_tags = list(
                     self.engine._turn_tag_index.get_active_tags(lookback=6)
                 )
@@ -276,6 +277,7 @@ class ProxyState:
                 self.metrics.record({
                     "type": "turn_complete",
                     "turn": turn,
+                    "turn_id": turn_id,
                     "tags": entry.tags if entry else [],
                     "primary_tag": entry.primary_tag if entry else "",
                     "complete_ms": tag_ms,
@@ -377,8 +379,27 @@ class ProxyState:
             except Exception as e:
                 logger.error("compact_if_needed error: %s", e, exc_info=True)
 
+    def _compact_after_ingestion(self, history: list[Message]) -> None:
+        """Check compaction threshold after ingestion and compact if needed."""
+        try:
+            monitor = getattr(self.engine, "_monitor", None)
+            if monitor is None:
+                return
+            snapshot = monitor.build_snapshot(history)
+            signal = monitor.check(snapshot)
+            if signal is None:
+                return
+            turn = len(self.engine._turn_tag_index.entries)
+            print(
+                f"[POST-INGEST] Compaction needed: {snapshot.total_tokens}t/"
+                f"{snapshot.budget_tokens}t ({signal.priority}) "
+                f"— running immediately"
+            )
+            self._run_compact(history, signal, turn)
+        except Exception as e:
+            logger.error("Post-ingestion compaction check error: %s", e, exc_info=True)
+
     def _history_ingested(self) -> bool:
-        """Whether the current session's history has been ingested."""
         return self.engine.config.conversation_id in self._ingested_conversations
 
     def ingest_if_needed(self, history_pairs: list[Message]) -> None:
@@ -615,6 +636,10 @@ class ProxyState:
         finally:
             if not cancelled:
                 self._ingested_conversations.add(conversation_id)
+                # After ingestion, check if compaction is needed immediately.
+                # Without this, the payload stays over-budget and upstream
+                # rejects every request — a deadlock.
+                self._compact_after_ingestion(initial_pairs)
                 self._transition_to(SessionState.ACTIVE)
 
     def _ingest_pairs_with_progress(self, pairs: list[Message]) -> None:

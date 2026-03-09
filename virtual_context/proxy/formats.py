@@ -53,11 +53,11 @@ class PayloadFormat(ABC):
 
     @abstractmethod
     def extract_user_message(self, body: dict) -> str:
-        """Extract the last user message text from a request body."""
+        ...
 
     @abstractmethod
     def extract_message_text(self, msg: dict) -> str:
-        """Extract text from a single message dict."""
+        ...
 
     @abstractmethod
     def extract_history_pairs(self, body: dict) -> list:
@@ -69,31 +69,31 @@ class PayloadFormat(ABC):
 
     @abstractmethod
     def get_messages(self, body: dict) -> list[dict]:
-        """Return the messages array from the request body."""
+        ...
 
     @abstractmethod
     def has_messages(self, body: dict) -> bool:
-        """Return True if the body has a valid messages array."""
+        ...
 
     # -- Context injection ---------------------------------------------------
 
     @abstractmethod
     def inject_context(self, body: dict, prepend_text: str) -> dict:
-        """Inject <virtual-context> block into a deep-copied request body."""
+        ...
 
     # -- Conversation markers -----------------------------------------------------
 
     @abstractmethod
     def extract_conversation_id(self, body: dict) -> str | None:
-        """Scan assistant messages for vc:conversation marker."""
+        ...
 
     @abstractmethod
     def strip_conversation_markers(self, body: dict) -> dict:
-        """Strip vc:conversation markers from all assistant messages."""
+        ...
 
     @abstractmethod
     def inject_conversation_marker(self, response_body: dict, marker: str) -> dict:
-        """Append conversation marker to the last text block in a non-streaming response."""
+        ...
 
     @abstractmethod
     def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
@@ -103,11 +103,11 @@ class PayloadFormat(ABC):
 
     @abstractmethod
     def extract_delta_text(self, data: dict) -> str:
-        """Extract text delta from a streaming SSE event payload."""
+        ...
 
     @abstractmethod
     def extract_assistant_text(self, response_body: dict) -> str:
-        """Extract assistant text from a non-streaming response."""
+        ...
 
     # -- Payload token estimation --------------------------------------------
 
@@ -127,11 +127,9 @@ class PayloadFormat(ABC):
         return total
 
     def _estimate_system_tokens(self, body: dict) -> int:
-        """Estimate system prompt tokens."""
         return 0
 
     def estimate_tools_tokens(self, body: dict) -> int:
-        """Estimate tokens consumed by tool definitions in the request."""
         tools = body.get("tools", [])
         if not tools:
             return 0
@@ -188,19 +186,15 @@ class PayloadFormat(ABC):
         tool_defs: list,
         require_tool_use: bool | None = None,
     ) -> dict:
-        """Inject tool definitions into the request body. Override in subclasses."""
         return body
 
     def is_tool_use_event(self, data: dict) -> bool:
-        """Return True if *data* is a streaming event containing a tool call."""
         return False
 
     def extract_tool_calls(self, content: list) -> list[dict]:
-        """Extract tool calls from response content blocks."""
         return []
 
     def build_tool_results(self, results: list[dict]) -> list[dict]:
-        """Build tool_result content blocks for continuation."""
         return results
 
     def build_continuation_request(
@@ -684,7 +678,6 @@ class GeminiFormat(PayloadFormat):
 
     @staticmethod
     def _extract_text_from_parts(parts: list) -> str:
-        """Join text fields from a Gemini parts list."""
         texts = []
         for p in parts:
             if isinstance(p, dict) and "text" in p:
@@ -1391,5 +1384,4 @@ def detect_format(body: dict) -> PayloadFormat:
 
 
 def get_format(name: str) -> PayloadFormat:
-    """Look up a format by name."""
     return _FORMAT_REGISTRY[name]

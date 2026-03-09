@@ -323,7 +323,6 @@ def _backfill_segment_tags(
 
 
 def _parse_response(response: str) -> list[ConsolidationGroup]:
-    """Parse LLM JSON response into ConsolidationGroup list."""
     data = parse_llm_json(response)
     if not data:
         logger.error("Failed to parse consolidation response.")

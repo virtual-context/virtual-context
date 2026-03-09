@@ -144,7 +144,6 @@ class FactSupersessionChecker:
         return superseded_count
 
     def _log_usage(self, detail: str, duration_ms: float = 0.0) -> None:
-        """Log LLM token usage to the telemetry ledger."""
         if not self._telemetry:
             return
         usage = getattr(self.llm, "last_usage", {})
@@ -163,7 +162,6 @@ class FactSupersessionChecker:
             )
 
     def _check_batch(self, new_fact: Fact, candidates: list[Fact]) -> list[str]:
-        """Ask LLM which candidates are superseded by new_fact."""
         prompt = self._build_prompt(new_fact, candidates)
         try:
             t0 = time.time()
@@ -180,7 +178,6 @@ class FactSupersessionChecker:
         return self._parse_response(response, candidates)
 
     def _build_prompt(self, new_fact: Fact, candidates: list[Fact]) -> str:
-        """Build prompt asking which candidates are superseded or duplicated."""
         new_date = new_fact.when_date or "(unknown)"
         lines = [
             "A new fact has been extracted from a conversation:",
@@ -271,7 +268,6 @@ class FactSupersessionChecker:
         )
 
     def _parse_merge_response(self, response: str) -> dict | None:
-        """Parse the merge LLM response into a dict with verb/object/status/what."""
         text = response.strip()
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         try:
@@ -306,7 +302,6 @@ class FactSupersessionChecker:
         return None
 
     def _parse_response(self, response: str | None, candidates: list[Fact]) -> list[str]:
-        """Extract superseded fact IDs from LLM response."""
         if not response:
             return []
         text = response.strip()

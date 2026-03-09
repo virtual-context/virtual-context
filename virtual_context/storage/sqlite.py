@@ -1108,7 +1108,6 @@ class SQLiteStore(ContextStore):
     # ------------------------------------------------------------------
 
     def store_facts(self, facts: list[Fact]) -> int:
-        """Store extracted facts + fact_tags in a single transaction."""
         if not facts:
             return 0
         conn = self._get_conn()
@@ -1158,7 +1157,6 @@ class SQLiteStore(ContextStore):
             raise
 
     def _row_to_fact(self, row: sqlite3.Row) -> Fact:
-        """Convert a sqlite3.Row from the facts table to a Fact dataclass."""
         return Fact(
             id=row["id"],
             subject=row["subject"],
@@ -1181,7 +1179,6 @@ class SQLiteStore(ContextStore):
         )
 
     def _row_to_fact_with_session_date(self, row: sqlite3.Row) -> Fact:
-        """Like _row_to_fact but also extracts session_date from a joined segment."""
         fact = self._row_to_fact(row)
         seg_meta = row["_seg_meta"] if "_seg_meta" in row.keys() else None
         if seg_meta:
@@ -1193,7 +1190,6 @@ class SQLiteStore(ContextStore):
         return fact
 
     def get_unique_fact_verbs(self) -> list[str]:
-        """Return all distinct non-empty verbs from non-superseded facts."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL"
@@ -1212,7 +1208,6 @@ class SQLiteStore(ContextStore):
         tags: list[str] | None = None,
         limit: int = 50,
     ) -> list[Fact]:
-        """Query facts by structured filters."""
         conn = self._get_conn()
         conditions: list[str] = []
         params: list[object] = []
@@ -1263,7 +1258,6 @@ class SQLiteStore(ContextStore):
         return [self._row_to_fact(row) for row in rows]
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
-        """Get all facts extracted from a given segment."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM facts WHERE segment_ref = ? ORDER BY mentioned_at",
@@ -1316,7 +1310,6 @@ class SQLiteStore(ContextStore):
             return [self._row_to_fact_with_session_date(row) for row in rows]
 
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        """Mark old_fact_id as superseded by new_fact_id."""
         conn = self._get_conn()
         conn.execute(
             "UPDATE facts SET superseded_by = ? WHERE id = ?",
@@ -1327,7 +1320,6 @@ class SQLiteStore(ContextStore):
     def update_fact_fields(
         self, fact_id: str, verb: str, object: str, status: str, what: str
     ) -> None:
-        """Update structured fields on a fact (used after supersession merge)."""
         conn = self._get_conn()
         conn.execute(
             "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
@@ -1337,7 +1329,6 @@ class SQLiteStore(ContextStore):
         conn.commit()
 
     def get_fact_count_by_tags(self) -> dict[str, int]:
-        """Return {tag: fact_count} for context hint annotations."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
@@ -1373,7 +1364,6 @@ class SQLiteStore(ContextStore):
             return []
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
-        """Return old facts that were superseded by the given IDs."""
         if not fact_ids:
             return []
         conn = self._get_conn()

@@ -420,7 +420,6 @@ class DomainCompactor:
 
     @staticmethod
     def _normalize_tag_list(tags: list) -> list[str]:
-        """Normalize a list of raw tag strings: lowercase, hyphenate, strip special chars."""
         result = []
         for tag in tags:
             if not isinstance(tag, str):
@@ -431,7 +430,6 @@ class DomainCompactor:
         return result
 
     def _get_prompt_for_tags(self, tags: list[str]) -> str | None:
-        """Find a custom summary prompt matching any of the tags."""
         for rule in self.tag_rules:
             for tag in tags:
                 if fnmatch.fnmatch(tag, rule.match) and rule.summary_prompt:
@@ -463,7 +461,6 @@ class DomainCompactor:
             )
 
     def _format_conversation(self, messages: list[Message]) -> str:
-        """Format messages as 'Role (HH:MM): content' blocks."""
         lines: list[str] = []
         for m in messages:
             ts = ""
@@ -473,7 +470,6 @@ class DomainCompactor:
         return "\n\n".join(lines)
 
     def _parse_response(self, response: str) -> dict:
-        """Parse LLM JSON response with fallback for malformed output."""
         result = parse_llm_json(response)
         if result:
             return result

@@ -44,7 +44,6 @@ def _get_replay_lock() -> asyncio.Lock:
 
 
 def _build_settings_response(cfg) -> dict:
-    """Build the settings JSON from a VirtualContextConfig."""
     strategy = cfg.retriever.strategy_configs.get("default") or StrategyConfig()
     return {
         "readonly": {
@@ -86,7 +85,6 @@ def _build_settings_response(cfg) -> dict:
 
 
 def get_dashboard_html() -> str:
-    """Return the full self-contained HTML page for the dashboard."""
     return _DASHBOARD_HTML
 
 
@@ -114,8 +112,6 @@ def register_dashboard_routes(
     instance_label: str = "",
     dashboard_token: str = "",
 ) -> None:
-    """Register ``/dashboard`` and ``/dashboard/events`` routes."""
-
     _static_dir = Path(__file__).parent / "static"
     _token = dashboard_token or os.environ.get("VC_DASHBOARD_TOKEN", "")
     if not _token:
@@ -223,7 +219,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/conversations")
     async def dashboard_conversations():
-        """Return per-conversation stats from the store as JSON."""
         if not state:
             return JSONResponse({"conversations": [], "current_conversation_id": ""})
 
@@ -258,7 +253,6 @@ def register_dashboard_routes(
 
     @app.delete("/dashboard/conversations/{conversation_id}")
     async def dashboard_delete_conversation(conversation_id: str, request: Request):
-        """Delete all stored segments for a conversation."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not state:
@@ -288,7 +282,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/conversations/live")
     async def dashboard_conversations_live():
-        """Return real-time conversation data from the registry (not the store)."""
         live_conversations = []
         if registry and hasattr(registry, "_conversations"):
             for sid, s in registry._conversations.items():
@@ -300,7 +293,6 @@ def register_dashboard_routes(
 
     @app.post("/dashboard/conversations/{conversation_id}/passthrough")
     async def dashboard_toggle_passthrough(conversation_id: str, request: Request):
-        """Toggle manual passthrough mode for a conversation."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not registry or not hasattr(registry, "_conversations"):
@@ -517,7 +509,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/replay/status")
     async def replay_status():
-        """Return current replay status."""
         if _replay_state.get("running"):
             return JSONResponse({
                 "running": True,
@@ -528,7 +519,6 @@ def register_dashboard_routes(
 
     @app.post("/dashboard/shutdown")
     async def dashboard_shutdown(request: Request):
-        """Shut down the proxy server."""
         if err := _check_dashboard_auth(request, _token):
             return err
         import signal
@@ -609,7 +599,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/settings")
     async def dashboard_settings_get():
-        """Return current engine config as JSON."""
         if not state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
@@ -621,7 +610,6 @@ def register_dashboard_routes(
 
     @app.put("/dashboard/settings")
     async def dashboard_settings_put(request: Request):
-        """Apply partial config updates to the running engine."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not state:
@@ -778,7 +766,6 @@ def _get_provider_config(engine) -> dict:
     provider = engine._llm_provider
 
     def _redact(key: str) -> str:
-        """Mask API key for safe inclusion in dicts that may be serialized."""
         if not key or len(key) <= 8:
             return "***"
         return key[:4] + "..." + key[-4:]

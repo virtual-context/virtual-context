@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -353,13 +354,11 @@ def create_app(
             state, is_new = registry.get_or_create(
                 inbound_conversation_id, body=body,
             )
-            # Update trailing fingerprint on the engine so it gets persisted
-            # with the next _save_state() call (inside on_turn_complete).
-            if state:
-                fp = SessionRegistry._compute_fingerprint(body)
-                if fp:
-                    state.engine._trailing_fingerprint = fp
-                    registry._fingerprints[fp] = state.engine.config.conversation_id
+            # Update last-message hash so the next request can match.
+            if state and body is not None:
+                registry.update_last_message_hash(
+                    body, state.engine.config.conversation_id,
+                )
 
         # Use accurate token counter from engine when available (e.g. tiktoken)
         if state and hasattr(state.engine, "_token_counter"):
@@ -391,17 +390,19 @@ def create_app(
             # Tool-result or non-text turn — skip VC enrichment but
             # preserve streaming so the client SDK doesn't break.
             _skip_sid = state.engine.config.conversation_id if state else ""
+            _skip_turn = len(state.engine._turn_tag_index.entries) if state else 0
+            _skip_turn_id = uuid.uuid4().hex[:12]
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
+                    metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=(state.turn_offset + len(state.conversation_history) // 2) if state else 0,
+                    metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_request_log_dir, log_prefix=_log_prefix,
@@ -445,12 +446,14 @@ def create_app(
                 )
 
                 _conversation_id = state.engine.config.conversation_id
-                turn = state.turn_offset + len(state.conversation_history) // 2
+                turn = len(state.engine._turn_tag_index.entries)
+                _turn_id = uuid.uuid4().hex[:12]
 
                 # Record passthrough request event
                 metrics.record({
                     "type": "request",
                     "turn": turn,
+                    "turn_id": _turn_id,
                     "message_preview": user_message[:60],
                     "api_format": api_format,
                     "streaming": is_streaming,
@@ -507,7 +510,7 @@ def create_app(
                 if is_streaming:
                     return await _handle_streaming(
                         client, url, fwd_headers, body, api_format, state,
-                        metrics=metrics, turn=turn,
+                        metrics=metrics, turn=turn, turn_id=_turn_id,
                         conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
@@ -515,7 +518,7 @@ def create_app(
                 else:
                     return await _handle_non_streaming(
                         client, url, fwd_headers, body, api_format, state,
-                        metrics=metrics, turn=turn,
+                        metrics=metrics, turn=turn, turn_id=_turn_id,
                         conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
@@ -598,6 +601,9 @@ def create_app(
         except (TypeError, ValueError, AttributeError):
             _effective_budget = 0
 
+        # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
+        _pre_filter_body = body
+
         # PROXY-025: Stub compacted messages via hash matching
         turns_stubbed = 0
         try:
@@ -615,7 +621,6 @@ def create_app(
             pass
 
         # Filter irrelevant history turns from the request body
-        _pre_filter_body = body  # preserve for request capture
         turns_dropped = 0
         _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
         if _real_tags and state:
@@ -671,7 +676,7 @@ def create_app(
                 enriched_body.get("model", ""),
             )
             if _paging_mode == "autonomous":
-                tool_turn_count = state.turn_offset + len(state.conversation_history) // 2
+                tool_turn_count = len(state.engine._turn_tag_index.entries)
                 try:
                     compacted_count = int(getattr(state.engine, "_compacted_through", 0))
                 except (TypeError, ValueError):
@@ -756,14 +761,16 @@ def create_app(
             })
 
         # Record request event
-        turn = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
+        turn = len(state.engine._turn_tag_index.entries) if state else 0
+        _turn_id = uuid.uuid4().hex[:12]
         context_tokens = len(prepend_text) // 4 if prepend_text else 0
-        total_turns = (state.turn_offset + len(state.conversation_history) // 2) if state else 0
+        total_turns = turn
         overhead_ms = round(wait_ms + inbound_ms, 1)
         _conversation_id = state.engine.config.conversation_id if state else ""
         metrics.record({
             "type": "request",
             "turn": turn,
+            "turn_id": _turn_id,
             "model": body.get("model", ""),
             "message_preview": user_message[:60],
             "api_format": api_format,
@@ -807,13 +814,15 @@ def create_app(
             inbound_tags=assembled.matched_tags if assembled else [],
             conversation_id=_conversation_id,
         )
+        # Capture enriched body (what we actually send to the LLM)
+        metrics.capture_enriched(turn, enriched_body)
 
         _intercept_vc_tools = paging_enabled or tool_output_find_quote
 
         if is_streaming:
             return await _handle_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
-                metrics=metrics, turn=turn, overhead_ms=overhead_ms,
+                metrics=metrics, turn=turn, turn_id=_turn_id, overhead_ms=overhead_ms,
                 conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
                 paging_enabled=_intercept_vc_tools,
@@ -823,7 +832,7 @@ def create_app(
         else:
             return await _handle_non_streaming(
                 client, url, fwd_headers, enriched_body, api_format, state,
-                metrics=metrics, turn=turn, overhead_ms=overhead_ms,
+                metrics=metrics, turn=turn, turn_id=_turn_id, overhead_ms=overhead_ms,
                 conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
                 request_log_dir=_request_log_dir, log_prefix=_log_prefix,

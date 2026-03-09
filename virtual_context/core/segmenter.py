@@ -34,13 +34,11 @@ def _parse_session_date(pair: TurnPair) -> str:
 
 
 def _latest_timestamp(pair: TurnPair) -> datetime | None:
-    """Return the latest message timestamp in a turn pair, or None."""
     timestamps = [m.timestamp for m in pair.messages if m.timestamp is not None]
     return max(timestamps) if timestamps else None
 
 
 def _earliest_timestamp(pair: TurnPair) -> datetime | None:
-    """Return the earliest message timestamp in a turn pair, or None."""
     timestamps = [m.timestamp for m in pair.messages if m.timestamp is not None]
     return min(timestamps) if timestamps else None
 
@@ -187,7 +185,6 @@ class TopicSegmenter:
     def _build_segment(
         self, group: list[tuple[TurnPair, TagResult]], session_date: str = "",
     ) -> TaggedSegment:
-        """Build a TaggedSegment from a group of tagged turn pairs."""
         all_messages: list[Message] = []
         all_tags: set[str] = set()
         primary_tag = group[0][1].primary

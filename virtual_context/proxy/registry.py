@@ -6,11 +6,11 @@ one per conversation, with fingerprint-based routing and persistence.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import TYPE_CHECKING
 
-from .formats import detect_format
 from .metrics import ProxyMetrics
 from .state import ProxyState
 
@@ -24,19 +24,13 @@ class SessionRegistry:
     """Manages multiple concurrent ProxyState instances, one per conversation.
 
     Routing priority:
-    1. Conversation marker (``<!-- vc:conversation=UUID -->``) in assistant messages
-    2. Trailing fingerprint — hash of last N user messages (before current
-       turn) in the request body, matched against in-memory or persisted
-       fingerprints from previous conversations
-    3. Fallback — claim unclaimed conversation or create new
-
-    Trailing fingerprints survive client-side compaction (which rewrites
-    early messages) because they sample from the tail of the history.
-
-    Future: ``X-VC-Session`` request header overrides all (requires client changes).
+    1. System prompt hash — stable across turns, survives client compaction,
+       unique per chat (OpenClaw embeds ``chat_id`` in the system prompt)
+    2. Last-message hash — hash of the last user message from the previous
+       request matches against the second-to-last user message in the
+       current request (fallback when system prompt is absent)
+    3. Claim unclaimed session / create new
     """
-
-    _FINGERPRINT_SAMPLE_SIZE = 1  # last N user messages to hash
 
     def __init__(
         self,
@@ -50,70 +44,94 @@ class SessionRegistry:
         self._upstream = upstream
         self._metrics = metrics
         self._conversations: dict[str, ProxyState] = {}
-        self._fingerprints: dict[str, str] = {}  # fingerprint → conversation_id
+        self._sys_hashes: dict[str, str] = {}  # system_prompt_hash → conversation_id
+        # Last-message fingerprint: hash of the last user message from the
+        # most recent request for each conversation.  The next request's
+        # second-to-last user message should match this.
+        self._last_msg_hashes: dict[str, str] = {}  # hash → conversation_id
         self._lock = threading.Lock()
         self._store = store  # for loading persisted fingerprints on restart
 
     @staticmethod
-    def _msg_text(msg: dict) -> str:
-        """Extract plain text from a message content (str or content blocks)."""
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            return content
+    def _compute_system_hash(body: dict) -> str:
+        """Hash the system prompt to identify the conversation.
+
+        The system prompt contains per-chat metadata (e.g. OpenClaw embeds
+        ``chat_id``) and is stable across turns — never compacted by the
+        client.  This makes it the most reliable routing signal for a
+        transparent proxy.
+
+        Handles both Anthropic (``system`` key, str or list of blocks) and
+        OpenAI (first message with ``role: "system"``).
+        """
+        text = ""
+
+        # Anthropic: top-level "system" key
+        system = body.get("system")
+        if system is not None:
+            if isinstance(system, str):
+                text = system
+            elif isinstance(system, list):
+                text = " ".join(
+                    b.get("text", "") for b in system
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+
+        # OpenAI: first message with role "system" or "developer"
+        if not text:
+            for msg in body.get("messages", []):
+                role = msg.get("role", "")
+                if role in ("system", "developer"):
+                    c = msg.get("content", "")
+                    text = c if isinstance(c, str) else " ".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ) if isinstance(c, list) else ""
+                    break
+
+        if not text:
+            return ""
+
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _hash_user_message(body: dict, position: int) -> str:
+        """Hash a user message at a given position from the end.
+
+        position=0 → last user message (current turn)
+        position=1 → second-to-last user message (previous turn)
+
+        After each request we store hash(position=0).  On the next
+        request we compute hash(position=1) and match — because what
+        was the last message last time is now the second-to-last.
+        """
+        msgs = body.get("messages", [])
+        user_msgs = [
+            m for m in msgs
+            if m.get("role") == "user"
+        ]
+        idx = len(user_msgs) - 1 - position
+        if idx < 0:
+            return ""
+
+        content = user_msgs[idx].get("content", "")
         if isinstance(content, list):
-            return " ".join(
+            content = " ".join(
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
             )
-        return ""
+        if not content:
+            return ""
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    @staticmethod
-    def _compute_fingerprint(body: dict, offset: int = 0) -> str:
-        """Trailing conversation fingerprint from the last N user messages.
+    def update_last_message_hash(self, body: dict, conversation_id: str) -> None:
+        """Store the hash of the current last user message for this conversation.
 
-        Delegates to the format-specific ``compute_fingerprint`` method
-        which handles provider-specific message structures (Anthropic,
-        OpenAI Chat, OpenAI Responses, Gemini).
-
-        The ``offset`` parameter shifts the sampling window back from the
-        tail.  Two conventions:
-
-        - **offset=0** (store): hash the last S history messages.
-          Used in ``catch_all`` to persist the fingerprint after each turn.
-        - **offset=1** (match): hash S messages ending one position before
-          the tail.  Used in ``get_or_create`` and restart matching.
+        Called after routing succeeds so the next request can match against it.
         """
-        fmt = detect_format(body)
-        return fmt.compute_fingerprint(body, offset)
-
-    def _match_persisted_fingerprint(self, body: dict) -> str | None:
-        """Match inbound request against persisted conversation fingerprints.
-
-        Compares the request's tail-1 fingerprint (offset=1) against stored
-        tail fingerprints (offset=0).  The one-turn shift between the last
-        save and the next inbound request is exactly bridged by offset=1.
-
-        Returns the matched conversation_id, or None.
-        """
-        if not self._store:
-            return None
-        try:
-            persisted = self._store.list_engine_state_fingerprints()
-            if not isinstance(persisted, dict) or not persisted:
-                return None
-        except Exception:
-            return None
-
-        fp = self._compute_fingerprint(body, offset=1)
-        if fp and fp in persisted:
-            matched = persisted[fp]
-            if isinstance(matched, str) and matched:
-                logger.info(
-                    "Persisted fingerprint match: fp=%s → conversation=%s",
-                    fp[:8], matched[:12],
-                )
-                return matched
-        return None
+        h = self._hash_user_message(body, position=0)
+        if h:
+            self._last_msg_hashes[h] = conversation_id
 
     def get_or_create(
         self,
@@ -125,80 +143,65 @@ class SessionRegistry:
 
         Returns (state, is_new).
 
-        Routing priority: marker (conversation_id) > in-memory fingerprint >
-        persisted fingerprint > claim unclaimed session > create new session.
+        Routing priority:
+        1. System prompt hash (stable per-chat identifier)
+        2. Last-message hash (previous turn's last msg = this turn's second-to-last)
+        3. Claim unclaimed session (first request after startup)
+        4. Create new session
         """
-        # Fast path: conversation marker found and conversation already in memory
-        if conversation_id and conversation_id in self._conversations:
-            return self._conversations[conversation_id], False
+        sys_hash = ""
+        msg_hash = ""
+        if body is not None:
+            sys_hash = self._compute_system_hash(body)
+            msg_hash = self._hash_user_message(body, position=1)
 
-        # Compute tail-1 fingerprint for matching (offset=1).
-        # The incoming request's tail-1 matches the previous request's tail
-        # because the conversation grew by exactly one turn.  catch_all
-        # stores each request's tail (offset=0) in _fingerprints, so the
-        # match here uses offset=1 to align with the stored value.
-        fp_match = ""  # offset=1 — for matching against stored tail
-        fp_store = ""  # offset=0 — saved in _fingerprints after session created
-        if conversation_id is None and body is not None:
-            fp_match = self._compute_fingerprint(body, offset=1)
-            fp_store = self._compute_fingerprint(body)
-            # Fast path: in-memory fingerprint match
-            if fp_match and fp_match in self._fingerprints:
-                matched_sid = self._fingerprints[fp_match]
-                if matched_sid in self._conversations:
-                    return self._conversations[matched_sid], False
+        # --- 1. System prompt hash (primary) ---
+        if sys_hash and sys_hash in self._sys_hashes:
+            matched_sid = self._sys_hashes[sys_hash]
+            if matched_sid in self._conversations:
+                self.update_last_message_hash(body, matched_sid)
+                return self._conversations[matched_sid], False
+
+        # --- 2. Last-message hash (secondary) ---
+        if msg_hash and msg_hash in self._last_msg_hashes:
+            matched_sid = self._last_msg_hashes[msg_hash]
+            if matched_sid in self._conversations:
+                self.update_last_message_hash(body, matched_sid)
+                return self._conversations[matched_sid], False
 
         with self._lock:
             # Double-check after acquiring lock
-            if conversation_id and conversation_id in self._conversations:
-                return self._conversations[conversation_id], False
-
-            if fp_match and fp_match in self._fingerprints:
-                matched_sid = self._fingerprints[fp_match]
+            if sys_hash and sys_hash in self._sys_hashes:
+                matched_sid = self._sys_hashes[sys_hash]
                 if matched_sid in self._conversations:
+                    self.update_last_message_hash(body, matched_sid)
                     return self._conversations[matched_sid], False
 
-            # Check persisted fingerprints (survives proxy restart +
-            # client-side compaction that destroys conversation markers)
-            if conversation_id is None and body is not None:
-                persisted_sid = self._match_persisted_fingerprint(body)
-                if persisted_sid:
-                    conversation_id = persisted_sid
+            if msg_hash and msg_hash in self._last_msg_hashes:
+                matched_sid = self._last_msg_hashes[msg_hash]
+                if matched_sid in self._conversations:
+                    self.update_last_message_hash(body, matched_sid)
+                    return self._conversations[matched_sid], False
 
-            # No marker, no fingerprint match — claim an unclaimed conversation
-            # if one exists.  This handles the startup case: create_app makes
-            # a default conversation before any request arrives.  The first
-            # conversation claims it; a second distinct conversation creates
-            # a new one.
-            if conversation_id is None:
-                claimed_sids = set(self._fingerprints.values())
-                for sid, st in self._conversations.items():
-                    if sid not in claimed_sids:
-                        if fp_store:
-                            self._fingerprints[fp_store] = sid
-                        logger.info(
-                            "Conversation claimed: %s (fp=%s, total=%d)",
-                            sid[:12],
-                            fp_store[:8] if fp_store else "none",
-                            len(self._conversations),
-                        )
-                        return st, False
+            # --- 3. Claim unclaimed session ---
+            claimed_sids = set(self._sys_hashes.values()) | set(self._last_msg_hashes.values())
+            for sid, st in self._conversations.items():
+                if sid not in claimed_sids:
+                    if sys_hash:
+                        self._sys_hashes[sys_hash] = sid
+                    if body is not None:
+                        self.update_last_message_hash(body, sid)
+                    logger.info(
+                        "Conversation claimed: %s (sys=%s, total=%d)",
+                        sid[:12],
+                        sys_hash[:8] if sys_hash else "none",
+                        len(self._conversations),
+                    )
+                    return st, False
 
-            # Create a new engine instance.
-            # Late import: tests patch VirtualContextEngine on the server
-            # module (``virtual_context.proxy.server.VirtualContextEngine``),
-            # so we look it up through that namespace to stay patchable.
+            # --- 4. Create new session ---
             from . import server as _srv  # noqa: avoid circular at module level
             engine = _srv.VirtualContextEngine(config_path=self._config_path)
-
-            if conversation_id:
-                # Override the auto-generated conversation_id so load_engine_state
-                # can find the persisted state for this session.
-                engine.config.conversation_id = conversation_id
-                # Trigger state reload (engine.__init__ already called
-                # _load_persisted_state but with the wrong conversation_id).
-                engine._load_persisted_state()
-                engine._bootstrap_vocabulary()
 
             actual_id = engine.config.conversation_id
             state = ProxyState(
@@ -206,15 +209,15 @@ class SessionRegistry:
             )
             self._conversations[actual_id] = state
 
-            # Record fingerprint → conversation mapping (offset=0 = tail)
-            if fp_store:
-                self._fingerprints[fp_store] = actual_id
+            if sys_hash:
+                self._sys_hashes[sys_hash] = actual_id
+            if body is not None:
+                self.update_last_message_hash(body, actual_id)
 
             logger.info(
-                "Conversation %s: %s (fp=%s, total=%d)",
-                "resumed" if conversation_id else "created",
+                "Conversation created: %s (sys=%s, total=%d)",
                 actual_id[:12],
-                fp_store[:8] if fp_store else "none",
+                sys_hash[:8] if sys_hash else "none",
                 len(self._conversations),
             )
             return state, True
@@ -224,7 +227,6 @@ class SessionRegistry:
         return len(self._conversations)
 
     def shutdown_all(self) -> None:
-        """Shut down all session states."""
         for state in self._conversations.values():
             state.shutdown()
         self._conversations.clear()

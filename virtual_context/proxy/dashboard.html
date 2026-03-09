@@ -631,7 +631,7 @@
       <dt>Message</dt><dd>Preview of the user message (first 50 characters).</dd>
       <dt>Payload</dt><dd>How many turns were included in the LLM payload after tag-based filtering (filtered/total).</dd>
       <dt>Tokens</dt><dd>Estimated total input tokens sent to the upstream provider for this request (system prompt + enriched messages).</dd>
-      <dt>Base</dt><dd>Estimated baseline input tokens a naive system would have sent for this turn — the full unfiltered request payload (all messages + system prompt) before VC filtering. Compare with Tokens to see per-turn savings from VC's selective history filtering.</dd>
+      <dt>Base</dt><dd>The full unfiltered client payload (all messages + system prompt) before any VC work — dropping, stubbing, or enrichment. This is what the client sent to the proxy. Compare with Sent to see per-turn savings from VC's selective history filtering.</dd>
       <dt>Injected</dt><dd>Number of tokens of retrieved virtual-context summaries injected into this request.</dd>
       <dt>Timing</dt><dd>Three-part breakdown: <strong>VC</strong> = virtual-context overhead (wait + inbound), <strong>LLM</strong> = upstream API round-trip, <strong>Total</strong> = end-to-end. LLM and Total appear once the upstream response completes.</dd>
     </dl>
@@ -642,7 +642,7 @@
   </div>
   <div class="log-scroll" id="log-scroll">
     <table class="log-table" id="log-table">
-      <thead><tr><th>T#</th><th>Session</th><th>Inbound Tags</th><th>Response Tags</th><th>Message</th><th>Payload</th><th>Tokens</th><th>Base</th><th>Injected</th><th>VC</th><th>LLM</th><th>Total</th><th></th></tr></thead>
+      <thead><tr><th>T#</th><th>Session</th><th>Inbound Tags</th><th>Response Tags</th><th>Message</th><th>Payload</th><th>Sent</th><th>Base</th><th>Injected</th><th>VC</th><th>LLM</th><th>Total</th><th></th></tr></thead>
       <tbody id="log-body"></tbody>
     </table>
   </div>
@@ -1013,13 +1013,17 @@
   function rowId(conversationId, turn) {
     return 'req-' + (conversationId || '').substring(0, 8) + '-' + turn;
   }
+  function turnRowId(turnId) {
+    return turnId ? 'tid-' + turnId : '';
+  }
 
   function addRequestRow(evt) {
     const body = $('log-body');
     const tr = document.createElement('tr');
     tr.className = evt.passthrough ? 'passthrough-row' : 'flash';
     var sid = evt.conversation_id || '';
-    tr.id = rowId(sid, evt.turn);
+    tr.id = evt.turn_id ? turnRowId(evt.turn_id) : rowId(sid, evt.turn);
+    tr.dataset.turnId = evt.turn_id || '';
     tr.dataset.conversation = sid;
     if (evt.broad) tr.dataset.broad = '1';
     // Store raw values for kt/$ toggle
@@ -1112,7 +1116,7 @@
   }
 
   function handleTurnComplete(evt) {
-    const row = $(rowId(evt.conversation_id, evt.turn));
+    const row = (evt.turn_id && $(turnRowId(evt.turn_id))) || $(rowId(evt.conversation_id, evt.turn));
     if (row) {
       fillResponseTags(row, evt.tags, evt.primary_tag);
       row.className = 'flash';
@@ -1154,7 +1158,7 @@
   }
 
   function handleResponse(evt) {
-    const row = $(rowId(evt.conversation_id, evt.turn));
+    const row = (evt.turn_id && $(turnRowId(evt.turn_id))) || $(rowId(evt.conversation_id, evt.turn));
     if (!row) return;
     const llmCell = row.querySelector('.timing-llm');
     const totalCell = row.querySelector('.timing-total');
@@ -1279,7 +1283,7 @@
     // Process turn_completes: fill response tags + fallback baseline for cells
     // not already populated by raw_input_tokens from the request event.
     (data.turn_completes || []).forEach(function(tc) {
-      var row = $(rowId(tc.conversation_id, tc.turn));
+      var row = (tc.turn_id && $(turnRowId(tc.turn_id))) || $(rowId(tc.conversation_id, tc.turn));
       if (row && tc.tags && tc.tags.length) {
         fillResponseTags(row, tc.tags, tc.primary_tag);
       }
@@ -2052,7 +2056,105 @@
       });
   };
 
+  var _inspectTab = 'inbound';
+
   function renderInspect(data) {
+    // Tab bar
+    var tabs = [
+      { id: 'inbound', label: 'Inbound' },
+      { id: 'enriched', label: 'To LLM', disabled: !data.enriched },
+      { id: 'response', label: 'From LLM', disabled: !data.response },
+      { id: 'json', label: 'Full JSON' },
+    ];
+    var tabHtml = '<div style="display:flex;gap:2px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:8px">';
+    tabs.forEach(function(tab) {
+      var active = _inspectTab === tab.id;
+      var style = 'padding:4px 12px;border-radius:4px 4px 0 0;cursor:pointer;font-size:12px;border:1px solid var(--border);border-bottom:none;';
+      if (tab.disabled) {
+        style += 'opacity:0.35;pointer-events:none;';
+      } else if (active) {
+        style += 'background:var(--accent);color:#fff;';
+      } else {
+        style += 'background:var(--surface);color:var(--text);';
+      }
+      tabHtml += '<div style="' + style + '" onclick="switchInspectTab(\'' + tab.id + '\')">' + tab.label + '</div>';
+    });
+    tabHtml += '</div>';
+
+    var bodyHtml = '';
+    if (_inspectTab === 'inbound') {
+      bodyHtml = renderInspectMessages(data);
+    } else if (_inspectTab === 'enriched') {
+      bodyHtml = data.enriched ? renderInspectMessages(data.enriched) : '<span class="empty-state">Not captured</span>';
+    } else if (_inspectTab === 'response') {
+      bodyHtml = renderInspectResponse(data.response);
+    } else if (_inspectTab === 'json') {
+      bodyHtml = '<pre style="background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap;max-height:600px;overflow:auto;font-size:11px;border:1px solid var(--border)">';
+      bodyHtml += escHtml(JSON.stringify(data, null, 2));
+      bodyHtml += '</pre>';
+    }
+    $('inspect-body').innerHTML = tabHtml + bodyHtml;
+  }
+
+  window.switchInspectTab = function(tab) {
+    _inspectTab = tab;
+    if (_inspectedData) renderInspect(_inspectedData);
+  };
+
+  function renderInspectResponse(resp) {
+    if (!resp) return '<span class="empty-state">Not captured</span>';
+    // Streaming response: show assistant text
+    if (resp.streaming && resp.assistant_text) {
+      var html = '<div style="margin-bottom:8px"><strong style="color:var(--accent)">Assistant Response</strong>';
+      html += ' <span style="color:var(--text-dim);font-size:11px">(streamed, ' + resp.assistant_text.length + ' chars)</span></div>';
+      html += '<pre style="background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap;max-height:500px;overflow:auto;font-size:11px;border:1px solid var(--border)">';
+      html += escHtml(resp.assistant_text);
+      html += '</pre>';
+      return html;
+    }
+    // Non-streaming: full response body — render messages if available, else JSON
+    if (resp.content || resp.choices || resp.output) {
+      var html = '<div style="margin-bottom:8px"><strong style="color:var(--accent)">Response Body</strong></div>';
+      // Anthropic format
+      if (resp.content && Array.isArray(resp.content)) {
+        resp.content.forEach(function(block) {
+          var btype = block.type || 'unknown';
+          var badge = '<span style="background:var(--border);padding:1px 6px;border-radius:3px;font-size:10px;margin-right:4px">' + btype + '</span>';
+          html += '<div style="margin:4px 0">' + badge;
+          if (btype === 'text') {
+            html += '<pre style="background:var(--bg);padding:6px;border-radius:4px;white-space:pre-wrap;max-height:300px;overflow:auto;font-size:11px">' + escHtml(block.text || '') + '</pre>';
+          } else if (btype === 'tool_use') {
+            html += '<span style="color:var(--text-dim);font-size:11px"> ' + (block.name || '') + '(' + escHtml(JSON.stringify(block.input || {}).substring(0, 500)) + ')</span>';
+          } else {
+            html += '<span style="color:var(--text-dim);font-size:11px"> ' + escHtml(JSON.stringify(block).substring(0, 300)) + '</span>';
+          }
+          html += '</div>';
+        });
+        if (resp.usage) {
+          html += '<div style="margin-top:8px;color:var(--text-dim);font-size:11px">Usage: ' + (resp.usage.input_tokens || 0) + ' in / ' + (resp.usage.output_tokens || 0) + ' out</div>';
+        }
+        return html;
+      }
+      // OpenAI format
+      if (resp.choices && Array.isArray(resp.choices)) {
+        resp.choices.forEach(function(choice, ci) {
+          var msg = choice.message || choice.delta || {};
+          html += '<div style="margin:4px 0;border-left:3px solid #49a;padding-left:8px">';
+          html += '<div style="font-weight:bold;color:#49a">[choice ' + ci + '] ' + (msg.role || 'assistant') + '</div>';
+          html += '<pre style="background:var(--bg);padding:6px;border-radius:4px;white-space:pre-wrap;max-height:300px;overflow:auto;font-size:11px">' + escHtml(msg.content || '') + '</pre>';
+          html += '</div>';
+        });
+        if (resp.usage) {
+          html += '<div style="margin-top:8px;color:var(--text-dim);font-size:11px">Usage: ' + (resp.usage.prompt_tokens || 0) + ' in / ' + (resp.usage.completion_tokens || 0) + ' out</div>';
+        }
+        return html;
+      }
+    }
+    // Fallback: pretty JSON
+    return '<pre style="background:var(--bg);padding:8px;border-radius:4px;white-space:pre-wrap;max-height:500px;overflow:auto;font-size:11px;border:1px solid var(--border)">' + escHtml(JSON.stringify(resp, null, 2)) + '</pre>';
+  }
+
+  function renderInspectMessages(data) {
     var html = '';
     // Tags section
     var hasInbound = data.inbound_tags && data.inbound_tags.length;
@@ -2088,8 +2190,8 @@
       html += '</pre></div>';
     }
     // Messages
-    html += '<div><strong style="color:var(--accent)">Messages</strong>';
     var allMsgs = data.messages || [];
+    html += '<div><strong style="color:var(--accent)">Messages</strong>';
     html += ' <span style="color:var(--text-dim);font-size:11px">(' + allMsgs.length + ' messages, newest first)</span></div>';
     for (var _ri = allMsgs.length - 1; _ri >= 0; _ri--) { var msg = allMsgs[_ri]; var i = _ri;
       var role = msg.role || '?';
@@ -2125,7 +2227,7 @@
       }
       html += '</div>';
     }
-    $('inspect-body').innerHTML = html;
+    return html;
   }
 
   function estimateTokens(s) {

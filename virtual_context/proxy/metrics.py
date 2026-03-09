@@ -42,7 +42,6 @@ class ProxyMetrics:
                 self._buckets[event_type] = self._buckets.get(event_type, 0) + 1
 
     def events_since(self, seq: int) -> list[dict]:
-        """Return events with ``_seq`` > *seq*."""
         with self._lock:
             return [e for e in self._events if e["_seq"] > seq]
 
@@ -187,10 +186,25 @@ class ProxyMetrics:
                 "passthrough": passthrough,
             })
 
+    def capture_enriched(self, turn: int, body: dict) -> None:
+        """Capture the enriched request body sent to the LLM."""
+        with self._lock:
+            for req in self._request_bodies:
+                if req["turn"] == turn:
+                    req["enriched"] = body
+                    return
+
+    def capture_response(self, turn: int, body: dict) -> None:
+        """Capture the LLM response body."""
+        with self._lock:
+            for req in self._request_bodies:
+                if req["turn"] == turn:
+                    req["response"] = body
+                    return
+
     def update_request_tags(
         self, turn: int, *, response_tags: list[str] | None = None,
     ) -> None:
-        """Update tags on a previously captured request (thread-safe)."""
         with self._lock:
             for req in self._request_bodies:
                 if req["turn"] == turn:
@@ -199,7 +213,6 @@ class ProxyMetrics:
                     return
 
     def get_captured_request(self, turn: int) -> dict | None:
-        """Return the full captured request for a specific turn."""
         with self._lock:
             for req in self._request_bodies:
                 if req["turn"] == turn:

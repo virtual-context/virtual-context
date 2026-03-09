@@ -308,7 +308,6 @@ def _flatten_text_content(content: object) -> str:
 
 
 def _extract_last_user_text(original_request: dict) -> str:
-    """Extract the latest user question from provider request payloads."""
     # Anthropic/OpenAI chat-completions style
     messages = original_request.get("messages")
     if isinstance(messages, list):
@@ -717,7 +716,6 @@ _EMPTY_STREAK_HINT_THRESHOLD = 3  # suggest strategy change after this many empt
 
 
 def _is_empty_result(result_json: str) -> bool:
-    """Return True if a tool result indicates nothing was found."""
     try:
         data = json.loads(result_json)
     except (json.JSONDecodeError, TypeError):
@@ -758,7 +756,6 @@ _DEFAULT_STRATEGY_HINT = (
 
 
 def _parse_sse_response(text: str) -> dict:
-    """Parse SSE text and return the final `response` object."""
     last_response: dict | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -788,7 +785,6 @@ def _parse_sse_response(text: str) -> dict:
 
 
 def _parse_provider_http_response(resp: httpx.Response) -> dict:
-    """Parse provider HTTP response, supporting JSON and SSE payloads."""
     content_type = (resp.headers.get("content-type", "") or "").lower()
     if "text/event-stream" in content_type:
         return _parse_sse_response(resp.text)

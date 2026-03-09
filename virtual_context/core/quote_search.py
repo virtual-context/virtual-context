@@ -30,7 +30,6 @@ _CURRENT_STATE_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _detect_query_intent(query: str) -> str:
-    """Return deterministic intent label for quote retrieval ordering."""
     for pattern in _CURRENT_STATE_PATTERNS:
         if pattern.search(query):
             # "or" in the query signals a disjunction (e.g. "led or am
@@ -68,7 +67,6 @@ def _parse_session_date(raw: str) -> date | None:
 
 
 def _normalize_session_date(raw: str) -> str:
-    """Normalize parseable session date to ISO-8601 date string."""
     parsed = _parse_session_date(raw)
     return parsed.isoformat() if parsed else ""
 
@@ -79,7 +77,6 @@ def _normalize_session_date(raw: str) -> str:
 
 
 def _union_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Merge overlapping or adjacent (start, end) intervals into minimal set."""
     if not spans:
         return []
     sorted_spans = sorted(spans)

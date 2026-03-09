@@ -60,7 +60,6 @@ class ContextRetriever:
         }
 
     def _fetch_all_facts(self) -> list:
-        """Fetch all non-superseded facts from the store."""
         try:
             return self.store.query_facts(limit=9999)
         except Exception:

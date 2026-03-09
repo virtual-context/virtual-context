@@ -337,7 +337,6 @@ class OpenAIAdapter(ProviderAdapter):
         return body
 
     def convert_tool_defs(self, anthropic_defs):
-        """Convert Anthropic tool defs to OpenAI function-calling format."""
         oai_tools = []
         for tool in anthropic_defs:
             oai_tools.append({
@@ -760,7 +759,6 @@ class GeminiAdapter(ProviderAdapter):
         return body
 
     def convert_tool_defs(self, anthropic_defs):
-        """Convert Anthropic tool defs to Gemini functionDeclarations."""
         declarations = []
         for tool in anthropic_defs:
             declarations.append({
@@ -902,7 +900,6 @@ class GeminiAdapter(ProviderAdapter):
         body.pop("tool_config", None)
 
     def add_tool_defs(self, body, anthropic_defs):
-        """Add tool definitions, merging into existing functionDeclarations."""
         declarations = []
         for tool in anthropic_defs:
             declarations.append({

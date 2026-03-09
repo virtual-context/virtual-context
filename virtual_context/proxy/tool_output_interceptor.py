@@ -108,7 +108,6 @@ class ToolOutputInterceptor:
         return body
 
     def increment_turn(self) -> None:
-        """Call when a new turn starts."""
         self._turn_counter += 1
 
     # ------------------------------------------------------------------
@@ -117,7 +116,6 @@ class ToolOutputInterceptor:
 
     @staticmethod
     def _build_tool_use_map(assistant_msg: dict | None) -> dict[str, dict]:
-        """Map tool_use_id -> {name, input} from assistant message blocks."""
         result: dict[str, dict] = {}
         if not assistant_msg:
             return result
@@ -138,7 +136,6 @@ class ToolOutputInterceptor:
 
     @staticmethod
     def _iter_tool_result_blocks(user_msg: dict):
-        """Yield tool_result content blocks from a user message."""
         content = user_msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -148,7 +145,6 @@ class ToolOutputInterceptor:
 
     @staticmethod
     def _extract_text(block: dict) -> str:
-        """Extract text content from a tool_result block."""
         content = block.get("content", "")
         if isinstance(content, str):
             return content
@@ -235,7 +231,6 @@ class ToolOutputInterceptor:
 
     @staticmethod
     def _replace_content(block: dict, new_text: str) -> None:
-        """Replace the text content of a tool_result block in-place."""
         content = block.get("content", "")
         if isinstance(content, str):
             block["content"] = new_text

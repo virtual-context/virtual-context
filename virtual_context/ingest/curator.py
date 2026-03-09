@@ -95,7 +95,6 @@ class FactCurator:
         return "\n".join(lines)
 
     def _parse_response(self, response: str, total: int) -> list[int]:
-        """Extract valid fact indices from LLM response."""
         # Strip thinking tags (e.g. Qwen3)
         response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         nums = re.findall(r"\d+", response)
