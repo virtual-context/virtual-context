@@ -98,7 +98,6 @@ class PagingManager:
         }
 
     def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
-        """Collapse a topic to shallower detail. Returns freed tokens."""
         if not self._paging_enabled:
             return {"error": "paging not enabled"}
 
@@ -127,7 +126,6 @@ class PagingManager:
         }
 
     def get_working_set_summary(self) -> dict:
-        """Return current working set with budget info."""
         budget = self._tag_context_max_tokens
         used = sum(ws.tokens for ws in self.working_set.values())
         entries = [
@@ -147,7 +145,6 @@ class PagingManager:
         }
 
     def calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
-        """Calculate token cost for a tag at a given depth level."""
         if depth == DepthLevel.NONE:
             return 0
 

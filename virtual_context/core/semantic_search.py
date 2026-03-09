@@ -128,7 +128,6 @@ class SemanticSearchManager:
         return self._embed_fn
 
     def embed_and_store_chunks(self, stored: StoredSegment) -> None:
-        """Chunk a segment's full_text, embed, and store vectors."""
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return
@@ -153,7 +152,6 @@ class SemanticSearchManager:
         logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
 
     def semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
-        """Embedding-based semantic search over stored chunk vectors."""
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
@@ -204,7 +202,6 @@ class SemanticSearchManager:
         return results
 
     def backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        """One-time backfill: embed all existing segments' full_text."""
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []

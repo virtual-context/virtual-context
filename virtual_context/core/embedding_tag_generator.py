@@ -38,7 +38,6 @@ class EmbeddingTagGenerator:
 
     @staticmethod
     def _load_model(model_name: str) -> Callable[[list[str]], list[list[float]]]:
-        """Load sentence-transformers model. Raises ImportError if not installed."""
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError:
@@ -57,7 +56,6 @@ class EmbeddingTagGenerator:
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:
-        """Generate tags by embedding text and comparing against tag embeddings."""
         # Ensure we have tag embeddings for existing tags
         tags_to_embed = []
         if existing_tags:
@@ -112,7 +110,6 @@ class EmbeddingTagGenerator:
         )
 
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
-        """Bootstrap vocabulary from existing stored tag counts."""
         self._tag_vocabulary.update(tag_counts)
         # Pre-embed all known tags
         tags_to_embed = [t for t in tag_counts if t not in self._tag_embeddings and t != "_general"]

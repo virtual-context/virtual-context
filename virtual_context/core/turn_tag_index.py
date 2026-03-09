@@ -26,7 +26,6 @@ class TurnTagIndex:
             self._by_hash[entry.message_hash] = entry
 
     def get_active_tags(self, lookback: int = 4) -> set[str]:
-        """Tags present in the last N turns."""
         recent = self.entries[-lookback:] if len(self.entries) >= lookback else self.entries
         tags: set[str] = set()
         for entry in recent:
@@ -84,7 +83,6 @@ class TurnTagIndex:
         return modified
 
     def get_tag_counts(self) -> dict[str, int]:
-        """Return {tag: turn_count} for all tags in the index."""
         counts: dict[str, int] = {}
         for entry in self.entries:
             for tag in entry.tags:

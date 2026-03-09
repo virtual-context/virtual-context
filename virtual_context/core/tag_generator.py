@@ -179,7 +179,6 @@ class TagGenerator(Protocol):
 
 
 def _compile_temporal_patterns(patterns: list[str]) -> list[re.Pattern]:
-    """Compile temporal-detection regex patterns, skipping invalid ones."""
     compiled = []
     for pattern in patterns:
         try:
@@ -190,7 +189,6 @@ def _compile_temporal_patterns(patterns: list[str]) -> list[re.Pattern]:
 
 
 def detect_temporal_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
-    """Deterministic temporal-query detection via regex patterns."""
     for pattern in patterns:
         if pattern.search(text):
             return True
@@ -221,7 +219,6 @@ class LLMTagGenerator:
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:
-        """Generate semantic tags for the given text."""
         prompt = self._build_prompt(text, existing_tags, context_turns=context_turns)
 
         prompt_template = TAG_GENERATOR_PROMPTS.get(
@@ -382,7 +379,6 @@ class LLMTagGenerator:
         return "\n".join(parts)
 
     def _parse_response(self, response: str) -> TagResult:
-        """Parse LLM JSON response into TagResult."""
         data = parse_llm_json(response)
 
         tags = data.get("tags", [])
@@ -446,14 +442,12 @@ class LLMTagGenerator:
         )
 
     def _normalize_tag(self, tag: str) -> str:
-        """Normalize a single tag: lowercase, hyphenate, resolve aliases."""
         tag = normalize_tag(tag)
         if self._canonicalizer:
             tag = self._canonicalizer.canonicalize(tag)
         return tag
 
     def _normalize_tags(self, tags: list) -> list[str]:
-        """Normalize and deduplicate a list of tags."""
         seen: set[str] = set()
         result: list[str] = []
         for tag in tags:
@@ -466,11 +460,9 @@ class LLMTagGenerator:
         return result
 
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
-        """Bootstrap vocabulary from existing stored tag counts."""
         self._tag_vocabulary.update(tag_counts)
 
     def _log_usage(self, duration_ms: float = 0.0) -> None:
-        """Log LLM token usage from the provider's last_usage to the telemetry ledger."""
         if not self._telemetry:
             return
         usage = getattr(self.llm, "last_usage", {})
@@ -498,7 +490,6 @@ class KeywordTagGenerator:
         self._initialize()
 
     def _initialize(self) -> None:
-        """Precompile regex patterns."""
         for tag, patterns in self.config.tag_patterns.items():
             self._compiled_patterns[tag] = []
             for pattern in patterns:
@@ -513,7 +504,6 @@ class KeywordTagGenerator:
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:
-        """Generate tags from keyword/pattern matching."""
         text_lower = text.lower()
         matched_tags: set[str] = set()
 

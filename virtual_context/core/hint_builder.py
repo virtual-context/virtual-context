@@ -253,7 +253,6 @@ def build_default_hint(
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
 ) -> str:
-    """Build simple topic list (no paging)."""
     # Compact name-only list of ALL tags — never truncated.
     all_tag_names = [ts.tag for ts in tag_summaries]
     all_topics_line = (

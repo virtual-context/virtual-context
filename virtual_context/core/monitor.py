@@ -24,7 +24,6 @@ class ContextMonitor:
         self._last_snapshot: ContextSnapshot | None = None
 
     def check(self, snapshot: ContextSnapshot) -> CompactionSignal | None:
-        """Check snapshot against thresholds. Returns signal if compaction needed."""
         self._last_snapshot = snapshot
 
         budget = snapshot.budget_tokens

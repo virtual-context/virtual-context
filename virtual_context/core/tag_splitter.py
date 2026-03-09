@@ -99,7 +99,6 @@ class TagSplitter:
         turn_contents: list[tuple[int, str]],
         existing_tags: set[str],
     ) -> SplitResult:
-        """Parse LLM response into a validated SplitResult."""
         data = parse_llm_json(response)
         if not data:
             return SplitResult(tag=tag, splittable=False, reason="JSON parse error")

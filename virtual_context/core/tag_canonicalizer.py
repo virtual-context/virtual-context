@@ -21,7 +21,6 @@ class TagCanonicalizer:
         self._known_tags: set[str] = set()
 
     def load(self) -> None:
-        """Load aliases from store at startup."""
         if self._store:
             self._alias_cache = self._store.get_tag_aliases()
             # Seed known tags from canonical values
@@ -54,7 +53,6 @@ class TagCanonicalizer:
         return tag
 
     def canonicalize_list(self, tags: list[str]) -> list[str]:
-        """Canonicalize and deduplicate a tag list, preserving order."""
         seen: set[str] = set()
         result: list[str] = []
         for tag in tags:
@@ -65,14 +63,12 @@ class TagCanonicalizer:
         return result
 
     def register_alias(self, alias: str, canonical: str) -> None:
-        """Register a new alias mapping."""
         normalized = alias.lower().strip().replace(" ", "-").replace("_", "-")
         self._alias_cache[normalized] = canonical
         if self._store:
             self._store.set_tag_alias(normalized, canonical)
 
     def get_aliases(self) -> dict[str, str]:
-        """Return all registered aliases."""
         return dict(self._alias_cache)
 
     def auto_detect_aliases(self, threshold: float = 0.85) -> list[tuple[str, str]]:

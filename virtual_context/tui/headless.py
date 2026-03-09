@@ -93,7 +93,6 @@ class HeadlessRunner:
         return self._turns
 
     def _print_turn(self, index: int, total: int, turn: TurnRecord) -> None:
-        """Print a turn's stats to stderr (called after tags are resolved)."""
         t = turn.timing
         timing_str = (
             f"wait={t.get('wait_ms', 0):.0f} "
@@ -109,13 +108,11 @@ class HeadlessRunner:
         )
 
     def _wait_for_complete(self) -> None:
-        """Block until the pending on_turn_complete finishes."""
         if self._pending_complete is not None:
             self._pending_complete.result()  # raises if the thread raised
             self._pending_complete = None
 
     def _execute_turn(self, user_message: str) -> TurnRecord:
-        """Run one turn: engine inbound → stream → engine complete (async)."""
         if user_message.strip() == "/compact":
             return self._execute_compact()
 
@@ -227,7 +224,6 @@ class HeadlessRunner:
     def _run_turn_complete(
         self, turn: TurnRecord, history: list[Message]
     ) -> None:
-        """Background: tag the turn, check compaction, update TurnRecord."""
         try:
             t0 = time.perf_counter()
             compaction = self.engine.on_turn_complete(history)

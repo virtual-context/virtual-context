@@ -29,7 +29,6 @@ class TurnRecord:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_export_dict(self) -> dict:
-        """Serializable dict for JSON export."""
         d = {
             "turn_number": self.turn_number,
             "timestamp": self.timestamp.isoformat(),
@@ -48,14 +47,12 @@ class TurnRecord:
 
 
 def save_turn(turn: TurnRecord, directory: str = ".") -> Path:
-    """Save a single turn to vc-turn-{N}.json. Returns the file path."""
     path = Path(directory) / f"vc-turn-{turn.turn_number}.json"
     path.write_text(json.dumps(turn.to_export_dict(), indent=2, ensure_ascii=False))
     return path
 
 
 def save_session(turns: list[TurnRecord], directory: str = ".") -> Path:
-    """Save all turns to vc-session.json. Returns the file path."""
     path = Path(directory) / "vc-session.json"
     data = {
         "total_turns": len(turns),

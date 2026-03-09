@@ -24,13 +24,11 @@ class BaseProvider(ABC):
         self._client: httpx.Client | None = None
 
     def _get_client(self) -> httpx.Client:
-        """Return the shared httpx.Client, creating it lazily on first use."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.Client(timeout=self._timeout)
         return self._client
 
     def close(self) -> None:
-        """Close the underlying httpx.Client and release resources."""
         if self._client is not None and not self._client.is_closed:
             self._client.close()
             self._client = None
