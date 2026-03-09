@@ -228,7 +228,6 @@ class ContextAssembler:
         )
 
     def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
-        """Format facts as a <facts> block within token budget."""
         if not facts:
             return ""
         lines: list[str] = []
@@ -254,7 +253,6 @@ class ContextAssembler:
         return "<facts>\n" + "\n".join(lines) + "\n</facts>"
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
-        """Format summaries for a tag as XML-tagged section (SUMMARY depth)."""
         if not summaries:
             return ""
 
@@ -282,7 +280,6 @@ class ContextAssembler:
         )
 
     def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
-        """Format individual segment summaries (SEGMENTS depth)."""
         if not segments:
             return ""
 
@@ -300,7 +297,6 @@ class ContextAssembler:
         return "\n\n".join(parts)
 
     def _format_full_section(self, tag: str, segments: list[StoredSegment]) -> str:
-        """Format full original text (FULL depth)."""
         if not segments:
             return ""
 
@@ -319,7 +315,6 @@ class ContextAssembler:
         return "\n\n".join(parts)
 
     def _trim_conversation(self, history: list[Message], budget: int) -> list[Message]:
-        """Keep most recent messages that fit within budget."""
         if budget <= 0:
             return []
 
@@ -338,7 +333,6 @@ class ContextAssembler:
         return result
 
     def _truncate_core(self, core: str, max_tokens: int) -> str:
-        """Truncate core context, keeping the beginning."""
         if self.token_counter(core) <= max_tokens:
             return core
 
@@ -354,7 +348,6 @@ class ContextAssembler:
         return 5
 
     def load_core_context(self, base_path: Path | None = None) -> str:
-        """Load and concatenate core files defined in config."""
         if not self.config.core_files:
             return ""
 

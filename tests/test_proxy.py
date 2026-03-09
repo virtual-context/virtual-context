@@ -2707,18 +2707,18 @@ class TestSessionRegistry:
         assert state.engine.config.conversation_id == "new-uuid-1234"
         assert registry.conversation_count == 1
 
-    def test_reuses_session_via_fingerprint(self, tmp_path):
-        """No session ID + tail-1 fingerprint match → reuses existing session.
+    def test_reuses_session_via_last_message_hash(self, tmp_path):
+        """No session ID + last-message hash match → reuses existing session.
 
-        Simulates the real flow: request N stores fp at offset=0 (tail),
-        then request N+1 (one more turn) matches via offset=1 (tail-1).
+        Simulates the real flow: request N stores hash of last user message,
+        then request N+1 (one more turn) matches via second-to-last user message.
         """
         metrics = ProxyMetrics()
         engine = MagicMock()
         engine.config.conversation_id = "default-session"
         default = ProxyState(engine, metrics=metrics)
 
-        # Request N: 3 user messages.  history_user = [u0, u1], fp = hash(u1)
+        # Request N: 3 user messages.  Store hash of last user msg ("tell me more")
         body_prev = {"messages": [
             {"role": "user", "content": "hello world"},
             {"role": "assistant", "content": "hi there"},
@@ -2726,8 +2726,8 @@ class TestSessionRegistry:
             {"role": "assistant", "content": "doing well"},
             {"role": "user", "content": "tell me more"},
         ]}
-        # Request N+1: one more turn.  history_user = [u0, u1, u2],
-        # fp_match(offset=1) = hash(u1) → matches prev fp
+        # Request N+1: one more turn.  Second-to-last user msg = "tell me more"
+        # which matches the hash stored from request N.
         body_next = {"messages": [
             {"role": "user", "content": "hello world"},
             {"role": "assistant", "content": "hi there"},
@@ -2744,11 +2744,10 @@ class TestSessionRegistry:
             metrics=metrics,
         )
         registry._conversations["default-session"] = default
-        # Simulate catch_all: store fp from request N at offset=0
-        fp = SessionRegistry._compute_fingerprint(body_prev)
-        registry._fingerprints[fp] = "default-session"
+        # Simulate catch_all: store last-message hash from request N
+        registry.update_last_message_hash(body_prev, "default-session")
 
-        # Request N+1 should match via offset=1
+        # Request N+1 should match via second-to-last user message
         result, is_new = registry.get_or_create(None, body=body_next)
         assert is_new is False
         assert result is default
@@ -2771,8 +2770,8 @@ class TestSessionRegistry:
         assert is_new is False
         assert result is state
 
-    def test_loads_state_from_store_on_restart(self, tmp_path):
-        """Known session ID but not in memory → creates engine, loads state."""
+    def test_creates_new_session_when_no_match(self, tmp_path):
+        """No matching system hash or last-message hash → creates new session."""
         metrics = ProxyMetrics()
         registry = SessionRegistry(
             config_path=None,
@@ -2782,18 +2781,16 @@ class TestSessionRegistry:
 
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             engine = MagicMock()
-            engine.config.conversation_id = "restored-session"
+            engine.config.conversation_id = "new-session"
             MockEngine.return_value = engine
 
-            state, is_new = registry.get_or_create("restored-session")
+            state, is_new = registry.get_or_create(None)
 
         assert is_new is True
-        assert state.engine.config.conversation_id == "restored-session"
-        # Engine should have had _load_persisted_state called
-        engine._load_persisted_state.assert_called_once()
+        assert state.engine.config.conversation_id == "new-session"
 
     def test_multiple_sessions(self, tmp_path):
-        """Multiple sessions can coexist."""
+        """Multiple sessions can coexist (routed via system prompt hash)."""
         metrics = ProxyMetrics()
         registry = SessionRegistry(
             config_path=None,
@@ -2801,14 +2798,17 @@ class TestSessionRegistry:
             metrics=metrics,
         )
 
-        engines = []
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
             for sid in ["session-a", "session-b", "session-c"]:
                 engine = MagicMock()
                 engine.config.conversation_id = sid
                 MockEngine.return_value = engine
-                engines.append(engine)
-                registry.get_or_create(None if sid == "session-a" else sid)
+                # Each session has a unique system prompt → unique hash
+                body = {"messages": [
+                    {"role": "system", "content": f"chat_id: {sid}"},
+                    {"role": "user", "content": "hello"},
+                ]}
+                registry.get_or_create(None, body=body)
 
         assert registry.conversation_count == 3
 
@@ -3051,174 +3051,86 @@ class TestContentFingerprintRouting:
 # ---------------------------------------------------------------------------
 
 
-class TestTrailingFingerprint:
-    """Tail-based fingerprint: store at offset=0, match at offset=1."""
+class TestSessionRouting:
+    """System prompt hash + last-message hash routing tests."""
 
-    def _make_body(self, user_messages: list[str]) -> dict:
+    def _make_body(self, user_messages: list[str], system: str = "") -> dict:
         msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
         for i, text in enumerate(user_messages):
             msgs.append({"role": "user", "content": text})
             if i < len(user_messages) - 1:
                 msgs.append({"role": "assistant", "content": f"Response {i}"})
         return {"messages": msgs, "model": "test"}
 
-    def test_compute_fingerprint_samples_tail(self):
-        """offset=0 hashes the last S user messages before current turn."""
+    def test_hash_user_message_position0(self):
+        """position=0 hashes the last user message."""
         body = self._make_body(["msg-a", "msg-b", "msg-c"])
-        # history_user = ["msg-a", "msg-b"], sample_size=1 → hash("msg-b")
-        fp = SessionRegistry._compute_fingerprint(body, offset=0)
-        assert fp  # non-empty
-        assert len(fp) == 16  # sha256 truncated to 16 hex chars
+        h = SessionRegistry._hash_user_message(body, position=0)
+        assert h  # non-empty
+        assert len(h) == 16  # sha256 truncated to 16 hex chars
 
-    def test_compute_fingerprint_offset1_shifts_back(self):
-        """offset=1 shifts sampling window back by one position."""
+    def test_hash_user_message_position1(self):
+        """position=1 hashes the second-to-last user message."""
         body = self._make_body(["msg-a", "msg-b", "msg-c"])
-        # history_user = ["msg-a", "msg-b"]
-        # offset=0 → hash("msg-b"), offset=1 → hash("msg-a")
-        fp0 = SessionRegistry._compute_fingerprint(body, offset=0)
-        fp1 = SessionRegistry._compute_fingerprint(body, offset=1)
-        assert fp0 != fp1
+        h0 = SessionRegistry._hash_user_message(body, position=0)
+        h1 = SessionRegistry._hash_user_message(body, position=1)
+        assert h0 != h1
 
-    def test_tail1_matches_previous_tail(self):
-        """Core invariant: request N+1's tail-1 == request N's tail.
+    def test_last_msg_hash_matches_across_turns(self):
+        """Core invariant: request N's position=0 == request N+1's position=1.
 
-        Request N:   history = [u0, u1, u2].  tail = hash(u2).
-        Request N+1: history = [u0, u1, u2, u3].  tail-1 = hash(u2).
+        Request N:   user msgs = [u0, u1, u2].  position=0 → hash(u2).
+        Request N+1: user msgs = [u0, u1, u2, u3].  position=1 → hash(u2).
         """
-        body_n = self._make_body(["u0", "u1", "u2", "current-n"])
-        body_n1 = self._make_body(["u0", "u1", "u2", "u3", "current-n1"])
+        body_n = self._make_body(["u0", "u1", "u2"])
+        body_n1 = self._make_body(["u0", "u1", "u2", "u3"])
 
-        fp_store = SessionRegistry._compute_fingerprint(body_n, offset=0)
-        fp_match = SessionRegistry._compute_fingerprint(body_n1, offset=1)
+        h_store = SessionRegistry._hash_user_message(body_n, position=0)
+        h_match = SessionRegistry._hash_user_message(body_n1, position=1)
 
-        assert fp_store == fp_match, (
-            "tail-1 of next request must equal tail of previous request"
+        assert h_store == h_match, (
+            "position=1 of next request must equal position=0 of previous request"
         )
 
     def test_too_few_messages_returns_empty(self):
-        """A body with < 2 user messages cannot produce a fingerprint."""
+        """A body with only 1 user message cannot produce position=1 hash."""
         body_one = self._make_body(["only-one"])
-        assert SessionRegistry._compute_fingerprint(body_one) == ""
+        assert SessionRegistry._hash_user_message(body_one, position=1) == ""
 
-        body_two = self._make_body(["first", "second"])
-        # history_user = ["first"], offset=1 → start < 0
-        assert SessionRegistry._compute_fingerprint(body_two, offset=1) == ""
+    def test_position_too_large_returns_empty(self):
+        """Position beyond available user messages returns empty string."""
+        body = self._make_body(["u0", "u1"])
+        assert SessionRegistry._hash_user_message(body, position=2) == ""
 
-    def test_offset_too_large_returns_empty(self):
-        """Offset beyond available history returns empty string."""
-        body = self._make_body(["u0", "u1", "u2"])
-        # history_user = ["u0", "u1"], offset=2 → end=0, returns ""
-        assert SessionRegistry._compute_fingerprint(body, offset=2) == ""
+    def test_system_prompt_hash_openai(self):
+        """System prompt hash extracts from OpenAI role=system message."""
+        body = self._make_body(["hello"], system="You are a helpful assistant. chat_id: telegram:123")
+        h = SessionRegistry._compute_system_hash(body)
+        assert h
+        assert len(h) == 16
 
-    def test_different_conversations_produce_different_fingerprints(self):
-        """Two conversations with different messages have different fps."""
-        body_a = self._make_body(["[id:111] hello", "[id:111] cars", "[id:111] query"])
-        body_b = self._make_body(["[id:222] hey", "[id:222] bikes", "[id:222] query"])
-        fp_a = SessionRegistry._compute_fingerprint(body_a)
-        fp_b = SessionRegistry._compute_fingerprint(body_b)
-        assert fp_a != fp_b
+    def test_system_prompt_hash_anthropic(self):
+        """System prompt hash extracts from Anthropic top-level system key."""
+        body = {"system": "You are helpful. chat_id: telegram:456", "messages": []}
+        h = SessionRegistry._compute_system_hash(body)
+        assert h
+        assert len(h) == 16
 
-    def test_persisted_fingerprint_roundtrip_sqlite(self, tmp_path):
-        """Trailing fingerprint persists through SQLite save/load cycle."""
-        from virtual_context.storage.sqlite import SQLiteStore
-        store = SQLiteStore(str(tmp_path / "test.db"))
+    def test_different_system_prompts_different_hashes(self):
+        """Different chat_ids in system prompt produce different hashes."""
+        body_a = self._make_body(["hi"], system="chat_id: telegram:111")
+        body_b = self._make_body(["hi"], system="chat_id: telegram:222")
+        assert SessionRegistry._compute_system_hash(body_a) != SessionRegistry._compute_system_hash(body_b)
 
-        from virtual_context.types import EngineStateSnapshot
-        snap = EngineStateSnapshot(
-            conversation_id="sess-1",
-            compacted_through=10,
-            turn_tag_entries=[],
-            turn_count=5,
-            trailing_fingerprint="abc123deadbeef00",
-        )
-        store.save_engine_state(snap)
+    def test_no_system_prompt_returns_empty(self):
+        """No system prompt → empty hash."""
+        body = self._make_body(["hello"])
+        assert SessionRegistry._compute_system_hash(body) == ""
 
-        loaded = store.load_engine_state("sess-1")
-        assert loaded is not None
-        assert loaded.trailing_fingerprint == "abc123deadbeef00"
-
-        # list_engine_state_fingerprints should return this
-        fps = store.list_engine_state_fingerprints()
-        assert fps == {"abc123deadbeef00": "sess-1"}
-
-    def test_persisted_fingerprint_roundtrip_filesystem(self, tmp_path):
-        """Trailing fingerprint persists through filesystem save/load cycle."""
-        from virtual_context.storage.filesystem import FilesystemStore
-        store = FilesystemStore(str(tmp_path / "fs_store"))
-
-        from virtual_context.types import EngineStateSnapshot
-        snap = EngineStateSnapshot(
-            conversation_id="sess-2",
-            compacted_through=5,
-            turn_tag_entries=[],
-            turn_count=3,
-            trailing_fingerprint="beef1234cafe5678",
-        )
-        store.save_engine_state(snap)
-
-        loaded = store.load_engine_state("sess-2")
-        assert loaded is not None
-        assert loaded.trailing_fingerprint == "beef1234cafe5678"
-
-        fps = store.list_engine_state_fingerprints()
-        assert fps == {"beef1234cafe5678": "sess-2"}
-
-    def test_empty_fingerprint_excluded_from_listing(self, tmp_path):
-        """Sessions with no trailing fingerprint are excluded from the map."""
-        from virtual_context.storage.sqlite import SQLiteStore
-        store = SQLiteStore(str(tmp_path / "test.db"))
-
-        from virtual_context.types import EngineStateSnapshot
-        snap = EngineStateSnapshot(
-            conversation_id="sess-no-fp",
-            compacted_through=0,
-            turn_tag_entries=[],
-            turn_count=0,
-            trailing_fingerprint="",
-        )
-        store.save_engine_state(snap)
-        assert store.list_engine_state_fingerprints() == {}
-
-    def test_match_persisted_fingerprint_on_restart(self, tmp_path):
-        """Simulates proxy restart: persisted fp matches inbound tail-1."""
-        from virtual_context.storage.sqlite import SQLiteStore
-        store = SQLiteStore(str(tmp_path / "test.db"))
-
-        # Request N stored fp = hash(u2) at offset=0
-        body_prev = self._make_body(["u0", "u1", "u2", "current-n"])
-        fp_stored = SessionRegistry._compute_fingerprint(body_prev, offset=0)
-
-        from virtual_context.types import EngineStateSnapshot
-        snap = EngineStateSnapshot(
-            conversation_id="persisted-sess",
-            compacted_through=0,
-            turn_tag_entries=[],
-            turn_count=4,
-            trailing_fingerprint=fp_stored,
-        )
-        store.save_engine_state(snap)
-
-        # Proxy restarts.  Request N+1 arrives with one more turn.
-        body_next = self._make_body(["u0", "u1", "u2", "u3", "current-n1"])
-
-        metrics = ProxyMetrics()
-        registry = SessionRegistry(
-            config_path=None,
-            upstream="http://fake:9999",
-            metrics=metrics,
-            store=store,
-        )
-
-        matched_sid = registry._match_persisted_fingerprint(body_next)
-        assert matched_sid == "persisted-sess"
-
-    def test_multi_session_fingerprint_routing(self):
-        """Multiple concurrent sessions route correctly via tail fingerprints.
-
-        Simulates 3 independent conversations (different Telegram groups)
-        each advancing over 3 turns.  Every request must route to the
-        correct session via tail-1 fingerprint matching.
-        """
+    def test_multi_session_routing_via_system_hash(self):
+        """Multiple sessions route correctly via system prompt hash."""
         metrics = ProxyMetrics()
         registry = SessionRegistry(
             config_path=None,
@@ -3226,7 +3138,42 @@ class TestTrailingFingerprint:
             metrics=metrics,
         )
 
-        # Three conversations with distinct Telegram group IDs
+        states = {}
+        with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
+            for sid, sys_prompt in [
+                ("session-a", "chat_id: telegram:111"),
+                ("session-b", "chat_id: telegram:222"),
+                ("session-c", "chat_id: telegram:333"),
+            ]:
+                engine = MagicMock()
+                engine.config.conversation_id = sid
+                MockEngine.return_value = engine
+                body = self._make_body(["hello"], system=sys_prompt)
+                state, is_new = registry.get_or_create(None, body=body)
+                states[sid] = state
+
+        assert registry.conversation_count == 3
+
+        # Next turn: same system prompts route back to correct sessions
+        for sid, sys_prompt in [
+            ("session-a", "chat_id: telegram:111"),
+            ("session-b", "chat_id: telegram:222"),
+            ("session-c", "chat_id: telegram:333"),
+        ]:
+            body = self._make_body(["hello", "follow-up"], system=sys_prompt)
+            state, is_new = registry.get_or_create(None, body=body)
+            assert is_new is False, f"{sid} should reuse existing session"
+            assert state is states[sid], f"{sid} routed to wrong session"
+
+    def test_multi_session_routing_via_last_message_hash(self):
+        """Without system prompts, sessions route via last-message hash."""
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=None,
+            upstream="http://fake:9999",
+            metrics=metrics,
+        )
+
         convos = {
             "session-a": ["[id:111] msg-a-{}".format(i) for i in range(6)],
             "session-b": ["[id:222] msg-b-{}".format(i) for i in range(6)],
@@ -3234,9 +3181,7 @@ class TestTrailingFingerprint:
         }
 
         states = {}
-
         with patch("virtual_context.proxy.server.VirtualContextEngine") as MockEngine:
-            # Turn 1: each conversation sends first 3 messages (creates session)
             for sid, msgs in convos.items():
                 engine = MagicMock()
                 engine.config.conversation_id = sid
@@ -3244,78 +3189,26 @@ class TestTrailingFingerprint:
                 body = self._make_body(msgs[:3])
                 state, is_new = registry.get_or_create(None, body=body)
                 states[sid] = state
-                # Simulate catch_all: store tail fingerprint
-                fp = SessionRegistry._compute_fingerprint(body)
-                if fp:
-                    registry._fingerprints[fp] = sid
+                registry.update_last_message_hash(body, sid)
 
         assert registry.conversation_count == 3
 
-        # Turn 2: each conversation grows by one message — must route back
-        # to its own session via tail-1 fingerprint match
+        # Next turn: route via last-message hash
         for sid, msgs in convos.items():
-            body = self._make_body(msgs[:4])  # one more message
+            body = self._make_body(msgs[:4])
             state, is_new = registry.get_or_create(None, body=body)
             assert is_new is False, f"{sid} should reuse existing session"
             assert state is states[sid], f"{sid} routed to wrong session"
+            registry.update_last_message_hash(body, sid)
 
-            # Simulate catch_all: update fingerprint
-            fp = SessionRegistry._compute_fingerprint(body)
-            if fp:
-                registry._fingerprints[fp] = sid
-
-        # Turn 3: another advance — still routes correctly
+        # Another turn
         for sid, msgs in convos.items():
             body = self._make_body(msgs[:5])
             state, is_new = registry.get_or_create(None, body=body)
             assert is_new is False, f"{sid} turn 3 should reuse session"
             assert state is states[sid], f"{sid} turn 3 routed to wrong session"
 
-        # No extra sessions created
         assert registry.conversation_count == 3
-
-    def test_multi_session_restart_with_persisted_fingerprints(self, tmp_path):
-        """On restart, 3 persisted sessions are correctly restored via fps."""
-        from virtual_context.storage.sqlite import SQLiteStore
-        from virtual_context.types import EngineStateSnapshot
-        store = SQLiteStore(str(tmp_path / "test.db"))
-
-        # Three conversations, each with a unique tail fingerprint
-        convos = {
-            "session-a": ["[id:111] a-{}".format(i) for i in range(5)],
-            "session-b": ["[id:222] b-{}".format(i) for i in range(5)],
-            "session-c": ["[id:333] c-{}".format(i) for i in range(5)],
-        }
-
-        # Persist engine state with fingerprints (simulates pre-restart)
-        for sid, msgs in convos.items():
-            body = self._make_body(msgs[:4])  # 4 msgs, last is "current"
-            fp = SessionRegistry._compute_fingerprint(body, offset=0)
-            snap = EngineStateSnapshot(
-                conversation_id=sid,
-                compacted_through=0,
-                turn_tag_entries=[],
-                turn_count=4,
-                trailing_fingerprint=fp,
-            )
-            store.save_engine_state(snap)
-
-        # Proxy restarts — fresh registry with store
-        metrics = ProxyMetrics()
-        registry = SessionRegistry(
-            config_path=None,
-            upstream="http://fake:9999",
-            metrics=metrics,
-            store=store,
-        )
-
-        # Each conversation sends request with one more turn
-        for sid, msgs in convos.items():
-            body = self._make_body(msgs[:5])  # 5 msgs, one more than persisted
-            matched = registry._match_persisted_fingerprint(body)
-            assert matched == sid, (
-                f"Session {sid} should match its persisted fingerprint"
-            )
 
 
 # ---------------------------------------------------------------------------

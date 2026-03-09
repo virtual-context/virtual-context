@@ -80,12 +80,10 @@ class TelemetryLedger:
         return event
 
     def events(self) -> list[TelemetryEvent]:
-        """Return a copy of the event list."""
         with self._lock:
             return list(self._events)
 
     def total(self) -> TelemetryRollup:
-        """Grand totals across all events."""
         rollup = TelemetryRollup()
         with self._lock:
             for event in self._events:
@@ -93,7 +91,6 @@ class TelemetryLedger:
         return rollup
 
     def by_component(self) -> dict[str, TelemetryRollup]:
-        """Rollups keyed by component name."""
         result: dict[str, TelemetryRollup] = {}
         with self._lock:
             for event in self._events:
@@ -103,7 +100,6 @@ class TelemetryLedger:
         return result
 
     def by_model(self) -> dict[str, TelemetryRollup]:
-        """Rollups keyed by model name."""
         result: dict[str, TelemetryRollup] = {}
         with self._lock:
             for event in self._events:
@@ -113,12 +109,10 @@ class TelemetryLedger:
         return result
 
     def reset(self) -> None:
-        """Clear all recorded events."""
         with self._lock:
             self._events.clear()
 
     def to_dict(self) -> dict:
-        """Serializable representation of the ledger."""
         with self._lock:
             events_snapshot = list(self._events)
 

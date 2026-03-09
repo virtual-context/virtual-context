@@ -51,7 +51,6 @@ async def _passthrough(
     url: str,
     headers: dict[str, str],
 ) -> StreamingResponse:
-    """Transparent forwarding for non-chat requests."""
     body = await request.body()
     return await _passthrough_bytes(client, request.method, url, headers, body)
 
@@ -63,7 +62,6 @@ async def _passthrough_bytes(
     headers: dict[str, str],
     body: bytes,
 ) -> JSONResponse | Response:
-    """Forward raw bytes to upstream and return the response."""
     resp = await client.request(method, url, headers=headers, content=body)
     fwd = _forward_headers(dict(resp.headers))
     if resp.headers.get("content-type", "").startswith("application/json"):
@@ -90,6 +88,7 @@ async def _handle_streaming(
     *,
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
+    turn_id: str = "",
     overhead_ms: float = 0.0,
     conversation_id: str = "",
     passthrough: bool = False,
@@ -133,6 +132,7 @@ async def _handle_streaming(
             metrics.record({
                 "type": "response",
                 "turn": turn,
+                "turn_id": turn_id,
                 "upstream_ms": upstream_ms,
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
@@ -167,12 +167,19 @@ async def _handle_streaming(
             metrics.record({
                 "type": "response",
                 "turn": turn,
+                "turn_id": turn_id,
                 "upstream_ms": upstream_ms,
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
                 "conversation_id": conversation_id,
             })
         assistant_text = "".join(text_chunks)
+        # Capture response for dashboard inspector
+        if metrics:
+            metrics.capture_response(turn, {
+                "streaming": True,
+                "assistant_text": assistant_text,
+            })
         # Log upstream LLM call to telemetry ledger
         if state and hasattr(state.engine, '_telemetry'):
             _model = body.get("model", "unknown")
@@ -837,6 +844,7 @@ async def _handle_streaming(
                     state.fire_turn_complete(
                         list(state.conversation_history),
                         payload_tokens=state._last_payload_tokens or None,
+                        turn_id=turn_id,
                     )
                 _marker_sid = state.engine.config.conversation_id
                 _fmt = get_format(api_format)
@@ -885,6 +893,7 @@ async def _handle_streaming(
                     state.fire_turn_complete(
                         list(state.conversation_history),
                         payload_tokens=state._last_payload_tokens or None,
+                        turn_id=turn_id,
                     )
 
                 # Inject session marker as a final SSE delta so the client SDK
@@ -898,7 +907,6 @@ async def _handle_streaming(
                 _dump_session_state(state, session_log_path)
 
     async def stream_generator():
-        """Wrapper that captures all bytes sent to the client."""
         client_chunks: list[bytes] = [] if request_log_dir else None
         async for chunk in _inner_stream():
             if client_chunks is not None:
@@ -930,6 +938,7 @@ async def _handle_non_streaming(
     *,
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
+    turn_id: str = "",
     overhead_ms: float = 0.0,
     conversation_id: str = "",
     passthrough: bool = False,
@@ -960,6 +969,10 @@ async def _handle_non_streaming(
         except Exception:
             pass
 
+    # Capture response for dashboard inspector
+    if metrics:
+        metrics.capture_response(turn, response_body)
+
     # Extract and record assistant text
     assistant_text = _extract_assistant_text(response_body, api_format)
     if state and assistant_text:
@@ -971,6 +984,7 @@ async def _handle_non_streaming(
             state.fire_turn_complete(
                 list(state.conversation_history),
                 payload_tokens=state._last_payload_tokens or None,
+                turn_id=turn_id,
             )
 
         # Inject session marker into the response body so the client stores it
@@ -982,6 +996,7 @@ async def _handle_non_streaming(
         metrics.record({
             "type": "response",
             "turn": turn,
+            "turn_id": turn_id,
             "upstream_ms": upstream_ms,
             "total_ms": round(overhead_ms + upstream_ms, 1),
             "streaming": False,

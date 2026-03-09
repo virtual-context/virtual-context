@@ -49,7 +49,6 @@ _HOP_BY_HOP = frozenset({
 
 
 def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Filter out hop-by-hop headers for forwarding."""
     return {
         k: v for k, v in headers.items()
         if k.lower() not in _HOP_BY_HOP
@@ -61,56 +60,46 @@ def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _detect_api_format(body: dict) -> str:
-    """Detect whether this is an Anthropic, OpenAI, or Gemini request."""
     return detect_format(body).name
 
 
 def _extract_conversation_id(body: dict) -> str | None:
-    """Scan assistant messages for vc:conversation marker. Returns UUID or None."""
     fmt = detect_format(body)
     return fmt.extract_conversation_id(body)
 
 
 def _strip_conversation_markers(body: dict) -> dict:
-    """Strip vc:conversation markers from all assistant messages in the request body."""
     fmt = detect_format(body)
     return fmt.strip_conversation_markers(body)
 
 
 def _extract_user_message(body: dict) -> str:
-    """Extract the last user message text from a request body."""
     fmt = detect_format(body)
     return fmt.extract_user_message(body)
 
 
 def _extract_message_text(msg: dict, api_format: str = "anthropic") -> str:
-    """Extract text from a single message dict (string or content blocks)."""
     return get_format(api_format).extract_message_text(msg)
 
 
 def _extract_history_pairs(body: dict) -> list[Message]:
-    """Extract complete user+assistant pairs from request history."""
     fmt = detect_format(body)
     return fmt.extract_history_pairs(body)
 
 
 def _inject_context(body: dict, prepend_text: str, api_format: str) -> dict:
-    """Inject <virtual-context> block into a deep-copied request body."""
     return get_format(api_format).inject_context(body, prepend_text)
 
 
 def _inject_conversation_marker(response_body: dict, marker: str, api_format: str) -> dict:
-    """Append conversation marker text to the last text content block."""
     return get_format(api_format).inject_conversation_marker(response_body, marker)
 
 
 def _extract_delta_text(data: dict, api_format: str) -> str:
-    """Extract text delta from a streaming SSE event payload."""
     return get_format(api_format).extract_delta_text(data)
 
 
 def _extract_assistant_text(response_body: dict, api_format: str) -> str:
-    """Extract assistant text from a non-streaming response."""
     return get_format(api_format).extract_assistant_text(response_body)
 
 
@@ -119,7 +108,6 @@ def _inject_vc_tools(
     engine: "VirtualContextEngine",
     require_tool_use: bool | None = None,
 ) -> dict:
-    """Append VC paging tool definitions to the request body's tools array."""
     from ..core.tool_loop import vc_tool_definitions
     fmt = detect_format(body)
     return fmt.inject_tools(
@@ -132,7 +120,6 @@ def _build_continuation_request(
     assistant_content: list[dict],
     tool_results: list[dict],
 ) -> dict:
-    """Build a non-streaming continuation request after VC tool execution."""
     fmt = detect_format(original_body)
     return fmt.build_continuation_request(original_body, assistant_content, tool_results)
 
@@ -180,7 +167,6 @@ def _parse_sse_events(
 
 
 def _emit_text_as_sse(text: str, block_index: int) -> list[bytes]:
-    """Convert *text* into Anthropic SSE events at *block_index*."""
     events: list[bytes] = []
     start = _json.dumps({
         "type": "content_block_start",
@@ -207,7 +193,6 @@ def _emit_text_as_sse(text: str, block_index: int) -> list[bytes]:
 def _emit_tool_use_as_sse(
     tool: dict, block_index: int,
 ) -> list[bytes]:
-    """Convert a tool_use content block into Anthropic SSE events."""
     events: list[bytes] = []
     start = _json.dumps({
         "type": "content_block_start",
@@ -238,7 +223,6 @@ def _emit_tool_use_as_sse(
 
 
 def _emit_text_as_responses_sse(text: str, item_index: int = 0) -> list[bytes]:
-    """Convert *text* into OpenAI Responses API SSE events."""
     events: list[bytes] = []
 
     item_id = f"item_{item_index}"
@@ -323,7 +307,6 @@ def _emit_text_as_responses_sse(text: str, item_index: int = 0) -> list[bytes]:
 def _emit_tool_use_as_responses_sse(
     tool: dict, item_index: int = 0,
 ) -> list[bytes]:
-    """Convert a function_call into OpenAI Responses API SSE events."""
     events: list[bytes] = []
     output_index = item_index
     call_id = tool.get("id", tool.get("call_id", ""))
@@ -390,7 +373,6 @@ def _emit_response_done_sse(
     output_items: list[dict],
     usage: dict | None = None,
 ) -> list[bytes]:
-    """Emit ``response.completed`` SSE event for Responses API."""
     events: list[bytes] = []
     completed = _json.dumps({
         "type": "response.completed",
@@ -410,7 +392,6 @@ def _emit_message_end_sse(
     stop_reason: str = "end_turn",
     usage: dict | None = None,
 ) -> list[bytes]:
-    """Emit ``message_delta`` and ``message_stop`` SSE events."""
     events: list[bytes] = []
     md_payload: dict = {
         "type": "message_delta",

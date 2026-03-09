@@ -31,7 +31,6 @@ class ModelCatalog:
 
     @classmethod
     def default(cls) -> ModelCatalog:
-        """Load the default models.yaml shipped alongside the package."""
         here = os.path.dirname(os.path.abspath(__file__))
         # core/ -> virtual_context/ -> project root
         root = os.path.dirname(os.path.dirname(here))
@@ -74,7 +73,6 @@ class ModelCatalog:
         return None
 
     def get_pricing(self, model_name: str) -> tuple[float, float]:
-        """Return (input_per_mtok, output_per_mtok) for a model."""
         model = self._resolve(model_name)
         if model is None:
             logger.debug("Unknown model '%s' — returning zero pricing", model_name)
@@ -82,11 +80,9 @@ class ModelCatalog:
         return (model.input_per_mtok, model.output_per_mtok)
 
     def calculate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
-        """Calculate cost in USD for a given token count."""
         inp_rate, out_rate = self.get_pricing(model_name)
         return (input_tokens * inp_rate + output_tokens * out_rate) / 1_000_000
 
     def get_context_window(self, model_name: str) -> int:
-        """Return context window size for a model, or 0 if unknown."""
         model = self._resolve(model_name)
         return model.context_window if model else 0

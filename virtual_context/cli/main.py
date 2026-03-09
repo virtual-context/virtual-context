@@ -25,7 +25,6 @@ def _get_store(config_path: str | None = None):
 
 
 def cmd_status(args):
-    """Show current tag stats and token usage."""
     store, config = _get_store(args.config)
     tag_stats = store.get_all_tags()
 
@@ -59,7 +58,6 @@ def cmd_status(args):
 
 
 def cmd_tags(args):
-    """List all tags in the store."""
     store, config = _get_store(args.config)
     tag_stats = store.get_all_tags()
 
@@ -74,7 +72,6 @@ def cmd_tags(args):
 
 
 def cmd_recall(args):
-    """Retrieve and display context for a tag."""
     store, config = _get_store(args.config)
     tag = args.tag
     limit = args.limit or 5
@@ -102,7 +99,6 @@ def cmd_recall(args):
 
 
 def cmd_compact(args):
-    """Trigger manual compaction."""
     from ..engine import VirtualContextEngine
     from ..types import Message
 
@@ -144,7 +140,6 @@ def cmd_compact(args):
 
 
 def cmd_telemetry(args):
-    """Show conversation telemetry report."""
     from ..engine import VirtualContextEngine
 
     engine = VirtualContextEngine(config_path=args.config)
@@ -176,7 +171,6 @@ def cmd_telemetry(args):
 
 
 def cmd_init(args):
-    """Generate a config file from a preset."""
     preset = get_preset(args.preset)
     if preset is None:
         available = ", ".join(p.name for p in list_presets())
@@ -203,7 +197,6 @@ def cmd_init(args):
 
 
 def cmd_presets(args):
-    """List or show presets."""
     action = getattr(args, "presets_action", None) or "list"
 
     if action == "list":
@@ -228,7 +221,6 @@ def cmd_presets(args):
 
 
 def cmd_config_validate(args):
-    """Validate config file."""
     try:
         config = load_config(args.config)
     except Exception as e:
@@ -252,7 +244,6 @@ def cmd_config_validate(args):
 
 
 def cmd_aliases(args):
-    """Manage tag aliases."""
     from ..core.tag_canonicalizer import TagCanonicalizer
 
     store, config = _get_store(args.config)
@@ -286,7 +277,6 @@ def cmd_aliases(args):
 
 
 def cmd_chat(args):
-    """Launch interactive TUI chat."""
     import os
 
     try:
@@ -348,7 +338,6 @@ def cmd_chat(args):
 
 
 def cmd_proxy(args):
-    """Start HTTP proxy for LLM enrichment."""
     try:
         import uvicorn
         from ..proxy import create_app
@@ -372,7 +361,6 @@ def cmd_proxy(args):
             return True
 
     class _SuppressDashboardAccess(_logging.Filter):
-        """Hide repetitive GET /dashboard/* access logs."""
         def filter(self, record: _logging.LogRecord) -> bool:
             msg = record.getMessage()
             if "GET /dashboard/" in msg and "200" in msg:
@@ -415,7 +403,6 @@ def cmd_proxy(args):
 
 
 def cmd_retrieve(args):
-    """Retrieve context for a message."""
     from ..engine import VirtualContextEngine
 
     engine = VirtualContextEngine(config_path=args.config)
@@ -444,7 +431,6 @@ def cmd_retrieve(args):
 
 
 def cmd_transform(args):
-    """Retrieve + assemble context block."""
     from ..engine import VirtualContextEngine
 
     engine = VirtualContextEngine(config_path=args.config)
@@ -498,7 +484,6 @@ def _prompt_yes_no(text: str, default_yes: bool = True) -> bool:
 
 
 def _prompt_choice(text: str, options: list[str], default: str | None = None) -> str:
-    """Display a numbered menu and return the selected option."""
     print(f"\n{text}")
     for i, opt in enumerate(options, 1):
         marker = " (default)" if opt == default else ""
@@ -525,7 +510,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
 
 
 def _prompt_tagging_provider() -> tuple[str, str]:
-    """Ask for a tagging/summarization provider and model. Returns (provider, model)."""
     provider = _prompt_choice(
         "Tagging/summarization provider:",
         ["anthropic", "openai", "ollama", "openrouter", "custom"],
@@ -842,7 +826,6 @@ def _install_windows_task_daemon(config_path: Path, upstream: str | None, start:
 
 
 def cmd_onboard(args):
-    """Guided setup: initialize config, validate, optionally install daemon."""
     config_path = Path(args.config) if args.config else Path.cwd() / "virtual-context.yaml"
 
     if not config_path.exists():
@@ -926,7 +909,6 @@ def _daemon_systemd_unit_path() -> Path:
 
 
 def cmd_daemon(args):
-    """Manage daemon lifecycle for the proxy service."""
     import time
 
     action = args.daemon_action

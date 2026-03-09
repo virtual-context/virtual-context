@@ -97,7 +97,6 @@ class VChatApp(App):
 
     @work(thread=True)
     def _run_replay(self) -> None:
-        """Send queued replay prompts sequentially in a single worker thread."""
         self._replaying = True
 
         for i, prompt in enumerate(self._replay_prompts, 1):
@@ -362,7 +361,6 @@ class VChatApp(App):
         self.call_from_thread(self._update_side_panel_complete, turn, compaction)
 
     def _update_side_panel_inbound(self, assembled: AssembledContext) -> None:
-        """Update side panel after engine.on_message_inbound."""
         budget = self.engine.config.context_window if self.engine else 120_000
         self._budget_bar.update_budget(
             assembled.total_tokens, assembled.budget_breakdown, budget=budget
@@ -376,7 +374,6 @@ class VChatApp(App):
     def _update_side_panel_complete(
         self, turn: TurnRecord, compaction
     ) -> None:
-        """Update side panel after engine.on_turn_complete."""
         # Update tag panel with recent tags (recency-weighted)
         tag_recency: dict[str, float] = {}
         recent = self._turns[-8:]
@@ -402,33 +399,27 @@ class VChatApp(App):
             )
 
     def action_inspect_turn(self) -> None:
-        """Open modal for the currently selected turn."""
         turn = self._turn_list.selected_turn
         if turn:
             self.push_screen(TurnInspector(turn, all_turns=self._turns))
 
     def action_prev_turn(self) -> None:
-        """Select previous turn in the turn list."""
         self._turn_list.select_prev()
 
     def action_next_turn(self) -> None:
-        """Select next turn in the turn list."""
         self._turn_list.select_next()
 
     def action_toggle_brief(self) -> None:
-        """Toggle brief mode — silently appends 'answer in 2 lines' to prompts."""
         self._brief_mode = not self._brief_mode
         state = "ON" if self._brief_mode else "OFF"
         self._chat_view.add_system_message(f"Brief mode {state}")
 
     def action_compact(self) -> None:
-        """Trigger manual compaction via Ctrl+K."""
         if self._streaming:
             return
         self._send_message("/compact")
 
     def action_save_session(self) -> None:
-        """Save full session log to vc-session.json."""
         if not self._turns:
             self._chat_view.add_system_message("Nothing to save yet.")
             return
@@ -457,7 +448,6 @@ def run_chat(
     model: str = "claude-sonnet-4-5-20250929",
     replay_prompts: list[str] | None = None,
 ) -> None:
-    """Entry point for the TUI chat."""
     app = VChatApp(
         config_path=config_path,
         api_key=api_key,

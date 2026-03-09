@@ -20,7 +20,6 @@ _engine = None
 
 
 def _get_engine():
-    """Get or create the engine singleton."""
     global _engine
     if _engine is None:
         from ..engine import VirtualContextEngine
@@ -271,7 +270,6 @@ def summarize_conversation() -> str:
 # ---------------------------------------------------------------------------
 
 def serve():
-    """Start the MCP server (stdio transport)."""
     mcp.run()
 
 

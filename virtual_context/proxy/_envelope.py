@@ -40,7 +40,6 @@ def _last_text_block(content: list) -> str:
 
 
 def _strip_vc_prompt(text: str) -> str:
-    """Strip the ``[vc:prompt]`` marker injected by the OpenClaw plugin."""
     if text.startswith(_VC_PROMPT_MARKER):
         return text[len(_VC_PROMPT_MARKER):]
     return text

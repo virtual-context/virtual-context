@@ -79,7 +79,6 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
 
 
 def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
-    """Parse a markdown file back into a StoredSegment."""
     if not text.startswith("---"):
         return None
 
@@ -604,7 +603,6 @@ class FilesystemStore(ContextStore):
         path.write_text(json.dumps(data, indent=2))
 
     def _parse_engine_state_data(self, data: dict) -> EngineStateSnapshot:
-        """Parse a JSON dict into an EngineStateSnapshot."""
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -671,7 +669,6 @@ class FilesystemStore(ContextStore):
             return None
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
-        """Return {trailing_fingerprint: conversation_id} for all persisted conversations."""
         state_dir = self.root / "_engine_state"
         if not state_dir.is_dir():
             return {}
@@ -719,5 +716,4 @@ class FilesystemStore(ContextStore):
         return results
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
-        """FilesystemStore does not support facts — return empty list."""
         return []
