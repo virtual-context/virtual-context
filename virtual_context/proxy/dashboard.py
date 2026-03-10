@@ -89,14 +89,19 @@ def get_dashboard_html() -> str:
 
 
 def _check_dashboard_auth(request: Request, dashboard_token: str) -> JSONResponse | None:
-    """Validate ``X-VC-Dashboard-Token`` header for mutating endpoints.
+    """Validate ``X-VC-Dashboard-Token`` header (or ``?token=`` query param) for mutating endpoints.
 
     Returns a 403 response if authentication fails, or ``None`` to allow access.
     If *dashboard_token* is empty, auth is skipped (backward compatible).
+
+    Check order: header first, then ``token`` query parameter (needed for
+    EventSource which cannot send custom headers).
     """
     if not dashboard_token:
         return None
     provided = request.headers.get("X-VC-Dashboard-Token", "")
+    if not provided:
+        provided = request.query_params.get("token", "")
     if provided != dashboard_token:
         return JSONResponse({"error": "Invalid or missing dashboard token"}, status_code=403)
     return None
@@ -120,6 +125,41 @@ def register_dashboard_routes(
             "(shutdown, compact, replay, settings) are unprotected. "
             "Set VC_DASHBOARD_TOKEN or pass dashboard_token to secure them."
         )
+
+    # ------------------------------------------------------------------
+    # CORS middleware for virtual-context.com
+    # ------------------------------------------------------------------
+    _allowed_origins = {
+        "https://virtual-context.com",
+        "https://www.virtual-context.com",
+    }
+
+    @app.middleware("http")
+    async def _cors_middleware(request: Request, call_next):
+        origin = request.headers.get("origin", "")
+        if origin not in _allowed_origins:
+            # Non-allowed origin — no CORS headers at all
+            return await call_next(request)
+
+        # Preflight (OPTIONS)
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, X-VC-Dashboard-Token, Content-Type",
+                    "Access-Control-Max-Age": "3600",
+                },
+            )
+
+        # Normal request — forward then stamp CORS headers on the response
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Authorization, X-VC-Dashboard-Token, Content-Type"
+        )
+        return response
 
     @app.get("/dashboard")
     async def dashboard_page():
