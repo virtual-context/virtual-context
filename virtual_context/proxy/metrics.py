@@ -14,25 +14,54 @@ class ProxyMetrics:
 
     Thread-safe: ``record()`` can be called from the background
     ThreadPoolExecutor that runs ``on_turn_complete``.
+
+    Events are kept in a 24-hour rolling buffer capped at
+    :pyattr:`MAX_EVENTS`.  Older entries are evicted lazily --
+    every 100 ``record()`` calls and at the start of
+    ``events_since()`` / ``snapshot()``.
     """
 
     BASELINE_RATIO = 0.30  # typical summarization compression (3.3x)
+    MAX_EVENTS = 50_000
+    MAX_AGE_S = 86_400  # 24 hours
 
     def __init__(self, context_window: int = 120_000, telemetry_ledger=None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
-        self._events: deque[dict] = deque(maxlen=2000)
+        self._events: list[dict] = []
         self._buckets: dict[str, int] = {}
         self._lock = threading.Lock()
         self._seq = 0
         self._request_bodies: deque[dict] = deque(maxlen=50)
         self._telemetry_ledger = telemetry_ledger
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _evict_old(self) -> None:
+        """Remove events older than *MAX_AGE_S*.  Must hold ``_lock``."""
+        cutoff = time.time() - self.MAX_AGE_S
+        # Events are appended in chronological order -- scan from the
+        # front and find the first index that is still fresh.
+        idx = 0
+        while idx < len(self._events):
+            if self._events[idx].get("_recorded_at", 0) >= cutoff:
+                break
+            idx += 1
+        if idx:
+            del self._events[:idx]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def record(self, event: dict) -> None:
-        """Append an event (thread-safe). Adds ``_seq`` and ``ts``."""
+        """Append an event (thread-safe). Adds ``_seq``, ``ts``, and ``_recorded_at``."""
         with self._lock:
             event = dict(event)  # shallow copy to avoid caller mutation
             event["_seq"] = self._seq
+            event["_recorded_at"] = time.time()
             if "ts" not in event:
                 event["ts"] = datetime.now(timezone.utc).isoformat()
             self._seq += 1
@@ -40,14 +69,21 @@ class ProxyMetrics:
             event_type = event.get("type", "")
             if event_type:
                 self._buckets[event_type] = self._buckets.get(event_type, 0) + 1
+            # Periodic eviction + hard cap
+            if self._seq % 100 == 0:
+                self._evict_old()
+            if len(self._events) > self.MAX_EVENTS:
+                del self._events[:len(self._events) - self.MAX_EVENTS]
 
     def events_since(self, seq: int) -> list[dict]:
         with self._lock:
+            self._evict_old()
             return [e for e in self._events if e["_seq"] > seq]
 
     def snapshot(self) -> dict:
         """Aggregate stats for the initial SSE load."""
         with self._lock:
+            self._evict_old()
             requests = [e for e in self._events if e.get("type") == "request"]
             compactions = [e for e in self._events if e.get("type") == "compaction"]
             turn_completes = [e for e in self._events if e.get("type") == "turn_complete"]
