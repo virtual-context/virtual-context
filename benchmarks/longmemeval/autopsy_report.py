@@ -77,7 +77,13 @@ def _load_reader_payload(question_id: str, cache_dir: Path | None) -> dict[str, 
     if not cache_dir or not question_id:
         return None
 
-    payload_path = cache_dir / question_id / "payload_log.json"
+    q_dir = cache_dir / question_id
+    # Find newest timestamped payload log, fall back to legacy name
+    candidates = sorted(q_dir.glob("payload_log_*.json"))
+    if candidates:
+        payload_path = candidates[-1]
+    else:
+        payload_path = q_dir / "payload_log.json"
     if not payload_path.exists():
         return None
 
@@ -218,6 +224,15 @@ def _load_reader_payload(question_id: str, cache_dir: Path | None) -> dict[str, 
     }
 
 
+def _find_latest(directory: Path, prefix: str) -> Path | None:
+    """Find the newest timestamped file matching prefix_*.json, or fall back to prefix.json."""
+    candidates = sorted(directory.glob(f"{prefix}_*.json"))
+    if candidates:
+        return candidates[-1]
+    legacy = directory / f"{prefix}.json"
+    return legacy if legacy.exists() else None
+
+
 def build_autopsy_data(results_data: dict[str, Any], cache_dir: Path | None = None) -> dict[str, Any]:
     questions = results_data.get("questions", [])
 
@@ -255,14 +270,21 @@ def build_autopsy_data(results_data: dict[str, Any], cache_dir: Path | None = No
         tool_calls = vc.get("tool_calls", []) if isinstance(vc.get("tool_calls"), list) else []
         tool_loop = [_summarize_tool_call(c, i + 1) for i, c in enumerate(tool_calls) if isinstance(c, dict)]
 
+        # Chain analytics
+        from .chain_analysis import analyze_tool_chain
+        chain_analysis = analyze_tool_chain(tool_calls)
+
         # Load the full reader payload from the cache
         qid = q.get("question_id", "")
         reader_payload = _load_reader_payload(qid, cache_dir)
 
-        # Resolve payload log paths using the actual cache dir
+        # Resolve payload log paths — find latest timestamped files
         base_cache = cache_dir or Path("benchmarks/longmemeval/cache")
-        vc_payload_log_path = str(base_cache / qid / "payload_log.json")
-        baseline_payload_log_path = str(base_cache / qid / "baseline_payload_log.json")
+        q_dir = base_cache / qid
+        vc_log = _find_latest(q_dir, "payload_log") if q_dir.exists() else None
+        bl_log = _find_latest(q_dir, "baseline_payload_log") if q_dir.exists() else None
+        vc_payload_log_path = str(vc_log) if vc_log else str(q_dir / "payload_log.json")
+        baseline_payload_log_path = str(bl_log) if bl_log else str(q_dir / "baseline_payload_log.json")
 
         question_reports.append(
             {
@@ -316,6 +338,7 @@ def build_autopsy_data(results_data: dict[str, Any], cache_dir: Path | None = No
                         "continuations": vc.get("continuation_count"),
                         "stop_reason": vc.get("stop_reason"),
                         "calls": tool_loop,
+                        "chain_analysis": chain_analysis,
                     },
                     "error": vc.get("error"),
                 },
@@ -452,6 +475,20 @@ def render_autopsy_markdown(autopsy: dict[str, Any]) -> str:
             lines.append(f"- Usefulness reason: {c.get('usefulness_reason', '')}")
             lines.append(f"- Returned JSON: `{json.dumps(c.get('returned_json'), ensure_ascii=True)}`")
         lines.append("")
+
+        chain = tool_loop.get("chain_analysis", {})
+        if chain and chain.get("total_calls", 0) > 0:
+            lines.append("### Chain Analysis")
+            lines.append(f"- Pattern: {chain.get('chain_pattern', 'unknown')}")
+            utypes = chain.get("unique_tool_types", [])
+            lines.append(f"- Tool types: {', '.join(utypes)} ({chain.get('unique_tool_type_count', 0)} unique)")
+            lines.append(f"- Useful/wasted: {chain.get('useful_calls', 0)}/{chain.get('wasted_calls', 0)}")
+            lines.append(f"- Tokens freed: {chain.get('tokens_freed_total', 0):,} | Tokens added: {chain.get('tokens_added_total', 0):,}")
+            if chain.get("has_strategy_pivot"):
+                lines.append("- Strategy pivot: Yes")
+            if chain.get("has_collapse_then_expand"):
+                lines.append("- Collapse-then-expand: Yes")
+            lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 

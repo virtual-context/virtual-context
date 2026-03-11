@@ -129,6 +129,7 @@ class VirtualContextEngine:
         self._init_fact_curator()
         self._last_split_result: SplitResult | None = None
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
+        self.reference_date: date | None = None  # override "today" for remember_when relative presets
 
         # Cached state from last on_message_inbound call (used by reassemble_context)
         self._last_retrieval_result: RetrievalResult | None = None
@@ -1664,16 +1665,16 @@ class VirtualContextEngine:
             raise ValueError("time_range must be an object")
 
         kind = str(time_range.get("kind", "")).strip().lower()
-        today = datetime.now(timezone.utc).date()
+        today = self.reference_date or datetime.now(timezone.utc).date()
 
         if kind == "relative":
             preset = str(time_range.get("preset", "")).strip().lower()
             if preset == "last_24_hours":
-                return today - timedelta(days=1), today, preset
+                return today - timedelta(days=2), today, preset
             if preset == "last_7_days":
-                return today - timedelta(days=6), today, preset
+                return today - timedelta(days=7), today, preset
             if preset == "last_30_days":
-                return today - timedelta(days=29), today, preset
+                return today - timedelta(days=30), today, preset
             if preset == "this_week":
                 start = today - timedelta(days=today.weekday())
                 return start, start + timedelta(days=6), preset

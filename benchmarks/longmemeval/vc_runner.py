@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 from virtual_context.config import load_config
@@ -402,7 +403,12 @@ def _dump_payload_log(
         "http_conversation": http_conversation,
     }
 
-    out_path = cache_dir / "payload_log.json"
+    # Chain analytics
+    from .chain_analysis import analyze_tool_chain
+    payload["chain_analysis"] = analyze_tool_chain(tool_calls)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = cache_dir / f"payload_log_{ts}.json"
     try:
         out_path.write_text(json.dumps(payload, indent=2, default=str))
         logger.info("VC [%s]: payload log saved to %s (%d request/response pairs)",
@@ -633,6 +639,19 @@ def run_vc(
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
+
+    # Set reference date so remember_when relative presets resolve against
+    # the conversation timeline, not the actual current date.
+    if question.question_date:
+        try:
+            import re as _re
+            from datetime import date as _date
+            m = _re.match(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", question.question_date)
+            if m:
+                engine.reference_date = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                logger.info("VC [%s]: reference_date set to %s", question.question_id, engine.reference_date)
+        except ValueError:
+            pass
 
     # 2. Convert sessions to messages
     messages = _sessions_to_messages(question)
@@ -960,6 +979,21 @@ def run_vc(
         " (CACHED)" if cached else "",
     )
 
+    # Compact tool chain summary for quick analysis
+    tool_chain = []
+    for tc in tool_calls_log:
+        inp = tc.get("input", {})
+        if "query" in inp:
+            detail = inp["query"]
+        elif "tag" in inp:
+            detail = inp["tag"]
+            if inp.get("collapse_tags"):
+                detail += f" (collapse: {inp['collapse_tags']})"
+        else:
+            parts = [f"{k}={v}" for k, v in inp.items() if v]
+            detail = ", ".join(parts) if parts else ""
+        tool_chain.append(f"{tc['tool']}({detail})")
+
     return {
         "hypothesis": hypothesis,
         "input_tokens": reader_input,
@@ -977,6 +1011,7 @@ def run_vc(
         "turns_ingested": turns_ingested,
         "timings": timings,
         "cached": cached,
+        "tool_chain": tool_chain,
         "tool_calls": tool_calls_log,
         "continuation_count": loop_result.continuation_count,
         "stop_reason": loop_result.stop_reason,
@@ -1034,6 +1069,16 @@ def run_vc_ingest_only(
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
+
+    # Set reference date so remember_when relative presets resolve against
+    # the conversation timeline, not the actual current date.
+    if question.question_date:
+        try:
+            from datetime import date as _date
+            parts = question.question_date.replace("-", "/").split("/")
+            engine.reference_date = _date(int(parts[0]), int(parts[1]), int(parts[2]))
+        except (ValueError, IndexError):
+            pass
 
     messages = _sessions_to_messages(question)
 

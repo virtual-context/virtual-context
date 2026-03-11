@@ -3577,7 +3577,7 @@ class TestInjectVCTools:
         assert "tools" in result
         names = {t["name"] for t in result["tools"]}
         assert "vc_expand_topic" in names
-        assert "vc_collapse_topic" in names
+        assert "vc_collapse_topic" not in names
 
     def test_preserves_existing_tools(self):
         engine = MagicMock()
@@ -3590,7 +3590,7 @@ class TestInjectVCTools:
         names = [t["name"] for t in result["tools"]]
         assert names[0] == "web_search"
         assert "vc_expand_topic" in names
-        assert len(names) == 7  # web_search + 6 VC tools
+        assert len(names) == 6  # web_search + 5 VC tools
 
     def test_sets_required_policy_when_requested(self):
         engine = MagicMock()
@@ -4451,7 +4451,7 @@ class TestStreamInterception:
         tools = captured_body.get("tools", [])
         tool_names = {t["name"] for t in tools}
         assert "vc_expand_topic" in tool_names
-        assert "vc_collapse_topic" in tool_names
+        assert "vc_collapse_topic" not in tool_names
 
 
 # ---------------------------------------------------------------------------
