@@ -949,8 +949,8 @@ python -m pytest tests/ollama/ -v -m ollama          # integration (requires Oll
 100 random questions from [LongMemEval-500](https://github.com/xiaowu0162/LongMemEval) (5 batches x 20, seeds 42/99/777/1234/2025).
 
 **Configuration:**
-- **VC:** MiMo-V2-Flash (ingestion) + Gemini 3 Pro Preview (reader/judge)
-- **Baseline:** Claude Sonnet 3.5 with full conversation history (~118K tokens) + Gemini 3 Pro Preview (judge)
+- **VC:** MiMo-V2-Flash (ingestion) + Claude Sonnet 4.5 (reader) + Gemini 3 Pro Preview (judge)
+- **Baseline:** Claude Sonnet 4.5 with full conversation history (~118K tokens) + Gemini 3 Pro Preview (judge)
 
 | Metric | VC | Baseline |
 |--------|-----|----------|
