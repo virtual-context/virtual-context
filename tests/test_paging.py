@@ -856,7 +856,7 @@ class TestContextHintModes:
         assert "budget=" in hint
         assert "available=" in hint
         assert "expand_topic" in hint
-        assert "collapse_topic" in hint
+        assert "collapse_tags" in hint
 
     def test_hint_empty_before_compaction(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
@@ -1038,15 +1038,17 @@ class TestMCPPagingTools:
         assert data["tokens_added"] == 5000
 
     @patch("virtual_context.mcp.server._get_engine")
-    def test_collapse_topic_tool(self, mock_get_engine):
+    def test_expand_with_collapse_tags(self, mock_get_engine):
         mock_get_engine.return_value = self._mock_engine()
 
-        from virtual_context.mcp.server import collapse_topic
-        result = collapse_topic("database", "summary")
+        from virtual_context.mcp.server import expand_topic
+        result = expand_topic("database", "full", collapse_tags=["other-topic"])
         data = json.loads(result)
         assert data["tag"] == "database"
-        assert data["depth"] == "summary"
-        assert data["tokens_freed"] == 4500
+        assert data["depth"] == "full"
+        assert data["tokens_added"] == 5000
+        assert "collapsed" in data
+        assert data["total_tokens_freed"] == 4500
 
     @patch("virtual_context.mcp.server._get_engine")
     def test_expand_calls_engine(self, mock_get_engine):
@@ -1058,13 +1060,14 @@ class TestMCPPagingTools:
         engine.expand_topic.assert_called_once_with("api", "segments")
 
     @patch("virtual_context.mcp.server._get_engine")
-    def test_collapse_calls_engine(self, mock_get_engine):
+    def test_expand_collapse_tags_calls_engine(self, mock_get_engine):
         engine = self._mock_engine()
         mock_get_engine.return_value = engine
 
-        from virtual_context.mcp.server import collapse_topic
-        collapse_topic("api", "none")
-        engine.collapse_topic.assert_called_once_with("api", "none")
+        from virtual_context.mcp.server import expand_topic
+        expand_topic("api", "segments", collapse_tags=["old-topic"])
+        engine.collapse_topic.assert_called_once_with(tag="old-topic", depth="summary")
+        engine.expand_topic.assert_called_once_with("api", "segments")
 
     @patch("virtual_context.mcp.server._get_engine")
     def test_domain_status_still_works(self, mock_get_engine):

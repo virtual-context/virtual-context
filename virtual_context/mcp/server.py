@@ -89,7 +89,9 @@ def compact_context(
 
 
 @mcp.tool()
-def expand_topic(tag: str, depth: str = "full") -> str:
+def expand_topic(
+    tag: str, depth: str = "full", collapse_tags: list[str] | None = None,
+) -> str:
     """Zoom into a topic you can already see in the context-topics list.
 
     Use when a topic summary mentions the area you need but lacks detail.
@@ -99,31 +101,29 @@ def expand_topic(tag: str, depth: str = "full") -> str:
     Args:
         tag: The topic tag to expand (from the context-topics list).
         depth: Target depth level: "segments" (individual summaries) or "full" (original text).
+        collapse_tags: Optional list of topic tags to collapse back to summary
+            depth before expanding. Frees context budget in the same call.
 
     Returns:
         JSON with expansion result including tokens added and any evicted topics.
     """
     engine = _get_engine()
+
+    # Collapse specified tags first to free budget
+    collapse_results = []
+    for ctag in collapse_tags or []:
+        cr = engine.collapse_topic(tag=ctag, depth="summary")
+        if cr.get("tokens_freed", 0) > 0:
+            collapse_results.append(cr)
+
     result = engine.expand_topic(tag, depth)
-    return json.dumps(result)
 
+    if collapse_results:
+        result["collapsed"] = collapse_results
+        result["total_tokens_freed"] = sum(
+            cr.get("tokens_freed", 0) for cr in collapse_results
+        )
 
-@mcp.tool()
-def collapse_topic(tag: str, depth: str = "summary") -> str:
-    """Collapse an expanded topic back to its summary to free context budget.
-
-    Use after you've retrieved what you need from an expanded topic,
-    or to make room before expanding a different one.
-
-    Args:
-        tag: The topic tag to collapse.
-        depth: Target depth: "summary" (brief overview) or "none" (remove from context entirely).
-
-    Returns:
-        JSON with collapse result including tokens freed.
-    """
-    engine = _get_engine()
-    result = engine.collapse_topic(tag, depth)
     return json.dumps(result)
 
 

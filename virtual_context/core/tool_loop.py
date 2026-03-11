@@ -41,7 +41,6 @@ VC_FIND_QUOTE_MAX_RESULTS = 20
 
 VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_expand_topic",
-    "vc_collapse_topic",
     "vc_find_quote",
     "vc_find_session",
     "vc_query_facts",
@@ -82,30 +81,14 @@ def vc_tool_definitions() -> list[dict]:
                             "'full' for original conversation text."
                         ),
                     },
-                },
-                "required": ["tag"],
-            },
-        },
-        {
-            "name": "vc_collapse_topic",
-            "description": (
-                "Collapse an expanded topic back to its summary to free context "
-                "budget. Use after you've retrieved what you need from an expanded "
-                "topic, or to make room before expanding a different one."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "tag": {
-                        "type": "string",
-                        "description": "Topic tag to collapse.",
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["summary", "none"],
+                    "collapse_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
                         "description": (
-                            "Target depth: 'summary' for brief overview, "
-                            "'none' to remove from context entirely."
+                            "Optional list of topic tags to collapse back to "
+                            "summary depth before expanding. Frees context "
+                            "budget in the same round-trip instead of requiring "
+                            "a separate tool call."
                         ),
                     },
                 },
@@ -241,7 +224,6 @@ _SUPPRESSION_MARKER = "[Older session ("
 # an unchanged system prompt on every continuation — saving significant tokens.
 _WORKING_SET_TOOLS: frozenset[str] = frozenset({
     "vc_expand_topic",
-    "vc_collapse_topic",
 })
 
 
@@ -610,15 +592,24 @@ def execute_vc_tool(
 
     try:
         if name == "vc_expand_topic":
+            # Collapse specified tags first to free budget
+            collapse_results = []
+            for ctag in tool_input.get("collapse_tags") or []:
+                cr = engine.collapse_topic(tag=ctag, depth="summary")
+                if cr.get("tokens_freed", 0) > 0:
+                    collapse_results.append(cr)
+
             result = engine.expand_topic(
                 tag=tool_input.get("tag", ""),
                 depth=tool_input.get("depth", "full"),
             )
-        elif name == "vc_collapse_topic":
-            result = engine.collapse_topic(
-                tag=tool_input.get("tag", ""),
-                depth=tool_input.get("depth", "summary"),
-            )
+
+            # Merge collapse info into expand result
+            if collapse_results:
+                result["collapsed"] = collapse_results
+                result["total_tokens_freed"] = sum(
+                    cr.get("tokens_freed", 0) for cr in collapse_results
+                )
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
             result = engine.find_quote(
@@ -886,8 +877,8 @@ def run_tool_loop(
     # Short reminder appended to each tool result so the model
     # doesn't lose sight of the original question during long loops.
     _question_reminder = (
-        f"\n\n[REMINDER] Question: {intent_context}\n"
-        "If you have enough information, stop calling tools and respond."
+        f"\n\n[REMINDER] If you have enough information to answer this "
+        f"user question: \"{intent_context}\" — stop calling tools and respond."
         if intent_context else ""
     )
 
@@ -973,6 +964,12 @@ def run_tool_loop(
                 if any(_SUPPRESSION_MARKER in r.result_json for r in recent_results):
                     adapter.add_tool_defs(cont_body, [_vc_find_session_def()])
                     _find_session_injected = True
+
+            # After the first round, downgrade tool_choice from "any" to
+            # "auto" so the model can answer with text when it has enough
+            # information instead of being forced to make another tool call.
+            if loop_i == 0:
+                adapter.relax_tool_choice(cont_body)
 
             result.continuation_count += 1
 
