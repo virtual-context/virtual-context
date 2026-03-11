@@ -28,16 +28,15 @@ from virtual_context.core.tool_loop import (
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_six_tools(self):
+    def test_returns_five_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 6
+        assert len(defs) == 5
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
         names = {d["name"] for d in defs}
         assert names == {
             "vc_expand_topic",
-            "vc_collapse_topic",
             "vc_find_quote",
             "vc_query_facts",
             "vc_recall_all",
@@ -58,11 +57,17 @@ class TestVCToolDefinitions:
         depth = expand["input_schema"]["properties"]["depth"]
         assert set(depth["enum"]) == {"segments", "full"}
 
-    def test_collapse_has_depth_enum(self):
+    def test_collapse_topic_not_in_definitions(self):
         defs = vc_tool_definitions()
-        collapse = [d for d in defs if d["name"] == "vc_collapse_topic"][0]
-        depth = collapse["input_schema"]["properties"]["depth"]
-        assert set(depth["enum"]) == {"summary", "none"}
+        names = {d["name"] for d in defs}
+        assert "vc_collapse_topic" not in names
+
+    def test_expand_has_collapse_tags_property(self):
+        defs = vc_tool_definitions()
+        expand = [d for d in defs if d["name"] == "vc_expand_topic"][0]
+        props = expand["input_schema"]["properties"]
+        assert "collapse_tags" in props
+        assert props["collapse_tags"]["type"] == "array"
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +80,8 @@ class TestIsVCTool:
     def test_recognizes_expand(self):
         assert is_vc_tool("vc_expand_topic") is True
 
-    def test_recognizes_collapse(self):
-        assert is_vc_tool("vc_collapse_topic") is True
+    def test_rejects_collapse(self):
+        assert is_vc_tool("vc_collapse_topic") is False
 
     def test_recognizes_find_quote(self):
         assert is_vc_tool("vc_find_quote") is True
@@ -107,13 +112,66 @@ class TestExecuteVCTool:
         assert parsed["tag"] == "db"
         assert parsed["tokens_added"] == 500
 
-    def test_collapse_calls_engine(self):
+    def test_expand_with_collapse_tags(self):
         engine = MagicMock()
         engine.collapse_topic.return_value = {"tag": "api", "depth": "summary", "tokens_freed": 300}
-        result = execute_vc_tool(engine, "vc_collapse_topic", {"tag": "api"})
+        engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
+        result = execute_vc_tool(
+            engine, "vc_expand_topic",
+            {"tag": "db", "depth": "full", "collapse_tags": ["api"]},
+        )
         engine.collapse_topic.assert_called_once_with(tag="api", depth="summary")
+        engine.expand_topic.assert_called_once_with(tag="db", depth="full")
         parsed = json.loads(result)
-        assert parsed["tokens_freed"] == 300
+        assert parsed["tokens_added"] == 500
+        assert parsed["collapsed"] == [{"tag": "api", "depth": "summary", "tokens_freed": 300}]
+        assert parsed["total_tokens_freed"] == 300
+
+    def test_expand_with_multiple_collapse_tags(self):
+        engine = MagicMock()
+        engine.collapse_topic.side_effect = [
+            {"tag": "a", "depth": "summary", "tokens_freed": 200},
+            {"tag": "b", "depth": "summary", "tokens_freed": 150},
+        ]
+        engine.expand_topic.return_value = {"tag": "c", "depth": "full", "tokens_added": 300}
+        result = execute_vc_tool(
+            engine, "vc_expand_topic",
+            {"tag": "c", "collapse_tags": ["a", "b"]},
+        )
+        assert engine.collapse_topic.call_count == 2
+        parsed = json.loads(result)
+        assert len(parsed["collapsed"]) == 2
+        assert parsed["total_tokens_freed"] == 350
+
+    def test_expand_with_empty_collapse_tags(self):
+        engine = MagicMock()
+        engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
+        result = execute_vc_tool(
+            engine, "vc_expand_topic",
+            {"tag": "db", "collapse_tags": []},
+        )
+        engine.collapse_topic.assert_not_called()
+        parsed = json.loads(result)
+        assert "collapsed" not in parsed
+
+    def test_expand_without_collapse_tags_backward_compatible(self):
+        engine = MagicMock()
+        engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
+        result = execute_vc_tool(engine, "vc_expand_topic", {"tag": "db"})
+        engine.collapse_topic.assert_not_called()
+        parsed = json.loads(result)
+        assert "collapsed" not in parsed
+
+    def test_expand_collapse_tags_skips_zero_freed(self):
+        engine = MagicMock()
+        engine.collapse_topic.return_value = {"tag": "x", "depth": "summary", "tokens_freed": 0}
+        engine.expand_topic.return_value = {"tag": "y", "depth": "full", "tokens_added": 100}
+        result = execute_vc_tool(
+            engine, "vc_expand_topic",
+            {"tag": "y", "collapse_tags": ["x"]},
+        )
+        parsed = json.loads(result)
+        assert "collapsed" not in parsed
 
     def test_find_quote_calls_engine(self):
         engine = MagicMock()
@@ -209,11 +267,23 @@ class TestExecuteVCTool:
         execute_vc_tool(engine, "vc_expand_topic", {"tag": "t"})
         engine.expand_topic.assert_called_once_with(tag="t", depth="full")
 
-    def test_collapse_default_depth(self):
+    def test_collapse_tags_called_before_expand(self):
+        """Collapse must happen before expand so freed budget is available."""
+        call_order = []
         engine = MagicMock()
-        engine.collapse_topic.return_value = {}
-        execute_vc_tool(engine, "vc_collapse_topic", {"tag": "t"})
-        engine.collapse_topic.assert_called_once_with(tag="t", depth="summary")
+        engine.collapse_topic.side_effect = lambda **kw: (
+            call_order.append("collapse"),
+            {"tag": kw["tag"], "depth": "summary", "tokens_freed": 100},
+        )[1]
+        engine.expand_topic.side_effect = lambda **kw: (
+            call_order.append("expand"),
+            {"tag": kw["tag"], "depth": "full", "tokens_added": 100},
+        )[1]
+        execute_vc_tool(
+            engine, "vc_expand_topic",
+            {"tag": "new", "collapse_tags": ["old"]},
+        )
+        assert call_order == ["collapse", "expand"]
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1210,6 @@ class TestVCToolNames:
     def test_contains_all_tools(self):
         assert VC_TOOL_NAMES == {
             "vc_expand_topic",
-            "vc_collapse_topic",
             "vc_find_quote",
             "vc_find_session",
             "vc_query_facts",

@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -274,7 +275,8 @@ def _dump_baseline_payload(
         cache_dir = Path(__file__).parent / "cache"
     out_dir = cache_dir / question_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "baseline_payload_log.json"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"baseline_payload_log_{ts}.json"
 
     payload = {
         "question_id": question_id,

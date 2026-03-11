@@ -107,6 +107,13 @@ class ProviderAdapter(ABC):
     def strip_tools(self, body: dict) -> None:
         """Remove tool definitions from a request body (in-place)."""
 
+    def relax_tool_choice(self, body: dict) -> None:
+        """Downgrade tool_choice from 'any'/'required' to 'auto' (in-place).
+
+        Called after the first tool-loop round so the model can choose to
+        answer with text instead of being forced to make another tool call.
+        """
+
     def compress_previous_results(
         self, body: dict, current_tool_call_ids: set[str],
     ) -> None:
@@ -293,6 +300,10 @@ class AnthropicAdapter(ProviderAdapter):
     def strip_tools(self, body):
         body.pop("tools", None)
         body.pop("tool_choice", None)
+
+    def relax_tool_choice(self, body: dict) -> None:
+        if "tool_choice" in body:
+            body["tool_choice"] = {"type": "auto"}
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +499,10 @@ class OpenAIAdapter(ProviderAdapter):
     def strip_tools(self, body):
         body.pop("tools", None)
         body.pop("tool_choice", None)
+
+    def relax_tool_choice(self, body: dict) -> None:
+        if "tool_choice" in body:
+            body["tool_choice"] = "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +704,10 @@ class OpenAICodexAdapter(ProviderAdapter):
     def strip_tools(self, body):
         body.pop("tools", None)
         body.pop("tool_choice", None)
+
+    def relax_tool_choice(self, body: dict) -> None:
+        if "tool_choice" in body:
+            body["tool_choice"] = "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +917,12 @@ class GeminiAdapter(ProviderAdapter):
     def strip_tools(self, body):
         body.pop("tools", None)
         body.pop("tool_config", None)
+
+    def relax_tool_choice(self, body: dict) -> None:
+        if "tool_config" in body:
+            body["tool_config"] = {
+                "function_calling_config": {"mode": "AUTO"}
+            }
 
     def add_tool_defs(self, body, anthropic_defs):
         declarations = []

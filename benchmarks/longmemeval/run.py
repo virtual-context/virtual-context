@@ -178,13 +178,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--categories", nargs="+", help="Question categories to include")
     parser.add_argument("--context-window", type=int, default=65536, help="VC context window (default: 65536)")
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: auto-generated)")
-    parser.add_argument("--baseline-model", type=str, default="claude-sonnet-4-5-20250929", help="Baseline reader model")
+    parser.add_argument("--baseline-model", type=str, default=None, help="Baseline reader model (REQUIRED if running baseline)")
     parser.add_argument(
         "--baseline-provider",
         type=str,
-        default="anthropic",
+        default=None,
         choices=["anthropic", "openai", "openai-codex", "gemini", "gemini-cli", "gemini-oauth"],
-        help="Provider for baseline run (default: anthropic)",
+        help="Provider for baseline run (REQUIRED if running baseline)",
     )
     parser.add_argument(
         "--baseline-auth-mode",
@@ -193,14 +193,14 @@ def main(argv: list[str] | None = None) -> None:
         choices=["auto", "api-key", "oauth"],
         help="Auth mode for baseline provider (OAuth mode applies to OpenAI).",
     )
-    parser.add_argument("--reader-model", type=str, default="claude-sonnet-4-5-20250929", help="VC reader model")
-    parser.add_argument("--judge-model", type=str, default="claude-haiku-4-5-20251001", help="Judge model")
+    parser.add_argument("--reader-model", type=str, default=None, help="VC reader model (REQUIRED if running VC)")
+    parser.add_argument("--judge-model", type=str, default=None, help="Judge model (REQUIRED)")
     parser.add_argument(
         "--judge-provider",
         type=str,
-        default="anthropic",
+        default=None,
         choices=["anthropic", "openai", "openai-codex", "gemini", "gemini-cli", "gemini-oauth"],
-        help="Provider for judge model (default: anthropic)",
+        help="Provider for judge model (REQUIRED)",
     )
     parser.add_argument(
         "--judge-auth-mode",
@@ -242,15 +242,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--tagger-provider",
         type=str,
-        default="anthropic",
+        default=None,
         choices=["anthropic", "openai", "ollama_native", "openrouter"],
-        help="Provider for ingestion tag generation (default: anthropic)",
+        help="Provider for ingestion tag generation (REQUIRED if running VC)",
     )
     parser.add_argument(
         "--tagger-model",
         type=str,
-        default="claude-haiku-4-5-20251001",
-        help="Model for ingestion tag generation (default: claude-haiku-4-5-20251001)",
+        default=None,
+        help="Model for ingestion tag generation (REQUIRED if running VC)",
     )
     parser.add_argument(
         "--summarizer-provider",
@@ -259,9 +259,9 @@ def main(argv: list[str] | None = None) -> None:
         choices=["anthropic", "openai", "ollama_native", "openrouter"],
         help="Provider for compaction summarization (default: same as tagger-provider)",
     )
-    parser.add_argument("--reader-provider", type=str, default="anthropic",
+    parser.add_argument("--reader-provider", type=str, default=None,
                         choices=["anthropic", "openai", "openai-codex", "gemini"],
-                        help="LLM provider for reader model (default: anthropic)")
+                        help="LLM provider for reader model (REQUIRED if running VC)")
     parser.add_argument(
         "--reader-auth-mode",
         type=str,
@@ -363,6 +363,25 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--judge-votes must be odd when --judge-vote-mode=majority")
     if args.vc_on_baseline_wrong_only and args.skip_baseline:
         parser.error("--vc-on-baseline-wrong-only cannot be used with --skip-baseline")
+
+    # Validate required model/provider args — NO silent defaults allowed.
+    # Check MEMORY.md for model assignment rules before running.
+    _NO_DEFAULT_MSG = (
+        " No defaults — you must specify explicitly."
+        " Check MEMORY.md for model assignment rules before running."
+    )
+    if not args.skip_baseline and not args.openai_codex and not args.openai_all_oauth:
+        if not args.baseline_model or not args.baseline_provider:
+            parser.error("--baseline-model and --baseline-provider are required." + _NO_DEFAULT_MSG)
+    if not args.skip_vc and not args.openai_codex and not args.openai_all_oauth:
+        if not args.reader_model or not args.reader_provider:
+            parser.error("--reader-model and --reader-provider are required." + _NO_DEFAULT_MSG)
+        if not args.tagger_provider or not args.tagger_model:
+            parser.error("--tagger-provider and --tagger-model are required." + _NO_DEFAULT_MSG)
+    if not args.judge_model or not args.judge_provider:
+        if not args.openai_codex and not args.openai_all_oauth:
+            parser.error("--judge-model and --judge-provider are required." + _NO_DEFAULT_MSG)
+
     _load_dotenv_if_present()
     if args.openai_codex:
         args.baseline_provider = "openai-codex"
