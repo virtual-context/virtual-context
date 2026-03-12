@@ -231,6 +231,10 @@ class AnthropicAdapter(ProviderAdapter):
                 body["tools"] = original_body["tools"]
             if "tool_choice" in original_body:
                 body["tool_choice"] = original_body["tool_choice"]
+            if "thinking" in original_body:
+                body["thinking"] = original_body["thinking"]
+            if "temperature" in original_body:
+                body["temperature"] = original_body["temperature"]
             body["messages"].append({"role": "assistant", "content": content})
             body["messages"].append({"role": "user", "content": tool_results})
             return body
@@ -334,13 +338,20 @@ class OpenAIAdapter(ProviderAdapter):
             oai_messages.append({"role": "system", "content": system})
         oai_messages.extend(messages)
 
+        # GPT-5 only supports temperature=1; drop it for those models
+        # so the API uses its default.  Request reasoning summaries so
+        # we can inspect the model's internal reasoning in payload logs.
+        is_gpt5 = "gpt-5" in model
         body: dict = {
             "model": model,
             "max_completion_tokens": max_tokens,
-            "temperature": temperature,
             "stream": False,
             "messages": oai_messages,
         }
+        if not is_gpt5:
+            body["temperature"] = temperature
+        # NOTE: reasoning summaries require the Responses API, not Chat
+        # Completions.  Use provider="openai-responses" for that.
         if tools:
             body["tools"] = tools
             # Require at least one tool call when tools are provided.
@@ -711,6 +722,43 @@ class OpenAICodexAdapter(ProviderAdapter):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Responses API Adapter (public API with reasoning summaries)
+# ---------------------------------------------------------------------------
+
+class OpenAIResponsesAdapter(OpenAICodexAdapter):
+    """Adapter for the public OpenAI Responses API with reasoning summaries.
+
+    Reuses the Codex adapter's Responses API format but targets the public
+    ``api.openai.com`` endpoint and requests reasoning summaries so we can
+    inspect the model's internal reasoning in payload logs.
+    """
+
+    def __init__(self, api_key: str, api_url: str = ""):
+        super().__init__(
+            api_key, api_url or "https://api.openai.com/v1/responses",
+        )
+
+    def build_request_body(self, *, model, messages, system, max_tokens,
+                           temperature, tools):
+        body = super().build_request_body(
+            model=model, messages=messages, system=system,
+            max_tokens=max_tokens, temperature=temperature, tools=tools,
+        )
+        body["reasoning"] = {"summary": "auto"}
+        body["stream"] = False
+        body.pop("store", None)
+        return body
+
+    def build_continuation(self, cont_body, original_body, raw_response,
+                           tool_results):
+        body = super().build_continuation(
+            cont_body, original_body, raw_response, tool_results,
+        )
+        body["stream"] = False
+        return body
+
+
+# ---------------------------------------------------------------------------
 # Gemini Adapter
 # ---------------------------------------------------------------------------
 
@@ -961,14 +1009,16 @@ def get_adapter(
     """
     if provider == "anthropic":
         return AnthropicAdapter(api_key, api_url)
-    elif provider == "openai":
+    elif provider in {"openai", "openrouter"}:
         return OpenAIAdapter(api_key, api_url)
     elif provider in {"openai-codex", "openai_codex"}:
         return OpenAICodexAdapter(api_key, api_url)
+    elif provider in {"openai-responses", "openai_responses"}:
+        return OpenAIResponsesAdapter(api_key, api_url)
     elif provider == "gemini":
         return GeminiAdapter(api_key, api_url)
     else:
         raise ValueError(
             f"Unknown provider: {provider!r}. "
-            "Use 'anthropic', 'openai', 'openai-codex', or 'gemini'."
+            "Use 'anthropic', 'openai', 'openai-responses', 'openai-codex', or 'gemini'."
         )
