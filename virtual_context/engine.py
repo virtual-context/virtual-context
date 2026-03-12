@@ -2008,6 +2008,7 @@ class VirtualContextEngine:
         require_tools: bool | None = None,
         max_loops: int | None = None,
         provider: str = "anthropic",
+        extended_thinking: bool = False,
     ) -> "ToolLoopResult":
         """Send a query to an LLM with VC tool support.
 
@@ -2098,7 +2099,7 @@ class VirtualContextEngine:
                     body["tool_choice"] = {"type": "any"}
                 else:
                     body.pop("tool_choice", None)
-            elif provider in {"openai", "openai-codex", "openai_codex"}:
+            elif provider in {"openai", "openrouter", "openai-codex", "openai_codex"}:
                 if require_tools:
                     body["tool_choice"] = "required"
                 else:
@@ -2111,8 +2112,21 @@ class VirtualContextEngine:
                 else:
                     body.pop("tool_config", None)
 
+        # Extended thinking: inject thinking params for Anthropic
+        if extended_thinking and provider == "anthropic":
+            body["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+            body["temperature"] = 1
+            # max_tokens must exceed thinking budget
+            if body.get("max_tokens", 0) <= 10000:
+                body["max_tokens"] = 16000
+            # tool_choice "any" is incompatible with thinking
+            if body.get("tool_choice", {}).get("type") == "any":
+                body["tool_choice"] = {"type": "auto"}
+
         url = adapter.get_url(model)
         headers = adapter.get_headers()
+        if extended_thinking and provider == "anthropic":
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
         with httpx.Client(timeout=300.0) as client:
             resp = client.post(url, headers=headers, json=body)
@@ -2143,9 +2157,14 @@ class VirtualContextEngine:
                 if max_loops is not None
                 else self.config.paging.max_tool_loops
             )
+            # Pass extra headers (e.g. anthropic-beta for extended thinking)
+            _extra_hdrs = {}
+            if extended_thinking and provider == "anthropic":
+                _extra_hdrs["anthropic-beta"] = "interleaved-thinking-2025-05-14"
             loop_result = run_tool_loop(
                 self, data, body, adapter,
                 url=url, max_loops=effective_loops,
+                extra_headers=_extra_hdrs or None,
             )
             # Prepend the initial request to raw_requests
             loop_result.raw_requests.insert(0, body)

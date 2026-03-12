@@ -793,6 +793,7 @@ def run_tool_loop(
     *,
     url: str = "",
     max_loops: int = _DEFAULT_MAX_LOOPS,
+    extra_headers: dict | None = None,
 ) -> ToolLoopResult:
     """Run a synchronous non-streaming tool loop.
 
@@ -869,6 +870,8 @@ def run_tool_loop(
         return result
 
     headers = adapter.get_headers()
+    if extra_headers:
+        headers.update(extra_headers)
     cont_body: dict | None = None
     current_response = initial_response
     intent_context = _extract_last_user_text(original_request)

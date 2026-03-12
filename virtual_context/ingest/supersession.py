@@ -99,8 +99,14 @@ class FactSupersessionChecker:
             return 0
 
         superseded_count = 0
-        for fact in new_facts:
+        superseded_this_run: set[str] = set()
+        total = len(new_facts)
+        for idx, fact in enumerate(new_facts, 1):
+            if fact.id in superseded_this_run:
+                logger.info("  Supersession %d/%d: skipped (already superseded this run)", idx, total)
+                continue
             if not fact.subject:
+                logger.info("  Supersession %d/%d: skipped (no subject)", idx, total)
                 continue
             # Query existing non-superseded facts with same subject.
             # When tags are available, filter by them to avoid sending
@@ -112,7 +118,9 @@ class FactSupersessionChecker:
                 limit=self.config.batch_size,
             )
             # Object-similarity candidates — catches cross-session duplicates
-            # whose tags don't overlap with the new fact's tags
+            # whose tags don't overlap with the new fact's tags.
+            # Use case-sensitive keyword to avoid false matches
+            # (e.g. "Apple" the brand vs "apple" the fruit).
             keyword = _extract_object_keyword(fact.object)
             if keyword and fact.tags:  # only when tag-scoped: unfiltered query already covers all subjects
                 obj_candidates = self.store.query_facts(
@@ -120,19 +128,30 @@ class FactSupersessionChecker:
                     object_contains=keyword,
                     limit=self.config.batch_size,
                 )
+                # Filter to case-sensitive whole-word matches to avoid
+                # false positives from substring/case-insensitive SQL LIKE
+                kw_pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
                 seen_ids = {c.id for c in candidates}
                 for c in obj_candidates:
-                    if c.id not in seen_ids:
+                    if c.id not in seen_ids and kw_pattern.search(c.object):
                         candidates.append(c)
                         seen_ids.add(c.id)
-            candidates = [c for c in candidates if c.id != fact.id]
+            candidates = [c for c in candidates if c.id != fact.id and c.id not in superseded_this_run]
             if not candidates:
+                logger.info("  Supersession %d/%d: no candidates for %s", idx, total, fact.subject[:40])
                 continue
 
             superseded_ids = self._check_batch(fact, candidates)
-            for old_id in superseded_ids:
-                self.store.set_fact_superseded(old_id, fact.id)
-                superseded_count += 1
+            if superseded_ids:
+                for old_id in superseded_ids:
+                    self.store.set_fact_superseded(old_id, fact.id)
+                    superseded_this_run.add(old_id)
+                    superseded_count += 1
+                logger.info("  Supersession %d/%d: %d superseded (total %d) — %s",
+                            idx, total, len(superseded_ids), superseded_count, fact.subject[:40])
+            else:
+                logger.info("  Supersession %d/%d: 0 superseded — %s [%d candidates]",
+                            idx, total, fact.subject[:40], len(candidates))
                 # NOTE: We intentionally skip _merge_facts() here.
                 # Merging rewrites the winning fact's verb/object/status/what
                 # via an LLM call, which can destroy precise extraction results
@@ -163,6 +182,7 @@ class FactSupersessionChecker:
 
     def _check_batch(self, new_fact: Fact, candidates: list[Fact]) -> list[str]:
         prompt = self._build_prompt(new_fact, candidates)
+        logger.debug("  _check_batch: %d candidates, prompt %d chars", len(candidates), len(prompt))
         try:
             t0 = time.time()
             response, _usage = self.llm.complete(
@@ -171,9 +191,10 @@ class FactSupersessionChecker:
                 max_tokens=200,
             )
             duration_ms = (time.time() - t0) * 1000
+            logger.debug("  _check_batch: LLM call %.1fms, response=%r", duration_ms, response[:100] if response else None)
             self._log_usage("check_batch", duration_ms=duration_ms)
         except Exception as e:
-            logger.warning("Supersession LLM call failed: %s", e)
+            logger.warning("Supersession LLM call failed (%.1fs): %s", time.time() - t0, e)
             return []
         return self._parse_response(response, candidates)
 
@@ -212,6 +233,11 @@ class FactSupersessionChecker:
             "NEVER mark an existing fact as superseded if it is MORE specific than the new fact. "
             "A fact with concrete details (locations, items, methods) must survive over a "
             "vague fact about the same topic. "
+            "CRITICAL: Sharing a keyword does NOT make two facts about the same attribute. "
+            "An EVENT (something the user did) is a different attribute from a STATE "
+            "(something the user has or prefers). Events and states that merely mention "
+            "the same object are independent facts — neither supersedes the other. "
+            "Only supersede when facts describe the SAME attribute with an updated value. "
             "Reply with a JSON array of indices, e.g. [0, 2]. "
             "Reply [] if none are superseded or duplicated."
         )

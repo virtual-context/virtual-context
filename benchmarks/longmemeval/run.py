@@ -260,7 +260,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Provider for compaction summarization (default: same as tagger-provider)",
     )
     parser.add_argument("--reader-provider", type=str, default=None,
-                        choices=["anthropic", "openai", "openai-codex", "gemini"],
+                        choices=["anthropic", "openai", "openai-responses", "openai-codex", "openrouter", "gemini"],
                         help="LLM provider for reader model (REQUIRED if running VC)")
     parser.add_argument(
         "--reader-auth-mode",
@@ -354,6 +354,12 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         default=False,
         help="Run fact supersession pass after compaction (deduplicates facts)",
+    )
+    parser.add_argument(
+        "--verbose-reasoning",
+        action="store_true",
+        default=False,
+        help="Ask the reader to explain its reasoning before each tool call",
     )
 
     args = parser.parse_args(argv)
@@ -576,6 +582,7 @@ def main(argv: list[str] | None = None) -> None:
                     provider=args.baseline_provider,
                     auth_mode=args.baseline_auth_mode,
                     cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+                    verbose_reasoning=args.verbose_reasoning,
                 )
                 baseline_result["elapsed_s"] = round(time.time() - t0, 1)
                 print(f"  Baseline: \"{baseline_result['hypothesis'][:100]}...\"  (${baseline_result['cost']:.4f})")
@@ -663,6 +670,7 @@ def main(argv: list[str] | None = None) -> None:
                     curation_provider=args.curation_provider,
                     curation_model=args.curation_model,
                     supersession=args.supersession,
+                    verbose_reasoning=args.verbose_reasoning,
                 )
                 vc_result["elapsed_s"] = round(time.time() - t0, 1)
                 print(f"  VC: \"{vc_result['hypothesis'][:100]}...\"  (${vc_result['cost']:.4f})")
