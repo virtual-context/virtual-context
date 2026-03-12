@@ -624,15 +624,22 @@ def create_app(
         turns_dropped = 0
         _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
         if _real_tags and state:
-            recent = state.engine.config.assembler.recent_turns_always_included
+            # Use protected_recent_turns (compaction protection) for the
+            # drop filter — NOT recent_turns_always_included (assembly).
+            # The drop filter removes raw history from the client payload;
+            # it should respect the same protection window as compaction.
+            recent = state.engine.config.monitor.protected_recent_turns
             # PROXY-023: when paging is active, drop compacted turns so the
             # LLM relies on VC summaries + vc_expand_topic for old content.
+            # NOTE: compacted_through is a lifetime segment index, not a
+            # body-local pair index.  The stub filter already handles
+            # replacement of compacted turns via hash matching.  Passing
+            # the raw watermark to filter_body_messages would over-drop
+            # because pair_idx (0..N) != turn_number, especially in proxy
+            # mode where the client may have done its own compaction.
+            # Disabled: the stub filter is the correct mechanism for
+            # handling compacted turns in proxy mode.
             _ct = 0
-            if (
-                state.engine.config.paging.enabled
-                and state.engine._compacted_through > 0
-            ):
-                _ct = state.engine._compacted_through // 2
             body, turns_dropped = _filter_body_messages(
                 body,
                 state.engine._turn_tag_index,
