@@ -305,6 +305,7 @@ def run_baseline(
     api_key: str | None = None,
     auth_mode: str = "auto",
     cache_dir: Path | None = None,
+    verbose_reasoning: bool = False,
 ) -> dict:
     """Run full-context baseline for a single question.
 
@@ -386,18 +387,26 @@ def run_baseline(
             "temperature": 0.0,
             "messages": [{"role": "user", "content": formatted}],
         }
+        if verbose_reasoning:
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+            payload["temperature"] = 1
+            payload["max_tokens"] = 16000
         url = API_URL
     elif provider == "openai":
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        # Reasoning models (gpt-5*, o3*, o4*) only support temperature=1
+        _is_reasoning = model.startswith(("gpt-5", "o3", "o4"))
         payload = {
             "model": model,
             "max_completion_tokens": 1024,
-            "temperature": 0.0,
             "messages": [{"role": "user", "content": formatted}],
         }
+        if not _is_reasoning:
+            payload["temperature"] = 0.0
         url = "https://api.openai.com/v1/chat/completions"
     elif provider in {"openai-codex", "openai_codex"}:
         headers = {}
@@ -454,6 +463,12 @@ def run_baseline(
         usage = data.get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
+        # Save full response with thinking blocks for analysis
+        if verbose_reasoning:
+            _bl_payload_path = (cache_dir or Path("benchmarks/longmemeval/cache")) / question.question_id / f"baseline_payload_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            _bl_payload_path.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            _bl_payload_path.write_text(_json.dumps(data, indent=2))
     elif provider == "openai":
         choices = data.get("choices", [])
         hypothesis = choices[0].get("message", {}).get("content", "") if choices else ""

@@ -23,12 +23,15 @@ API_URLS = {
     "anthropic": "https://api.anthropic.com/v1/messages",
     "openai": "https://api.openai.com/v1/chat/completions",
     "openai-codex": "https://chatgpt.com/backend-api/codex/responses",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     # Gemini URL is model-dependent, handled by adapter
 }
 API_KEY_ENVS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "openai-codex": "OPENAI_API_KEY",
+    "openai-responses": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
     "gemini": "GEMINI_API_KEY",
 }
 DEFAULT_CACHE_DIR = Path(__file__).parent / "cache"
@@ -547,6 +550,7 @@ def run_vc(
     curation_provider: str | None = None,
     curation_model: str | None = None,
     supersession: bool = False,
+    verbose_reasoning: bool = False,
 ) -> dict:
     """Run the VC pipeline for a single question.
 
@@ -568,7 +572,7 @@ def run_vc(
     key_env = API_KEY_ENVS.get(reader_provider, "ANTHROPIC_API_KEY")
     if api_key:
         pass
-    elif reader_provider in {"openai", "openai-codex"}:
+    elif reader_provider in {"openai", "openai-codex", "openai-responses"}:
         api_key = _resolve_openai_bearer_token(reader_auth_mode)
     else:
         api_key = os.environ.get(key_env, "")
@@ -587,7 +591,7 @@ def run_vc(
     if needs_openai:
         internal_openai_token = _resolve_openai_bearer_token(internal_openai_auth_mode)
     if not api_key:
-        if reader_provider in {"openai", "openai-codex"}:
+        if reader_provider in {"openai", "openai-codex", "openai-responses"}:
             if reader_auth_mode == "oauth":
                 raise ValueError(
                     "OpenAI OAuth token not found. Set one of "
@@ -899,6 +903,7 @@ def run_vc(
         force_tools=True,
         require_tools=require_tools,
         provider=reader_provider,
+        extended_thinking=verbose_reasoning and reader_provider == "anthropic",
     )
 
     timings["query_s"] = round(time.time() - t0, 1)
