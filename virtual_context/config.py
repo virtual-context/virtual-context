@@ -13,6 +13,7 @@ from .types import (
     AssemblerConfig,
     CompactorConfig,
     TelemetryConfig,
+    FactsConfig,
     KeywordTagConfig,
     MonitorConfig,
     PagingConfig,
@@ -172,11 +173,30 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     backend = storage_raw.get("backend", "sqlite")
     fs_raw = storage_raw.get("filesystem", {})
     sqlite_raw = storage_raw.get("sqlite", {})
+    pg_raw = storage_raw.get("postgres", {})
+    neo4j_raw = storage_raw.get("neo4j", {})
+    fdb_raw = storage_raw.get("falkordb", {})
     storage_root = raw.get("storage_root", ".virtualcontext")
     storage_config = StorageConfig(
         backend=backend,
         root=fs_raw.get("root", storage_root + "/store"),
         sqlite_path=sqlite_raw.get("path", storage_root + "/store.db"),
+        postgres_dsn=pg_raw.get("dsn", ""),
+        neo4j_uri=neo4j_raw.get("uri", ""),
+        neo4j_user=neo4j_raw.get("user", "neo4j"),
+        neo4j_password=neo4j_raw.get("password", ""),
+        falkordb_host=fdb_raw.get("host", "localhost"),
+        falkordb_port=fdb_raw.get("port", 6379),
+        falkordb_password=fdb_raw.get("password", ""),
+    )
+
+    # Facts
+    facts_raw = raw.get("facts", {})
+    facts_config = FactsConfig(
+        graph_links=facts_raw.get("graph_links", False),
+        link_types=facts_raw.get("link_types", [
+            "supersedes", "caused_by", "part_of", "contradicts", "same_as", "related_to",
+        ]),
     )
 
     # Assembly
@@ -310,6 +330,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         paging=paging_config,
         proxy=proxy_config,
         tool_output=tool_output_config,
+        facts=facts_config,
         supersession=supersession_config,
         curation=curation_config,
         providers=raw.get("providers", {}),
@@ -377,9 +398,10 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             )
 
     # Storage backend
-    if config.storage.backend not in ("sqlite", "filesystem"):
+    _valid_backends = ("sqlite", "filesystem", "postgres", "neo4j", "falkordb")
+    if config.storage.backend not in _valid_backends:
         errors.append(
-            f"storage.backend must be 'sqlite' or 'filesystem', "
+            f"storage.backend must be one of {_valid_backends}, "
             f"got '{config.storage.backend}'"
         )
 
