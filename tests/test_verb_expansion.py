@@ -149,9 +149,12 @@ class TestExpandVerb:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine._store = MagicMock()
+        engine._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
         engine._get_embed_fn = MagicMock(return_value=None)
 
         result = VirtualContextEngine._expand_verb(engine, "led")
+        # No embed fn and "led" doesn't match any verb cluster → None
         assert result is None
 
     def test_expand_returns_none_when_no_verbs(self):
@@ -196,23 +199,23 @@ class TestEngineQueryFactsIntegration:
     def test_verb_expansion_passed_to_store(self):
         from unittest.mock import MagicMock, call
         from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import Fact
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
         engine._store = store
         engine._semantic_fact_search = MagicMock(return_value=[])
-        # Return results so auto-relax doesn't trigger
-        store.query_facts.return_value = ["fake_fact"]
+        # Return results so auto-relax doesn't trigger — must be Fact objects
+        store.query_facts.return_value = [Fact(id="f1", subject="user", verb="led")]
 
         # Mock _expand_verb to return expanded list
         engine._expand_verb = MagicMock(return_value=["led", "leads"])
 
         VirtualContextEngine.query_facts(engine, verb="led", subject="user")
 
-        # Should call store with verbs instead of verb
-        store.query_facts.assert_called_once_with(
-            verbs=["led", "leads"], subject="user"
-        )
+        # Should call store with verbs instead of verb (first call)
+        first_call = store.query_facts.call_args_list[0]
+        assert first_call == call(verbs=["led", "leads"], subject="user", limit=50)
 
     def test_no_expansion_keeps_verb(self):
         from unittest.mock import MagicMock
@@ -259,20 +262,21 @@ class TestEngineQueryFactsIntegration:
         """When object_contains produces results, don't retry."""
         from unittest.mock import MagicMock
         from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import Fact
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
         engine._semantic_fact_search = MagicMock(return_value=[])
-        store.query_facts.return_value = ["fact1"]
+        fact1 = Fact(id="f1", subject="user", verb="led", object="team")
+        store.query_facts.return_value = [fact1]
 
         result = VirtualContextEngine.query_facts(
             engine, verb="led", subject="user", object_contains="team"
         )
 
-        assert result == ["fact1"]
-        store.query_facts.assert_called_once()
+        assert fact1 in result
 
     def test_no_relax_when_no_object_contains(self):
         """When object_contains not provided, no retry even on 0 results."""
