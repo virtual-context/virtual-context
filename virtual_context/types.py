@@ -326,6 +326,7 @@ class QuoteResult:
     match_type: str = "fts"  # "fts", "like", or "semantic"
     similarity: float = 0.0  # cosine similarity (semantic matches only)
     session_date: str = ""   # session date from segment metadata
+    created_at: str = ""     # segment created_at timestamp for chronological ordering
 
 
 @dataclass

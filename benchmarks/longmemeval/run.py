@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    parser.add_argument("--fresh", action="store_true", help="Clear cached ingestion+compaction (re-ingest from scratch)")
+    parser.add_argument("--fresh-never-use-this-except-with-permission", dest="fresh", action="store_true", help="DANGER: Clear cached ingestion+compaction (re-ingest from scratch). Destroys store.db and all payload logs.")
     parser.add_argument("--recompact", action="store_true", help="Keep cached tags, re-run compaction only (faster than --fresh)")
     parser.add_argument("--clear-cache", action="store_true", help="Clear all VC caches and exit")
     parser.add_argument("--summarizer-model", type=str, default=None, help="Override summarization model (e.g. gpt-4o-mini)")
@@ -355,6 +355,8 @@ def main(argv: list[str] | None = None) -> None:
         default=False,
         help="Run fact supersession pass after compaction (deduplicates facts)",
     )
+    parser.add_argument("--supersession-provider", type=str, default=None, help="Provider for supersession (default: fact provider, then summarizer)")
+    parser.add_argument("--supersession-model", type=str, default=None, help="Model for supersession (default: fact model, then summarizer)")
     parser.add_argument(
         "--verbose-reasoning",
         action="store_true",
@@ -492,6 +494,8 @@ def main(argv: list[str] | None = None) -> None:
                 fact_model=args.fact_model,
                 cache_dir=Path(args.cache_dir) if args.cache_dir else None,
                 supersession=args.supersession,
+                supersession_provider=args.supersession_provider,
+                supersession_model=args.supersession_model,
             )
             result["elapsed_s"] = round(time.time() - t0, 1)
             return q.question_id, result
@@ -670,6 +674,8 @@ def main(argv: list[str] | None = None) -> None:
                     curation_provider=args.curation_provider,
                     curation_model=args.curation_model,
                     supersession=args.supersession,
+                    supersession_provider=args.supersession_provider,
+                    supersession_model=args.supersession_model,
                     verbose_reasoning=args.verbose_reasoning,
                 )
                 vc_result["elapsed_s"] = round(time.time() - t0, 1)

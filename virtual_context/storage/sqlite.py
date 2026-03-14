@@ -672,7 +672,8 @@ class SQLiteStore(ContextStore):
         try:
             rows = conn.execute(
                 """SELECT fts.ref, s.primary_tag, s.metadata_json,
-                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 100)
+                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 500),
+                          s.created_at
                    FROM segments_fts_full fts
                    JOIN segments s ON s.ref = fts.ref
                    WHERE segments_fts_full MATCH ?
@@ -691,6 +692,7 @@ class SQLiteStore(ContextStore):
                     tags=fts_tags_map[row[0]],
                     match_type="fts",
                     session_date=meta.get("session_date", ""),
+                    created_at=row[4] or "",
                 ))
             return results
         except sqlite3.OperationalError:
@@ -701,7 +703,7 @@ class SQLiteStore(ContextStore):
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like_query = f"%{escaped}%"
         rows = conn.execute(
-            """SELECT ref, primary_tag, full_text, metadata_json FROM segments
+            """SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments
                WHERE full_text LIKE ? ESCAPE '\\'
                LIMIT ?""",
             [like_query, limit],
@@ -718,6 +720,7 @@ class SQLiteStore(ContextStore):
                 tags=like_tags_map[row[0]],
                 match_type="like",
                 session_date=meta.get("session_date", ""),
+                created_at=row[4] or "",
             ))
         return results
 

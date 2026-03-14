@@ -192,6 +192,9 @@ class DomainCompactor:
         prompt for verification and consolidation.
         """
         signals = fact_signals_by_segment or {}
+        import sys as _sys
+        import time as _time
+
         logger.info(
             "Compacting %d segments (%d workers)...",
             len(segments), min(self.config.max_concurrent_summaries, len(segments)),
@@ -206,6 +209,7 @@ class DomainCompactor:
 
         results: list[CompactionResult] = [None] * len(segments)  # type: ignore[list-item]
         done_count = 0
+        _compact_start = _time.time()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(self._compact_one, segment, signals.get(segment.id, [])): i
@@ -223,6 +227,14 @@ class DomainCompactor:
                         results[idx].original_tokens,
                         results[idx].summary_tokens,
                     )
+                    _elapsed = _time.time() - _compact_start
+                    _rate = done_count / _elapsed if _elapsed > 0 else 0
+                    _eta = int((len(segments) - done_count) / _rate) if _rate > 0 else 0
+                    _sys.stderr.write(
+                        f"\r  COMPACT: {done_count}/{len(segments)} segments | "
+                        f"{_rate:.1f} seg/s | ETA {_eta}s   "
+                    )
+                    _sys.stderr.flush()
                 except Exception as e:
                     logger.error(f"Concurrent compaction failed for segment {idx}: {e}")
                     # Create a fallback result
@@ -239,6 +251,8 @@ class DomainCompactor:
                         full_text=conversation_text,
                     )
 
+        _sys.stderr.write("\n")
+        _sys.stderr.flush()
         return results
 
     def _compact_one(
@@ -381,9 +395,13 @@ class DomainCompactor:
                 from virtual_context.ingest.date_resolver import (
                     resolve_relative_date, normalize_fact_text,
                 )
-                if not raw_when or raw_when == sess_date:
+                # Validate raw_when looks like a real date (contains a digit).
+                # LLMs sometimes echo the field name (e.g. "when") or other
+                # garbage; treat those as blank so the fallback kicks in.
+                raw_when_valid = raw_when and any(c.isdigit() for c in raw_when)
+                if not raw_when_valid or raw_when == sess_date:
                     resolved = resolve_relative_date(raw_what, sess_date)
-                    when_date = resolved or raw_when or sess_date
+                    when_date = resolved or sess_date
                 else:
                     when_date = raw_when
                 # Always normalize relative terms in the fact text
@@ -522,8 +540,12 @@ class DomainCompactor:
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        import sys as _sys
+        import time as _time
+
         max_workers = min(self.config.max_concurrent_summaries, len(tags_to_build))
         results: list[TagSummary | None] = [None] * len(tags_to_build)
+        _ts_start = _time.time()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
@@ -547,6 +569,14 @@ class DomainCompactor:
                         done_count, len(tags_to_build),
                         tags_to_build[idx], results[idx].summary_tokens,
                     )
+                    _elapsed = _time.time() - _ts_start
+                    _rate = done_count / _elapsed if _elapsed > 0 else 0
+                    _eta = int((len(tags_to_build) - done_count) / _rate) if _rate > 0 else 0
+                    _sys.stderr.write(
+                        f"\r  TAG_SUMMARIES: {done_count}/{len(tags_to_build)} tags | "
+                        f"{_rate:.1f} tag/s | ETA {_eta}s   "
+                    )
+                    _sys.stderr.flush()
                 except Exception as e:
                     tag = tags_to_build[idx]
                     logger.error(f"Tag summary build failed for '{tag}': {e}")
@@ -561,6 +591,8 @@ class DomainCompactor:
                         covers_through_turn=max_turn,
                     )
 
+        _sys.stderr.write("\n")
+        _sys.stderr.flush()
         return [r for r in results if r is not None]
 
     def _build_one_tag_summary(

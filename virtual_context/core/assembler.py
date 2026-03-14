@@ -262,14 +262,15 @@ class ContextAssembler:
         all_tags = sorted({t for s in summaries for t in s.tags})
         tags_attr = ", ".join(all_tags) if all_tags else tag
 
-        # Prefix each summary with its session date when available
+        # Prefix each summary with sequence number and optional session date
+        total = len(summaries)
         summary_texts: list[str] = []
-        for s in summaries:
+        for idx, s in enumerate(summaries, 1):
+            prefix = f"[{idx}/{total}]"
             session = s.metadata.session_date
             if session:
-                summary_texts.append(f"[{session}]\n{s.summary}")
-            else:
-                summary_texts.append(s.summary)
+                prefix += f" [{session}]"
+            summary_texts.append(f"{prefix}\n{s.summary}")
 
         body = "\n\n---\n\n".join(summary_texts)
 
@@ -282,6 +283,9 @@ class ContextAssembler:
     def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
         if not segments:
             return ""
+
+        # Sort chronologically so reader sees old → new progression
+        segments = sorted(segments, key=lambda s: s.created_at)
 
         parts: list[str] = []
         for seg in segments:
@@ -299,6 +303,9 @@ class ContextAssembler:
     def _format_full_section(self, tag: str, segments: list[StoredSegment]) -> str:
         if not segments:
             return ""
+
+        # Sort chronologically so reader sees old → new progression
+        segments = sorted(segments, key=lambda s: s.created_at)
 
         parts: list[str] = []
         for seg in segments:
