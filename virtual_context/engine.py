@@ -1861,7 +1861,8 @@ class VirtualContextEngine:
 
         # Auto-follow fact links when graph_links is enabled
         linked_facts = []
-        if self.config.facts.graph_links and results:
+        _graph_links = getattr(getattr(self, "config", None), "facts", None)
+        if _graph_links and _graph_links.graph_links and results:
             fact_ids = [f.id for f in results]
             linked_facts = self._store.get_linked_facts(fact_ids, depth=1)
             # Deduplicate — don't include linked facts already in primary results
