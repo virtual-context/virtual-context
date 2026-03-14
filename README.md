@@ -330,6 +330,8 @@ vc_query_facts(fact_type="preference")
 
 **Fact supersession.** When new information contradicts or updates a previously stored fact ("I moved from NYC to LA"), the supersession checker detects the conflict and marks the old fact as superseded. Detection uses object-keyword similarity to find cross-session candidates that share the same subject and semantic domain, then an LLM verifies whether the new fact genuinely replaces the old one. Superseded facts are retained in storage (for audit) but excluded from query results.
 
+**Fact graph.** Facts aren't isolated triples — they have relationships. "User led Project Alpha" and "Project Alpha uses Python" are connected by a `PART_OF` relationship. "User moved from NYC to LA" `SUPERSEDES` the older "User lives in NYC." virtual-context automatically detects these relationships during the same LLM pass that checks for supersession (zero additional API calls) and stores them as typed, directed links between facts. Six relationship types are supported: `SUPERSEDES`, `CAUSED_BY`, `PART_OF`, `CONTRADICTS`, `SAME_AS`, and `RELATED_TO`. When `vc_query_facts` returns results, linked facts are automatically included via 1-hop traversal — the reader gets richer context without needing to know the graph exists. In SQLite, links are stored in a `fact_links` table with BFS traversal; graph database backends (Neo4j, FalkorDB) represent them as native edges.
+
 **Semantic verb expansion.** Queries like `verb="runs"` automatically expand to morphologically similar verbs in the database (e.g., "running", "run", "jogs") via sentence-transformer embedding similarity. This means the reader doesn't need to guess the exact verb form used during extraction.
 
 **Semantic fact search.** When structured filters return sparse results, a fallback embedding search matches the query intent against all stored facts' `what` fields by cosine similarity, surfacing relevant facts even when the subject/verb/object decomposition doesn't align.
@@ -839,11 +841,20 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 ### Storage Backends
 
-**SQLiteStore**: Primary backend. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search, structured fact tables with provenance tracking. Single file, no external dependencies.
+The storage layer is decomposed into five focused protocols — `SegmentStore`, `FactStore`, `FactLinkStore`, `StateStore`, `SearchStore` — composed via a `CompositeStore`. Each backend implements the protocols it's suited for; the rest fall back to SQLite.
+
+```yaml
+storage:
+  backend: "sqlite"  # or "postgres", "neo4j", "falkordb"
+```
+
+**SQLiteStore** (default): Implements all five protocols. Two FTS5 indexes (summary search for retrieval, full-text search across raw stored conversation text for `find_quote`), tag-overlap queries via junction table, tag aliases, tag summaries, chunk embeddings for semantic search, structured fact tables with provenance tracking, fact link graph with BFS traversal. Single file, no external dependencies.
 
 **FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly. Thread-safe with atomic index writes and persisted tag aliases.
 
-Both implement the same abstract interface; swap backends without changing application code.
+**Postgres** (planned): Full protocol coverage — segments, facts, links, state, search — in a single relational database with pgvector for embeddings.
+
+**Neo4j / FalkorDB** (planned): Graph-native backends for `FactStore` + `FactLinkStore`. Facts become nodes, relationships become typed edges with native Cypher traversal. Segments, state, and search fall back to SQLite.
 
 ### LLM Providers
 
