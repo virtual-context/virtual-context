@@ -219,6 +219,22 @@ class VirtualContextEngine:
                 segments=pg, facts=pg, fact_links=fact_links,
                 state=pg, search=pg,
             )
+        elif self.config.storage.backend == "neo4j":
+            from .storage.neo4j import Neo4jFactStore
+            neo = Neo4jFactStore(
+                uri=self.config.storage.neo4j_uri,
+                auth=(self.config.storage.neo4j_user, self.config.storage.neo4j_password),
+            )
+            # Fallback: use Postgres if configured, otherwise SQLite
+            if self.config.storage.postgres_dsn:
+                from .storage.postgres import PostgresStore
+                fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
+            else:
+                fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            self._store = CompositeStore(
+                segments=fallback, facts=neo, fact_links=neo,
+                state=fallback, search=fallback,
+            )
         elif self.config.storage.backend == "filesystem":
             fs = FilesystemStore(root=self.config.storage.root)
             self._store = CompositeStore(
