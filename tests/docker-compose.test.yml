@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vc_test
+      POSTGRES_PASSWORD: vc_test
+      POSTGRES_DB: vc_test
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vc_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/vc_test_pass
+    ports:
+      - "17687:7687"
+      - "17474:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p vc_test_pass 'RETURN 1'"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
