@@ -154,6 +154,8 @@ def _build_vc_config(
     curation_provider: str | None = None,
     curation_model: str | None = None,
     supersession: bool = False,
+    supersession_provider: str | None = None,
+    supersession_model: str | None = None,
 ) -> dict:
     """Build a VC config dict for benchmark use."""
     chosen_summarizer_provider = summarizer_provider or tagger_provider
@@ -224,6 +226,30 @@ def _build_vc_config(
                 "api_key_env": "OPENROUTER_API_KEY",
             }
 
+    # Supersession provider: falls back to fact provider, then summarizer
+    chosen_supersession_provider = supersession_provider or fact_provider or chosen_summarizer_provider
+    chosen_supersession_model = supersession_model or fact_model or chosen_summarizer_model
+    # If supersession uses same provider type but different model, register a
+    # separate provider entry so the model doesn't conflict with the existing one.
+    supersession_provider_key = chosen_supersession_provider
+    if chosen_supersession_provider in providers:
+        existing_model = providers[chosen_supersession_provider].get("model")
+        if existing_model and existing_model != chosen_supersession_model:
+            supersession_provider_key = f"{chosen_supersession_provider}-supersession"
+            base = dict(providers[chosen_supersession_provider])
+            base["model"] = chosen_supersession_model
+            providers[supersession_provider_key] = base
+    elif chosen_supersession_provider:
+        _PROVIDER_TEMPLATES = {
+            "openrouter": {"type": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+            "openai": {"type": "generic_openai", "base_url": "https://api.openai.com/v1", "api_key": openai_bearer_token or os.environ.get("OPENAI_API_KEY", "")},
+            "ollama_native": {"type": "ollama_native", "base_url": os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "num_predict": 500, "force_json": True},
+            "anthropic": {"type": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+        }
+        tmpl = _PROVIDER_TEMPLATES.get(chosen_supersession_provider, {})
+        if tmpl:
+            providers[supersession_provider_key] = {**tmpl, "model": chosen_supersession_model}
+
     cfg: dict = {
         "version": "0.2",
         "storage_root": storage_dir or "",
@@ -271,8 +297,8 @@ def _build_vc_config(
         },
         "supersession": {
             "enabled": supersession,
-            "provider": chosen_summarizer_provider,
-            "model": chosen_summarizer_model,
+            "provider": supersession_provider_key,
+            "model": chosen_supersession_model,
             "batch_size": 25,
         },
         "providers": providers,
@@ -550,6 +576,8 @@ def run_vc(
     curation_provider: str | None = None,
     curation_model: str | None = None,
     supersession: bool = False,
+    supersession_provider: str | None = None,
+    supersession_model: str | None = None,
     verbose_reasoning: bool = False,
 ) -> dict:
     """Run the VC pipeline for a single question.
@@ -640,6 +668,8 @@ def run_vc(
         curation_provider=curation_provider,
         curation_model=curation_model,
         supersession=supersession,
+        supersession_provider=supersession_provider,
+        supersession_model=supersession_model,
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
@@ -903,7 +933,7 @@ def run_vc(
         force_tools=True,
         require_tools=require_tools,
         provider=reader_provider,
-        extended_thinking=verbose_reasoning and reader_provider == "anthropic",
+        extended_thinking=verbose_reasoning and reader_provider in ("anthropic", "openai-responses"),
     )
 
     timings["query_s"] = round(time.time() - t0, 1)
@@ -1037,6 +1067,8 @@ def run_vc_ingest_only(
     fact_model: str | None = None,
     cache_dir: Path | None = None,
     supersession: bool = False,
+    supersession_provider: str | None = None,
+    supersession_model: str | None = None,
 ) -> dict:
     """Run ingest + compact only, skip reader and judge. Returns stats dict."""
     timings: dict[str, float] = {}
@@ -1071,6 +1103,8 @@ def run_vc_ingest_only(
         fact_provider=fact_provider,
         fact_model=fact_model,
         supersession=supersession,
+        supersession_provider=supersession_provider,
+        supersession_model=supersession_model,
     )
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)

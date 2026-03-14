@@ -142,13 +142,16 @@ def vc_tool_definitions() -> list[dict]:
         {
             "name": "vc_query_facts",
             "description": (
-                "Query extracted facts with structured filters. Use for counting, "
-                "listing, or filtering questions like 'how many X have I done', "
-                "'what projects am I leading', 'things I prefer', 'what tools do I use'. "
+                "Query extracted facts with structured filters. Essential for "
+                "questions about events, experiences, trips, activities, or anything "
+                "the user has done — each fact has a date, location, and status. "
+                "Also use for counting, listing, or filtering questions like "
+                "'how many X have I done', 'what projects am I leading'. "
                 "Returns matching facts with count. For counting questions, omit status "
                 "to get the total across all statuses in a single call. "
                 "Verb is automatically expanded to include morphological variants (e.g. "
-                "'led' also matches 'leads'). Object filter is auto-relaxed if too narrow."
+                "'led' also matches 'leads', 'visited' also matches 'traveled'). "
+                "Object filter is auto-relaxed if too narrow."
             ),
             "input_schema": {
                 "type": "object",
@@ -181,11 +184,14 @@ def vc_tool_definitions() -> list[dict]:
         {
             "name": "vc_remember_when",
             "description": (
-                "Find memory by topic within a time window. "
-                "Use for requests like 'last week', 'last month', "
-                "'3 days ago', or 'between June and July'. "
-                "Do not compute calendar dates yourself; prefer relative "
-                "presets and let the backend resolve exact dates."
+                "Best tool for time-based questions. Retrieves conversations "
+                "and facts from a specific date range. Use FIRST when the "
+                "question mentions a time period ('past three months', "
+                "'last week', 'in March', 'between June and July'). "
+                "Returns both conversation excerpts and structured facts "
+                "within the window. Use relative presets when they match, "
+                "or between_dates with explicit YYYY-MM-DD dates for "
+                "custom ranges."
             ),
             "input_schema": {
                 "type": "object",
@@ -196,13 +202,17 @@ def vc_tool_definitions() -> list[dict]:
                     },
                     "time_range": {
                         "type": "object",
-                        "description": (
-                            "Time window selector. One of: "
-                            "{kind:'relative', preset:'last_24_hours|last_7_days|last_30_days|"
-                            "this_week|last_week|this_month|last_month|this_year|last_year'} "
-                            "or {kind:'between_dates', start:'YYYY-MM-DD or YYYY-MM', "
-                            "end:'YYYY-MM-DD or YYYY-MM'}."
-                        ),
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["relative", "between_dates"]},
+                            "preset": {"type": "string", "enum": [
+                                "last_7_days", "last_30_days", "last_90_days",
+                                "last_week", "last_month",
+                                "this_week", "this_month",
+                            ]},
+                            "start": {"type": "string", "description": "YYYY-MM-DD"},
+                            "end": {"type": "string", "description": "YYYY-MM-DD"},
+                        },
+                        "required": ["kind"],
                     },
                     "max_results": {
                         "type": "integer",

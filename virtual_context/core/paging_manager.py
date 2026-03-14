@@ -153,7 +153,7 @@ class PagingManager:
             return ts.summary_tokens if ts else 0
 
         # SEGMENTS or FULL: need stored segments
-        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500)
         if not segments:
             return 0
 
