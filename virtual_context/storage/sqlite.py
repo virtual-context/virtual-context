@@ -1499,6 +1499,42 @@ class SQLiteStore(ContextStore):
         conn.commit()
         return cursor.rowcount
 
+    def migrate_supersession_to_links(self) -> int:
+        """Migrate superseded_by column data to SUPERSEDES fact links. Idempotent."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, superseded_by FROM facts WHERE superseded_by IS NOT NULL"
+        ).fetchall()
+        if not rows:
+            return 0
+        count = 0
+        for row in rows:
+            old_id = row["id"]
+            new_id = row["superseded_by"]
+            existing = conn.execute(
+                "SELECT 1 FROM fact_links WHERE source_fact_id = ? AND target_fact_id = ? AND relation_type = 'supersedes'",
+                (new_id, old_id),
+            ).fetchone()
+            if existing:
+                continue
+            link = FactLink(
+                source_fact_id=new_id,
+                target_fact_id=old_id,
+                relation_type="supersedes",
+                confidence=1.0,
+                context="Migrated from superseded_by column",
+                created_by="migration",
+            )
+            conn.execute(
+                """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,
+                   confidence, context, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (link.id, link.source_fact_id, link.target_fact_id, link.relation_type,
+                 link.confidence, link.context, _dt_to_str(link.created_at), link.created_by),
+            )
+            count += 1
+        conn.commit()
+        return count
+
     def _row_to_fact_link(self, row: sqlite3.Row) -> FactLink:
         """Convert a sqlite3.Row to a FactLink dataclass."""
         return FactLink(
