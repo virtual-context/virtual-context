@@ -304,30 +304,41 @@ class FalkorDBFactStore:
     def get_linked_facts(self, fact_ids: list[str], depth: int = 1) -> list[LinkedFact]:
         if not fact_ids:
             return []
-        rows = self._query(
-            "MATCH (seed:Fact)-[r:FACT_LINK*1..$depth]-(linked:Fact) "
-            "WHERE seed.id IN $ids "
-            "AND (linked.superseded_by IS NULL OR linked.superseded_by = '') "
-            "AND NOT linked.id IN $ids "
-            "WITH seed, linked, r[0] AS first_rel "
-            "RETURN DISTINCT linked AS fact, seed.id AS linked_from, "
-            "first_rel.relation_type AS rt, first_rel.confidence AS conf, "
-            "first_rel.context AS ctx",
-            {"ids": fact_ids, "depth": depth},
-        )
-        linked_facts = []
-        seen: set[str] = set()
-        for r in rows:
-            fact = self._node_to_fact(r[0])
-            if fact.id in seen:
-                continue
-            seen.add(fact.id)
-            linked_facts.append(LinkedFact(
-                fact=fact, linked_from_fact_id=r[1],
-                relation_type=r[2], confidence=r[3],
-                link_context=r[4] or "",
-            ))
-        return linked_facts
+        # FalkorDB's variable-length path returns Path objects that don't
+        # support property access like r[0].relation_type. Use manual BFS
+        # with single-hop queries instead (same approach as SQLiteStore).
+        visited = set(fact_ids)
+        result: list[LinkedFact] = []
+        current_layer = set(fact_ids)
+
+        for _hop in range(max(1, min(depth, 5))):
+            if not current_layer:
+                break
+            layer_list = list(current_layer)
+            rows = self._query(
+                "MATCH (seed:Fact)-[r:FACT_LINK]-(linked:Fact) "
+                "WHERE seed.id IN $layer "
+                "AND (linked.superseded_by IS NULL OR linked.superseded_by = '') "
+                "AND NOT linked.id IN $visited "
+                "RETURN linked, seed.id AS from_id, "
+                "r.relation_type AS rt, r.confidence AS conf, r.context AS ctx",
+                {"layer": layer_list, "visited": list(visited)},
+            )
+            next_layer: set[str] = set()
+            for r in rows:
+                fact = self._node_to_fact(r[0])
+                if fact.id in visited:
+                    continue
+                result.append(LinkedFact(
+                    fact=fact, linked_from_fact_id=r[1],
+                    relation_type=r[2], confidence=r[3],
+                    link_context=r[4] or "",
+                ))
+                visited.add(fact.id)
+                next_layer.add(fact.id)
+            current_layer = next_layer
+
+        return result
 
     def delete_fact_links(self, fact_id: str) -> int:
         rows = self._query(

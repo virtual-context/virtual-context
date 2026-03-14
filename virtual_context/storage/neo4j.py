@@ -328,10 +328,12 @@ class Neo4jFactStore:
     def get_linked_facts(self, fact_ids: list[str], depth: int = 1) -> list[LinkedFact]:
         if not fact_ids:
             return []
+        # Cypher does not allow parameterized variable-length path bounds,
+        # so we interpolate depth directly (always a small int, no injection risk).
+        depth = max(1, min(depth, 5))
         with self._driver.session() as session:
-            # Native graph traversal — depth-bounded
             result = session.run(
-                """MATCH (seed:Fact)-[r:FACT_LINK*1..$depth]-(linked:Fact)
+                f"""MATCH (seed:Fact)-[r:FACT_LINK*1..{depth}]-(linked:Fact)
                 WHERE seed.id IN $ids
                   AND linked.superseded_by IS NULL
                   AND NOT linked.id IN $ids
@@ -341,7 +343,7 @@ class Neo4jFactStore:
                     first_rel.relation_type AS relation_type,
                     first_rel.confidence AS confidence,
                     first_rel.context AS context""",
-                ids=fact_ids, depth=depth,
+                ids=fact_ids,
             )
             linked_facts = []
             seen: set[str] = set()
