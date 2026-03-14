@@ -200,11 +200,25 @@ class VirtualContextEngine:
         )
 
     def _init_store(self) -> None:
-        """Initialize the storage backend."""
+        """Initialize the storage backend via CompositeStore."""
+        from .core.composite_store import CompositeStore
+        from .storage.noop_fact_link_store import NoopFactLinkStore
+
         if self.config.storage.backend == "sqlite":
-            self._store = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            sqlite = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            fact_links = sqlite if self.config.facts.graph_links else NoopFactLinkStore()
+            self._store = CompositeStore(
+                segments=sqlite, facts=sqlite, fact_links=fact_links,
+                state=sqlite, search=sqlite,
+            )
+        elif self.config.storage.backend == "filesystem":
+            fs = FilesystemStore(root=self.config.storage.root)
+            self._store = CompositeStore(
+                segments=fs, facts=fs, fact_links=NoopFactLinkStore(),
+                state=fs, search=fs,
+            )
         else:
-            self._store = FilesystemStore(root=self.config.storage.root)
+            raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
     def _init_monitor(self) -> None:
         self._monitor = ContextMonitor(
@@ -1845,6 +1859,16 @@ class VirtualContextEngine:
         if results and intent_context.strip():
             results = self._rerank_facts(results, intent_context)
 
+        # Auto-follow fact links when graph_links is enabled
+        linked_facts = []
+        _graph_links = getattr(getattr(self, "config", None), "facts", None)
+        if _graph_links and _graph_links.graph_links and results:
+            fact_ids = [f.id for f in results]
+            linked_facts = self._store.get_linked_facts(fact_ids, depth=1)
+            # Deduplicate — don't include linked facts already in primary results
+            primary_ids = set(fact_ids)
+            linked_facts = [lf for lf in linked_facts if lf.fact.id not in primary_ids]
+
         if return_meta:
             meta: dict = {
                 "facts": results,
@@ -1852,6 +1876,8 @@ class VirtualContextEngine:
                 "object_relaxed": False,  # auto-relax removed (BUG-032)
                 "semantic_note": semantic_note,
             }
+            if linked_facts:
+                meta["linked_facts"] = linked_facts
             # When status was filtered, also query without status so the
             # caller can show total_all_statuses — prevents the reader from
             # splitting into per-status calls and never seeing the grand total.

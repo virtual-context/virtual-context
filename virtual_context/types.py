@@ -68,6 +68,39 @@ class Fact:
     superseded_by: str | None = None  # fact_id that replaces this fact
 
 
+class RelationType(str, Enum):
+    """Supported relationship types between facts."""
+    SUPERSEDES = "supersedes"
+    CAUSED_BY = "caused_by"
+    PART_OF = "part_of"
+    CONTRADICTS = "contradicts"
+    SAME_AS = "same_as"
+    RELATED_TO = "related_to"
+
+
+@dataclass
+class FactLink:
+    """A directed relationship between two facts."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    source_fact_id: str = ""
+    target_fact_id: str = ""
+    relation_type: str = ""         # RelationType value
+    confidence: float = 1.0         # 0.0-1.0
+    context: str = ""               # one-sentence explanation
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = "compaction"  # "compaction" | "supersession" | "migration"
+
+
+@dataclass
+class LinkedFact:
+    """A Fact returned as part of a link traversal result."""
+    fact: Fact
+    linked_from_fact_id: str = ""   # which primary fact this is linked to
+    relation_type: str = ""
+    confidence: float = 1.0
+    link_context: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Message & Turn
 # ---------------------------------------------------------------------------
@@ -585,10 +618,29 @@ class SummarizationConfig:
 
 
 @dataclass
+class FactsConfig:
+    """Configuration for fact features."""
+    graph_links: bool = True
+    link_types: list[str] = field(default_factory=lambda: [
+        "supersedes", "caused_by", "part_of", "contradicts", "same_as", "related_to",
+    ])
+
+
+@dataclass
 class StorageConfig:
     backend: str = "sqlite"
     root: str = ".virtualcontext/store"
     sqlite_path: str = ".virtualcontext/store.db"
+    # Postgres
+    postgres_dsn: str = ""
+    # Neo4j
+    neo4j_uri: str = ""
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+    # FalkorDB
+    falkordb_host: str = "localhost"
+    falkordb_port: int = 6379
+    falkordb_password: str = ""
 
 
 @dataclass
@@ -684,6 +736,7 @@ class VirtualContextConfig:
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
+    facts: FactsConfig = field(default_factory=FactsConfig)
     supersession: SupersessionConfig = field(default_factory=SupersessionConfig)
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)

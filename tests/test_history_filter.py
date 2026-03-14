@@ -317,7 +317,11 @@ class FakeChatProvider:
             yield word + " "
 
 
+_has_pytest_asyncio = bool(__import__("importlib").util.find_spec("pytest_asyncio"))
+
+
 @pytest.mark.slow
+@pytest.mark.skipif(not _has_pytest_asyncio, reason="pytest-asyncio not installed")
 @pytest.mark.asyncio
 async def test_tui_workflow_payload_filtering():
     """Full TUI workflow: send multi-topic messages and verify

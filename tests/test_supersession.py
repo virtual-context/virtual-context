@@ -304,13 +304,20 @@ class TestCheckAndSupersede:
 
         checker, store, llm = _make_checker(llm_response="[0]")
 
+        # Track which new fact we're processing by checking object_contains.
+        # The first tag-based call for each fact has object_contains=None;
+        # the object-similarity call has a keyword.  We use the keyword to
+        # decide which old fact to return as a candidate.
+        _fact_idx = [0]  # mutable counter
+
         def query_side_effect(subject=None, tags=None, limit=20, object_contains=None):
+            if subject == "user" and object_contains is None and tags is None:
+                # Unfiltered call (e.g., embedding candidates cache) — return all
+                return [old1, old2]
             if subject == "user":
-                # Return different candidates per call
-                if not hasattr(query_side_effect, "_call_count"):
-                    query_side_effect._call_count = 0
-                query_side_effect._call_count += 1
-                if query_side_effect._call_count <= 2:
+                # Tag-based or object-keyword call — return matching candidate
+                _fact_idx[0] += 1
+                if _fact_idx[0] <= 2:
                     return [old1]
                 return [old2]
             return []
