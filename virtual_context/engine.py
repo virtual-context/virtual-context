@@ -1859,6 +1859,15 @@ class VirtualContextEngine:
         if results and intent_context.strip():
             results = self._rerank_facts(results, intent_context)
 
+        # Auto-follow fact links when graph_links is enabled
+        linked_facts = []
+        if self.config.facts.graph_links and results:
+            fact_ids = [f.id for f in results]
+            linked_facts = self._store.get_linked_facts(fact_ids, depth=1)
+            # Deduplicate — don't include linked facts already in primary results
+            primary_ids = set(fact_ids)
+            linked_facts = [lf for lf in linked_facts if lf.fact.id not in primary_ids]
+
         if return_meta:
             meta: dict = {
                 "facts": results,
@@ -1866,6 +1875,8 @@ class VirtualContextEngine:
                 "object_relaxed": False,  # auto-relax removed (BUG-032)
                 "semantic_note": semantic_note,
             }
+            if linked_facts:
+                meta["linked_facts"] = linked_facts
             # When status was filtered, also query without status so the
             # caller can show total_all_statuses — prevents the reader from
             # splitting into per-status calls and never seeing the grand total.

@@ -693,6 +693,20 @@ def execute_vc_tool(
                 notes.append(meta["semantic_note"])
             if notes:
                 result["search_notes"] = "; ".join(notes)
+            # Include linked facts when graph_links is enabled
+            if meta.get("linked_facts"):
+                result["linked_facts"] = [
+                    {
+                        "subject": lf.fact.subject,
+                        "verb": lf.fact.verb,
+                        "object": lf.fact.object,
+                        "status": lf.fact.status,
+                        "what": lf.fact.what,
+                        "_linked_via": f"{lf.relation_type} from '{lf.linked_from_fact_id[:8]}'",
+                        "_confidence": lf.confidence,
+                    }
+                    for lf in meta["linked_facts"]
+                ]
         elif name == "vc_remember_when":
             result = engine.remember_when(
                 query=tool_input.get("query", ""),
