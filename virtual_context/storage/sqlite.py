@@ -12,7 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
@@ -342,6 +342,22 @@ class SQLiteStore(ContextStore):
                 FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_fact_tags_tag ON fact_tags(tag);
+
+            CREATE TABLE IF NOT EXISTS fact_links (
+                id TEXT PRIMARY KEY,
+                source_fact_id TEXT NOT NULL,
+                target_fact_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                context TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT 'compaction',
+                FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fact_links_source ON fact_links(source_fact_id);
+            CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
+            CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
         """)
         # D1: migrate — add fact_type column to existing facts tables
         try:
@@ -1337,6 +1353,164 @@ class SQLiteStore(ContextStore):
             "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
         ).fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
+
+    # ------------------------------------------------------------------
+    # Fact links
+    # ------------------------------------------------------------------
+
+    def store_fact_links(self, links: list[FactLink]) -> int:
+        """Store fact links, returning the number stored."""
+        if not links:
+            return 0
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            count = 0
+            for link in links:
+                conn.execute(
+                    """INSERT OR REPLACE INTO fact_links
+                    (id, source_fact_id, target_fact_id, relation_type,
+                     confidence, context, created_at, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        link.id,
+                        link.source_fact_id,
+                        link.target_fact_id,
+                        link.relation_type,
+                        link.confidence,
+                        link.context,
+                        _dt_to_str(link.created_at),
+                        link.created_by,
+                    ),
+                )
+                count += 1
+            conn.execute("COMMIT")
+            return count
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def get_fact_links(self, fact_id: str, direction: str = "both") -> list[FactLink]:
+        """Get fact links for a given fact ID.
+
+        Args:
+            fact_id: The fact ID to query links for.
+            direction: "outgoing" (source), "incoming" (target), or "both".
+        """
+        conn = self._get_conn()
+        if direction == "outgoing":
+            rows = conn.execute(
+                "SELECT * FROM fact_links WHERE source_fact_id = ?", (fact_id,)
+            ).fetchall()
+        elif direction == "incoming":
+            rows = conn.execute(
+                "SELECT * FROM fact_links WHERE target_fact_id = ?", (fact_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM fact_links WHERE source_fact_id = ? OR target_fact_id = ?",
+                (fact_id, fact_id),
+            ).fetchall()
+        return [self._row_to_fact_link(row) for row in rows]
+
+    def get_linked_facts(self, fact_ids: list[str], depth: int = 1) -> list[LinkedFact]:
+        """BFS traversal through fact_links, returning linked Fact objects.
+
+        Excludes superseded facts (superseded_by IS NOT NULL).
+        """
+        if not fact_ids:
+            return []
+        conn = self._get_conn()
+        visited: set[str] = set(fact_ids)
+        current_layer: set[str] = set(fact_ids)
+        results: list[LinkedFact] = []
+
+        for _hop in range(depth):
+            if not current_layer:
+                break
+            placeholders = ",".join("?" * len(current_layer))
+            visited_placeholders = ",".join("?" * len(visited))
+            rows = conn.execute(
+                f"""SELECT fl.source_fact_id, fl.target_fact_id, fl.relation_type,
+                        fl.confidence, fl.context,
+                        f.id AS fact_id, f.subject, f.verb, f.object, f.status, f.what, f.who,
+                        f.when_date, f."where", f.why, f.fact_type, f.tags_json, f.segment_ref,
+                        f.conversation_id, f.turn_numbers_json, f.mentioned_at, f.session_date,
+                        f.superseded_by
+                    FROM fact_links fl
+                    JOIN facts f ON (
+                        (fl.source_fact_id IN ({placeholders}) AND f.id = fl.target_fact_id)
+                        OR (fl.target_fact_id IN ({placeholders}) AND f.id = fl.source_fact_id)
+                    )
+                    WHERE f.superseded_by IS NULL
+                    AND f.id NOT IN ({visited_placeholders})""",
+                list(current_layer) + list(current_layer) + list(visited),
+            ).fetchall()
+
+            next_layer: set[str] = set()
+            for row in rows:
+                fid = row["fact_id"]
+                if fid in visited:
+                    continue
+                visited.add(fid)
+                next_layer.add(fid)
+                # Determine which seed fact this is linked from
+                src = row["source_fact_id"]
+                tgt = row["target_fact_id"]
+                linked_from = src if src in current_layer else tgt
+                fact = Fact(
+                    id=fid,
+                    subject=row["subject"],
+                    verb=row["verb"],
+                    object=row["object"],
+                    status=row["status"],
+                    what=row["what"],
+                    who=row["who"],
+                    when_date=row["when_date"],
+                    where=row["where"],
+                    why=row["why"],
+                    fact_type=row["fact_type"] if row["fact_type"] else "personal",
+                    tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
+                    segment_ref=row["segment_ref"],
+                    conversation_id=row["conversation_id"],
+                    turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
+                    mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
+                    session_date=row["session_date"] if row["session_date"] else "",
+                    superseded_by=row["superseded_by"],
+                )
+                results.append(LinkedFact(
+                    fact=fact,
+                    linked_from_fact_id=linked_from,
+                    relation_type=row["relation_type"],
+                    confidence=row["confidence"],
+                    link_context=row["context"],
+                ))
+            current_layer = next_layer
+
+        return results
+
+    def delete_fact_links(self, fact_id: str) -> int:
+        """Delete all links where fact_id is source or target. Returns count deleted."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM fact_links WHERE source_fact_id = ? OR target_fact_id = ?",
+            (fact_id, fact_id),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    def _row_to_fact_link(self, row: sqlite3.Row) -> FactLink:
+        """Convert a sqlite3.Row to a FactLink dataclass."""
+        return FactLink(
+            id=row["id"],
+            source_fact_id=row["source_fact_id"],
+            target_fact_id=row["target_fact_id"],
+            relation_type=row["relation_type"],
+            confidence=row["confidence"],
+            context=row["context"],
+            created_at=_str_to_dt(row["created_at"]) if row["created_at"] else datetime.now(timezone.utc),
+            created_by=row["created_by"],
+        )
 
     # ------------------------------------------------------------------
     # Cross-cutting queries
