@@ -490,6 +490,7 @@ class VirtualContextEngine:
             store=self._store,
             config=sc,
             telemetry_ledger=self._telemetry,
+            embed_fn=self._get_embed_fn(),
         )
         logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 
@@ -631,7 +632,7 @@ class VirtualContextEngine:
             seen_refs: set[str] = set()
             for tag, entry in self._working_set.items():
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
-                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
+                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500)
                     deduped = [s for s in segs if s.ref not in seen_refs]
                     seen_refs.update(s.ref for s in deduped)
                     if deduped:
@@ -1390,8 +1391,13 @@ class VirtualContextEngine:
         Returns:
             Number of turns ingested.
         """
+        import sys as _sys
+        import time as _time
+        _tag_start = _time.time()
+
         store_tags = [ts.tag for ts in self._store.get_all_tags()]
         ingested = 0
+        _total_turns = len(history_pairs) // 2
         n_context = self.config.tag_generator.context_lookback_pairs
         running_session_date = ""
 
@@ -1476,6 +1482,17 @@ class VirtualContextEngine:
             self._turn_tag_index.append(entry)
             ingested += 1
 
+            # Stderr progress for visibility
+            if ingested % 5 == 0 or ingested == _total_turns:
+                _elapsed = _time.time() - _tag_start
+                _rate = ingested / _elapsed if _elapsed > 0 else 0
+                _eta = int((_total_turns - ingested) / _rate) if _rate > 0 else 0
+                _sys.stderr.write(
+                    f"\r  TAGGING: {ingested}/{_total_turns} turns | "
+                    f"{_rate:.1f} turn/s | ETA {_eta}s   "
+                )
+                _sys.stderr.flush()
+
             if progress_callback:
                 total = len(history_pairs) // 2
                 progress_callback(ingested, total, entry)
@@ -1490,6 +1507,8 @@ class VirtualContextEngine:
 
         # Final save after all turns ingested
         self._save_state(history_pairs)
+        _sys.stderr.write("\n")
+        _sys.stderr.flush()
         logger.info("Ingested %d historical turns into TurnTagIndex", ingested)
         return ingested
 
@@ -1540,7 +1559,7 @@ class VirtualContextEngine:
             for tag, entry in self._working_set.items():
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
                     segs = self._store.get_segments_by_tags(
-                        tags=[tag], min_overlap=1, limit=50,
+                        tags=[tag], min_overlap=1, limit=500,
                     )
                     deduped = [s for s in segs if s.ref not in seen_refs]
                     seen_refs.update(s.ref for s in deduped)
@@ -1675,6 +1694,8 @@ class VirtualContextEngine:
                 return today - timedelta(days=7), today, preset
             if preset == "last_30_days":
                 return today - timedelta(days=30), today, preset
+            if preset == "last_90_days":
+                return today - timedelta(days=90), today, preset
             if preset == "this_week":
                 start = today - timedelta(days=today.weekday())
                 return start, start + timedelta(days=6), preset
@@ -1752,6 +1773,11 @@ class VirtualContextEngine:
                 expanded_verbs = expanded
                 kwargs["verbs"] = expanded
                 kwargs.pop("verb", None)
+                # Verb expansion widens the query significantly — bump the
+                # SQL limit so rare-verb facts don't get cut off by ORDER BY
+                # mentioned_at DESC.  Scale with number of expanded verbs.
+                if "limit" not in kwargs:
+                    kwargs["limit"] = max(50, len(expanded) * 10)
 
         results = self._store.query_facts(**kwargs)
 
@@ -1784,9 +1810,40 @@ class VirtualContextEngine:
                 results = results + sem_filtered
                 semantic_note = f"semantic search added {len(sem_filtered)} fact(s)"
 
+        # Tag-based sibling discovery: when we have some results, use their
+        # tags to find related facts the structured query missed (e.g. "made
+        # apple pie" when the reader searched verb="baked").
+        if results and orig_subject:
+            result_ids = {f.id for f in results}
+            # Collect tags from current results
+            seed_tags: set[str] = set()
+            for f in results:
+                seed_tags.update(f.tags)
+            if seed_tags:
+                siblings = self._store.query_facts(
+                    subject=orig_subject,
+                    tags=list(seed_tags),
+                    limit=50,
+                )
+                new_siblings = [s for s in siblings if s.id not in result_ids]
+                if new_siblings:
+                    results = results + new_siblings
+                    sibling_note = f"tag siblings added {len(new_siblings)} fact(s)"
+                    semantic_note = (
+                        f"{semantic_note}; {sibling_note}" if semantic_note
+                        else sibling_note
+                    )
+
         # Auto-relax removed (BUG-032): dropping object_contains returns facts
         # that contradict the reader's explicit constraint, causing over-counting.
         # If 0 results, the reader should broaden its own query intentionally.
+
+        # Relevance re-ranking: sort results by embedding similarity to the
+        # reader's question so the most relevant facts appear first.  Without
+        # this, results are ordered by ingestion timestamp (mentioned_at DESC)
+        # which is essentially random with respect to the query.
+        if results and intent_context.strip():
+            results = self._rerank_facts(results, intent_context)
 
         if return_meta:
             meta: dict = {
@@ -1825,30 +1882,75 @@ class VirtualContextEngine:
             return meta
         return results
 
+    # Manual verb synonym clusters.  If the query verb matches any member
+    # of a cluster (case-insensitive), all other members that actually exist
+    # in the fact store are included in the expansion — regardless of
+    # embedding similarity.  This catches contextual synonyms that small
+    # embedding models miss (e.g. "visited" ↔ "returned from").
+    _VERB_CLUSTERS: list[set[str]] = [
+        {
+            "visited", "returned from", "got back from", "completed",
+            "went on", "took", "explored", "toured", "traveled to",
+            "went to", "hiked", "drove to", "flew to", "camped at",
+            "stayed at",
+        },
+        {"bought", "purchased", "ordered", "got", "acquired", "picked up"},
+        {"started", "began", "launched", "kicked off", "initiated"},
+        {"finished", "completed", "wrapped up", "ended", "concluded"},
+        {"likes", "enjoys", "loves", "prefers", "is fond of", "is a fan of"},
+        {"dislikes", "hates", "avoids", "is not a fan of"},
+        {"made", "created", "built", "crafted", "prepared", "cooked", "baked"},
+        {"joined", "enrolled in", "signed up for", "registered for"},
+        {"quit", "left", "resigned from", "stopped", "dropped out of"},
+        {"moved to", "relocated to", "settled in", "is moving to"},
+    ]
+
+    # Pre-built lookup: lowercase verb → set of cluster synonyms
+    _VERB_CLUSTER_MAP: dict[str, set[str]] = {}
+    for _cluster in _VERB_CLUSTERS:
+        _lower_cluster = {v.lower() for v in _cluster}
+        for _v in _lower_cluster:
+            _VERB_CLUSTER_MAP[_v] = _lower_cluster
+
     def _expand_verb(self, verb: str) -> list[str] | None:
         """Find semantically similar verbs in the facts DB via embedding similarity.
 
-        Returns list of matching verbs (including original) if expansions found,
-        None if embeddings unavailable or no expansions.
+        Also includes manual synonym clusters for contextual synonyms that
+        embeddings miss.  Returns list of matching verbs (including original)
+        if expansions found, None if no expansions.
         """
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return None
         all_verbs = self._store.get_unique_fact_verbs()
         if not all_verbs:
             return None
-        from .core.math_utils import cosine_similarity
+        all_verbs_lower = {v.lower(): v for v in all_verbs}
 
-        texts = [verb] + all_verbs
-        vectors = embed_fn(texts)
-        query_vec = vectors[0]
-        threshold = 0.53
         matches = [verb]
-        for i, v in enumerate(all_verbs):
-            if v != verb:
-                sim = cosine_similarity(query_vec, vectors[i + 1])
-                if sim >= threshold:
-                    matches.append(v)
+        seen = {verb.lower()}
+
+        # 1. Manual cluster expansion
+        cluster = self._VERB_CLUSTER_MAP.get(verb.lower())
+        if cluster:
+            for synonym in cluster:
+                if synonym not in seen and synonym in all_verbs_lower:
+                    matches.append(all_verbs_lower[synonym])
+                    seen.add(synonym)
+
+        # 2. Embedding-based expansion
+        embed_fn = self._get_embed_fn()
+        if embed_fn is not None:
+            from .core.math_utils import cosine_similarity
+
+            texts = [verb] + all_verbs
+            vectors = embed_fn(texts)
+            query_vec = vectors[0]
+            threshold = 0.53
+            for i, v in enumerate(all_verbs):
+                if v.lower() not in seen:
+                    sim = cosine_similarity(query_vec, vectors[i + 1])
+                    if sim >= threshold:
+                        matches.append(v)
+                        seen.add(v.lower())
+
         return matches if len(matches) > 1 else None
 
     def _semantic_fact_search(
@@ -1932,6 +2034,44 @@ class VirtualContextEngine:
 
         return matches
 
+    def _rerank_facts(self, facts: list, intent_context: str) -> list:
+        """Re-rank *facts* by embedding similarity to the reader's question.
+
+        Extracts the question from *intent_context*, embeds it alongside
+        each fact's ``what`` field, and returns facts sorted by descending
+        cosine similarity.  Falls back to the original order if embeddings
+        are unavailable.
+        """
+        embed_fn = self._get_embed_fn()
+        if embed_fn is None or not facts:
+            return facts
+
+        # Extract just the question from intent_context
+        query_str = intent_context.strip()
+        for _tag in ("</system-reminder>", "</virtual-context>"):
+            if _tag in query_str:
+                query_str = query_str.split(_tag)[-1].strip()
+        m = re.search(r"(?:^|\n)\s*Question:\s*(.+)", query_str, re.IGNORECASE)
+        if m:
+            query_str = m.group(1).strip()
+            query_str = re.sub(r"\s*Answer:\s*$", "", query_str).strip()
+        if not query_str:
+            return facts
+
+        from .core.math_utils import cosine_similarity
+
+        whats = [f.what or f"{f.subject} {f.verb} {f.object}" for f in facts]
+        texts = [query_str] + whats
+        vectors = embed_fn(texts)
+        query_vec = vectors[0]
+
+        scored = []
+        for i, fact in enumerate(facts):
+            sim = cosine_similarity(query_vec, vectors[i + 1])
+            scored.append((sim, fact))
+        scored.sort(key=lambda x: -x[0])
+        return [fact for _, fact in scored]
+
     def remember_when(
         self,
         query: str,
@@ -1974,18 +2114,56 @@ class VirtualContextEngine:
             if len(filtered) >= max_results:
                 break
 
+        # Also query structured facts within the date window.
+        # Return completed experience facts — these are the most relevant
+        # for "what did I do" temporal questions.
+        fact_results: list[dict] = []
+        try:
+            start_str = start.strftime("%Y/%m/%d")
+            end_str = end.strftime("%Y/%m/%d")
+            db = None
+            if hasattr(self._store, "_get_conn"):
+                db = self._store._get_conn()
+            if db is not None:
+                rows = db.execute(
+                    """SELECT subject, verb, object, status, fact_type, what,
+                              when_date, session_date, "where"
+                       FROM facts
+                       WHERE fact_type = 'experience'
+                         AND status = 'completed'
+                         AND session_date >= ? AND session_date <= ?
+                       ORDER BY session_date ASC
+                       LIMIT ?""",
+                    (start_str, end_str + "~", max_results * 5),
+                ).fetchall()
+                for r in rows:
+                    when_str = r[6] or r[7] or ""
+                    fact_results.append({
+                        "type": "fact",
+                        "what": r[5] or f"{r[0]} {r[1]} {r[2]}",
+                        "when": when_str,
+                        "where": r[8] or "",
+                        "status": r[3] or "",
+                    })
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "remember_when fact query failed: %s", exc
+            )
+
         return {
             "query": query,
-            "found": bool(filtered),
+            "found": bool(filtered) or bool(fact_results),
             "range": {
                 "kind": resolved_kind,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
             },
             "results": filtered,
+            "facts_in_window": fact_results,
             "message": (
                 f"No matches for '{query}' in the requested time window."
-                if not filtered else ""
+                if not filtered and not fact_results else ""
             ),
         }
 
@@ -2122,6 +2300,9 @@ class VirtualContextEngine:
             # tool_choice "any" is incompatible with thinking
             if body.get("tool_choice", {}).get("type") == "any":
                 body["tool_choice"] = {"type": "auto"}
+        # Extended thinking: inject reasoning effort for OpenAI Responses API
+        if extended_thinking and provider == "openai-responses":
+            body["reasoning"] = {"effort": "high", "summary": "auto"}
 
         url = adapter.get_url(model)
         headers = adapter.get_headers()

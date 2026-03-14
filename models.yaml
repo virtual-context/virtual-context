@@ -64,6 +64,13 @@ models:
     context_window: 128000
     aliases: [gpt5-codex, codex]
 
+  gpt-5.4:
+    provider: openai
+    input_per_mtok: 2.50
+    output_per_mtok: 15.00
+    context_window: 1050000
+    aliases: [gpt5.4]
+
   gpt-5-mini:
     provider: openai
     input_per_mtok: 0.25

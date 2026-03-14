@@ -196,6 +196,7 @@ def _merge_segment_excerpts(
             match_type=best.match_type,
             similarity=best_similarity,
             session_date=best.session_date,
+            created_at=best.created_at,
         ))
 
         # Append any excerpts we couldn't locate (don't lose data)
@@ -391,6 +392,8 @@ def find_quote(
                     "session": session_date,
                     "session_date_normalized": session_dates_normalized.get(session_date, ""),
                 }
+                if qr.created_at:
+                    entry["created_at"] = qr.created_at
                 if qr.match_type == "semantic":
                     entry["match_type"] = "semantic"
                     entry["similarity"] = qr.similarity
@@ -399,6 +402,8 @@ def find_quote(
                 seen_texts: set[str] = set()
                 merged_parts: list[str] = []
                 topics: list[str] = []
+                group_created = [qr.created_at for qr in group if qr.created_at]
+                earliest_created = min(group_created) if group_created else ""
                 for qr in group:
                     norm = qr.text.strip()
                     if norm not in seen_texts:
@@ -413,6 +418,8 @@ def find_quote(
                     "session_date_normalized": session_dates_normalized.get(session_date, ""),
                     "merged_count": len(merged_parts),
                 }
+                if earliest_created:
+                    entry["created_at"] = earliest_created
                 formatted.append(entry)
         for qr in no_session:
             formatted.append({
@@ -467,6 +474,8 @@ def find_quote(
                 "session": session_date,
                 "session_date_normalized": session_dates_normalized.get(session_date, ""),
             }
+            if qr.created_at:
+                entry["created_at"] = qr.created_at
             if current_state_multi_session:
                 entry["session_recency_rank"] = session_rank
                 if session_rank == 1:
@@ -491,6 +500,9 @@ def find_quote(
                 if qr.segment_ref not in all_refs:
                     all_refs.append(qr.segment_ref)
 
+            # Use earliest created_at from the group for chronological ordering
+            group_created = [qr.created_at for qr in group if qr.created_at]
+            earliest_created = min(group_created) if group_created else ""
             entry = {
                 "excerpt": "\n---\n".join(merged_parts),
                 "topic": ", ".join(topics),
@@ -499,11 +511,16 @@ def find_quote(
                 "session_date_normalized": session_dates_normalized.get(session_date, ""),
                 "merged_count": len(merged_parts),
             }
+            if earliest_created:
+                entry["created_at"] = earliest_created
             if current_state_multi_session:
                 entry["session_recency_rank"] = session_rank
                 if session_rank == 1:
                     entry["priority"] = "HIGHEST_PRIORITY_CURRENT_STATE"
             formatted.append(entry)
+
+    # Sort no-session results chronologically when created_at is available
+    no_session.sort(key=lambda qr: qr.created_at or "")
 
     # Append results with no session date individually
     for qr in no_session:
@@ -512,6 +529,8 @@ def find_quote(
             "topic": qr.tag,
             "segment_ref": qr.segment_ref,
         }
+        if qr.created_at:
+            entry["created_at"] = qr.created_at
         if qr.match_type == "semantic":
             entry["match_type"] = "semantic"
             entry["similarity"] = qr.similarity

@@ -22,6 +22,25 @@ _STOPWORDS = frozenset({
 })
 
 
+def _parse_date_for_comparison(date_str: str):
+    """Parse a date string into a comparable date object. Returns None on failure."""
+    from datetime import date, datetime
+    if not date_str or date_str == "(unknown)":
+        return None
+    # Try YYYY-MM-DD
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(date_str[:10], fmt).date()
+        except ValueError:
+            pass
+    # Try "2023/04/20 (Thu) 04:17" format
+    try:
+        return datetime.strptime(date_str.split("(")[0].strip(), "%Y/%m/%d").date()
+    except ValueError:
+        pass
+    return None
+
+
 def _extract_object_keyword(object_str: str) -> str | None:
     """Extract the most distinctive word from a fact's object string.
 
@@ -83,12 +102,15 @@ class FactSupersessionChecker:
         store: ContextStore,
         config: SupersessionConfig,
         telemetry_ledger: TelemetryLedger | None = None,
+        embed_fn=None,
     ):
         self.llm = llm_provider
         self.model = model
         self.store = store
         self.config = config
         self._telemetry = telemetry_ledger
+        self._embed_fn = embed_fn
+        self._all_facts_cache: list[Fact] | None = None
 
     def check_and_supersede(self, new_facts: list[Fact]) -> int:
         """For each new fact, find candidates by subject, ask LLM, mark superseded.
@@ -98,9 +120,15 @@ class FactSupersessionChecker:
         if not self.config.enabled or not new_facts:
             return 0
 
+        import sys as _sys
+        import time as _time
+        _ss_start = _time.time()
+
         superseded_count = 0
         superseded_this_run: set[str] = set()
         total = len(new_facts)
+        _skipped = 0
+        _llm_calls = 0
         for idx, fact in enumerate(new_facts, 1):
             if fact.id in superseded_this_run:
                 logger.info("  Supersession %d/%d: skipped (already superseded this run)", idx, total)
@@ -136,14 +164,45 @@ class FactSupersessionChecker:
                     if c.id not in seen_ids and kw_pattern.search(c.object):
                         candidates.append(c)
                         seen_ids.add(c.id)
+            # Embedding-based candidates — finds semantically similar facts
+            # regardless of tag overlap or ingestion order.
+            seen_ids = {c.id for c in candidates}
+            embed_candidates = self._embedding_candidates(fact, seen_ids)
+            candidates.extend(embed_candidates)
             candidates = [c for c in candidates if c.id != fact.id and c.id not in superseded_this_run]
             if not candidates:
-                logger.info("  Supersession %d/%d: no candidates for %s", idx, total, fact.subject[:40])
+                _skipped += 1
+                if idx % 100 == 0 or idx == total:
+                    _elapsed = _time.time() - _ss_start
+                    _rate = idx / _elapsed if _elapsed > 0 else 0
+                    _eta = int((total - idx) / _rate) if _rate > 0 else 0
+                    _sys.stderr.write(
+                        f"\r  SUPERSESSION: {idx}/{total} facts | "
+                        f"{superseded_count} superseded | {_skipped} skipped | "
+                        f"{_llm_calls} LLM calls | {_rate:.1f} fact/s | ETA {_eta}s   "
+                    )
+                    _sys.stderr.flush()
                 continue
 
+            _llm_calls += 1
             superseded_ids = self._check_batch(fact, candidates)
             if superseded_ids:
+                # Hard date guard: never supersede a candidate with a newer
+                # session date than the new fact.  The LLM prompt asks for
+                # this but doesn't always comply.
+                cand_by_id = {c.id: c for c in candidates}
+                new_date = _parse_date_for_comparison(fact.when_date or fact.session_date or "")
+                safe_ids = []
                 for old_id in superseded_ids:
+                    old_fact = cand_by_id.get(old_id)
+                    if old_fact:
+                        old_date = _parse_date_for_comparison(old_fact.when_date or old_fact.session_date or "")
+                        if new_date and old_date and old_date > new_date:
+                            logger.info("  Supersession date guard: refusing to supersede newer fact %s (%s > %s)",
+                                        old_id[:8], old_date, new_date)
+                            continue
+                    safe_ids.append(old_id)
+                for old_id in safe_ids:
                     self.store.set_fact_superseded(old_id, fact.id)
                     superseded_this_run.add(old_id)
                     superseded_count += 1
@@ -152,15 +211,62 @@ class FactSupersessionChecker:
             else:
                 logger.info("  Supersession %d/%d: 0 superseded — %s [%d candidates]",
                             idx, total, fact.subject[:40], len(candidates))
-                # NOTE: We intentionally skip _merge_facts() here.
-                # Merging rewrites the winning fact's verb/object/status/what
-                # via an LLM call, which can destroy precise extraction results
-                # (e.g. a planned trip "superseding" a completed trip mutates
-                # the winner into a summary that loses the original event).
-                # The flag alone is sufficient — the old fact is marked dead,
-                # the winner survives with its original extracted fields.
+            # Progress on every LLM call
+            _elapsed = _time.time() - _ss_start
+            _rate = idx / _elapsed if _elapsed > 0 else 0
+            _eta = int((total - idx) / _rate) if _rate > 0 else 0
+            _sys.stderr.write(
+                f"\r  SUPERSESSION: {idx}/{total} facts | "
+                f"{superseded_count} superseded | {_skipped} skipped | "
+                f"{_llm_calls} LLM calls | {_rate:.1f} fact/s | ETA {_eta}s   "
+            )
+            _sys.stderr.flush()
 
+        _sys.stderr.write("\n")
+        _sys.stderr.flush()
         return superseded_count
+
+    def _get_all_facts(self) -> list[Fact]:
+        """Cache all non-superseded facts for embedding search."""
+        if self._all_facts_cache is None:
+            self._all_facts_cache = self.store.query_facts(limit=10000)
+        return self._all_facts_cache
+
+    def _embedding_candidates(
+        self, fact: Fact, already_seen: set[str], top_k: int = 10, threshold: float = 0.5
+    ) -> list[Fact]:
+        """Find semantically similar facts via embedding on the 'what' field."""
+        if self._embed_fn is None:
+            return []
+        query_text = fact.what or f"{fact.subject} {fact.verb} {fact.object}"
+        if not query_text.strip():
+            return []
+
+        all_facts = self._get_all_facts()
+        # Filter to same subject, not already seen
+        pool = [
+            f for f in all_facts
+            if f.id not in already_seen
+            and f.id != fact.id
+            and f.subject and f.subject.lower() == (fact.subject or "").lower()
+        ]
+        if not pool:
+            return []
+
+        from ..core.math_utils import cosine_similarity
+
+        whats = [f.what or f"{f.subject} {f.verb} {f.object}" for f in pool]
+        texts = [query_text] + whats
+        vectors = self._embed_fn(texts)
+        query_vec = vectors[0]
+
+        scored = []
+        for i, f in enumerate(pool):
+            sim = cosine_similarity(query_vec, vectors[i + 1])
+            if sim >= threshold:
+                scored.append((sim, f))
+        scored.sort(key=lambda x: -x[0])
+        return [f for _, f in scored[:top_k]]
 
     def _log_usage(self, detail: str, duration_ms: float = 0.0) -> None:
         if not self._telemetry:
