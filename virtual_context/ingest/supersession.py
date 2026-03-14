@@ -9,7 +9,7 @@ import time
 
 from ..core.store import ContextStore
 from ..core.telemetry import TelemetryLedger
-from ..types import Fact, LLMProvider, SupersessionConfig
+from ..types import Fact, FactLink, LLMProvider, RelationType, SupersessionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -467,3 +467,234 @@ class FactSupersessionChecker:
                 return []
 
         return [candidates[i].id for i in indices if isinstance(i, int) and 0 <= i < len(candidates)]
+
+
+# Valid relation types for link detection
+_VALID_LINK_TYPES = frozenset(rt.value for rt in RelationType)
+
+
+class FactLinkChecker:
+    """Extended supersession checker that also detects inter-fact relationships.
+
+    When ``graph_links=False``, delegates to FactSupersessionChecker.check_and_supersede()
+    (identical to pre-graph behaviour).
+
+    When ``graph_links=True``, uses an expanded prompt to detect all relationship
+    types (SUPERSEDES, CAUSED_BY, PART_OF, CONTRADICTS, SAME_AS, RELATED_TO)
+    and stores them as FactLink objects.
+    """
+
+    def __init__(
+        self,
+        llm_provider: LLMProvider,
+        model: str,
+        store: ContextStore,
+        config: SupersessionConfig,
+        graph_links: bool = False,
+        telemetry_ledger: TelemetryLedger | None = None,
+        embed_fn=None,
+    ):
+        self._supersession = FactSupersessionChecker(
+            llm_provider=llm_provider,
+            model=model,
+            store=store,
+            config=config,
+            telemetry_ledger=telemetry_ledger,
+            embed_fn=embed_fn,
+        )
+        self.store = store
+        self.llm = llm_provider
+        self.model = model
+        self.config = config
+        self.graph_links = graph_links
+        self._telemetry = telemetry_ledger
+
+    def check_and_link(self, new_facts: list[Fact]) -> tuple[int, int]:
+        """Detect supersession and (optionally) inter-fact links.
+
+        Returns ``(links_created, facts_superseded)``.
+        """
+        if not self.config.enabled or not new_facts:
+            return 0, 0
+
+        if not self.graph_links:
+            superseded = self._supersession.check_and_supersede(new_facts)
+            return 0, superseded
+
+        # Graph mode: expanded prompt for all relationship types
+        total_links = 0
+        total_superseded = 0
+
+        for fact in new_facts:
+            if not fact.subject:
+                continue
+
+            candidates = self.store.query_facts(
+                subject=fact.subject,
+                tags=fact.tags if fact.tags else None,
+                limit=self.config.batch_size,
+            )
+            candidates = [c for c in candidates if c.id != fact.id]
+            if not candidates:
+                continue
+
+            try:
+                links, superseded_ids = self._check_links(fact, candidates)
+            except Exception as e:
+                logger.warning("FactLinkChecker LLM call failed: %s", e)
+                continue
+
+            # Handle supersession
+            for old_id in superseded_ids:
+                self.store.set_fact_superseded(old_id, fact.id)
+                total_superseded += 1
+
+            # Store links
+            if links:
+                self.store.store_fact_links(links)
+                total_links += len(links)
+
+        return total_links, total_superseded
+
+    def _check_links(
+        self, new_fact: Fact, candidates: list[Fact],
+    ) -> tuple[list[FactLink], list[str]]:
+        """Ask LLM to identify relationships between new fact and candidates.
+
+        Returns ``(fact_links, superseded_fact_ids)``.
+        """
+        prompt = self._build_link_prompt(new_fact, candidates)
+        t0 = time.time()
+        response, _usage = self.llm.complete(
+            system="You are a fact relationship assistant. Respond only with JSON.",
+            user=prompt,
+            max_tokens=500,
+        )
+        duration_ms = (time.time() - t0) * 1000
+        if self._telemetry:
+            usage = getattr(self.llm, "last_usage", {})
+            input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+            if input_tokens or output_tokens:
+                self._telemetry.log(
+                    component="fact_link_checker",
+                    model=self.model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    duration_ms=duration_ms,
+                    detail="check_links",
+                )
+
+        return self._parse_link_response(response, new_fact, candidates)
+
+    def _build_link_prompt(self, new_fact: Fact, candidates: list[Fact]) -> str:
+        lines = [
+            "A new fact has been extracted from a conversation:",
+            f"  N0: Subject={new_fact.subject}, Verb={new_fact.verb}, "
+            f"Object={new_fact.object}, Status={new_fact.status}",
+        ]
+        if new_fact.what:
+            lines.append(f"      What: {new_fact.what}")
+        lines.append("")
+        lines.append("Existing facts:")
+        for i, c in enumerate(candidates):
+            line = f"  E{i}: Subject={c.subject}, Verb={c.verb}, Object={c.object}, Status={c.status}"
+            if c.what:
+                line += f" — {c.what}"
+            lines.append(line)
+        lines.append("")
+        lines.append(
+            "Identify relationships between facts. Reply with JSON:\n"
+            '{"superseded": [indices of existing facts superseded by N0],\n'
+            ' "links": [{"source": "N0 or E<i>", "target": "N0 or E<i>", '
+            '"relation": "<type>", "confidence": 0.0-1.0, "context": "one sentence"}]}\n\n'
+            "Valid relation types: supersedes, caused_by, part_of, contradicts, same_as, related_to\n\n"
+            "Rules:\n"
+            "- supersedes: N0 replaces an existing fact (knowledge update)\n"
+            "- caused_by: one fact happened because of another\n"
+            "- part_of: one fact is a component/aspect of another\n"
+            "- contradicts: facts conflict but neither replaces the other\n"
+            "- same_as: facts refer to the same entity/event with different names\n"
+            "- related_to: clear relationship that doesn't fit above types\n"
+            "- Only create links when clear from context. Prefer no link over a weak one.\n"
+            '- Reply {"superseded": [], "links": []} if no relationships found.'
+        )
+        return "\n".join(lines)
+
+    def _parse_link_response(
+        self, response: str | None, new_fact: Fact, candidates: list[Fact],
+    ) -> tuple[list[FactLink], list[str]]:
+        """Parse LLM response into FactLink objects and superseded IDs."""
+        if not response:
+            return [], []
+
+        text = response.strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            # Try to find JSON object in response
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if not match:
+                return [], []
+            try:
+                data = json.loads(match.group())
+            except (json.JSONDecodeError, ValueError):
+                return [], []
+
+        if not isinstance(data, dict):
+            return [], []
+
+        # Parse superseded indices
+        superseded_raw = data.get("superseded", [])
+        superseded_ids = []
+        if isinstance(superseded_raw, list):
+            for idx in superseded_raw:
+                if isinstance(idx, int) and 0 <= idx < len(candidates):
+                    superseded_ids.append(candidates[idx].id)
+
+        # Parse links
+        links_raw = data.get("links", [])
+        fact_links: list[FactLink] = []
+        if isinstance(links_raw, list):
+            for link_data in links_raw:
+                if not isinstance(link_data, dict):
+                    continue
+                relation = link_data.get("relation", "").lower()
+                if relation not in _VALID_LINK_TYPES:
+                    continue
+
+                source_ref = str(link_data.get("source", ""))
+                target_ref = str(link_data.get("target", ""))
+                source_id = self._resolve_ref(source_ref, new_fact, candidates)
+                target_id = self._resolve_ref(target_ref, new_fact, candidates)
+
+                if not source_id or not target_id or source_id == target_id:
+                    continue
+
+                fact_links.append(FactLink(
+                    source_fact_id=source_id,
+                    target_fact_id=target_id,
+                    relation_type=relation,
+                    confidence=float(link_data.get("confidence", 0.8)),
+                    context=str(link_data.get("context", "")),
+                    created_by="compaction",
+                ))
+
+        return fact_links, superseded_ids
+
+    @staticmethod
+    def _resolve_ref(ref: str, new_fact: Fact, candidates: list[Fact]) -> str | None:
+        """Resolve 'N0' or 'E<i>' to a fact ID."""
+        ref = ref.strip().upper()
+        if ref == "N0":
+            return new_fact.id
+        if ref.startswith("E"):
+            try:
+                idx = int(ref[1:])
+                if 0 <= idx < len(candidates):
+                    return candidates[idx].id
+            except ValueError:
+                pass
+        return None
