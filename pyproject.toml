@@ -23,8 +23,9 @@ tiktoken = ["tiktoken>=0.7"]
 bridge = ["uvicorn>=0.30", "fastapi>=0.115"]
 mcp = ["mcp>=1.0"]
 tui = ["textual>=3.0", "rich>=13.0"]
+postgres = ["psycopg[binary]>=3.1"]
 all = [
-    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,mcp,tui]",
+    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,mcp,tui,postgres]",
 ]
 dev = [
     "pytest>=8.0",

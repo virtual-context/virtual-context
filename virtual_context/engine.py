@@ -211,6 +211,14 @@ class VirtualContextEngine:
                 segments=sqlite, facts=sqlite, fact_links=fact_links,
                 state=sqlite, search=sqlite,
             )
+        elif self.config.storage.backend == "postgres":
+            from .storage.postgres import PostgresStore
+            pg = PostgresStore(dsn=self.config.storage.postgres_dsn)
+            fact_links = pg if self.config.facts.graph_links else NoopFactLinkStore()
+            self._store = CompositeStore(
+                segments=pg, facts=pg, fact_links=fact_links,
+                state=pg, search=pg,
+            )
         elif self.config.storage.backend == "filesystem":
             fs = FilesystemStore(root=self.config.storage.root)
             self._store = CompositeStore(
