@@ -68,6 +68,39 @@ class Fact:
     superseded_by: str | None = None  # fact_id that replaces this fact
 
 
+class RelationType(str, Enum):
+    """Supported relationship types between facts."""
+    SUPERSEDES = "supersedes"
+    CAUSED_BY = "caused_by"
+    PART_OF = "part_of"
+    CONTRADICTS = "contradicts"
+    SAME_AS = "same_as"
+    RELATED_TO = "related_to"
+
+
+@dataclass
+class FactLink:
+    """A directed relationship between two facts."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    source_fact_id: str = ""
+    target_fact_id: str = ""
+    relation_type: str = ""         # RelationType value
+    confidence: float = 1.0         # 0.0-1.0
+    context: str = ""               # one-sentence explanation
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = "compaction"  # "compaction" | "supersession" | "migration"
+
+
+@dataclass
+class LinkedFact:
+    """A Fact returned as part of a link traversal result."""
+    fact: Fact
+    linked_from_fact_id: str = ""   # which primary fact this is linked to
+    relation_type: str = ""
+    confidence: float = 1.0
+    link_context: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Message & Turn
 # ---------------------------------------------------------------------------
