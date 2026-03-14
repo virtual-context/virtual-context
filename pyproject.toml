@@ -25,8 +25,9 @@ mcp = ["mcp>=1.0"]
 tui = ["textual>=3.0", "rich>=13.0"]
 postgres = ["psycopg[binary]>=3.1"]
 neo4j = ["neo4j>=5.0"]
+falkordb = ["falkordb>=1.0"]
 all = [
-    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,mcp,tui,postgres,neo4j]",
+    "virtual-context[anthropic,openai,embeddings,tiktoken,bridge,mcp,tui,postgres,neo4j,falkordb]",
 ]
 dev = [
     "pytest>=8.0",
