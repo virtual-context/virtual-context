@@ -620,7 +620,7 @@ class SummarizationConfig:
 @dataclass
 class FactsConfig:
     """Configuration for fact features."""
-    graph_links: bool = False
+    graph_links: bool = True
     link_types: list[str] = field(default_factory=lambda: [
         "supersedes", "caused_by", "part_of", "contradicts", "same_as", "related_to",
     ])
