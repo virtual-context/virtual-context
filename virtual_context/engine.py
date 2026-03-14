@@ -235,6 +235,22 @@ class VirtualContextEngine:
                 segments=fallback, facts=neo, fact_links=neo,
                 state=fallback, search=fallback,
             )
+        elif self.config.storage.backend == "falkordb":
+            from .storage.falkordb import FalkorDBFactStore
+            fdb = FalkorDBFactStore(
+                host=self.config.storage.falkordb_host,
+                port=self.config.storage.falkordb_port,
+                password=self.config.storage.falkordb_password,
+            )
+            if self.config.storage.postgres_dsn:
+                from .storage.postgres import PostgresStore
+                fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
+            else:
+                fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            self._store = CompositeStore(
+                segments=fallback, facts=fdb, fact_links=fdb,
+                state=fallback, search=fallback,
+            )
         elif self.config.storage.backend == "filesystem":
             fs = FilesystemStore(root=self.config.storage.root)
             self._store = CompositeStore(
