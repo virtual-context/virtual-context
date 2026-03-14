@@ -696,8 +696,8 @@ class PostgresStore(ContextStore):
             for row in rows:
                 meta = json.loads(row["metadata_json"])
                 results.append(QuoteResult(
-                    ref=row["ref"], tag=row["primary_tag"],
-                    excerpt=_extract_excerpt(row["full_text"], query),
+                    text=_extract_excerpt(row["full_text"], query),
+                    tag=row["primary_tag"], segment_ref=row["ref"],
                     session_date=meta.get("session_date", ""),
                     match_type="text_search",
                 ))
@@ -707,8 +707,8 @@ class PostgresStore(ContextStore):
         for row in rows:
             meta = json.loads(row["metadata_json"])
             results.append(QuoteResult(
-                ref=row["ref"], tag=row["primary_tag"],
-                excerpt=row["excerpt"],
+                text=row["excerpt"], tag=row["primary_tag"],
+                segment_ref=row["ref"],
                 session_date=meta.get("session_date", ""),
                 match_type="fts",
             ))
@@ -763,7 +763,7 @@ class PostgresStore(ContextStore):
         except Exception:
             return []
         return [
-            QuoteResult(ref=row["ref"], tag=row["tool_name"], excerpt=row["excerpt"], session_date="", match_type="tool_output")
+            QuoteResult(text=row["excerpt"], tag=row["tool_name"], segment_ref=row["ref"], session_date="", match_type="tool_output")
             for row in rows
         ]
 
