@@ -618,10 +618,29 @@ class SummarizationConfig:
 
 
 @dataclass
+class FactsConfig:
+    """Configuration for fact features."""
+    graph_links: bool = False
+    link_types: list[str] = field(default_factory=lambda: [
+        "supersedes", "caused_by", "part_of", "contradicts", "same_as", "related_to",
+    ])
+
+
+@dataclass
 class StorageConfig:
     backend: str = "sqlite"
     root: str = ".virtualcontext/store"
     sqlite_path: str = ".virtualcontext/store.db"
+    # Postgres
+    postgres_dsn: str = ""
+    # Neo4j
+    neo4j_uri: str = ""
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+    # FalkorDB
+    falkordb_host: str = "localhost"
+    falkordb_port: int = 6379
+    falkordb_password: str = ""
 
 
 @dataclass
@@ -717,6 +736,7 @@ class VirtualContextConfig:
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
+    facts: FactsConfig = field(default_factory=FactsConfig)
     supersession: SupersessionConfig = field(default_factory=SupersessionConfig)
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)

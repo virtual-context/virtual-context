@@ -212,3 +212,16 @@ class CompositeStore:
 
     def search_tool_outputs(self, query: str, limit: int = 5) -> list:
         return self._search.search_tool_outputs(query, limit=limit)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Close all unique sub-stores that support close()."""
+        closed: set[int] = set()
+        for sub in (self._segments, self._facts, self._fact_links, self._state, self._search):
+            sid = id(sub)
+            if sid not in closed and hasattr(sub, "close"):
+                sub.close()
+                closed.add(sid)

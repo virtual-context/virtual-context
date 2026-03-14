@@ -200,11 +200,25 @@ class VirtualContextEngine:
         )
 
     def _init_store(self) -> None:
-        """Initialize the storage backend."""
+        """Initialize the storage backend via CompositeStore."""
+        from .core.composite_store import CompositeStore
+        from .storage.noop_fact_link_store import NoopFactLinkStore
+
         if self.config.storage.backend == "sqlite":
-            self._store = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            sqlite = SQLiteStore(db_path=self.config.storage.sqlite_path)
+            fact_links = sqlite if self.config.facts.graph_links else NoopFactLinkStore()
+            self._store = CompositeStore(
+                segments=sqlite, facts=sqlite, fact_links=fact_links,
+                state=sqlite, search=sqlite,
+            )
+        elif self.config.storage.backend == "filesystem":
+            fs = FilesystemStore(root=self.config.storage.root)
+            self._store = CompositeStore(
+                segments=fs, facts=fs, fact_links=NoopFactLinkStore(),
+                state=fs, search=fs,
+            )
         else:
-            self._store = FilesystemStore(root=self.config.storage.root)
+            raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
     def _init_monitor(self) -> None:
         self._monitor = ContextMonitor(
