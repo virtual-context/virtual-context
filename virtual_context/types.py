@@ -67,6 +67,31 @@ class Fact:
     # Knowledge update chain
     superseded_by: str | None = None  # fact_id that replaces this fact
 
+    def format_for_prompt(self, include_index: int | None = None) -> str:
+        """Canonical one-line rendering for LLM prompts.
+
+        Used by the assembler, curator, supersession checker, and any other
+        component that presents facts to an LLM.  All fields are included
+        so no consumer silently drops dimensions.
+        """
+        prefix = f"[{include_index}] " if include_index is not None else "- "
+        line = f"{prefix}{self.subject} | {self.verb} | {self.object}"
+        if self.what:
+            line += f" — {self.what}"
+        if self.who and self.who.lower() != self.subject.lower():
+            line += f" [who: {self.who}]"
+        if self.when_date:
+            line += f" [when: {self.when_date}]"
+        elif self.session_date:
+            line += f" [session: {self.session_date}]"
+        if self.where:
+            line += f" [where: {self.where}]"
+        if self.why:
+            line += f" [why: {self.why}]"
+        if self.status and self.status != "active":
+            line += f" [status: {self.status}]"
+        return line
+
 
 class RelationType(str, Enum):
     """Supported relationship types between facts."""

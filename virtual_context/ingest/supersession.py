@@ -69,18 +69,10 @@ State what IS true now as durable knowledge. Do not echo the original \
 conversational phrasing — restate the facts in neutral, declarative language.
 
 SUPERSEDED (old) fact:
-  Subject: {old_subject}
-  Verb: {old_verb}
-  Object: {old_object}
-  Status: {old_status}
-  What: {old_what}
+  {old_formatted}
 
 CURRENT (new) fact:
-  Subject: {new_subject}
-  Verb: {new_verb}
-  Object: {new_object}
-  Status: {new_status}
-  What: {new_what}
+  {new_formatted}
 
 Produce a merged fact with updated fields:
 - "verb": a declarative verb describing the current state (e.g. "has", "holds", "improved")
@@ -90,6 +82,138 @@ Produce a merged fact with updated fields:
 
 Reply with JSON: {{"verb": "...", "object": "...", "status": "...", "what": "..."}}\
 """
+
+
+_PROMOTE_SYSTEM = "You are a memory rewrite assistant. Respond only with JSON."
+
+_PROMOTE_PROMPT = """\
+A planned event's date has passed. Rewrite this fact as a completed event.
+
+Original fact:
+  Subject: {subject}
+  Verb: {verb}
+  Object: {object}
+  Who: {who}
+  What: {what}
+  Planned date: {when_date}
+
+The date {when_date} is now in the past (current date: {ref_date}). \
+Rewrite the fact as something that happened, not something that was planned. \
+Preserve who was involved (the "Who" field) in the rewritten text.
+
+Produce updated fields:
+- "verb": a past-tense action verb (e.g. "played", "attended", "went to")
+- "object": the object with planning language removed
+- "what": one sentence stating what happened, in past tense, including who was involved
+
+Reply with JSON: {{"verb": "...", "object": "...", "what": "..."}}\
+"""
+
+
+def promote_planned_facts(
+    store: ContextStore,
+    reference_date: str = "",
+    llm_provider: LLMProvider | None = None,
+    model: str = "",
+) -> int:
+    """Promote 'planned' facts whose when_date has passed to 'completed'.
+
+    When a fact has status='planned' and a concrete when_date that is before
+    the reference_date (or today if not provided), its status is updated to
+    'completed' and verb/what are rewritten via LLM to reflect past tense.
+
+    Falls back to a simple status flip if no LLM provider is available.
+
+    Returns the number of facts promoted.
+    """
+    from datetime import date, datetime
+
+    ref = None
+    if reference_date:
+        ref = _parse_date_for_comparison(reference_date)
+    if ref is None:
+        ref = date.today()
+
+    planned = store.query_facts(status="planned", limit=10000)
+    promoted = 0
+    for fact in planned:
+        fact_date = _parse_date_for_comparison(fact.when_date or "")
+        if fact_date and fact_date < ref:
+            verb = fact.verb
+            obj = fact.object
+            what = fact.what or ""
+
+            # LLM rewrite for clean past-tense text
+            if llm_provider:
+                prompt = _PROMOTE_PROMPT.format(
+                    subject=fact.subject, verb=fact.verb,
+                    object=fact.object, who=fact.who or "",
+                    what=fact.what or "",
+                    when_date=fact.when_date or str(fact_date),
+                    ref_date=ref.isoformat(),
+                )
+                try:
+                    response, _ = llm_provider.complete(
+                        system=_PROMOTE_SYSTEM, user=prompt, max_tokens=200,
+                    )
+                    cleaned = re.sub(r"<think>.*?</think>", "", response.strip(), flags=re.DOTALL).strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+                    if cleaned.endswith("```"):
+                        cleaned = cleaned[:-3]
+                    cleaned = cleaned.strip()
+                    if cleaned.startswith("json"):
+                        cleaned = cleaned[4:].strip()
+                    data = json.loads(cleaned)
+                    verb = data.get("verb", verb)
+                    obj = data.get("object", obj)
+                    what = data.get("what", what)
+                except Exception as e:
+                    logger.warning("Planned fact rewrite failed, using status-only: %s", e)
+
+            store.update_fact_fields(fact.id, verb=verb, object=obj, status="completed", what=what)
+            promoted += 1
+            logger.info(
+                "Promoted planned→completed: %s %s → %s %s [when: %s]",
+                fact.subject, fact.verb, verb, obj[:40], fact.when_date,
+            )
+    if promoted:
+        logger.info("Promoted %d planned facts to completed (ref date: %s)", promoted, ref.isoformat())
+    return promoted
+
+
+def dedup_facts(store: ContextStore) -> int:
+    """Remove exact-duplicate facts from the store.
+
+    Groups non-superseded facts by (subject, verb, object, what) and marks
+    duplicates as superseded by the first occurrence.  Only considers facts
+    with non-empty 'what' to avoid collapsing distinct facts that happen to
+    share subject+verb but differ in meaning.
+
+    Storage-agnostic — works with any ContextStore implementation.
+
+    Returns the number of duplicates removed.
+    """
+    all_facts = store.query_facts(limit=50000)
+    groups: dict[tuple, list[Fact]] = {}
+    for f in all_facts:
+        if f.superseded_by or not f.what:
+            continue
+        key = (f.subject.lower(), f.verb.lower(), f.object.lower(), f.what.lower())
+        groups.setdefault(key, []).append(f)
+
+    deduped = 0
+    for key, facts in groups.items():
+        if len(facts) <= 1:
+            continue
+        keeper = facts[0]
+        for dupe in facts[1:]:
+            store.set_fact_superseded(dupe.id, keeper.id)
+            deduped += 1
+
+    if deduped:
+        logger.info("Deduped %d exact-duplicate facts", deduped)
+    return deduped
 
 
 class FactSupersessionChecker:
@@ -305,25 +429,14 @@ class FactSupersessionChecker:
         return self._parse_response(response, candidates)
 
     def _build_prompt(self, new_fact: Fact, candidates: list[Fact]) -> str:
-        new_date = new_fact.when_date or "(unknown)"
         lines = [
             "A new fact has been extracted from a conversation:",
-            f"  Subject: {new_fact.subject}",
-            f"  Verb: {new_fact.verb}",
-            f"  Object: {new_fact.object}",
-            f"  Status: {new_fact.status}",
-            f"  Session date: {new_date}",
+            f"  {new_fact.format_for_prompt()}",
+            "",
+            "Existing facts with the same subject:",
         ]
-        if new_fact.what:
-            lines.append(f"  What: {new_fact.what}")
-        lines.append("")
-        lines.append("Existing facts with the same subject:")
         for i, c in enumerate(candidates):
-            c_date = c.when_date or "(unknown)"
-            line = f"  [{i}] (session: {c_date}) {c.verb} {c.object} (status: {c.status})"
-            if c.what:
-                line += f" — {c.what}"
-            lines.append(line)
+            lines.append(f"  {c.format_for_prompt(include_index=i)}")
         lines.append("")
         lines.append(
             "Which existing facts (by index) are CONTRADICTED, SUPERSEDED, or "
@@ -356,16 +469,8 @@ class FactSupersessionChecker:
         the temporal transition as durable knowledge.
         """
         prompt = _MERGE_PROMPT.format(
-            old_subject=old_fact.subject,
-            old_verb=old_fact.verb,
-            old_object=old_fact.object,
-            old_status=old_fact.status,
-            old_what=old_fact.what or f"{old_fact.subject} {old_fact.verb} {old_fact.object}",
-            new_subject=winning_fact.subject,
-            new_verb=winning_fact.verb,
-            new_object=winning_fact.object,
-            new_status=winning_fact.status,
-            new_what=winning_fact.what or f"{winning_fact.subject} {winning_fact.verb} {winning_fact.object}",
+            old_formatted=old_fact.format_for_prompt(),
+            new_formatted=winning_fact.format_for_prompt(),
         )
         try:
             response, _ = self.llm.complete(
@@ -512,10 +617,16 @@ class FactLinkChecker:
     def check_and_link(self, new_facts: list[Fact]) -> tuple[int, int]:
         """Detect supersession and (optionally) inter-fact links.
 
+        Runs a deterministic planned→completed promotion pass first,
+        then LLM-based supersession/linking.
+
         Returns ``(links_created, facts_superseded)``.
         """
         if not self.config.enabled or not new_facts:
             return 0, 0
+
+        # Pre-pass: promote planned facts whose date has passed (LLM rewrite)
+        promote_planned_facts(self.store, llm_provider=self.llm, model=self.model)
 
         if not self.graph_links:
             superseded = self._supersession.check_and_supersede(new_facts)
@@ -590,18 +701,12 @@ class FactLinkChecker:
     def _build_link_prompt(self, new_fact: Fact, candidates: list[Fact]) -> str:
         lines = [
             "A new fact has been extracted from a conversation:",
-            f"  N0: Subject={new_fact.subject}, Verb={new_fact.verb}, "
-            f"Object={new_fact.object}, Status={new_fact.status}",
+            f"  N0: {new_fact.format_for_prompt()}",
+            "",
+            "Existing facts:",
         ]
-        if new_fact.what:
-            lines.append(f"      What: {new_fact.what}")
-        lines.append("")
-        lines.append("Existing facts:")
         for i, c in enumerate(candidates):
-            line = f"  E{i}: Subject={c.subject}, Verb={c.verb}, Object={c.object}, Status={c.status}"
-            if c.what:
-                line += f" — {c.what}"
-            lines.append(line)
+            lines.append(f"  E{i}: {c.format_for_prompt()}")
         lines.append("")
         lines.append(
             "Identify relationships between facts. Reply with JSON:\n"
