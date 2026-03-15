@@ -236,13 +236,7 @@ class ContextAssembler:
         wrapper_overhead = self.token_counter("<facts>\n</facts>")
         tokens_used += wrapper_overhead
         for fact in facts:
-            line = f"- {fact.subject} | {fact.verb} | {fact.object}"
-            if fact.what:
-                line += f" — {fact.what}"
-            if fact.when_date:
-                line += f" [when: {fact.when_date}]"
-            elif fact.session_date:
-                line += f" [session: {fact.session_date}]"
+            line = fact.format_for_prompt()
             line_tokens = self.token_counter(line)
             if tokens_used + line_tokens > max_tokens:
                 break

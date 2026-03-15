@@ -121,9 +121,17 @@ For "related_tags", generate 3-8 alternate terms someone might use to refer to t
 concepts later (e.g. if discussing "materialized views", related_tags might include
 "caching", "precomputed", "feed-optimization", "query-cache").
 
-Also extract facts from the conversation. For each fact:
+Also extract facts from the RAW CONVERSATION TEXT above (not from your summary).
+The summary may omit details — facts must capture ALL substantive information
+from every speaker in the conversation, even details not included in the summary.
+For each fact:
 - "subject": who (usually "user"; proper names for others)
-- "verb": the exact action verb (e.g. "led", "built", "prefers", "lives in", "ordered")
+- "verb": the EXACT action verb from the conversation text (e.g. "led", "built", "prefers", "lives in", "ordered")
+  VERB RULE: Use the verb that matches the actual event described.
+  When someone says "we were given X", the verb is "were given" — NOT "mentioned" or "discussed".
+  When someone says "I went to X", the verb is "went to" — NOT "talked about".
+  Only use "mentioned"/"discussed" when the conversation is genuinely about referencing
+  something without doing it (e.g. "I mentioned to my boss..." or "we talked about maybe going...").
 - "object": what (specific noun phrase — preserve ALL numbers, names, dates, amounts exactly)
   For experience facts: derive the object from the user's own declarative sentence
   ("I went to X", "I visited X", "I got back from X"). A place or activity mentioned
@@ -134,7 +142,9 @@ Also extract facts from the conversation. For each fact:
   "world" (facts about other people, places, things in the user's world)
 - "what": one full sentence capturing the complete fact with ALL specifics preserved.
   WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
-- "who": people involved (populate when present, empty string if n/a)
+- "who": ALL people involved (populate when present, empty string if n/a)
+  WHO RULE: Resolve pronouns. "We" in a speaker's message means the speaker + someone.
+  Use preceding context to determine who. If unclear, write "speaker and companion".
 - "when": the calendar date this event occurred, resolved from context.
   DATE RULES — use SESSION DATE ({session_date}) as your reference point:
   "today" / "this morning" / "just now" → use {session_date}.
@@ -152,6 +162,10 @@ When the same event is disclosed directly in the current turn AND referenced in 
 as the primary source, enriched with any additional detail from the reference.
 Extract the FACT behind the question, not the conversational act.
 WRONG: "user asks about Cairo restaurants" RIGHT: "user wants to try authentic Egyptian food in Cairo"
+Extract both EXPLICIT and IMPLIED facts. When someone refers to "the last photo/time
+with someone", "sadly the last time together", "I'm sorry for your loss" — extract the
+implied fact (e.g. the person passed away). When someone says "we were given a game" —
+extract both the receiving and the implied playing.
 If two signals describe the same event, emit one fact with the richest details.
 Include "facts" in the JSON response.
 Only extract facts with genuine substance. Skip greetings and filler."""
@@ -199,9 +213,30 @@ class DomainCompactor:
             "Compacting %d segments (%d workers)...",
             len(segments), min(self.config.max_concurrent_summaries, len(segments)),
         )
+        # Build preceding-conversation context for pronoun resolution.
+        # Each segment gets the raw text of the preceding segments (up to
+        # ~5000 chars) so the compactor can resolve pronouns like "we",
+        # "they", "he/she" using nearby conversational context.
+        _MAX_CONTEXT_CHARS = 5000
+        prev_contexts: list[str] = [""]  # first segment has no predecessor
+        for i in range(1, len(segments)):
+            parts: list[str] = []
+            total_chars = 0
+            for j in range(i - 1, -1, -1):
+                part = self._format_conversation(segments[j].messages)
+                if total_chars + len(part) > _MAX_CONTEXT_CHARS:
+                    # Add truncated tail of this segment to fill remaining budget
+                    remaining = _MAX_CONTEXT_CHARS - total_chars
+                    if remaining > 200:
+                        parts.insert(0, part[-remaining:])
+                    break
+                parts.insert(0, part)
+                total_chars += len(part)
+            prev_contexts.append("\n---\n".join(parts))
+
         if len(segments) <= 1:
             # Sequential for single segment — no threading overhead
-            return [self._compact_one(s, signals.get(s.id, [])) for s in segments]
+            return [self._compact_one(s, signals.get(s.id, []), prev_context=prev_contexts[0]) for s in segments]
 
         max_workers = min(self.config.max_concurrent_summaries, len(segments))
 
@@ -212,7 +247,8 @@ class DomainCompactor:
         _compact_start = _time.time()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
-                executor.submit(self._compact_one, segment, signals.get(segment.id, [])): i
+                executor.submit(self._compact_one, segment, signals.get(segment.id, []),
+                                prev_context=prev_contexts[i]): i
                 for i, segment in enumerate(segments)
             }
             for future in as_completed(future_to_idx):
@@ -257,6 +293,7 @@ class DomainCompactor:
 
     def _compact_one(
         self, segment: TaggedSegment, fact_signals: list[FactSignal] | None = None,
+        prev_context: str = "",
     ) -> CompactionResult:
         """Summarize a single segment."""
         conversation_text = self._format_conversation(segment.messages)
@@ -289,10 +326,20 @@ class DomainCompactor:
                     + "\n".join(hint_lines)
                 )
 
+        # Previous segment context for pronoun resolution
+        context_block = ""
+        if prev_context:
+            context_block = (
+                f"Previous conversation context (use ONLY for resolving pronouns "
+                f"like 'we', 'they', 'he', 'she' — do NOT summarize this):\n"
+                f"{prev_context}\n\n"
+            )
+
         if custom_prompt:
             prompt = (
                 f"{custom_prompt}\n\n"
                 f"Target length: {target_tokens} tokens or fewer.\n\n"
+                f"{context_block}"
                 f"Conversation:\n{conversation_text}"
                 f"{signals_text}\n\n"
                 'Respond with JSON: {{"summary": "...", "entities": ["..."], '
@@ -305,7 +352,7 @@ class DomainCompactor:
             prompt = DEFAULT_SUMMARY_PROMPT.format(
                 tags=tags_str,
                 target_tokens=target_tokens,
-                conversation_text=conversation_text,
+                conversation_text=context_block + conversation_text,
                 session_date=segment.session_date or "",
             )
             if signals_text:
