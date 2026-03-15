@@ -151,6 +151,14 @@ class AnthropicAdapter(ProviderAdapter):
         super().__init__(api_key, api_url or "https://api.anthropic.com/v1/messages")
 
     def get_headers(self) -> dict:
+        # OAuth tokens (sk-ant-oat*) use Bearer auth + beta header
+        if self.api_key.startswith("sk-ant-oat"):
+            return {
+                "Authorization": f"Bearer {self.api_key}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+                "content-type": "application/json",
+            }
         return {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",

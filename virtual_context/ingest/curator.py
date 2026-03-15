@@ -13,8 +13,11 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM = (
     "You are a memory relevance assistant. "
-    "Given a user question and a list of personal facts, identify which facts "
-    "could possibly be relevant to answering the question. "
+    "Given a user question and a list of personal facts, identify ALL facts "
+    "that might be even tangentially relevant to answering the question. "
+    "Be INCLUSIVE — when in doubt, include the fact. It is much better to "
+    "include a marginally relevant fact than to exclude one that turns out "
+    "to be needed. "
     "Respond only with the fact numbers, comma-separated (e.g. '0, 3, 7'). "
     "No explanation. If none are relevant, respond with an empty string."
 )
@@ -84,15 +87,7 @@ class FactCurator:
         return [facts[i] for i in selected]
 
     def _format_facts(self, facts: list[Fact]) -> str:
-        lines = []
-        for i, f in enumerate(facts):
-            line = f"[{i}] {f.verb} | {f.object}"
-            if f.when_date:
-                line += f" [when: {f.when_date}]"
-            elif f.session_date:
-                line += f" [session: {f.session_date}]"
-            lines.append(line)
-        return "\n".join(lines)
+        return "\n".join(f.format_for_prompt(include_index=i) for i, f in enumerate(facts))
 
     def _parse_response(self, response: str, total: int) -> list[int]:
         # Strip thinking tags (e.g. Qwen3)
