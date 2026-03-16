@@ -244,12 +244,20 @@ class ProxyMetrics:
                     req["enriched"] = body
                     return
 
-    def capture_response(self, turn: int, body: dict) -> None:
-        """Capture the LLM response body."""
+    def capture_response(
+        self, turn: int, body: dict, *,
+        upstream_input_tokens: int = 0,
+        upstream_output_tokens: int = 0,
+    ) -> None:
+        """Capture the LLM response body and upstream token usage."""
         with self._lock:
             for req in self._request_bodies:
                 if req["turn"] == turn:
                     req["response"] = body
+                    if upstream_input_tokens:
+                        req["upstream_input_tokens"] = upstream_input_tokens
+                    if upstream_output_tokens:
+                        req["upstream_output_tokens"] = upstream_output_tokens
                     return
 
     def update_request_tags(
@@ -290,6 +298,8 @@ class ProxyMetrics:
                 "turns_dropped": r.get("turns_dropped", 0),
                 "turns_stubbed": r.get("turns_stubbed", 0),
                 "message_preview": r.get("message_preview", ""),
+                "upstream_input_tokens": r.get("upstream_input_tokens", 0),
+                "upstream_output_tokens": r.get("upstream_output_tokens", 0),
             } for r in self._request_bodies]
 
     def restore_request_captures(self, captures: list[dict]) -> None:

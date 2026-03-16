@@ -160,9 +160,10 @@ async def _handle_streaming(
     resp_headers.setdefault("x-accel-buffering", "no")
 
     # ----- shared post-stream processing -----
-    def _post_stream(text_chunks, raw_events):
+    def _post_stream(text_chunks, raw_events, usage=None):
         """Return (assistant_text, upstream_ms) and handle side-effects."""
         nonlocal t_upstream
+        _usage = usage or {}
         upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
         if metrics:
             metrics.record({
@@ -177,10 +178,12 @@ async def _handle_streaming(
         assistant_text = "".join(text_chunks)
         # Capture response for dashboard inspector
         if metrics:
-            metrics.capture_response(turn, {
-                "streaming": True,
-                "assistant_text": assistant_text,
-            })
+            metrics.capture_response(
+                turn,
+                {"streaming": True, "assistant_text": assistant_text},
+                upstream_input_tokens=_usage.get("input_tokens", 0),
+                upstream_output_tokens=_usage.get("output_tokens", 0),
+            )
         # Log upstream LLM call to telemetry ledger
         if state and hasattr(state.engine, '_telemetry'):
             _model = body.get("model", "unknown")
@@ -234,6 +237,7 @@ async def _handle_streaming(
             current_text_parts: list[str] = []
             suppressed_raw: list[bytes] = []
             need_continuation = False
+            _stream_usage: dict = {}  # accumulate input/output tokens
 
             try:
                 async for raw_chunk in upstream.aiter_bytes():
@@ -255,6 +259,12 @@ async def _handle_streaming(
                             continue
 
                         dtype = data.get("type", "")
+
+                        # -- message_start: extract input_tokens --
+                        if dtype == "message_start":
+                            msg_usage = data.get("message", {}).get("usage", {})
+                            if "input_tokens" in msg_usage:
+                                _stream_usage["input_tokens"] = msg_usage["input_tokens"]
 
                         # -- content_block_start --
                         if dtype == "content_block_start":
@@ -332,8 +342,11 @@ async def _handle_streaming(
                                     current_text_parts = []
                                     forwarded_block_count += 1
 
-                        # -- message_delta --
+                        # -- message_delta: extract output_tokens --
                         elif dtype == "message_delta":
+                            delta_usage = data.get("usage", {})
+                            if "output_tokens" in delta_usage:
+                                _stream_usage["output_tokens"] = delta_usage["output_tokens"]
                             sr = data.get("delta", {}).get("stop_reason")
                             if sr == "tool_use" and vc_tools:
                                 if non_vc_tools:
@@ -836,7 +849,7 @@ async def _handle_streaming(
                         yield sse_evt
 
             # Post-stream processing
-            assistant_text, _ = _post_stream(text_chunks, raw_events)
+            assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_stream_usage)
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
@@ -861,6 +874,7 @@ async def _handle_streaming(
         # Non-paging path: raw-byte forwarding (unchanged)
         # ---------------------------------------------------------------
         line_buf = ""
+        _raw_usage: dict = {}
         try:
             async for raw_chunk in upstream.aiter_bytes():
                 yield raw_chunk  # forward raw bytes unchanged
@@ -881,11 +895,21 @@ async def _handle_streaming(
                             delta = _extract_delta_text(data, api_format)
                             if delta:
                                 text_chunks.append(delta)
+                            # Extract usage from message_start / message_delta
+                            _dtype = data.get("type", "")
+                            if _dtype == "message_start":
+                                _mu = data.get("message", {}).get("usage", {})
+                                if "input_tokens" in _mu:
+                                    _raw_usage["input_tokens"] = _mu["input_tokens"]
+                            elif _dtype == "message_delta":
+                                _du = data.get("usage", {})
+                                if "output_tokens" in _du:
+                                    _raw_usage["output_tokens"] = _du["output_tokens"]
                         except json.JSONDecodeError:
                             pass
         finally:
             await upstream.aclose()
-            assistant_text, _ = _post_stream(text_chunks, raw_events)
+            assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
@@ -972,8 +996,13 @@ async def _handle_non_streaming(
             pass
 
     # Capture response for dashboard inspector
+    _ns_usage = response_body.get("usage", {})
     if metrics:
-        metrics.capture_response(turn, response_body)
+        metrics.capture_response(
+            turn, response_body,
+            upstream_input_tokens=_ns_usage.get("input_tokens", 0),
+            upstream_output_tokens=_ns_usage.get("output_tokens", 0),
+        )
 
     # Extract and record assistant text
     assistant_text = _extract_assistant_text(response_body, api_format)
