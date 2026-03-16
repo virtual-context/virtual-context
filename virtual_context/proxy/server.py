@@ -763,6 +763,7 @@ def create_app(
 
         # Ground truth: actual byte-measured outbound token count
         _outbound_json = json.dumps(enriched_body, default=str)
+        _outbound_bytes = len(_outbound_json.encode("utf-8"))
         outbound_tokens = fmt._count(_outbound_json)
 
         # Ground truth: inbound tokens (what the client sent us, measured above)
@@ -848,6 +849,8 @@ def create_app(
             conversation_id=_conversation_id,
             inbound_tokens=inbound_tokens,
             outbound_tokens=outbound_tokens,
+            inbound_bytes=_inbound_bytes,
+            outbound_bytes=_outbound_bytes,
             context_tokens=context_tokens,
             overhead_ms=overhead_ms,
             turns_dropped=turns_dropped,
