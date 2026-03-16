@@ -1569,6 +1569,15 @@ class VirtualContextEngine:
                 session_date=running_session_date,
             )
             self._turn_tag_index.append(entry)
+            try:
+                self._store.save_turn_message(
+                    self.config.conversation_id,
+                    entry.turn_number,
+                    user_msg.content,
+                    asst_msg.content,
+                )
+            except Exception:
+                pass
             ingested += 1
 
             # Stderr progress for visibility
