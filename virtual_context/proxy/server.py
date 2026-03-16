@@ -485,6 +485,8 @@ def create_app(
                     turn, body, api_format,
                     conversation_id=_conversation_id,
                     passthrough=True,
+                    payload_tokens=_payload_tok,
+                    message_preview=user_message[:60],
                 )
 
                 # Tool output interception applies even in passthrough —
@@ -825,6 +827,13 @@ def create_app(
             turn, _pre_filter_body, api_format,
             inbound_tags=assembled.matched_tags if assembled else [],
             conversation_id=_conversation_id,
+            payload_tokens=_payload_tok,
+            input_tokens=input_tokens,
+            context_tokens=context_tokens,
+            overhead_ms=overhead_ms,
+            turns_dropped=turns_dropped,
+            turns_stubbed=turns_stubbed,
+            message_preview=user_message[:60],
         )
         # Capture enriched body (what we actually send to the LLM)
         metrics.capture_enriched(turn, enriched_body)

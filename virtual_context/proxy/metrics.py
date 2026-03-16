@@ -204,6 +204,13 @@ class ProxyMetrics:
         inbound_tags: list[str] | None = None,
         conversation_id: str = "",
         passthrough: bool = False,
+        payload_tokens: int = 0,
+        input_tokens: int = 0,
+        context_tokens: int = 0,
+        overhead_ms: float = 0,
+        turns_dropped: int = 0,
+        turns_stubbed: int = 0,
+        message_preview: str = "",
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
         with self._lock:
@@ -220,6 +227,13 @@ class ProxyMetrics:
                 "response_tags": [],
                 "conversation_id": conversation_id,
                 "passthrough": passthrough,
+                "payload_tokens": payload_tokens,
+                "input_tokens": input_tokens,
+                "context_tokens": context_tokens,
+                "overhead_ms": overhead_ms,
+                "turns_dropped": turns_dropped,
+                "turns_stubbed": turns_stubbed,
+                "message_preview": message_preview,
             })
 
     def capture_enriched(self, turn: int, body: dict) -> None:
@@ -256,13 +270,24 @@ class ProxyMetrics:
             return None
 
     def get_captured_requests_summary(self) -> list[dict]:
-        """Return summaries (without full messages) for the list view."""
+        """Return summaries (without full messages/system) for the list view."""
         with self._lock:
             return [{
                 "turn": r["turn"],
                 "ts": r["ts"],
                 "api_format": r["api_format"],
                 "model": r["model"],
+                "stream": r.get("stream", False),
                 "message_count": r["message_count"],
                 "conversation_id": r.get("conversation_id", ""),
+                "inbound_tags": r.get("inbound_tags", []),
+                "response_tags": r.get("response_tags", []),
+                "passthrough": r.get("passthrough", False),
+                "payload_tokens": r.get("payload_tokens", 0),
+                "input_tokens": r.get("input_tokens", 0),
+                "context_tokens": r.get("context_tokens", 0),
+                "overhead_ms": r.get("overhead_ms", 0),
+                "turns_dropped": r.get("turns_dropped", 0),
+                "turns_stubbed": r.get("turns_stubbed", 0),
+                "message_preview": r.get("message_preview", ""),
             } for r in self._request_bodies]
