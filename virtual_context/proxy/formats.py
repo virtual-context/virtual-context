@@ -112,10 +112,15 @@ class PayloadFormat(ABC):
     # -- Payload token estimation --------------------------------------------
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        """Estimate total input tokens from a request body.
+        """Estimate total input tokens from a request body (fallback only).
 
         Counts all token-consuming content: message text, tool_use inputs,
         tool_result outputs, system prompt, and tool definitions.
+
+        NOTE: This is a structural estimate. When the actual serialized payload
+        is available, use ``fmt._count(json.dumps(body))`` for ground truth.
+        This method remains useful for pre-parse estimation in paths where
+        the final body hasn't been constructed yet.
         """
         total = 0
         for m in self.get_messages(body):
