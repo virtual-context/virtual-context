@@ -1736,6 +1736,70 @@ class VirtualContextEngine:
             session_filter=session_filter,
         )
 
+    def get_turns_by_tag(
+        self,
+        tag: str,
+        conversation_history: list[Message] | None = None,
+    ) -> dict:
+        """Return all raw turns associated with a tag, from both stored segments and live history.
+
+        Stored turns come from compacted segments in the store.
+        Live turns come from the TurnTagIndex matched against conversation_history.
+        """
+        result: dict = {
+            "tag": tag,
+            "stored_turns": [],
+            "live_turns": [],
+            "total_turns": 0,
+        }
+
+        # Stored turns: segments matching this tag
+        segments = self._store.get_segments_by_tags(
+            tags=[tag], min_overlap=1, limit=500,
+        )
+        seen_refs: set[str] = set()
+        for seg in segments:
+            if seg.ref in seen_refs:
+                continue
+            seen_refs.add(seg.ref)
+            meta = seg.metadata or SegmentMetadata(turn_count=0)
+            result["stored_turns"].append({
+                "segment_ref": seg.ref,
+                "messages": seg.messages,
+                "full_text": seg.full_text,
+                "summary": seg.summary,
+                "turn_count": meta.turn_count,
+                "created_at": str(seg.created_at),
+            })
+
+        # Live turns: TurnTagIndex entries where tag appears,
+        # paired with conversation_history messages
+        history = conversation_history or []
+        for entry in self._turn_tag_index.entries:
+            if tag not in entry.tags:
+                continue
+            msg_idx = entry.turn_number * 2
+            messages = []
+            if msg_idx < len(history):
+                messages.append({
+                    "role": "user",
+                    "content": history[msg_idx].content,
+                })
+            if msg_idx + 1 < len(history):
+                messages.append({
+                    "role": "assistant",
+                    "content": history[msg_idx + 1].content,
+                })
+            result["live_turns"].append({
+                "turn_number": entry.turn_number,
+                "tags": entry.tags,
+                "primary_tag": entry.primary_tag,
+                "messages": messages,
+            })
+
+        result["total_turns"] = len(result["stored_turns"]) + len(result["live_turns"])
+        return result
+
     def _parse_session_date(self, raw: str) -> date | None:
         """Best-effort parse for session date strings from stored metadata."""
         s = (raw or "").strip()

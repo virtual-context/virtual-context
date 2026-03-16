@@ -361,7 +361,8 @@ def _attach_related_facts(
         return result
 
     try:
-        facts = engine._store.search_facts(query=query, limit=10)
+        _sf_limit = engine.config.search.search_facts_max_results
+        facts = engine._store.search_facts(query=query, limit=_sf_limit)
     except Exception:
         return result
 

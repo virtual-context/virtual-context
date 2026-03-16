@@ -203,6 +203,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         remember_when_max_results=search_raw.get("remember_when_max_results", 5),
         semantic_search_max_results=search_raw.get("semantic_search_max_results", 5),
         query_facts_default_limit=search_raw.get("query_facts_default_limit", 50),
+        search_facts_max_results=search_raw.get("search_facts_max_results", 10),
     )
 
     # Facts
