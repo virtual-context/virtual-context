@@ -20,6 +20,7 @@ def filter_body_messages(
     recent_turns: int = 3,
     compacted_turn: int = 0,
     fmt: PayloadFormat | None = None,
+    pre_compaction_mode: str = "aggressive",
 ) -> tuple[dict, int]:
     """Filter request body messages to remove irrelevant history turns.
 
@@ -30,6 +31,11 @@ def filter_body_messages(
     When *compacted_turn* > 0 (paging active), pairs whose turn index is
     below the watermark are unconditionally dropped — their content lives
     in VC summaries and is retrievable via ``vc_expand_topic``.
+
+    Pre-compaction mode (when *compacted_turn* == 0):
+    - ``"off"``: skip all tag-based filtering, return body unchanged
+    - ``"conservative"``: double the *recent_turns* protection window
+    - ``"aggressive"``: use *recent_turns* as-is (default, backward compatible)
 
     Returns (filtered_body, turns_dropped).
     """
@@ -50,6 +56,13 @@ def filter_body_messages(
     messages = body.get(_msg_key, [])
     if not messages:
         return body, 0
+
+    # Pre-compaction mode check
+    if compacted_turn == 0:
+        if pre_compaction_mode == "off":
+            return body, 0
+        elif pre_compaction_mode == "conservative":
+            recent_turns = recent_turns * 2
 
     # Separate system messages (OpenAI format) and chat messages
     prefix: list[dict] = []

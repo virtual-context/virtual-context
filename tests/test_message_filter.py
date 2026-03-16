@@ -417,3 +417,83 @@ class TestEdgeCases:
         idx = TurnTagIndex()
         result, dropped = filter_body_messages(body, idx, [])
         assert dropped == 0
+
+
+# ---------------------------------------------------------------------------
+# Pre-compaction mode tests
+# ---------------------------------------------------------------------------
+
+class TestPreCompactionModes:
+    """Test pre_compaction_mode parameter on filter_body_messages."""
+
+    def test_mode_off_drops_nothing(self):
+        """mode=off pre-compaction: all turns preserved."""
+        idx = _make_index([
+            (0, ["database"]),
+            (1, ["auth"]),
+            (2, ["frontend"]),
+            (3, ["database"]),
+        ])
+        body = _make_anthropic_body(pairs=4, current_user="database query")
+        filtered_body, dropped = filter_body_messages(
+            body, idx, ["database"],
+            recent_turns=1, compacted_turn=0,
+            pre_compaction_mode="off",
+        )
+        assert dropped == 0
+
+    def test_mode_conservative_doubles_window(self):
+        """mode=conservative doubles the recent_turns protection window."""
+        idx = _make_index([
+            (0, ["database"]),
+            (1, ["auth"]),
+            (2, ["frontend"]),
+            (3, ["auth"]),
+            (4, ["database"]),
+            (5, ["auth"]),
+        ])
+        body = _make_anthropic_body(pairs=6, current_user="database query")
+        # recent_turns=2, conservative doubles to 4
+        # 6 pairs total, 4 protected → only pairs 0-1 are candidates
+        # Pair 0 (database) matches, pair 1 (auth) dropped
+        filtered_body, dropped = filter_body_messages(
+            body, idx, ["database"],
+            recent_turns=2, compacted_turn=0,
+            pre_compaction_mode="conservative",
+        )
+        assert dropped == 1
+
+    def test_mode_aggressive_uses_standard_window(self):
+        """mode=aggressive (default): standard recent_turns window."""
+        idx = _make_index([
+            (0, ["database"]),
+            (1, ["auth"]),
+            (2, ["frontend"]),
+            (3, ["database"]),
+        ])
+        body = _make_anthropic_body(pairs=4, current_user="database query")
+        # recent_turns=1, aggressive uses 1 as-is
+        # 4 pairs, 1 protected → pairs 0-2 are candidates
+        # Pair 0 (database) kept, pair 1 (auth) dropped, pair 2 (frontend) dropped
+        filtered_body, dropped = filter_body_messages(
+            body, idx, ["database"],
+            recent_turns=1, compacted_turn=0,
+            pre_compaction_mode="aggressive",
+        )
+        assert dropped == 2
+
+    def test_post_compaction_ignores_mode(self):
+        """When compacted_turn > 0, mode parameter is irrelevant."""
+        idx = _make_index([
+            (0, ["database"]),
+            (1, ["auth"]),
+            (2, ["database"]),
+        ])
+        body = _make_anthropic_body(pairs=3, current_user="database query")
+        # mode=off but compacted_turn > 0 → standard filtering applies
+        filtered_body, dropped = filter_body_messages(
+            body, idx, ["database"],
+            recent_turns=1, compacted_turn=1,
+            pre_compaction_mode="off",
+        )
+        assert dropped >= 1

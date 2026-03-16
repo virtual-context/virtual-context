@@ -649,6 +649,10 @@ def create_app(
             # Disabled: the stub filter is the correct mechanism for
             # handling compacted turns in proxy mode.
             _ct = 0
+            _pcf_mode = getattr(
+                state.engine.config.assembler,
+                "pre_compaction_filtering", "aggressive",
+            )
             body, turns_dropped = _filter_body_messages(
                 body,
                 state.engine._turn_tag_index,
@@ -656,6 +660,7 @@ def create_app(
                 recent_turns=recent,
                 compacted_turn=_ct,
                 fmt=fmt,
+                pre_compaction_mode=_pcf_mode,
             )
 
         # Tool output interception: truncate large tool_result blocks.
