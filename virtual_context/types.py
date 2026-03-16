@@ -230,6 +230,7 @@ class EngineStateSnapshot:
     split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
     working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
     trailing_fingerprint: str = ""  # hash of last N user messages for session matching on restart
+    telemetry_rollup: dict = field(default_factory=dict)  # persisted telemetry totals (survives restart)
 
 
 @dataclass

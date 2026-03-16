@@ -474,6 +474,9 @@ class VirtualContextEngine:
         # Restore paging working set (backward-compatible: old snapshots have empty list)
         self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
         self._trailing_fingerprint = saved.trailing_fingerprint
+        # Restore telemetry counters from persisted rollup
+        if saved.telemetry_rollup:
+            self._telemetry.restore_from_rollup(saved.telemetry_rollup)
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
@@ -517,6 +520,9 @@ class VirtualContextEngine:
     def _save_state(self, conversation_history: list[Message]) -> None:
         """Persist current engine state to store."""
         try:
+            # Persist telemetry rollup (totals + by_model) without raw events
+            telemetry_dict = self._telemetry.to_dict()
+            telemetry_dict.pop("events", None)  # too large for state blob
             self._store.save_engine_state(EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
                 compacted_through=self._compacted_through,
@@ -525,6 +531,7 @@ class VirtualContextEngine:
                 split_processed_tags=sorted(self._split_processed_tags),
                 working_set=list(self._working_set.values()),
                 trailing_fingerprint=self._trailing_fingerprint,
+                telemetry_rollup=telemetry_dict,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)

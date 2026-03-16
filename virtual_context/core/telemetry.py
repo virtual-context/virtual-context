@@ -112,6 +112,32 @@ class TelemetryLedger:
         with self._lock:
             self._events.clear()
 
+    def restore_from_rollup(self, rollup: dict) -> None:
+        """Restore counters from a persisted rollup dict.
+
+        Creates synthetic events from the by_model breakdown so that
+        total(), by_component(), and by_model() return accurate numbers
+        after a lossless restart.
+        """
+        by_model = rollup.get("by_model", {})
+        if not by_model:
+            return
+        with self._lock:
+            for model, data in by_model.items():
+                if not isinstance(data, dict):
+                    continue
+                event = TelemetryEvent(
+                    timestamp=0.0,
+                    component="_restored",
+                    model=model,
+                    input_tokens=data.get("input_tokens", 0),
+                    output_tokens=data.get("output_tokens", 0),
+                    cost_usd=data.get("cost_usd", 0.0),
+                    duration_ms=data.get("duration_ms", 0.0),
+                    detail="restored_from_snapshot",
+                )
+                self._events.append(event)
+
     def to_dict(self) -> dict:
         with self._lock:
             events_snapshot = list(self._events)
