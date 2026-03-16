@@ -164,6 +164,8 @@ async def _handle_streaming(
         """Return (assistant_text, upstream_ms) and handle side-effects."""
         nonlocal t_upstream
         _usage = usage or {}
+        if _usage:
+            logger.info("_post_stream usage: %s", _usage)
         upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
         if metrics:
             metrics.record({
@@ -265,6 +267,7 @@ async def _handle_streaming(
                             msg_usage = data.get("message", {}).get("usage", {})
                             if "input_tokens" in msg_usage:
                                 _stream_usage["input_tokens"] = msg_usage["input_tokens"]
+                                logger.info("Stream usage (paging): message_start input_tokens=%d", msg_usage["input_tokens"])
 
                         # -- content_block_start --
                         if dtype == "content_block_start":
@@ -901,10 +904,12 @@ async def _handle_streaming(
                                 _mu = data.get("message", {}).get("usage", {})
                                 if "input_tokens" in _mu:
                                     _raw_usage["input_tokens"] = _mu["input_tokens"]
+                                    logger.info("Stream usage: message_start input_tokens=%d", _mu["input_tokens"])
                             elif _dtype == "message_delta":
                                 _du = data.get("usage", {})
                                 if "output_tokens" in _du:
                                     _raw_usage["output_tokens"] = _du["output_tokens"]
+                                    logger.info("Stream usage: message_delta output_tokens=%d", _du["output_tokens"])
                         except json.JSONDecodeError:
                             pass
         finally:
