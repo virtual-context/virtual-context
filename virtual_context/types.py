@@ -652,6 +652,7 @@ class SearchConfig:
     remember_when_max_results: int = 5     # default max_results for vc_remember_when
     semantic_search_max_results: int = 5   # max results from embedding-based search
     query_facts_default_limit: int = 50    # default limit for query_facts()
+    search_facts_max_results: int = 10     # max results from FTS fact search
 
 
 @dataclass
