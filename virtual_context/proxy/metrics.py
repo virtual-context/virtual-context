@@ -248,6 +248,8 @@ class ProxyMetrics:
         self, turn: int, body: dict, *,
         upstream_input_tokens: int = 0,
         upstream_output_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
     ) -> None:
         """Capture the LLM response body and upstream token usage."""
         with self._lock:
@@ -258,6 +260,10 @@ class ProxyMetrics:
                         req["upstream_input_tokens"] = upstream_input_tokens
                     if upstream_output_tokens:
                         req["upstream_output_tokens"] = upstream_output_tokens
+                    if cache_creation_input_tokens:
+                        req["cache_creation_input_tokens"] = cache_creation_input_tokens
+                    if cache_read_input_tokens:
+                        req["cache_read_input_tokens"] = cache_read_input_tokens
                     return
 
     def update_request_tags(
@@ -300,6 +306,8 @@ class ProxyMetrics:
                 "message_preview": r.get("message_preview", ""),
                 "upstream_input_tokens": r.get("upstream_input_tokens", 0),
                 "upstream_output_tokens": r.get("upstream_output_tokens", 0),
+                "cache_creation_input_tokens": r.get("cache_creation_input_tokens", 0),
+                "cache_read_input_tokens": r.get("cache_read_input_tokens", 0),
             } for r in self._request_bodies]
 
     def restore_request_captures(self, captures: list[dict]) -> None:
