@@ -509,12 +509,14 @@ class PagingConfig:
     """
     enabled: bool = False
     autonomous_models: list[str] = field(default_factory=lambda: [
-        "claude-3-opus", "claude-3-5-sonnet", "claude-3.5-sonnet",
+        "claude-sonnet-4", "claude-opus-4",
+        "claude-3-5-sonnet", "claude-3.5-sonnet",
         "claude-3-7-sonnet", "claude-3.7-sonnet",
-        "claude-4", "claude-sonnet-4", "claude-opus-4",
-        "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-4.5", "gpt-5",
+        "claude-3-opus",
+        "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-5",
         "o1", "o3", "o4-mini",
-        "gemini-2", "gemini-pro",
+        "gemini-2.5-pro", "gemini-2.5-flash",
+        "gemini-3", "gemini-2.0-flash",
     ])
     auto_promote: bool = True   # auto-expand on strong retrieval match
     auto_evict: bool = True     # auto-collapse coldest when over budget
@@ -606,7 +608,7 @@ class CompactorConfig:
     max_summary_tokens: int = 2000
     max_concurrent_summaries: int = 4
     overflow_buffer: float = 1.2
-    llm_token_overhead: int = 8000  # extra tokens for thinking/reasoning overhead
+    llm_token_overhead: int = 2000  # extra tokens for thinking/reasoning overhead
 
 
 @dataclass
@@ -632,6 +634,22 @@ class AssemblerConfig:
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
     context_hint_max_tokens: int = 2000
+
+
+@dataclass
+class SearchConfig:
+    """Configuration for find_quote excerpt/snippet lengths and result limits."""
+    # Excerpt/snippet lengths
+    excerpt_context_chars: int = 200       # chars of context around a LIKE/manual match
+    fts_snippet_chars: int = 500           # FTS5 snippet() max chars for segment search
+    tool_output_snippet_chars: int = 100   # FTS5 snippet() max chars for tool output search
+    postgres_max_words: int = 100          # ts_headline MaxWords for Postgres FTS
+    # Result limits
+    find_quote_max_results: int = 20       # max results from vc_find_quote tool calls
+    find_quote_default_results: int = 5    # default max_results for engine.find_quote()
+    remember_when_max_results: int = 5     # default max_results for vc_remember_when
+    semantic_search_max_results: int = 5   # max results from embedding-based search
+    query_facts_default_limit: int = 50    # default limit for query_facts()
 
 
 @dataclass
@@ -761,6 +779,7 @@ class VirtualContextConfig:
     paging: PagingConfig = field(default_factory=PagingConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     tool_output: ToolOutputConfig = field(default_factory=ToolOutputConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     facts: FactsConfig = field(default_factory=FactsConfig)
     supersession: SupersessionConfig = field(default_factory=SupersessionConfig)
     curation: CurationConfig = field(default_factory=CurationConfig)

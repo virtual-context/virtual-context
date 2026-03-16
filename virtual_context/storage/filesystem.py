@@ -178,6 +178,7 @@ class FilesystemStore(ContextStore):
         self._index: dict[str, dict] = {}
         self._aliases: dict[str, str] = {}
         self._lock = threading.Lock()
+        self.search_config = None  # set by engine after construction
         self._ensure_root()
         self._load_index()
         self._load_aliases()
@@ -343,7 +344,9 @@ class FilesystemStore(ContextStore):
         for entry in self._index.values():
             seg = self.get_segment(entry["ref"])
             if seg and query_lower in seg.full_text.lower():
-                excerpt = _extract_excerpt(seg.full_text, query)
+                _sc = self.search_config
+                _ctx = _sc.excerpt_context_chars if _sc else 200
+                excerpt = _extract_excerpt(seg.full_text, query, context_chars=_ctx)
                 results.append(QuoteResult(
                     text=excerpt,
                     tag=seg.primary_tag,
@@ -356,10 +359,14 @@ class FilesystemStore(ContextStore):
                     break
         return results
 
-    def get_all_tags(self) -> list[TagStats]:
+    def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         tag_map: dict[str, TagStats] = {}
 
         for entry in self._index.values():
+            if conversation_id:
+                cid = entry.get("conversation_id", entry.get("session_id", ""))
+                if cid != conversation_id:
+                    continue
             for tag in entry.get("tags", []):
                 if tag not in tag_map:
                     tag_map[tag] = TagStats(tag=tag)

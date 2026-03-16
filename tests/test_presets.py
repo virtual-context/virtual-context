@@ -42,7 +42,7 @@ def test_unknown_preset_returns_none():
 
 EXPECTED_KEYWORD_TAGS = [
     "architecture", "database", "auth", "backend", "frontend",
-    "debugging", "infrastructure", "testing",
+    "debugging", "infrastructure",
 ]
 
 

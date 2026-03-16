@@ -77,8 +77,8 @@ class CompositeStore:
     ) -> list[StoredSummary]:
         return self._segments.search(query, tags=tags, limit=limit)
 
-    def get_all_tags(self) -> list[TagStats]:
-        return self._segments.get_all_tags()
+    def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
+        return self._segments.get_all_tags(conversation_id=conversation_id)
 
     def get_conversation_stats(self) -> list[ConversationStats]:
         return self._segments.get_conversation_stats()
@@ -115,6 +115,9 @@ class CompositeStore:
 
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
         return self._segments.get_orphan_tag_snippets(limit=limit)
+
+    def delete_conversation(self, conversation_id: str) -> int:
+        return self._segments.delete_conversation(conversation_id)
 
     # ------------------------------------------------------------------
     # FactStore

@@ -14,6 +14,7 @@ from .types import (
     CompactorConfig,
     TelemetryConfig,
     FactsConfig,
+    SearchConfig,
     KeywordTagConfig,
     MonitorConfig,
     PagingConfig,
@@ -156,7 +157,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         max_summary_tokens=compaction.get("max_summary_tokens", 2000),
         max_concurrent_summaries=compaction.get("max_concurrent_summaries", 4),
         overflow_buffer=compaction.get("overflow_buffer", 1.2),
-        llm_token_overhead=compaction.get("llm_token_overhead", 800),
+        llm_token_overhead=compaction.get("llm_token_overhead", 2000),
     )
 
     # Summarization
@@ -190,10 +191,24 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         falkordb_password=fdb_raw.get("password", ""),
     )
 
+    # Search (find_quote excerpts and snippet lengths)
+    search_raw = raw.get("search", {})
+    search_config = SearchConfig(
+        excerpt_context_chars=search_raw.get("excerpt_context_chars", 200),
+        fts_snippet_chars=search_raw.get("fts_snippet_chars", 500),
+        tool_output_snippet_chars=search_raw.get("tool_output_snippet_chars", 100),
+        postgres_max_words=search_raw.get("postgres_max_words", 100),
+        find_quote_max_results=search_raw.get("find_quote_max_results", 20),
+        find_quote_default_results=search_raw.get("find_quote_default_results", 5),
+        remember_when_max_results=search_raw.get("remember_when_max_results", 5),
+        semantic_search_max_results=search_raw.get("semantic_search_max_results", 5),
+        query_facts_default_limit=search_raw.get("query_facts_default_limit", 50),
+    )
+
     # Facts
     facts_raw = raw.get("facts", {})
     facts_config = FactsConfig(
-        graph_links=facts_raw.get("graph_links", False),
+        graph_links=facts_raw.get("graph_links", True),
         link_types=facts_raw.get("link_types", [
             "supersedes", "caused_by", "part_of", "contradicts", "same_as", "related_to",
         ]),
@@ -208,7 +223,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         core_files=assembly_raw.get("core_files", []),
         recent_turns_always_included=assembly_raw.get("recent_turns_always_included", 3),
         context_hint_enabled=assembly_raw.get("context_hint_enabled", True),
-        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 500),
+        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 2000),
     )
 
     # Retrieval
@@ -261,12 +276,14 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     paging_config = PagingConfig(
         enabled=paging_raw.get("enabled", False),
         autonomous_models=paging_raw.get("autonomous_models", [
-            "claude-3-opus", "claude-3-5-sonnet", "claude-3.5-sonnet",
+            "claude-sonnet-4", "claude-opus-4",
+            "claude-3-5-sonnet", "claude-3.5-sonnet",
             "claude-3-7-sonnet", "claude-3.7-sonnet",
-            "claude-4", "claude-sonnet-4", "claude-opus-4",
-            "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-4.5", "gpt-5",
+            "claude-3-opus",
+            "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-5",
             "o1", "o3", "o4-mini",
-            "gemini-2", "gemini-pro",
+            "gemini-2.5-pro", "gemini-2.5-flash",
+            "gemini-3", "gemini-2.0-flash",
         ]),
         auto_promote=paging_raw.get("auto_promote", True),
         auto_evict=paging_raw.get("auto_evict", True),
@@ -330,6 +347,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         paging=paging_config,
         proxy=proxy_config,
         tool_output=tool_output_config,
+        search=search_config,
         facts=facts_config,
         supersession=supersession_config,
         curation=curation_config,

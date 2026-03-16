@@ -28,7 +28,7 @@ from ._envelope import (  # noqa: E402
     _VC_CONVERSATION_RE,
     _last_text_block,
     _strip_vc_prompt,
-    _strip_openclaw_envelope,
+    _strip_envelope,
 )
 
 _HOP_BY_HOP = frozenset({

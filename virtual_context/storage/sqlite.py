@@ -236,6 +236,7 @@ class SQLiteStore(ContextStore):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self.search_config = None  # set by engine after construction
         self._ensure_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -685,10 +686,13 @@ class SQLiteStore(ContextStore):
         results: list[QuoteResult] = []
 
         # Try FTS5 first (with snippet extraction)
+        _sc = self.search_config
+        _fts_chars = _sc.fts_snippet_chars if _sc else 500
+        _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
         try:
             rows = conn.execute(
                 """SELECT fts.ref, s.primary_tag, s.metadata_json,
-                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', 500),
+                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', """ + str(_fts_chars) + """),
                           s.created_at
                    FROM segments_fts_full fts
                    JOIN segments s ON s.ref = fts.ref
@@ -727,7 +731,7 @@ class SQLiteStore(ContextStore):
         like_refs = [row[0] for row in rows]
         like_tags_map = self._batch_get_tags(like_refs)
         for row in rows:
-            excerpt = _extract_excerpt(row[2], query, context_chars=200)
+            excerpt = _extract_excerpt(row[2], query, context_chars=_excerpt_chars)
             meta = json.loads(row[3]) if row[3] else {}
             results.append(QuoteResult(
                 text=excerpt,
@@ -740,20 +744,35 @@ class SQLiteStore(ContextStore):
             ))
         return results
 
-    def get_all_tags(self) -> list[TagStats]:
+    def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         conn = self._get_conn()
-        rows = conn.execute("""
-            SELECT st.tag,
-                   COUNT(DISTINCT st.segment_ref) as usage_count,
-                   COALESCE(SUM(s.full_tokens), 0) as total_full_tokens,
-                   COALESCE(SUM(s.summary_tokens), 0) as total_summary_tokens,
-                   MIN(s.created_at) as oldest,
-                   MAX(s.created_at) as newest
-            FROM segment_tags st
-            JOIN segments s ON s.ref = st.segment_ref
-            GROUP BY st.tag
-            ORDER BY usage_count DESC
-        """).fetchall()
+        if conversation_id:
+            rows = conn.execute("""
+                SELECT st.tag,
+                       COUNT(DISTINCT st.segment_ref) as usage_count,
+                       COALESCE(SUM(s.full_tokens), 0) as total_full_tokens,
+                       COALESCE(SUM(s.summary_tokens), 0) as total_summary_tokens,
+                       MIN(s.created_at) as oldest,
+                       MAX(s.created_at) as newest
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.conversation_id = ?
+                GROUP BY st.tag
+                ORDER BY usage_count DESC
+            """, (conversation_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT st.tag,
+                       COUNT(DISTINCT st.segment_ref) as usage_count,
+                       COALESCE(SUM(s.full_tokens), 0) as total_full_tokens,
+                       COALESCE(SUM(s.summary_tokens), 0) as total_summary_tokens,
+                       MIN(s.created_at) as oldest,
+                       MAX(s.created_at) as newest
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                GROUP BY st.tag
+                ORDER BY usage_count DESC
+            """).fetchall()
 
         return [
             TagStats(
@@ -1626,10 +1645,12 @@ class SQLiteStore(ContextStore):
         from ..types import QuoteResult
 
         conn = self._get_conn()
+        _sc = self.search_config
+        _tool_chars = _sc.tool_output_snippet_chars if _sc else 100
         try:
             rows = conn.execute(
                 """SELECT t.ref, t.tool_name,
-                          snippet(tool_outputs_fts, 0, '>>>', '<<<', '...', 100) as snippet
+                          snippet(tool_outputs_fts, 0, '>>>', '<<<', '...', """ + str(_tool_chars) + """) as snippet
                    FROM tool_outputs_fts fts
                    JOIN tool_outputs t ON t.rowid = fts.rowid
                    WHERE tool_outputs_fts MATCH ?

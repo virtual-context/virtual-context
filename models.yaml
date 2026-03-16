@@ -1,5 +1,5 @@
 # Model pricing catalog for Virtual Context telemetry.
-# Prices in USD per million tokens. Updated 2026-03-05.
+# Prices in USD per million tokens. Updated 2026-03-15.
 
 models:
   # ---------------------------------------------------------------------------
@@ -112,6 +112,41 @@ models:
     output_per_mtok: 0.60
     context_window: 128000
     aliases: [gpt4o-mini]
+
+  gpt-4.1:
+    provider: openai
+    input_per_mtok: 2.00
+    output_per_mtok: 8.00
+    context_window: 1050000
+    aliases: [gpt4.1]
+
+  gpt-5:
+    provider: openai
+    input_per_mtok: 1.25
+    output_per_mtok: 10.00
+    context_window: 128000
+    aliases: [gpt5]
+
+  o1:
+    provider: openai
+    input_per_mtok: 15.00
+    output_per_mtok: 60.00
+    context_window: 200000
+    aliases: []
+
+  o3:
+    provider: openai
+    input_per_mtok: 2.00
+    output_per_mtok: 8.00
+    context_window: 200000
+    aliases: []
+
+  o4-mini:
+    provider: openai
+    input_per_mtok: 1.10
+    output_per_mtok: 4.40
+    context_window: 200000
+    aliases: []
 
   # ---------------------------------------------------------------------------
   # Google Gemini

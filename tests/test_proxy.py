@@ -28,7 +28,7 @@ from virtual_context.proxy.server import (
     _inject_vc_tools,
     _last_text_block,
     _parse_sse_events,
-    _strip_openclaw_envelope,
+    _strip_envelope,
     _strip_conversation_markers,
     _strip_vc_prompt,
     create_app,
@@ -228,28 +228,28 @@ class TestStripVcPrompt:
 
 
 # ---------------------------------------------------------------------------
-# _strip_openclaw_envelope
+# _strip_envelope
 # ---------------------------------------------------------------------------
 
 
 class TestStripOpenclawEnvelope:
     def test_empty_string(self):
-        assert _strip_openclaw_envelope("") == ""
+        assert _strip_envelope("") == ""
 
     def test_plain_text_passthrough(self):
-        assert _strip_openclaw_envelope("just a question") == "just a question"
+        assert _strip_envelope("just a question") == "just a question"
 
     def test_strips_vc_prompt_marker(self):
         text = "[vc:prompt]\nhello world"
-        assert _strip_openclaw_envelope(text) == "hello world"
+        assert _strip_envelope(text) == "hello world"
 
     def test_strips_channel_header(self):
         text = "[Telegram Y (@yursilk) id:8049932331 +17m Sun 2026-02-15 22:07 EST] what time is it"
-        assert _strip_openclaw_envelope(text) == "what time is it"
+        assert _strip_envelope(text) == "what time is it"
 
     def test_strips_message_id_footer(self):
         text = "some content\n[message_id: 8663]"
-        assert _strip_openclaw_envelope(text) == "some content"
+        assert _strip_envelope(text) == "some content"
 
     @pytest.mark.regression("PROXY-003")
     def test_strips_full_envelope(self):
@@ -260,7 +260,7 @@ class TestStripOpenclawEnvelope:
             "what time is it\n"
             "[message_id: 8663]"
         )
-        assert _strip_openclaw_envelope(text) == "what time is it"
+        assert _strip_envelope(text) == "what time is it"
 
     def test_strips_system_event(self):
         text = (
@@ -268,7 +268,7 @@ class TestStripOpenclawEnvelope:
             "[Telegram Y (@yursilk) id:123 +5m Sun] hello\n"
             "[message_id: 456]"
         )
-        assert _strip_openclaw_envelope(text) == "hello"
+        assert _strip_envelope(text) == "hello"
 
     def test_strips_system_event_with_vc_prompt(self):
         text = (
@@ -277,30 +277,30 @@ class TestStripOpenclawEnvelope:
             "[Telegram Y (@yursilk) id:123 +5m Sun] question\n"
             "[message_id: 456]"
         )
-        assert _strip_openclaw_envelope(text) == "question"
+        assert _strip_envelope(text) == "question"
 
     def test_vc_user_backward_compat(self):
         """Old-format [vc:user]...[/vc:user] extracts inner content."""
         text = "[vc:user]clean content here[/vc:user]\n[Telegram ...] more stuff"
-        assert _strip_openclaw_envelope(text) == "clean content here"
+        assert _strip_envelope(text) == "clean content here"
 
     def test_vc_prompt_then_vc_user(self):
         """[vc:prompt] stripped first, then [vc:user] inner content extracted."""
         text = "[vc:prompt]\n[vc:user]the question[/vc:user]\ngarbage"
-        assert _strip_openclaw_envelope(text) == "the question"
+        assert _strip_envelope(text) == "the question"
 
     def test_whatsapp_channel(self):
         text = "[WhatsApp User id:12345 +2m Mon] how is the weather\n[message_id: 99]"
-        assert _strip_openclaw_envelope(text) == "how is the weather"
+        assert _strip_envelope(text) == "how is the weather"
 
     def test_discord_channel(self):
         text = "[Discord Bob id:777 +1m Tue] hello there\n[message_id: 42]"
-        assert _strip_openclaw_envelope(text) == "hello there"
+        assert _strip_envelope(text) == "hello there"
 
     def test_no_id_in_header_not_stripped(self):
         """Bracketed text without id:NNN is not treated as channel header."""
         text = "[Some random bracket] content here"
-        assert _strip_openclaw_envelope(text) == "[Some random bracket] content here"
+        assert _strip_envelope(text) == "[Some random bracket] content here"
 
     def test_multiline_content_preserved(self):
         text = (
@@ -309,7 +309,7 @@ class TestStripOpenclawEnvelope:
             "line three\n"
             "[message_id: 456]"
         )
-        assert _strip_openclaw_envelope(text) == "line one\nline two\nline three"
+        assert _strip_envelope(text) == "line one\nline two\nline three"
 
     def test_short_message_extraction(self):
         """Short messages (where metadata dominates) are correctly extracted."""
@@ -319,7 +319,95 @@ class TestStripOpenclawEnvelope:
             "ok\n"
             "[message_id: 8670]"
         )
-        assert _strip_openclaw_envelope(text) == "ok"
+        assert _strip_envelope(text) == "ok"
+
+    # Labeled metadata block stripping
+
+    def test_strips_labeled_metadata_blocks(self):
+        """Strips fenced JSON metadata blocks with labeled headers."""
+        text = (
+            '[vc:prompt]\n'
+            '\n\n'
+            'Conversation info (untrusted metadata):\n'
+            '```json\n'
+            '{\n'
+            '  "message_id": "12070",\n'
+            '  "sender_id": "7281617716"\n'
+            '}\n'
+            '```\n'
+            '\n'
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{\n'
+            '  "label": "Sania (7281617716)",\n'
+            '  "name": "Sania"\n'
+            '}\n'
+            '```\n'
+            '\n'
+            'What about charlotte tilbury wonder skin'
+        )
+        assert _strip_envelope(text) == "What about charlotte tilbury wonder skin"
+
+    def test_strips_metadata_with_reply_context(self):
+        """Strips metadata blocks including reply-context JSON."""
+        text = (
+            'Conversation info (untrusted metadata):\n'
+            '```json\n'
+            '{"message_id": "12065", "reply_to_id": "12062"}\n'
+            '```\n'
+            '\n'
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{"label": "Sania (7281617716)"}\n'
+            '```\n'
+            '\n'
+            'Replied message (untrusted, for context):\n'
+            '```json\n'
+            '{"sender_label": "Bast", "body": "What fell short?"}\n'
+            '```\n'
+            '\n'
+            'The finish was too dewy for my oily skin'
+        )
+        assert _strip_envelope(text) == "The finish was too dewy for my oily skin"
+
+    def test_preserves_user_code_fences(self):
+        """User code fences without labeled headers are NOT stripped."""
+        text = (
+            'Here is my code:\n'
+            '```python\n'
+            'def hello():\n'
+            '    print("hello")\n'
+            '```\n'
+            'Does this look right?'
+        )
+        assert _strip_envelope(text) == text
+
+    def test_metadata_then_user_code(self):
+        """Metadata stripped, user code preserved."""
+        text = (
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{"label": "Y (8049932331)"}\n'
+            '```\n'
+            '\n'
+            'Here is my code:\n'
+            '```python\n'
+            'x = 1\n'
+            '```\n'
+            'Fix this.'
+        )
+        assert _strip_envelope(text) == (
+            'Here is my code:\n'
+            '```python\n'
+            'x = 1\n'
+            '```\n'
+            'Fix this.'
+        )
+
+    def test_no_metadata_blocks_passthrough(self):
+        """Plain message without metadata passes through unchanged."""
+        text = "Need a dupe for Becca Backlight priming filter"
+        assert _strip_envelope(text) == text
 
     # Integration tests with _extract_user_message
 

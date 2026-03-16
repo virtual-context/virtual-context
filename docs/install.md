@@ -247,7 +247,7 @@ Show a preset's config as YAML:
 
 ```bash
 virtual-context presets show coding
-virtual-context presets show general
+virtual-context presets show agentic
 ```
 
 ## Daemon Restart

@@ -44,8 +44,12 @@ class ContextStore(ABC):
         """Search summaries by keyword. Ordered by relevance."""
 
     @abstractmethod
-    def get_all_tags(self) -> list[TagStats]:
-        """List all tags with statistics."""
+    def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
+        """List all tags with statistics.
+
+        If *conversation_id* is given, only return tags from segments
+        belonging to that conversation.
+        """
 
     @abstractmethod
     def get_conversation_stats(self) -> list[ConversationStats]:

@@ -101,7 +101,7 @@ def test_presets_list(tmp_cwd):
     result = _run_cli("presets", "list")
     assert result.returncode == 0
     assert "coding" in result.stdout
-    assert "general" in result.stdout
+    assert "agentic" in result.stdout
 
 
 def test_presets_show_coding(tmp_cwd):
@@ -110,8 +110,8 @@ def test_presets_show_coding(tmp_cwd):
     assert "tag_generator" in result.stdout
 
 
-def test_presets_show_general(tmp_cwd):
-    result = _run_cli("presets", "show", "general")
+def test_presets_show_agentic(tmp_cwd):
+    result = _run_cli("presets", "show", "agentic")
     assert result.returncode == 0
     assert "tag_generator" in result.stdout
 

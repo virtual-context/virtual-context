@@ -1018,8 +1018,8 @@ def main():
     )
     onboard_parser.add_argument(
         "--preset",
-        default="general",
-        help="Preset used when creating a new config (default: general)",
+        default="agentic",
+        help="Preset used when creating a new config (default: agentic)",
     )
     onboard_parser.add_argument(
         "--install-daemon",

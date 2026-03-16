@@ -26,7 +26,7 @@ from abc import ABC, abstractmethod
 from ._envelope import (  # noqa: E402
     _VC_CONVERSATION_RE,
     _last_text_block,
-    _strip_openclaw_envelope,
+    _strip_envelope,
 )
 
 
@@ -228,17 +228,17 @@ class AnthropicFormat(PayloadFormat):
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                return _strip_openclaw_envelope(content)
+                return _strip_envelope(content)
             if isinstance(content, list):
-                return _strip_openclaw_envelope(_last_text_block(content))
+                return _strip_envelope(_last_text_block(content))
         return ""
 
     def extract_message_text(self, msg: dict) -> str:
         content = msg.get("content", "")
         if isinstance(content, str):
-            return _strip_openclaw_envelope(content)
+            return _strip_envelope(content)
         if isinstance(content, list):
-            return _strip_openclaw_envelope(_last_text_block(content))
+            return _strip_envelope(_last_text_block(content))
         return ""
 
     def extract_history_pairs(self, body: dict) -> list:
@@ -462,17 +462,17 @@ class OpenAIFormat(PayloadFormat):
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                return _strip_openclaw_envelope(content)
+                return _strip_envelope(content)
             if isinstance(content, list):
-                return _strip_openclaw_envelope(_last_text_block(content))
+                return _strip_envelope(_last_text_block(content))
         return ""
 
     def extract_message_text(self, msg: dict) -> str:
         content = msg.get("content", "")
         if isinstance(content, str):
-            return _strip_openclaw_envelope(content)
+            return _strip_envelope(content)
         if isinstance(content, list):
-            return _strip_openclaw_envelope(_last_text_block(content))
+            return _strip_envelope(_last_text_block(content))
         return ""
 
     def extract_history_pairs(self, body: dict) -> list:
@@ -693,13 +693,13 @@ class GeminiFormat(PayloadFormat):
                 continue
             parts = msg.get("parts", [])
             text = self._extract_text_from_parts(parts)
-            return _strip_openclaw_envelope(text)
+            return _strip_envelope(text)
         return ""
 
     def extract_message_text(self, msg: dict) -> str:
         parts = msg.get("parts", [])
         text = self._extract_text_from_parts(parts)
-        return _strip_openclaw_envelope(text)
+        return _strip_envelope(text)
 
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message
@@ -1013,7 +1013,7 @@ class OpenAIResponsesFormat(PayloadFormat):
     def extract_user_message(self, body: dict) -> str:
         items = body.get("input", [])
         if isinstance(items, str):
-            return _strip_openclaw_envelope(items)
+            return _strip_envelope(items)
         if not isinstance(items, list):
             return ""
         for item in reversed(items):
@@ -1024,13 +1024,13 @@ class OpenAIResponsesFormat(PayloadFormat):
             content = item.get("content", "")
             text = self._extract_text_from_content(content)
             if text:
-                return _strip_openclaw_envelope(text)
+                return _strip_envelope(text)
         return ""
 
     def extract_message_text(self, msg: dict) -> str:
         content = msg.get("content", "")
         text = self._extract_text_from_content(content)
-        return _strip_openclaw_envelope(text)
+        return _strip_envelope(text)
 
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message

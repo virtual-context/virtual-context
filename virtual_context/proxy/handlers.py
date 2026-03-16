@@ -141,7 +141,8 @@ async def _handle_streaming(
             })
         print(
             f"[T{turn}] ERROR {upstream.status_code} "
-            f"llm={int(upstream_ms)}ms | {error_bytes[:200].decode('utf-8', errors='replace')}"
+            f"llm={int(upstream_ms)}ms | {error_bytes[:200].decode('utf-8', errors='replace')}",
+            flush=True,
         )
         try:
             error_body = json.loads(error_bytes)
@@ -197,7 +198,8 @@ async def _handle_streaming(
             f"[T{turn}] RESPONSE stream={True} "
             f"llm={int(upstream_ms)}ms "
             f"total={int(round(overhead_ms + upstream_ms))}ms "
-            f"chars={len(assistant_text)}"
+            f"chars={len(assistant_text)}",
+            flush=True,
         )
         if response_log_path:
             try:
@@ -1021,7 +1023,8 @@ async def _handle_non_streaming(
         f"[T{turn}] RESPONSE stream=False "
         f"llm={int(upstream_ms)}ms "
         f"total={int(round(overhead_ms + upstream_ms))}ms "
-        f"chars={len(assistant_text or '')}"
+        f"chars={len(assistant_text or '')}",
+        flush=True,
     )
 
     # Session state dump

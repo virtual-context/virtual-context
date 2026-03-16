@@ -260,6 +260,9 @@ class VirtualContextEngine:
         else:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
+        # Propagate search config to the store for excerpt/snippet lengths
+        self._store.search_config = self.config.search
+
     def _init_monitor(self) -> None:
         self._monitor = ContextMonitor(
             config=self.config.monitor,
@@ -292,6 +295,7 @@ class VirtualContextEngine:
             config=self.config.retriever,
             turn_tag_index=self._turn_tag_index,
             inbound_tagger=inbound_tagger,
+            conversation_id=self.config.conversation_id,
         )
 
     def _build_inbound_embedding_tagger(self) -> TagGenerator:
@@ -1697,11 +1701,13 @@ class VirtualContextEngine:
     def find_quote(
         self,
         query: str,
-        max_results: int = 5,
+        max_results: int | None = None,
         intent_context: str = "",
         session_filter: str = "",
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
+        if max_results is None:
+            max_results = self.config.search.find_quote_default_results
         return _find_quote(
             self._store,
             self._semantic,
@@ -2142,9 +2148,11 @@ class VirtualContextEngine:
         self,
         query: str,
         time_range: dict,
-        max_results: int = 5,
+        max_results: int | None = None,
     ) -> dict:
         """Find memory snippets for *query* constrained to a resolved date window."""
+        if max_results is None:
+            max_results = self.config.search.remember_when_max_results
         if not query.strip():
             return {"error": "empty query"}
 
