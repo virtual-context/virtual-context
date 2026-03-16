@@ -231,6 +231,7 @@ class EngineStateSnapshot:
     working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
     trailing_fingerprint: str = ""  # hash of last N user messages for session matching on restart
     telemetry_rollup: dict = field(default_factory=dict)  # persisted telemetry totals (survives restart)
+    request_captures: list[dict] = field(default_factory=list)  # lightweight request summaries for dashboard
 
 
 @dataclass

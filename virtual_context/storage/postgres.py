@@ -812,6 +812,7 @@ class PostgresStore(ContextStore):
                 for tag, ws in (state.working_set or {}).items()
             } if state.working_set else {},
             "trailing_fingerprint": state.trailing_fingerprint or "",
+            "request_captures": state.request_captures,
         }
         conn.execute(
             """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
@@ -830,6 +831,7 @@ class PostgresStore(ContextStore):
             split_tags: set[str] = set()
             working_set: dict = {}
             fingerprint = ""
+            request_captures = []
         elif isinstance(raw, dict):
             entries_list = raw.get("entries", [])
             split_tags = set(raw.get("split_processed_tags", []))
@@ -839,11 +841,13 @@ class PostgresStore(ContextStore):
                 for tag, ws in ws_raw.items()
             }
             fingerprint = raw.get("trailing_fingerprint", "")
+            request_captures = raw.get("request_captures", [])
         else:
             entries_list = []
             split_tags = set()
             working_set = {}
             fingerprint = ""
+            request_captures = []
 
         entries = []
         for e in entries_list:
@@ -868,6 +872,7 @@ class PostgresStore(ContextStore):
             split_processed_tags=split_tags,
             working_set=working_set,
             trailing_fingerprint=fingerprint,
+            request_captures=request_captures,
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
