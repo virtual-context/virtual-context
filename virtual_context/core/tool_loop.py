@@ -622,18 +622,20 @@ def execute_vc_tool(
                 )
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
+            _fq_max = engine.config.search.find_quote_max_results
             result = engine.find_quote(
                 query=fq_query,
-                max_results=VC_FIND_QUOTE_MAX_RESULTS,
+                max_results=_fq_max,
                 intent_context=intent_context,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
             result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
         elif name == "vc_find_session":
+            _fq_max = engine.config.search.find_quote_max_results
             result = engine.find_quote(
                 query=tool_input.get("query", ""),
-                max_results=VC_FIND_QUOTE_MAX_RESULTS,
+                max_results=_fq_max,
                 intent_context=intent_context,
                 session_filter=tool_input.get("session", ""),
             )
@@ -711,7 +713,7 @@ def execute_vc_tool(
             result = engine.remember_when(
                 query=tool_input.get("query", ""),
                 time_range=tool_input.get("time_range", {}),
-                max_results=tool_input.get("max_results", 5),
+                max_results=tool_input.get("max_results", engine.config.search.remember_when_max_results),
             )
         else:
             result = {"error": f"unknown VC tool: {name}"}

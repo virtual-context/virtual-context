@@ -7,6 +7,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from virtual_context.types import SearchConfig
+
+
+def _mock_engine(**overrides):
+    """Create a MagicMock engine with a real SearchConfig on config.search."""
+    engine = MagicMock()
+    engine.config.search = SearchConfig()
+    for k, v in overrides.items():
+        setattr(engine, k, v)
+    return engine
+
 from virtual_context.core.tool_loop import (
     VC_TOOL_NAMES,
     AnthropicAdapter,
@@ -174,7 +185,7 @@ class TestExecuteVCTool:
         assert "collapsed" not in parsed
 
     def test_find_quote_calls_engine(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {
             "query": "test",
             "query_intent": "current_state",
@@ -202,7 +213,7 @@ class TestExecuteVCTool:
         assert "segment_refs" not in parsed["results"][0]
 
     def test_find_session_calls_engine_with_session_filter(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {
             "found": True,
             "results": [{"excerpt": "found it", "topic": "sneakers"}],
@@ -222,14 +233,14 @@ class TestExecuteVCTool:
 
     def test_find_quote_does_not_pass_session_filter(self):
         """vc_find_quote must NOT pass session_filter to engine."""
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {"found": False, "results": []}
         execute_vc_tool(engine, "vc_find_quote", {"query": "test"})
         call_kwargs = engine.find_quote.call_args[1]
         assert "session_filter" not in call_kwargs
 
     def test_remember_when_calls_engine(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.remember_when.return_value = {"query": "auth", "found": True, "results": []}
         result = execute_vc_tool(
             engine,
@@ -712,7 +723,7 @@ class TestRunToolLoop:
         assert result.stop_reason == "tool_use"
 
     def test_single_tool_call_with_continuation(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {"found": True, "results": []}
         engine.reassemble_context.return_value = ""
 
@@ -757,7 +768,7 @@ class TestRunToolLoop:
         )
 
     def test_passes_last_user_text_as_intent_context(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {"found": True, "results": []}
         engine.reassemble_context.return_value = ""
 
@@ -1159,7 +1170,7 @@ class TestRunToolLoopOpenAI:
         assert result.stop_reason == "end_turn"
 
     def test_single_tool_call_with_continuation(self):
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {"found": True, "results": []}
         engine.reassemble_context.return_value = ""
 

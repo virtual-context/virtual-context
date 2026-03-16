@@ -5,6 +5,17 @@ import pytest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+from virtual_context.types import SearchConfig
+
+
+def _mock_engine(**overrides):
+    """Create a MagicMock engine with a real SearchConfig on config.search."""
+    engine = MagicMock()
+    engine.config.search = SearchConfig()
+    for k, v in overrides.items():
+        setattr(engine, k, v)
+    return engine
+
 from virtual_context.types import (
     PagingConfig,
     QuoteResult,
@@ -343,7 +354,7 @@ class TestProxyFindQuoteTool:
 
     def test_execute_vc_tool_dispatches_find_quote(self):
         from virtual_context.core.tool_loop import execute_vc_tool
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {
             "query": "magnesium",
             "query_intent": "default",
@@ -371,7 +382,7 @@ class TestProxyFindQuoteTool:
 
     def test_execute_vc_tool_find_quote_ignores_input_max_results(self):
         from virtual_context.core.tool_loop import execute_vc_tool
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.find_quote.return_value = {"found": False, "results": []}
 
         execute_vc_tool(engine, "vc_find_quote", {"query": "test", "max_results": 3})
@@ -419,7 +430,7 @@ class TestRememberWhenTool:
     def test_execute_vc_tool_dispatches_remember_when(self):
         from virtual_context.core.tool_loop import execute_vc_tool
 
-        engine = MagicMock()
+        engine = _mock_engine()
         engine.remember_when.return_value = {
             "query": "auth",
             "found": True,

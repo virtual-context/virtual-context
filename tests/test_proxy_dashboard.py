@@ -587,15 +587,13 @@ class TestDashboardShutdown:
 
 
 class TestDashboardReplay:
-    def test_replay_html_panel(self, test_client):
-        """HTML includes the Replay panel."""
+    def test_replay_html_panel_removed(self, test_client):
+        """Replay panel has been removed from the dashboard."""
         client, _ = test_client
         resp = client.get("/dashboard")
         body = resp.text
-        assert "Replay" in body
-        assert "replay-file" in body
-        assert "startReplay" in body
-        assert "stopReplay" in body
+        assert "replay-file" not in body
+        assert "startReplay" not in body
 
     def test_replay_start_no_state(self):
         """Start replay when state is None returns 503."""

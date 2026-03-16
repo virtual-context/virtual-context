@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 
 from ..core.turn_tag_index import TurnTagIndex
-from ._envelope import _strip_openclaw_envelope
+from ._envelope import _strip_envelope
 from .formats import PayloadFormat, detect_format
 
 
@@ -395,12 +395,12 @@ def _extract_text_for_stub_hash(msg: dict) -> str:
     """
     content = msg.get("content", "")
     if isinstance(content, str):
-        return _strip_openclaw_envelope(content).strip()
+        return _strip_envelope(content).strip()
     if isinstance(content, list):
         for block in reversed(content):
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "")
-                return _strip_openclaw_envelope(text).strip()
+                return _strip_envelope(text).strip()
     return ""
 
 

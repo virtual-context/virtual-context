@@ -33,12 +33,14 @@ class ContextRetriever:
         config: RetrieverConfig,
         turn_tag_index: TurnTagIndex | None = None,
         inbound_tagger: TagGenerator | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         self.tag_generator = tag_generator
         self.store = store
         self.config = config
         self._turn_tag_index = turn_tag_index
         self._inbound_tagger = inbound_tagger
+        self._conversation_id = conversation_id
         # Pre-compile heuristic patterns for embedding-based inbound tagger
         self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
 
@@ -48,7 +50,9 @@ class ContextRetriever:
         Returns a dict mapping tag → log(1 + total_segments / usage_count).
         Rare tags get higher weights than common ones.
         """
-        all_tags = self.store.get_all_tags()
+        all_tags = self.store.get_all_tags(
+            conversation_id=self._conversation_id,
+        )
         if not all_tags:
             return {}
         total = sum(ts.usage_count for ts in all_tags)
@@ -112,13 +116,15 @@ class ContextRetriever:
         start_time = time.monotonic()
         active_tags = set(current_active_tags or [])
 
-        # Tag the inbound message
-        store_tags = [ts.tag for ts in self.store.get_all_tags()]
+        # Tag the inbound message — scope vocabulary to current conversation
+        store_tags = [ts.tag for ts in self.store.get_all_tags(
+            conversation_id=self._conversation_id,
+        )]
         if self._inbound_tagger is not None:
             # Embedding-based: match against existing vocabulary (no hallucination)
-            # Pass both store tags and ALL TurnTagIndex tags as vocabulary.
-            # Note: get_active_tags(lookback=4) would only return recent tags —
-            # the inbound tagger needs the full vocabulary to match any topic.
+            # Store tags are conversation-scoped via get_all_tags().
+            # TurnTagIndex is inherently per-conversation (loaded from that
+            # conversation's engine_state), so all its tags are in scope.
             vocab_tags = list(set(store_tags))
             if self._turn_tag_index:
                 all_index_tags = {t for e in self._turn_tag_index.entries for t in e.tags}

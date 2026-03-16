@@ -51,7 +51,7 @@ from .helpers import (  # noqa: F401 — re-exported for tests
     _HOP_BY_HOP,
     _last_text_block,
     _strip_vc_prompt,
-    _strip_openclaw_envelope,
+    _strip_envelope,
     _forward_headers,
     _detect_api_format,
     _extract_conversation_id,
@@ -359,6 +359,11 @@ def create_app(
                 registry.update_last_message_hash(
                     body, state.engine.config.conversation_id,
                 )
+
+        # In multi-tenant mode, use the tenant's metrics so captures
+        # (request, enriched, response) land on the correct instance.
+        if state and state.metrics:
+            metrics = state.metrics
 
         # Use accurate token counter from engine when available (e.g. tiktoken)
         if state and hasattr(state.engine, "_token_counter"):

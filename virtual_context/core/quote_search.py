@@ -270,8 +270,10 @@ def supplement_from_descriptions(
             seg_score = sum(1 for p in word_patterns if p.search(text_lower))
             if seg_score > best_score:
                 best_score = seg_score
+                _sc = getattr(store, 'search_config', None)
+                _ctx = _sc.excerpt_context_chars if _sc else 200
                 excerpt = extract_excerpt(
-                    seg.full_text, query, context_chars=200
+                    seg.full_text, query, context_chars=_ctx
                 )
                 meta = seg.metadata or SegmentMetadata(turn_count=0)
                 best = QuoteResult(

@@ -232,36 +232,6 @@
   }
   .passthrough-toggle:hover { background: var(--accent); color: #000; }
 
-  /* Replay panel */
-  .replay-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .replay-controls input[type="text"],
-  .replay-controls input[type="password"] {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
-    color: var(--text); padding: 5px 8px; font-size: 12px;
-    font-family: inherit; flex: 1;
-  }
-  .replay-controls input::placeholder { color: var(--text-dim); }
-  .replay-controls label { font-size: 11px; color: var(--text-dim); min-width: 50px; }
-  .replay-btn {
-    background: var(--accent); color: #fff; border: none; border-radius: 4px;
-    padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
-    font-family: inherit;
-  }
-  .replay-btn:hover { opacity: 0.9; }
-  .replay-btn:disabled { opacity: 0.4; cursor: default; }
-  .replay-btn.stop { background: var(--red); }
-  .replay-progress { margin-top: 8px; }
-  .replay-bar-track {
-    height: 10px; background: var(--bg); border-radius: 4px;
-    overflow: hidden; margin-bottom: 4px;
-  }
-  .replay-bar-fill {
-    height: 100%; background: var(--accent); border-radius: 4px;
-    transition: width 0.3s ease; width: 0%;
-  }
-  .replay-bar-fill.done { background: var(--green); }
-  .replay-bar-fill.error { background: var(--red); }
-  .replay-status { font-size: 11px; color: var(--text-dim); }
 
   /* Two-column layout for middle panels */
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
@@ -458,6 +428,8 @@
       <dt>Turns</dt><dd>Number of completed conversation turns (user message + assistant response pairs). Turns drive the tagging and compaction pipeline.</dd>
       <dt>Compactions</dt><dd>Number of compaction events that have fired. Each compaction summarizes older turns, frees token budget, and stores segments for later retrieval.</dd>
       <dt>Freed</dt><dd>Total tokens reclaimed by compaction. These tokens were occupied by raw conversation history and have been replaced by compressed summaries stored externally.</dd>
+      <dt>Soft Compact</dt><dd>Token count at which soft (proactive, non-blocking) compaction triggers. Computed as context_window &times; soft_threshold. Updates live when you adjust the threshold in Settings.</dd>
+      <dt>Hard Compact</dt><dd>Token count at which hard (mandatory, blocking) compaction triggers. Computed as context_window &times; hard_threshold. Updates live when you adjust the threshold in Settings.</dd>
     </dl>
   </div>
   <div class="stats">
@@ -467,29 +439,11 @@
     <div class="stat"><div class="label">Compactions</div><div class="value" id="s-compactions">0</div></div>
     <div class="stat"><div class="label">Intercepts</div><div class="value" id="s-intercepts">0</div></div>
     <div class="stat"><div class="label">Freed</div><div class="value" id="s-freed">0</div></div>
+    <div class="stat"><div class="label">Soft Compact</div><div class="value" id="s-soft" style="color:var(--yellow)">--</div></div>
+    <div class="stat"><div class="label">Hard Compact</div><div class="value" id="s-hard" style="color:var(--red)">--</div></div>
   </div>
 </div>
 
-<div class="panel">
-  <div class="section-header"><h2>Replay</h2><button class="help-btn" data-help="replay" onclick="toggleHelp(this)">?</button></div>
-  <div class="help-content" data-help-for="replay" style="display:none">
-    <p>Run a stress test by replaying a file of user prompts through the engine. Each line in the file becomes one conversation turn, processed through the full pipeline: tagging, retrieval, assembly, LLM call, and on_turn_complete. Use this to validate compaction behavior, retrieval accuracy, and context budget management over many turns.</p>
-    <dl>
-      <dt>File</dt><dd>Path to a text file with one user prompt per line. The proxy will send each line as a user message, call the configured LLM, and record the full turn.</dd>
-      <dt>Start / Stop</dt><dd>Begin or halt the replay. Progress is shown in the bar below. Metrics (request log, compaction events, cost savings) update live as turns complete.</dd>
-    </dl>
-  </div>
-  <div class="replay-controls">
-    <label>File</label>
-    <input type="text" id="replay-file" placeholder="path/to/prompts.txt" value="prompts100.txt">
-    <button class="replay-btn" id="replay-start" onclick="startReplay()">Start</button>
-    <button class="replay-btn stop" id="replay-stop" onclick="stopReplay()" disabled>Stop</button>
-  </div>
-  <div class="replay-progress" id="replay-progress" style="display:none">
-    <div class="replay-bar-track"><div class="replay-bar-fill" id="replay-fill"></div></div>
-    <div class="replay-status" id="replay-status"></div>
-  </div>
-</div>
 
 <div class="two-col">
   <div class="panel">
@@ -724,7 +678,7 @@
 
   // State
   let totalRequests = 0, totalCompactions = 0, totalFreed = 0, totalIntercepts = 0;
-  let totalTurns = 0, contextWindow = 120000;
+  let totalTurns = 0, contextWindow = 120000, softThreshold = 0.7, hardThreshold = 0.85;
   let waitSum = 0, inboundSum = 0, contextSum = 0;
   let compactedThrough = 0, historyLen = 0;
   let uptimeBase = 0, uptimeStart = Date.now();
@@ -820,6 +774,8 @@
     $('s-compactions').textContent = totalCompactions;
     $('s-intercepts').textContent = totalIntercepts;
     $('s-freed').textContent = fmtNum(totalFreed);
+    $('s-soft').textContent = fmtNum(Math.round(contextWindow * softThreshold)) + 't';
+    $('s-hard').textContent = fmtNum(Math.round(contextWindow * hardThreshold)) + 't';
   }
 
   function updatePipeline() {
@@ -1224,6 +1180,18 @@
     contextWindow = data.context_window || 120000;
     totalTurns = data.history_len ? Math.floor(data.history_len / 2) : totalRequests;
 
+    // Fetch thresholds from settings for the stat boxes
+    fetch('/dashboard/settings').then(function(r) {
+      if (!r.ok) return;
+      return r.json();
+    }).then(function(s) {
+      if (!s) return;
+      softThreshold = s.compaction.soft_threshold;
+      hardThreshold = s.compaction.hard_threshold;
+      contextWindow = s.readonly.context_window || contextWindow;
+      updateStats();
+    }).catch(function() {});
+
     // Set latestSystemTokens from snapshot requests
     if (data.recent_requests && data.recent_requests.length) {
       latestSystemTokens = data.recent_requests[data.recent_requests.length - 1].system_tokens || 0;
@@ -1501,40 +1469,6 @@
   }
 
   // Replay controls
-  let replayRunning = false;
-
-  window.startReplay = function() {
-    const file = $('replay-file').value.trim();
-    if (!file) { alert('Enter a prompts file path'); return; }
-
-    $('replay-start').disabled = true;
-    fetch('/dashboard/replay/start', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({file: file}),
-    })
-    .then(r => r.json().then(d => ({status: r.status, data: d})))
-    .then(({status, data}) => {
-      if (status >= 400) {
-        alert(data.error || 'Failed to start replay');
-        $('replay-start').disabled = false;
-        return;
-      }
-      replayRunning = true;
-      $('replay-stop').disabled = false;
-      $('replay-progress').style.display = 'block';
-      $('replay-fill').style.width = '0%';
-      $('replay-fill').className = 'replay-bar-fill';
-      $('replay-status').textContent = 'Starting... 0/' + data.total_prompts;
-    })
-    .catch(() => { $('replay-start').disabled = false; });
-  };
-
-  window.stopReplay = function() {
-    fetch('/dashboard/replay/stop', {method: 'POST'});
-    $('replay-status').textContent = 'Stopping...';
-  };
-
   function handleHistoryIngestion(data) {
     const turns = data.turns_ingested || 0;
     const ms = data.elapsed_ms || 0;
@@ -1567,34 +1501,6 @@
     // Update header ingestion status too
     var hdr = $('ingestion-status');
     if (hdr) hdr.textContent = 'Ingesting: ' + done + '/' + total + ' (' + pct + '%)';
-  }
-
-  function handleReplayProgress(data) {
-    const pct = data.total > 0 ? Math.round((data.turn / data.total) * 100) : 0;
-    $('replay-fill').style.width = pct + '%';
-    const preview = data.prompt_preview ? ' \u2014 "' + data.prompt_preview.substring(0, 50) + '"' : '';
-    $('replay-status').textContent = 'Turn ' + data.turn + '/' + data.total + ' (' + pct + '%)' + preview;
-  }
-
-  function handleReplayDone(data) {
-    replayRunning = false;
-    $('replay-start').disabled = false;
-    $('replay-stop').disabled = true;
-    const fill = $('replay-fill');
-    if (data.status === 'complete') {
-      fill.style.width = '100%';
-      fill.className = 'replay-bar-fill done';
-      $('replay-status').textContent = 'Complete \u2014 ' + data.turns_completed + '/' + data.total + ' turns';
-    } else if (data.status === 'stopped') {
-      fill.className = 'replay-bar-fill';
-      $('replay-status').textContent = 'Stopped at turn ' + data.turns_completed + '/' + data.total;
-    } else {
-      fill.className = 'replay-bar-fill error';
-      $('replay-status').textContent = 'Error: ' + (data.error || 'unknown');
-    }
-    // Final refresh after replay ends
-    fetchConversations();
-    updateSavings();
   }
 
   // Session filter
@@ -1953,10 +1859,6 @@
         showBudgetPromoted(data);
       } else if (data.type === 'budget_exceeded') {
         showBudgetExceeded(data);
-      } else if (data.type === 'replay_progress') {
-        handleReplayProgress(data);
-      } else if (data.type === 'replay_done') {
-        handleReplayDone(data);
       }
     };
   }
@@ -2390,6 +2292,14 @@
     document.querySelectorAll('.settings-slider').forEach(function(sl) {
       sl.addEventListener('input', function() {
         this.nextElementSibling.textContent = this.value;
+        // Live-update stat boxes when thresholds change
+        if (this.dataset.section === 'compaction' && this.dataset.key === 'soft_threshold') {
+          softThreshold = Number(this.value);
+          updateStats();
+        } else if (this.dataset.section === 'compaction' && this.dataset.key === 'hard_threshold') {
+          hardThreshold = Number(this.value);
+          updateStats();
+        }
       });
     });
     // Bind toggle events

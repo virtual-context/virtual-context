@@ -419,13 +419,14 @@ class TestInboundMatching:
             inbound_tagger=inbound,
         )
 
-        # "cars" is 10 turns back — must still be in vocabulary
+        # "cars" is 10 turns back — must still be in vocabulary.
+        # TurnTagIndex is per-conversation, so all its tags are in scope.
         result = retriever.retrieve("tell me about cars please")
         tags = result.retrieval_metadata.get("tags_from_message", [])
 
         assert "cars" in tags, (
             f"Expected 'cars' in vocabulary but got {tags}. "
-            "Inbound tagger must see ALL TurnTagIndex tags, not just recent lookback."
+            "Inbound tagger must see ALL TurnTagIndex tags (per-conversation scope)."
         )
         store.close()
 

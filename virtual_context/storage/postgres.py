@@ -294,6 +294,7 @@ class PostgresStore(ContextStore):
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
         self._conn: psycopg.Connection | None = None
+        self.search_config = None  # set by engine after construction
         self._ensure_schema()
 
     def _get_conn(self) -> psycopg.Connection:
@@ -501,20 +502,35 @@ class PostgresStore(ContextStore):
         tags_map = self._batch_get_tags(refs)
         return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
 
-    def get_all_tags(self) -> list[TagStats]:
+    def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         conn = self._get_conn()
-        rows = conn.execute("""
-            SELECT st.tag,
-                   COUNT(DISTINCT st.segment_ref) as usage_count,
-                   COALESCE(SUM(s.full_tokens), 0) as total_full,
-                   COALESCE(SUM(s.summary_tokens), 0) as total_summary,
-                   MIN(s.created_at) as oldest,
-                   MAX(s.created_at) as newest
-            FROM segment_tags st
-            JOIN segments s ON s.ref = st.segment_ref
-            GROUP BY st.tag
-            ORDER BY usage_count DESC
-        """).fetchall()
+        if conversation_id:
+            rows = conn.execute("""
+                SELECT st.tag,
+                       COUNT(DISTINCT st.segment_ref) as usage_count,
+                       COALESCE(SUM(s.full_tokens), 0) as total_full,
+                       COALESCE(SUM(s.summary_tokens), 0) as total_summary,
+                       MIN(s.created_at) as oldest,
+                       MAX(s.created_at) as newest
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.conversation_id = %s
+                GROUP BY st.tag
+                ORDER BY usage_count DESC
+            """, (conversation_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT st.tag,
+                       COUNT(DISTINCT st.segment_ref) as usage_count,
+                       COALESCE(SUM(s.full_tokens), 0) as total_full,
+                       COALESCE(SUM(s.summary_tokens), 0) as total_summary,
+                       MIN(s.created_at) as oldest,
+                       MAX(s.created_at) as newest
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                GROUP BY st.tag
+                ORDER BY usage_count DESC
+            """).fetchall()
         return [
             TagStats(
                 tag=row["tag"],
@@ -673,12 +689,14 @@ class PostgresStore(ContextStore):
 
     def search_full_text(self, query: str, limit: int = 5) -> list[QuoteResult]:
         conn = self._get_conn()
+        _sc = self.search_config
+        _pg_words = _sc.postgres_max_words if _sc else 100
         tsquery = " & ".join(query.split())
         try:
             rows = conn.execute(
                 """SELECT s.ref, s.primary_tag, s.metadata_json,
                     ts_headline('english', s.full_text, to_tsquery('english', %s),
-                                'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=100') as excerpt,
+                                'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=""" + str(_pg_words) + """') as excerpt,
                     s.created_at
                 FROM segments s
                 WHERE s.full_text_tsv @@ to_tsquery('english', %s)
@@ -688,6 +706,7 @@ class PostgresStore(ContextStore):
             ).fetchall()
         except Exception:
             # Fallback to ILIKE
+            _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
             rows = conn.execute(
                 "SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments WHERE full_text ILIKE %s LIMIT %s",
                 (f"%{query}%", limit),
@@ -696,7 +715,7 @@ class PostgresStore(ContextStore):
             for row in rows:
                 meta = json.loads(row["metadata_json"])
                 results.append(QuoteResult(
-                    text=_extract_excerpt(row["full_text"], query),
+                    text=_extract_excerpt(row["full_text"], query, context_chars=_excerpt_chars),
                     tag=row["primary_tag"], segment_ref=row["ref"],
                     session_date=meta.get("session_date", ""),
                     match_type="text_search",

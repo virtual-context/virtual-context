@@ -1,101 +1,93 @@
 version: "0.2"
 
-# storage_root: Base directory for all virtual-context data (SQLite DB, filesystem store).
-# Relative paths are resolved from the config file's directory.
-storage_root: ".virtualcontext"
-
-# context_window: Total token budget for the LLM's context window. virtual-context uses
-# this to decide when to compact (compress old turns) and how much retrieved context to
-# include. Set this to match your model's actual context limit.
-context_window: 120000
-
-# paging: Virtual memory paging — lets the LLM manage its own context budget.
-# When enabled, VC injects expand/collapse tools into API requests so the LLM can
-# page in detail about compacted topics or free budget by collapsing others.
-# Requires context_hint_enabled: true in assembly so the LLM sees the topic list.
+# =====================================================================================
+# VIRTUAL CONTEXT — COMPLETE REFERENCE CONFIGURATION
+# =====================================================================================
+# This file documents every configurable parameter with its default value.
+# Copy to virtual-context.yaml and customize as needed.
 #
-# autonomous_models: Model-name substrings (case-insensitive) for models trusted to
-#   page themselves via tool calls. These get vc_expand_topic/vc_collapse_topic tools
-#   and a budget dashboard in the context hint. Models NOT matching any entry run in
-#   supervised mode — VC pages silently via auto_promote/auto_evict.
+# Quick start (local Ollama):
+#   cp virtual-context.yaml.example virtual-context.yaml
+#   virtual-context chat
+#
+# Proxy mode (enriches any LLM client):
+#   virtual-context -c virtual-context.yaml proxy --upstream https://api.anthropic.com --port 5757
+
+storage_root: ".virtualcontext"                     # base directory for all VC data
+context_window: 120000                              # total token budget — match your model's limit
+token_counter: "estimate"                           # "estimate" | "tiktoken" | "callable:module.path:func"
+
+# =====================================================================================
+# PAGING — virtual memory depth control
+# =====================================================================================
+# Lets the LLM manage its own context budget via expand/collapse tools.
+# autonomous_models: model-name prefixes (case-insensitive startswith matching).
+# Matching models get vc_expand_topic / vc_collapse_topic tools injected.
+# Non-matching models run in supervised mode (VC pages silently).
+
 paging:
   enabled: true
+  auto_promote: true                                # auto-expand on strong retrieval match
+  auto_evict: true                                  # auto-collapse coldest when over budget
+  max_tool_loops: 10                                # max continuation rounds in tool loop
   autonomous_models:
-    - opus
-    - sonnet
-    - gpt-4
-    - gpt-4o
-  auto_promote: true
-  auto_evict: true
-
-# token_counter: How tokens are counted.
-#   "estimate"  — fast, no dependencies (chars / 4)
-#   "tiktoken"  — accurate, requires `pip install tiktoken`
-#   "callable:module.path:func" — custom function
-token_counter: "estimate"
+    # Anthropic
+    - claude-sonnet-4                               # claude-sonnet-4-5, claude-sonnet-4-6
+    - claude-opus-4                                 # claude-opus-4-5, claude-opus-4-6
+    - claude-3-5-sonnet                             # legacy claude-3-5-sonnet-*
+    - claude-3.5-sonnet                             # legacy claude-3.5-sonnet-*
+    - claude-3-7-sonnet                             # legacy claude-3-7-sonnet-*
+    - claude-3.7-sonnet                             # legacy claude-3.7-sonnet-*
+    - claude-3-opus                                 # legacy claude-3-opus-*
+    # OpenAI
+    - gpt-4o                                        # gpt-4o, gpt-4o-mini
+    - gpt-4-turbo                                   # gpt-4-turbo
+    - gpt-4.1                                       # gpt-4.1, gpt-4.1-mini, gpt-4.1-nano
+    - gpt-5                                         # gpt-5, gpt-5-mini, gpt-5.2, gpt-5.4
+    - o1                                            # o1
+    - o3                                            # o3, o3-mini
+    - o4-mini                                       # o4-mini
+    # Google
+    - gemini-2.5-pro                                # gemini-2.5-pro-*
+    - gemini-2.5-flash                              # gemini-2.5-flash-*
+    - gemini-3                                      # gemini-3-pro-*, gemini-3.1-pro-*
+    - gemini-2.0-flash                              # gemini-2.0-flash-*
 
 # =====================================================================================
 # TAG GENERATOR — how conversation turns get semantic tags
 # =====================================================================================
-# Every user+assistant exchange is tagged with 1-10 semantic labels (e.g. "database",
-# "authentication", "flask"). Tags drive retrieval: when you ask about "database" later,
-# virtual-context fetches stored summaries that share that tag.
+# Every user+assistant exchange is tagged with semantic labels (e.g. "database",
+# "authentication"). Tags drive retrieval: when you mention "database" later,
+# VC fetches stored summaries sharing that tag.
 #
-# type: "llm"     — LLM generates tags from conversation content (best quality)
-# type: "keyword" — deterministic keyword/regex matching (no LLM needed, fast)
-#
-# When type is "llm", keyword_fallback provides a safety net if the LLM is unavailable.
+# type: "llm"     — LLM generates tags (best quality, requires provider)
+# type: "keyword" — deterministic keyword/regex matching (no LLM needed)
 
 tag_generator:
   type: "llm"
-  provider: "ollama"                    # must match a key in the providers section below
-  model: "qwen3:4b-instruct-2507-fp16" # model used for tagging (can differ from summarization)
-  max_tags: 10                          # upper bound on tags per exchange
-  min_tags: 5                           # lower bound — encourages richer tagging
+  provider: "ollama"                                # must match a key in providers section
+  model: "qwen3:4b-instruct-2507-fp16"
+  max_tags: 10                                      # upper bound on tags per exchange
+  min_tags: 5                                       # lower bound — encourages richer tagging
+  max_tokens: 8192                                  # LLM max_tokens for tagger calls
+  prompt_mode: "compact"                            # "detailed" (full rules) or "compact" (minimal)
+  context_lookback_pairs: 5                         # recent turn pairs fed as tagger context
+  context_bleed_threshold: 0.1                      # embedding similarity gate (0 = disabled)
+  disable_thinking: false                           # prepend /no_think for qwen3 models
+  temporal_heuristic_enabled: true                  # regex-based temporal detection
 
-  # context_lookback_pairs: Number of recent turn pairs to include as context when
-  # tagging short/ambiguous messages (e.g. "of course", "yes", "?"). Helps the tagger
-  # infer the correct topic from surrounding conversation. Set to 0 to disable.
-  context_lookback_pairs: 5
-
-  # context_bleed_threshold: Embedding similarity gate that prevents stale context
-  # from a previous topic from bleeding into the tagger when the conversation shifts.
-  # Compares the current turn against the most recent context pair using cosine
-  # similarity. Below this threshold → topic shift → context is skipped.
-  # Set to 0 to disable the gate. Requires sentence-transformers (pip install
-  # virtual-context[embeddings]); degrades gracefully to no gating if not installed.
-  context_bleed_threshold: 0.1
-
-  # prompt_mode: Controls how much instruction the LLM receives for tagging.
-  #   "detailed" — full rules, examples, temporal detection guidance (~600 tokens)
-  #   "compact"  — minimal rules (~200 tokens), better for models with small context
-  prompt_mode: "compact"
-
-  # max_tokens: Maximum tokens the LLM can generate for its tagging response.
-  # The response is a single JSON object (~50-100 tokens). Set higher for models
-  # with thinking mode (qwen3) where internal reasoning consumes extra tokens.
-  # Default: 1000. Use 200 with disable_thinking, 2000+ without.
-  # max_tokens: 1000
-
-  # disable_thinking: Prepends /no_think to the tagger prompt. For qwen3 models,
-  # this skips the internal reasoning chain — 15x fewer tokens, faster, and often
-  # more accurate for structured JSON output. No effect on non-qwen models.
-  # disable_thinking: true
-
-  # temporal_patterns: Regex patterns for deterministic temporal-query detection.
-  # Temporal queries reference a position in time ("the first thing we discussed",
-  # "at the beginning"). These fetch granular segment summaries sorted earliest-first
-  # instead of merged tag summaries, preserving chronological detail.
-  #
+  # temporal_patterns: regex patterns for temporal-query detection.
   # Defaults are built in (8 patterns). Set to [] to disable.
-  #
-  # temporal_patterns:
-  #   - "\\b(?:the )?(?:very )?first (?:thing|topic|discussion)\\b"
-  #   - "\\bat the (?:very )?(?:beginning|start)\\b"
-  #   - "\\bearly (?:on|in our)\\b"
+  # temporal_patterns: []
 
-  # keyword_fallback: Deterministic tagging used when type is "keyword", or as a
-  # fallback when the LLM is unavailable. Maps keywords and regex patterns to tags.
+  # Tag splitting — automatic splitting of overly-broad tags
+  tag_splitting:
+    enabled: false
+    frequency_threshold: 15                         # min absolute turn count to trigger
+    frequency_pct_threshold: 0.15                   # min relative frequency
+    max_splits_per_turn: 1                          # max tags to attempt per on_turn_complete
+
+  # keyword_fallback: deterministic tagging when LLM is unavailable
   keyword_fallback:
     tag_keywords:
       legal:
@@ -132,12 +124,10 @@ tag_generator:
 # =====================================================================================
 # TAG RULES — per-tag priority, TTL, and custom summarization prompts
 # =====================================================================================
-# Controls how stored tags are prioritized during assembly and when they expire.
-#
-# match:          fnmatch pattern against tag names ("database*" matches "database-schema")
-# priority:       higher = assembled first when budget is tight (1-10 scale)
-# ttl_days:       auto-delete stored segments after N days. null = never expire
-# summary_prompt: custom LLM prompt used when summarizing this tag's segments
+# match: fnmatch pattern against tag names
+# priority: 1-10 scale, higher = assembled first when budget is tight
+# ttl_days: auto-delete stored segments after N days (null = never expire)
+# summary_prompt: custom LLM prompt for summarizing this tag's segments
 
 tag_rules:
   - match: "architecture*"
@@ -153,7 +143,7 @@ tag_rules:
 
   - match: "debug*"
     priority: 7
-    ttl_days: 7           # debugging context stales fast
+    ttl_days: 7
 
   - match: "legal*"
     priority: 9
@@ -166,173 +156,214 @@ tag_rules:
     priority: 8
     ttl_days: 90
 
-  - match: "*"            # catch-all for any unmatched tags
+  - match: "*"
     priority: 5
     ttl_days: 30
 
 # =====================================================================================
 # COMPACTION — when and how old conversation turns are compressed
 # =====================================================================================
-# When token usage crosses a threshold, virtual-context compacts (summarizes) older
-# turns into stored segments. The raw turns are replaced by compact summaries, freeing
-# space in the context window while preserving the information.
+# When token usage crosses a threshold (fraction of context_window), old turns are
+# grouped by tag and summarized. The raw turns are replaced by compact summaries,
+# freeing space while preserving the information in the store.
 
 compaction:
   # soft_threshold: Fraction of context_window that triggers proactive compaction.
-  # At 0.70 with a 120k window, compaction starts at ~84k tokens.
+  # Runs in a background thread — non-blocking. At 0.70 with a 120k window,
+  # compaction fires when usage crosses ~84k tokens.
   soft_threshold: 0.70
 
   # hard_threshold: Fraction that triggers mandatory blocking compaction.
-  # The engine will not proceed until compaction frees enough space.
+  # The engine will NOT proceed until compaction frees enough space.
+  # At 0.85 with a 120k window, this fires at ~102k tokens.
   hard_threshold: 0.85
 
-  # protected_recent_turns: Number of recent turn pairs (user+assistant) that are
-  # never compacted. These stay as raw messages in the context window.
-  protected_recent_turns: 6
-
-  # overflow_buffer: Multiplier for how much extra to compact beyond the minimum.
-  # 1.2 = compact 20% more than needed, reducing how often compaction fires.
-  overflow_buffer: 1.2
-
-  # summary_ratio: Target compression ratio. 0.15 = summaries should be ~15% the
-  # size of the original text.
-  summary_ratio: 0.15
-
-  # min/max_summary_tokens: Bounds on individual segment summary length.
-  min_summary_tokens: 200
-  max_summary_tokens: 2000
-
-  # max_concurrent_summaries: How many segments to summarize in parallel.
-  # Higher = faster compaction but more LLM calls at once.
-  max_concurrent_summaries: 4
+  protected_recent_turns: 6                         # recent turn pairs never compacted
+  overflow_buffer: 1.2                              # compact 20% more than needed to reduce frequency
+  summary_ratio: 0.15                               # target summary/original ratio (0.15 = ~85% compression)
+  min_summary_tokens: 200                           # floor on individual segment summary length
+  max_summary_tokens: 2000                          # ceiling on individual segment summary length
+  max_concurrent_summaries: 4                       # parallel summarization calls via ThreadPoolExecutor
+  llm_token_overhead: 2000                          # extra tokens reserved for LLM reasoning overhead
 
 # =====================================================================================
-# SUMMARIZATION — LLM used to generate compaction summaries
+# SEGMENTER
 # =====================================================================================
-# Can use a different provider/model than the tagger. Summarization is less
-# latency-sensitive (runs in a background thread), so you can use a larger model.
+
+segmenter:
+  session_gap_minutes: 30                           # split segments when messages >N min apart (0=disabled)
+
+# =====================================================================================
+# SUMMARIZATION — LLM used for compaction summaries
+# =====================================================================================
 
 summarization:
-  provider: "ollama"                    # must match a key in the providers section
+  provider: "ollama"                                # must match a key in providers section
   model: "qwen3:4b-instruct-2507-fp16"
-  max_tokens: 1000                      # max tokens for each summary response
-  temperature: 0.3                      # lower = more deterministic summaries
+  max_tokens: 1000
+  temperature: 0.3
 
 # =====================================================================================
 # PROVIDERS — LLM endpoint configurations
 # =====================================================================================
-# Define named LLM backends. The tag_generator and summarization sections reference
-# these by name. Each provider needs a type and endpoint configuration.
-#
 # Supported types:
-#   "generic_openai" — any OpenAI-compatible API (Ollama, LM Studio, vLLM, OpenRouter,
-#                      Together, Fireworks, etc.)
+#   "generic_openai" — any OpenAI-compatible API (Ollama, LM Studio, vLLM, etc.)
+#   "openrouter"     — OpenRouter (auto-injects HTTP-Referer header)
 #   "anthropic"      — Anthropic API (Claude models)
 
 providers:
   ollama:
     type: "generic_openai"
     base_url: "http://127.0.0.1:11434/v1"
-    # api_key: "not-needed"             # Ollama doesn't require an API key
+
+  # openrouter:
+  #   type: "openrouter"
+  #   base_url: "https://openrouter.ai/api/v1"
+  #   api_key_env: "OPENROUTER_API_KEY"
 
   # anthropic:
   #   type: "anthropic"
-  #   api_key_env: "ANTHROPIC_API_KEY"  # reads API key from this env var
-  #   model: "claude-haiku-4-5-20251001"
-
-  # openrouter:
-  #   type: "generic_openai"
-  #   base_url: "https://openrouter.ai/api/v1"
-  #   api_key: "sk-or-..."             # or use api_key_env
-  #   model: "qwen/qwen3-32b"
+  #   api_key_env: "ANTHROPIC_API_KEY"
 
 # =====================================================================================
-# STORAGE — where compacted segments and tag summaries are persisted
+# STORAGE
 # =====================================================================================
-# Two backends available:
-#   "sqlite"     — single file, FTS5 full-text search, tag aliases. Recommended.
-#   "filesystem" — markdown files + YAML frontmatter + JSON index. Human-readable.
 
 storage:
-  backend: "sqlite"
+  backend: "sqlite"                                 # "sqlite" | "filesystem" | "postgres" | "neo4j" | "falkordb"
   sqlite:
     path: ".virtualcontext/store.db"
   filesystem:
     root: ".virtualcontext/store"
+  # postgres:
+  #   dsn: ""
+  # neo4j:
+  #   uri: ""
+  #   user: "neo4j"
+  #   password: ""
+  # falkordb:
+  #   host: "localhost"
+  #   port: 6379
+  #   password: ""
+
+# =====================================================================================
+# SEARCH — find_quote excerpt and snippet lengths
+# =====================================================================================
+
+search:
+  # Excerpt/snippet lengths
+  excerpt_context_chars: 200              # chars of context around a LIKE/manual match
+  fts_snippet_chars: 500                  # FTS5 snippet max chars for segment search
+  tool_output_snippet_chars: 100          # FTS5 snippet max chars for tool output search
+  postgres_max_words: 100                 # ts_headline MaxWords for Postgres FTS
+  # Result limits
+  find_quote_max_results: 20              # max results from vc_find_quote tool calls
+  find_quote_default_results: 5           # default max_results for engine.find_quote()
+  remember_when_max_results: 5            # default max_results for vc_remember_when
+  semantic_search_max_results: 5          # max results from embedding-based search
+  query_facts_default_limit: 50           # default limit for query_facts()
+
+# =====================================================================================
+# FACTS — fact extraction and graph linking
+# =====================================================================================
+
+facts:
+  graph_links: true                                 # enable fact-to-fact relationship graph
+  link_types:
+    - supersedes
+    - caused_by
+    - part_of
+    - contradicts
+    - same_as
+    - related_to
+
+# =====================================================================================
+# SUPERSESSION — fact supersession checking at compaction time
+# =====================================================================================
+
+supersession:
+  enabled: false
+  provider: ""                                      # empty = use summarization provider
+  model: ""                                         # empty = use summarization model
+  batch_size: 20
+
+# =====================================================================================
+# CURATION — LLM-based fact curation
+# =====================================================================================
+
+curation:
+  enabled: false
+  provider: ""
+  model: ""
+  max_response_tokens: 2048
+
+# =====================================================================================
+# TOOL OUTPUT INTERCEPTION — truncate large tool results, index for search
+# =====================================================================================
+
+tool_output:
+  enabled: false
+  default_truncate_threshold: 8192                  # truncate results larger than 8KB
+  max_index_bytes: 524288                           # 512KB max indexed per tool result
+  default_head_ratio: 0.6
+  default_tail_ratio: 0.4
+  # rules:                                          # per-tool overrides
+  #   - match: "read_file"
+  #     truncate_threshold: 16384
+
+# =====================================================================================
+# PROXY — HTTP proxy settings
+# =====================================================================================
+
+proxy:
+  request_log_dir: ".virtualcontext/request_log"
+  request_log_max_files: 50
+  upstream_context_limit: 200000                    # max tokens the upstream model accepts
+  # instances:                                      # multi-instance proxy config
+  #   - port: 5757
+  #     upstream: "https://api.anthropic.com"
+  #     label: "anthropic"
+  #     host: "127.0.0.1"
 
 # =====================================================================================
 # ASSEMBLY — how retrieved context is built for the LLM
 # =====================================================================================
-# After retrieval, the assembler builds the enriched system prompt within a token budget.
-# It includes: core files (always present) + tag summaries (priority-ordered) + context hint.
 
 assembly:
-  # core_context_max_tokens: Budget for always-included files (SOUL.md, USER.md, etc.)
-  core_context_max_tokens: 18000
-
-  # tag_context_max_tokens: Budget for retrieved tag summaries. Summaries are included
-  # in priority order (from tag_rules) until this budget is exhausted.
-  tag_context_max_tokens: 30000
-
-  # context_hint: After compaction, the LLM loses visibility into what topics are stored.
-  # When enabled, a lightweight <context-topics> block is injected listing stored tags
-  # with turn counts, so the LLM knows what prior context is available for recall.
+  core_context_max_tokens: 18000                    # budget for always-included files
+  tag_context_max_tokens: 30000                     # budget for retrieved tag summaries
+  facts_max_tokens: 20000                           # budget for facts block
+  recent_turns_always_included: 3                   # recent turns always in assembled context
   context_hint_enabled: true
-  context_hint_max_tokens: 200
-
-  # core_files: Files always included in the system prompt (e.g. persona, user profile).
-  # Each file gets a priority (higher = included first if budget is tight).
+  context_hint_max_tokens: 2000
   core_files: []
   # core_files:
   #   - path: "SOUL.md"
   #     priority: 10
-  #   - path: "USER.md"
-  #     priority: 9
 
 # =====================================================================================
-# RETRIEVAL — how stored context is fetched for incoming messages
+# RETRIEVAL — tag-overlap based context retrieval
 # =====================================================================================
-# When a message arrives, the retriever tags it, then fetches stored summaries whose
-# tags overlap. IDF weighting ensures rare-tag matches score higher than common ones.
 
 retrieval:
-  # skip_active_tags: When true, don't retrieve summaries for tags that are already
-  # in the active conversation (they're already in the context window). Set to false
-  # post-compaction (handled automatically by the engine).
   skip_active_tags: true
-
-  # active_tag_lookback: How many recent turns to check for "active" tags.
   active_tag_lookback: 4
-
+  anchorless_lookback: 6                            # recent turns for working set
+  inbound_tagger_type: "embedding"                  # "embedding" or "llm"
+  embedding_model: "all-MiniLM-L6-v2"
+  embedding_threshold: 0.3
   strategy_config:
     default:
-      # min_overlap: Minimum number of overlapping tags to consider a match.
-      # 1 = any single shared tag is enough.
       min_overlap: 1
-
-      # max_results: Maximum stored summaries to return per retrieval.
       max_results: 10
-
-      # max_budget_fraction: Maximum fraction of tag_context_max_tokens to use
-      # for a single retrieval. 0.25 = up to 25% of the tag context budget.
       max_budget_fraction: 0.25
-
-      # include_related: When true, expand the search using related_tags generated
-      # by the tagger. Bridges vocabulary mismatches (e.g. "caching" finds
-      # "materialized view" via related tag overlap).
       include_related: true
 
 # =====================================================================================
-# COST TRACKING — monitor token usage and estimated costs per session
+# TELEMETRY — cost tracking and performance monitoring
 # =====================================================================================
-# Tracks LLM calls made by the tagger and compactor. View with `virtual-context status`.
+# Pricing is managed by models.yaml (see telemetry.models_file).
 
-cost_tracking:
-  enabled: true
-  pricing:
-    ollama:
-      input_per_1k: 0.0      # local models = free
-      output_per_1k: 0.0
-    anthropic:
-      input_per_1k: 0.00025  # Haiku pricing
-      output_per_1k: 0.00125
+telemetry:
+  enabled: false
+  models_file: "models.yaml"
