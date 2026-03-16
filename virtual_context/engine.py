@@ -860,6 +860,18 @@ class VirtualContextEngine:
 
         if signal is None:
             self._last_compact_ms = 0.0
+            # Persist turn message text for post-restart recall
+            if latest_pair:
+                turn_num = len(self._turn_tag_index.entries) - 1
+                try:
+                    self._store.save_turn_message(
+                        self.config.conversation_id,
+                        turn_num,
+                        latest_pair[0].content if len(latest_pair) > 0 else "",
+                        latest_pair[1].content if len(latest_pair) > 1 else "",
+                    )
+                except Exception:
+                    pass  # never block tagging for message persistence
             self._save_state(conversation_history)
 
         return signal
@@ -1773,29 +1785,47 @@ class VirtualContextEngine:
             })
 
         # Live turns: TurnTagIndex entries where tag appears,
-        # paired with conversation_history messages
+        # paired with conversation_history messages or persisted turn_messages
         history = conversation_history or []
+        missing_turn_numbers: list[int] = []
+        live_entries: list[tuple] = []  # (entry, msg_idx)
         for entry in self._turn_tag_index.entries:
             if tag not in entry.tags:
                 continue
             msg_idx = entry.turn_number * 2
-            messages = []
             if msg_idx < len(history):
-                messages.append({
-                    "role": "user",
-                    "content": history[msg_idx].content,
+                messages = [{"role": "user", "content": history[msg_idx].content}]
+                if msg_idx + 1 < len(history):
+                    messages.append({"role": "assistant", "content": history[msg_idx + 1].content})
+                result["live_turns"].append({
+                    "turn_number": entry.turn_number,
+                    "tags": entry.tags,
+                    "primary_tag": entry.primary_tag,
+                    "messages": messages,
                 })
-            if msg_idx + 1 < len(history):
-                messages.append({
-                    "role": "assistant",
-                    "content": history[msg_idx + 1].content,
+            else:
+                missing_turn_numbers.append(entry.turn_number)
+                live_entries.append(entry)
+
+        # Fall back to persisted turn_messages for restored turns
+        if missing_turn_numbers:
+            persisted = self._store.get_turn_messages(
+                self.config.conversation_id, missing_turn_numbers,
+            )
+            for entry in live_entries:
+                pair = persisted.get(entry.turn_number)
+                messages = []
+                if pair:
+                    if pair[0]:
+                        messages.append({"role": "user", "content": pair[0]})
+                    if pair[1]:
+                        messages.append({"role": "assistant", "content": pair[1]})
+                result["live_turns"].append({
+                    "turn_number": entry.turn_number,
+                    "tags": entry.tags,
+                    "primary_tag": entry.primary_tag,
+                    "messages": messages,
                 })
-            result["live_turns"].append({
-                "turn_number": entry.turn_number,
-                "tags": entry.tags,
-                "primary_tag": entry.primary_tag,
-                "messages": messages,
-            })
 
         result["total_turns"] = len(result["stored_turns"]) + len(result["live_turns"])
         return result

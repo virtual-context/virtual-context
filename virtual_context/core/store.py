@@ -131,6 +131,31 @@ class ContextStore(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Turn messages (lightweight per-turn text for post-restart recall)
+    # ------------------------------------------------------------------
+
+    def save_turn_message(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        """Persist turn message text. Upsert by (conversation_id, turn_number)."""
+
+    def get_turn_messages(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, tuple[str, str]]:
+        """Retrieve message text for specific turns.
+
+        Returns {turn_number: (user_content, assistant_content)}.
+        Missing turns are omitted from the result.
+        """
+        return {}
+
+    # ------------------------------------------------------------------
     # Cross-cutting queries (used by consolidator, tool loop, etc.)
     # ------------------------------------------------------------------
 

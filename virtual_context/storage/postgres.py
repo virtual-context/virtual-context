@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS engine_state (
     saved_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS turn_messages (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    user_content TEXT NOT NULL DEFAULT '',
+    assistant_content TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (conversation_id, turn_number)
+);
+
 CREATE TABLE IF NOT EXISTS segment_chunks (
     segment_ref TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -899,6 +907,48 @@ class PostgresStore(ContextStore):
             if fp:
                 result[fp] = row["conversation_id"]
         return result
+
+    # ------------------------------------------------------------------
+    # Turn messages
+    # ------------------------------------------------------------------
+
+    def save_turn_message(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO turn_messages
+            (conversation_id, turn_number, user_content, assistant_content)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (conversation_id, turn_number) DO UPDATE SET
+                user_content=EXCLUDED.user_content,
+                assistant_content=EXCLUDED.assistant_content""",
+            (conversation_id, turn_number, user_content, assistant_content),
+        )
+
+    def get_turn_messages(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, tuple[str, str]]:
+        if not turn_numbers:
+            return {}
+        conn = self._get_conn()
+        placeholders = ",".join("%s" for _ in turn_numbers)
+        rows = conn.execute(
+            f"""SELECT turn_number, user_content, assistant_content
+            FROM turn_messages
+            WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
+            [conversation_id] + turn_numbers,
+        ).fetchall()
+        return {
+            row["turn_number"]: (row["user_content"], row["assistant_content"])
+            for row in rows
+        }
 
     # ------------------------------------------------------------------
     # FactStore
