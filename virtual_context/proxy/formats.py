@@ -112,18 +112,42 @@ class PayloadFormat(ABC):
     # -- Payload token estimation --------------------------------------------
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        """Estimate total input tokens from a request body."""
+        """Estimate total input tokens from a request body.
+
+        Counts all token-consuming content: message text, tool_use inputs,
+        tool_result outputs, system prompt, and tool definitions.
+        """
         total = 0
         for m in self.get_messages(body):
             c = m.get("content", "")
             if isinstance(c, str):
                 total += self._count(c)
             elif isinstance(c, list):
-                total += sum(
-                    self._count(b.get("text", ""))
-                    for b in c if isinstance(b, dict)
-                )
+                for b in c:
+                    if not isinstance(b, dict):
+                        continue
+                    btype = b.get("type", "")
+                    if btype == "text":
+                        total += self._count(b.get("text", ""))
+                    elif btype == "tool_use":
+                        total += self._count(b.get("name", ""))
+                        inp = b.get("input")
+                        if inp:
+                            total += self._count(
+                                json.dumps(inp) if not isinstance(inp, str) else inp
+                            )
+                    elif btype == "tool_result":
+                        rc = b.get("content", "")
+                        if isinstance(rc, str):
+                            total += self._count(rc)
+                        elif isinstance(rc, list):
+                            for rb in rc:
+                                if isinstance(rb, dict):
+                                    total += self._count(rb.get("text", ""))
+                    else:
+                        total += self._count(json.dumps(b))
         total += self._estimate_system_tokens(body)
+        total += self.estimate_tools_tokens(body)
         return total
 
     def _estimate_system_tokens(self, body: dict) -> int:
@@ -1232,11 +1256,31 @@ class OpenAIResponsesFormat(PayloadFormat):
             if isinstance(content, str):
                 total += self._count(content)
             elif isinstance(content, list):
-                total += sum(
-                    self._count(b.get("text", ""))
-                    for b in content if isinstance(b, dict)
-                )
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    btype = b.get("type", "")
+                    if btype in ("text", "output_text", "input_text"):
+                        total += self._count(b.get("text", ""))
+                    elif btype == "tool_use":
+                        total += self._count(b.get("name", ""))
+                        inp = b.get("input")
+                        if inp:
+                            total += self._count(
+                                json.dumps(inp) if not isinstance(inp, str) else inp
+                            )
+                    elif btype == "tool_result":
+                        rc = b.get("content", "")
+                        if isinstance(rc, str):
+                            total += self._count(rc)
+                        elif isinstance(rc, list):
+                            for rb in rc:
+                                if isinstance(rb, dict):
+                                    total += self._count(rb.get("text", ""))
+                    else:
+                        total += self._count(json.dumps(b))
         total += self._estimate_system_tokens(body)
+        total += self.estimate_tools_tokens(body)
         return total
 
     # -- Fingerprinting --
