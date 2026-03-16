@@ -877,9 +877,6 @@ async def _handle_streaming(
                             timestamp=datetime.now(timezone.utc)),
                 )
                 if not passthrough:
-                    _real_input_paging = _stream_usage.get("input_tokens", 0)
-                    if _real_input_paging and _real_input_paging > (state._last_payload_tokens or 0):
-                        state._last_payload_tokens = _real_input_paging
                     state.fire_turn_complete(
                         list(state.conversation_history),
                         payload_tokens=state._last_payload_tokens or None,
@@ -939,11 +936,6 @@ async def _handle_streaming(
                             timestamp=datetime.now(timezone.utc))
                 )
                 if not passthrough:
-                    # Use Anthropic's reported input tokens if available (includes
-                    # cache_creation + cache_read), falling back to our estimate.
-                    _real_input = _raw_usage.get("input_tokens", 0)
-                    if _real_input and _real_input > (state._last_payload_tokens or 0):
-                        state._last_payload_tokens = _real_input
                     state.fire_turn_complete(
                         list(state.conversation_history),
                         payload_tokens=state._last_payload_tokens or None,
@@ -1044,9 +1036,6 @@ async def _handle_non_streaming(
                     timestamp=datetime.now(timezone.utc))
         )
         if not passthrough:
-            _real_input_ns = _ns_usage.get("input_tokens", 0)
-            if _real_input_ns and _real_input_ns > (state._last_payload_tokens or 0):
-                state._last_payload_tokens = _real_input_ns
             state.fire_turn_complete(
                 list(state.conversation_history),
                 payload_tokens=state._last_payload_tokens or None,
