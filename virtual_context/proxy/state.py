@@ -98,6 +98,14 @@ class ProxyState:
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
 
+        # Wire up request captures persistence: engine pulls from metrics at save time
+        if metrics:
+            engine._request_captures_provider = metrics.get_captured_requests_summary
+        # Restore persisted request captures into metrics
+        if metrics and engine._restored_request_captures:
+            metrics.restore_request_captures(engine._restored_request_captures)
+            engine._restored_request_captures = []
+
     @property
     def turn_offset(self) -> int:
         """Starting turn number from persisted engine state.

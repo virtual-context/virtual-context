@@ -606,6 +606,7 @@ class FilesystemStore(ContextStore):
                 for ws in state.working_set
             ],
             "trailing_fingerprint": state.trailing_fingerprint,
+            "request_captures": state.request_captures,
         }
         path.write_text(json.dumps(data, indent=2))
 
@@ -639,6 +640,7 @@ class FilesystemStore(ContextStore):
             split_processed_tags=data.get("split_processed_tags", []),
             working_set=working_set,
             trailing_fingerprint=data.get("trailing_fingerprint", ""),
+            request_captures=data.get("request_captures", []),
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:

@@ -291,3 +291,9 @@ class ProxyMetrics:
                 "turns_stubbed": r.get("turns_stubbed", 0),
                 "message_preview": r.get("message_preview", ""),
             } for r in self._request_bodies]
+
+    def restore_request_captures(self, captures: list[dict]) -> None:
+        """Restore persisted request captures into the ring buffer."""
+        with self._lock:
+            for cap in captures:
+                self._request_bodies.append(cap)

@@ -130,6 +130,8 @@ class VirtualContextEngine:
         self._last_split_result: SplitResult | None = None
         self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
         self.reference_date: date | None = None  # override "today" for remember_when relative presets
+        self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
+        self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
 
         # Cached state from last on_message_inbound call (used by reassemble_context)
         self._last_retrieval_result: RetrievalResult | None = None
@@ -477,6 +479,8 @@ class VirtualContextEngine:
         # Restore telemetry counters from persisted rollup
         if saved.telemetry_rollup:
             self._telemetry.restore_from_rollup(saved.telemetry_rollup)
+        # Stash request captures for ProxyState to pick up after init
+        self._restored_request_captures = saved.request_captures or []
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
@@ -523,6 +527,13 @@ class VirtualContextEngine:
             # Persist telemetry rollup (totals + by_model) without raw events
             telemetry_dict = self._telemetry.to_dict()
             telemetry_dict.pop("events", None)  # too large for state blob
+            # Pull request captures from proxy metrics if available
+            captures = []
+            if self._request_captures_provider:
+                try:
+                    captures = self._request_captures_provider()
+                except Exception:
+                    pass
             self._store.save_engine_state(EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
                 compacted_through=self._compacted_through,
@@ -532,6 +543,7 @@ class VirtualContextEngine:
                 working_set=list(self._working_set.values()),
                 trailing_fingerprint=self._trailing_fingerprint,
                 telemetry_rollup=telemetry_dict,
+                request_captures=captures,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
