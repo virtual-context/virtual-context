@@ -45,6 +45,26 @@ from .state import ProxyState
 logger = logging.getLogger(__name__)
 
 
+def _extract_usage(msg_usage: dict, target: dict) -> None:
+    """Extract token usage from an Anthropic message_start usage dict.
+
+    Anthropic splits input tokens into:
+    - input_tokens: new (uncached) tokens
+    - cache_creation_input_tokens: tokens written to cache
+    - cache_read_input_tokens: tokens read from cache
+
+    Total input = input_tokens + cache_creation + cache_read.
+    """
+    if "input_tokens" in msg_usage:
+        uncached = msg_usage["input_tokens"]
+        cache_create = msg_usage.get("cache_creation_input_tokens", 0) or 0
+        cache_read = msg_usage.get("cache_read_input_tokens", 0) or 0
+        target["input_tokens"] = uncached + cache_create + cache_read
+        target["input_tokens_uncached"] = uncached
+        target["cache_creation_input_tokens"] = cache_create
+        target["cache_read_input_tokens"] = cache_read
+
+
 async def _passthrough(
     client: httpx.AsyncClient,
     request: Request,
@@ -164,8 +184,6 @@ async def _handle_streaming(
         """Return (assistant_text, upstream_ms) and handle side-effects."""
         nonlocal t_upstream
         _usage = usage or {}
-        if _usage:
-            logger.info("_post_stream usage: %s", _usage)
         upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
         if metrics:
             metrics.record({
@@ -185,6 +203,8 @@ async def _handle_streaming(
                 {"streaming": True, "assistant_text": assistant_text},
                 upstream_input_tokens=_usage.get("input_tokens", 0),
                 upstream_output_tokens=_usage.get("output_tokens", 0),
+                cache_creation_input_tokens=_usage.get("cache_creation_input_tokens", 0),
+                cache_read_input_tokens=_usage.get("cache_read_input_tokens", 0),
             )
         # Log upstream LLM call to telemetry ledger
         if state and hasattr(state.engine, '_telemetry'):
@@ -265,15 +285,7 @@ async def _handle_streaming(
                         # -- message_start: extract input_tokens --
                         if dtype == "message_start":
                             msg_usage = data.get("message", {}).get("usage", {})
-                            logger.info("Stream usage (paging): message_start full usage=%s", msg_usage)
-                            if "input_tokens" in msg_usage:
-                                _stream_usage["input_tokens"] = msg_usage["input_tokens"]
-                                # Include cache tokens for true total
-                                cache_create = msg_usage.get("cache_creation_input_tokens", 0)
-                                cache_read = msg_usage.get("cache_read_input_tokens", 0)
-                                if cache_create or cache_read:
-                                    _stream_usage["cache_creation_input_tokens"] = cache_create
-                                    _stream_usage["cache_read_input_tokens"] = cache_read
+                            _extract_usage(msg_usage, _stream_usage)
 
                         # -- content_block_start --
                         if dtype == "content_block_start":
@@ -908,14 +920,11 @@ async def _handle_streaming(
                             _dtype = data.get("type", "")
                             if _dtype == "message_start":
                                 _mu = data.get("message", {}).get("usage", {})
-                                if "input_tokens" in _mu:
-                                    _raw_usage["input_tokens"] = _mu["input_tokens"]
-                                    logger.info("Stream usage: message_start input_tokens=%d", _mu["input_tokens"])
+                                _extract_usage(_mu, _raw_usage)
                             elif _dtype == "message_delta":
                                 _du = data.get("usage", {})
                                 if "output_tokens" in _du:
                                     _raw_usage["output_tokens"] = _du["output_tokens"]
-                                    logger.info("Stream usage: message_delta output_tokens=%d", _du["output_tokens"])
                         except json.JSONDecodeError:
                             pass
         finally:
@@ -1007,12 +1016,16 @@ async def _handle_non_streaming(
             pass
 
     # Capture response for dashboard inspector
-    _ns_usage = response_body.get("usage", {})
+    _ns_raw = response_body.get("usage", {})
+    _ns_usage: dict = {}
+    _extract_usage(_ns_raw, _ns_usage)
     if metrics:
         metrics.capture_response(
             turn, response_body,
             upstream_input_tokens=_ns_usage.get("input_tokens", 0),
-            upstream_output_tokens=_ns_usage.get("output_tokens", 0),
+            upstream_output_tokens=_ns_raw.get("output_tokens", 0),
+            cache_creation_input_tokens=_ns_usage.get("cache_creation_input_tokens", 0),
+            cache_read_input_tokens=_ns_usage.get("cache_read_input_tokens", 0),
         )
 
     # Extract and record assistant text
