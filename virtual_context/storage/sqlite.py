@@ -1040,6 +1040,7 @@ class SQLiteStore(ContextStore):
                 for ws in state.working_set
             ],
             "trailing_fingerprint": state.trailing_fingerprint,
+            "telemetry_rollup": state.telemetry_rollup,
         })
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
@@ -1064,11 +1065,13 @@ class SQLiteStore(ContextStore):
             split_processed_tags = raw.get("split_processed_tags", [])
             working_set_raw = raw.get("working_set", [])
             trailing_fingerprint = raw.get("trailing_fingerprint", "")
+            telemetry_rollup = raw.get("telemetry_rollup", {})
         else:
             entries_raw = raw
             split_processed_tags = []
             working_set_raw = []
             trailing_fingerprint = ""
+            telemetry_rollup = {}
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -1107,6 +1110,7 @@ class SQLiteStore(ContextStore):
             split_processed_tags=split_processed_tags,
             working_set=working_set,
             trailing_fingerprint=trailing_fingerprint,
+            telemetry_rollup=telemetry_rollup,
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
