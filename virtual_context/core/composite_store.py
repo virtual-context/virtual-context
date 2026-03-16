@@ -119,6 +119,19 @@ class CompositeStore:
     def delete_conversation(self, conversation_id: str) -> int:
         return self._segments.delete_conversation(conversation_id)
 
+    def save_turn_message(
+        self, conversation_id: str, turn_number: int,
+        user_content: str, assistant_content: str,
+    ) -> None:
+        return self._segments.save_turn_message(
+            conversation_id, turn_number, user_content, assistant_content,
+        )
+
+    def get_turn_messages(
+        self, conversation_id: str, turn_numbers: list[int],
+    ) -> dict[int, tuple[str, str]]:
+        return self._segments.get_turn_messages(conversation_id, turn_numbers)
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------

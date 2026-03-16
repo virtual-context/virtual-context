@@ -693,6 +693,56 @@ class FilesystemStore(ContextStore):
         return result
 
     # ------------------------------------------------------------------
+    # Turn messages
+    # ------------------------------------------------------------------
+
+    def _turn_messages_path(self, conversation_id: str) -> Path:
+        safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+        return self.root / "_turn_messages" / f"{safe_id}.json"
+
+    def save_turn_message(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        path = self._turn_messages_path(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        existing[str(turn_number)] = {
+            "user_content": user_content,
+            "assistant_content": assistant_content,
+        }
+        path.write_text(json.dumps(existing, indent=2))
+
+    def get_turn_messages(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, tuple[str, str]]:
+        if not turn_numbers:
+            return {}
+        path = self._turn_messages_path(conversation_id)
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        result: dict[int, tuple[str, str]] = {}
+        for tn in turn_numbers:
+            entry = data.get(str(tn))
+            if entry:
+                result[tn] = (entry.get("user_content", ""), entry.get("assistant_content", ""))
+        return result
+
+    # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------
 

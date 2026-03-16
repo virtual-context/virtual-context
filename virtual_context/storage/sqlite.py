@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     PRIMARY KEY (segment_ref, chunk_index)
 );
 
+CREATE TABLE IF NOT EXISTS turn_messages (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    user_content TEXT NOT NULL DEFAULT '',
+    assistant_content TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (conversation_id, turn_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
 CREATE INDEX IF NOT EXISTS idx_segments_conversation_id ON segments(conversation_id);
@@ -1148,6 +1156,46 @@ class SQLiteStore(ContextStore):
             except (json.JSONDecodeError, TypeError):
                 continue
         return result
+
+    # ------------------------------------------------------------------
+    # Turn messages
+    # ------------------------------------------------------------------
+
+    def save_turn_message(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO turn_messages
+            (conversation_id, turn_number, user_content, assistant_content)
+            VALUES (?, ?, ?, ?)""",
+            (conversation_id, turn_number, user_content, assistant_content),
+        )
+        conn.commit()
+
+    def get_turn_messages(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, tuple[str, str]]:
+        if not turn_numbers:
+            return {}
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in turn_numbers)
+        rows = conn.execute(
+            f"""SELECT turn_number, user_content, assistant_content
+            FROM turn_messages
+            WHERE conversation_id = ? AND turn_number IN ({placeholders})""",
+            [conversation_id] + turn_numbers,
+        ).fetchall()
+        return {
+            row["turn_number"]: (row["user_content"], row["assistant_content"])
+            for row in rows
+        }
 
     # ------------------------------------------------------------------
     # D1: Fact Extraction
