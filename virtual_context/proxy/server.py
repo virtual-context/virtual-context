@@ -375,15 +375,15 @@ def create_app(
         user_message = fmt.extract_user_message(body)
         is_streaming = body.get("stream", False)
 
-        # Track payload size for dashboard (KB + rough token estimate)
+        # Ground truth: actual byte-measured inbound token count
         _payload_kb = round(len(body_bytes) / 1024, 1)
-        _payload_tok = fmt.estimate_payload_tokens(body)
+        _inbound_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace"))
         if state:
             state._last_payload_kb = _payload_kb
-            state._last_payload_tokens = _payload_tok
+            state._last_payload_tokens = _inbound_tokens
             if state._initial_payload_kb is None:
                 state._initial_payload_kb = _payload_kb
-                state._initial_payload_tokens = _payload_tok
+                state._initial_payload_tokens = _inbound_tokens
 
         import datetime as _dt
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -485,7 +485,8 @@ def create_app(
                     turn, body, api_format,
                     conversation_id=_conversation_id,
                     passthrough=True,
-                    payload_tokens=_payload_tok,
+                    inbound_tokens=_inbound_tokens,
+                    outbound_tokens=_inbound_tokens,  # passthrough: same as inbound
                     message_preview=user_message[:60],
                 )
 
@@ -561,7 +562,7 @@ def create_app(
                     _upstream_limit = int(state.engine.config.proxy.upstream_context_limit)
                     _output_budget = body.get("max_tokens", 4096)
                     _overhead = 5000  # tools, XML wrappers, safety margin
-                    _available_for_vc = max(0, _upstream_limit - _payload_tok - _output_budget - _overhead)
+                    _available_for_vc = max(0, _upstream_limit - _inbound_tokens - _output_budget - _overhead)
                 except (TypeError, ValueError, AttributeError):
                     pass  # headroom unknown — assembler uses default budget
 
@@ -743,33 +744,35 @@ def create_app(
 
         is_streaming = body.get("stream", False)
 
-        # Estimate system prompt tokens from original body (before VC enrichment)
+        # Component-level estimate (diagnostic breakdown, not source of truth)
         system_tokens = fmt._estimate_system_tokens(body)
 
-        # Estimate input tokens from enriched body
-        input_tokens = fmt.estimate_payload_tokens(enriched_body)
+        # Ground truth: actual byte-measured outbound token count
+        _outbound_json = json.dumps(enriched_body, default=str)
+        outbound_tokens = fmt._count(_outbound_json)
 
-        # Estimate raw (pre-filter) input tokens — the baseline cost of sending
-        # the full unfiltered payload.  Uses _pre_filter_body so it reflects
-        # what a naive system without VC would actually send upstream.
-        raw_input_tokens = fmt.estimate_payload_tokens(_pre_filter_body)
+        # Ground truth: inbound tokens (what the client sent us, measured above)
+        inbound_tokens = _inbound_tokens
 
-        # Track enriched payload tokens for dashboard
-        # (raw payload tokens already set earlier alongside KB tracking)
+        # Legacy aliases for downstream consumers
+        input_tokens = outbound_tokens
+        raw_input_tokens = inbound_tokens
+
+        # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
         if state:
-            state._last_enriched_payload_tokens = input_tokens
+            state._last_enriched_payload_tokens = outbound_tokens
 
         # PROXY-025: Over-budget alert
-        if state and _effective_budget > 0 and input_tokens > _effective_budget:
-            _excess = input_tokens - _effective_budget
+        if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
+            _excess = outbound_tokens - _effective_budget
             print(
-                f"[BUDGET] Payload {input_tokens}t exceeds budget "
+                f"[BUDGET] Payload {outbound_tokens}t exceeds budget "
                 f"{_effective_budget}t by {_excess}t. "
                 f"Uncompacted turns pending compaction."
             )
             metrics.record({
                 "type": "budget_exceeded",
-                "total": input_tokens,
+                "total": outbound_tokens,
                 "budget": _effective_budget,
                 "excess": _excess,
             })
@@ -801,9 +804,11 @@ def create_app(
             "overhead_ms": overhead_ms,
             "total_turns": total_turns,
             "filtered_turns": total_turns - turns_dropped,
-            "input_tokens": input_tokens,
-            "raw_input_tokens": raw_input_tokens,
-            "system_tokens": system_tokens,
+            "inbound_tokens": inbound_tokens,
+            "outbound_tokens": outbound_tokens,
+            "input_tokens": input_tokens,       # legacy alias for outbound
+            "raw_input_tokens": raw_input_tokens,  # legacy alias for inbound
+            "system_tokens": system_tokens,      # component estimate
             "turns_dropped": turns_dropped,
             "turns_stubbed": turns_stubbed,
             "conversation_id": _conversation_id,
@@ -818,7 +823,7 @@ def create_app(
             f"msgs={len(body.get('messages', []))} "
             f"dropped={turns_dropped} "
             f"stubbed={turns_stubbed} "
-            f"ctx={context_tokens}t input={input_tokens}t "
+            f"ctx={context_tokens}t in={inbound_tokens}t out={outbound_tokens}t "
             f"vc={overhead_ms}ms | {user_message[:60]}"
         )
 
@@ -827,8 +832,8 @@ def create_app(
             turn, _pre_filter_body, api_format,
             inbound_tags=assembled.matched_tags if assembled else [],
             conversation_id=_conversation_id,
-            payload_tokens=_payload_tok,
-            input_tokens=input_tokens,
+            inbound_tokens=inbound_tokens,
+            outbound_tokens=outbound_tokens,
             context_tokens=context_tokens,
             overhead_ms=overhead_ms,
             turns_dropped=turns_dropped,
