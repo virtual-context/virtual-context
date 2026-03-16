@@ -488,6 +488,8 @@ def create_app(
                     passthrough=True,
                     inbound_tokens=_inbound_tokens,
                     outbound_tokens=_inbound_tokens,  # passthrough: same as inbound
+                    inbound_bytes=_inbound_bytes,
+                    outbound_bytes=_inbound_bytes,  # passthrough: same as inbound
                     message_preview=user_message[:60],
                 )
 
@@ -653,6 +655,7 @@ def create_app(
                 state.engine.config.assembler,
                 "pre_compaction_filtering", "aggressive",
             )
+            _pre_compaction = getattr(state.engine, "_compacted_through", 0) == 0
             body, turns_dropped = _filter_body_messages(
                 body,
                 state.engine._turn_tag_index,
@@ -662,6 +665,11 @@ def create_app(
                 fmt=fmt,
                 pre_compaction_mode=_pcf_mode,
             )
+            if turns_dropped:
+                _phase = f"mode={_pcf_mode}, pre-compaction" if _pre_compaction else "post-compaction"
+                print(f"[FILTER] Dropped {turns_dropped} turns ({_phase})")
+            elif _pre_compaction and _pcf_mode == "off":
+                print("[FILTER] Skipped filtering (mode=off, pre-compaction)")
 
         # Tool output interception: truncate large tool_result blocks.
         # I6: deepcopy before interceptor so mutations don't affect the
