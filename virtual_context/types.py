@@ -232,6 +232,7 @@ class EngineStateSnapshot:
     trailing_fingerprint: str = ""  # hash of last N user messages for session matching on restart
     telemetry_rollup: dict = field(default_factory=dict)  # persisted telemetry totals (survives restart)
     request_captures: list[dict] = field(default_factory=list)  # lightweight request summaries for dashboard
+    provider: str = ""  # upstream provider (anthropic, openai, gemini, etc.)
 
 
 @dataclass
@@ -434,6 +435,7 @@ class ConversationStats:
     oldest_segment: datetime | None = None
     newest_segment: datetime | None = None
     compaction_model: str = ""
+    provider: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +638,7 @@ class AssemblerConfig:
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
     context_hint_max_tokens: int = 2000
+    pre_compaction_filtering: str = "aggressive"  # "off" | "conservative" | "aggressive"
 
 
 @dataclass

@@ -225,6 +225,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         recent_turns_always_included=assembly_raw.get("recent_turns_always_included", 3),
         context_hint_enabled=assembly_raw.get("context_hint_enabled", True),
         context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 2000),
+        pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", "aggressive"),
     )
 
     # Retrieval
@@ -415,6 +416,14 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
                 f"strategy_config[{name}].min_overlap must be >= 1, "
                 f"got {sc.min_overlap}"
             )
+
+    # Pre-compaction filtering mode
+    _valid_pcf = {"off", "conservative", "aggressive"}
+    if config.assembler.pre_compaction_filtering not in _valid_pcf:
+        errors.append(
+            f"assembly.pre_compaction_filtering must be one of {_valid_pcf}, "
+            f"got '{config.assembler.pre_compaction_filtering}'"
+        )
 
     # Storage backend
     _valid_backends = ("sqlite", "filesystem", "postgres", "neo4j", "falkordb")

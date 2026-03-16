@@ -381,3 +381,39 @@ async def test_tui_workflow_payload_filtering():
         # Verify message content is captured in payloads
         turn1_msgs = app._turns[0].api_payload["messages"]
         assert turn1_msgs[0]["content"].startswith("Tell me about the database schema")
+
+
+# ---------------------------------------------------------------------------
+# Config tests for pre_compaction_filtering
+# ---------------------------------------------------------------------------
+
+def test_pre_compaction_filtering_config_default():
+    """Default pre_compaction_filtering is 'aggressive'."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        engine = _make_engine(tmpdir)
+        assert engine.config.assembler.pre_compaction_filtering == "aggressive"
+
+
+def test_pre_compaction_filtering_config_custom():
+    """Config accepts off/conservative/aggressive."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "store.db")
+        engine = VirtualContextEngine(config=load_config(config_dict={
+            "context_window": 50_000,
+            "storage_root": tmpdir,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "assembly": {"pre_compaction_filtering": "conservative"},
+            "tag_generator": {"type": "keyword"},
+        }))
+        assert engine.config.assembler.pre_compaction_filtering == "conservative"
+
+
+def test_pre_compaction_filtering_config_invalid():
+    """Invalid values are caught by validate_config."""
+    with pytest.raises(ValueError, match="pre_compaction_filtering"):
+        load_config(config_dict={
+            "context_window": 50_000,
+            "storage_root": "/tmp/vc-test",
+            "assembly": {"pre_compaction_filtering": "turbo"},
+            "tag_generator": {"type": "keyword"},
+        })
