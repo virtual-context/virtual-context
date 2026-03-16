@@ -77,6 +77,7 @@ def _build_settings_response(cfg) -> dict:
             "recent_turns_always_included": cfg.assembler.recent_turns_always_included,
             "context_hint_enabled": cfg.assembler.context_hint_enabled,
             "context_hint_max_tokens": cfg.assembler.context_hint_max_tokens,
+            "pre_compaction_filtering": cfg.assembler.pre_compaction_filtering,
         },
         "summarization": {
             "temperature": cfg.summarization.temperature,
@@ -685,6 +686,14 @@ def register_dashboard_routes(
             ("summarization", "temperature"): (cfg.summarization, "temperature", float),
         }
 
+        # String enum fields: (target_obj, attr_name, valid_values)
+        _str_enum_fields = {
+            ("assembly", "pre_compaction_filtering"): (
+                cfg.assembler, "pre_compaction_filtering",
+                {"off", "conservative", "aggressive"},
+            ),
+        }
+
         # Collect updates
         updates = []
         for section, keys in body.items():
@@ -697,20 +706,33 @@ def register_dashboard_routes(
                 )
             for key, value in keys.items():
                 mapping = field_map.get((section, key))
-                if mapping is None:
-                    return JSONResponse(
-                        {"error": f"Unknown setting: {section}.{key}"},
-                        status_code=400,
-                    )
-                obj, attr, cast = mapping
-                try:
-                    value = cast(value)
-                except (ValueError, TypeError):
-                    return JSONResponse(
-                        {"error": f"Invalid type for {section}.{key}"},
-                        status_code=400,
-                    )
-                updates.append((obj, attr, value, section, key))
+                if mapping is not None:
+                    obj, attr, cast = mapping
+                    try:
+                        value = cast(value)
+                    except (ValueError, TypeError):
+                        return JSONResponse(
+                            {"error": f"Invalid type for {section}.{key}"},
+                            status_code=400,
+                        )
+                    updates.append((obj, attr, value, section, key))
+                    continue
+
+                str_enum = _str_enum_fields.get((section, key))
+                if str_enum is not None:
+                    obj, attr, valid_values = str_enum
+                    if value not in valid_values:
+                        return JSONResponse(
+                            {"error": f"'{key}' must be one of {sorted(valid_values)}, got '{value}'"},
+                            status_code=400,
+                        )
+                    updates.append((obj, attr, value, section, key))
+                    continue
+
+                return JSONResponse(
+                    {"error": f"Unknown setting: {section}.{key}"},
+                    status_code=400,
+                )
 
         # Preview-validate cross-field constraints
         preview = {

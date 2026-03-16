@@ -2215,6 +2215,7 @@
       '<dl>' +
       '<dt>Tag Context Max</dt><dd>Total token budget for injected tag summaries. Retrieved summaries are included highest-priority first and trimmed when this limit is reached. This value is synced to the retriever budget, so changing it here also updates the retrieval cap. Higher values provide richer context but leave less room for conversation history.</dd>' +
       '<dt>Recent Turns Kept</dt><dd>Number of recent conversation turns always included in the filtered history sent to the LLM, regardless of whether they match the current tags. Ensures the LLM always sees the most recent exchanges for continuity. Set to 0 to rely entirely on tag-based filtering.</dd>' +
+      '<dt>Pre-Compaction Filtering</dt><dd>Controls how aggressively turns are dropped before compaction summaries exist. <b>off</b>: keep all turns (no drops until summaries back them up). <b>conservative</b>: tag-based drops with doubled protection window. <b>aggressive</b> (default): tag-based drops with standard protection window. After compaction, standard filtering always applies.</dd>' +
       '<dt>Context Hint</dt><dd>When enabled, injects a brief topic list into the context after the first compaction occurs. This tells the LLM "you have previously discussed: [topic1, topic2, ...]" so it knows stored knowledge exists and can reference it naturally rather than claiming ignorance about compacted topics. Strongly recommended.</dd>' +
       '<dt>Hint Max Tokens</dt><dd>Token budget for the context hint block. Controls how much space the topic list can consume. Typically 100–300 tokens is sufficient. Only relevant when Context Hint is enabled.</dd>' +
       '</dl>',
@@ -2279,6 +2280,17 @@
     html += '<div class="settings-section">' + sectionHeader('Assembly', 'assembly');
     html += numberRow('assembly', 'tag_context_max_tokens', 'Tag Context Max', 'Token budget for injected tag summaries', data.assembly.tag_context_max_tokens, 1000, 100000);
     html += numberRow('assembly', 'recent_turns_always_included', 'Recent Turns Kept', 'Turns always included regardless of tag match', data.assembly.recent_turns_always_included, 0, 10);
+    // Pre-compaction filtering dropdown
+    html += '<div class="settings-row">';
+    html += '<label>Pre-Compaction Filtering</label>';
+    html += '<select class="settings-select" data-section="assembly" data-key="pre_compaction_filtering">';
+    ['off', 'conservative', 'aggressive'].forEach(function(v) {
+        var sel = v === data.assembly.pre_compaction_filtering ? ' selected' : '';
+        html += '<option value="' + v + '"' + sel + '>' + v + '</option>';
+    });
+    html += '</select>';
+    html += '<span class="desc">Turn filtering before summaries exist (off=keep all, conservative=2x window, aggressive=standard)</span>';
+    html += '</div>';
     html += toggleRow('assembly', 'context_hint_enabled', 'Context Hint', 'Inject a topic list into context after compaction', data.assembly.context_hint_enabled);
     html += numberRow('assembly', 'context_hint_max_tokens', 'Hint Max Tokens', 'Token budget for the context hint block', data.assembly.context_hint_max_tokens, 50, 1000);
     html += '</div>';
@@ -2355,6 +2367,12 @@
       var section = btn.dataset.section, key = btn.dataset.key;
       if (!body[section]) body[section] = {};
       body[section][key] = btn.classList.contains('on');
+    });
+    // Collect selects (string enum fields)
+    document.querySelectorAll('.settings-select').forEach(function(sel) {
+      var section = sel.dataset.section, key = sel.dataset.key;
+      if (!body[section]) body[section] = {};
+      body[section][key] = sel.value;
     });
 
     var statusEl = $('settings-status');
