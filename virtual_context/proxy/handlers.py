@@ -265,9 +265,15 @@ async def _handle_streaming(
                         # -- message_start: extract input_tokens --
                         if dtype == "message_start":
                             msg_usage = data.get("message", {}).get("usage", {})
+                            logger.info("Stream usage (paging): message_start full usage=%s", msg_usage)
                             if "input_tokens" in msg_usage:
                                 _stream_usage["input_tokens"] = msg_usage["input_tokens"]
-                                logger.info("Stream usage (paging): message_start input_tokens=%d", msg_usage["input_tokens"])
+                                # Include cache tokens for true total
+                                cache_create = msg_usage.get("cache_creation_input_tokens", 0)
+                                cache_read = msg_usage.get("cache_read_input_tokens", 0)
+                                if cache_create or cache_read:
+                                    _stream_usage["cache_creation_input_tokens"] = cache_create
+                                    _stream_usage["cache_read_input_tokens"] = cache_read
 
                         # -- content_block_start --
                         if dtype == "content_block_start":
