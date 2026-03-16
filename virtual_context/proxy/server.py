@@ -377,7 +377,13 @@ def create_app(
 
         # Ground truth: actual byte-measured inbound token count
         _payload_kb = round(len(body_bytes) / 1024, 1)
+        _inbound_bytes = len(body_bytes)
         _inbound_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace"))
+        logger.info(
+            "INBOUND MEASUREMENT: bytes=%d tokens=%d kb=%.1f counter=%s",
+            _inbound_bytes, _inbound_tokens, _payload_kb,
+            fmt._count.__qualname__ if hasattr(fmt._count, '__qualname__') else type(fmt._count).__name__,
+        )
         if state:
             state._last_payload_kb = _payload_kb
             state._last_payload_tokens = _inbound_tokens
@@ -750,6 +756,15 @@ def create_app(
         # Ground truth: actual byte-measured outbound token count
         _outbound_json = json.dumps(enriched_body, default=str)
         outbound_tokens = fmt._count(_outbound_json)
+        _outbound_bytes = len(_outbound_json.encode("utf-8"))
+        _outbound_msgs = len(enriched_body.get("messages", []))
+        _has_system = bool(enriched_body.get("system"))
+        _has_tools = bool(enriched_body.get("tools"))
+        logger.info(
+            "OUTBOUND MEASUREMENT: json_bytes=%d json_chars=%d tokens=%d msgs=%d has_system=%s has_tools=%s counter=%s",
+            _outbound_bytes, len(_outbound_json), outbound_tokens, _outbound_msgs, _has_system, _has_tools,
+            fmt._count.__qualname__ if hasattr(fmt._count, '__qualname__') else type(fmt._count).__name__,
+        )
 
         # Ground truth: inbound tokens (what the client sent us, measured above)
         inbound_tokens = _inbound_tokens
