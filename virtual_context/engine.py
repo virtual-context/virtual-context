@@ -132,6 +132,7 @@ class VirtualContextEngine:
         self.reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
+        self._provider: str = ""  # set by ProxyState, persisted in engine state
 
         # Cached state from last on_message_inbound call (used by reassemble_context)
         self._last_retrieval_result: RetrievalResult | None = None
@@ -481,6 +482,7 @@ class VirtualContextEngine:
             self._telemetry.restore_from_rollup(saved.telemetry_rollup)
         # Stash request captures for ProxyState to pick up after init
         self._restored_request_captures = saved.request_captures or []
+        self._provider = saved.provider or ""
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
@@ -544,6 +546,7 @@ class VirtualContextEngine:
                 trailing_fingerprint=self._trailing_fingerprint,
                 telemetry_rollup=telemetry_dict,
                 request_captures=captures,
+                provider=self._provider,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
@@ -1201,26 +1204,46 @@ class VirtualContextEngine:
     ) -> list[Message]:
         """Filter conversation history by tag relevance.
 
-        Always includes the last ``recent_turns`` turn pairs.  For older turns,
-        includes only those whose TurnTagIndex tags overlap with *current_tags*.
-        If a turn has no index entry (e.g. first turns before tagging kicks in),
-        it is included conservatively.
+        Pre-compaction behaviour is governed by
+        ``config.assembler.pre_compaction_filtering``:
+
+        * ``"off"``          – no tag-based drops (all turns pass through)
+        * ``"conservative"`` – tag-based drops with doubled protection window
+                               (``monitor.protected_recent_turns * 2``)
+        * ``"aggressive"``   – tag-based drops with standard protection window
+                               (``monitor.protected_recent_turns``)
+
+        Post-compaction (``_compacted_through > 0``): always uses standard
+        ``monitor.protected_recent_turns`` regardless of mode setting.
 
         Returns a new list — the original is not mutated.
         """
-        if recent_turns is None:
-            recent_turns = self.config.assembler.recent_turns_always_included
+        mode = getattr(
+            getattr(self.config, "assembler", None),
+            "pre_compaction_filtering", "aggressive",
+        )
+        watermark = getattr(self, "_compacted_through", 0)
+        pre_compaction = watermark == 0
+
+        # Determine protection window
+        if recent_turns is not None:
+            # Explicit override (e.g. from tests)
+            protected = recent_turns
+        elif pre_compaction and mode == "off":
+            return list(conversation_history)
+        elif pre_compaction and mode == "conservative":
+            protected = self.config.monitor.protected_recent_turns * 2
+        else:
+            # aggressive, or post-compaction
+            protected = self.config.monitor.protected_recent_turns
 
         total = len(conversation_history)
-        # Each turn = 2 messages (user + assistant), except possibly the
-        # very last entry which may be an unpaired user message.
-        protected_count = recent_turns * 2
+        protected_count = protected * 2  # each turn = 2 messages
 
         if total <= protected_count:
             return list(conversation_history)
 
         # Skip compacted messages — their content is in stored summaries
-        watermark = getattr(self, "_compacted_through", 0)
         older = conversation_history[watermark:-protected_count]
         recent = conversation_history[-protected_count:]
 
@@ -1230,12 +1253,10 @@ class VirtualContextEngine:
         # Walk older messages in pairs (user, assistant)
         i = 0
         while i < len(older):
-            # Determine pair boundaries
             if i + 1 < len(older):
                 pair = [older[i], older[i + 1]]
                 step = 2
             else:
-                # Trailing unpaired message — keep it
                 filtered.append(older[i])
                 break
 
@@ -1246,7 +1267,6 @@ class VirtualContextEngine:
                 # No tag data — conservatively include
                 filtered.extend(pair)
             elif "rule" in entry.tags or set(entry.tags) & current_tag_set:
-                # Rule turns always included; tag overlap — include
                 filtered.extend(pair)
             # else: no overlap — drop this turn
 

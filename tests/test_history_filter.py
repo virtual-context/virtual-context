@@ -29,6 +29,7 @@ def _make_engine(tmpdir: str, recent_turns: int = 2) -> VirtualContextEngine:
         "storage_root": tmpdir,
         "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
         "assembly": {"recent_turns_always_included": recent_turns},
+        "compaction": {"protected_recent_turns": recent_turns},
         "tag_generator": {
             "type": "keyword",
             "keyword_fallback": {
@@ -406,6 +407,145 @@ def test_pre_compaction_filtering_config_custom():
             "tag_generator": {"type": "keyword"},
         }))
         assert engine.config.assembler.pre_compaction_filtering == "conservative"
+
+
+class TestPreCompactionFilteringModes:
+    """Test pre_compaction_filtering config modes."""
+
+    def _make_engine_with_mode(self, tmpdir, mode, protected_recent_turns=3):
+        db_path = str(Path(tmpdir) / "store.db")
+        return VirtualContextEngine(config=load_config(config_dict={
+            "context_window": 50_000,
+            "storage_root": tmpdir,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "assembly": {"pre_compaction_filtering": mode},
+            "compaction": {"protected_recent_turns": protected_recent_turns},
+            "tag_generator": {
+                "type": "keyword",
+                "keyword_fallback": {
+                    "tag_keywords": {
+                        "database": ["schema", "table", "query", "sql", "database"],
+                        "auth": ["auth", "login", "jwt", "token", "password"],
+                        "frontend": ["react", "component", "css", "html", "button"],
+                    },
+                },
+            },
+        }))
+
+    def test_mode_off_keeps_all_turns(self):
+        """mode=off pre-compaction: no turns dropped regardless of tags."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._make_engine_with_mode(tmpdir, "off", protected_recent_turns=1)
+            history = _simulate_turns(engine, [
+                ("database schema design", "5 tables"),
+                ("auth login flow", "JWT tokens"),
+                ("react component fix", "Updated CSS"),
+                ("database query optimization", "Added index"),
+            ])
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == len(history)
+
+    def test_mode_conservative_uses_doubled_window(self):
+        """mode=conservative: protected window = protected_recent_turns * 2."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._make_engine_with_mode(tmpdir, "conservative", protected_recent_turns=3)
+            history = _simulate_turns(engine, [
+                ("database schema", "tables"),
+                ("auth login", "JWT"),
+                ("database query", "SELECT"),
+                ("auth token", "RS256"),
+                ("database index", "CREATE INDEX"),
+                ("auth session", "Redis"),
+                ("database backup", "pg_dump"),
+                ("auth password", "bcrypt"),
+            ])
+            # Conservative window = 3*2 = 6 turns protected (turns 2-7)
+            # Only turns 0-1 candidates: turn 0 (database) kept, turn 1 (auth) dropped
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == 14
+
+    def test_mode_aggressive_uses_standard_window(self):
+        """mode=aggressive: uses protected_recent_turns as-is."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._make_engine_with_mode(tmpdir, "aggressive", protected_recent_turns=3)
+            history = _simulate_turns(engine, [
+                ("database schema", "tables"),
+                ("auth login", "JWT"),
+                ("database query", "SELECT"),
+                ("auth token", "RS256"),
+                ("database index", "CREATE INDEX"),
+                ("auth session", "Redis"),
+                ("database backup", "pg_dump"),
+                ("auth password", "bcrypt"),
+            ])
+            # Aggressive window = 3 turns protected (turns 5-7)
+            # Turns 0-4 candidates: 0,2,4 (database) kept, 1,3 (auth) dropped
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == 12
+
+    def test_post_compaction_ignores_mode(self):
+        """After compaction, mode=off is irrelevant — standard filtering applies."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._make_engine_with_mode(tmpdir, "off", protected_recent_turns=2)
+            history = _simulate_turns(engine, [
+                ("database schema", "tables"),
+                ("auth login", "JWT"),
+                ("database query", "SELECT"),
+                ("auth token", "RS256"),
+                ("database index", "CREATE INDEX"),
+            ])
+            engine._compacted_through = 2
+            # Working set: history[2:] = 8 msgs, 2 turns protected (4 msgs)
+            # Candidates: turn 1 (auth→dropped), turn 2 (database→kept)
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == 6
+
+    def test_conservative_total_within_doubled_window(self):
+        """When total turns <= conservative window, no filtering occurs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._make_engine_with_mode(tmpdir, "conservative", protected_recent_turns=3)
+            history = _simulate_turns(engine, [
+                ("database schema", "tables"),
+                ("auth login", "JWT"),
+                ("database query", "SELECT"),
+                ("auth token", "RS256"),
+                ("database index", "CREATE INDEX"),
+            ])
+            # 5 turns <= 6 (3*2) conservative window → all kept
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == len(history)
+
+    def test_uses_protected_recent_turns_not_assembly(self):
+        """filter_history() defaults to monitor.protected_recent_turns."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "store.db")
+            engine = VirtualContextEngine(config=load_config(config_dict={
+                "context_window": 50_000,
+                "storage_root": tmpdir,
+                "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+                "assembly": {"recent_turns_always_included": 1},
+                "compaction": {"protected_recent_turns": 4},
+                "tag_generator": {
+                    "type": "keyword",
+                    "keyword_fallback": {
+                        "tag_keywords": {
+                            "database": ["database", "schema"],
+                            "auth": ["auth", "jwt"],
+                        },
+                    },
+                },
+            }))
+            history = _simulate_turns(engine, [
+                ("database schema", "tables"),
+                ("auth jwt", "tokens"),
+                ("auth jwt again", "more tokens"),
+                ("auth jwt more", "even more"),
+                ("auth jwt final", "done"),
+            ])
+            # protected_recent_turns=4 → last 4 turns protected
+            # Turn 0 (database) is the only candidate and it matches
+            filtered = engine.filter_history(history, current_tags=["database"])
+            assert len(filtered) == 10
 
 
 def test_pre_compaction_filtering_config_invalid():
