@@ -429,6 +429,18 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             f"got '{config.assembler.pre_compaction_filtering}'"
         )
 
+    # Segmenter config
+    if not (0.0 <= config.segmenter.tag_overlap_threshold <= 1.0):
+        errors.append(
+            f"segmenter.tag_overlap_threshold must be in [0.0, 1.0], "
+            f"got {config.segmenter.tag_overlap_threshold}"
+        )
+    if config.segmenter.max_segment_turns < 0:
+        errors.append(
+            f"segmenter.max_segment_turns must be >= 0, "
+            f"got {config.segmenter.max_segment_turns}"
+        )
+
     # Storage backend
     _valid_backends = ("sqlite", "filesystem", "postgres", "neo4j", "falkordb")
     if config.storage.backend not in _valid_backends:

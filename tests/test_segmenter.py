@@ -2,9 +2,9 @@
 
 import pytest
 
-from virtual_context.config import load_config
+from virtual_context.config import load_config, validate_config
 from virtual_context.core.segmenter import TopicSegmenter
-from virtual_context.types import Message, SegmenterConfig, TagResult
+from virtual_context.types import Message, SegmenterConfig, TagResult, VirtualContextConfig
 
 from conftest import MockTagGenerator
 
@@ -113,3 +113,32 @@ def test_config_defaults_without_tag_overlap(tmp_path):
     config = load_config(str(cfg_file))
     assert config.segmenter.tag_overlap_threshold == 0.5
     assert config.segmenter.max_segment_turns == 20
+
+
+def test_validate_rejects_threshold_above_1():
+    config = VirtualContextConfig()
+    config.segmenter = SegmenterConfig(tag_overlap_threshold=1.5)
+    errors = validate_config(config)
+    assert any("tag_overlap_threshold" in e for e in errors)
+
+
+def test_validate_rejects_threshold_below_0():
+    config = VirtualContextConfig()
+    config.segmenter = SegmenterConfig(tag_overlap_threshold=-0.1)
+    errors = validate_config(config)
+    assert any("tag_overlap_threshold" in e for e in errors)
+
+
+def test_validate_rejects_negative_max_segment_turns():
+    config = VirtualContextConfig()
+    config.segmenter = SegmenterConfig(max_segment_turns=-1)
+    errors = validate_config(config)
+    assert any("max_segment_turns" in e for e in errors)
+
+
+def test_validate_accepts_valid_segmenter_config():
+    config = VirtualContextConfig()
+    config.segmenter = SegmenterConfig(tag_overlap_threshold=0.7, max_segment_turns=10)
+    errors = validate_config(config)
+    assert not any("tag_overlap_threshold" in e for e in errors)
+    assert not any("max_segment_turns" in e for e in errors)
