@@ -367,6 +367,7 @@ class VirtualContextEngine:
 
     def _compact_and_store(
         self, segments: list, compact_messages_len: int,
+        progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
         """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
         batch immediately so results are visible in the DB incrementally."""
@@ -427,6 +428,14 @@ class VirtualContextEngine:
                 )
                 self._store.store_segment(stored)
                 self._embed_and_store_chunks(stored)
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            len(all_results) + i + 1, len(segments), result,
+                            phase="segment_stored",
+                        )
+                    except Exception:
+                        pass
                 # D1: Store extracted facts with provenance
                 if result.facts:
                     for fact in result.facts:
@@ -448,6 +457,15 @@ class VirtualContextEngine:
                                 )
                         except Exception as e:
                             logger.warning("Supersession check failed: %s", e)
+                    if progress_callback:
+                        try:
+                            progress_callback(
+                                len(all_results) + i + 1, len(segments), result,
+                                phase="facts_extracted",
+                                fact_count=len(result.facts),
+                            )
+                        except Exception:
+                            pass
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
                     "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
@@ -883,6 +901,7 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
         compact_messages: list[Message],
+        progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport:
         """Shared compaction core: segment, compact, store, build tag summaries.
 
@@ -899,7 +918,7 @@ class VirtualContextEngine:
             "Segmented %d messages into %d segments (watermark=%d)",
             len(compact_messages), len(segments), self._compacted_through,
         )
-        results = self._compact_and_store(segments, len(compact_messages))
+        results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
 
         # Advance watermark past compacted messages
         self._compacted_through += len(compact_messages)
@@ -961,8 +980,17 @@ class VirtualContextEngine:
                         max_turn=max_turn,
                     )
 
-                    for ts in new_tag_summaries:
+                    for ts_i, ts in enumerate(new_tag_summaries):
                         self._store.save_tag_summary(ts)
+                        if progress_callback:
+                            try:
+                                progress_callback(
+                                    ts_i + 1, len(new_tag_summaries), None,
+                                    phase="tag_summary_built",
+                                    tag=ts.tag,
+                                )
+                            except Exception:
+                                pass
                     tag_summaries_built = len(new_tag_summaries)
 
         report = CompactionReport(
@@ -989,6 +1017,7 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
         signal: CompactionSignal,
+        progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport | None:
         """Phase 2 of turn processing: run compaction.
 
@@ -1028,7 +1057,7 @@ class VirtualContextEngine:
         if not compact_messages:
             return None
 
-        report = self._run_compaction(conversation_history, compact_messages)
+        report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
 
         self._last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
         self._save_state(conversation_history)

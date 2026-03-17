@@ -680,7 +680,10 @@ class TestProxyState:
         state.fire_turn_complete(history)
         state.wait_for_complete()  # waits for both tag + compact
         engine.tag_turn.assert_called_once()
-        engine.compact_if_needed.assert_called_once_with(history, signal)
+        engine.compact_if_needed.assert_called_once()
+        call_args = engine.compact_if_needed.call_args
+        assert call_args[0] == (history, signal)
+        assert "progress_callback" in call_args[1]
 
     def test_error_in_tag_turn_is_caught(self):
         engine = MagicMock()
