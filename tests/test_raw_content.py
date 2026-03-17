@@ -48,6 +48,52 @@ def test_save_and_get_turn_message_with_raw_content(store):
     assert json.loads(asst_rc)[1]["name"] == "bash"
 
 
+def test_extract_user_raw_content_anthropic():
+    from virtual_context.proxy.formats import AnthropicFormat
+
+    fmt = AnthropicFormat()
+    body = {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Check this file"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "file contents here"},
+            ]},
+        ],
+    }
+    raw = fmt.extract_user_raw_content(body)
+    assert raw is not None
+    assert len(raw) == 2
+    assert raw[0]["type"] == "text"
+    assert raw[1]["type"] == "tool_result"
+
+
+def test_extract_user_raw_content_string_content():
+    from virtual_context.proxy.formats import AnthropicFormat
+
+    fmt = AnthropicFormat()
+    body = {"messages": [{"role": "user", "content": "hello"}]}
+    raw = fmt.extract_user_raw_content(body)
+    assert raw == [{"type": "text", "text": "hello"}]
+
+
+def test_extract_assistant_raw_content_anthropic():
+    from virtual_context.proxy.formats import AnthropicFormat
+
+    fmt = AnthropicFormat()
+    response_body = {
+        "content": [
+            {"type": "text", "text": "Here's the result"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}},
+        ]
+    }
+    raw = fmt.extract_assistant_raw_content(response_body)
+    assert raw is not None
+    assert len(raw) == 2
+    assert raw[0]["type"] == "text"
+    assert raw[1]["type"] == "tool_use"
+    assert raw[1]["name"] == "bash"
+
+
 def test_save_turn_message_without_raw_content(store):
     store.save_turn_message("conv-1", 0, "hello", "Hi!")
     result = store.get_turn_messages("conv-1", [0])

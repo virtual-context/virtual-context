@@ -99,6 +99,24 @@ class PayloadFormat(ABC):
     def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
         """Return a single SSE event bytes that injects a conversation marker."""
 
+    # -- Raw content extraction -----------------------------------------------
+
+    def extract_user_raw_content(self, body: dict) -> list[dict] | None:
+        """Extract raw content blocks from the last user message.
+
+        Returns None if the format doesn't support structured content blocks.
+        Subclasses override to provide format-specific extraction.
+        """
+        return None
+
+    def extract_assistant_raw_content(self, response_body: dict) -> list[dict] | None:
+        """Extract raw content blocks from an assistant response.
+
+        Returns None if the format doesn't support structured content blocks.
+        Subclasses override to provide format-specific extraction.
+        """
+        return None
+
     # -- SSE / response parsing ----------------------------------------------
 
     @abstractmethod
@@ -261,6 +279,26 @@ class AnthropicFormat(PayloadFormat):
             if isinstance(content, list):
                 return _strip_envelope(_last_text_block(content))
         return ""
+
+    def extract_user_raw_content(self, body: dict) -> list[dict] | None:
+        """Extract raw content blocks from the last user message."""
+        messages = body.get("messages", [])
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return [{"type": "text", "text": content}]
+            if isinstance(content, list):
+                return content
+        return None
+
+    def extract_assistant_raw_content(self, response_body: dict) -> list[dict] | None:
+        """Extract raw content blocks from assistant response."""
+        content = response_body.get("content", [])
+        if isinstance(content, list) and content:
+            return content
+        return None
 
     def extract_message_text(self, msg: dict) -> str:
         content = msg.get("content", "")
