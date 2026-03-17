@@ -152,3 +152,41 @@ def test_tool_tag_counter_persists_in_snapshot():
     }
     restored = EngineStateSnapshot(**snap_dict)
     assert restored.tool_tag_counter == 7
+
+
+# --- Task 6: Assembler expansion hints for tool segments ---
+
+from virtual_context.core.assembler import ContextAssembler as Assembler
+from virtual_context.types import StoredSummary, SegmentMetadata
+from datetime import datetime, timezone
+
+
+def _make_summary(tag: str, tags: list[str], summary: str) -> StoredSummary:
+    return StoredSummary(
+        ref="ref-1",
+        primary_tag=tag,
+        tags=tags,
+        summary=summary,
+        summary_tokens=50,
+        start_timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end_timestamp=datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+        metadata=SegmentMetadata(turn_count=1),
+    )
+
+
+def test_expansion_hint_for_tool_tag():
+    """Segments with tool_N tags get expansion hints at SUMMARY depth."""
+    assembler = Assembler.__new__(Assembler)
+    summaries = [_make_summary("tool_3", ["tool_3"], "User ran bash to list files.")]
+    result = assembler._format_tag_section("tool_3", summaries)
+    assert 'vc_expand_topic("tool_3")' in result
+    assert "tool output truncated" in result
+
+
+def test_no_expansion_hint_for_regular_tag():
+    """Regular tags don't get expansion hints."""
+    assembler = Assembler.__new__(Assembler)
+    summaries = [_make_summary("coding", ["coding"], "Discussed Python patterns.")]
+    result = assembler._format_tag_section("coding", summaries)
+    assert "vc_expand_topic" not in result
+    assert "tool output truncated" not in result
