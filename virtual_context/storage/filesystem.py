@@ -607,6 +607,7 @@ class FilesystemStore(ContextStore):
             ],
             "trailing_fingerprint": state.trailing_fingerprint,
             "request_captures": state.request_captures,
+            "provider": state.provider,
         }
         path.write_text(json.dumps(data, indent=2))
 
@@ -641,6 +642,7 @@ class FilesystemStore(ContextStore):
             working_set=working_set,
             trailing_fingerprint=data.get("trailing_fingerprint", ""),
             request_captures=data.get("request_captures", []),
+            provider=data.get("provider", ""),
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
@@ -706,6 +708,8 @@ class FilesystemStore(ContextStore):
         turn_number: int,
         user_content: str,
         assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
     ) -> None:
         path = self._turn_messages_path(conversation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -715,17 +719,22 @@ class FilesystemStore(ContextStore):
                 existing = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
                 pass
-        existing[str(turn_number)] = {
+        entry = {
             "user_content": user_content,
             "assistant_content": assistant_content,
         }
+        if user_raw_content is not None:
+            entry["user_raw_content"] = user_raw_content
+        if assistant_raw_content is not None:
+            entry["assistant_raw_content"] = assistant_raw_content
+        existing[str(turn_number)] = entry
         path.write_text(json.dumps(existing, indent=2))
 
     def get_turn_messages(
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str]]:
+    ) -> dict[int, tuple[str, str, str | None, str | None]]:
         if not turn_numbers:
             return {}
         path = self._turn_messages_path(conversation_id)
@@ -735,11 +744,16 @@ class FilesystemStore(ContextStore):
             data = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
-        result: dict[int, tuple[str, str]] = {}
+        result: dict[int, tuple[str, str, str | None, str | None]] = {}
         for tn in turn_numbers:
             entry = data.get(str(tn))
             if entry:
-                result[tn] = (entry.get("user_content", ""), entry.get("assistant_content", ""))
+                result[tn] = (
+                    entry.get("user_content", ""),
+                    entry.get("assistant_content", ""),
+                    entry.get("user_raw_content"),
+                    entry.get("assistant_raw_content"),
+                )
         return result
 
     # ------------------------------------------------------------------
