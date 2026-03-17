@@ -82,3 +82,11 @@ def test_segment_tags_union(segmenter):
     segments = segmenter.segment(messages)
     assert len(segments) == 1
     assert "legal" in segments[0].tags
+
+
+def test_segmenter_config_defaults():
+    """SegmenterConfig exposes tag_overlap_threshold and max_segment_turns with defaults."""
+    cfg = SegmenterConfig()
+    assert cfg.tag_overlap_threshold == 0.5
+    assert cfg.max_segment_turns == 20
+    assert cfg.session_gap_minutes == 30  # existing field unchanged
