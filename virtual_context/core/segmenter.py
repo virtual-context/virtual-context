@@ -138,6 +138,9 @@ class TopicSegmenter:
         if current_group:
             segments.append(self._build_segment(current_group, group_session))
 
+        if self.config.tool_result_segment_threshold > 0:
+            segments = self._split_large_tool_results(segments)
+
         return segments
 
     @staticmethod
@@ -244,3 +247,95 @@ class TopicSegmenter:
         if last_ts is None or new_ts is None:
             return False
         return (new_ts - last_ts).total_seconds() > threshold * 60
+
+    def _split_large_tool_results(
+        self, segments: list[TaggedSegment],
+    ) -> list[TaggedSegment]:
+        """Split out turns with large tool_result blocks into their own segments."""
+        threshold = self.config.tool_result_segment_threshold
+        result: list[TaggedSegment] = []
+        for segment in segments:
+            if segment.turn_count <= 1:
+                result.append(segment)
+                continue
+            pairs = self._pair_turns(segment.messages)
+            needs_split = False
+            for pair in pairs:
+                if self._has_large_tool_result(pair.messages, threshold):
+                    needs_split = True
+                    break
+            if not needs_split:
+                result.append(segment)
+                continue
+            # Re-group: isolate large-tool-result turns, keep others together
+            current_group: list[TurnPair] = []
+            for pair in pairs:
+                if self._has_large_tool_result(pair.messages, threshold):
+                    if current_group:
+                        result.append(self._build_segment_from_pairs(
+                            current_group, segment.primary_tag, segment.tags,
+                        ))
+                        current_group = []
+                    result.append(self._build_segment_from_pairs(
+                        [pair], segment.primary_tag, segment.tags,
+                    ))
+                else:
+                    current_group.append(pair)
+            if current_group:
+                result.append(self._build_segment_from_pairs(
+                    current_group, segment.primary_tag, segment.tags,
+                ))
+        return result
+
+    @staticmethod
+    def _has_large_tool_result(messages: list[Message], threshold: int) -> bool:
+        for m in messages:
+            if not m.raw_content:
+                continue
+            for block in m.raw_content:
+                if block.get("type") != "tool_result":
+                    continue
+                content = block.get("content", "")
+                if isinstance(content, str):
+                    if len(content.encode("utf-8")) >= threshold:
+                        return True
+                elif isinstance(content, list):
+                    total = sum(
+                        len(item.get("text", "").encode("utf-8"))
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                    if total >= threshold:
+                        return True
+        return False
+
+    def _build_segment_from_pairs(
+        self,
+        pairs: list[TurnPair],
+        primary_tag: str,
+        tags: list[str],
+    ) -> TaggedSegment:
+        all_messages: list[Message] = []
+        for p in pairs:
+            all_messages.extend(p.messages)
+
+        text = " ".join(m.content for m in all_messages)
+        token_count = self.token_counter(text)
+
+        timestamps = [
+            m.timestamp for m in all_messages
+            if m.timestamp is not None
+        ]
+        start_ts = min(timestamps) if timestamps else datetime.now(timezone.utc)
+        end_ts = max(timestamps) if timestamps else datetime.now(timezone.utc)
+
+        return TaggedSegment(
+            id=str(uuid.uuid4()),
+            primary_tag=primary_tag,
+            tags=tags,
+            messages=all_messages,
+            token_count=token_count,
+            start_timestamp=start_ts,
+            end_timestamp=end_ts,
+            turn_count=len(pairs),
+        )

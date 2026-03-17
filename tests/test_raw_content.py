@@ -159,3 +159,66 @@ def test_format_conversation_falls_back_to_content():
     result = compactor._format_conversation(messages)
     assert "User: hello" in result
     assert "Assistant: world" in result
+
+
+# ---------------------------------------------------------------------------
+# Task 11: Segmenter splits large tool_result turns
+# ---------------------------------------------------------------------------
+
+from virtual_context.core.segmenter import TopicSegmenter
+from virtual_context.types import SegmenterConfig, TagResult
+from conftest import MockTagGenerator
+
+
+def test_segmenter_splits_large_tool_result():
+    """Turns with large tool_result in raw_content get their own segment."""
+    gen = MockTagGenerator(default_tag="coding", default_tags=["coding"])
+    config = SegmenterConfig(tool_result_segment_threshold=100)  # low threshold for test
+    segmenter = TopicSegmenter(tag_generator=gen, config=config)
+
+    large_result = "x" * 200  # exceeds threshold
+    messages = [
+        Message(role="user", content="show me the file"),
+        Message(role="assistant", content="Here it is"),
+        # Turn 2: user sends tool_result with large content
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": large_result},
+        ]),
+        Message(role="assistant", content="I see the file"),
+        # Turn 3: normal turn
+        Message(role="user", content="thanks"),
+        Message(role="assistant", content="You're welcome"),
+    ]
+    segments = segmenter.segment(messages)
+    # The large tool_result turn should be in its own segment
+    assert len(segments) >= 2
+    # Verify total turns are preserved
+    assert sum(seg.turn_count for seg in segments) == 3
+    # Find the segment with the large tool_result turn
+    found_isolated = False
+    for seg in segments:
+        for m in seg.messages:
+            if m.raw_content:
+                for block in m.raw_content:
+                    if block.get("type") == "tool_result" and len(block.get("content", "")) > 100:
+                        assert seg.turn_count == 1
+                        found_isolated = True
+    assert found_isolated
+
+
+def test_segmenter_no_split_small_tool_result():
+    """Small tool_results stay grouped normally."""
+    gen = MockTagGenerator(default_tag="coding", default_tags=["coding"])
+    config = SegmenterConfig(tool_result_segment_threshold=50000)
+    segmenter = TopicSegmenter(tag_generator=gen, config=config)
+
+    messages = [
+        Message(role="user", content="show me the file"),
+        Message(role="assistant", content="Here it is"),
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "small result"},
+        ]),
+        Message(role="assistant", content="I see"),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1  # all same tag, small result -> one segment
