@@ -90,7 +90,7 @@ Rules:
 - Extract facts about the user's life, experiences, preferences, plans, and world.
   For each fact, classify:
   - "fact_type": "personal" (user's life/identity/preferences), "experience" (assistant-provided info the user engaged with), or "world" (facts about other people, places, things in the user's world)
-  - "subject": who (usually "user"; proper names for others)
+  - "subject": who — use the actual name when conversation metadata identifies the sender (e.g. if metadata shows sender "Sania", the subject is "Sania", not "user"). When no name is available, use "user". For people mentioned but not speaking, use their name.
   - "verb": the exact action verb from the conversation (e.g. "led", "ordered", "prefers", "lives in")
   - "object": what (specific noun phrase — preserve ALL numbers, names, dates, amounts)
   - "status": one of: active, completed, planned, abandoned, recurring
@@ -122,7 +122,8 @@ Rules:
 - Tag the concrete subject, not conversational framing. "What do you think of trees?" → "trees", NOT "introspection".
 - Tag both what the conversation is about AND what the user reveals about
   their own life, experiences, or situation — even if mentioned in passing.
-- Extract facts: {{"subject": "user", "verb": "exact action verb", "object": "noun phrase with ALL specifics", "status": "active|completed|planned|abandoned|recurring", "fact_type": "personal|experience|world", "what": "full sentence with ALL specifics"}}
+- Extract facts: {{"subject": "Sania", "verb": "exact action verb", "object": "noun phrase with ALL specifics", "status": "active|completed|planned|abandoned|recurring", "fact_type": "personal|experience|world", "what": "full sentence with ALL specifics"}}
+  For "subject": use the actual sender name from conversation metadata when available, not "user".
   Use the real verb (e.g. "led", "ordered", "prefers"). Extract the fact behind the question, not the conversational act.
   DO NOT extract mere asks/mentions/discusses. Preserve ALL numbers, names, dates, amounts.
 - Generate 2-5 related_tags: alternate words for future recall.
@@ -152,8 +153,8 @@ You are a semantic tagger and fact extractor. Given a conversation segment:
   Example: "What do you think of my new car?" → fact: user has a new car.
   Example: "Can you help me train for the marathon?" → fact: user is training for a marathon.
 - Skip ONLY pure information requests with no personal revelation.
-- For each fact: subject, verb (exact action verb), object (with ALL numbers preserved), status (active/completed/planned), fact_type (personal/experience/world), what (one full sentence with all specifics).
-  WRONG: "User has a personal best time." RIGHT: "User has a personal best 5K time of 27:12."
+- For each fact: subject (use actual sender name from metadata when available, not "user"), verb (exact action verb), object (with ALL numbers preserved), status (active/completed/planned), fact_type (personal/experience/world), what (one full sentence with all specifics).
+  WRONG: "User has a personal best time." RIGHT: "Sania has a personal best 5K time of 27:12."
 - Populate who/when/where/why when the conversation mentions them. Leave "" if not mentioned.
 
 === OUTPUT ===
