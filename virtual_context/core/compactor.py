@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import time
 from typing import Callable
@@ -526,13 +527,59 @@ class DomainCompactor:
             )
 
     def _format_conversation(self, messages: list[Message]) -> str:
+        # Build tool_use_id -> name map for tool_result resolution
+        tool_name_map: dict[str, str] = {}
+        for m in messages:
+            if m.raw_content:
+                for block in m.raw_content:
+                    if block.get("type") == "tool_use" and "id" in block:
+                        tool_name_map[block["id"]] = block.get("name", "")
+
         lines: list[str] = []
         for m in messages:
             ts = ""
             if m.timestamp:
                 ts = f" ({m.timestamp.strftime('%H:%M')})"
-            lines.append(f"{m.role.capitalize()}{ts}: {m.content}")
+            if m.raw_content:
+                parts = self._render_raw_content(m.raw_content, tool_name_map)
+                lines.append(f"{m.role.capitalize()}{ts}: {parts}")
+            else:
+                lines.append(f"{m.role.capitalize()}{ts}: {m.content}")
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _render_raw_content(blocks: list[dict], tool_name_map: dict[str, str]) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            btype = block.get("type", "")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+            elif btype == "tool_use":
+                name = block.get("name", "unknown")
+                inputs = block.get("input", {})
+                parts.append(f"Assistant called {name}({json.dumps(inputs)})")
+            elif btype == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                name = tool_name_map.get(tool_use_id)
+                content = block.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        item.get("text", "") for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                if name:
+                    parts.append(f"Tool result for {name}: {content}")
+                else:
+                    parts.append(f"Tool result ({tool_use_id}): {content}")
+            elif btype == "thinking":
+                pass  # skip thinking blocks
+            else:
+                text = block.get("text", block.get("content", ""))
+                if text:
+                    parts.append(f"{btype}: {text}")
+        return "\n".join(parts) if parts else ""
 
     def _parse_response(self, response: str) -> dict:
         result = parse_llm_json(response)

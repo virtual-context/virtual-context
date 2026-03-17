@@ -102,3 +102,60 @@ def test_save_turn_message_without_raw_content(store):
     assert asst_content == "Hi!"
     assert user_rc is None
     assert asst_rc is None
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Compactor renders raw_content into full_text
+# ---------------------------------------------------------------------------
+
+from virtual_context.core.compactor import DomainCompactor
+
+
+def test_format_conversation_with_raw_content():
+    """When raw_content is present, _format_conversation renders it."""
+    messages = [
+        Message(role="user", content="check the file", raw_content=[
+            {"type": "text", "text": "check the file"},
+        ]),
+        Message(role="assistant", content="Here it is", raw_content=[
+            {"type": "text", "text": "Here it is"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "cat foo.py"}},
+        ]),
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "print('hello')"},
+        ]),
+    ]
+    compactor = DomainCompactor.__new__(DomainCompactor)
+    result = compactor._format_conversation(messages)
+    assert "bash" in result
+    assert "cat foo.py" in result
+    assert "print('hello')" in result
+    assert "tool_use_id" not in result  # should be rendered, not raw JSON
+
+
+def test_format_conversation_tool_result_name_resolution():
+    """tool_result blocks resolve tool name from preceding tool_use."""
+    messages = [
+        Message(role="assistant", content="", raw_content=[
+            {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "/tmp/x"}},
+        ]),
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "file contents"},
+        ]),
+    ]
+    compactor = DomainCompactor.__new__(DomainCompactor)
+    result = compactor._format_conversation(messages)
+    assert "read_file" in result
+    assert "file contents" in result
+
+
+def test_format_conversation_falls_back_to_content():
+    """When raw_content is None, use content as before."""
+    messages = [
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="world"),
+    ]
+    compactor = DomainCompactor.__new__(DomainCompactor)
+    result = compactor._format_conversation(messages)
+    assert "User: hello" in result
+    assert "Assistant: world" in result
