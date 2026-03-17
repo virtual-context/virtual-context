@@ -824,6 +824,24 @@ class VirtualContextEngine:
 
         return assembled
 
+    @staticmethod
+    def _is_tool_turn(messages: list[Message]) -> bool:
+        """Check if a turn is tool-only: has tool blocks in raw_content and empty text content."""
+        combined_text = " ".join(m.content for m in messages)
+        if combined_text.strip():
+            return False  # has real text content — use LLM tagger
+        has_tool_block = False
+        for m in messages:
+            if not m.raw_content:
+                continue
+            for block in m.raw_content:
+                if block.get("type") in ("tool_use", "tool_result"):
+                    has_tool_block = True
+                    break
+            if has_tool_block:
+                break
+        return has_tool_block
+
     def tag_turn(
         self,
         conversation_history: list[Message],
