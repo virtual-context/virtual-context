@@ -136,6 +136,7 @@ class Message:
     content: str
     timestamp: datetime | None = None
     metadata: dict | None = None
+    raw_content: list[dict] | None = None
 
 
 @dataclass
