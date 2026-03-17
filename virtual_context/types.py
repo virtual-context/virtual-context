@@ -603,6 +603,8 @@ class MonitorConfig:
 @dataclass
 class SegmenterConfig:
     session_gap_minutes: int = 30  # split segments when messages are >N min apart (0=disabled)
+    tag_overlap_threshold: float = 0.5  # min overlap coefficient to keep turns in same segment
+    max_segment_turns: int = 20  # hard cap on turns per segment (0=unlimited)
 
 
 @dataclass
