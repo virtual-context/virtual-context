@@ -91,6 +91,7 @@ class ProxyMetrics:
             responses = [e for e in self._events if e.get("type") == "response"]
             ingested_turns = [e for e in self._events if e.get("type") == "ingested_turn"]
             tool_intercepts = [e for e in self._events if e.get("type") == "tool_intercept"]
+            compaction_progress = [e for e in self._events if e.get("type") == "compaction_progress"]
 
             wait_values = [r["wait_ms"] for r in requests if "wait_ms" in r]
             inbound_values = [r["inbound_ms"] for r in requests if "inbound_ms" in r]
@@ -184,6 +185,7 @@ class ProxyMetrics:
                 ),
                 "tool_intercepts": list(tool_intercepts),
                 "total_tool_intercepts": len(tool_intercepts),
+                "compaction_progress": list(compaction_progress),
                 "telemetry": telemetry,
                 "budget_promoted": next(
                     (e for e in reversed(self._events)
