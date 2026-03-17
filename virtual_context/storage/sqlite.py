@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     turn_number INTEGER NOT NULL,
     user_content TEXT NOT NULL DEFAULT '',
     assistant_content TEXT NOT NULL DEFAULT '',
+    user_raw_content TEXT,
+    assistant_raw_content TEXT,
     PRIMARY KEY (conversation_id, turn_number)
 );
 
@@ -306,6 +308,14 @@ class SQLiteStore(ContextStore):
             conn.execute("ALTER TABLE tag_summaries ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE turn_messages ADD COLUMN user_raw_content TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT")
+        except Exception:
+            pass
         # D1: migrate role→verb — drop old schema if it has the 'role' column
         try:
             cur = conn.execute("PRAGMA table_info(facts)")
@@ -810,6 +820,22 @@ class SQLiteStore(ContextStore):
             ORDER BY newest DESC
         """).fetchall()
 
+        # Fetch provider from engine_state blobs (one query for all)
+        provider_map: dict[str, str] = {}
+        try:
+            es_rows = conn.execute(
+                "SELECT conversation_id, turn_tag_entries FROM engine_state"
+            ).fetchall()
+            for es_row in es_rows:
+                try:
+                    blob = json.loads(es_row["turn_tag_entries"])
+                    if isinstance(blob, dict) and blob.get("provider"):
+                        provider_map[es_row["conversation_id"]] = blob["provider"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        except Exception:
+            pass
+
         results = []
         for row in rows:
             total_full = row["total_full_tokens"]
@@ -834,6 +860,7 @@ class SQLiteStore(ContextStore):
                 oldest_segment=_str_to_dt(row["oldest"]) if row["oldest"] else None,
                 newest_segment=_str_to_dt(row["newest"]) if row["newest"] else None,
                 compaction_model=row["compaction_model"] or "",
+                provider=provider_map.get(row["conversation_id"], ""),
             ))
 
         return results
@@ -1050,6 +1077,7 @@ class SQLiteStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint,
             "telemetry_rollup": state.telemetry_rollup,
             "request_captures": state.request_captures,
+            "provider": state.provider,
         })
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
@@ -1076,6 +1104,7 @@ class SQLiteStore(ContextStore):
             trailing_fingerprint = raw.get("trailing_fingerprint", "")
             telemetry_rollup = raw.get("telemetry_rollup", {})
             request_captures = raw.get("request_captures", [])
+            provider = raw.get("provider", "")
         else:
             entries_raw = raw
             split_processed_tags = []
@@ -1083,6 +1112,7 @@ class SQLiteStore(ContextStore):
             trailing_fingerprint = ""
             telemetry_rollup = {}
             request_captures = []
+            provider = ""
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
@@ -1123,6 +1153,7 @@ class SQLiteStore(ContextStore):
             trailing_fingerprint=trailing_fingerprint,
             telemetry_rollup=telemetry_rollup,
             request_captures=request_captures,
+            provider=provider,
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
@@ -1167,13 +1198,17 @@ class SQLiteStore(ContextStore):
         turn_number: int,
         user_content: str,
         assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
     ) -> None:
         conn = self._get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO turn_messages
-            (conversation_id, turn_number, user_content, assistant_content)
-            VALUES (?, ?, ?, ?)""",
-            (conversation_id, turn_number, user_content, assistant_content),
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content),
         )
         conn.commit()
 
@@ -1181,19 +1216,25 @@ class SQLiteStore(ContextStore):
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str]]:
+    ) -> dict[int, tuple[str, str, str | None, str | None]]:
         if not turn_numbers:
             return {}
         conn = self._get_conn()
         placeholders = ",".join("?" for _ in turn_numbers)
         rows = conn.execute(
-            f"""SELECT turn_number, user_content, assistant_content
+            f"""SELECT turn_number, user_content, assistant_content,
+                       user_raw_content, assistant_raw_content
             FROM turn_messages
             WHERE conversation_id = ? AND turn_number IN ({placeholders})""",
             [conversation_id] + turn_numbers,
         ).fetchall()
         return {
-            row["turn_number"]: (row["user_content"], row["assistant_content"])
+            row["turn_number"]: (
+                row["user_content"],
+                row["assistant_content"],
+                row["user_raw_content"],
+                row["assistant_raw_content"],
+            )
             for row in rows
         }
 
