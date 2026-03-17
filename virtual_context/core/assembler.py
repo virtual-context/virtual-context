@@ -264,7 +264,12 @@ class ContextAssembler:
             session = s.metadata.session_date
             if session:
                 prefix += f" [{session}]"
-            summary_texts.append(f"{prefix}\n{s.summary}")
+            text = f"{prefix}\n{s.summary}"
+            # Expansion hint for tool segments
+            tool_tags = [t for t in s.tags if t.startswith("tool_")]
+            if tool_tags:
+                text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
+            summary_texts.append(text)
 
         body = "\n\n---\n\n".join(summary_texts)
 
