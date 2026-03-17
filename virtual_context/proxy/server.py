@@ -448,7 +448,8 @@ def create_app(
 
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
-                            timestamp=datetime.now(timezone.utc))
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=fmt.extract_user_raw_content(body))
                 )
 
                 _conversation_id = state.engine.config.conversation_id
@@ -556,7 +557,8 @@ def create_app(
 
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
-                            timestamp=datetime.now(timezone.utc))
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=fmt.extract_user_raw_content(body))
                 )
 
                 # Compute available headroom for VC context injection
