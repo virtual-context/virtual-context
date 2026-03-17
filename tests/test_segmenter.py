@@ -1,5 +1,7 @@
 """Tests for TopicSegmenter (tag-based)."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from virtual_context.config import load_config, validate_config
@@ -170,3 +172,250 @@ def test_overlap_above_threshold_merges():
     segments = segmenter.segment(messages)
     assert len(segments) == 1
     assert segments[0].turn_count == 2
+
+
+def test_overlap_below_threshold_splits():
+    """Turns with no tag overlap split into separate segments."""
+    gen = MockTagGenerator()
+    gen.set_override("pricing", TagResult(
+        tags=["saas-version", "pricing"], primary="saas-version", source="mock",
+    ))
+    gen.set_override("doctor", TagResult(
+        tags=["medical", "health"], primary="medical", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="What about pricing?"),
+        Message(role="assistant", content="Three tiers."),
+        Message(role="user", content="I need a doctor"),
+        Message(role="assistant", content="Let me help."),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 2
+    assert segments[0].primary_tag == "saas-version"
+    assert segments[1].primary_tag == "medical"
+
+
+def test_general_only_turn_merges():
+    """A turn tagged only with _general merges into the preceding segment."""
+    gen = MockTagGenerator()
+    gen.set_override("pricing", TagResult(
+        tags=["saas-version", "pricing"], primary="saas-version", source="mock",
+    ))
+    gen.set_override("ok", TagResult(
+        tags=["_general"], primary="_general", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="What about pricing?"),
+        Message(role="assistant", content="Three tiers."),
+        Message(role="user", content="ok"),
+        Message(role="assistant", content="Sure."),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1
+    assert segments[0].turn_count == 2
+
+
+def test_max_segment_turns_cap():
+    """Segment splits when max_segment_turns is reached, even with full overlap."""
+    gen = MockTagGenerator(default_tag="topic-a", default_tags=["topic-a", "topic-b"])
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5, max_segment_turns=3),
+    )
+    messages = []
+    for i in range(5):
+        messages.append(Message(role="user", content=f"Question {i}"))
+        messages.append(Message(role="assistant", content=f"Answer {i}"))
+
+    segments = segmenter.segment(messages)
+    assert len(segments) == 2
+    assert segments[0].turn_count == 3
+    assert segments[1].turn_count == 2
+
+
+def test_max_segment_turns_zero_unlimited():
+    """max_segment_turns=0 disables the cap."""
+    gen = MockTagGenerator(default_tag="topic-a", default_tags=["topic-a"])
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5, max_segment_turns=0),
+    )
+    messages = []
+    for i in range(25):
+        messages.append(Message(role="user", content=f"Question {i}"))
+        messages.append(Message(role="assistant", content=f"Answer {i}"))
+
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1
+    assert segments[0].turn_count == 25
+
+
+def test_threshold_zero_never_splits_on_tags():
+    """threshold=0.0 means only session/temporal/cap splits apply."""
+    gen = MockTagGenerator()
+    gen.set_override("pricing", TagResult(
+        tags=["saas-version"], primary="saas-version", source="mock",
+    ))
+    gen.set_override("doctor", TagResult(
+        tags=["medical"], primary="medical", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.0, max_segment_turns=0),
+    )
+    messages = [
+        Message(role="user", content="What about pricing?"),
+        Message(role="assistant", content="Three tiers."),
+        Message(role="user", content="I need a doctor"),
+        Message(role="assistant", content="Help."),
+    ]
+    segments = segmenter.segment(messages)
+    # overlap=0.0, threshold=0.0 → 0.0 < 0.0 is False → no split
+    assert len(segments) == 1
+
+
+def test_threshold_one_splits_unless_identical():
+    """threshold=1.0 splits unless tags are identical sets."""
+    gen = MockTagGenerator()
+    gen.set_override("pricing", TagResult(
+        tags=["saas-version", "pricing"], primary="saas-version", source="mock",
+    ))
+    gen.set_override("sounds good", TagResult(
+        tags=["saas-version", "agreement"], primary="agreement", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=1.0),
+    )
+    messages = [
+        Message(role="user", content="What about pricing?"),
+        Message(role="assistant", content="Three tiers."),
+        Message(role="user", content="sounds good"),
+        Message(role="assistant", content="Great."),
+    ]
+    segments = segmenter.segment(messages)
+    # {saas-version, pricing} vs {saas-version, agreement}
+    # intersection={saas-version}, min(2,2)=2, overlap=0.5 < 1.0 → splits
+    assert len(segments) == 2
+
+
+def test_gradual_topic_drift_merges():
+    """Consecutive turns with overlap merge even if first and last share no tags.
+
+    A=[alpha, beta], B=[beta, gamma], C=[gamma, delta]
+    A→B overlap: {beta}/min(2,2) = 0.5 → merge
+    B→C overlap: {gamma}/min(2,2) = 0.5 → merge
+    A and C share nothing, but they're in the same segment because each
+    consecutive pair passes the threshold. max_segment_turns is the mitigation.
+    """
+    gen = MockTagGenerator()
+    gen.set_override("turn-a", TagResult(
+        tags=["alpha", "beta"], primary="alpha", source="mock",
+    ))
+    gen.set_override("turn-b", TagResult(
+        tags=["beta", "gamma"], primary="beta", source="mock",
+    ))
+    gen.set_override("turn-c", TagResult(
+        tags=["gamma", "delta"], primary="gamma", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5, max_segment_turns=0),
+    )
+    messages = [
+        Message(role="user", content="turn-a question"),
+        Message(role="assistant", content="turn-a answer"),
+        Message(role="user", content="turn-b question"),
+        Message(role="assistant", content="turn-b answer"),
+        Message(role="user", content="turn-c question"),
+        Message(role="assistant", content="turn-c answer"),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1
+    assert segments[0].turn_count == 3
+
+
+def test_gradual_drift_capped_by_max_segment_turns():
+    """max_segment_turns breaks a drifting segment."""
+    gen = MockTagGenerator()
+    gen.set_override("turn-a", TagResult(
+        tags=["alpha", "beta"], primary="alpha", source="mock",
+    ))
+    gen.set_override("turn-b", TagResult(
+        tags=["beta", "gamma"], primary="beta", source="mock",
+    ))
+    gen.set_override("turn-c", TagResult(
+        tags=["gamma", "delta"], primary="gamma", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5, max_segment_turns=2),
+    )
+    messages = [
+        Message(role="user", content="turn-a question"),
+        Message(role="assistant", content="turn-a answer"),
+        Message(role="user", content="turn-b question"),
+        Message(role="assistant", content="turn-b answer"),
+        Message(role="user", content="turn-c question"),
+        Message(role="assistant", content="turn-c answer"),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 2
+    assert segments[0].turn_count == 2
+    assert segments[1].turn_count == 1
+
+
+def test_session_date_change_still_splits():
+    """Session date header forces a split regardless of tag overlap."""
+    gen = MockTagGenerator(default_tag="topic-a", default_tags=["topic-a", "topic-b"])
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="Hello"),
+        Message(role="assistant", content="Hi"),
+        Message(role="user", content="[Session from 2026-03-16] Hello again"),
+        Message(role="assistant", content="Welcome back"),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 2
+
+
+def test_temporal_gap_still_splits():
+    """Temporal gap forces a split regardless of tag overlap."""
+    gen = MockTagGenerator(default_tag="topic-a", default_tags=["topic-a", "topic-b"])
+    now = datetime.now(timezone.utc)
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(
+            tag_overlap_threshold=0.5,
+            session_gap_minutes=30,
+        ),
+    )
+    messages = [
+        Message(role="user", content="Hello", timestamp=now),
+        Message(role="assistant", content="Hi", timestamp=now + timedelta(minutes=1)),
+        Message(role="user", content="Hello again", timestamp=now + timedelta(minutes=60)),
+        Message(role="assistant", content="Welcome back", timestamp=now + timedelta(minutes=61)),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 2
