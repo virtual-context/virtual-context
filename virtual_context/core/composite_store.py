@@ -122,14 +122,18 @@ class CompositeStore:
     def save_turn_message(
         self, conversation_id: str, turn_number: int,
         user_content: str, assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
     ) -> None:
         return self._segments.save_turn_message(
             conversation_id, turn_number, user_content, assistant_content,
+            user_raw_content=user_raw_content,
+            assistant_raw_content=assistant_raw_content,
         )
 
     def get_turn_messages(
         self, conversation_id: str, turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str]]:
+    ) -> dict[int, tuple[str, str, str | None, str | None]]:
         return self._segments.get_turn_messages(conversation_id, turn_numbers)
 
     # ------------------------------------------------------------------
