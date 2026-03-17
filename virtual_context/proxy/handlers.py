@@ -27,6 +27,7 @@ from .helpers import (
     _forward_headers,
     _extract_delta_text,
     _extract_assistant_text,
+    _extract_assistant_raw_content,
     _inject_context,
     _inject_conversation_marker,
     _parse_sse_events,
@@ -874,7 +875,8 @@ async def _handle_streaming(
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
-                            timestamp=datetime.now(timezone.utc)),
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=all_content_blocks if all_content_blocks else None),
                 )
                 if not passthrough:
                     state.fire_turn_complete(
@@ -896,6 +898,10 @@ async def _handle_streaming(
         # ---------------------------------------------------------------
         line_buf = ""
         _raw_usage: dict = {}
+        np_content_blocks: list[dict] = []
+        np_current_text_parts: list[str] = []
+        np_current_tool_input_parts: list[str] = []
+        np_current_tool: dict | None = None
         try:
             async for raw_chunk in upstream.aiter_bytes():
                 yield raw_chunk  # forward raw bytes unchanged
@@ -925,6 +931,43 @@ async def _handle_streaming(
                                 _du = data.get("usage", {})
                                 if "output_tokens" in _du:
                                     _raw_usage["output_tokens"] = _du["output_tokens"]
+
+                            # Content block tracking for raw_content
+                            if _dtype == "content_block_start":
+                                block = data.get("content_block", {})
+                                btype = block.get("type", "")
+                                if btype == "tool_use":
+                                    np_current_tool = {
+                                        "type": "tool_use",
+                                        "id": block.get("id", ""),
+                                        "name": block.get("name", ""),
+                                    }
+                                    np_current_tool_input_parts = []
+                                elif btype == "text":
+                                    np_current_text_parts = []
+                            elif _dtype == "content_block_delta":
+                                cb_delta = data.get("delta", {})
+                                if cb_delta.get("type") == "input_json_delta" and np_current_tool is not None:
+                                    np_current_tool_input_parts.append(cb_delta.get("partial_json", ""))
+                                elif cb_delta.get("type") == "text_delta":
+                                    np_current_text_parts.append(cb_delta.get("text", ""))
+                            elif _dtype == "content_block_stop":
+                                if np_current_tool is not None:
+                                    input_str = "".join(np_current_tool_input_parts)
+                                    try:
+                                        parsed_input = json.loads(input_str) if input_str else {}
+                                    except json.JSONDecodeError:
+                                        parsed_input = {}
+                                    np_current_tool["input"] = parsed_input
+                                    np_content_blocks.append(np_current_tool)
+                                    np_current_tool = None
+                                    np_current_tool_input_parts = []
+                                elif np_current_text_parts:
+                                    np_content_blocks.append({
+                                        "type": "text",
+                                        "text": "".join(np_current_text_parts),
+                                    })
+                                    np_current_text_parts = []
                         except json.JSONDecodeError:
                             pass
         finally:
@@ -933,7 +976,8 @@ async def _handle_streaming(
             if state and assistant_text:
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
-                            timestamp=datetime.now(timezone.utc))
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=np_content_blocks if np_content_blocks else None)
                 )
                 if not passthrough:
                     state.fire_turn_complete(
@@ -1033,7 +1077,8 @@ async def _handle_non_streaming(
     if state and assistant_text:
         state.conversation_history.append(
             Message(role="assistant", content=assistant_text,
-                    timestamp=datetime.now(timezone.utc))
+                    timestamp=datetime.now(timezone.utc),
+                    raw_content=_extract_assistant_raw_content(response_body, api_format))
         )
         if not passthrough:
             state.fire_turn_complete(
