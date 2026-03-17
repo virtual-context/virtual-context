@@ -260,3 +260,36 @@ compaction:
 """)
     config = load_config(str(config_file))
     assert config.segmenter.tool_result_segment_threshold == 50000
+
+
+# ---------------------------------------------------------------------------
+# Task 13: End-to-end verification
+# ---------------------------------------------------------------------------
+
+
+def test_raw_content_end_to_end_compaction():
+    """raw_content flows from Message through compactor _format_conversation."""
+    messages = [
+        Message(role="user", content="run the command", raw_content=[
+            {"type": "text", "text": "run the command"},
+        ]),
+        Message(role="assistant", content="", raw_content=[
+            {"type": "text", "text": "Running it now"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls -la"}},
+        ]),
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "/home/user\nfile1.py\nfile2.py"},
+        ]),
+        Message(role="assistant", content="I see three items", raw_content=[
+            {"type": "text", "text": "I see three items in the directory."},
+        ]),
+    ]
+    compactor = DomainCompactor.__new__(DomainCompactor)
+    result = compactor._format_conversation(messages)
+    # Verify the full conversational flow is captured
+    assert "run the command" in result
+    assert "Running it now" in result
+    assert "bash" in result
+    assert "ls -la" in result
+    assert "file1.py" in result
+    assert "I see three items" in result
