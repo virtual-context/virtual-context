@@ -103,6 +103,10 @@ def _extract_assistant_text(response_body: dict, api_format: str) -> str:
     return get_format(api_format).extract_assistant_text(response_body)
 
 
+def _extract_assistant_raw_content(response_body: dict, api_format: str) -> list[dict] | None:
+    return get_format(api_format).extract_assistant_raw_content(response_body)
+
+
 def _inject_vc_tools(
     body: dict,
     engine: "VirtualContextEngine",
