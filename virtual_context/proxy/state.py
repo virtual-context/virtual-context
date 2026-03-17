@@ -23,6 +23,37 @@ from .metrics import ProxyMetrics
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Provider derivation from upstream URL
+# ---------------------------------------------------------------------------
+
+_PROVIDER_HOSTS: dict[str, str] = {
+    "api.anthropic.com": "anthropic",
+    "api.openai.com": "openai",
+    "generativelanguage.googleapis.com": "gemini",
+    "api.groq.com": "groq",
+    "openrouter.ai": "openrouter",
+    "api.together.xyz": "together",
+    "api.mistral.ai": "mistral",
+    "api.cohere.com": "cohere",
+    "api.deepseek.com": "deepseek",
+}
+
+
+def _derive_provider(upstream: str) -> str:
+    """Derive a provider name from an upstream URL."""
+    if not upstream:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(upstream).hostname or ""
+        for pattern, name in _PROVIDER_HOSTS.items():
+            if host == pattern or host.endswith("." + pattern):
+                return name
+        return host.split(".")[0] if host else ""
+    except Exception:
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # SessionState — state machine for non-blocking ingestion
@@ -70,6 +101,7 @@ class ProxyState:
         self.conversation_history: list[Message] = []
         self.metrics = metrics
         self.upstream = upstream
+        self.provider = _derive_provider(upstream)
         self._pool = ThreadPoolExecutor(max_workers=1)       # tagging (serialized)
         self._compact_pool = ThreadPoolExecutor(max_workers=1)  # compaction (background)
         self._pending_tag: Future | None = None
@@ -97,6 +129,10 @@ class ProxyState:
         self._last_enriched_payload_tokens: int = 0
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
+
+        # Set provider on engine for persistence (only if not already restored)
+        if self.provider and not getattr(engine, '_provider', ''):
+            engine._provider = self.provider
 
         # Wire up request captures persistence: engine pulls from metrics at save time
         if metrics:
@@ -338,10 +374,32 @@ class ProxyState:
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request."""
         conversation_id = self.engine.config.conversation_id
+
+        def _compact_progress(done, total, result, *, phase="", **kwargs):
+            if self.metrics:
+                evt = {
+                    "type": "compaction_progress",
+                    "turn": turn,
+                    "done": done,
+                    "total": total,
+                    "phase": phase,
+                    "conversation_id": conversation_id,
+                }
+                if result is not None:
+                    evt["primary_tag"] = result.primary_tag
+                    evt["tags"] = result.tags
+                    evt["original_tokens"] = result.original_tokens
+                    evt["summary_tokens"] = result.summary_tokens
+                for k, v in kwargs.items():
+                    evt[k] = v
+                self.metrics.record(evt)
+
         with self._compaction_lock:
             t0 = time.monotonic()
             try:
-                report = self.engine.compact_if_needed(history, signal)
+                report = self.engine.compact_if_needed(
+                    history, signal, progress_callback=_compact_progress,
+                )
                 compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 if report is not None:
