@@ -140,6 +140,8 @@ class ContextStore(ABC):
         turn_number: int,
         user_content: str,
         assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
     ) -> None:
         """Persist turn message text. Upsert by (conversation_id, turn_number)."""
 
@@ -147,10 +149,10 @@ class ContextStore(ABC):
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str]]:
+    ) -> dict[int, tuple[str, str, str | None, str | None]]:
         """Retrieve message text for specific turns.
 
-        Returns {turn_number: (user_content, assistant_content)}.
+        Returns {turn_number: (user_content, assistant_content, user_raw_content, assistant_raw_content)}.
         Missing turns are omitted from the result.
         """
         return {}
