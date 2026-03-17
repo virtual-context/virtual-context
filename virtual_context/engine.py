@@ -113,6 +113,7 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._compacted_through = 0  # message index watermark: messages before this already compacted
+        self._tool_tag_counter = 0  # sequential counter for tool_N tags
         self._last_tag_ms: float = 0.0
         self._last_compact_ms: float = 0.0
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
@@ -864,8 +865,21 @@ class VirtualContextEngine:
         if latest_pair:
             combined_text = " ".join(m.content for m in latest_pair)
 
-            # BUG-013: Skip empty turns (tool_use/tool_result with no text)
-            if not combined_text.strip():
+            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
+            if self._is_tool_turn(latest_pair):
+                self._tool_tag_counter += 1
+                tag_name = f"tool_{self._tool_tag_counter}"
+                self._turn_tag_index.append(TurnTagEntry(
+                    turn_number=len(self._turn_tag_index.entries),
+                    message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
+                    tags=[tag_name],
+                    primary_tag=tag_name,
+                    session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                ))
+                latest_pair = None  # skip normal tagger flow below
+
+            # BUG-013: Skip empty turns with no tool blocks
+            elif not combined_text.strip():
                 latest_pair = None
 
         if latest_pair:
