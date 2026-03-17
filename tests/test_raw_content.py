@@ -222,3 +222,41 @@ def test_segmenter_no_split_small_tool_result():
     ]
     segments = segmenter.segment(messages)
     assert len(segments) == 1  # all same tag, small result -> one segment
+
+
+# ---------------------------------------------------------------------------
+# Task 12: Config parsing and validation for tool_result_segment_threshold
+# ---------------------------------------------------------------------------
+
+from virtual_context.config import load_config
+
+
+def test_config_parses_tool_result_segment_threshold(tmp_path):
+    config_file = tmp_path / "vc.yaml"
+    config_file.write_text("""
+conversation_id: test
+storage:
+  backend: sqlite
+  sqlite:
+    db_path: ":memory:"
+compaction:
+  tool_result_segment_threshold: 100000
+  model: test-model
+""")
+    config = load_config(str(config_file))
+    assert config.segmenter.tool_result_segment_threshold == 100000
+
+
+def test_config_default_tool_result_segment_threshold(tmp_path):
+    config_file = tmp_path / "vc.yaml"
+    config_file.write_text("""
+conversation_id: test
+storage:
+  backend: sqlite
+  sqlite:
+    db_path: ":memory:"
+compaction:
+  model: test-model
+""")
+    config = load_config(str(config_file))
+    assert config.segmenter.tool_result_segment_threshold == 50000

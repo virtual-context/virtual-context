@@ -154,6 +154,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         session_gap_minutes=compaction.get("session_gap_minutes", 30),
         tag_overlap_threshold=compaction.get("tag_overlap_threshold", 0.5),
         max_segment_turns=compaction.get("max_segment_turns", 20),
+        tool_result_segment_threshold=compaction.get("tool_result_segment_threshold", 50000),
     )
     compactor_config = CompactorConfig(
         summary_ratio=compaction.get("summary_ratio", 0.15),
@@ -439,6 +440,11 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append(
             f"segmenter.max_segment_turns must be >= 0, "
             f"got {config.segmenter.max_segment_turns}"
+        )
+    if config.segmenter.tool_result_segment_threshold < 0:
+        errors.append(
+            f"segmenter.tool_result_segment_threshold must be >= 0, "
+            f"got {config.segmenter.tool_result_segment_threshold}"
         )
 
     # Storage backend
