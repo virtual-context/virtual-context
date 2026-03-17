@@ -446,23 +446,35 @@ class VirtualContextEngine:
                         "  Stored %d facts for segment %s",
                         len(result.facts), result.primary_tag,
                     )
-                    # D1: Run supersession check on new facts
+                    # D1: Run supersession + fact linking
+                    _superseded_count = 0
+                    _links_count = 0
                     if self._supersession_checker:
                         try:
-                            superseded = self._supersession_checker.check_and_supersede(result.facts)
-                            if superseded:
+                            if hasattr(self._supersession_checker, 'check_and_link'):
+                                _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
+                            else:
+                                _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
+                            if _superseded_count:
                                 logger.info(
                                     "  Superseded %d facts for segment %s",
-                                    superseded, result.primary_tag,
+                                    _superseded_count, result.primary_tag,
+                                )
+                            if _links_count:
+                                logger.info(
+                                    "  Linked %d facts for segment %s",
+                                    _links_count, result.primary_tag,
                                 )
                         except Exception as e:
-                            logger.warning("Supersession check failed: %s", e)
+                            logger.warning("Supersession/linking failed: %s", e)
                     if progress_callback:
                         try:
                             progress_callback(
                                 len(all_results) + i + 1, len(segments), result,
                                 phase="facts_extracted",
                                 fact_count=len(result.facts),
+                                superseded_count=_superseded_count,
+                                links_count=_links_count,
                             )
                         except Exception:
                             pass
@@ -581,16 +593,29 @@ class VirtualContextEngine:
         if not llm:
             logger.warning("Supersession enabled but provider '%s' could not be built", provider_name)
             return
-        from .ingest.supersession import FactSupersessionChecker
-        self._supersession_checker = FactSupersessionChecker(
-            llm_provider=llm,
-            model=model,
-            store=self._store,
-            config=sc,
-            telemetry_ledger=self._telemetry,
-            embed_fn=self._get_embed_fn(),
-        )
-        logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
+        if self.config.facts.graph_links:
+            from .ingest.supersession import FactLinkChecker
+            self._supersession_checker = FactLinkChecker(
+                llm_provider=llm,
+                model=model,
+                store=self._store,
+                config=sc,
+                graph_links=True,
+                telemetry_ledger=self._telemetry,
+                embed_fn=self._get_embed_fn(),
+            )
+            logger.info("Fact link checker initialized (provider=%s, model=%s, graph_links=True)", provider_name, model)
+        else:
+            from .ingest.supersession import FactSupersessionChecker
+            self._supersession_checker = FactSupersessionChecker(
+                llm_provider=llm,
+                model=model,
+                store=self._store,
+                config=sc,
+                telemetry_ledger=self._telemetry,
+                embed_fn=self._get_embed_fn(),
+            )
+            logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 
     def _init_fact_curator(self) -> None:
         """Initialize the fact curator from config if enabled."""
