@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     turn_number INTEGER NOT NULL,
     user_content TEXT NOT NULL DEFAULT '',
     assistant_content TEXT NOT NULL DEFAULT '',
+    user_raw_content TEXT,
+    assistant_raw_content TEXT,
     PRIMARY KEY (conversation_id, turn_number)
 );
 
@@ -330,6 +332,22 @@ class PostgresStore(ContextStore):
             conn.execute("UPDATE segments SET summary_tsv = to_tsvector('english', COALESCE(summary, '')) WHERE summary_tsv IS NULL")
             conn.execute("UPDATE segments SET full_text_tsv = to_tsvector('english', COALESCE(full_text, '')) WHERE full_text_tsv IS NULL")
             conn.execute("UPDATE facts SET facts_tsv = to_tsvector('english', COALESCE(subject,'') || ' ' || COALESCE(verb,'') || ' ' || COALESCE(object,'') || ' ' || COALESCE(what,'')) WHERE facts_tsv IS NULL")
+        except Exception:
+            pass
+        # Migration: add raw_content columns to turn_messages
+        try:
+            conn.execute("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='turn_messages' AND column_name='user_raw_content') THEN
+                        ALTER TABLE turn_messages ADD COLUMN user_raw_content TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='turn_messages' AND column_name='assistant_raw_content') THEN
+                        ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT;
+                    END IF;
+                END $$;
+            """)
         except Exception:
             pass
 
@@ -821,6 +839,7 @@ class PostgresStore(ContextStore):
             } if state.working_set else {},
             "trailing_fingerprint": state.trailing_fingerprint or "",
             "request_captures": state.request_captures,
+            "provider": state.provider,
         }
         conn.execute(
             """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
@@ -840,6 +859,7 @@ class PostgresStore(ContextStore):
             working_set: dict = {}
             fingerprint = ""
             request_captures = []
+            provider = ""
         elif isinstance(raw, dict):
             entries_list = raw.get("entries", [])
             split_tags = set(raw.get("split_processed_tags", []))
@@ -850,12 +870,14 @@ class PostgresStore(ContextStore):
             }
             fingerprint = raw.get("trailing_fingerprint", "")
             request_captures = raw.get("request_captures", [])
+            provider = raw.get("provider", "")
         else:
             entries_list = []
             split_tags = set()
             working_set = {}
             fingerprint = ""
             request_captures = []
+            provider = ""
 
         entries = []
         for e in entries_list:
@@ -881,6 +903,7 @@ class PostgresStore(ContextStore):
             working_set=working_set,
             trailing_fingerprint=fingerprint,
             request_captures=request_captures,
+            provider=provider,
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
@@ -918,35 +941,47 @@ class PostgresStore(ContextStore):
         turn_number: int,
         user_content: str,
         assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
     ) -> None:
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO turn_messages
-            (conversation_id, turn_number, user_content, assistant_content)
-            VALUES (%s, %s, %s, %s)
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (conversation_id, turn_number) DO UPDATE SET
                 user_content=EXCLUDED.user_content,
-                assistant_content=EXCLUDED.assistant_content""",
-            (conversation_id, turn_number, user_content, assistant_content),
+                assistant_content=EXCLUDED.assistant_content,
+                user_raw_content=EXCLUDED.user_raw_content,
+                assistant_raw_content=EXCLUDED.assistant_raw_content""",
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content),
         )
 
     def get_turn_messages(
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str]]:
+    ) -> dict[int, tuple[str, str, str | None, str | None]]:
         if not turn_numbers:
             return {}
         conn = self._get_conn()
         placeholders = ",".join("%s" for _ in turn_numbers)
         rows = conn.execute(
-            f"""SELECT turn_number, user_content, assistant_content
+            f"""SELECT turn_number, user_content, assistant_content,
+                       user_raw_content, assistant_raw_content
             FROM turn_messages
             WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
             [conversation_id] + turn_numbers,
         ).fetchall()
         return {
-            row["turn_number"]: (row["user_content"], row["assistant_content"])
+            row["turn_number"]: (
+                row["user_content"],
+                row["assistant_content"],
+                row["user_raw_content"],
+                row["assistant_raw_content"],
+            )
             for row in rows
         }
 
