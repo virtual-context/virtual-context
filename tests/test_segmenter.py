@@ -142,3 +142,31 @@ def test_validate_accepts_valid_segmenter_config():
     errors = validate_config(config)
     assert not any("tag_overlap_threshold" in e for e in errors)
     assert not any("max_segment_turns" in e for e in errors)
+
+
+def test_overlap_above_threshold_merges():
+    """Turns sharing enough tags stay in the same segment even with different primaries."""
+    gen = MockTagGenerator()
+    # Turn 1: primary=saas-version, tags=[saas-version, pricing, product]
+    gen.set_override("pricing tiers", TagResult(
+        tags=["saas-version", "pricing", "product"], primary="saas-version", source="mock",
+    ))
+    # Turn 2: primary=agreement, tags=[agreement, saas-version]
+    # Overlap with turn 1: {saas-version} / min(3, 2) = 1/2 = 0.5
+    gen.set_override("yes exactly", TagResult(
+        tags=["agreement", "saas-version"], primary="agreement", source="mock",
+    ))
+
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="What are the pricing tiers?"),
+        Message(role="assistant", content="We have three tiers."),
+        Message(role="user", content="yes exactly"),
+        Message(role="assistant", content="Great."),
+    ]
+    segments = segmenter.segment(messages)
+    assert len(segments) == 1
+    assert segments[0].turn_count == 2
