@@ -234,6 +234,7 @@ class EngineStateSnapshot:
     telemetry_rollup: dict = field(default_factory=dict)  # persisted telemetry totals (survives restart)
     request_captures: list[dict] = field(default_factory=list)  # lightweight request summaries for dashboard
     provider: str = ""  # upstream provider (anthropic, openai, gemini, etc.)
+    tool_tag_counter: int = 0  # sequential counter for tool_N tags
 
 
 @dataclass
