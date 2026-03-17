@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -915,6 +916,8 @@ class VirtualContextEngine:
                         turn_num,
                         latest_pair[0].content if len(latest_pair) > 0 else "",
                         latest_pair[1].content if len(latest_pair) > 1 else "",
+                        user_raw_content=json.dumps(latest_pair[0].raw_content) if len(latest_pair) > 0 and latest_pair[0].raw_content else None,
+                        assistant_raw_content=json.dumps(latest_pair[1].raw_content) if len(latest_pair) > 1 and latest_pair[1].raw_content else None,
                     )
                 except Exception:
                     pass  # never block tagging for message persistence
@@ -1649,6 +1652,8 @@ class VirtualContextEngine:
                     entry.turn_number,
                     user_msg.content,
                     asst_msg.content,
+                    user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                    assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
                 )
             except Exception:
                 pass
