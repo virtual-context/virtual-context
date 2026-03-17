@@ -2,6 +2,7 @@
 
 import pytest
 
+from virtual_context.config import load_config
 from virtual_context.core.segmenter import TopicSegmenter
 from virtual_context.types import Message, SegmenterConfig, TagResult
 
@@ -90,3 +91,25 @@ def test_segmenter_config_defaults():
     assert cfg.tag_overlap_threshold == 0.5
     assert cfg.max_segment_turns == 20
     assert cfg.session_gap_minutes == 30  # existing field unchanged
+
+
+def test_config_parses_tag_overlap_threshold(tmp_path):
+    """tag_overlap_threshold and max_segment_turns parsed from compaction: section."""
+    cfg_file = tmp_path / "vc.yaml"
+    cfg_file.write_text(
+        "compaction:\n"
+        "  tag_overlap_threshold: 0.7\n"
+        "  max_segment_turns: 15\n"
+    )
+    config = load_config(str(cfg_file))
+    assert config.segmenter.tag_overlap_threshold == 0.7
+    assert config.segmenter.max_segment_turns == 15
+
+
+def test_config_defaults_without_tag_overlap(tmp_path):
+    """Omitted fields get defaults."""
+    cfg_file = tmp_path / "vc.yaml"
+    cfg_file.write_text("compaction:\n  soft_threshold: 0.70\n")
+    config = load_config(str(cfg_file))
+    assert config.segmenter.tag_overlap_threshold == 0.5
+    assert config.segmenter.max_segment_turns == 20

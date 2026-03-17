@@ -150,7 +150,11 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         hard_threshold=compaction.get("hard_threshold", 0.85),
         protected_recent_turns=compaction.get("protected_recent_turns", 6),
     )
-    segmenter_config = SegmenterConfig()
+    segmenter_config = SegmenterConfig(
+        session_gap_minutes=compaction.get("session_gap_minutes", 30),
+        tag_overlap_threshold=compaction.get("tag_overlap_threshold", 0.5),
+        max_segment_turns=compaction.get("max_segment_turns", 20),
+    )
     compactor_config = CompactorConfig(
         summary_ratio=compaction.get("summary_ratio", 0.15),
         min_summary_tokens=compaction.get("min_summary_tokens", 200),
