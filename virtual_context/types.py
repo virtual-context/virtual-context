@@ -606,6 +606,7 @@ class SegmenterConfig:
     session_gap_minutes: int = 30  # split segments when messages are >N min apart (0=disabled)
     tag_overlap_threshold: float = 0.5  # min overlap coefficient to keep turns in same segment
     max_segment_turns: int = 20  # hard cap on turns per segment (0=unlimited)
+    tool_result_segment_threshold: int = 50000  # bytes; large tool_results get own segment (0=disabled)
 
 
 @dataclass
