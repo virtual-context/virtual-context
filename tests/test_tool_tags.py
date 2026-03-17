@@ -190,3 +190,36 @@ def test_no_expansion_hint_for_regular_tag():
     result = assembler._format_tag_section("coding", summaries)
     assert "vc_expand_topic" not in result
     assert "tool output truncated" not in result
+
+
+# --- Task 7: End-to-end verification ---
+
+def test_tool_tag_counter_increments():
+    """Multiple tool turns get sequential tool_1, tool_2, etc."""
+    engine = _build_tag_turn_engine_mock()
+
+    # First tool turn
+    history1 = [
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "out1"},
+        ]),
+        Message(role="assistant", content="", raw_content=[
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}},
+        ]),
+    ]
+    VirtualContextEngine.tag_turn(engine, history1)
+
+    # Second tool turn
+    history2 = history1 + [
+        Message(role="user", content="", raw_content=[
+            {"type": "tool_result", "tool_use_id": "t2", "content": "out2"},
+        ]),
+        Message(role="assistant", content="", raw_content=[
+            {"type": "tool_use", "id": "t2", "name": "read", "input": {}},
+        ]),
+    ]
+    VirtualContextEngine.tag_turn(engine, history2)
+
+    assert engine._tool_tag_counter == 2
+    assert engine._turn_tag_index.entries[0].tags == ["tool_1"]
+    assert engine._turn_tag_index.entries[1].tags == ["tool_2"]
