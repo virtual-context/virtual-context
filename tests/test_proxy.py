@@ -1389,7 +1389,10 @@ class TestEngineIngestHistory:
         """Create a mock engine with the config attributes needed by ingest_history."""
         engine = MagicMock()
         from virtual_context.core.turn_tag_index import TurnTagIndex
+        from virtual_context.engine import VirtualContextEngine
         engine._turn_tag_index = TurnTagIndex()
+        engine._tool_tag_counter = 0
+        engine._is_tool_turn = VirtualContextEngine._is_tool_turn
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
         engine.config.tag_generator.context_lookback_pairs = 5

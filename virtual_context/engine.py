@@ -1603,7 +1603,35 @@ class VirtualContextEngine:
             user_msg = history_pairs[i]
             asst_msg = history_pairs[i + 1]
 
-            # BUG-013: Skip empty turns (tool_use/tool_result with no text)
+            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
+            if self._is_tool_turn([user_msg, asst_msg]):
+                self._tool_tag_counter += 1
+                tag_name = f"tool_{self._tool_tag_counter}"
+                entry = TurnTagEntry(
+                    turn_number=len(self._turn_tag_index.entries),
+                    message_hash=hashlib.sha256(
+                        f"{user_msg.content} {asst_msg.content}".encode()
+                    ).hexdigest()[:16],
+                    tags=[tag_name],
+                    primary_tag=tag_name,
+                    session_date=running_session_date,
+                )
+                self._turn_tag_index.append(entry)
+                try:
+                    self._store.save_turn_message(
+                        self.config.conversation_id,
+                        entry.turn_number,
+                        user_msg.content,
+                        asst_msg.content,
+                        user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                        assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                    )
+                except Exception:
+                    pass
+                ingested += 1
+                continue
+
+            # BUG-013: Skip empty turns with no tool blocks
             if not user_msg.content.strip() and not asst_msg.content.strip():
                 logger.debug("Skipping empty turn at pair index %d", i // 2)
                 continue
