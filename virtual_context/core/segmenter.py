@@ -104,7 +104,22 @@ class TopicSegmenter:
             if parsed:
                 running_session = parsed
             if current_group:
-                tag_changed = current_group[0][1].primary != result.primary
+                prev_tags = set(current_group[-1][1].tags)
+                curr_tags = set(result.tags)
+                meaningful_prev = {t for t in prev_tags if t != "_general"}
+                meaningful_curr = {t for t in curr_tags if t != "_general"}
+
+                if not meaningful_prev or not meaningful_curr:
+                    tag_changed = False  # merge on empty/general-only
+                else:
+                    overlap = len(meaningful_prev & meaningful_curr) / min(
+                        len(meaningful_prev), len(meaningful_curr)
+                    )
+                    tag_changed = overlap < self.config.tag_overlap_threshold
+
+                # Hard cap on segment size
+                if self.config.max_segment_turns > 0 and len(current_group) >= self.config.max_segment_turns:
+                    tag_changed = True
                 session_changed = parsed and parsed != group_session
                 temporal_gap = self._has_temporal_gap(current_group[-1][0], pair)
                 if tag_changed or session_changed or temporal_gap:
