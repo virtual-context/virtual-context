@@ -218,9 +218,12 @@ def test_primary_tag_guarantee_ephemeral_gets_tag_summary():
         db_path = Path(tmpdir) / "store.db"
 
         # Tag generator: baking for all, sourdough-starter for sourdough turns
+        # Sourdough override omits "baking" so the segmenter splits them into
+        # separate segments (overlap=0).  The TurnTagIndex below still lists
+        # "baking" for sourdough turns so greedy set cover can drop sourdough-starter.
         tag_gen = MockTagGenerator(default_tag="baking")
         tag_gen.set_override("sourdough", TagResult(
-            tags=["baking", "sourdough-starter"], primary="sourdough-starter", source="mock",
+            tags=["sourdough-starter"], primary="sourdough-starter", source="mock",
         ))
 
         store = SQLiteStore(db_path=db_path)
