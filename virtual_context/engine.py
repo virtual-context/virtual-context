@@ -515,6 +515,7 @@ class VirtualContextEngine:
         # Stash request captures for ProxyState to pick up after init
         self._restored_request_captures = saved.request_captures or []
         self._provider = saved.provider or ""
+        self._tool_tag_counter = saved.tool_tag_counter or 0
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
@@ -579,6 +580,7 @@ class VirtualContextEngine:
                 telemetry_rollup=telemetry_dict,
                 request_captures=captures,
                 provider=self._provider,
+                tool_tag_counter=self._tool_tag_counter,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)

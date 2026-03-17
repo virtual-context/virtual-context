@@ -127,3 +127,28 @@ def test_is_tool_turn_empty_content_with_tools():
         ]),
     ]
     assert VirtualContextEngine._is_tool_turn(msgs) is True
+
+
+# --- Task 5: Persist and restore tool_tag_counter ---
+
+def test_tool_tag_counter_persists_in_snapshot():
+    """tool_tag_counter round-trips through EngineStateSnapshot."""
+    snap = EngineStateSnapshot(
+        conversation_id="test",
+        compacted_through=0,
+        turn_tag_entries=[],
+        turn_count=0,
+        tool_tag_counter=7,
+    )
+    assert snap.tool_tag_counter == 7
+
+    # Simulate save/restore
+    snap_dict = {
+        "conversation_id": snap.conversation_id,
+        "compacted_through": snap.compacted_through,
+        "turn_tag_entries": snap.turn_tag_entries,
+        "turn_count": snap.turn_count,
+        "tool_tag_counter": snap.tool_tag_counter,
+    }
+    restored = EngineStateSnapshot(**snap_dict)
+    assert restored.tool_tag_counter == 7
