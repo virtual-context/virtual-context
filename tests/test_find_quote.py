@@ -558,7 +558,7 @@ class TestMergeSegmentExcerpts:
         store = MagicMock()
         segs = segments or {}
 
-        def get_segment(ref):
+        def get_segment(ref, conversation_id=None):
             if ref not in segs or segs[ref] is None:
                 return None
             mock_seg = MagicMock()
