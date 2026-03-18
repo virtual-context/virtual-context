@@ -459,16 +459,28 @@ class PostgresStore(ContextStore):
                 )
         return segment.ref
 
-    def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str, conversation_id: str | None = None) -> StoredSegment | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
+        if conversation_id is not None:
+            row = conn.execute(
+                "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
+                (ref, conversation_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
         if not row:
             return None
         return _row_to_segment(row, self._get_tags_for_ref(ref))
 
-    def get_summary(self, ref: str) -> StoredSummary | None:
+    def get_summary(self, ref: str, conversation_id: str | None = None) -> StoredSummary | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
+        if conversation_id is not None:
+            row = conn.execute(
+                "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
+                (ref, conversation_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
         if not row:
             return None
         return _row_to_summary(row, self._get_tags_for_ref(ref))
@@ -476,6 +488,7 @@ class PostgresStore(ContextStore):
     def get_summaries_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 10,
         before: datetime | None = None, after: datetime | None = None,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         if not tags:
             return []
@@ -487,6 +500,9 @@ class PostgresStore(ContextStore):
             WHERE st.tag = ANY(%s)
         """
         params: list = [tags]
+        if conversation_id is not None:
+            query += " AND s.conversation_id = %s"
+            params.append(conversation_id)
         if before:
             query += " AND s.created_at < %s"
             params.append(_dt_to_str(before))
@@ -505,32 +521,38 @@ class PostgresStore(ContextStore):
         tags_map = self._batch_get_tags(refs)
         return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
 
-    def search(self, query: str, tags: list[str] | None = None, limit: int = 5) -> list[StoredSummary]:
+    def search(self, query: str, tags: list[str] | None = None, limit: int = 5, conversation_id: str | None = None) -> list[StoredSummary]:
         conn = self._get_conn()
         tsquery = " & ".join(query.split())
         if tags:
-            rows = conn.execute(
-                """SELECT DISTINCT s.* FROM segments s
+            sql = """SELECT DISTINCT s.* FROM segments s
                 JOIN segment_tags st ON s.ref = st.segment_ref
                 WHERE s.summary_tsv @@ to_tsquery('english', %s)
-                AND st.tag = ANY(%s)
-                ORDER BY s.created_at DESC LIMIT %s""",
-                (tsquery, tags, limit),
-            ).fetchall()
+                AND st.tag = ANY(%s)"""
+            params: list = [tsquery, tags]
+            if conversation_id is not None:
+                sql += " AND s.conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY s.created_at DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         else:
-            rows = conn.execute(
-                """SELECT * FROM segments
-                WHERE summary_tsv @@ to_tsquery('english', %s)
-                ORDER BY created_at DESC LIMIT %s""",
-                (tsquery, limit),
-            ).fetchall()
+            sql = """SELECT * FROM segments
+                WHERE summary_tsv @@ to_tsquery('english', %s)"""
+            params = [tsquery]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         refs = [row["ref"] for row in rows]
         tags_map = self._batch_get_tags(refs)
         return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
 
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         conn = self._get_conn()
-        if conversation_id:
+        if conversation_id is not None:
             rows = conn.execute("""
                 SELECT st.tag,
                        COUNT(DISTINCT st.segment_ref) as usage_count,
@@ -682,18 +704,21 @@ class PostgresStore(ContextStore):
             for row in rows
         ]
 
-    def get_segments_by_tags(self, tags: list[str], min_overlap: int = 1, limit: int = 20) -> list[StoredSegment]:
+    def get_segments_by_tags(self, tags: list[str], min_overlap: int = 1, limit: int = 20, conversation_id: str | None = None) -> list[StoredSegment]:
         if not tags:
             return []
         conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT s.*, COUNT(st.tag) as overlap_count
+        sql = """SELECT s.*, COUNT(st.tag) as overlap_count
             FROM segments s JOIN segment_tags st ON s.ref = st.segment_ref
-            WHERE st.tag = ANY(%s)
-            GROUP BY s.ref HAVING COUNT(st.tag) >= %s
-            ORDER BY COUNT(st.tag) DESC, s.created_at DESC LIMIT %s""",
-            (tags, min_overlap, limit),
-        ).fetchall()
+            WHERE st.tag = ANY(%s)"""
+        params: list = [tags]
+        if conversation_id is not None:
+            sql += " AND s.conversation_id = %s"
+            params.append(conversation_id)
+        sql += """ GROUP BY s.ref HAVING COUNT(st.tag) >= %s
+            ORDER BY COUNT(st.tag) DESC, s.created_at DESC LIMIT %s"""
+        params.extend([min_overlap, limit])
+        rows = conn.execute(sql, params).fetchall()
         refs = [row["ref"] for row in rows]
         tags_map = self._batch_get_tags(refs)
         return [_row_to_segment(row, tags_map[row["ref"]]) for row in rows]
@@ -713,30 +738,38 @@ class PostgresStore(ContextStore):
     # SearchStore
     # ------------------------------------------------------------------
 
-    def search_full_text(self, query: str, limit: int = 5) -> list[QuoteResult]:
+    def search_full_text(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list[QuoteResult]:
         conn = self._get_conn()
         _sc = self.search_config
         _pg_words = _sc.postgres_max_words if _sc else 100
         tsquery = " & ".join(query.split())
         try:
-            rows = conn.execute(
-                """SELECT s.ref, s.primary_tag, s.metadata_json,
+            sql = """SELECT s.ref, s.primary_tag, s.metadata_json,
                     ts_headline('english', s.full_text, to_tsquery('english', %s),
                                 'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=""" + str(_pg_words) + """') as excerpt,
                     s.created_at
                 FROM segments s
-                WHERE s.full_text_tsv @@ to_tsquery('english', %s)
+                WHERE s.full_text_tsv @@ to_tsquery('english', %s)"""
+            params: list = [tsquery, tsquery]
+            if conversation_id is not None:
+                sql += " AND s.conversation_id = %s"
+                params.append(conversation_id)
+            sql += """
                 ORDER BY ts_rank(s.full_text_tsv, to_tsquery('english', %s)) DESC
-                LIMIT %s""",
-                (tsquery, tsquery, tsquery, limit),
-            ).fetchall()
+                LIMIT %s"""
+            params.extend([tsquery, limit])
+            rows = conn.execute(sql, params).fetchall()
         except Exception:
             # Fallback to ILIKE
             _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
-            rows = conn.execute(
-                "SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments WHERE full_text ILIKE %s LIMIT %s",
-                (f"%{query}%", limit),
-            ).fetchall()
+            sql = "SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments WHERE full_text ILIKE %s"
+            params = [f"%{query}%"]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
             results = []
             for row in rows:
                 meta = json.loads(row["metadata_json"])
@@ -791,20 +824,24 @@ class PostgresStore(ContextStore):
             (ref, conversation_id, tool_name, command, turn, content, original_bytes, _dt_to_str(datetime.now(timezone.utc))),
         )
 
-    def search_tool_outputs(self, query: str, limit: int = 5) -> list:
+    def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list:
         conn = self._get_conn()
         tsquery = " & ".join(query.split())
         try:
-            rows = conn.execute(
-                """SELECT t.ref, t.tool_name,
+            sql = """SELECT t.ref, t.tool_name,
                     ts_headline('english', t.content, to_tsquery('english', %s),
                                 'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=20') as excerpt
                 FROM tool_outputs t
-                WHERE t.content_tsv @@ to_tsquery('english', %s)
+                WHERE t.content_tsv @@ to_tsquery('english', %s)"""
+            params: list = [tsquery, tsquery]
+            if conversation_id is not None:
+                sql += " AND t.conversation_id = %s"
+                params.append(conversation_id)
+            sql += """
                 ORDER BY ts_rank(t.content_tsv, to_tsquery('english', %s)) DESC
-                LIMIT %s""",
-                (tsquery, tsquery, tsquery, limit),
-            ).fetchall()
+                LIMIT %s"""
+            params.extend([tsquery, limit])
+            rows = conn.execute(sql, params).fetchall()
         except Exception:
             return []
         return [
@@ -1027,11 +1064,15 @@ class PostgresStore(ContextStore):
         verbs: list[str] | None = None, object_contains: str | None = None,
         status: str | None = None, fact_type: str | None = None,
         tags: list[str] | None = None, limit: int = 50,
+        conversation_id: str | None = None,
     ) -> list[Fact]:
         conn = self._get_conn()
         conditions: list[str] = []
         params: list = []
 
+        if conversation_id is not None:
+            conditions.append("f.conversation_id = %s")
+            params.append(conversation_id)
         if subject:
             conditions.append("f.subject = %s")
             params.append(subject)
@@ -1071,9 +1112,15 @@ class PostgresStore(ContextStore):
 
         return [self._row_to_fact(row) for row in rows]
 
-    def get_unique_fact_verbs(self) -> list[str]:
+    def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
         conn = self._get_conn()
-        rows = conn.execute("SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL").fetchall()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL AND conversation_id = %s",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL").fetchall()
         return [row["verb"] for row in rows]
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
@@ -1081,25 +1128,31 @@ class PostgresStore(ContextStore):
         rows = conn.execute("SELECT * FROM facts WHERE segment_ref = %s ORDER BY mentioned_at", (segment_ref,)).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
-    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
+    def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         conn = self._get_conn()
         tsquery = " & ".join(query.split())
         try:
-            rows = conn.execute(
-                """SELECT f.* FROM facts f
-                WHERE f.facts_tsv @@ to_tsquery('english', %s) AND f.superseded_by IS NULL
-                ORDER BY ts_rank(f.facts_tsv, to_tsquery('english', %s)) DESC LIMIT %s""",
-                (tsquery, tsquery, limit),
-            ).fetchall()
+            sql = """SELECT f.* FROM facts f
+                WHERE f.facts_tsv @@ to_tsquery('english', %s) AND f.superseded_by IS NULL"""
+            params: list = [tsquery]
+            if conversation_id is not None:
+                sql += " AND f.conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY ts_rank(f.facts_tsv, to_tsquery('english', %s)) DESC LIMIT %s"
+            params.extend([tsquery, limit])
+            rows = conn.execute(sql, params).fetchall()
         except Exception:
             like = f"%{query}%"
-            rows = conn.execute(
-                """SELECT * FROM facts f
+            sql = """SELECT * FROM facts f
                 WHERE (f.subject ILIKE %s OR f.verb ILIKE %s OR f.object ILIKE %s OR f.what ILIKE %s)
-                AND f.superseded_by IS NULL
-                ORDER BY f.mentioned_at DESC LIMIT %s""",
-                (like, like, like, like, limit),
-            ).fetchall()
+                AND f.superseded_by IS NULL"""
+            params = [like, like, like, like]
+            if conversation_id is not None:
+                sql += " AND f.conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY f.mentioned_at DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
@@ -1113,9 +1166,15 @@ class PostgresStore(ContextStore):
             (verb, object, status, what, fact_id),
         )
 
-    def get_fact_count_by_tags(self) -> dict[str, int]:
+    def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         conn = self._get_conn()
-        rows = conn.execute("SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag").fetchall()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT ft.tag, COUNT(*) as cnt FROM fact_tags ft JOIN facts f ON f.id = ft.fact_id WHERE f.conversation_id = %s GROUP BY ft.tag",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag").fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
