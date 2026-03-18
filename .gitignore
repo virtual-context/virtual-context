@@ -28,6 +28,7 @@ virtual-context-*.yaml
 
 # Internal docs
 CHANGELOG.md
+docs/superpowers/
 
 # Worktrees
 .worktrees/
