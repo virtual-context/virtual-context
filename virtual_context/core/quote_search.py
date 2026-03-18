@@ -123,6 +123,7 @@ def _locate_excerpt(full_text: str, excerpt: str) -> tuple[int, int] | None:
 def _merge_segment_excerpts(
     store: ContextStore,
     results: list[QuoteResult],
+    conversation_id: str | None = None,
 ) -> list[QuoteResult]:
     """Merge overlapping excerpts from the same segment_ref via span-union.
 
@@ -143,7 +144,8 @@ def _merge_segment_excerpts(
             continue
 
         # Multiple excerpts from the same segment — try span-union
-        seg = store.get_segment(ref)
+        _cid_kw: dict = {"conversation_id": conversation_id} if conversation_id is not None else {}
+        seg = store.get_segment(ref, **_cid_kw)
         if not seg or not seg.full_text:
             # Can't locate spans — keep first result only
             merged.append(group[0])
@@ -210,6 +212,7 @@ def supplement_from_descriptions(
     query: str,
     results: list[QuoteResult],
     max_results: int,
+    conversation_id: str | None = None,
 ) -> list[QuoteResult]:
     """Add results from tags whose descriptions match query terms.
 
@@ -260,7 +263,8 @@ def supplement_from_descriptions(
 
     for tag, _score, _desc in candidates[:slots]:
         # Fetch segments for this tag and search their full_text
-        segments = store.get_segments_by_tags([tag], limit=5)
+        _cid_kw: dict = {"conversation_id": conversation_id} if conversation_id is not None else {}
+        segments = store.get_segments_by_tags([tag], limit=5, **_cid_kw)
         best: QuoteResult | None = None
         best_score = 0
         for seg in segments:
@@ -298,6 +302,7 @@ def find_quote(
     max_results: int = 5,
     intent_context: str = "",
     session_filter: str = "",
+    conversation_id: str | None = None,
 ) -> dict:
     """Search stored conversation text for a specific phrase or keyword.
 
@@ -316,7 +321,9 @@ def find_quote(
         # the model issues a narrow tool query (e.g. "shoe rack").
         query_intent = _detect_query_intent(intent_context)
 
-    results = store.search_full_text(query, limit=max_results)
+    _cid_kw: dict = {"conversation_id": conversation_id} if conversation_id is not None else {}
+
+    results = store.search_full_text(query, limit=max_results, **_cid_kw)
 
     # Always run semantic search to supplement FTS — surfaces chunks
     # that match semantically but use different words, and may return
@@ -327,16 +334,16 @@ def find_quote(
         results.extend(semantic_results)
 
     # ---- Description-aware search ----
-    results = supplement_from_descriptions(store, query, results, max_results)
+    results = supplement_from_descriptions(store, query, results, max_results, conversation_id=conversation_id)
 
     # ---- Tool output search (truncated tool_result content) ----
     tool_remaining = max_results - len(results)
     if tool_remaining > 0:
-        tool_results = store.search_tool_outputs(query, limit=tool_remaining)
+        tool_results = store.search_tool_outputs(query, limit=tool_remaining, **_cid_kw)
         results.extend(tool_results)
 
     # ---- Span-union: merge overlapping excerpts from the same segment ----
-    results = _merge_segment_excerpts(store, results)
+    results = _merge_segment_excerpts(store, results, conversation_id=conversation_id)
 
     if not results:
         return {
