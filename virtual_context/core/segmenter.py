@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from .tag_generator import TagGenerator
 from ..types import (
@@ -91,6 +94,12 @@ class TopicSegmenter:
                 combined = " ".join(m.content for m in pair.messages)
                 tag_result = self.tag_generator.generate_tags(combined)
             tagged.append((pair, tag_result))
+            preview = " ".join(m.content for m in pair.messages)[:60].replace("\n", " ")
+            logger.info(
+                "SEGMENT turn=%d global=%d primary=%s tags=%s source=%s preview=\"%s\"",
+                i, global_turn, tag_result.primary, sorted(tag_result.tags),
+                tag_result.source, preview,
+            )
 
         # Step 3: group contiguous same-primary-tag pairs,
         #         split on session date change or temporal gap
@@ -111,18 +120,47 @@ class TopicSegmenter:
 
                 if not meaningful_prev or not meaningful_curr:
                     tag_changed = False  # merge on empty/general-only
+                    overlap = 1.0
                 else:
-                    overlap = len(meaningful_prev & meaningful_curr) / min(
+                    shared = meaningful_prev & meaningful_curr
+                    overlap = len(shared) / min(
                         len(meaningful_prev), len(meaningful_curr)
                     )
                     tag_changed = overlap < self.config.tag_overlap_threshold
+                    turn_idx = tagged.index((pair, result))
+                    logger.info(
+                        "SEGMENT overlap turn=%d prev_tags=%s curr_tags=%s "
+                        "shared=%s overlap=%.3f threshold=%.1f → %s",
+                        turn_offset + turn_idx, sorted(meaningful_prev),
+                        sorted(meaningful_curr), sorted(shared), overlap,
+                        self.config.tag_overlap_threshold,
+                        "SPLIT" if tag_changed else "MERGE",
+                    )
 
                 # Hard cap on segment size
-                if self.config.max_segment_turns > 0 and len(current_group) >= self.config.max_segment_turns:
+                max_cap = self.config.max_segment_turns > 0 and len(current_group) >= self.config.max_segment_turns
+                if max_cap:
                     tag_changed = True
                 session_changed = parsed and parsed != group_session
                 temporal_gap = self._has_temporal_gap(current_group[-1][0], pair)
+
                 if tag_changed or session_changed or temporal_gap:
+                    turn_idx = tagged.index((pair, result))
+                    if session_changed:
+                        reason = f"session_changed session={parsed}"
+                    elif temporal_gap:
+                        last_ts = _latest_timestamp(current_group[-1][0])
+                        new_ts = _earliest_timestamp(pair)
+                        gap_min = int((new_ts - last_ts).total_seconds() / 60) if last_ts and new_ts else 0
+                        reason = f"temporal_gap minutes={gap_min}"
+                    elif max_cap:
+                        reason = f"max_segment_turns limit={self.config.max_segment_turns}"
+                    else:
+                        reason = f"tag_changed overlap={overlap:.3f}"
+                    logger.info(
+                        "SEGMENT split turn=%d reason=%s",
+                        turn_offset + turn_idx, reason,
+                    )
                     segments.append(self._build_segment(current_group, group_session))
                     current_group = []
                     # Derive session date from timestamp if no header present
@@ -141,6 +179,13 @@ class TopicSegmenter:
         if self.config.tool_result_segment_threshold > 0:
             segments = self._split_large_tool_results(segments)
 
+        avg_turns = len(tagged) / len(segments) if segments else 0
+        logger.info(
+            "SEGMENT complete: %d segments from %d turns, avg %.1f turns/segment, "
+            "config: threshold=%.1f max_turns=%d",
+            len(segments), len(tagged), avg_turns,
+            self.config.tag_overlap_threshold, self.config.max_segment_turns,
+        )
         return segments
 
     @staticmethod
@@ -221,8 +266,9 @@ class TopicSegmenter:
         start_ts = min(timestamps) if timestamps else datetime.now(timezone.utc)
         end_ts = max(timestamps) if timestamps else datetime.now(timezone.utc)
 
-        return TaggedSegment(
-            id=str(uuid.uuid4()),
+        seg_id = str(uuid.uuid4())
+        seg = TaggedSegment(
+            id=seg_id,
             primary_tag=primary_tag,
             tags=sorted(all_tags),
             messages=all_messages,
@@ -232,6 +278,12 @@ class TopicSegmenter:
             turn_count=len(group),
             session_date=session_date,
         )
+        logger.info(
+            "SEGMENT built ref=%s primary=%s tags=%s turns=%d tokens=%d session=%s",
+            seg_id[:8], primary_tag, sorted(all_tags), len(group), token_count,
+            session_date or start_ts.strftime("%Y-%m-%dT%H:%M") if start_ts else "",
+        )
+        return seg
 
     def _has_temporal_gap(self, last_pair: TurnPair, new_pair: TurnPair) -> bool:
         """Check if there's a significant time gap between two turn pairs.
