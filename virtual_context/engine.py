@@ -542,7 +542,7 @@ class VirtualContextEngine:
         tag_counts: dict[str, int] = {}
 
         # Store tags (cross-session)
-        for ts in self._store.get_all_tags():
+        for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id):
             tag_counts[ts.tag] = ts.usage_count
 
         # TurnTagIndex (restored session, higher priority)
@@ -759,7 +759,7 @@ class VirtualContextEngine:
             seen_refs: set[str] = set()
             for tag, entry in self._working_set.items():
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
-                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500)
+                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500, conversation_id=self.config.conversation_id)
                     deduped = [s for s in segs if s.ref not in seen_refs]
                     seen_refs.update(s.ref for s in deduped)
                     if deduped:
@@ -885,7 +885,7 @@ class VirtualContextEngine:
                 latest_pair = None
 
         if latest_pair:
-            store_tags = [ts.tag for ts in self._store.get_all_tags()]
+            store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
             n_context = self.config.tag_generator.context_lookback_pairs
             context = self._get_recent_context(
                 conversation_history, n_context, current_text=combined_text,
@@ -1012,7 +1012,8 @@ class VirtualContextEngine:
                 tag_to_summaries: dict[str, list] = {}
                 for tag in cover_tags:
                     summaries = self._store.get_summaries_by_tags(
-                        tags=[tag], min_overlap=1, limit=50
+                        tags=[tag], min_overlap=1, limit=50,
+                        conversation_id=self.config.conversation_id,
                     )
                     if summaries:
                         tag_to_summaries[tag] = summaries
@@ -1416,7 +1417,7 @@ class VirtualContextEngine:
             max_hint_tokens=self.config.assembler.context_hint_max_tokens,
             token_counter=self._token_counter,
             calculate_depth_tokens=self._calculate_depth_tokens,
-            fact_counts=self._store.get_fact_count_by_tags(),
+            fact_counts=self._store.get_fact_count_by_tags(conversation_id=self.config.conversation_id),
             max_tool_rounds=self.config.paging.max_tool_loops,
         )
 
@@ -1595,7 +1596,7 @@ class VirtualContextEngine:
         import time as _time
         _tag_start = _time.time()
 
-        store_tags = [ts.tag for ts in self._store.get_all_tags()]
+        store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
         ingested = 0
         _total_turns = len(history_pairs) // 2
         n_context = self.config.tag_generator.context_lookback_pairs
@@ -1738,7 +1739,7 @@ class VirtualContextEngine:
 
             # Refresh store tags every 10 turns so new tags influence later tagging
             if ingested % 10 == 0:
-                store_tags = [ts.tag for ts in self._store.get_all_tags()]
+                store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
 
             # Periodic state save so session_date + tags are queryable during ingestion
             if ingested % 20 == 0:
@@ -1799,6 +1800,7 @@ class VirtualContextEngine:
                 if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
                     segs = self._store.get_segments_by_tags(
                         tags=[tag], min_overlap=1, limit=500,
+                        conversation_id=self.config.conversation_id,
                     )
                     deduped = [s for s in segs if s.ref not in seen_refs]
                     seen_refs.update(s.ref for s in deduped)
@@ -1877,7 +1879,7 @@ class VirtualContextEngine:
         max_results: int,
     ) -> list[QuoteResult]:
         """Add results from tags whose descriptions match query terms."""
-        return _supplement_from_descriptions(self._store, query, results, max_results)
+        return _supplement_from_descriptions(self._store, query, results, max_results, conversation_id=self.config.conversation_id)
 
     def find_quote(
         self,
@@ -1896,6 +1898,7 @@ class VirtualContextEngine:
             max_results,
             intent_context=intent_context,
             session_filter=session_filter,
+            conversation_id=self.config.conversation_id,
         )
 
     def get_turns_by_tag(
@@ -1918,6 +1921,7 @@ class VirtualContextEngine:
         # Stored turns: segments matching this tag
         segments = self._store.get_segments_by_tags(
             tags=[tag], min_overlap=1, limit=500,
+            conversation_id=self.config.conversation_id,
         )
         seen_refs: set[str] = set()
         for seg in segments:
@@ -2083,6 +2087,9 @@ class VirtualContextEngine:
         expanded_verbs: list[str] | None = None
         semantic_note: str | None = None
 
+        # Scope all store queries to this conversation
+        kwargs.setdefault("conversation_id", self.config.conversation_id)
+
         # Save original params before verb expansion mutates kwargs
         orig_verb = kwargs.get("verb")
         orig_subject = kwargs.get("subject")
@@ -2147,6 +2154,7 @@ class VirtualContextEngine:
                     subject=orig_subject,
                     tags=list(seed_tags),
                     limit=50,
+                    conversation_id=self.config.conversation_id,
                 )
                 new_siblings = [s for s in siblings if s.id not in result_ids]
                 if new_siblings:
@@ -2254,7 +2262,7 @@ class VirtualContextEngine:
         embeddings miss.  Returns list of matching verbs (including original)
         if expansions found, None if no expansions.
         """
-        all_verbs = self._store.get_unique_fact_verbs()
+        all_verbs = self._store.get_unique_fact_verbs(conversation_id=self.config.conversation_id)
         if not all_verbs:
             return None
         all_verbs_lower = {v.lower(): v for v in all_verbs}
@@ -2343,7 +2351,7 @@ class VirtualContextEngine:
             query_str = " ".join(parts)
 
         # Broad candidate set: all facts for this subject (no verb/object filter)
-        cand_kwargs: dict = {"limit": 200}
+        cand_kwargs: dict = {"limit": 200, "conversation_id": self.config.conversation_id}
         if subject:
             cand_kwargs["subject"] = subject
         candidates = self._store.query_facts(**cand_kwargs)
