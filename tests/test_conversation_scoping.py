@@ -228,6 +228,7 @@ from conftest import MockTagGenerator
 
 
 class TestEndToEndScoping:
+    @pytest.mark.regression("BUG-035")
     def test_new_conversation_gets_no_context_from_other(self, tmp_path):
         """Conversation B should not get context from conversation A's segments."""
         store = SQLiteStore(db_path=str(tmp_path / "shared.db"))

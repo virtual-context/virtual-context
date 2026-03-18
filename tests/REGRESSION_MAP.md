@@ -364,6 +364,16 @@ Use `pytest -m regression` to run all regression tests.
   - `test_proxy.py::TestComputeEffectiveBudget::test_compute_effective_budget_auto_promotes`
   - `test_proxy.py::TestTurnTagIndexHashLookup::test_turn_tag_index_hash_lookup`
 
+### BUG-035 — Cross-conversation context leakage in shared stores
+
+- **Symptom**: New conversations get context injected from other conversations via shared store. A cron conversation about "oura data fetch" gets segments about crochet, Bridgerton, and makeup.
+- **Root cause**: Retriever and store retrieval methods had no `conversation_id` filtering. All store methods searched the entire DB, not scoped to the current conversation.
+- **Fix**: Added `conversation_id: str | None = None` to all retrieval methods in the ABC, all 3 store implementations (SQLite, Postgres, Filesystem), and threaded it through retriever, quote_search, tool_loop, and engine.
+- **Tests**:
+  - `test_conversation_scoping.py::TestEndToEndScoping::test_new_conversation_gets_no_context_from_other`
+  - `test_conversation_scoping.py::TestEndToEndScoping::test_find_quote_scoped_no_cross_conversation_leaks`
+  - `test_conversation_scoping.py::TestEndToEndScoping::test_alias_ride_along_scoped`
+
 ---
 
 ## By Test File
@@ -386,3 +396,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_find_quote.py` | BUG-029, BUG-031 |
 | `test_verb_expansion.py` | BUG-032 |
 | `test_engine_integration.py` | BUG-034 |
+| `test_conversation_scoping.py` | BUG-035 |
