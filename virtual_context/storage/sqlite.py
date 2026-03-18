@@ -932,13 +932,25 @@ class SQLiteStore(ContextStore):
         return cursor.rowcount > 0
 
     def delete_conversation(self, conversation_id: str) -> int:
-        """Delete all segments for a given conversation_id. Returns count deleted."""
+        """Delete all segments and engine state for a conversation. Returns segment count deleted."""
         conn = self._get_conn()
         cursor = conn.execute(
             "DELETE FROM segments WHERE conversation_id = ?", (conversation_id,),
         )
+        deleted = cursor.rowcount
+        # Also clear persisted engine state so lossless restart doesn't
+        # restore a stale _compacted_through watermark.
+        conn.execute(
+            "DELETE FROM engine_state WHERE conversation_id = ?", (conversation_id,),
+        )
+        conn.execute(
+            "DELETE FROM facts WHERE conversation_id = ?", (conversation_id,),
+        )
+        conn.execute(
+            "DELETE FROM turn_messages WHERE conversation_id = ?", (conversation_id,),
+        )
         conn.commit()
-        return cursor.rowcount
+        return deleted
 
     def cleanup(
         self,
