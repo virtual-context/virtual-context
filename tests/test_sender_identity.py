@@ -106,3 +106,68 @@ class TestExtractEnvelopeMetadata:
         stripped, meta = _extract_envelope_metadata(text)
         assert "reply context" in meta
         assert meta["reply context"]["sender_label"] == "Bast"
+
+
+class TestExtractMessageTextWithMeta:
+    def test_anthropic_format_extracts_metadata(self):
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        msg = {
+            "role": "user",
+            "content": (
+                'Sender (untrusted metadata):\n'
+                '```json\n'
+                '{"name": "Sania"}\n'
+                '```\n'
+                'What about charlotte tilbury'
+            ),
+        }
+        text, meta = fmt.extract_message_text_with_meta(msg)
+        assert "charlotte tilbury" in text
+        assert meta.get("sender", {}).get("name") == "Sania"
+
+    def test_no_metadata_returns_empty_dict(self):
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        msg = {"role": "user", "content": "plain message"}
+        text, meta = fmt.extract_message_text_with_meta(msg)
+        assert text == "plain message"
+        assert meta == {}
+
+
+class TestHistoryPairsMetadata:
+    def test_anthropic_history_pairs_have_metadata(self):
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        'Sender (untrusted metadata):\n'
+                        '```json\n'
+                        '{"name": "Sania"}\n'
+                        '```\n'
+                        'Hello'
+                    ),
+                },
+                {"role": "assistant", "content": "Hi there"},
+            ]
+        }
+        pairs = fmt.extract_history_pairs(body)
+        assert len(pairs) == 2
+        assert pairs[0].metadata is not None
+        assert pairs[0].metadata.get("sender", {}).get("name") == "Sania"
+        assert pairs[1].metadata is None
+
+    def test_user_message_without_metadata_gets_none_or_empty(self):
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        body = {
+            "messages": [
+                {"role": "user", "content": "plain message"},
+                {"role": "assistant", "content": "response"},
+            ]
+        }
+        pairs = fmt.extract_history_pairs(body)
+        assert pairs[0].metadata is None or pairs[0].metadata == {}

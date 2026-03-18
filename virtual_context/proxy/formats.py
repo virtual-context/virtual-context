@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 
 from ._envelope import (  # noqa: E402
     _VC_CONVERSATION_RE,
+    _extract_envelope_metadata,
     _last_text_block,
     _strip_envelope,
 )
@@ -308,6 +309,16 @@ class AnthropicFormat(PayloadFormat):
             return _strip_envelope(_last_text_block(content))
         return ""
 
+    def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
+        """Extract message text and envelope metadata."""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return _extract_envelope_metadata(content)
+        if isinstance(content, list):
+            text = _last_text_block(content)
+            return _extract_envelope_metadata(text)
+        return "", {}
+
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message
 
@@ -325,9 +336,11 @@ class AnthropicFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 pairs.append(Message(
                     role="user",
-                    content=self.extract_message_text(chat_msgs[i]),
+                    content=text,
+                    metadata=meta or None,
                 ))
                 pairs.append(Message(
                     role="assistant",
@@ -542,6 +555,16 @@ class OpenAIFormat(PayloadFormat):
             return _strip_envelope(_last_text_block(content))
         return ""
 
+    def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
+        """Extract message text and envelope metadata."""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return _extract_envelope_metadata(content)
+        if isinstance(content, list):
+            text = _last_text_block(content)
+            return _extract_envelope_metadata(text)
+        return "", {}
+
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message
 
@@ -559,9 +582,11 @@ class OpenAIFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 pairs.append(Message(
                     role="user",
-                    content=self.extract_message_text(chat_msgs[i]),
+                    content=text,
+                    metadata=meta or None,
                 ))
                 pairs.append(Message(
                     role="assistant",
@@ -768,6 +793,12 @@ class GeminiFormat(PayloadFormat):
         text = self._extract_text_from_parts(parts)
         return _strip_envelope(text)
 
+    def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
+        """Extract message text and envelope metadata."""
+        parts = msg.get("parts", [])
+        text = self._extract_text_from_parts(parts)
+        return _extract_envelope_metadata(text)
+
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message
 
@@ -785,9 +816,11 @@ class GeminiFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "model"):
+                text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 pairs.append(Message(
                     role="user",
-                    content=self.extract_message_text(chat_msgs[i]),
+                    content=text,
+                    metadata=meta or None,
                 ))
                 pairs.append(Message(
                     role="assistant",
@@ -1099,6 +1132,12 @@ class OpenAIResponsesFormat(PayloadFormat):
         text = self._extract_text_from_content(content)
         return _strip_envelope(text)
 
+    def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
+        """Extract message text and envelope metadata."""
+        content = msg.get("content", "")
+        text = self._extract_text_from_content(content)
+        return _extract_envelope_metadata(text)
+
     def extract_history_pairs(self, body: dict) -> list:
         from ..types import Message
 
@@ -1124,9 +1163,11 @@ class OpenAIResponsesFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 pairs.append(Message(
                     role="user",
-                    content=self.extract_message_text(chat_msgs[i]),
+                    content=text,
+                    metadata=meta or None,
                 ))
                 pairs.append(Message(
                     role="assistant",
