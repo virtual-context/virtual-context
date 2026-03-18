@@ -86,8 +86,12 @@ class ContextStore(ABC):
         """Retrieve a tag summary by tag name. None if not found."""
 
     @abstractmethod
-    def get_all_tag_summaries(self) -> list[TagSummary]:
-        """Retrieve all tag summaries, ordered by tag name."""
+    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
+        """Retrieve all tag summaries, ordered by tag name.
+
+        If *conversation_id* is given, only return tag summaries whose
+        source segments belong to that conversation.
+        """
 
     @abstractmethod
     def search_full_text(

@@ -1391,7 +1391,9 @@ class VirtualContextEngine:
         if getattr(self, "_compacted_through", 0) == 0:
             return ""
 
-        tag_summaries = self._store.get_all_tag_summaries()
+        tag_summaries = self._store.get_all_tag_summaries(
+            conversation_id=self.config.conversation_id,
+        )
         if not tag_summaries:
             return ""
 
@@ -1833,7 +1835,9 @@ class VirtualContextEngine:
 
     def recall_all(self) -> dict:
         """Load all tag summaries. Used by vc_recall_all tool."""
-        tag_summaries = self._store.get_all_tag_summaries()
+        tag_summaries = self._store.get_all_tag_summaries(
+            conversation_id=self.config.conversation_id,
+        )
         if not tag_summaries:
             return {"found": False, "message": "No stored summaries yet."}
         budget = self.config.assembler.tag_context_max_tokens
@@ -2470,17 +2474,19 @@ class VirtualContextEngine:
             if hasattr(self._store, "_get_conn"):
                 db = self._store._get_conn()
             if db is not None:
-                rows = db.execute(
-                    """SELECT subject, verb, object, status, fact_type, what,
+                sql = """SELECT subject, verb, object, status, fact_type, what,
                               when_date, session_date, "where"
                        FROM facts
                        WHERE fact_type = 'experience'
                          AND status = 'completed'
-                         AND session_date >= ? AND session_date <= ?
-                       ORDER BY session_date ASC
-                       LIMIT ?""",
-                    (start_str, end_str + "~", max_results * 5),
-                ).fetchall()
+                         AND session_date >= ? AND session_date <= ?"""
+                params: list = [start_str, end_str + "~"]
+                if self.config.conversation_id:
+                    sql += " AND conversation_id = ?"
+                    params.append(self.config.conversation_id)
+                sql += " ORDER BY session_date ASC LIMIT ?"
+                params.append(max_results * 5)
+                rows = db.execute(sql, params).fetchall()
                 for r in rows:
                     when_str = r[6] or r[7] or ""
                     fact_results.append({

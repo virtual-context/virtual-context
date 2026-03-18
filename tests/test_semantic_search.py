@@ -239,7 +239,9 @@ class TestFindQuoteSemanticFallback:
         # FTS finds 1 result, max_results=5, so semantic runs for remaining 4
         result = engine.find_quote("arrived", max_results=5)
         assert result["found"] is True
-        engine._semantic.semantic_search.assert_called_once_with("arrived", max_results=4)
+        engine._semantic.semantic_search.assert_called_once_with(
+            "arrived", max_results=4, conversation_id=engine.config.conversation_id,
+        )
 
     def test_semantic_fallback_on_fts_miss(self, tmp_path):
         """FTS misses vocabulary mismatch, semantic finds it."""

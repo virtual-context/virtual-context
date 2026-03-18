@@ -1005,11 +1005,31 @@ class SQLiteStore(ContextStore):
             updated_at=_str_to_dt(row["updated_at"]),
         )
 
-    def get_all_tag_summaries(self) -> list[TagSummary]:
+    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM tag_summaries ORDER BY tag"
-        ).fetchall()
+        if conversation_id is not None:
+            # Exclude tag summaries only when ALL source segments resolve to
+            # a different conversation.  Include when:
+            # 1. source_segment_refs is empty (legacy/manual), OR
+            # 2. At least one source segment belongs to this conversation, OR
+            # 3. Source refs don't resolve to any segment (dangling refs).
+            rows = conn.execute(
+                """SELECT ts.* FROM tag_summaries ts
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM segments s, json_each(ts.source_segment_refs) je
+                       WHERE s.ref = je.value AND s.conversation_id != ?
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM segments s, json_each(ts.source_segment_refs) je
+                       WHERE s.ref = je.value AND s.conversation_id = ?
+                   )
+                   ORDER BY ts.tag""",
+                (conversation_id, conversation_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tag_summaries ORDER BY tag"
+            ).fetchall()
         results: list[TagSummary] = []
         for row in rows:
             desc = ""

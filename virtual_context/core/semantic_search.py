@@ -151,7 +151,10 @@ class SemanticSearchManager:
         self._store.store_chunk_embeddings(stored.ref, chunk_embeddings)
         logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
 
-    def semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
+    def semantic_search(
+        self, query: str, max_results: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
@@ -159,7 +162,7 @@ class SemanticSearchManager:
         all_chunks = self._store.get_all_chunk_embeddings()
         if not all_chunks:
             # Lazy backfill: embed all existing segments if chunks table is empty
-            all_chunks = self.backfill_chunk_embeddings()
+            all_chunks = self.backfill_chunk_embeddings(conversation_id=conversation_id)
             if not all_chunks:
                 return []
 
@@ -185,13 +188,17 @@ class SemanticSearchManager:
             if chunk.segment_ref in seen_refs:
                 continue
             seen_refs.add(chunk.segment_ref)
-            # Look up segment tags and metadata
-            seg = self._store.get_segment(chunk.segment_ref)
+            # Look up segment tags and metadata; conversation_id filter
+            # naturally excludes chunks from other conversations (get_segment
+            # returns None for non-matching conversation).
+            seg = self._store.get_segment(chunk.segment_ref, conversation_id=conversation_id)
+            if seg is None:
+                continue
             results.append(QuoteResult(
                 text=chunk.text,
-                tag=seg.primary_tag if seg else "",
+                tag=seg.primary_tag,
                 segment_ref=chunk.segment_ref,
-                tags=seg.tags if seg else [],
+                tags=seg.tags,
                 match_type="semantic",
                 similarity=round(sim, 3),
                 session_date=seg.metadata.session_date if seg else "",
@@ -201,19 +208,23 @@ class SemanticSearchManager:
 
         return results
 
-    def backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
+    def backfill_chunk_embeddings(
+        self, conversation_id: str | None = None,
+    ) -> list[ChunkEmbedding]:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
 
-        all_tags = self._store.get_all_tags()
+        all_tags = self._store.get_all_tags(conversation_id=conversation_id)
         if not all_tags:
             return []
 
         logger.info("Backfilling chunk embeddings for semantic search...")
         all_chunks: list[ChunkEmbedding] = []
         for tag_stat in all_tags:
-            segments = self._store.get_segments_by_tags([tag_stat.tag], limit=100)
+            segments = self._store.get_segments_by_tags(
+                [tag_stat.tag], limit=100, conversation_id=conversation_id,
+            )
             for seg in segments:
                 chunks = chunk_segment_text(seg.full_text)
                 if not chunks:
