@@ -16,11 +16,11 @@ class ContextStore(ABC):
         """Store a segment. Idempotent on ref (upsert). Returns ref."""
 
     @abstractmethod
-    def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         """Retrieve full segment by ref. None if not found."""
 
     @abstractmethod
-    def get_summary(self, ref: str) -> StoredSummary | None:
+    def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None:
         """Retrieve lightweight summary by ref. None if not found."""
 
     @abstractmethod
@@ -31,6 +31,7 @@ class ContextStore(ABC):
         limit: int = 10,
         before: datetime | None = None,
         after: datetime | None = None,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         """Retrieve summaries matching tags by overlap count, newest first."""
 
@@ -40,6 +41,7 @@ class ContextStore(ABC):
         query: str,
         tags: list[str] | None = None,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         """Search summaries by keyword. Ordered by relevance."""
 
@@ -92,6 +94,7 @@ class ContextStore(ABC):
         self,
         query: str,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[QuoteResult]:
         """Search full_text across all segments.
 
@@ -104,6 +107,7 @@ class ContextStore(ABC):
         tags: list[str],
         min_overlap: int = 1,
         limit: int = 20,
+        conversation_id: str | None = None,
     ) -> list[StoredSegment]:
         """Retrieve full segments (including full_text) matching tags by overlap."""
 
@@ -206,11 +210,12 @@ class ContextStore(ABC):
         fact_type: str | None = None,
         tags: list[str] | None = None,
         limit: int = 50,
+        conversation_id: str | None = None,
     ) -> list[Fact]:
         """Query facts by structured filters."""
         return []
 
-    def get_unique_fact_verbs(self) -> list[str]:
+    def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
         """Return all distinct non-empty verbs from non-superseded facts."""
         return []
 
@@ -218,7 +223,7 @@ class ContextStore(ABC):
         """Get all facts extracted from a given segment."""
         return []
 
-    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
+    def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact fields. Returns non-superseded facts."""
         return []
 
@@ -232,7 +237,7 @@ class ContextStore(ABC):
         """Update structured fields on a fact (used after supersession merge)."""
         pass
 
-    def get_fact_count_by_tags(self) -> dict[str, int]:
+    def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         """Return {tag: fact_count} for context hint annotations."""
         return {}
 
@@ -257,6 +262,7 @@ class ContextStore(ABC):
         self,
         query: str,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list:
         """Search indexed tool outputs by FTS. Returns list of QuoteResult."""
         return []
