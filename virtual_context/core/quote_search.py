@@ -243,7 +243,7 @@ def supplement_from_descriptions(
     word_patterns = [re.compile(rf"\b{re.escape(w)}\b") for w in query_words]
 
     # Score each tag description by how many query words it contains
-    all_summaries = store.get_all_tag_summaries()
+    all_summaries = store.get_all_tag_summaries(conversation_id=conversation_id)
     candidates: list[tuple[str, int, str]] = []  # (tag, score, description)
     for ts in all_summaries:
         if ts.tag in covered_tags:
@@ -330,7 +330,9 @@ def find_quote(
     # different excerpts from the same segment FTS already found.
     remaining = max_results - len(results)
     if remaining > 0:
-        semantic_results = semantic.semantic_search(query, max_results=remaining)
+        semantic_results = semantic.semantic_search(
+            query, max_results=remaining, conversation_id=conversation_id,
+        )
         results.extend(semantic_results)
 
     # ---- Description-aware search ----

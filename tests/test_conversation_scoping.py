@@ -23,6 +23,7 @@ class TestABCSignatures:
         "get_fact_count_by_tags",
         "get_unique_fact_verbs",
         "get_all_tags",
+        "get_all_tag_summaries",
     ]
 
     @pytest.mark.parametrize("method_name", SCOPED_METHODS)
@@ -313,3 +314,171 @@ class TestEndToEndScoping:
         assert "b-food" not in refs, (
             f"Alias ride-along leaked cross-conversation ref: {refs}"
         )
+
+
+from virtual_context.types import TagSummary
+
+
+class TestScopingGapFixes:
+    """Tests for the four conversation_id scoping gaps."""
+
+    def test_composite_store_get_summary_forwards_conversation_id(self, tmp_path):
+        """CompositeStore.get_summary() should respect conversation_id."""
+        store = _make_two_conversation_store(tmp_path)
+        from virtual_context.core.composite_store import CompositeStore
+
+        comp = CompositeStore(
+            segments=store, facts=store, fact_links=store,
+            state=store, search=store,
+        )
+        # conv-b-1 exists but should be invisible when scoped to conv-a
+        result = comp.get_summary("conv-b-1", conversation_id="conv-a")
+        assert result is None, "get_summary should return None for wrong conversation"
+        # conv-a-1 should be visible when scoped to conv-a
+        result = comp.get_summary("conv-a-1", conversation_id="conv-a")
+        assert result is not None
+
+    def test_get_all_tag_summaries_scoped(self, tmp_path):
+        """Tag summaries should be scoped when conversation_id is provided."""
+        store = SQLiteStore(db_path=str(tmp_path / "ts.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50, full_text="text",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.store_segment(StoredSegment(
+            ref="a-1", conversation_id="conv-a",
+            primary_tag="cooking", tags=["cooking"],
+            summary="Conv-A cooking.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="b-1", conversation_id="conv-b",
+            primary_tag="fitness", tags=["fitness"],
+            summary="Conv-B fitness.", **base,
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="cooking", summary="Cooking stuff.",
+            summary_tokens=5, source_segment_refs=["a-1"],
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="fitness", summary="Fitness stuff.",
+            summary_tokens=5, source_segment_refs=["b-1"],
+        ))
+        # Scoped to conv-a: should only see cooking
+        summaries = store.get_all_tag_summaries(conversation_id="conv-a")
+        tags = [ts.tag for ts in summaries]
+        assert "cooking" in tags
+        assert "fitness" not in tags
+
+    def test_get_all_tag_summaries_unscoped_returns_all(self, tmp_path):
+        """Without conversation_id, all tag summaries should be returned."""
+        store = SQLiteStore(db_path=str(tmp_path / "ts2.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50, full_text="text",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.store_segment(StoredSegment(
+            ref="a-1", conversation_id="conv-a",
+            primary_tag="cooking", tags=["cooking"],
+            summary="Conv-A cooking.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="b-1", conversation_id="conv-b",
+            primary_tag="fitness", tags=["fitness"],
+            summary="Conv-B fitness.", **base,
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="cooking", summary="Cooking stuff.",
+            summary_tokens=5, source_segment_refs=["a-1"],
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="fitness", summary="Fitness stuff.",
+            summary_tokens=5, source_segment_refs=["b-1"],
+        ))
+        summaries = store.get_all_tag_summaries()
+        tags = [ts.tag for ts in summaries]
+        assert "cooking" in tags
+        assert "fitness" in tags
+
+    def test_composite_store_get_all_tag_summaries_forwards(self, tmp_path):
+        """CompositeStore.get_all_tag_summaries() should forward conversation_id."""
+        store = SQLiteStore(db_path=str(tmp_path / "comp_ts.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50, full_text="text",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.store_segment(StoredSegment(
+            ref="a-1", conversation_id="conv-a",
+            primary_tag="cooking", tags=["cooking"],
+            summary="Conv-A cooking.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="b-1", conversation_id="conv-b",
+            primary_tag="fitness", tags=["fitness"],
+            summary="Conv-B fitness.", **base,
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="cooking", summary="Cooking stuff.",
+            summary_tokens=5, source_segment_refs=["a-1"],
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="fitness", summary="Fitness stuff.",
+            summary_tokens=5, source_segment_refs=["b-1"],
+        ))
+        from virtual_context.core.composite_store import CompositeStore
+
+        comp = CompositeStore(
+            segments=store, facts=store, fact_links=store,
+            state=store, search=store,
+        )
+        summaries = comp.get_all_tag_summaries(conversation_id="conv-a")
+        tags = [ts.tag for ts in summaries]
+        assert "cooking" in tags
+        assert "fitness" not in tags
+
+    def test_supplement_from_descriptions_scoped(self, tmp_path):
+        """supplement_from_descriptions should only scan tag summaries for target conversation."""
+        store = SQLiteStore(db_path=str(tmp_path / "desc.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50,
+            full_text="chocolate cake recipe details here",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.store_segment(StoredSegment(
+            ref="a-1", conversation_id="conv-a",
+            primary_tag="baking", tags=["baking"],
+            summary="Conv-A baking.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="b-1", conversation_id="conv-b",
+            primary_tag="woodworking", tags=["woodworking"],
+            summary="Conv-B woodworking.",
+            full_text="building a chocolate colored desk",
+            summary_tokens=10, full_tokens=50,
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="baking", summary="Baking.",
+            description="chocolate cake baking",
+            summary_tokens=5, source_segment_refs=["a-1"],
+        ))
+        store.save_tag_summary(TagSummary(
+            tag="woodworking", summary="Woodworking.",
+            description="chocolate colored desk project",
+            summary_tokens=5, source_segment_refs=["b-1"],
+        ))
+        from virtual_context.core.quote_search import supplement_from_descriptions
+
+        results = supplement_from_descriptions(
+            store, "chocolate", [], max_results=5, conversation_id="conv-a",
+        )
+        tags = [r.tag for r in results]
+        assert "woodworking" not in tags

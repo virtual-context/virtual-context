@@ -75,7 +75,7 @@ class ContextRetriever:
         Returns ``(selected_summaries, total_tokens)``.  Used by the
         post-compaction summary floor.
         """
-        tag_summaries = self.store.get_all_tag_summaries()
+        tag_summaries = self.store.get_all_tag_summaries(conversation_id=self._conversation_id)
         if not tag_summaries:
             return [], 0
 

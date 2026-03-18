@@ -524,15 +524,30 @@ class FilesystemStore(ContextStore):
             updated_at=_str_to_dt(data["updated_at"]) if "updated_at" in data else datetime.now(timezone.utc),
         )
 
-    def get_all_tag_summaries(self) -> list[TagSummary]:
+    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         ts_dir = self.root / "_tag_summaries"
         if not ts_dir.is_dir():
             return []
         results: list[TagSummary] = []
         for path in sorted(ts_dir.glob("*.json")):
             ts = self.get_tag_summary(path.stem)
-            if ts:
-                results.append(ts)
+            if ts is None:
+                continue
+            if conversation_id is not None and ts.source_segment_refs:
+                # Exclude only when ALL resolved source segments belong to
+                # a different conversation.  Unresolvable refs (not in index)
+                # are treated as neutral — they don't exclude.
+                resolved = [
+                    self._index[ref]
+                    for ref in ts.source_segment_refs
+                    if ref in self._index
+                ]
+                if resolved and not any(
+                    entry.get("conversation_id", "") == conversation_id
+                    for entry in resolved
+                ):
+                    continue
+            results.append(ts)
         return results
 
     def get_segments_by_tags(

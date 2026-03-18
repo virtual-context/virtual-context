@@ -57,8 +57,8 @@ class CompositeStore:
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         return self._segments.get_segment(ref, conversation_id=conversation_id)
 
-    def get_summary(self, ref: str) -> StoredSummary | None:
-        return self._segments.get_summary(ref)
+    def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None:
+        return self._segments.get_summary(ref, conversation_id=conversation_id)
 
     def get_summaries_by_tags(
         self,
@@ -108,8 +108,8 @@ class CompositeStore:
     def get_tag_summary(self, tag: str) -> TagSummary | None:
         return self._segments.get_tag_summary(tag)
 
-    def get_all_tag_summaries(self) -> list[TagSummary]:
-        return self._segments.get_all_tag_summaries()
+    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
+        return self._segments.get_all_tag_summaries(conversation_id=conversation_id)
 
     def get_segments_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 20,
