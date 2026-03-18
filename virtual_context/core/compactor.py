@@ -102,6 +102,9 @@ Always preserve the user's role and relationship to the topic — phrases like
 critical personal context. Never paraphrase these into passive voice or drop them
 in favor of technical details.
 
+When speakers are identified by name in the conversation (e.g. "Alice (14:30):"), always use their
+actual name in the summary. Never replace a named speaker with "User" or "the user".
+
 Be concise but retain enough detail that the conversation could be resumed from this summary.
 The summary should be {target_tokens} tokens or fewer.
 
