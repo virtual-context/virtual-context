@@ -50,10 +50,11 @@ def _make_segment(
     tags: list[str] | None = None,
     summary: str = "Discussed supplements",
     full_text: str = "User asked about magnesium glycinate 400mg for sleep. Assistant recommended taking it before bed.",
+    conversation_id: str = "session-1",
 ) -> StoredSegment:
     return StoredSegment(
         ref=ref,
-        conversation_id="session-1",
+        conversation_id=conversation_id,
         primary_tag=primary_tag,
         tags=tags or [primary_tag],
         summary=summary,
@@ -263,7 +264,7 @@ class TestFilesystemSearchFullText:
 class TestEngineFindQuote:
     def test_find_quote_hit(self, tmp_path):
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment(tags=["health", "supplements"]))
+        engine._store.store_segment(_make_segment(tags=["health", "supplements"], conversation_id=engine.config.conversation_id))
 
         result = engine.find_quote("magnesium glycinate")
         assert result["found"] is True
@@ -274,7 +275,7 @@ class TestEngineFindQuote:
 
     def test_find_quote_miss(self, tmp_path):
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         result = engine.find_quote("nonexistent xyz")
         assert result["found"] is False
@@ -294,7 +295,7 @@ class TestEngineFindQuote:
     def test_find_quote_works_without_paging_enabled(self, tmp_path):
         """find_quote works even when paging is disabled."""
         engine = _make_engine(tmp_path, paging_enabled=False)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         result = engine.find_quote("magnesium")
         assert result["found"] is True
@@ -302,7 +303,7 @@ class TestEngineFindQuote:
     def test_find_quote_works_with_paging_enabled(self, tmp_path):
         """find_quote also works when paging is enabled."""
         engine = _make_engine(tmp_path, paging_enabled=True)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         result = engine.find_quote("magnesium")
         assert result["found"] is True
@@ -316,6 +317,7 @@ class TestEngineFindQuote:
             primary_tag="ai-memory-systems",
             tags=["ai-memory-systems"],
             full_text="magnesium glycinate 400mg recommended for sleep quality",
+            conversation_id=engine.config.conversation_id,
         ))
 
         result = engine.find_quote("magnesium glycinate")

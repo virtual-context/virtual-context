@@ -362,7 +362,7 @@ def _attach_related_facts(
 
     try:
         _sf_limit = engine.config.search.search_facts_max_results
-        facts = engine._store.search_facts(query=query, limit=_sf_limit)
+        facts = engine._store.search_facts(query=query, limit=_sf_limit, conversation_id=engine.config.conversation_id)
     except Exception:
         return result
 
@@ -446,7 +446,7 @@ def _attach_related_facts(
             if not f.segment_ref or f.segment_ref in seen_refs:
                 continue
             seen_refs.add(f.segment_ref)
-            seg = engine._store.get_segment(f.segment_ref)
+            seg = engine._store.get_segment(f.segment_ref, conversation_id=engine.config.conversation_id)
             if not seg or not seg.full_text:
                 continue
             # Derive session label from segment metadata

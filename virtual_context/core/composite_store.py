@@ -54,8 +54,8 @@ class CompositeStore:
     def store_segment(self, segment: StoredSegment) -> str:
         return self._segments.store_segment(segment)
 
-    def get_segment(self, ref: str) -> StoredSegment | None:
-        return self._segments.get_segment(ref)
+    def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
+        return self._segments.get_segment(ref, conversation_id=conversation_id)
 
     def get_summary(self, ref: str) -> StoredSummary | None:
         return self._segments.get_summary(ref)
@@ -67,15 +67,18 @@ class CompositeStore:
         limit: int = 10,
         before=None,
         after=None,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         return self._segments.get_summaries_by_tags(
             tags, min_overlap=min_overlap, limit=limit, before=before, after=after,
+            conversation_id=conversation_id,
         )
 
     def search(
         self, query: str, tags: list[str] | None = None, limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
-        return self._segments.search(query, tags=tags, limit=limit)
+        return self._segments.search(query, tags=tags, limit=limit, conversation_id=conversation_id)
 
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         return self._segments.get_all_tags(conversation_id=conversation_id)
@@ -110,8 +113,9 @@ class CompositeStore:
 
     def get_segments_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 20,
+        conversation_id: str | None = None,
     ) -> list[StoredSegment]:
-        return self._segments.get_segments_by_tags(tags, min_overlap=min_overlap, limit=limit)
+        return self._segments.get_segments_by_tags(tags, min_overlap=min_overlap, limit=limit, conversation_id=conversation_id)
 
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
         return self._segments.get_orphan_tag_snippets(limit=limit)
@@ -146,14 +150,14 @@ class CompositeStore:
     def query_facts(self, **kwargs) -> list[Fact]:
         return self._facts.query_facts(**kwargs)
 
-    def get_unique_fact_verbs(self) -> list[str]:
-        return self._facts.get_unique_fact_verbs()
+    def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
+        return self._facts.get_unique_fact_verbs(conversation_id=conversation_id)
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return self._facts.get_facts_by_segment(segment_ref)
 
-    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
-        return self._facts.search_facts(query, limit=limit)
+    def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
+        return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
 
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
         return self._facts.set_fact_superseded(old_fact_id, new_fact_id)
@@ -163,8 +167,8 @@ class CompositeStore:
     ) -> None:
         return self._facts.update_fact_fields(fact_id, verb, object, status, what)
 
-    def get_fact_count_by_tags(self) -> dict[str, int]:
-        return self._facts.get_fact_count_by_tags()
+    def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
+        return self._facts.get_fact_count_by_tags(conversation_id=conversation_id)
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
         return self._facts.get_superseded_facts(fact_ids)
@@ -230,8 +234,8 @@ class CompositeStore:
             ref, conversation_id, tool_name, command, turn, content, original_bytes,
         )
 
-    def search_tool_outputs(self, query: str, limit: int = 5) -> list:
-        return self._search.search_tool_outputs(query, limit=limit)
+    def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list:
+        return self._search.search_tool_outputs(query, limit=limit, conversation_id=conversation_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
