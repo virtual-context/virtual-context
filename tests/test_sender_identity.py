@@ -227,3 +227,40 @@ class TestTurnTagEntrySender:
         loaded = store.load_engine_state("test-conv")
         assert loaded is not None
         assert loaded.turn_tag_entries[0].sender == ""
+
+
+class TestEndToEndSenderIdentity:
+    def test_format_conversation_with_real_envelope(self):
+        """Full pipeline: envelope with sender -> compactor sees real name."""
+        from virtual_context.proxy._envelope import _extract_envelope_metadata
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig, get_sender_name
+
+        raw_text = (
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{"label": "Sania (7281617716)", "name": "Sania"}\n'
+            '```\n'
+            'What about charlotte tilbury wonder skin'
+        )
+        stripped, meta = _extract_envelope_metadata(raw_text)
+        msg = Message(role="user", content=stripped, metadata=meta)
+        asst = Message(role="assistant", content="The wonder skin is great!")
+
+        compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
+        formatted = compactor._format_conversation([msg, asst])
+        assert "Sania" in formatted
+        assert "User:" not in formatted
+        assert "charlotte tilbury" in formatted
+        assert get_sender_name(meta) == "Sania"
+
+    def test_no_metadata_falls_back_to_role(self):
+        """Without metadata, compactor uses role as label."""
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig
+
+        msg = Message(role="user", content="Hello")
+        asst = Message(role="assistant", content="Hi")
+        compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
+        formatted = compactor._format_conversation([msg, asst])
+        assert "User:" in formatted or "User (" in formatted

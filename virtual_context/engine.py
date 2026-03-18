@@ -50,6 +50,7 @@ from .types import (
     TurnTagEntry,
     VirtualContextConfig,
     WorkingSetEntry,
+    get_sender_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -864,6 +865,7 @@ class VirtualContextEngine:
         # Tag the latest round trip
         _t_tag = time.monotonic()
         latest_pair = self._get_latest_turn_pair(conversation_history)
+        sender = get_sender_name(latest_pair[0].metadata) if latest_pair else ""
         if latest_pair:
             combined_text = " ".join(m.content for m in latest_pair)
 
@@ -876,6 +878,7 @@ class VirtualContextEngine:
                     message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                     tags=[tag_name],
                     primary_tag=tag_name,
+                    sender=sender or "",
                     session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
                 ))
                 latest_pair = None  # skip normal tagger flow below
@@ -921,6 +924,7 @@ class VirtualContextEngine:
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
                 fact_signals=tag_result.fact_signals,
+                sender=sender or "",
                 session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             ))
 
@@ -1608,6 +1612,8 @@ class VirtualContextEngine:
             user_msg = history_pairs[i]
             asst_msg = history_pairs[i + 1]
 
+            sender = get_sender_name(user_msg.metadata) if user_msg.metadata else ""
+
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn([user_msg, asst_msg]):
                 self._tool_tag_counter += 1
@@ -1619,6 +1625,7 @@ class VirtualContextEngine:
                     ).hexdigest()[:16],
                     tags=[tag_name],
                     primary_tag=tag_name,
+                    sender=sender or "",
                     session_date=running_session_date,
                 )
                 self._turn_tag_index.append(entry)
@@ -1708,6 +1715,7 @@ class VirtualContextEngine:
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
+                sender=sender or "",
                 session_date=running_session_date,
             )
             self._turn_tag_index.append(entry)
