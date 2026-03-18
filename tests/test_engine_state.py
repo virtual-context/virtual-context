@@ -190,8 +190,21 @@ class TestEngineStateIntegration:
             ))
         engine1._compacted_through = 4
 
+        # Store a segment so watermark validation passes on reload
+        from virtual_context.types import Message, StoredSegment, SegmentMetadata
+        from datetime import datetime, timezone
+        engine1._store.store_segment(StoredSegment(
+            ref="seg-0", conversation_id=conversation_id,
+            primary_tag="tag-0", tags=["tag-0"],
+            summary="Test segment", summary_tokens=5,
+            full_text="test", full_tokens=2,
+            metadata=SegmentMetadata(),
+            created_at=datetime.now(timezone.utc),
+            start_timestamp=datetime.now(timezone.utc),
+            end_timestamp=datetime.now(timezone.utc),
+        ))
+
         # Save state
-        from virtual_context.types import Message
         history = [Message(role="user", content="x"), Message(role="assistant", content="y")] * 5
         engine1._save_state(history)
         engine1._store.close()
