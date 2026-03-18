@@ -28,6 +28,7 @@ from ._envelope import (  # noqa: E402
     _extract_envelope_metadata,
     _last_text_block,
     _strip_envelope,
+    extract_timestamp_from_metadata,
 )
 
 
@@ -337,14 +338,17 @@ class AnthropicFormat(PayloadFormat):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
+                ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
                     role="user",
                     content=text,
                     metadata=meta or None,
+                    timestamp=ts,
                 ))
                 pairs.append(Message(
                     role="assistant",
                     content=self.extract_message_text(chat_msgs[i + 1]),
+                    timestamp=ts,
                 ))
                 i += 2
             else:
@@ -583,14 +587,17 @@ class OpenAIFormat(PayloadFormat):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
+                ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
                     role="user",
                     content=text,
                     metadata=meta or None,
+                    timestamp=ts,
                 ))
                 pairs.append(Message(
                     role="assistant",
                     content=self.extract_message_text(chat_msgs[i + 1]),
+                    timestamp=ts,
                 ))
                 i += 2
             else:
@@ -817,14 +824,17 @@ class GeminiFormat(PayloadFormat):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "model"):
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
+                ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
                     role="user",
                     content=text,
                     metadata=meta or None,
+                    timestamp=ts,
                 ))
                 pairs.append(Message(
                     role="assistant",
                     content=self.extract_message_text(chat_msgs[i + 1]),
+                    timestamp=ts,
                 ))
                 i += 2
             else:
@@ -1164,14 +1174,17 @@ class OpenAIResponsesFormat(PayloadFormat):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
+                ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
                     role="user",
                     content=text,
                     metadata=meta or None,
+                    timestamp=ts,
                 ))
                 pairs.append(Message(
                     role="assistant",
                     content=self.extract_message_text(chat_msgs[i + 1]),
+                    timestamp=ts,
                 ))
                 i += 2
             else:

@@ -131,6 +131,73 @@ def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
     return text.strip(), metadata
 
 
+def parse_envelope_timestamp(ts_str: str) -> "datetime | None":
+    """Parse an envelope timestamp like 'Tue 2026-03-17 00:35 EDT' into a datetime.
+
+    Handles formats:
+    - 'Day YYYY-MM-DD HH:MM TZ' (e.g., 'Tue 2026-03-17 00:35 EDT')
+    - ISO 8601 (e.g., '2026-03-17T00:35:00Z')
+    - 'YYYY-MM-DD HH:MM:SS' (no timezone)
+
+    Returns None if parsing fails.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    ts_str = ts_str.strip()
+
+    # Common US timezone offsets
+    _tz_offsets = {
+        "EDT": timedelta(hours=-4), "EST": timedelta(hours=-5),
+        "CDT": timedelta(hours=-5), "CST": timedelta(hours=-6),
+        "MDT": timedelta(hours=-6), "MST": timedelta(hours=-7),
+        "PDT": timedelta(hours=-7), "PST": timedelta(hours=-8),
+        "UTC": timedelta(hours=0), "GMT": timedelta(hours=0),
+    }
+
+    # Format: "Day YYYY-MM-DD HH:MM TZ"
+    m = re.match(r"[A-Za-z]+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(\w+)", ts_str)
+    if m:
+        try:
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")
+            tz_name = m.group(3).upper()
+            offset = _tz_offsets.get(tz_name, timedelta(hours=0))
+            return dt.replace(tzinfo=timezone(offset))
+        except ValueError:
+            pass
+
+    # ISO 8601
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    # Plain datetime
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    return None
+
+
+def extract_timestamp_from_metadata(metadata: dict | None) -> "datetime | None":
+    """Extract and parse a timestamp from envelope metadata.
+
+    Checks 'conversation info' block for a 'timestamp' field.
+    """
+    if not metadata:
+        return None
+    conv_info = metadata.get("conversation info")
+    if not conv_info or not isinstance(conv_info, dict):
+        return None
+    ts_str = conv_info.get("timestamp")
+    if ts_str:
+        return parse_envelope_timestamp(ts_str)
+    return None
+
+
 def _strip_envelope(text: str) -> str:
     """Strip message envelope metadata to extract actual conversational content.
 

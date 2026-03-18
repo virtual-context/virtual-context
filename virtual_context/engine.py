@@ -1725,11 +1725,12 @@ class VirtualContextEngine:
                 logger.debug("Skipping empty turn at pair index %d", i // 2)
                 continue
 
-            # Track running session date from [Session from ...] headers
+            # Track running session date from [Session from ...] headers,
+            # envelope metadata timestamps, or Message.timestamp
             m = _SESSION_HEADER_RE.search(user_msg.content)
             if m:
                 running_session_date = m.group(1)
-            elif not running_session_date and user_msg.timestamp:
+            elif user_msg.timestamp:
                 running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
