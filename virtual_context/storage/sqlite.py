@@ -573,17 +573,29 @@ class SQLiteStore(ContextStore):
             raise
         return segment.ref
 
-    def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str, conversation_id: str | None = None) -> StoredSegment | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM segments WHERE ref = ?", (ref,)).fetchone()
+        if conversation_id is not None:
+            row = conn.execute(
+                "SELECT * FROM segments WHERE ref = ? AND conversation_id = ?",
+                (ref, conversation_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM segments WHERE ref = ?", (ref,)).fetchone()
         if not row:
             return None
         tags = self._get_tags_for_ref(ref)
         return _row_to_segment(row, tags)
 
-    def get_summary(self, ref: str) -> StoredSummary | None:
+    def get_summary(self, ref: str, conversation_id: str | None = None) -> StoredSummary | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM segments WHERE ref = ?", (ref,)).fetchone()
+        if conversation_id is not None:
+            row = conn.execute(
+                "SELECT * FROM segments WHERE ref = ? AND conversation_id = ?",
+                (ref, conversation_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM segments WHERE ref = ?", (ref,)).fetchone()
         if not row:
             return None
         tags = self._get_tags_for_ref(ref)
@@ -596,6 +608,7 @@ class SQLiteStore(ContextStore):
         limit: int = 10,
         before: datetime | None = None,
         after: datetime | None = None,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         if not tags:
             return []
@@ -610,6 +623,10 @@ class SQLiteStore(ContextStore):
             WHERE st.tag IN ({placeholders})
         """
         params: list = list(tags)
+
+        if conversation_id is not None:
+            query += " AND s.conversation_id = ?"
+            params.append(conversation_id)
 
         if before:
             query += " AND s.created_at < ?"
@@ -640,8 +657,16 @@ class SQLiteStore(ContextStore):
         query: str,
         tags: list[str] | None = None,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         conn = self._get_conn()
+
+        # Build optional conversation_id filter fragment
+        _conv_filter = ""
+        _conv_params: list = []
+        if conversation_id is not None:
+            _conv_filter = " AND s.conversation_id = ?"
+            _conv_params = [conversation_id]
 
         # Try FTS5 first
         try:
@@ -653,19 +678,21 @@ class SQLiteStore(ContextStore):
                     JOIN segment_tags st ON s.ref = st.segment_ref
                     WHERE segments_fts MATCH ?
                     AND st.tag IN ({placeholders})
+                    {_conv_filter}
                     GROUP BY s.ref
                     ORDER BY rank
                     LIMIT ?""",
-                    [_sanitize_fts_query(query), *tags, limit],
+                    [_sanitize_fts_query(query), *tags, *_conv_params, limit],
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT s.* FROM segments_fts fts
+                    f"""SELECT s.* FROM segments_fts fts
                     JOIN segments s ON s.ref = fts.ref
                     WHERE segments_fts MATCH ?
+                    {_conv_filter}
                     ORDER BY rank
                     LIMIT ?""",
-                    [_sanitize_fts_query(query), limit],
+                    [_sanitize_fts_query(query), *_conv_params, limit],
                 ).fetchall()
         except sqlite3.OperationalError:
             # FTS5 not available, fall back to LIKE
@@ -679,13 +706,18 @@ class SQLiteStore(ContextStore):
                     JOIN segment_tags st ON s.ref = st.segment_ref
                     WHERE s.summary LIKE ? ESCAPE '\\'
                     AND st.tag IN ({placeholders})
+                    {_conv_filter}
                     LIMIT ?""",
-                    [like_query, *tags, limit],
+                    [like_query, *tags, *_conv_params, limit],
                 ).fetchall()
             else:
+                # No JOIN — use conversation_id directly on segments table
+                _conv_filter_simple = ""
+                if conversation_id is not None:
+                    _conv_filter_simple = " AND conversation_id = ?"
                 rows = conn.execute(
-                    "SELECT * FROM segments WHERE summary LIKE ? ESCAPE '\\' LIMIT ?",
-                    [like_query, limit],
+                    f"SELECT * FROM segments WHERE summary LIKE ? ESCAPE '\\'{_conv_filter_simple} LIMIT ?",
+                    [like_query, *_conv_params, limit],
                 ).fetchall()
 
         refs = [row["ref"] for row in rows]
@@ -699,9 +731,17 @@ class SQLiteStore(ContextStore):
         self,
         query: str,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[QuoteResult]:
         conn = self._get_conn()
         results: list[QuoteResult] = []
+
+        # Build optional conversation_id filter fragment
+        _conv_filter = ""
+        _conv_params: list = []
+        if conversation_id is not None:
+            _conv_filter = " AND s.conversation_id = ?"
+            _conv_params = [conversation_id]
 
         # Try FTS5 first (with snippet extraction)
         _sc = self.search_config
@@ -709,15 +749,16 @@ class SQLiteStore(ContextStore):
         _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
         try:
             rows = conn.execute(
-                """SELECT fts.ref, s.primary_tag, s.metadata_json,
-                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', """ + str(_fts_chars) + """),
+                f"""SELECT fts.ref, s.primary_tag, s.metadata_json,
+                          snippet(segments_fts_full, 1, '>>>', '<<<', '...', {_fts_chars}),
                           s.created_at
                    FROM segments_fts_full fts
                    JOIN segments s ON s.ref = fts.ref
                    WHERE segments_fts_full MATCH ?
+                   {_conv_filter}
                    ORDER BY rank
                    LIMIT ?""",
-                [_sanitize_fts_query(query), limit],
+                [_sanitize_fts_query(query), *_conv_params, limit],
             ).fetchall()
             fts_refs = [row[0] for row in rows]
             fts_tags_map = self._batch_get_tags(fts_refs)
@@ -740,11 +781,17 @@ class SQLiteStore(ContextStore):
         # Escape LIKE wildcards in user input to prevent pattern injection
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like_query = f"%{escaped}%"
+        _conv_filter_like = ""
+        _conv_params_like: list = []
+        if conversation_id is not None:
+            _conv_filter_like = " AND conversation_id = ?"
+            _conv_params_like = [conversation_id]
         rows = conn.execute(
-            """SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments
+            f"""SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments
                WHERE full_text LIKE ? ESCAPE '\\'
+               {_conv_filter_like}
                LIMIT ?""",
-            [like_query, limit],
+            [like_query, *_conv_params_like, limit],
         ).fetchall()
         like_refs = [row[0] for row in rows]
         like_tags_map = self._batch_get_tags(like_refs)
@@ -988,6 +1035,7 @@ class SQLiteStore(ContextStore):
         tags: list[str],
         min_overlap: int = 1,
         limit: int = 20,
+        conversation_id: str | None = None,
     ) -> list[StoredSegment]:
         if not tags:
             return []
@@ -998,12 +1046,20 @@ class SQLiteStore(ContextStore):
             FROM segments s
             JOIN segment_tags st ON s.ref = st.segment_ref
             WHERE st.tag IN ({placeholders})
+        """
+        params: list = list(tags)
+
+        if conversation_id is not None:
+            query += " AND s.conversation_id = ?"
+            params.append(conversation_id)
+
+        query += """
             GROUP BY s.ref
             HAVING overlap_count >= ?
             ORDER BY overlap_count DESC, s.created_at DESC
             LIMIT ?
         """
-        params: list = list(tags) + [min_overlap, limit]
+        params.extend([min_overlap, limit])
         rows = conn.execute(query, params).fetchall()
         refs = [row["ref"] for row in rows]
         tags_map = self._batch_get_tags(refs)
