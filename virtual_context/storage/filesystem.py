@@ -811,5 +811,41 @@ class FilesystemStore(ContextStore):
                         return results
         return results
 
+    # ------------------------------------------------------------------
+    # Fact / tool-output stubs (FilesystemStore lacks SQL backing)
+    # ------------------------------------------------------------------
+
+    def query_facts(
+        self,
+        *,
+        subject: str | None = None,
+        verb: str | None = None,
+        verbs: list[str] | None = None,
+        object_contains: str | None = None,
+        status: str | None = None,
+        fact_type: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list:
+        return []
+
+    def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list:
+        return []
+
+    def search_tool_outputs(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list:
+        return []
+
+    def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
+        return {}
+
+    def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
+        return []
+
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
         return []
