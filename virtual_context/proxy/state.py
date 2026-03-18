@@ -614,7 +614,7 @@ class ProxyState:
             # can use the pool once we transition to ACTIVE.
             self._ingestion_thread = threading.Thread(
                 target=self._run_ingestion_with_catchup,
-                args=(list(history_pairs),),
+                args=(list(history_pairs), existing_turns, total),
                 daemon=True,
                 name="vc-ingest",
             )
@@ -661,13 +661,17 @@ class ProxyState:
                 prev_turn, new_hash,
             )
 
-    def _run_ingestion_with_catchup(self, initial_pairs: list[Message]) -> None:
+    def _run_ingestion_with_catchup(
+        self, initial_pairs: list[Message], baseline: int = 0, cumulative_total: int = 0,
+    ) -> None:
         """Background thread: ingest initial pairs, then catch up any gap."""
         conversation_id = self.engine.config.conversation_id
         cancelled = False
         try:
             # Phase 1: tag all initial history
-            self._ingest_pairs_with_progress(initial_pairs)
+            self._ingest_pairs_with_progress(
+                initial_pairs, baseline=baseline, cumulative_total=cumulative_total or None,
+            )
 
             # Phase 2: catch-up loop — tag any turns that arrived during ingestion
             for _ in range(10):  # bounded to avoid infinite loops
@@ -689,7 +693,8 @@ class ProxyState:
                     "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
                     len(gap_pairs) // 2, have, needed,
                 )
-                self._ingest_pairs_with_progress(gap_pairs)
+                self._ingestion_progress = (have, needed)
+                self._ingest_pairs_with_progress(gap_pairs, baseline=have, cumulative_total=needed)
 
         except _IngestionCancelled as e:
             # New request is taking over — exit cleanly without
@@ -709,21 +714,30 @@ class ProxyState:
                 self._compact_after_ingestion(initial_pairs)
                 self._transition_to(SessionState.ACTIVE)
 
-    def _ingest_pairs_with_progress(self, pairs: list[Message]) -> None:
+    def _ingest_pairs_with_progress(
+        self, pairs: list[Message], baseline: int = 0, cumulative_total: int | None = None,
+    ) -> None:
         """Call engine.ingest_history with a progress callback that emits events.
+
+        Args:
+            pairs: Message pairs to ingest.
+            baseline: Already-ingested turns before this batch (for cumulative progress).
+            cumulative_total: Total turns across all batches. Defaults to baseline + batch size.
 
         Raises ``_IngestionCancelled`` if ``_ingestion_cancel`` is set.
         """
         conversation_id = self.engine.config.conversation_id
         t0 = time.monotonic()
         baseline_history_tokens = 0
+        _total = cumulative_total if cumulative_total is not None else baseline + len(pairs) // 2
 
         def on_progress(done: int, total: int, entry) -> None:
             nonlocal baseline_history_tokens
+            cum_done = baseline + done
             # Check cancellation before updating progress
             if self._ingestion_cancel.is_set():
-                raise _IngestionCancelled(done, total)
-            self._ingestion_progress = (done, total)
+                raise _IngestionCancelled(cum_done, _total)
+            self._ingestion_progress = (cum_done, _total)
             if self.metrics:
                 # Find the pair for this turn to compute preview + tokens
                 turn_num = entry.turn_number
@@ -745,8 +759,8 @@ class ProxyState:
                     "message_preview": preview,
                     "turn_pair_tokens": tpt,
                     "conversation_id": conversation_id,
-                    "done": done,
-                    "total": total,
+                    "done": cum_done,
+                    "total": _total,
                 })
 
         turns = self.engine.ingest_history(pairs, progress_callback=on_progress)
