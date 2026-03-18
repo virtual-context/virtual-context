@@ -337,6 +337,13 @@ class AnthropicFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                _user_raw = chat_msgs[i].get("content", "")
+                if isinstance(_user_raw, list):
+                    _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
+                    if _ctypes and _ctypes <= {"tool_result"}:
+                        i += 2
+                        continue
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
@@ -586,6 +593,13 @@ class OpenAIFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                _user_raw = chat_msgs[i].get("content", "")
+                if isinstance(_user_raw, list):
+                    _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
+                    if _ctypes and _ctypes <= {"tool_result"}:
+                        i += 2
+                        continue
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
@@ -1173,6 +1187,13 @@ class OpenAIResponsesFormat(PayloadFormat):
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
+                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                _user_raw = chat_msgs[i].get("content", "")
+                if isinstance(_user_raw, list):
+                    _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
+                    if _ctypes and _ctypes <= {"tool_result"}:
+                        i += 2
+                        continue
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
                 pairs.append(Message(
