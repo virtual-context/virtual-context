@@ -206,3 +206,109 @@ class TestSQLiteFactScoping:
         results = store.search_tool_outputs("recipes", conversation_id="conv-a")
         for r in results:
             assert "conv-a" in r.segment_ref or "pasta" in str(r.text)
+
+
+class TestEmptyStringSemantics:
+    def test_sqlite_get_all_tags_empty_string_not_unscoped(self, tmp_path):
+        store = _make_two_conversation_store(tmp_path)
+        tags = store.get_all_tags(conversation_id="")
+        assert len(tags) == 0
+
+    def test_sqlite_get_all_tags_none_is_unscoped(self, tmp_path):
+        store = _make_two_conversation_store(tmp_path)
+        tags = store.get_all_tags(conversation_id=None)
+        tag_names = [t.tag for t in tags]
+        assert "cooking" in tag_names
+
+
+from virtual_context.core.retriever import ContextRetriever
+from virtual_context.types import RetrieverConfig, StrategyConfig
+
+from conftest import MockTagGenerator
+
+
+class TestEndToEndScoping:
+    def test_new_conversation_gets_no_context_from_other(self, tmp_path):
+        """Conversation B should not get context from conversation A's segments."""
+        store = SQLiteStore(db_path=str(tmp_path / "shared.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50,
+            full_text="Discussion about crochet patterns and yarn.",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.store_segment(StoredSegment(
+            ref="a-1", conversation_id="conv-a",
+            primary_tag="crochet", tags=["crochet", "crafts"],
+            summary="Crochet pattern discussion.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="a-2", conversation_id="conv-a",
+            primary_tag="tv_shows", tags=["tv_shows", "bridgerton"],
+            summary="Bridgerton season 4 review.", **base,
+        ))
+
+        tag_gen = MockTagGenerator(default_tag="crochet", default_tags=["crochet"])
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            strategy_configs={
+                "default": StrategyConfig(min_overlap=1, max_results=10),
+            },
+        )
+        retriever_b = ContextRetriever(
+            tag_generator=tag_gen, store=store, config=config,
+            conversation_id="conv-b",
+        )
+        result = retriever_b.retrieve("tell me about crochet")
+        assert len(result.summaries) == 0, (
+            f"Conv-B leaked {len(result.summaries)} segments from conv-A: "
+            f"{[s.ref for s in result.summaries]}"
+        )
+
+    def test_find_quote_scoped_no_cross_conversation_leaks(self, tmp_path):
+        """find_quote must not leak across conversations via FTS."""
+        store = _make_store_with_facts(tmp_path)
+        # Test FTS scoping directly — search_full_text is the core path
+        results = store.search_full_text("pasta sourdough", conversation_id="conv-a")
+        for r in results:
+            assert r.segment_ref.startswith("conv-a"), (
+                f"search_full_text leaked cross-conversation ref: {r.segment_ref}"
+            )
+
+    def test_alias_ride_along_scoped(self, tmp_path):
+        """Alias-expanded retrieval is conversation-scoped."""
+        store = SQLiteStore(db_path=str(tmp_path / "alias.db"))
+        now = datetime.now(timezone.utc)
+        base = dict(
+            summary_tokens=10, full_tokens=50, full_text="text",
+            metadata=SegmentMetadata(), created_at=now,
+            start_timestamp=now, end_timestamp=now,
+        )
+        store.set_tag_alias("food", "cooking")
+        store.store_segment(StoredSegment(
+            ref="a-food", conversation_id="conv-a",
+            primary_tag="cooking", tags=["cooking"],
+            summary="Conv-A cooking segment.", **base,
+        ))
+        store.store_segment(StoredSegment(
+            ref="b-food", conversation_id="conv-b",
+            primary_tag="cooking", tags=["cooking"],
+            summary="Conv-B cooking segment.", **base,
+        ))
+        tag_gen = MockTagGenerator(default_tag="food", default_tags=["food"])
+        config = RetrieverConfig(
+            tag_context_max_tokens=30000,
+            strategy_configs={
+                "default": StrategyConfig(min_overlap=1, max_results=10),
+            },
+        )
+        retriever = ContextRetriever(
+            tag_generator=tag_gen, store=store, config=config,
+            conversation_id="conv-a",
+        )
+        result = retriever.retrieve("tell me about food")
+        refs = [s.ref for s in result.summaries]
+        assert "b-food" not in refs, (
+            f"Alias ride-along leaked cross-conversation ref: {refs}"
+        )
