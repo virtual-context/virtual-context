@@ -33,10 +33,11 @@ def _make_segment(
         "It arrived on February 10th, a wireless model compatible with their Canon R5.\n\n"
         "Assistant recommended testing it in burst mode for wildlife shots."
     ),
+    conversation_id: str = "session-1",
 ) -> StoredSegment:
     return StoredSegment(
         ref=ref,
-        conversation_id="session-1",
+        conversation_id=conversation_id,
         primary_tag=primary_tag,
         tags=tags or [primary_tag],
         summary=summary,
@@ -218,7 +219,7 @@ class TestFindQuoteSemanticFallback:
     def test_fts_full_no_semantic(self, tmp_path):
         """When FTS fills max_results, semantic search is NOT called."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         # Mock _semantic_search to verify it's not called when FTS fills quota
         engine._semantic_search = MagicMock(return_value=[])
@@ -231,7 +232,7 @@ class TestFindQuoteSemanticFallback:
     def test_fts_hit_still_supplements_with_semantic(self, tmp_path):
         """When FTS finds matches but has remaining slots, semantic supplements."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         engine._semantic.semantic_search = MagicMock(return_value=[])
 
@@ -297,7 +298,7 @@ class TestFindQuoteSemanticFallback:
     def test_fts_results_no_match_type_key(self, tmp_path):
         """FTS results do NOT include match_type in output (clean output)."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
         result = engine.find_quote("arrived")
         assert result["found"] is True

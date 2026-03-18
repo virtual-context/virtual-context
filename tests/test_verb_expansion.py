@@ -122,6 +122,7 @@ class TestExpandVerb:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
         engine._store.get_unique_fact_verbs.return_value = ["led", "leads", "built", "prefers"]
 
@@ -149,6 +150,7 @@ class TestExpandVerb:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
         engine._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
         engine._get_embed_fn = MagicMock(return_value=None)
@@ -162,6 +164,7 @@ class TestExpandVerb:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._get_embed_fn = MagicMock(return_value=lambda texts: [[0.0]] * len(texts))
         engine._store = MagicMock()
         engine._store.get_unique_fact_verbs.return_value = []
@@ -175,6 +178,7 @@ class TestExpandVerb:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
         engine._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
 
@@ -203,6 +207,7 @@ class TestEngineQueryFactsIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._semantic_fact_search = MagicMock(return_value=[])
         # Return results so auto-relax doesn't trigger — must be Fact objects
@@ -215,7 +220,7 @@ class TestEngineQueryFactsIntegration:
 
         # Should call store with verbs instead of verb (first call)
         first_call = store.query_facts.call_args_list[0]
-        assert first_call == call(verbs=["led", "leads"], subject="user", limit=50)
+        assert first_call == call(verbs=["led", "leads"], subject="user", limit=50, conversation_id="test-session")
 
     def test_no_expansion_keeps_verb(self):
         from unittest.mock import MagicMock
@@ -223,6 +228,7 @@ class TestEngineQueryFactsIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._semantic_fact_search = MagicMock(return_value=[])
         store.query_facts.return_value = []
@@ -231,7 +237,7 @@ class TestEngineQueryFactsIntegration:
         VirtualContextEngine.query_facts(engine, verb="led", subject="user")
 
         store.query_facts.assert_called_once_with(
-            verb="led", subject="user"
+            verb="led", subject="user", conversation_id="test-session"
         )
 
     @pytest.mark.regression("BUG-032")
@@ -244,6 +250,7 @@ class TestEngineQueryFactsIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
         engine._semantic_fact_search = MagicMock(return_value=[])
@@ -266,6 +273,7 @@ class TestEngineQueryFactsIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
         engine._semantic_fact_search = MagicMock(return_value=[])
@@ -285,6 +293,7 @@ class TestEngineQueryFactsIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
         engine._semantic_fact_search = MagicMock(return_value=[])
@@ -311,6 +320,7 @@ class TestSemanticFactSearch:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
 
         # SQL found Fitbit (verb=uses), semantic should find Accu-Chek (verb=is testing)
@@ -376,6 +386,7 @@ class TestSemanticFactSearch:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
 
         existing = [self._make_fact("f1", "uses", "User uses a Fitbit daily")]
@@ -394,6 +405,7 @@ class TestSemanticFactSearch:
         from virtual_context.engine import VirtualContextEngine
 
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = MagicMock()
 
         no_what = self._make_fact("f2", "is testing", "")
@@ -420,6 +432,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 
@@ -443,6 +456,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 
@@ -468,6 +482,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 
@@ -489,6 +504,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 
@@ -512,6 +528,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 
@@ -547,6 +564,7 @@ class TestQueryFactsSemanticIntegration:
 
         store = MagicMock()
         engine = MagicMock(spec=VirtualContextEngine)
+        engine.config = MagicMock(conversation_id="test-session")
         engine._store = store
         engine._expand_verb = MagicMock(return_value=None)
 

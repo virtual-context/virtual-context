@@ -1163,6 +1163,7 @@ class TestReassembleContext:
         ))
         engine._store.store_segment(StoredSegment(
             ref="seg1",
+            conversation_id=engine.config.conversation_id,
             primary_tag="database",
             tags=["database"],
             summary="PostgreSQL schema discussion.",
@@ -1262,6 +1263,7 @@ class TestTemporalNoBypass:
         ))
         engine._store.store_segment(StoredSegment(
             ref="seg-arch",
+            conversation_id=engine.config.conversation_id,
             primary_tag="architecture",
             tags=["architecture"],
             summary="Architecture discussion.",

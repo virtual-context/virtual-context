@@ -656,9 +656,10 @@ class TestEngineCuration:
 
         # Store two facts
         from virtual_context.types import Fact
+        cid = engine.config.conversation_id
         facts = [
-            Fact(subject="user", verb="hiked", object="Dipsea Trail"),
-            Fact(subject="user", verb="studied", object="automata theory"),
+            Fact(subject="user", verb="hiked", object="Dipsea Trail", conversation_id=cid),
+            Fact(subject="user", verb="studied", object="automata theory", conversation_id=cid),
         ]
         engine._store.store_facts(facts)
 
@@ -691,9 +692,10 @@ class TestEngineCuration:
         engine = VirtualContextEngine(config=cfg)
         assert engine._fact_curator is None
 
+        cid = engine.config.conversation_id
         facts = [
-            Fact(subject="user", verb="hiked", object="trail"),
-            Fact(subject="user", verb="studied", object="math"),
+            Fact(subject="user", verb="hiked", object="trail", conversation_id=cid),
+            Fact(subject="user", verb="studied", object="math", conversation_id=cid),
         ]
         engine._store.store_facts(facts)
         assembled = engine.on_message_inbound("test", conversation_history=[])
