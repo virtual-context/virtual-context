@@ -236,18 +236,21 @@ class FilesystemStore(ContextStore):
             self._save_index()
         return segment.ref
 
-    def get_segment(self, ref: str) -> StoredSegment | None:
+    def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         entry = self._index.get(ref)
         if not entry:
             return None
+        if conversation_id is not None:
+            if entry.get("conversation_id", "") != conversation_id:
+                return None
         primary_tag = entry["primary_tag"]
         path = self._segment_path(primary_tag, ref)
         if not path.is_file():
             return None
         return _markdown_to_segment(path.read_text(), ref)
 
-    def get_summary(self, ref: str) -> StoredSummary | None:
-        seg = self.get_segment(ref)
+    def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None:
+        seg = self.get_segment(ref, conversation_id=conversation_id)
         return _segment_to_summary(seg) if seg else None
 
     def get_summaries_by_tags(
@@ -257,6 +260,7 @@ class FilesystemStore(ContextStore):
         limit: int = 10,
         before: datetime | None = None,
         after: datetime | None = None,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         if not tags:
             return []
@@ -265,6 +269,10 @@ class FilesystemStore(ContextStore):
         scored: list[tuple[int, dict]] = []
 
         for entry in self._index.values():
+            if conversation_id is not None:
+                if entry.get("conversation_id", "") != conversation_id:
+                    continue
+
             entry_tags = set(entry.get("tags", []))
             overlap = len(tag_set & entry_tags)
             if overlap < min_overlap:
@@ -294,6 +302,7 @@ class FilesystemStore(ContextStore):
         query: str,
         tags: list[str] | None = None,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[StoredSummary]:
         """Keyword search against summary text and entities."""
         query_lower = query.lower()
@@ -302,6 +311,9 @@ class FilesystemStore(ContextStore):
 
         scored: list[tuple[float, dict]] = []
         for entry in self._index.values():
+            if conversation_id is not None:
+                if entry.get("conversation_id", "") != conversation_id:
+                    continue
             if tag_set:
                 entry_tags = set(entry.get("tags", []))
                 if not (tag_set & entry_tags):
@@ -317,6 +329,9 @@ class FilesystemStore(ContextStore):
         # Also check summaries for matches
         if not scored:
             for entry in self._index.values():
+                if conversation_id is not None:
+                    if entry.get("conversation_id", "") != conversation_id:
+                        continue
                 if tag_set:
                     entry_tags = set(entry.get("tags", []))
                     if not (tag_set & entry_tags):
@@ -338,10 +353,14 @@ class FilesystemStore(ContextStore):
         self,
         query: str,
         limit: int = 5,
+        conversation_id: str | None = None,
     ) -> list[QuoteResult]:
         query_lower = query.lower()
         results: list[QuoteResult] = []
         for entry in self._index.values():
+            if conversation_id is not None:
+                if entry.get("conversation_id", "") != conversation_id:
+                    continue
             seg = self.get_segment(entry["ref"])
             if seg and query_lower in seg.full_text.lower():
                 _sc = self.search_config
@@ -363,7 +382,7 @@ class FilesystemStore(ContextStore):
         tag_map: dict[str, TagStats] = {}
 
         for entry in self._index.values():
-            if conversation_id:
+            if conversation_id is not None:
                 cid = entry.get("conversation_id", entry.get("session_id", ""))
                 if cid != conversation_id:
                     continue
@@ -521,12 +540,16 @@ class FilesystemStore(ContextStore):
         tags: list[str],
         min_overlap: int = 1,
         limit: int = 20,
+        conversation_id: str | None = None,
     ) -> list[StoredSegment]:
         if not tags:
             return []
         tag_set = set(tags)
         scored: list[tuple[int, str]] = []
         for ref, entry in self._index.items():
+            if conversation_id is not None:
+                if entry.get("conversation_id", "") != conversation_id:
+                    continue
             entry_tags = set(entry.get("tags", []))
             overlap = len(tag_set & entry_tags)
             if overlap >= min_overlap:
