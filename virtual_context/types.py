@@ -142,15 +142,27 @@ class Message:
 def get_sender_name(metadata: dict | None) -> str | None:
     """Extract sender name from message metadata, with fallbacks.
 
-    Tries sender.name -> sender.display_name -> sender.label.
+    Checks (in order):
+    1. sender.name / sender.display_name / sender.label (full sender object)
+    2. conversation info.sender (string field from conversation metadata)
+
     Returns None if no sender info is available.
     """
     if not metadata:
         return None
+    # Primary: dedicated sender metadata block
     sender = metadata.get("sender")
-    if not sender or not isinstance(sender, dict):
-        return None
-    return sender.get("name") or sender.get("display_name") or sender.get("label") or None
+    if sender and isinstance(sender, dict):
+        name = sender.get("name") or sender.get("display_name") or sender.get("label")
+        if name:
+            return name
+    # Fallback: conversation info block often has a "sender" string field
+    conv_info = metadata.get("conversation info")
+    if conv_info and isinstance(conv_info, dict):
+        name = conv_info.get("sender")
+        if name and isinstance(name, str):
+            return name
+    return None
 
 
 @dataclass
