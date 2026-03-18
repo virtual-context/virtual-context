@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import statistics
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyMetrics:
