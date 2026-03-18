@@ -131,3 +131,78 @@ class TestSQLiteSegmentScoping:
         store = _make_two_conversation_store(tmp_path)
         summary = store.get_summary("conv-b-1", conversation_id="conv-a")
         assert summary is None
+
+
+from virtual_context.types import Fact
+
+
+def _make_store_with_facts(tmp_path):
+    """Create a store with segments and facts in two conversations."""
+    store = _make_two_conversation_store(tmp_path)
+    store.store_facts([
+        Fact(
+            subject="user", verb="likes", object="pasta",
+            segment_ref="conv-a-1", conversation_id="conv-a",
+            tags=["cooking"],
+        ),
+        Fact(
+            subject="user", verb="likes", object="sourdough",
+            segment_ref="conv-b-1", conversation_id="conv-b",
+            tags=["cooking"],
+        ),
+    ])
+    return store
+
+
+class TestSQLiteFactScoping:
+    def test_query_facts_scoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        facts = store.query_facts(verb="likes", conversation_id="conv-a")
+        objects = [f.object for f in facts]
+        assert "pasta" in objects
+        assert "sourdough" not in objects
+
+    def test_query_facts_unscoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        facts = store.query_facts(verb="likes")
+        assert len(facts) == 2
+
+    def test_search_facts_scoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        facts = store.search_facts("pasta sourdough", conversation_id="conv-a")
+        for f in facts:
+            assert f.conversation_id == "conv-a"
+
+    def test_get_unique_fact_verbs_scoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        store.store_facts([
+            Fact(
+                subject="user", verb="trains_for", object="marathon",
+                segment_ref="conv-b-2", conversation_id="conv-b",
+                tags=["fitness"],
+            ),
+        ])
+        verbs_a = store.get_unique_fact_verbs(conversation_id="conv-a")
+        assert "likes" in verbs_a
+        assert "trains_for" not in verbs_a
+
+    def test_get_fact_count_by_tags_scoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        counts = store.get_fact_count_by_tags(conversation_id="conv-a")
+        assert counts.get("cooking", 0) == 1
+
+    def test_search_tool_outputs_scoped(self, tmp_path):
+        store = _make_store_with_facts(tmp_path)
+        store.store_tool_output(
+            ref="conv-a-1", tool_name="web_search",
+            content="Italian pasta recipes found", conversation_id="conv-a",
+            command="search pasta", turn=1, original_bytes=100,
+        )
+        store.store_tool_output(
+            ref="conv-b-1", tool_name="web_search",
+            content="Sourdough bread recipes found", conversation_id="conv-b",
+            command="search sourdough", turn=1, original_bytes=100,
+        )
+        results = store.search_tool_outputs("recipes", conversation_id="conv-a")
+        for r in results:
+            assert "conv-a" in r.segment_ref or "pasta" in str(r.text)
