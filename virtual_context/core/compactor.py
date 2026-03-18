@@ -537,6 +537,10 @@ class DomainCompactor:
                         tool_name_map[block["id"]] = block.get("name", "")
 
         lines: list[str] = []
+        # Prepend session date header from the first timestamped message
+        first_ts = next((m.timestamp for m in messages if m.timestamp), None)
+        if first_ts:
+            lines.append(f"[Session: {first_ts.strftime('%B %d, %Y %I:%M %p')}]")
         for m in messages:
             ts = ""
             if m.timestamp:

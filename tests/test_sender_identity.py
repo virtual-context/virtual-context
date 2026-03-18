@@ -1,7 +1,12 @@
 """Tests for sender identity attribution pipeline."""
 
 from virtual_context.types import get_sender_name, Message
-from virtual_context.proxy._envelope import _extract_envelope_metadata, _strip_envelope
+from virtual_context.proxy._envelope import (
+    _extract_envelope_metadata,
+    _strip_envelope,
+    extract_timestamp_from_metadata,
+    parse_envelope_timestamp,
+)
 
 
 class TestGetSenderName:
@@ -264,3 +269,84 @@ class TestEndToEndSenderIdentity:
         compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
         formatted = compactor._format_conversation([msg, asst])
         assert "User:" in formatted or "User (" in formatted
+
+
+class TestEnvelopeTimestamps:
+    def test_parse_envelope_timestamp_edt(self):
+        ts = parse_envelope_timestamp("Tue 2026-03-17 00:35 EDT")
+        assert ts is not None
+        assert ts.year == 2026
+        assert ts.month == 3
+        assert ts.day == 17
+        assert ts.hour == 0
+        assert ts.minute == 35
+
+    def test_parse_envelope_timestamp_iso(self):
+        ts = parse_envelope_timestamp("2026-03-17T00:35:00+00:00")
+        assert ts is not None
+        assert ts.year == 2026
+
+    def test_parse_envelope_timestamp_none(self):
+        assert parse_envelope_timestamp(None) is None
+        assert parse_envelope_timestamp("") is None
+        assert parse_envelope_timestamp("not a date") is None
+
+    def test_extract_timestamp_from_metadata(self):
+        meta = {
+            "sender": {"name": "Sania"},
+            "conversation info": {"timestamp": "Tue 2026-03-17 00:35 EDT"},
+        }
+        ts = extract_timestamp_from_metadata(meta)
+        assert ts is not None
+        assert ts.year == 2026
+        assert ts.month == 3
+        assert ts.day == 17
+
+    def test_extract_timestamp_from_metadata_no_info(self):
+        assert extract_timestamp_from_metadata(None) is None
+        assert extract_timestamp_from_metadata({}) is None
+        assert extract_timestamp_from_metadata({"sender": {"name": "X"}}) is None
+
+    def test_history_pairs_get_timestamp(self):
+        from virtual_context.proxy.formats import AnthropicFormat
+        fmt = AnthropicFormat()
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        'Sender (untrusted metadata):\n'
+                        '```json\n'
+                        '{"name": "Sania"}\n'
+                        '```\n'
+                        'Conversation info (untrusted metadata):\n'
+                        '```json\n'
+                        '{"timestamp": "Tue 2026-03-17 00:35 EDT"}\n'
+                        '```\n'
+                        'Hello'
+                    ),
+                },
+                {"role": "assistant", "content": "Hi"},
+            ]
+        }
+        pairs = fmt.extract_history_pairs(body)
+        assert pairs[0].timestamp is not None
+        assert pairs[0].timestamp.year == 2026
+        assert pairs[0].timestamp.month == 3
+        # Assistant gets same timestamp
+        assert pairs[1].timestamp is not None
+
+    def test_format_conversation_includes_session_header(self):
+        from datetime import datetime, timezone
+        from virtual_context.core.compactor import DomainCompactor
+        from virtual_context.types import CompactorConfig
+
+        ts = datetime(2026, 3, 17, 0, 35, tzinfo=timezone.utc)
+        msg = Message(role="user", content="Hello", timestamp=ts,
+                      metadata={"sender": {"name": "Sania"}})
+        asst = Message(role="assistant", content="Hi", timestamp=ts)
+        compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
+        formatted = compactor._format_conversation([msg, asst])
+        assert "[Session:" in formatted
+        assert "March 17, 2026" in formatted
+        assert "Sania (00:35):" in formatted
