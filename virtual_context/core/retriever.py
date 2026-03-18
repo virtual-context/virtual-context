@@ -65,7 +65,7 @@ class ContextRetriever:
 
     def _fetch_all_facts(self) -> list:
         try:
-            return self.store.query_facts(limit=9999)
+            return self.store.query_facts(limit=9999, conversation_id=self._conversation_id)
         except Exception:
             return []
 
@@ -240,6 +240,7 @@ class ContextRetriever:
             tags=expanded_tags,
             min_overlap=strategy.min_overlap,
             limit=overfetch_limit,
+            conversation_id=self._conversation_id,
         )
 
         # IDF re-rank: score each result by weighted tag overlap
@@ -282,6 +283,7 @@ class ContextRetriever:
             alias_extras = _alias_ride_along(
                 self.store, query_tag_set, selected, selected_refs,
                 token_budget, total_tokens,
+                conversation_id=self._conversation_id,
             )
             if alias_extras:
                 selected.extend(alias_extras)
@@ -302,6 +304,7 @@ class ContextRetriever:
             fts_results = self.store.search(
                 query=fts_terms,
                 limit=strategy.max_results,
+                conversation_id=self._conversation_id,
             )
             for summary in fts_results:
                 if total_tokens + summary.summary_tokens > token_budget:
@@ -325,7 +328,7 @@ class ContextRetriever:
         full_detail: list[StoredSegment] = []
         if selected:
             for summary in selected[:3]:  # limit to top 3
-                segment = self.store.get_segment(summary.ref)
+                segment = self.store.get_segment(summary.ref, conversation_id=self._conversation_id)
                 if segment:
                     full_detail.append(segment)
 
@@ -372,6 +375,7 @@ def _alias_ride_along(
     selected_refs: set[str],
     token_budget: int,
     tokens_used: int,
+    conversation_id: str | None = None,
 ) -> list[StoredSummary]:
     """Find extra segments via aliases for tags that already made the cut.
 
@@ -418,6 +422,7 @@ def _alias_ride_along(
         tags=list(alias_tags),
         min_overlap=1,
         limit=50,
+        conversation_id=conversation_id,
     )
 
     # Add new segments within token budget
