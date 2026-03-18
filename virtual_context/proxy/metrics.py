@@ -66,6 +66,29 @@ class ProxyMetrics:
                 event["ts"] = datetime.now(timezone.utc).isoformat()
             self._seq += 1
             self._events.append(event)
+            # Debug: log every event for diagnostics
+            etype = event.get("type", "?")
+            conv = event.get("conversation_id", "")[:12]
+            extras = ""
+            if etype == "request":
+                extras = f" turn={event.get('turn')} passthrough={event.get('passthrough')} in={event.get('input_tokens',0)} ctx={event.get('context_tokens',0)}"
+            elif etype == "response":
+                extras = f" turn={event.get('turn')} ms={event.get('upstream_ms',0)}"
+            elif etype == "turn_complete":
+                extras = f" turn={event.get('turn')} tags={event.get('tags',[])} primary={event.get('primary_tag','')}"
+            elif etype == "compaction":
+                extras = f" segments={event.get('segments')} freed={event.get('tokens_freed')} summaries={event.get('tag_summaries_built')}"
+            elif etype == "compaction_progress":
+                extras = f" phase={event.get('phase')} done={event.get('done')}/{event.get('total')} tag={event.get('primary_tag','')}"
+            elif etype == "ingested_turn":
+                extras = f" turn={event.get('turn')} done={event.get('done')}/{event.get('total')} tags={event.get('tags',[])} preview=\"{event.get('message_preview','')[:40]}\""
+            elif etype == "history_ingestion":
+                extras = f" turns={event.get('turns_ingested')} ms={event.get('elapsed_ms',0):.0f}"
+            elif etype == "conversation_deleted":
+                extras = f" conv={event.get('conversation_id','')[:12]} segments={event.get('segments_removed')}"
+            elif etype == "budget_exceeded":
+                extras = f" total={event.get('total')} budget={event.get('budget')}"
+            logger.info("EVENT seq=%d type=%s conv=%s%s", self._seq - 1, etype, conv, extras)
             event_type = event.get("type", "")
             if event_type:
                 self._buckets[event_type] = self._buckets.get(event_type, 0) + 1
