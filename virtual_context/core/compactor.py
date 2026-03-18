@@ -287,6 +287,7 @@ class DomainCompactor:
                         original_tokens=self.token_counter(conversation_text),
                         compression_ratio=0.0,
                         full_text=conversation_text,
+                        timestamp=segment.start_timestamp,
                     )
 
         _sys.stderr.write("\n")
@@ -482,6 +483,7 @@ class DomainCompactor:
             metadata=metadata,
             full_text=conversation_text,
             messages=messages_dicts,
+            timestamp=segment.start_timestamp,
             facts=facts,
         )
 
