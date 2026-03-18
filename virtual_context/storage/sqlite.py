@@ -1380,11 +1380,19 @@ class SQLiteStore(ContextStore):
                 pass
         return fact
 
-    def get_unique_fact_verbs(self) -> list[str]:
+    def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
         conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL"
-        ).fetchall()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT DISTINCT f.verb FROM facts f"
+                " JOIN segments s ON f.segment_ref = s.ref"
+                " WHERE s.conversation_id = ? AND f.verb != '' AND f.superseded_by IS NULL",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL"
+            ).fetchall()
         return [r[0] for r in rows]
 
     def query_facts(
@@ -1398,11 +1406,15 @@ class SQLiteStore(ContextStore):
         fact_type: str | None = None,
         tags: list[str] | None = None,
         limit: int = 50,
+        conversation_id: str | None = None,
     ) -> list[Fact]:
         conn = self._get_conn()
         conditions: list[str] = []
         params: list[object] = []
 
+        if conversation_id is not None:
+            conditions.append("f.conversation_id = ?")
+            params.append(conversation_id)
         if subject is not None:
             conditions.append("f.subject = ?")
             params.append(subject)
@@ -1456,23 +1468,28 @@ class SQLiteStore(ContextStore):
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
-    def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
+    def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact subject, verb, object, what fields.
 
         Only returns non-superseded facts. Falls back to LIKE if FTS
         is unavailable. Populates session_date from the parent segment.
         """
         conn = self._get_conn()
+        conv_clause = ""
+        conv_params: list[object] = []
+        if conversation_id is not None:
+            conv_clause = " AND f.conversation_id = ?"
+            conv_params = [conversation_id]
         try:
             rows = conn.execute("""
                 SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
                 JOIN facts_fts fts ON f.id = fts.id
                 LEFT JOIN segments s ON f.segment_ref = s.ref
                 WHERE facts_fts MATCH ?
-                AND f.superseded_by IS NULL
+                AND f.superseded_by IS NULL""" + conv_clause + """
                 ORDER BY rank
                 LIMIT ?
-            """, (_sanitize_fts_query(query), limit)).fetchall()
+            """, [_sanitize_fts_query(query)] + conv_params + [limit]).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
         except sqlite3.OperationalError:
             # FTS not available — fall back to LIKE across key fields
@@ -1493,9 +1510,10 @@ class SQLiteStore(ContextStore):
                 SELECT f.*, s.metadata_json AS _seg_meta FROM facts f
                 LEFT JOIN segments s ON f.segment_ref = s.ref
                 WHERE ({where})
-                AND f.superseded_by IS NULL
+                AND f.superseded_by IS NULL""" + conv_clause + """
                 ORDER BY f.mentioned_at DESC LIMIT ?
             """
+            params.extend(conv_params)
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
@@ -1519,11 +1537,20 @@ class SQLiteStore(ContextStore):
         # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
         conn.commit()
 
-    def get_fact_count_by_tags(self) -> dict[str, int]:
+    def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
-        ).fetchall()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT ft.tag, COUNT(*) as cnt FROM fact_tags ft"
+                " JOIN facts f ON f.id = ft.fact_id"
+                " WHERE f.conversation_id = ?"
+                " GROUP BY ft.tag",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
+            ).fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
 
     # ------------------------------------------------------------------
@@ -1794,22 +1821,27 @@ class SQLiteStore(ContextStore):
         )
         conn.commit()
 
-    def search_tool_outputs(self, query: str, limit: int = 5) -> list:
+    def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list:
         from ..types import QuoteResult
 
         conn = self._get_conn()
         _sc = self.search_config
         _tool_chars = _sc.tool_output_snippet_chars if _sc else 100
+        conv_clause = ""
+        conv_params: list[object] = []
+        if conversation_id is not None:
+            conv_clause = " AND t.conversation_id = ?"
+            conv_params = [conversation_id]
         try:
             rows = conn.execute(
                 """SELECT t.ref, t.tool_name,
                           snippet(tool_outputs_fts, 0, '>>>', '<<<', '...', """ + str(_tool_chars) + """) as snippet
                    FROM tool_outputs_fts fts
                    JOIN tool_outputs t ON t.rowid = fts.rowid
-                   WHERE tool_outputs_fts MATCH ?
+                   WHERE tool_outputs_fts MATCH ?""" + conv_clause + """
                    ORDER BY rank
                    LIMIT ?""",
-                [_sanitize_fts_query(query), limit],
+                [_sanitize_fts_query(query)] + conv_params + [limit],
             ).fetchall()
         except Exception:
             return []
