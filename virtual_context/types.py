@@ -139,6 +139,20 @@ class Message:
     raw_content: list[dict] | None = None
 
 
+def get_sender_name(metadata: dict | None) -> str | None:
+    """Extract sender name from message metadata, with fallbacks.
+
+    Tries sender.name -> sender.display_name -> sender.label.
+    Returns None if no sender info is available.
+    """
+    if not metadata:
+        return None
+    sender = metadata.get("sender")
+    if not sender or not isinstance(sender, dict):
+        return None
+    return sender.get("name") or sender.get("display_name") or sender.get("label") or None
+
+
 @dataclass
 class TurnPair:
     """Atomic unit: a user message and its assistant response (plus any system/tool)."""
