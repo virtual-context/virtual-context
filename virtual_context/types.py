@@ -232,6 +232,7 @@ class TurnTagEntry:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     session_date: str = ""         # e.g. "2023/05/25 (Thu) 10:04" or ISO timestamp
     fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
+    sender: str = ""                # sender identity from envelope metadata
 
 
 @dataclass
