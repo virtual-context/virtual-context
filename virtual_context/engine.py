@@ -410,6 +410,55 @@ class VirtualContextEngine:
                 seg.id: segment_signals[seg.id]
                 for seg in batch if seg.id in segment_signals
             } or None
+            # Filter out tiny segments — not worth LLM summarization.
+            # Pass through raw text as summary instead.
+            MIN_COMPACT_TOKENS = 10
+            compactable = [s for s in batch if s.token_count >= MIN_COMPACT_TOKENS]
+            tiny = [s for s in batch if s.token_count < MIN_COMPACT_TOKENS]
+            for seg in tiny:
+                text = " ".join(m.content for m in seg.messages).strip()
+                logger.info(
+                    "SEGMENT skip_tiny ref=%s tokens=%d primary=%s — using raw text as summary",
+                    seg.id[:8], seg.token_count, seg.primary_tag,
+                )
+                results_tiny = [CompactionResult(
+                    segment_id=seg.id,
+                    primary_tag=seg.primary_tag,
+                    tags=seg.tags,
+                    summary=text or f"[empty turn: {seg.primary_tag}]",
+                    summary_tokens=seg.token_count,
+                    full_text=text,
+                    original_tokens=seg.token_count,
+                    messages=[{"role": m.role, "content": m.content} for m in seg.messages],
+                    metadata=SegmentMetadata(
+                        turn_count=seg.turn_count,
+                        session_date=getattr(seg, "session_date", ""),
+                    ),
+                    compression_ratio=1.0,
+                    timestamp=seg.start_timestamp,
+                )]
+                all_results.extend(results_tiny)
+                for result in results_tiny:
+                    stored = StoredSegment(
+                        ref=result.segment_id,
+                        conversation_id=self.config.conversation_id,
+                        primary_tag=result.primary_tag,
+                        tags=result.tags,
+                        summary=result.summary,
+                        summary_tokens=result.summary_tokens,
+                        full_text=result.full_text,
+                        full_tokens=result.original_tokens,
+                        messages=result.messages,
+                        metadata=result.metadata,
+                        compaction_model="passthrough",
+                        compression_ratio=1.0,
+                        start_timestamp=result.timestamp,
+                        end_timestamp=result.timestamp,
+                    )
+                    self._store.store_segment(stored)
+            if not compactable:
+                continue
+            batch = compactable
             results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
             # Store each result to DB right away
             for i, result in enumerate(results):

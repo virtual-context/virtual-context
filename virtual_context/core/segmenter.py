@@ -82,6 +82,15 @@ class TopicSegmenter:
         # Step 2: tag each turn pair
         tagged: list[tuple[TurnPair, TagResult]] = []
         for i, pair in enumerate(pairs):
+            # Skip empty/whitespace turns (stripped images, media, etc.)
+            combined = " ".join(m.content for m in pair.messages)
+            if not combined.strip():
+                logger.info(
+                    "SEGMENT skip_empty turn=%d global=%d content_len=%d",
+                    i, turn_offset + i, len(combined),
+                )
+                continue
+
             # Check index first — avoid redundant LLM call
             global_turn = turn_offset + i
             entry = self._turn_tag_index.get_tags_for_turn(global_turn) if self._turn_tag_index else None
@@ -91,7 +100,11 @@ class TopicSegmenter:
                     source="index",
                 )
             else:
-                combined = " ".join(m.content for m in pair.messages)
+                logger.info(
+                    "SEGMENT index_miss turn=%d global=%d index_size=%d — falling back to LLM",
+                    i, global_turn,
+                    len(self._turn_tag_index.entries) if self._turn_tag_index else 0,
+                )
                 tag_result = self.tag_generator.generate_tags(combined)
             tagged.append((pair, tag_result))
             preview = " ".join(m.content for m in pair.messages)[:60].replace("\n", " ")
