@@ -6,6 +6,7 @@ and helpers.py to depend on without circular import risk.
 
 from __future__ import annotations
 
+import json
 import re
 
 # ---------------------------------------------------------------------------
@@ -30,10 +31,10 @@ _MESSAGE_ID_RE = re.compile(r"\n?\[message_id:\s*\d+\]\s*$")
 # Matches any client that wraps structured metadata in labeled fenced JSON.
 # Only matches at string start (after lstrip) — won't eat user code fences.
 _METADATA_BLOCK_RE = re.compile(
-    r"^[A-Z][^\n]{0,80}\([^\)]*\)\s*:\s*\n"  # "Label (qualifier):\n"
-    r"```(?:json)?\s*\n"                       # opening fence
-    r"(?:\{[^`]*?\}|\[[^`]*?\])\s*\n"          # JSON object or array
-    r"```\s*\n?",                               # closing fence
+    r"^([A-Z][^\n(]{0,80})\s*\(([^\)]*)\)\s*:\s*\n"  # "Label (qualifier):\n"
+    r"```(?:json)?\s*\n"                               # opening fence
+    r"(\{[^`]*?\}|\[[^`]*?\])\s*\n"                    # JSON object or array
+    r"```\s*\n?",                                       # closing fence
     re.DOTALL,
 )
 
@@ -56,8 +57,8 @@ def _strip_vc_prompt(text: str) -> str:
     return text
 
 
-def _strip_envelope(text: str) -> str:
-    """Strip message envelope metadata to extract actual conversational content.
+def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
+    """Strip envelope metadata and return both clean text and parsed metadata.
 
     Handles (in order):
 
@@ -69,14 +70,21 @@ def _strip_envelope(text: str) -> str:
        Strips any number of fenced JSON blocks with labeled headers from the
        front of the message. These are injected by various clients (OpenClaw,
        Telegram adapters, etc.) and contain routing/sender metadata.
+       Each block's parsed JSON is collected into the metadata dict, keyed by
+       the lowercase label (e.g. ``"sender"``, ``"conversation info"``).
     5. ``System: [TIMESTAMP] event`` lines prepended by OpenClaw
     6. ``[ChannelName ... id:NNN ...] `` header (Telegram, WhatsApp, etc.)
     7. ``[message_id: NNN]`` footer
 
-    Returns the actual conversational content with all metadata removed.
+    Returns:
+        A tuple of (stripped_text, metadata_dict).  The metadata dict maps
+        lowercase labels to parsed JSON objects.  If no metadata blocks are
+        found (or JSON is malformed), the dict is empty.
     """
+    metadata: dict = {}
+
     if not text:
-        return text
+        return text, metadata
 
     # 1. Strip [vc:prompt] marker and any trailing whitespace
     if text.startswith(_VC_PROMPT_MARKER):
@@ -91,13 +99,21 @@ def _strip_envelope(text: str) -> str:
     # 2. Handle [vc:user]...[/vc:user] — inner content is already clean
     m = _VC_USER_RE.match(text)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip(), metadata
 
     # 3. Strip labeled metadata blocks from the front
     while True:
         stripped = text.lstrip()
         m = _METADATA_BLOCK_RE.match(stripped)
         if m:
+            label = m.group(1).strip().lower()
+            json_body = m.group(3)
+            try:
+                parsed = json.loads(json_body)
+                if isinstance(parsed, (dict, list)):
+                    metadata[label] = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass  # malformed JSON — skip metadata but still strip the block
             text = stripped[m.end():]
         else:
             text = stripped
@@ -112,7 +128,18 @@ def _strip_envelope(text: str) -> str:
     # 6. Strip [message_id: NNN] footer
     text = _MESSAGE_ID_RE.sub("", text)
 
-    return text.strip()
+    return text.strip(), metadata
+
+
+def _strip_envelope(text: str) -> str:
+    """Strip message envelope metadata to extract actual conversational content.
+
+    Thin wrapper around :func:`_extract_envelope_metadata` that discards the
+    metadata dict and returns only the cleaned text.  All 25+ existing callers
+    are unaffected.
+    """
+    stripped, _ = _extract_envelope_metadata(text)
+    return stripped
 
 
 # Backward-compatible alias
