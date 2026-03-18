@@ -302,6 +302,13 @@ class DomainCompactor:
         conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
 
+        # DIAGNOSTIC: log compactor input for each segment
+        logger.info(
+            "COMPACTOR_INPUT ref=%s tag=%s tokens=%d text_preview=\"%s\"",
+            segment.id[:8], segment.primary_tag, original_tokens,
+            conversation_text[:300].replace("\n", "\\n"),
+        )
+
         target_tokens = max(
             self.config.min_summary_tokens,
             min(
@@ -389,6 +396,13 @@ class DomainCompactor:
 
         summary = parsed.get("summary", "")
         summary_tokens = self.token_counter(summary)
+
+        # DIAGNOSTIC: log compactor output
+        logger.info(
+            "COMPACTOR_OUTPUT ref=%s tag=%s summary_preview=\"%s\"",
+            segment.id[:8], segment.primary_tag,
+            summary[:200].replace("\n", "\\n"),
+        )
 
         # Always preserve original segment tags (source of truth from TurnTagIndex).
         # LLM refined_tags and related_tags can ADD new tags but never remove originals.
