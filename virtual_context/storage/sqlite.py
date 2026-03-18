@@ -811,7 +811,7 @@ class SQLiteStore(ContextStore):
 
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         conn = self._get_conn()
-        if conversation_id:
+        if conversation_id is not None:
             rows = conn.execute("""
                 SELECT st.tag,
                        COUNT(DISTINCT st.segment_ref) as usage_count,
