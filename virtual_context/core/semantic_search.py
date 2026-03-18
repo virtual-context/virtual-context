@@ -250,7 +250,7 @@ class SemanticSearchManager:
 
     def context_is_relevant(
         self, current_text: str, context_pairs: list[str],
-    ) -> bool:
+    ) -> bool | tuple[bool, float]:
         """Check if current turn is semantically similar to the most recent context pair.
 
         Compares the current turn's combined text against the last user+assistant
@@ -258,9 +258,19 @@ class SemanticSearchManager:
         Returns ``True`` (pass context) when similarity >= threshold, or when
         embeddings are unavailable (graceful degradation).
         """
+        return self.context_is_relevant_with_score(current_text, context_pairs)[0]
+
+    def context_is_relevant_with_score(
+        self, current_text: str, context_pairs: list[str],
+    ) -> tuple[bool, float]:
+        """Like context_is_relevant but also returns the cosine similarity score.
+
+        Returns (is_relevant, similarity). When embeddings are unavailable,
+        returns (True, -1.0) to indicate graceful pass-through.
+        """
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
-            return True
+            return True, -1.0
 
         # Compare against the most recent pair in context
         if len(context_pairs) >= 2:
@@ -273,4 +283,4 @@ class SemanticSearchManager:
         threshold = self._config.tag_generator.context_bleed_threshold
 
         logger.debug("Context bleed gate: sim=%.3f threshold=%.3f", sim, threshold)
-        return sim >= threshold
+        return sim >= threshold, sim

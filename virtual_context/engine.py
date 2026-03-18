@@ -1489,6 +1489,12 @@ class VirtualContextEngine:
         """Check if current turn is semantically similar to the most recent context pair."""
         return self._semantic.context_is_relevant(current_text, context_pairs)
 
+    def _context_is_relevant_with_score(
+        self, current_text: str, context_pairs: list[str],
+    ) -> tuple[bool, float]:
+        """Like _context_is_relevant but also returns the similarity score."""
+        return self._semantic.context_is_relevant_with_score(current_text, context_pairs)
+
     def _get_recent_context(
         self, history: list[Message], n_pairs: int, exclude_last: int = 2,
         current_text: str | None = None,
@@ -1656,6 +1662,15 @@ class VirtualContextEngine:
                 running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
+            _turn_num = i // 2
+            _content_preview = combined_text[:60].replace("\n", " ")
+
+            # Flag short content that may be dominated by context
+            if len(combined_text) < 80:
+                logger.info(
+                    "TAGGER turn=%d SHORT_CONTENT len=%d \"%s\"",
+                    _turn_num, len(combined_text), _content_preview,
+                )
 
             # Build context from preceding pairs in the flat history
             context: list[str] | None = None
@@ -1669,15 +1684,36 @@ class VirtualContextEngine:
                 context = ctx_pairs if ctx_pairs else None
 
             # Context bleed gate (BUG-010): skip stale context on topic shift
+            _bleed_gate = "no_context"
+            _bleed_sim = -1.0
             if (
                 context
                 and self.config.tag_generator.context_bleed_threshold > 0
-                and not self._context_is_relevant(combined_text, context)
             ):
-                context = None
+                _relevant, _bleed_sim = self._context_is_relevant_with_score(combined_text, context)
+                if not _relevant:
+                    _bleed_gate = f"BLOCKED (similarity={_bleed_sim:.2f} threshold={self.config.tag_generator.context_bleed_threshold})"
+                    context = None
+                else:
+                    _bleed_gate = f"passed (similarity={_bleed_sim:.2f})"
+            elif context:
+                _bleed_gate = "disabled"
+
+            _ctx_preview = context[-2][:60].replace("\n", " ") if context and len(context) >= 2 else ""
+            logger.info(
+                "TAGGER turn=%d content_len=%d content_preview=\"%s\" "
+                "context_pairs=%d context_preview=\"%s\" bleed_gate=%s",
+                _turn_num, len(combined_text), _content_preview,
+                len(context) // 2 if context else 0, _ctx_preview, _bleed_gate,
+            )
 
             tag_result = self._tag_generator.generate_tags(
                 combined_text, store_tags, context_turns=context,
+            )
+
+            logger.info(
+                "TAGGER turn=%d result primary=%s tags=%s source=%s",
+                _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
             )
 
             # Retry with expanded context on _general
@@ -1689,15 +1725,28 @@ class VirtualContextEngine:
                         expanded_ctx.append(history_pairs[j].content)
                         expanded_ctx.append(history_pairs[j + 1].content)
                 # Gate expanded context too
+                _expanded_gate = "no_context"
                 if (
                     expanded_ctx
                     and self.config.tag_generator.context_bleed_threshold > 0
-                    and not self._context_is_relevant(combined_text, expanded_ctx)
                 ):
-                    expanded_ctx = []
+                    _rel, _sim = self._context_is_relevant_with_score(combined_text, expanded_ctx)
+                    if not _rel:
+                        _expanded_gate = f"BLOCKED (similarity={_sim:.2f})"
+                        expanded_ctx = []
+                    else:
+                        _expanded_gate = f"passed (similarity={_sim:.2f})"
                 if expanded_ctx:
+                    logger.info(
+                        "TAGGER turn=%d retry=expanded_context expanded_pairs=%d bleed_gate=%s",
+                        _turn_num, len(expanded_ctx) // 2, _expanded_gate,
+                    )
                     tag_result = self._tag_generator.generate_tags(
                         combined_text, store_tags, context_turns=expanded_ctx,
+                    )
+                    logger.info(
+                        "TAGGER turn=%d retry_result primary=%s tags=%s source=%s",
+                        _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
                     )
 
             # Final fallback: inherit from most recent meaningful turn
@@ -1708,6 +1757,10 @@ class VirtualContextEngine:
                         tags=list(prev.tags),
                         primary=prev.primary_tag,
                         source="inherited",
+                    )
+                    logger.info(
+                        "TAGGER turn=%d fallback=inherited from_turn=%d tags=%s",
+                        _turn_num, prev.turn_number, sorted(prev.tags),
                     )
 
             entry = TurnTagEntry(
