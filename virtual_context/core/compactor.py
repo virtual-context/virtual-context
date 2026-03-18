@@ -21,6 +21,7 @@ from ..types import (
     TagPromptRule,
     TagSummary,
     TemporalStatus,
+    get_sender_name,
 )
 from .llm_utils import normalize_tag, parse_llm_json
 from .telemetry import TelemetryLedger
@@ -126,7 +127,7 @@ Also extract facts from the RAW CONVERSATION TEXT above (not from your summary).
 The summary may omit details — facts must capture ALL substantive information
 from every speaker in the conversation, even details not included in the summary.
 For each fact:
-- "subject": who — use the actual name when conversation metadata identifies the sender (e.g. if metadata shows sender "Sania", the subject is "Sania", not "user"). When no name is available, use "user". For people mentioned but not speaking, use their name.
+- "subject": who — use the actual name when conversation metadata identifies the sender (e.g. if metadata shows sender "Bob", the subject is "Bob", not "user"). When no name is available, use "user". For people mentioned but not speaking, use their name.
 - "verb": the EXACT action verb from the conversation text (e.g. "led", "built", "prefers", "lives in", "ordered")
   VERB RULE: Use the verb that matches the actual event described.
   When someone says "we were given X", the verb is "were given" — NOT "mentioned" or "discussed".
@@ -540,11 +541,12 @@ class DomainCompactor:
             ts = ""
             if m.timestamp:
                 ts = f" ({m.timestamp.strftime('%H:%M')})"
+            label = get_sender_name(m.metadata) or m.role.capitalize()
             if m.raw_content:
                 parts = self._render_raw_content(m.raw_content, tool_name_map)
-                lines.append(f"{m.role.capitalize()}{ts}: {parts}")
+                lines.append(f"{label}{ts}: {parts}")
             else:
-                lines.append(f"{m.role.capitalize()}{ts}: {m.content}")
+                lines.append(f"{label}{ts}: {m.content}")
         return "\n\n".join(lines)
 
     @staticmethod
