@@ -1133,6 +1133,7 @@ class SQLiteStore(ContextStore):
                      "object": fs.object, "status": fs.status}
                     for fs in e.fact_signals
                 ] if e.fact_signals else [],
+                "sender": e.sender,
             }
             for e in state.turn_tag_entries
         ])
@@ -1206,6 +1207,7 @@ class SQLiteStore(ContextStore):
                     )
                     for fs in e.get("fact_signals", [])
                 ],
+                sender=e.get("sender", ""),
             )
             for e in entries_raw
         ]

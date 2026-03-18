@@ -630,6 +630,7 @@ class FilesystemStore(ContextStore):
                     "primary_tag": e.primary_tag,
                     "timestamp": _dt_to_str(e.timestamp),
                     "session_date": e.session_date,
+                    "sender": e.sender,
                 }
                 for e in state.turn_tag_entries
             ],
@@ -658,6 +659,7 @@ class FilesystemStore(ContextStore):
                 primary_tag=e["primary_tag"],
                 timestamp=_str_to_dt(e["timestamp"]),
                 session_date=e.get("session_date", ""),
+                sender=e.get("sender", ""),
             )
             for e in data.get("turn_tag_entries", [])
         ]

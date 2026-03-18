@@ -171,3 +171,59 @@ class TestHistoryPairsMetadata:
         }
         pairs = fmt.extract_history_pairs(body)
         assert pairs[0].metadata is None or pairs[0].metadata == {}
+
+
+class TestTurnTagEntrySender:
+    def test_turn_tag_entry_has_sender_field(self):
+        from virtual_context.types import TurnTagEntry
+        entry = TurnTagEntry(
+            turn_number=0, message_hash="abc123",
+            tags=["cooking"], primary_tag="cooking",
+            sender="Sania",
+        )
+        assert entry.sender == "Sania"
+
+    def test_sender_defaults_to_empty(self):
+        from virtual_context.types import TurnTagEntry
+        entry = TurnTagEntry(turn_number=0, message_hash="abc123")
+        assert entry.sender == ""
+
+    def test_sqlite_round_trip_preserves_sender(self, tmp_path):
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import TurnTagEntry, EngineStateSnapshot
+        store = SQLiteStore(db_path=str(tmp_path / "test.db"))
+        entry = TurnTagEntry(
+            turn_number=0, message_hash="abc123",
+            tags=["cooking"], primary_tag="cooking",
+            sender="Sania",
+        )
+        state = EngineStateSnapshot(
+            conversation_id="test-conv",
+            compacted_through=0,
+            turn_count=1,
+            turn_tag_entries=[entry],
+        )
+        store.save_engine_state(state)
+        loaded = store.load_engine_state("test-conv")
+        assert loaded is not None
+        assert loaded.turn_tag_entries[0].sender == "Sania"
+
+    def test_sqlite_round_trip_missing_sender_defaults_empty(self, tmp_path):
+        """Old state without sender field should deserialize with empty string."""
+        from virtual_context.storage.sqlite import SQLiteStore
+        from virtual_context.types import TurnTagEntry, EngineStateSnapshot
+        store = SQLiteStore(db_path=str(tmp_path / "test.db"))
+        entry = TurnTagEntry(
+            turn_number=0, message_hash="abc123",
+            tags=["cooking"], primary_tag="cooking",
+        )
+        state = EngineStateSnapshot(
+            conversation_id="test-conv",
+            compacted_through=0,
+            turn_count=1,
+            turn_tag_entries=[entry],
+        )
+        store.save_engine_state(state)
+        loaded = store.load_engine_state("test-conv")
+        assert loaded is not None
+        assert loaded.turn_tag_entries[0].sender == ""
