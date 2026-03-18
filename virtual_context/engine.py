@@ -524,6 +524,28 @@ class VirtualContextEngine:
             len(self._working_set),
         )
 
+        # Validate watermark against actual stored segments.
+        # If the store has no segments for this conversation (e.g., user deleted
+        # the conversation or segments were purged), reset the watermark so
+        # ingested history can be compacted fresh.
+        if self._compacted_through > 0:
+            try:
+                segs = self._store.get_segments_by_tags(
+                    tags=["_general"], min_overlap=0, limit=1,
+                    conversation_id=self.config.conversation_id,
+                )
+                # Also check if ANY tag has segments
+                if not segs:
+                    tags = self._store.get_all_tags(conversation_id=self.config.conversation_id)
+                    if not tags:
+                        logger.warning(
+                            "Watermark=%d but store has no segments for conversation %s — resetting to 0",
+                            self._compacted_through, self.config.conversation_id[:12],
+                        )
+                        self._compacted_through = 0
+            except Exception:
+                pass  # Don't crash on validation failure
+
     def _bootstrap_vocabulary(self) -> None:
         """Load historical tag frequencies into the tagger's vocabulary.
 
