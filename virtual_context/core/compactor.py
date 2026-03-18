@@ -587,8 +587,29 @@ class DomainCompactor:
         result = parse_llm_json(response)
         if result:
             return result
+        # parse_llm_json failed — raw response becomes summary fallback.
+        # Safety net: if the raw text looks like our JSON schema, try
+        # a lenient extraction of just the "summary" field so we don't
+        # store the entire JSON blob as the summary text.
+        text = response.strip()
+        if '"summary"' in text:
+            import re as _re
+            m = _re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if m:
+                logger.info(
+                    "Recovered summary field from unparseable JSON response (len=%d)",
+                    len(text),
+                )
+                return {
+                    "summary": m.group(1).replace('\\"', '"').replace("\\n", "\n"),
+                    "entities": [],
+                    "key_decisions": [],
+                    "action_items": [],
+                    "date_references": [],
+                    "refined_tags": [],
+                }
         return {
-            "summary": response.strip(),
+            "summary": text,
             "entities": [],
             "key_decisions": [],
             "action_items": [],
