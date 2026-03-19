@@ -67,6 +67,55 @@ class Fact:
     # Knowledge update chain
     superseded_by: str | None = None  # fact_id that replaces this fact
 
+    @classmethod
+    def from_dict(cls, d: dict, *, dt_parser=None) -> Fact:
+        """Build a Fact from a storage row/dict.
+
+        Handles JSON-encoded ``tags_json`` and ``turn_numbers_json``,
+        graph-backend ``where_val`` key, and optional datetime parsing
+        via *dt_parser* (defaults to ``datetime.fromisoformat``).
+        """
+        import json as _json
+
+        if dt_parser is None:
+            def dt_parser(s):
+                dt = datetime.fromisoformat(s)
+                return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+        mentioned_raw = d.get("mentioned_at")
+        mentioned = dt_parser(mentioned_raw) if mentioned_raw else datetime.now(timezone.utc)
+
+        tags_raw = d.get("tags_json", "[]")
+        tags = _json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
+
+        turns_raw = d.get("turn_numbers_json", "[]")
+        turn_numbers = _json.loads(turns_raw) if isinstance(turns_raw, str) else (turns_raw or [])
+
+        sup = d.get("superseded_by")
+        if sup == "":
+            sup = None
+
+        return cls(
+            id=d["id"],
+            subject=d.get("subject", ""),
+            verb=d.get("verb", ""),
+            object=d.get("object", ""),
+            status=d.get("status", "active"),
+            what=d.get("what", ""),
+            who=d.get("who", ""),
+            when_date=d.get("when_date", ""),
+            where=d.get("where", d.get("where_val", "")),
+            why=d.get("why", ""),
+            fact_type=d.get("fact_type", "personal"),
+            tags=tags,
+            segment_ref=d.get("segment_ref", ""),
+            conversation_id=d.get("conversation_id", ""),
+            turn_numbers=turn_numbers,
+            mentioned_at=mentioned,
+            session_date=d.get("session_date", ""),
+            superseded_by=sup,
+        )
+
     def format_for_prompt(self, include_index: int | None = None) -> str:
         """Canonical one-line rendering for LLM prompts.
 
@@ -497,17 +546,6 @@ class RetrievalResult:
 # Cost Tracking
 # ---------------------------------------------------------------------------
 
-@dataclass
-class SessionCostSummary:
-    """Running session cost totals."""
-    total_retrievals: int = 0
-    total_compactions: int = 0
-    total_tag_generations: int = 0
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    estimated_cost_usd: float = 0.0
-
-
 # ---------------------------------------------------------------------------
 # Paging (Virtual Memory Depth Control)
 # ---------------------------------------------------------------------------
@@ -749,6 +787,7 @@ class ProxyConfig:
     request_log_dir: str = ".virtualcontext/request_log"
     request_log_max_files: int = 50
     upstream_context_limit: int = 200_000  # max tokens the upstream model accepts
+    history_widening_threshold: float = 0.10  # 10% growth + prefix change triggers re-ingest
     instances: list[ProxyInstanceConfig] = field(default_factory=list)
 
 
