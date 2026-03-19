@@ -104,6 +104,7 @@ in favor of technical details.
 
 When speakers are identified by name in the conversation (e.g. "Alice (14:30):"), always use their
 actual name in the summary. Never replace a named speaker with "User" or "the user".
+"Assistant" is a valid speaker label — do not replace it with a person's name from elsewhere.
 
 Be concise but retain enough detail that the conversation could be resumed from this summary.
 The summary should be {target_tokens} tokens or fewer.
