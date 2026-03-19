@@ -189,6 +189,12 @@ class TopicSegmenter:
         if current_group:
             segments.append(self._build_segment(current_group, group_session))
 
+        # Reassign _stub segments to their chronologically nearest neighbor.
+        # A stub between segments inherits tags from whichever neighbor is
+        # temporally closer — handles both "end of session image" (attach backward)
+        # and "morning image to start new conversation" (attach forward).
+        segments = self._reassign_stub_segments(segments)
+
         if self.config.tool_result_segment_threshold > 0:
             segments = self._split_large_tool_results(segments)
 
@@ -297,6 +303,49 @@ class TopicSegmenter:
             session_date or start_ts.strftime("%Y-%m-%dT%H:%M") if start_ts else "",
         )
         return seg
+
+    @staticmethod
+    def _reassign_stub_segments(segments: list[TaggedSegment]) -> list[TaggedSegment]:
+        """Reassign _stub segments to their chronologically nearest neighbor.
+
+        A stub between two real segments inherits tags from whichever is
+        temporally closer. Stubs at the edges inherit from their only neighbor.
+        """
+        if not segments:
+            return segments
+
+        stub_indices = [i for i, s in enumerate(segments) if s.primary_tag == "_stub"]
+        if not stub_indices:
+            return segments
+
+        for idx in stub_indices:
+            stub = segments[idx]
+            prev_seg = segments[idx - 1] if idx > 0 else None
+            next_seg = segments[idx + 1] if idx + 1 < len(segments) else None
+
+            # Skip if both neighbors are also stubs or don't exist
+            donor = None
+            if prev_seg and prev_seg.primary_tag != "_stub" and next_seg and next_seg.primary_tag != "_stub":
+                # Both neighbors are real — pick the temporally closer one
+                stub_ts = stub.start_timestamp
+                prev_gap = abs((stub_ts - prev_seg.end_timestamp).total_seconds()) if prev_seg.end_timestamp else float("inf")
+                next_gap = abs((next_seg.start_timestamp - stub_ts).total_seconds()) if next_seg.start_timestamp else float("inf")
+                donor = prev_seg if prev_gap <= next_gap else next_seg
+            elif prev_seg and prev_seg.primary_tag != "_stub":
+                donor = prev_seg
+            elif next_seg and next_seg.primary_tag != "_stub":
+                donor = next_seg
+
+            if donor:
+                stub.primary_tag = donor.primary_tag
+                stub.tags = list(donor.tags)
+                logger.info(
+                    "SEGMENT stub_reassign ref=%s → inherited tags=%s from %s neighbor",
+                    stub.id[:8], sorted(stub.tags),
+                    "prev" if donor is prev_seg else "next",
+                )
+
+        return segments
 
     def _has_temporal_gap(self, last_pair: TurnPair, new_pair: TurnPair) -> bool:
         """Check if there's a significant time gap between two turn pairs.
