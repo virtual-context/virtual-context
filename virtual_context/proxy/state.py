@@ -560,6 +560,18 @@ class ProxyState:
                 )
                 return
 
+            # Slice past already-ingested turns to avoid re-tagging and index collision.
+            # The persisted TurnTagIndex already has entries 0..existing_turns-1.
+            if existing_turns > 0:
+                logger.info(
+                    "Slicing history past %d existing turns (needed=%d)",
+                    existing_turns, needed_turns,
+                )
+                history_pairs = list(history_pairs[existing_turns * 2:])
+                if not history_pairs:
+                    self._ingested_conversations.add(conversation_id)
+                    return
+
             # ---- PROXY-013: cancel-and-resume if already running ----
             if (
                 self._ingestion_thread is not None
