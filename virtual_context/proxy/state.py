@@ -763,7 +763,7 @@ class ProxyState:
                     "total": _total,
                 })
 
-        turns = self.engine.ingest_history(pairs, progress_callback=on_progress)
+        turns = self.engine.ingest_history(pairs, progress_callback=on_progress, turn_offset=baseline)
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
         print(

@@ -1661,6 +1661,7 @@ class VirtualContextEngine:
         self,
         history_pairs: list[Message],
         progress_callback: Callable[..., None] | None = None,
+        turn_offset: int = 0,
     ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
@@ -1671,6 +1672,9 @@ class VirtualContextEngine:
             history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
             progress_callback: Optional ``(done, total, entry)`` called after
                 each turn is ingested.  Used by the proxy for live progress.
+            turn_offset: Global turn number of the first pair. Used by catch-up
+                ingestion to prevent TurnTagIndex overwrites when multiple
+                batches are ingested sequentially.
 
         Returns:
             Number of turns ingested.
@@ -1734,7 +1738,7 @@ class VirtualContextEngine:
                 running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
-            _turn_num = i // 2
+            _turn_num = turn_offset + (i // 2)  # global turn number
             _content_preview = combined_text[:60].replace("\n", " ")
 
             # Flag short content that may be dominated by context
@@ -1836,7 +1840,7 @@ class VirtualContextEngine:
                     )
 
             entry = TurnTagEntry(
-                turn_number=i // 2,
+                turn_number=turn_offset + (i // 2),
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
