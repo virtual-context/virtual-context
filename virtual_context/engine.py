@@ -60,6 +60,36 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ISO_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
+# Patterns for stub content detection (media attachments, image placeholders, etc.)
+_STUB_PATTERNS = [
+    re.compile(r"\[image data removed[^\]]*\]"),
+    re.compile(r"\[media attached:[^\]]*\]"),
+    re.compile(r"\[file attached[^\]]*\]"),
+    re.compile(r"\[attachment:[^\]]*\]"),
+    re.compile(r"To send an image back to the user.*", re.IGNORECASE),
+]
+
+
+def _is_stub_content(text: str) -> bool:
+    """Check if text is a stub (attachments, image placeholders, boilerplate) with no real user content.
+
+    Returns True only when the text contains at least one stub pattern AND
+    after stripping all stub patterns, fewer than 3 words of actual content remain.
+    Plain short messages ("im good", "ok") are NOT stubs — they're real conversation.
+    """
+    if not text or not text.strip():
+        return True
+    # Must contain at least one stub pattern to be considered a stub
+    has_stub = any(pattern.search(text) for pattern in _STUB_PATTERNS)
+    if not has_stub:
+        return False
+    residual = text
+    for pattern in _STUB_PATTERNS:
+        residual = pattern.sub("", residual)
+    residual = residual.strip()
+    return len(residual.split()) < 3
+
+
 from .core.math_utils import cosine_similarity as _cosine_sim
 from .core.paging_manager import PagingManager
 from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions
@@ -1729,13 +1759,45 @@ class VirtualContextEngine:
                 logger.debug("Skipping empty turn at pair index %d", i // 2)
                 continue
 
-            # Track running session date from [Session from ...] headers,
-            # envelope metadata timestamps, or Message.timestamp
+            # Track running session date BEFORE stub/tagger — stubs need timestamps too
             m = _SESSION_HEADER_RE.search(user_msg.content)
             if m:
                 running_session_date = m.group(1)
             elif user_msg.timestamp:
                 running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+
+            # Stub turns (media attachments, image placeholders, etc.):
+            # skip tagger, assign _stub tag, preserve raw text for passthrough.
+            combined_for_stub = f"{user_msg.content} {asst_msg.content}"
+            if _is_stub_content(combined_for_stub):
+                entry = TurnTagEntry(
+                    turn_number=turn_offset + (i // 2),
+                    message_hash=hashlib.sha256(combined_for_stub.encode()).hexdigest()[:16],
+                    tags=["_stub"],
+                    primary_tag="_stub",
+                    sender=sender or "",
+                    session_date=running_session_date,
+                )
+                self._turn_tag_index.append(entry)
+                try:
+                    self._store.save_turn_message(
+                        self.config.conversation_id,
+                        entry.turn_number,
+                        user_msg.content,
+                        asst_msg.content,
+                    )
+                except Exception:
+                    pass
+                ingested += 1
+                logger.info(
+                    "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
+                    turn_offset + (i // 2), len(combined_for_stub),
+                    combined_for_stub[:60].replace("\n", " "),
+                )
+                if progress_callback:
+                    total = len(history_pairs) // 2
+                    progress_callback(ingested, total, entry)
+                continue
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
             _turn_num = turn_offset + (i // 2)  # global turn number
