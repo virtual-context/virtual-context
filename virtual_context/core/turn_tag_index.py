@@ -20,6 +20,15 @@ class TurnTagIndex:
         self._by_hash: dict[str, TurnTagEntry] = {}
 
     def append(self, entry: TurnTagEntry) -> None:
+        if entry.turn_number in self._by_turn:
+            import logging
+            logging.getLogger(__name__).warning(
+                "OVERWRITE_BLOCKED turn=%d existing_tags=%s new_tags=%s — keeping original",
+                entry.turn_number,
+                self._by_turn[entry.turn_number].tags,
+                entry.tags,
+            )
+            return  # silently reject duplicate turn_number
         self.entries.append(entry)
         self._by_turn[entry.turn_number] = entry
         if entry.message_hash:

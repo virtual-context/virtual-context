@@ -3431,7 +3431,7 @@ class TestSessionStateMachine:
         ingestion_calls = []
         progress_events = []
 
-        def slow_ingest(pairs, progress_callback=None):
+        def slow_ingest(pairs, progress_callback=None, turn_offset=0):
             """Simulate slow ingestion — record each call's pair count."""
             ingestion_calls.append(len(pairs) // 2)
             # Simulate tagging each pair
@@ -3502,7 +3502,7 @@ class TestSessionStateMachine:
 
         ingestion_calls = []
 
-        def slow_ingest(pairs, progress_callback=None):
+        def slow_ingest(pairs, progress_callback=None, turn_offset=0):
             """Simulate slow ingestion — record each call's pair count."""
             ingestion_calls.append(len(pairs) // 2)
             n = len(pairs) // 2
