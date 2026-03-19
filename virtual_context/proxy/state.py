@@ -545,6 +545,13 @@ class ProxyState:
             if conversation_id in self._ingested_conversations:
                 return
 
+            logger.info(
+                "INGEST_ENTRY conversation=%s pairs=%d index_size=%d thread_alive=%s",
+                conversation_id[:12], len(history_pairs) // 2,
+                len(self.engine._turn_tag_index.entries),
+                self._ingestion_thread is not None and self._ingestion_thread.is_alive(),
+            )
+
             if not history_pairs:
                 self._ingested_conversations.add(conversation_id)
                 return
@@ -561,8 +568,13 @@ class ProxyState:
                 return
 
             # Slice past already-ingested turns to avoid re-tagging and index collision.
-            # The persisted TurnTagIndex already has entries 0..existing_turns-1.
-            if existing_turns > 0:
+            # Only when NO ingestion is running (persisted state resume case).
+            # If ingestion IS running, the cancel-and-resume path handles slicing.
+            _thread_running = (
+                self._ingestion_thread is not None
+                and self._ingestion_thread.is_alive()
+            )
+            if existing_turns > 0 and not _thread_running:
                 logger.info(
                     "Slicing history past %d existing turns (needed=%d)",
                     existing_turns, needed_turns,
@@ -742,6 +754,12 @@ class ProxyState:
         t0 = time.monotonic()
         baseline_history_tokens = 0
         _total = cumulative_total if cumulative_total is not None else baseline + len(pairs) // 2
+        logger.info(
+            "INGEST_BATCH baseline=%d cumulative_total=%s pairs=%d index_size=%d conversation=%s",
+            baseline, _total, len(pairs) // 2,
+            len(self.engine._turn_tag_index.entries),
+            conversation_id[:12],
+        )
 
         def on_progress(done: int, total: int, entry) -> None:
             nonlocal baseline_history_tokens
