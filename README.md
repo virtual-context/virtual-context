@@ -18,23 +18,29 @@ Layer 1: Segment summaries + Facts per tag           (compressed pages, per-topi
 Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-eye view)
 ```
 
-The result: an LLM that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.
+The result: an Agent that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.  
+
+
 
 ### Configurable Context Ceiling
 
-Most teams set `context_window` to whatever the model supports — 128K, 200K — and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 120K tokens of raw history are missed more often than the same facts concentrated in a managed 30K window.
+Most teams set `context_window` to whatever the model supports... 128K, 200K, 1M, and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200k tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
 
 virtual-context lets you set an artificial context ceiling well below the model's maximum:
 
 ```yaml
-context_window: 30000  # Run a 200K model at 30K
+context_window: 200000
+  compaction:
+    soft_threshold: 0.30 ## run a 200K model at 60k
+    hard_threshold: 0.90 
+
 ```
 
 The compression hierarchy (raw turns → segment summaries → tag summaries) keeps the window within this budget. When the ceiling is hit, compaction fires: stale turns are summarized, facts are extracted and indexed, and the working set reshapes around what's active. The result is a smaller, denser context where every token carries signal.
 
-**Cost impact:** A 200K-capable model running at 30K uses ~85% fewer input tokens per request. Over thousands of requests, this is the difference between a viable product and a cost problem.
+**Cost impact:** A 200K-capable model running at 60K uses ~70% fewer input tokens per request.
 
-**Quality impact:** Concentrated context means the model's attention isn't spread across 120K tokens of mostly-stale history. Relevant facts surface through targeted retrieval and structured tools rather than hoping the model notices them buried in a long window. The managed context window becomes a feature, not a limitation.
+**Quality impact:** Concentrated context means the model's attention isn't spread across 200K tokens of mostly-stale history. Relevant facts surface through targeted retrieval and structured tools rather than hoping the model notices them buried in a long window. The managed context window becomes a feature, not a limitation.
 
 ## Virtual-Context vs RAG vs Compaction
 
@@ -56,14 +62,19 @@ These approaches are complementary, but optimize different failure modes.
 
 virtual-context combines retrieval and compaction, then adds explicit tools for overview/time/fact recall under strict token budgets.
 
-dx
-## Install
+## Cloud Offering
+
+virtual-context.com offers the fastest way to get going, just sign up and change your base-url.  You'll get statistics, visibility into the context window and cost savings reports. 
+
+## Local Install
 
 ```bash
 pip install virtual-context
 ```
 
-Batteries included: Python 3.11+, all core dependencies in the base install. Optional storage backends: `pip install virtual-context[postgres]`, `[neo4j]`, or `[falkordb]`.
+Python 3.11+, all core dependencies in the base install. 
+
+Optional storage backends: `pip install virtual-context[postgres]`, `[neo4j]`, or `[falkordb]`.
 
 ## Getting Started
 
@@ -418,7 +429,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 Compaction mirrors OS page replacement:
 
-- **Soft threshold (70%)**: proactive compaction. Summarize now while there's headroom.
+- **Soft threshold (30%)**: proactive compaction. Summarize now while there's headroom.
 - **Hard threshold (85%)**: mandatory compaction. Summarize immediately or the context window overflows.
 
 Compaction is greedy-batch: everything between the watermark and the protected zone gets compacted in one pass, so it fires infrequently (one big batch instead of many small ones). Summarization runs concurrently via ThreadPoolExecutor, with order-preserving results, per-tag custom prompts, and per-segment progress logging. The summary prompt preserves exact numbers, proper nouns, and state assertions (e.g., "I now store sneakers on the shoe rack" is never softened to "plans to store").
