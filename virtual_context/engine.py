@@ -440,20 +440,18 @@ class VirtualContextEngine:
                 seg.id: segment_signals[seg.id]
                 for seg in batch if seg.id in segment_signals
             } or None
-            # Filter out tiny segments and stub segments — not worth LLM summarization.
-            # Pass through raw text as summary instead.
-            MIN_COMPACT_TOKENS = 10
+            # Filter out stub segments (media placeholders, image stubs) — not worth
+            # LLM summarization. Real short messages ("im good") should be compacted
+            # normally since they belong to their parent topic segment.
             def _is_passthrough(s):
-                if s.token_count < MIN_COMPACT_TOKENS:
-                    return True
                 text = " ".join(m.content for m in s.messages)
                 return _is_stub_content(text)
             compactable = [s for s in batch if not _is_passthrough(s)]
-            tiny = [s for s in batch if _is_passthrough(s)]
-            for seg in tiny:
+            stubs = [s for s in batch if _is_passthrough(s)]
+            for seg in stubs:
                 text = " ".join(m.content for m in seg.messages).strip()
                 logger.info(
-                    "SEGMENT skip_tiny ref=%s tokens=%d primary=%s — using raw text as summary",
+                    "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s — using raw text as summary",
                     seg.id[:8], seg.token_count, seg.primary_tag,
                 )
                 results_tiny = [CompactionResult(
