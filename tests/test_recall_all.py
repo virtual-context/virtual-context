@@ -67,12 +67,12 @@ class TestEngineRecallAll:
             tag="legal", summary="Legal overview.", summary_tokens=20,
             source_segment_refs=["seg-1"], covers_through_turn=5,
             created_at=now, updated_at=now,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine._store.save_tag_summary(TagSummary(
             tag="medical", summary="Medical overview.", summary_tokens=20,
             source_segment_refs=["seg-2"], covers_through_turn=5,
             created_at=now, updated_at=now,
-        ))
+        ), conversation_id=engine.config.conversation_id)
 
         result = engine.recall_all()
         assert result["found"] is True
@@ -94,7 +94,7 @@ class TestEngineRecallAll:
                 summary_tokens=50,  # 20 * 50 = 1000 > 500 budget
                 source_segment_refs=[f"seg-{i}"], covers_through_turn=5,
                 created_at=now, updated_at=now,
-            ))
+            ), conversation_id=engine.config.conversation_id)
 
         result = engine.recall_all()
         assert result["found"] is True
