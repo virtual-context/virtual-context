@@ -339,12 +339,9 @@ class DomainCompactor:
                     + "\n".join(hint_lines)
                 )
 
-        # Previous segment context for pronoun resolution.
-        # Skip for short segments (< 100 tokens) — there's nothing meaningful
-        # to resolve pronouns for, and the context overwhelms the actual content,
-        # causing the LLM to summarize the context instead of the segment.
+        # Previous segment context for pronoun resolution
         context_block = ""
-        if prev_context and original_tokens >= 100:
+        if prev_context:
             context_block = (
                 f"Previous conversation context (use ONLY for resolving pronouns "
                 f"like 'we', 'they', 'he', 'she' — do NOT summarize this):\n"
