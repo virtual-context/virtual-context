@@ -339,21 +339,35 @@ class DomainCompactor:
                     + "\n".join(hint_lines)
                 )
 
-        # Previous segment context for pronoun resolution
+        # Previous segment context for pronoun resolution — XML-tagged
+        # to structurally separate it from the segment to summarize.
         context_block = ""
         if prev_context:
             context_block = (
-                f"Previous conversation context (use ONLY for resolving pronouns "
-                f"like 'we', 'they', 'he', 'she' — do NOT summarize this):\n"
-                f"{prev_context}\n\n"
+                f"<context_for_pronoun_resolution_only>\n"
+                f"The following is prior conversation for resolving pronouns ONLY.\n"
+                f"DO NOT include any information from this block in your summary.\n"
+                f"{prev_context}\n"
+                f"</context_for_pronoun_resolution_only>\n\n"
             )
+
+        # Wrap conversation text in <segment_to_summarize> tags when
+        # prev_context is present, so the LLM can distinguish the two.
+        if prev_context:
+            conv_block = (
+                f"<segment_to_summarize>\n"
+                f"Conversation:\n{conversation_text}\n"
+                f"</segment_to_summarize>"
+            )
+        else:
+            conv_block = f"Conversation:\n{conversation_text}"
 
         if custom_prompt:
             prompt = (
                 f"{custom_prompt}\n\n"
                 f"Target length: {target_tokens} tokens or fewer.\n\n"
                 f"{context_block}"
-                f"Conversation:\n{conversation_text}"
+                f"{conv_block}"
                 f"{signals_text}\n\n"
                 'Respond with JSON: {{"summary": "...", "entities": ["..."], '
                 '"key_decisions": ["..."], "action_items": ["..."], '
@@ -365,7 +379,7 @@ class DomainCompactor:
             prompt = DEFAULT_SUMMARY_PROMPT.format(
                 tags=tags_str,
                 target_tokens=target_tokens,
-                conversation_text=context_block + conversation_text,
+                conversation_text=context_block + conv_block,
                 session_date=segment.session_date or "",
             )
             if signals_text:
@@ -375,6 +389,11 @@ class DomainCompactor:
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text."
         )
+        if prev_context:
+            system += (
+                " ONLY summarize content inside <segment_to_summarize> tags."
+                " NEVER include information from <context_for_pronoun_resolution_only> in your summary."
+            )
 
         try:
             t0 = time.time()
