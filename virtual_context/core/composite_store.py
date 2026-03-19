@@ -102,11 +102,11 @@ class CompositeStore:
     ) -> int:
         return self._segments.cleanup(max_age=max_age, max_total_tokens=max_total_tokens)
 
-    def save_tag_summary(self, tag_summary: TagSummary) -> None:
-        return self._segments.save_tag_summary(tag_summary)
+    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
+        return self._segments.save_tag_summary(tag_summary, conversation_id=conversation_id)
 
-    def get_tag_summary(self, tag: str) -> TagSummary | None:
-        return self._segments.get_tag_summary(tag)
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
+        return self._segments.get_tag_summary(tag, conversation_id=conversation_id)
 
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         return self._segments.get_all_tag_summaries(conversation_id=conversation_id)

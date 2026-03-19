@@ -490,7 +490,7 @@ class TestEnginePagingAPI:
             summary_tokens=30,
             source_segment_refs=[f"{tag}-seg-{i}" for i in range(n)],
             source_turn_numbers=list(range(n)),
-        ))
+        ), conversation_id=engine.config.conversation_id)
 
     def test_expand_disabled_returns_error(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
@@ -688,7 +688,7 @@ class TestCalculateDepthTokens:
         engine = self._make_engine(tmp_path)
         engine._store.save_tag_summary(TagSummary(
             tag="db", summary="Database summary.", summary_tokens=42,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         assert engine._calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
 
     def test_summary_missing_returns_zero(self, tmp_path):
@@ -702,6 +702,7 @@ class TestCalculateDepthTokens:
                 ref=f"s{i}", primary_tag="api", tags=["api"],
                 summary=f"Summary {i}", summary_tokens=10 * (i + 1),
                 full_text="text", full_tokens=100,
+                conversation_id=engine.config.conversation_id,
             ))
         # Should sum summary_tokens: 10 + 20 + 30 = 60
         assert engine._calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
@@ -831,7 +832,7 @@ class TestContextHintModes:
             summary=summary,
             summary_tokens=len(summary) // 4,
             source_turn_numbers=[0, 1, 2],
-        ))
+        ), conversation_id=engine.config.conversation_id)
 
     def test_default_hint_no_paging(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
@@ -954,7 +955,7 @@ class TestContextHintModes:
             description="Sania's cycle tracking via Mira",
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2],
-        ))
+        ), conversation_id=engine.config.conversation_id)
         hint = engine._build_context_hint(paging_mode="autonomous")
         assert "Sania's cycle tracking via Mira" in hint
 
@@ -967,7 +968,7 @@ class TestContextHintModes:
             description="",
             summary_tokens=20,
             source_turn_numbers=[0, 1],
-        ))
+        ), conversation_id=engine.config.conversation_id)
         hint = engine._build_context_hint(paging_mode="autonomous")
         assert "database" in hint
         # The " — " separator should not appear since description is empty
@@ -984,7 +985,7 @@ class TestContextHintModes:
             description="Weekly meal prep and grocery optimization",
             summary_tokens=25,
             source_turn_numbers=[0, 1, 2],
-        ))
+        ), conversation_id=engine.config.conversation_id)
         hint = engine._build_context_hint(paging_mode="supervised")
         assert "Weekly meal prep and grocery optimization" in hint
 
@@ -997,7 +998,7 @@ class TestContextHintModes:
             description="Interval training and HR zone programming",
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2, 3],
-        ))
+        ), conversation_id=engine.config.conversation_id)
         hint = engine._build_context_hint()
         # Default hint uses description when available instead of summary[:60]
         assert "Interval training and HR zone programming" in hint
@@ -1113,10 +1114,11 @@ class TestPagingStatePersistence:
             ref="seg-1", primary_tag="db", tags=["db"],
             summary="DB summary", summary_tokens=20,
             full_text="Full text", full_tokens=50,
+            conversation_id=engine.config.conversation_id,
         ))
         engine._store.save_tag_summary(TagSummary(
             tag="db", summary="Tag summary", summary_tokens=20,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine.expand_topic("db", depth="full")
         assert "db" in engine._working_set
 
@@ -1160,7 +1162,7 @@ class TestReassembleContext:
             tag="database",
             summary="Discussed PostgreSQL schema design and indexing.",
             summary_tokens=30,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine._store.store_segment(StoredSegment(
             ref="seg1",
             conversation_id=engine.config.conversation_id,
@@ -1170,6 +1172,7 @@ class TestReassembleContext:
             summary_tokens=20,
             full_text="User asked about database indexing. Assistant explained B-tree indexes.",
             full_tokens=50,
+            conversation_id=engine.config.conversation_id,
         ))
 
         # Simulate post-compaction state so context hint is generated
@@ -1260,7 +1263,7 @@ class TestTemporalNoBypass:
             summary="Discussed system architecture.",
             summary_tokens=20,
             source_turn_numbers=[0, 1],
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine._store.store_segment(StoredSegment(
             ref="seg-arch",
             conversation_id=engine.config.conversation_id,
@@ -1270,6 +1273,7 @@ class TestTemporalNoBypass:
             summary_tokens=15,
             full_text="Detailed architecture text with all implementation specifics. " * 20,
             full_tokens=300,
+            conversation_id=engine.config.conversation_id,
         ))
         engine._working_set = {
             "architecture": WorkingSetEntry(
@@ -1329,7 +1333,7 @@ class TestSegmentLoadingGate:
 
         engine._store.save_tag_summary(TagSummary(
             tag="api", summary="API discussion.", summary_tokens=15,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine._working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
         }
@@ -1360,11 +1364,12 @@ class TestSegmentLoadingGate:
 
         engine._store.save_tag_summary(TagSummary(
             tag="auth", summary="Auth discussion.", summary_tokens=15,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         engine._store.store_segment(StoredSegment(
             ref="seg-auth", primary_tag="auth", tags=["auth"],
             summary="Auth segment.", summary_tokens=10,
             full_text="Full auth text.", full_tokens=20,
+            conversation_id=engine.config.conversation_id,
         ))
         engine._working_set = {
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
@@ -1459,7 +1464,7 @@ class TestCrossTagSegmentDedup:
         for tag in ("api", "auth"):
             engine._store.save_tag_summary(TagSummary(
                 tag=tag, summary=f"{tag} summary.", summary_tokens=10,
-            ))
+            ), conversation_id=engine.config.conversation_id)
 
         # Put both tags in working set at FULL depth
         engine._working_set = {
@@ -1522,7 +1527,7 @@ class TestCrossTagSegmentDedup:
         for tag in ("api", "auth"):
             engine._store.save_tag_summary(TagSummary(
                 tag=tag, summary=f"{tag} summary.", summary_tokens=10,
-            ))
+            ), conversation_id=engine.config.conversation_id)
 
         # Put both tags at FULL depth
         engine._working_set = {

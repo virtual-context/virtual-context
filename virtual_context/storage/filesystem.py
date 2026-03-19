@@ -485,7 +485,7 @@ class FilesystemStore(ContextStore):
 
         return deleted
 
-    def save_tag_summary(self, tag_summary: TagSummary) -> None:
+    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
         ts_dir = self.root / "_tag_summaries"
         ts_dir.mkdir(parents=True, exist_ok=True)
         safe_tag = tag_summary.tag.replace("/", "_").replace("\\", "_").replace("..", "_")
@@ -503,7 +503,7 @@ class FilesystemStore(ContextStore):
         }
         path.write_text(json.dumps(data, indent=2))
 
-    def get_tag_summary(self, tag: str) -> TagSummary | None:
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         safe_tag = tag.replace("/", "_").replace("\\", "_").replace("..", "_")
         path = self.root / "_tag_summaries" / f"{safe_tag}.json"
         if not path.is_file():

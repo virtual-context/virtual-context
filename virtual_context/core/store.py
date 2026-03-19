@@ -78,12 +78,12 @@ class ContextStore(ABC):
         """Remove old/excess segments. Returns count deleted."""
 
     @abstractmethod
-    def save_tag_summary(self, tag_summary: TagSummary) -> None:
-        """Store or update a tag summary. Upsert on tag name."""
+    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
+        """Store or update a tag summary. Upsert on (tag, conversation_id)."""
 
     @abstractmethod
-    def get_tag_summary(self, tag: str) -> TagSummary | None:
-        """Retrieve a tag summary by tag name. None if not found."""
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
+        """Retrieve a tag summary by tag name and conversation. None if not found."""
 
     @abstractmethod
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:

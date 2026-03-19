@@ -413,7 +413,7 @@ class TestContextHintMentionsFindQuote:
             source_segment_refs=["seg-1"],
             source_turn_numbers=[1],
             covers_through_turn=5,
-        ))
+        ), conversation_id=engine.config.conversation_id)
         return engine
 
     def test_autonomous_hint_mentions_find_quote(self, tmp_path):

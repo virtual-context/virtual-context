@@ -1136,7 +1136,7 @@ class VirtualContextEngine:
                 # Load existing tag summaries for staleness check
                 existing_tag_summaries = {}
                 for tag in cover_tags:
-                    ts = self._store.get_tag_summary(tag)
+                    ts = self._store.get_tag_summary(tag, conversation_id=self.config.conversation_id)
                     if ts:
                         existing_tag_summaries[tag] = ts
 
@@ -1152,7 +1152,7 @@ class VirtualContextEngine:
                     )
 
                     for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(ts)
+                        self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
                         if progress_callback:
                             try:
                                 progress_callback(
@@ -1394,7 +1394,7 @@ class VirtualContextEngine:
             max_turn=max_turn,
         )
         for ts in summaries:
-            self._store.save_tag_summary(ts)
+            self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
 
     def filter_history(
         self,
@@ -1733,7 +1733,7 @@ class VirtualContextEngine:
                 self._tool_tag_counter += 1
                 tag_name = f"tool_{self._tool_tag_counter}"
                 entry = TurnTagEntry(
-                    turn_number=len(self._turn_tag_index.entries),
+                    turn_number=turn_offset + (i // 2),
                     message_hash=hashlib.sha256(
                         f"{user_msg.content} {asst_msg.content}".encode()
                     ).hexdigest()[:16],

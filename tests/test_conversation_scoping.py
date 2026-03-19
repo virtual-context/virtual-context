@@ -360,11 +360,11 @@ class TestScopingGapFixes:
         store.save_tag_summary(TagSummary(
             tag="cooking", summary="Cooking stuff.",
             summary_tokens=5, source_segment_refs=["a-1"],
-        ))
+        ), conversation_id="conv-a")
         store.save_tag_summary(TagSummary(
             tag="fitness", summary="Fitness stuff.",
             summary_tokens=5, source_segment_refs=["b-1"],
-        ))
+        ), conversation_id="conv-b")
         # Scoped to conv-a: should only see cooking
         summaries = store.get_all_tag_summaries(conversation_id="conv-a")
         tags = [ts.tag for ts in summaries]
@@ -393,11 +393,11 @@ class TestScopingGapFixes:
         store.save_tag_summary(TagSummary(
             tag="cooking", summary="Cooking stuff.",
             summary_tokens=5, source_segment_refs=["a-1"],
-        ))
+        ), conversation_id="conv-a")
         store.save_tag_summary(TagSummary(
             tag="fitness", summary="Fitness stuff.",
             summary_tokens=5, source_segment_refs=["b-1"],
-        ))
+        ), conversation_id="conv-b")
         summaries = store.get_all_tag_summaries()
         tags = [ts.tag for ts in summaries]
         assert "cooking" in tags
@@ -425,11 +425,11 @@ class TestScopingGapFixes:
         store.save_tag_summary(TagSummary(
             tag="cooking", summary="Cooking stuff.",
             summary_tokens=5, source_segment_refs=["a-1"],
-        ))
+        ), conversation_id="conv-a")
         store.save_tag_summary(TagSummary(
             tag="fitness", summary="Fitness stuff.",
             summary_tokens=5, source_segment_refs=["b-1"],
-        ))
+        ), conversation_id="conv-b")
         from virtual_context.core.composite_store import CompositeStore
 
         comp = CompositeStore(
@@ -469,12 +469,12 @@ class TestScopingGapFixes:
             tag="baking", summary="Baking.",
             description="chocolate cake baking",
             summary_tokens=5, source_segment_refs=["a-1"],
-        ))
+        ), conversation_id="conv-a")
         store.save_tag_summary(TagSummary(
             tag="woodworking", summary="Woodworking.",
             description="chocolate colored desk project",
             summary_tokens=5, source_segment_refs=["b-1"],
-        ))
+        ), conversation_id="conv-b")
         from virtual_context.core.quote_search import supplement_from_descriptions
 
         results = supplement_from_descriptions(

@@ -56,14 +56,16 @@ CREATE TABLE IF NOT EXISTS cost_log (
 );
 
 CREATE TABLE IF NOT EXISTS tag_summaries (
-    tag TEXT PRIMARY KEY,
+    tag TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     summary_tokens INTEGER NOT NULL DEFAULT 0,
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tag, conversation_id)
 );
 
 CREATE TABLE IF NOT EXISTS engine_state (
@@ -435,6 +437,38 @@ class SQLiteStore(ContextStore):
             """)
         except sqlite3.OperationalError:
             pass
+        # Migration: add conversation_id to tag_summaries (compound PK).
+        # Old schema had tag as sole PK — two conversations with the same tag
+        # would overwrite each other's summaries.
+        try:
+            conn.execute("SELECT conversation_id FROM tag_summaries LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist — migrate
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS tag_summaries_new (
+                    tag TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    summary_tokens INTEGER NOT NULL DEFAULT 0,
+                    source_segment_refs TEXT NOT NULL DEFAULT '[]',
+                    source_turn_numbers TEXT NOT NULL DEFAULT '[]',
+                    covers_through_turn INTEGER NOT NULL DEFAULT -1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tag, conversation_id)
+                );
+                INSERT OR IGNORE INTO tag_summaries_new
+                    (tag, conversation_id, summary, description, summary_tokens,
+                     source_segment_refs, source_turn_numbers, covers_through_turn,
+                     created_at, updated_at)
+                SELECT tag, '', summary, description, summary_tokens,
+                       source_segment_refs, source_turn_numbers, covers_through_turn,
+                       created_at, updated_at
+                FROM tag_summaries;
+                DROP TABLE tag_summaries;
+                ALTER TABLE tag_summaries_new RENAME TO tag_summaries;
+            """)
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -949,6 +983,9 @@ class SQLiteStore(ContextStore):
         conn.execute(
             "DELETE FROM turn_messages WHERE conversation_id = ?", (conversation_id,),
         )
+        conn.execute(
+            "DELETE FROM tag_summaries WHERE conversation_id = ?", (conversation_id,),
+        )
         conn.commit()
         return deleted
 
@@ -971,15 +1008,16 @@ class SQLiteStore(ContextStore):
         conn.commit()
         return deleted
 
-    def save_tag_summary(self, tag_summary: TagSummary) -> None:
+    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
         conn = self._get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO tag_summaries
-            (tag, summary, description, summary_tokens, source_segment_refs,
+            (tag, conversation_id, summary, description, summary_tokens, source_segment_refs,
              source_turn_numbers, covers_through_turn, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 tag_summary.tag,
+                conversation_id,
                 tag_summary.summary,
                 tag_summary.description,
                 tag_summary.summary_tokens,
@@ -992,10 +1030,10 @@ class SQLiteStore(ContextStore):
         )
         conn.commit()
 
-    def get_tag_summary(self, tag: str) -> TagSummary | None:
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT * FROM tag_summaries WHERE tag = ?", (tag,)
+            "SELECT * FROM tag_summaries WHERE tag = ? AND conversation_id = ?", (tag, conversation_id)
         ).fetchone()
         if not row:
             return None
@@ -1020,23 +1058,9 @@ class SQLiteStore(ContextStore):
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         conn = self._get_conn()
         if conversation_id is not None:
-            # Exclude tag summaries only when ALL source segments resolve to
-            # a different conversation.  Include when:
-            # 1. source_segment_refs is empty (legacy/manual), OR
-            # 2. At least one source segment belongs to this conversation, OR
-            # 3. Source refs don't resolve to any segment (dangling refs).
             rows = conn.execute(
-                """SELECT ts.* FROM tag_summaries ts
-                   WHERE NOT EXISTS (
-                       SELECT 1 FROM segments s, json_each(ts.source_segment_refs) je
-                       WHERE s.ref = je.value AND s.conversation_id != ?
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM segments s, json_each(ts.source_segment_refs) je
-                       WHERE s.ref = je.value AND s.conversation_id = ?
-                   )
-                   ORDER BY ts.tag""",
-                (conversation_id, conversation_id),
+                "SELECT * FROM tag_summaries WHERE conversation_id = ? ORDER BY tag",
+                (conversation_id,),
             ).fetchall()
         else:
             rows = conn.execute(

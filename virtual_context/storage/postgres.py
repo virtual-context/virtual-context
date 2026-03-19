@@ -651,7 +651,7 @@ class PostgresStore(ContextStore):
         cur = conn.execute("DELETE FROM segments WHERE created_at < %s", (cutoff,))
         return cur.rowcount
 
-    def save_tag_summary(self, tag_summary: TagSummary) -> None:
+    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO tag_summaries
@@ -671,7 +671,7 @@ class PostgresStore(ContextStore):
              _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
         )
 
-    def get_tag_summary(self, tag: str) -> TagSummary | None:
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         conn = self._get_conn()
         row = conn.execute("SELECT * FROM tag_summaries WHERE tag = %s", (tag,)).fetchone()
         if not row:
