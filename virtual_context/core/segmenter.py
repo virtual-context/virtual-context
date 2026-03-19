@@ -318,32 +318,41 @@ class TopicSegmenter:
         if not stub_indices:
             return segments
 
-        for idx in stub_indices:
-            stub = segments[idx]
-            prev_seg = segments[idx - 1] if idx > 0 else None
-            next_seg = segments[idx + 1] if idx + 1 < len(segments) else None
+        # Multiple passes: reassigned stubs become valid donors for adjacent stubs.
+        # Max passes bounded by stub count to avoid infinite loops.
+        for _pass in range(len(stub_indices) + 1):
+            changed = False
+            for idx in stub_indices:
+                stub = segments[idx]
+                if stub.primary_tag != "_stub":
+                    continue  # already reassigned in a prior pass
+                prev_seg = segments[idx - 1] if idx > 0 else None
+                next_seg = segments[idx + 1] if idx + 1 < len(segments) else None
 
-            # Skip if both neighbors are also stubs or don't exist
-            donor = None
-            if prev_seg and prev_seg.primary_tag != "_stub" and next_seg and next_seg.primary_tag != "_stub":
-                # Both neighbors are real — pick the temporally closer one
-                stub_ts = stub.start_timestamp
-                prev_gap = abs((stub_ts - prev_seg.end_timestamp).total_seconds()) if prev_seg.end_timestamp else float("inf")
-                next_gap = abs((next_seg.start_timestamp - stub_ts).total_seconds()) if next_seg.start_timestamp else float("inf")
-                donor = prev_seg if prev_gap <= next_gap else next_seg
-            elif prev_seg and prev_seg.primary_tag != "_stub":
-                donor = prev_seg
-            elif next_seg and next_seg.primary_tag != "_stub":
-                donor = next_seg
+                donor = None
+                if prev_seg and prev_seg.primary_tag != "_stub" and next_seg and next_seg.primary_tag != "_stub":
+                    # Both neighbors are real — pick the temporally closer one
+                    stub_ts = stub.start_timestamp
+                    prev_gap = abs((stub_ts - prev_seg.end_timestamp).total_seconds()) if prev_seg.end_timestamp else float("inf")
+                    next_gap = abs((next_seg.start_timestamp - stub_ts).total_seconds()) if next_seg.start_timestamp else float("inf")
+                    donor = prev_seg if prev_gap <= next_gap else next_seg
+                elif prev_seg and prev_seg.primary_tag != "_stub":
+                    donor = prev_seg
+                elif next_seg and next_seg.primary_tag != "_stub":
+                    donor = next_seg
 
-            if donor:
-                stub.primary_tag = donor.primary_tag
-                stub.tags = list(donor.tags)
-                logger.info(
-                    "SEGMENT stub_reassign ref=%s → inherited tags=%s from %s neighbor",
-                    stub.id[:8], sorted(stub.tags),
-                    "prev" if donor is prev_seg else "next",
-                )
+                if donor:
+                    stub.primary_tag = donor.primary_tag
+                    stub.tags = list(donor.tags)
+                    changed = True
+                    logger.info(
+                        "SEGMENT stub_reassign ref=%s → inherited tags=%s from %s neighbor (pass %d)",
+                        stub.id[:8], sorted(stub.tags),
+                        "prev" if donor is prev_seg else "next", _pass + 1,
+                    )
+
+            if not changed:
+                break
 
         return segments
 
