@@ -476,6 +476,7 @@ class TestEnginePagingAPI:
             text = "x" * (tokens_per * 4)  # ~tokens_per tokens with //4 counter
             engine._store.store_segment(StoredSegment(
                 ref=f"{tag}-seg-{i}",
+                conversation_id=engine.config.conversation_id,
                 primary_tag=tag,
                 tags=[tag],
                 summary=f"Summary for {tag} segment {i}.",
@@ -711,7 +712,8 @@ class TestCalculateDepthTokens:
         engine = self._make_engine(tmp_path)
         for i in range(2):
             engine._store.store_segment(StoredSegment(
-                ref=f"f{i}", primary_tag="auth", tags=["auth"],
+                ref=f"f{i}", conversation_id=engine.config.conversation_id,
+                primary_tag="auth", tags=["auth"],
                 summary="s", summary_tokens=5,
                 full_text="x" * 400, full_tokens=100,
             ))
@@ -1172,7 +1174,6 @@ class TestReassembleContext:
             summary_tokens=20,
             full_text="User asked about database indexing. Assistant explained B-tree indexes.",
             full_tokens=50,
-            conversation_id=engine.config.conversation_id,
         ))
 
         # Simulate post-compaction state so context hint is generated
@@ -1273,7 +1274,6 @@ class TestTemporalNoBypass:
             summary_tokens=15,
             full_text="Detailed architecture text with all implementation specifics. " * 20,
             full_tokens=300,
-            conversation_id=engine.config.conversation_id,
         ))
         engine._working_set = {
             "architecture": WorkingSetEntry(

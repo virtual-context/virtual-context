@@ -26,12 +26,14 @@ class PagingManager:
         tag_context_max_tokens: int,
         auto_evict: bool = True,
         paging_enabled: bool = True,
+        conversation_id: str = "",
     ) -> None:
         self._store = store
         self._token_counter = token_counter
         self._tag_context_max_tokens = tag_context_max_tokens
         self._auto_evict_enabled = auto_evict
         self._paging_enabled = paging_enabled
+        self._conversation_id = conversation_id
         self.working_set: dict[str, WorkingSetEntry] = {}
 
     def expand_topic(self, tag: str, depth: str = "full") -> dict:
@@ -149,11 +151,11 @@ class PagingManager:
             return 0
 
         if depth == DepthLevel.SUMMARY:
-            ts = self._store.get_tag_summary(tag)
+            ts = self._store.get_tag_summary(tag, conversation_id=self._conversation_id)
             return ts.summary_tokens if ts else 0
 
         # SEGMENTS or FULL: need stored segments
-        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500)
+        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500, conversation_id=self._conversation_id or None)
         if not segments:
             return 0
 

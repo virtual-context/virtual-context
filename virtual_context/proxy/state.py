@@ -13,6 +13,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from ..engine import VirtualContextEngine
+from ..core.turn_tag_index import TurnTagIndex
 from ..types import Message, SplitResult
 
 from .helpers import (
@@ -108,6 +109,8 @@ class ProxyState:
         self._pending_compact: Future | None = None
         self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
         self._ingested_conversations: set[str] = set()
+        self._ingested_first_hash: dict[str, str] = {}  # conversation_id → hash of first message
+        self._ingested_turn_count: dict[str, int] = {}   # conversation_id → turn count at ingestion
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
         # State machine for non-blocking ingestion
@@ -469,6 +472,60 @@ class ProxyState:
     def _history_ingested(self) -> bool:
         return self.engine.config.conversation_id in self._ingested_conversations
 
+    def _check_history_widening(self, history_pairs: list[Message], conversation_id: str) -> bool:
+        """Detect if history prefix shifted (widening) and trigger full re-ingest.
+
+        Returns True if widening was detected and state was cleared for re-ingestion.
+        """
+        import hashlib
+        if not history_pairs or conversation_id not in self._ingested_first_hash:
+            return False
+
+        new_first_hash = hashlib.sha256(history_pairs[0].content.encode()).hexdigest()[:16]
+        old_first_hash = self._ingested_first_hash.get(conversation_id, "")
+        if new_first_hash == old_first_hash:
+            return False
+
+        new_turns = len(history_pairs) // 2
+        old_turns = self._ingested_turn_count.get(conversation_id, 0)
+        threshold = getattr(self.engine.config.proxy, "history_widening_threshold", 0.10)
+
+        if new_turns <= old_turns * (1 + threshold):
+            return False  # Not enough growth — likely aging, not widening
+
+        logger.info(
+            "HISTORY_WIDENED conversation=%s old_hash=%s new_hash=%s old_turns=%d new_turns=%d "
+            "threshold=%.0f%% — clearing state and re-ingesting",
+            conversation_id[:12], old_first_hash, new_first_hash,
+            old_turns, new_turns, threshold * 100,
+        )
+        print(
+            f"[INGEST] History widened: {old_turns}→{new_turns} turns, "
+            f"prefix changed — full re-ingest (conversation={conversation_id[:12]})"
+        )
+
+        # Clear all conversation state
+        try:
+            self.engine._store.delete_conversation(conversation_id)
+        except Exception as e:
+            logger.warning("Failed to delete conversation during widening reset: %s", e)
+        self.engine._turn_tag_index = TurnTagIndex()
+        self.engine._compacted_through = 0
+        self._ingested_conversations.discard(conversation_id)
+        self._ingested_first_hash.pop(conversation_id, None)
+        self._ingested_turn_count.pop(conversation_id, None)
+
+        return True
+
+    def _record_ingestion_watermark(self, history_pairs: list[Message], conversation_id: str) -> None:
+        """Store the first-message hash and turn count after successful ingestion."""
+        import hashlib
+        if history_pairs:
+            self._ingested_first_hash[conversation_id] = (
+                hashlib.sha256(history_pairs[0].content.encode()).hexdigest()[:16]
+            )
+        self._ingested_turn_count[conversation_id] = len(history_pairs) // 2
+
     def ingest_if_needed(self, history_pairs: list[Message]) -> None:
         """Bootstrap TurnTagIndex from pre-existing history (once per session).
 
@@ -476,7 +533,10 @@ class ProxyState:
         """
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations:
-            return
+            # Check for history widening even after ingestion is "done"
+            self._check_history_widening(history_pairs, conversation_id)
+            if conversation_id in self._ingested_conversations:
+                return  # No widening detected
         with self._ingestion_lock:
             if conversation_id in self._ingested_conversations:
                 return
@@ -484,6 +544,7 @@ class ProxyState:
             turns = self.engine.ingest_history(history_pairs)
             elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
             self._ingested_conversations.add(conversation_id)
+            self._record_ingestion_watermark(history_pairs, conversation_id)
 
             print(
                 f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
@@ -540,7 +601,10 @@ class ProxyState:
         """
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations:
-            return
+            # Check for history widening even after ingestion is "done"
+            self._check_history_widening(history_pairs, conversation_id)
+            if conversation_id in self._ingested_conversations:
+                return
         with self._ingestion_lock:
             if conversation_id in self._ingested_conversations:
                 return
@@ -732,6 +796,11 @@ class ProxyState:
         finally:
             if not cancelled:
                 self._ingested_conversations.add(conversation_id)
+                # Record watermark for history widening detection
+                latest = self._latest_body
+                if latest:
+                    _pairs = _extract_history_pairs(latest)
+                    self._record_ingestion_watermark(_pairs, conversation_id)
                 # After ingestion, check if compaction is needed immediately.
                 # Without this, the payload stays over-budget and upstream
                 # rejects every request — a deadlock.
