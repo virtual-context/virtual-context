@@ -30,6 +30,7 @@ class TurnTagIndex:
         tags: set[str] = set()
         for entry in recent:
             tags.update(entry.tags)
+        tags -= self._NON_INHERITABLE_TAGS  # exclude _general, _stub from retrieval queries
         return tags
 
     def get_tags_for_turn(self, turn_number: int) -> TurnTagEntry | None:

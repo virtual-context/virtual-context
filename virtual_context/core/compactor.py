@@ -353,14 +353,16 @@ class DomainCompactor:
 
         # Wrap conversation text in <segment_to_summarize> tags when
         # prev_context is present, so the LLM can distinguish the two.
+        # Note: the DEFAULT_SUMMARY_PROMPT template already has "Conversation:\n"
+        # before {conversation_text}, so conv_block should NOT add it again.
         if prev_context:
             conv_block = (
                 f"<segment_to_summarize>\n"
-                f"Conversation:\n{conversation_text}\n"
+                f"{conversation_text}\n"
                 f"</segment_to_summarize>"
             )
         else:
-            conv_block = f"Conversation:\n{conversation_text}"
+            conv_block = conversation_text
 
         if custom_prompt:
             prompt = (
