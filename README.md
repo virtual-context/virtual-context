@@ -224,7 +224,7 @@ Persist engine state (TurnTagIndex + compaction watermark → store)
 
 ### Tags Emerge From Conversation
 
-There are no predefined domains to configure. An LLM tagger reads each turn and generates semantic tags (`database`, `auth`, `fitness`, `legal`) that naturally converge over the session. A vocabulary feedback loop passes known tags back into the tagger prompt, so it reuses `storage` instead of inventing `data-persistence` or `file-management`.
+There are no predefined domains to configure. An LLM tagger reads each turn and generates semantic tags (`database`, `auth`, `fitness`, `legal`) that naturally converge over the session. A vocabulary feedback loop passes known tags back into the tagger prompt, so it reuses `storage` instead of inventing `data-persistence` or `file-management`. When synonyms do slip through (`db` vs `database`), a canonicalizer detects aliases via edit distance and normalizes them automatically (`virtual-context aliases suggest`).
 
 The same codebase handles legal briefs, medical notes, coding sessions, recipe planning, and marathon training, whatever the user talks about. Tag rules let you configure priority, TTL, and custom summary prompts per tag family using fnmatch patterns.
 
@@ -374,15 +374,6 @@ Compaction mirrors OS page replacement:
 - **Hard threshold (85%)**: mandatory compaction. Summarize immediately or the context window overflows.
 
 Compaction is greedy-batch: everything between the watermark and the protected zone gets compacted in one pass, so it fires infrequently (one big batch instead of many small ones). Summarization runs concurrently via ThreadPoolExecutor, with order-preserving results, per-tag custom prompts, and per-segment progress logging. The summary prompt preserves exact numbers, proper nouns, and state assertions (e.g., "I now store sneakers on the shoe rack" is never softened to "plans to store").
-
-### Tag Canonicalization
-
-Tags naturally produce synonyms: `db`, `database`, `data-storage`. The TagCanonicalizer detects aliases via edit distance and normalizes them automatically. You can also register aliases manually:
-
-```bash
-virtual-context aliases suggest    # auto-detect potential aliases
-virtual-context aliases add db database
-```
 
 ### Automatic Tag Refinement
 
