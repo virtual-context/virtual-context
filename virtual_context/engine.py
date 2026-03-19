@@ -90,9 +90,8 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
-from .core.math_utils import cosine_similarity as _cosine_sim
 from .core.paging_manager import PagingManager
-from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions
+from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions, _parse_session_date as _parse_session_date_str
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
 
 
@@ -154,6 +153,7 @@ class VirtualContextEngine:
             tag_context_max_tokens=self.config.assembler.tag_context_max_tokens,
             auto_evict=self.config.paging.auto_evict,
             paging_enabled=self.config.paging.enabled,
+            conversation_id=self.config.conversation_id,
         )
         self._split_processed_tags: set[str] = set()
         self._supersession_checker = None
@@ -2192,24 +2192,7 @@ class VirtualContextEngine:
 
     def _parse_session_date(self, raw: str) -> date | None:
         """Best-effort parse for session date strings from stored metadata."""
-        s = (raw or "").strip()
-        if not s:
-            return None
-        # Fast-path ISO date/month prefixes.
-        m = re.search(r"\d{4}-\d{2}-\d{2}", s)
-        if m:
-            try:
-                return date.fromisoformat(m.group(0))
-            except ValueError:
-                pass
-        m = re.search(r"\d{4}/\d{2}/\d{2}", s)
-        if m:
-            try:
-                y, mo, d = [int(x) for x in m.group(0).split("/")]
-                return date(y, mo, d)
-            except ValueError:
-                pass
-        return None
+        return _parse_session_date_str(raw)
 
     def _resolve_remember_when_range(self, time_range: dict) -> tuple[date, date, str]:
         """Resolve tool time_range input to absolute [start_date, end_date]."""
@@ -2487,18 +2470,15 @@ class VirtualContextEngine:
         # 2. Embedding-based expansion
         embed_fn = self._get_embed_fn()
         if embed_fn is not None:
-            from .core.math_utils import cosine_similarity
+            from .core.math_utils import rank_by_embedding
 
-            texts = [verb] + all_verbs
-            vectors = embed_fn(texts)
-            query_vec = vectors[0]
-            threshold = 0.53
-            for i, v in enumerate(all_verbs):
+            scored = rank_by_embedding(
+                verb, all_verbs, all_verbs, embed_fn, threshold=0.53,
+            )
+            for _, v in scored:
                 if v.lower() not in seen:
-                    sim = cosine_similarity(query_vec, vectors[i + 1])
-                    if sim >= threshold:
-                        matches.append(v)
-                        seen.add(v.lower())
+                    matches.append(v)
+                    seen.add(v.lower())
 
         return matches if len(matches) > 1 else None
 
@@ -2568,20 +2548,13 @@ class VirtualContextEngine:
         if not candidates:
             return []
 
-        from .core.math_utils import cosine_similarity
+        from .core.math_utils import rank_by_embedding
 
-        texts = [query_str] + [f.what for f in candidates]
-        vectors = embed_fn(texts)
-        query_vec = vectors[0]
-
-        threshold = 0.35
-        matches = []
-        for i, fact in enumerate(candidates):
-            sim = cosine_similarity(query_vec, vectors[i + 1])
-            if sim >= threshold:
-                matches.append(fact)
-
-        return matches
+        scored = rank_by_embedding(
+            query_str, candidates, [f.what for f in candidates],
+            embed_fn, threshold=0.35,
+        )
+        return [fact for _, fact in scored]
 
     def _rerank_facts(self, facts: list, intent_context: str) -> list:
         """Re-rank *facts* by embedding similarity to the reader's question.
@@ -2607,18 +2580,12 @@ class VirtualContextEngine:
         if not query_str:
             return facts
 
-        from .core.math_utils import cosine_similarity
+        from .core.math_utils import rank_by_embedding
 
         whats = [f.what or f"{f.subject} {f.verb} {f.object}" for f in facts]
-        texts = [query_str] + whats
-        vectors = embed_fn(texts)
-        query_vec = vectors[0]
-
-        scored = []
-        for i, fact in enumerate(facts):
-            sim = cosine_similarity(query_vec, vectors[i + 1])
-            scored.append((sim, fact))
-        scored.sort(key=lambda x: -x[0])
+        scored = rank_by_embedding(
+            query_str, facts, whats, embed_fn, threshold=-1.0,
+        )
         return [fact for _, fact in scored]
 
     def remember_when(
@@ -2672,37 +2639,22 @@ class VirtualContextEngine:
         try:
             start_str = start.strftime("%Y/%m/%d")
             end_str = end.strftime("%Y/%m/%d")
-            db = None
-            if hasattr(self._store, "_get_conn"):
-                db = self._store._get_conn()
-            if db is not None:
-                sql = """SELECT subject, verb, object, status, fact_type, what,
-                              when_date, session_date, "where"
-                       FROM facts
-                       WHERE fact_type = 'experience'
-                         AND status = 'completed'
-                         AND session_date >= ? AND session_date <= ?"""
-                params: list = [start_str, end_str + "~"]
-                if self.config.conversation_id:
-                    sql += " AND conversation_id = ?"
-                    params.append(self.config.conversation_id)
-                sql += " ORDER BY session_date ASC LIMIT ?"
-                params.append(max_results * 5)
-                rows = db.execute(sql, params).fetchall()
-                for r in rows:
-                    when_str = r[6] or r[7] or ""
-                    fact_results.append({
-                        "type": "fact",
-                        "what": r[5] or f"{r[0]} {r[1]} {r[2]}",
-                        "when": when_str,
-                        "where": r[8] or "",
-                        "status": r[3] or "",
-                    })
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "remember_when fact query failed: %s", exc
+            facts = self._store.query_experience_facts_by_date(
+                start_date=start_str,
+                end_date=end_str,
+                limit=max_results * 5,
+                conversation_id=self.config.conversation_id or None,
             )
+            for f in facts:
+                fact_results.append({
+                    "type": "fact",
+                    "what": f.what or f"{f.subject} {f.verb} {f.object}",
+                    "when": f.when_date or f.session_date or "",
+                    "where": f.where or "",
+                    "status": f.status or "",
+                })
+        except Exception as exc:
+            logger.warning("remember_when fact query failed: %s", exc)
 
         return {
             "query": query,
