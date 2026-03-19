@@ -45,80 +45,112 @@ dx
 
 ```bash
 pip install virtual-context
+```
 
-# pick one 
-virtual-context proxy --upstream https://api.anthropic.com --port 5757 
-virtual-context proxy --upstream https://api.openai.com --port 5757. 
-virtual-context proxy --upstream https://generativelanguage.googleapis.com --port 5757
+Batteries included: Python 3.11+, all core dependencies in the base install. Optional storage backends: `pip install virtual-context[postgres]`, `[neo4j]`, or `[falkordb]`.
 
-# for multiple providers use the yaml 
-#    instances:
-#      - port: 5757
-#        upstream: "https://api.anthropic.com"
-#        label: "anthropic"
-#      - port: 5758
-#        upstream: "https://api.openai.com"
-#        label: "openai"
-#      - port: 5759
-#        upstream: "https://generativelanguage.googleapis.com"
-#        label: "gemini"
+## Getting Started
 
+Two ways to integrate. Pick whichever fits:
+
+### HTTP Proxy (zero code changes)
+
+Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently — inbound tagging, retrieval, history filtering, response tagging, compaction. Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats. Includes a [live dashboard](#live-dashboard).
+
+```bash
+# Pick your upstream — format is auto-detected per request
+virtual-context proxy --upstream https://api.anthropic.com
+virtual-context proxy --upstream https://api.openai.com
+virtual-context proxy --upstream https://generativelanguage.googleapis.com
+```
+
+Then point your client at `http://127.0.0.1:5757`:
+
+```python
+# Python (anthropic SDK)
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:5757")
+
+# Python (openai SDK)
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:5757/v1")
+```
+
+No config file needed for basic usage. For customization (LLM tagger, tag rules, multi-instance):
+
+```bash
 cp virtual-context.yaml.example virtual-context.yaml
-# Edit to set LLM tagger, custom providers, tag rules, etc.
 virtual-context -c virtual-context.yaml proxy
 ```
 
+**Multi-instance mode** — multiple providers on different ports in one process:
+
+```yaml
+proxy:
+  instances:
+    - port: 5757
+      upstream: https://api.anthropic.com
+      label: anthropic
+    - port: 5758
+      upstream: https://api.openai.com
+      label: openai
+    - port: 5760
+      upstream: https://generativelanguage.googleapis.com
+      label: gemini
+```
+
+**Daemon mode** — run as a background service:
+
 ```bash
-virtual-context onboard
 virtual-context onboard --install-daemon --upstream https://api.anthropic.com
 ```
 
 Daemon setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
 
-Optional extras:
+### Python SDK
 
-```bash
-Optional backends (not included by default):
-  ▎ pip install virtual-context[postgres]    # PostgreSQL storage
-  ▎ pip install virtual-context[neo4j]       # Neo4j graph storage
-  ▎ pip install virtual-context[falkordb]    # FalkorDB graph storage
-```
-
-Python 3.11+.
-
-Two hooks into your LLM pipeline. Pick whichever integration fits:
-
-**Option A: HTTP Proxy (zero code changes).** Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently (inbound tagging, retrieval, history filtering, response tagging, compaction). Works with any client that speaks OpenAI, Anthropic, or Gemini API format. Includes a [live dashboard](#live-dashboard) for real-time monitoring and tuning.
-
-```bash
-virtual-context proxy --upstream https://api.anthropic.com
-# Then change your client's base_url to http://127.0.0.1:5757
-```
-
-**Option B: Python SDK.** Two function calls wrap your existing LLM pipeline:
+Two function calls wrap your existing LLM pipeline:
 
 ```python
 from virtual_context import VirtualContextEngine, Message
 
 engine = VirtualContextEngine(config_path="./virtual-context.yaml")
 
-# BEFORE sending to LLM - retrieve relevant stored context
+# BEFORE sending to LLM — retrieve relevant stored context
 assembled = engine.on_message_inbound(
     message="What was the Henninger filing deadline?",
     conversation_history=messages,
 )
 # assembled.prepend_text → enriched system prompt with retrieved summaries
 # assembled.matched_tags → ["legal", "filing"]
-# For time-scoped recall, call vc_remember_when(query, time_range)
-# For broad overviews, call the recall-all tool (vc_recall_all / recall_all)
 
-# AFTER LLM responds - tag, index, compact if needed
+# AFTER LLM responds — tag, index, compact if needed
 report = engine.on_turn_complete(messages)
 if report:
     print(f"Compacted {report.segments_compacted} segments, freed {report.tokens_freed:,} tokens")
 ```
 
-Everything happens synchronously, in-process. 
+Everything happens synchronously, in-process.
+
+### MCP Server (Model Context Protocol)
+
+Exposes virtual-context as an MCP server for integration with Claude Desktop, Cursor, or any MCP-compatible client:
+
+| Type | Name | Description |
+|------|------|-------------|
+| Tool | `recall_context` | Tag + retrieve + assemble context for a message |
+| Tool | `recall_all` | Load summaries for all topics (broad overview path) |
+| Tool | `remember_when` | Time-scoped recall with relative presets or explicit date bounds |
+| Tool | `compact_context` | Trigger compaction on a message history |
+| Tool | `domain_status` | All tags with stats |
+| Tool | `expand_topic` | Expand a topic to segment or full detail depth |
+| Tool | `collapse_topic` | Collapse a topic back to summary or none |
+| Tool | `find_quote` | Full-text search across all stored conversation text |
+| Tool | `query_facts` | Structured fact lookup with subject/verb/object/status filters |
+| Resource | `virtualcontext://domains` | List all tags |
+| Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
+| Prompt | `recall` | Suggest context retrieval for a topic |
+| Prompt | `summarize_session` | Suggest compaction |
 
 ### The Full Pipeline
 
@@ -523,50 +555,25 @@ Session JSON captures every turn with tags, token counts, and timing. Replay a s
 virtual-context chat --replay vc-session.json
 ```
 
-## Integrations
+### Proxy Deep Dive
 
-### HTTP Proxy
+**Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state from the store. Multiple concurrent conversations are routed independently via a session registry.
 
-The fastest path to production. The proxy sits between any LLM client and an upstream provider, running the full virtual-context pipeline on every request. The client just changes its `base_url`. No SDK integration, no code changes, no plugin required.
+**Conversation-scoped retrieval.** All store retrieval methods are scoped by `conversation_id`. Multiple conversations sharing the same SQLite database are fully isolated — a new conversation never gets context from another conversation's segments.
 
-Start the proxy:
+**Session suppression.** When a session has no compacted data, the pipeline is suppressed — requests pass through as-is. Once the first compaction runs, the pipeline activates automatically.
 
-```bash
-# Anthropic upstream
-virtual-context -c virtual-context.yaml proxy --upstream https://api.anthropic.com
+**History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period.
 
-# OpenAI upstream
-virtual-context -c virtual-context.yaml proxy --upstream https://api.openai.com --port 8080
+**Format-agnostic.** Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats. Context is injected into the appropriate location per format. A single proxy instance handles all formats on one port.
 
-# Custom host/port
-virtual-context -c virtual-context.yaml proxy -u https://api.anthropic.com --host 0.0.0.0 --port 9090
-```
+**Streaming with zero added latency.** SSE streams are forwarded byte-for-byte. Text deltas are accumulated in the background for response tagging.
 
-**Multi-instance mode.** Run multiple proxy listeners on different ports, each forwarding to a different upstream provider. Configure in YAML instead of CLI flags:
+**Error-resilient.** If the engine fails, the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls.
 
-```yaml
-proxy:
-  instances:
-    - port: 5757
-      upstream: https://api.anthropic.com
-      label: anthropic
-    - port: 5758
-      upstream: https://api.openai.com/v1
-      label: openai
-    - port: 5760
-      upstream: https://generativelanguage.googleapis.com
-      label: gemini
-```
+**Envelope stripping + metadata extraction.** Strips client metadata while extracting sender identity and timestamps from labeled JSON blocks. Group chat participants appear as "Sania" and "Yur" instead of generic "User". Original message timestamps give segments accurate chronological ordering.
 
-```bash
-virtual-context -c virtual-context.yaml proxy
-# No --upstream needed; instances are read from config
-# Each port gets its own dashboard showing the instance label
-```
-
-By default, all instances share the same `VirtualContextEngine`, `ProxyMetrics`, and storage backend.
-
-**Per-port config.** When different instances need different tagging providers, summarization models, or isolated storage, add a `config` field pointing to a standalone config file:
+**Per-port config.** Multi-instance setups can give each port its own engine and storage:
 
 ```yaml
 proxy:
@@ -574,135 +581,19 @@ proxy:
     - port: 5757
       upstream: https://api.anthropic.com
       label: anthropic
-      config: ./virtual-context-proxy-anthropic.yaml
+      config: ./vc-anthropic.yaml    # isolated engine + storage
     - port: 5758
-      upstream: https://api.openai.com/v1
-      label: openai
-      config: ./virtual-context-proxy-openai.yaml
-```
-
-Each instance config is a full standalone config with its own storage path:
-
-```yaml
-# virtual-context-proxy-anthropic.yaml
-version: '0.2'
-storage_root: .virtualcontext/anthropic
-tag_generator:
-  type: llm
-  provider: anthropic
-  model: claude-haiku-4-5-20251001
-storage:
-  backend: sqlite
-  sqlite:
-    path: .virtualcontext/anthropic/store.db
-```
-
-Instances with a `config` field get their own `VirtualContextEngine` and isolated storage. Instances without `config` share the master engine. The `onboard --wizard` flow generates these per-instance config files automatically.
-
-Point your client at the proxy:
-
-```python
-# Python (anthropic SDK)
-import anthropic
-client = anthropic.Anthropic(base_url="http://127.0.0.1:5757")
-
-# Python (openai SDK)
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:5757/v1")
-
-# curl
-curl http://127.0.0.1:5757/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "content-type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
-```
-
-**Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. Client SDKs store this as part of the message. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state (TurnTagIndex + compaction watermark) from the store, so no re-ingestion is needed. Multiple concurrent conversations are routed independently via a session registry.
-
-**Conversation-scoped retrieval.** All store retrieval methods (tag lookups, segment searches, fact queries, full-text search) are scoped by `conversation_id`. Multiple conversations sharing the same SQLite database are fully isolated — a new conversation never gets context injected from another conversation's segments. Cross-conversation search is not performed; each conversation's memory is independent.
-
-**Session suppression.** When a session has no compacted data (no tag summaries, no stored segments), the full virtual-context pipeline is suppressed — no context injection, no tool definitions, no history filtering. The request passes through as-is with minimal overhead. Once the first compaction runs and summaries exist, the pipeline activates automatically.
-
-**Dynamic session discovery.** A `vc_find_session` tool is injected into the reader's tool definitions only when multiple sessions exist in the store. This lets the reader discover and reference prior sessions when answering cross-session questions, without cluttering the tool set in single-session conversations.
-
-**History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period; the tag vocabulary is immediately available for inbound matching.
-
-**Format-agnostic.** Auto-detects Anthropic, OpenAI, and Gemini request formats via a `PayloadFormat` strategy pattern and injects context accordingly: into `system` for Anthropic, into `messages[0]` for OpenAI, into `system_instruction.parts` for Gemini. Paging tool interception works across Anthropic and Gemini formats (`tool_use`/`tool_result` and `functionCall`/`functionResponse` respectively).
-
-**Streaming with zero added latency.** SSE streams are forwarded byte-for-byte as they arrive from upstream. Text deltas are accumulated in the background for response tagging. The user sees no delay.
-
-**Error-resilient.** If the engine fails (config error, tagger timeout, etc.), the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls.
-
-**Envelope stripping + metadata extraction.** Strips client metadata (channel headers, message footers, event lines, plugin markers) while extracting structured metadata (sender identity, timestamps, conversation info) from labeled JSON blocks. Sender names flow through to summaries and facts — group chat participants appear as "Sania" and "Yur" instead of generic "User". Original message timestamps from envelope metadata are preserved on `Message.timestamp`, giving segments accurate chronological ordering instead of compaction-time timestamps.
-
-**Terminal logging.** Every event is logged to stdout in real-time:
-
-```
-[INGEST] 43 turns in 45123ms (session=a1b2c3d4e5f6)
-[T44] POST anthropic stream=True tags=[css, design] msgs=52 dropped=25 ctx=312t input=8421t vc=89ms | help me with some css styling
-[T44] RESPONSE stream=True llm=3028ms total=3117ms chars=117
-[T44] COMPLETE 1204ms tags=[css, web-development, html] primary=css
+      upstream: https://api.openai.com
+      label: openai                   # shares master engine (no config field)
 ```
 
 #### Live Dashboard
 
-The proxy serves a real-time monitoring dashboard at `http://localhost:5757/dashboard`, a full operational view of what virtual-context is doing to every request.
-
-**Request grid.** Every proxy request displayed with turn number, inbound tags, response tags (updated live when `on_turn_complete` finishes), token counts, latency breakdown (vc overhead vs upstream LLM), tool activity, and turns dropped by filtering. Newest requests appear on top. Each row is clickable for deep inspection.
-
-**Turn inspector.** Click any request row to see the full picture: every message in the request with role labels, content block types (`text`, `tool_use`, `tool_result`, `thinking`), the raw text content, inbound tags vs response tags side by side, and the token budget breakdown showing how context was assembled.
-
-**Ingested history.** When the proxy bootstraps from a client's existing conversation, every ingested turn appears in its own grid with per-turn tags and message previews, so you can verify the tag vocabulary was built correctly from history.
-
-**Session stats.** Uptime, total requests processed, compaction events, total tokens freed, compression ratio, average VC overhead latency, and average upstream LLM latency.
-
-**Request capture.** A ring buffer stores the last 50 raw request bodies (the actual `messages` array sent to the upstream LLM). Inspect any captured request through the dashboard or export as JSON for offline analysis. Essential for diagnosing tagger accuracy: you can see exactly what text the embedding matcher evaluated.
-
-**Dashboard authentication.** Mutating endpoints (DELETE, POST, PUT) are gated by an `X-VC-Dashboard-Token` header when configured. Set via `dashboard_token` in config or `VC_DASHBOARD_TOKEN` env var. Read-only GET endpoints remain open.
-
-**Live updates.** SSE-powered: new events appear the instant they happen. No polling, no refresh.
-
-**JSON export.** Download the full session state (all events, all stats) as a single JSON file for offline analysis or bug reporting.
-
-**Telemetry panel.** Per-component LLM cost and timing breakdown (compactor, tagger, tool_loop, fact_curator, proxy_upstream) with call counts, token volumes, total cost, and cumulative time. Auto-refreshes via AJAX.
+Real-time monitoring at `http://localhost:5757/dashboard`: request grid with tags/tokens/latency, turn inspector, ingestion history, session stats, request capture (last 50 raw payloads), telemetry panel, SSE live updates, JSON export. Dashboard auth via `X-VC-Dashboard-Token` header.
 
 #### Telemetry
 
-Every LLM call across the pipeline is instrumented with token counts, cost, and wall-clock timing. A `models.yaml` catalog (project root) provides pricing for all supported models — Anthropic, OpenAI, Google, Xiaomi, Ollama — with alias resolution so `"haiku"`, `"claude-haiku"`, and `"claude-haiku-4-5-20251001"` all resolve correctly.
-
-The telemetry ledger tracks five components: `compactor`, `tagger`, `tool_loop`, `fact_curator`, and `proxy_upstream`. Data is available three ways:
-
-- **Dashboard**: the telemetry panel shows live per-component breakdown (calls, tokens, cost, time)
-- **CLI**: `virtual-context telemetry` prints a formatted table; `--verbose` shows every individual call
-- **Programmatic**: `engine.get_telemetry().to_dict()` returns the full event log and rollups
-
-```yaml
-# Override the default bundled catalog:
-telemetry:
-  enabled: true
-  models_file: models.yaml  # resolved relative to config directory
-```
-
-### MCP Server (Model Context Protocol)
-
-Exposes virtual-context as an MCP server for integration with Claude Desktop, Cursor, or any MCP-compatible client:
-
-| Type | Name | Description |
-|------|------|-------------|
-| Tool | `recall_context` | Tag + retrieve + assemble context for a message |
-| Tool | `recall_all` | Load summaries for all topics (broad overview path) |
-| Tool | `remember_when` | Time-scoped recall with relative presets or explicit date bounds |
-| Tool | `compact_context` | Trigger compaction on a message history |
-| Tool | `domain_status` | All tags with stats |
-| Tool | `expand_topic` | Expand a topic to segment or full detail depth |
-| Tool | `collapse_topic` | Collapse a topic back to summary or none |
-| Tool | `find_quote` | Full-text search across all stored conversation text (fixed top 20 results per call) |
-| Tool | `query_facts` | Structured fact lookup with subject/verb/object/status filters and semantic expansion |
-| Resource | `virtualcontext://domains` | List all tags |
-| Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
-| Prompt | `recall` | Suggest context retrieval for a topic |
-| Prompt | `summarize_session` | Suggest compaction |
+Every LLM call is instrumented with token counts, cost, and timing. A `models.yaml` catalog provides pricing for all supported models with alias resolution. Five tracked components: `compactor`, `tagger`, `tool_loop`, `fact_curator`, `proxy_upstream`. Available via dashboard, CLI (`virtual-context telemetry`), or programmatic (`engine.get_telemetry()`).
 
 ### OpenClaw Plugin
 
