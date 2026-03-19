@@ -1406,26 +1406,7 @@ class SQLiteStore(ContextStore):
             raise
 
     def _row_to_fact(self, row: sqlite3.Row) -> Fact:
-        return Fact(
-            id=row["id"],
-            subject=row["subject"],
-            verb=row["verb"],
-            object=row["object"],
-            status=row["status"],
-            what=row["what"],
-            who=row["who"],
-            when_date=row["when_date"],
-            where=row["where"],
-            why=row["why"],
-            fact_type=row["fact_type"] if "fact_type" in row.keys() else "personal",
-            tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
-            segment_ref=row["segment_ref"],
-            conversation_id=row["conversation_id"],
-            turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
-            mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
-            session_date=row["session_date"] if "session_date" in row.keys() else "",
-            superseded_by=row["superseded_by"],
-        )
+        return Fact.from_dict(dict(row), dt_parser=_str_to_dt)
 
     def _row_to_fact_with_session_date(self, row: sqlite3.Row) -> Fact:
         fact = self._row_to_fact(row)
@@ -1610,6 +1591,27 @@ class SQLiteStore(ContextStore):
                 "SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag"
             ).fetchall()
         return {row["tag"]: row["cnt"] for row in rows}
+
+    def query_experience_facts_by_date(
+        self,
+        start_date: str,
+        end_date: str,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[Fact]:
+        conn = self._get_conn()
+        sql = """SELECT * FROM facts
+                 WHERE fact_type = 'experience'
+                   AND status = 'completed'
+                   AND session_date >= ? AND session_date <= ?"""
+        params: list = [start_date, end_date + "~"]
+        if conversation_id:
+            sql += " AND conversation_id = ?"
+            params.append(conversation_id)
+        sql += " ORDER BY session_date ASC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_fact(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Fact links

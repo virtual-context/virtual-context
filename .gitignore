@@ -38,6 +38,7 @@ docs/superpowers/
 *.json
 !pyproject.toml
 !package.json
+*.autopsy.md
 
 # OS
 .DS_Store

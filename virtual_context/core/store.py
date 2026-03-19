@@ -245,6 +245,21 @@ class ContextStore(ABC):
         """Return {tag: fact_count} for context hint annotations."""
         return {}
 
+    def query_experience_facts_by_date(
+        self,
+        start_date: str,
+        end_date: str,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[Fact]:
+        """Return completed experience facts within a session_date range.
+
+        *start_date* and *end_date* are ``YYYY/MM/DD`` strings compared
+        lexicographically against the ``session_date`` column.  Returns
+        facts ordered by session_date ASC.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Tool Output Storage
     # ------------------------------------------------------------------
