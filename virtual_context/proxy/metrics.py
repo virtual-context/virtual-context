@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 import statistics
 import threading
 import time
@@ -28,7 +30,7 @@ class ProxyMetrics:
     MAX_EVENTS = 50_000
     MAX_AGE_S = 86_400  # 24 hours
 
-    def __init__(self, context_window: int = 120_000, telemetry_ledger=None) -> None:
+    def __init__(self, context_window: int = 120_000, telemetry_ledger=None, db_path: str | None = None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
         self._events: list[dict] = []
@@ -37,10 +39,46 @@ class ProxyMetrics:
         self._seq = 0
         self._request_bodies: deque[dict] = deque(maxlen=50)
         self._telemetry_ledger = telemetry_ledger
+        self._db: sqlite3.Connection | None = None
+
+        if db_path:
+            self._db = sqlite3.connect(db_path, check_same_thread=False)
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS metrics_events ("
+                "  seq INTEGER PRIMARY KEY,"
+                "  ts TEXT NOT NULL,"
+                "  type TEXT NOT NULL,"
+                "  conversation_id TEXT,"
+                "  recorded_at REAL NOT NULL,"
+                "  data_json TEXT NOT NULL"
+                ")"
+            )
+            self._db.commit()
+            # Restore seq from existing data
+            row = self._db.execute("SELECT MAX(seq) FROM metrics_events").fetchone()
+            if row and row[0] is not None:
+                self._seq = row[0] + 1
+            # Load existing events into memory for snapshot/events_since
+            self._load_from_db()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _load_from_db(self) -> None:
+        """Load events from SQLite into memory. Must be called during __init__."""
+        if not self._db:
+            return
+        cutoff = time.time() - self.MAX_AGE_S
+        rows = self._db.execute(
+            "SELECT data_json FROM metrics_events WHERE recorded_at >= ? ORDER BY seq",
+            (cutoff,),
+        ).fetchall()
+        for (data_json,) in rows:
+            try:
+                self._events.append(json.loads(data_json))
+            except (json.JSONDecodeError, TypeError):
+                pass
 
     def _evict_old(self) -> None:
         """Remove events older than *MAX_AGE_S*.  Must hold ``_lock``."""
@@ -54,6 +92,10 @@ class ProxyMetrics:
             idx += 1
         if idx:
             del self._events[:idx]
+        # Also evict from SQLite
+        if self._db:
+            self._db.execute("DELETE FROM metrics_events WHERE recorded_at < ?", (cutoff,))
+            self._db.commit()
 
     # ------------------------------------------------------------------
     # Public API
@@ -64,11 +106,30 @@ class ProxyMetrics:
         with self._lock:
             event = dict(event)  # shallow copy to avoid caller mutation
             event["_seq"] = self._seq
-            event["_recorded_at"] = time.time()
+            if "_recorded_at" not in event:
+                event["_recorded_at"] = time.time()
             if "ts" not in event:
                 event["ts"] = datetime.now(timezone.utc).isoformat()
             self._seq += 1
             self._events.append(event)
+            # Persist to SQLite
+            if self._db:
+                try:
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO metrics_events (seq, ts, type, conversation_id, recorded_at, data_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            event["_seq"],
+                            event.get("ts", ""),
+                            event.get("type", ""),
+                            event.get("conversation_id", ""),
+                            event["_recorded_at"],
+                            json.dumps(event),
+                        ),
+                    )
+                    self._db.commit()
+                except Exception:
+                    pass  # never block event recording for DB errors
             # Debug: log every event for diagnostics
             etype = event.get("type", "?")
             conv = event.get("conversation_id", "")[:12]
