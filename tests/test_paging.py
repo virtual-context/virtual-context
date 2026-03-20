@@ -525,8 +525,8 @@ class TestEnginePagingAPI:
         assert result["tag"] == "database"
         assert result["depth"] == "full"
         assert result["tokens_added"] > 0
-        assert "database" in engine._working_set
-        assert engine._working_set["database"].depth == DepthLevel.FULL
+        assert "database" in engine._paging.working_set
+        assert engine._paging.working_set["database"].depth == DepthLevel.FULL
 
     def test_expand_to_segments(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -534,7 +534,7 @@ class TestEnginePagingAPI:
 
         result = engine.expand_topic("api", depth="segments")
         assert result["depth"] == "segments"
-        assert engine._working_set["api"].depth == DepthLevel.SEGMENTS
+        assert engine._paging.working_set["api"].depth == DepthLevel.SEGMENTS
 
     def test_expand_to_summary(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -542,7 +542,7 @@ class TestEnginePagingAPI:
 
         result = engine.expand_topic("auth", depth="summary")
         assert result["depth"] == "summary"
-        assert engine._working_set["auth"].depth == DepthLevel.SUMMARY
+        assert engine._paging.working_set["auth"].depth == DepthLevel.SUMMARY
 
     def test_expand_none_delegates_to_collapse(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -550,12 +550,12 @@ class TestEnginePagingAPI:
 
         # First expand to full
         engine.expand_topic("db", depth="full")
-        assert "db" in engine._working_set
+        assert "db" in engine._paging.working_set
 
         # Expand with "none" should collapse
         result = engine.expand_topic("db", depth="none")
         assert result["depth"] == "none"
-        assert "db" not in engine._working_set
+        assert "db" not in engine._paging.working_set
 
     def test_collapse_to_summary(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -563,14 +563,14 @@ class TestEnginePagingAPI:
 
         # Expand to full first
         engine.expand_topic("database", depth="full")
-        old_tokens = engine._working_set["database"].tokens
+        old_tokens = engine._paging.working_set["database"].tokens
 
         # Collapse to summary
         result = engine.collapse_topic("database", depth="summary")
         assert result["tag"] == "database"
         assert result["depth"] == "summary"
         assert result["tokens_freed"] > 0
-        assert engine._working_set["database"].depth == DepthLevel.SUMMARY
+        assert engine._paging.working_set["database"].depth == DepthLevel.SUMMARY
 
     def test_collapse_to_none_removes(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -579,7 +579,7 @@ class TestEnginePagingAPI:
 
         result = engine.collapse_topic("auth", depth="none")
         assert result["depth"] == "none"
-        assert "auth" not in engine._working_set
+        assert "auth" not in engine._paging.working_set
 
     def test_collapse_nonexistent_tag(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -611,9 +611,9 @@ class TestEnginePagingAPI:
         result = engine.expand_topic("new-topic", depth="full")
 
         # old-topic should have been evicted (collapsed or removed)
-        if "old-topic" in engine._working_set:
+        if "old-topic" in engine._paging.working_set:
             # Collapsed to summary
-            assert engine._working_set["old-topic"].depth == DepthLevel.SUMMARY
+            assert engine._paging.working_set["old-topic"].depth == DepthLevel.SUMMARY
         assert result.get("evicted_tags", []) != [] or "error" in result
 
     def test_no_evict_when_disabled(self, tmp_path):
@@ -645,7 +645,7 @@ class TestEngineAutoEvict:
         engine = self._make_engine(tmp_path)
 
         # Manually set working set with different access turns
-        engine._working_set = {
+        engine._paging.working_set = {
             "cold": WorkingSetEntry(tag="cold", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=1),
             "warm": WorkingSetEntry(tag="warm", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=5),
             "hot": WorkingSetEntry(tag="hot", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=10),
@@ -657,7 +657,7 @@ class TestEngineAutoEvict:
 
     def test_excludes_specified_tag(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        engine._working_set = {
+        engine._paging.working_set = {
             "target": WorkingSetEntry(tag="target", depth=DepthLevel.FULL, tokens=500, last_accessed_turn=1),
             "other": WorkingSetEntry(tag="other", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=2),
         }
@@ -877,7 +877,7 @@ class TestContextHintModes:
             self._seed_tag_summary(engine, f"a-tag-{i:02d}")
         # Put z-fragrance in working set at summary depth
         self._seed_tag_summary(engine, "z-fragrance")
-        engine._working_set["z-fragrance"] = WorkingSetEntry(
+        engine._paging.working_set["z-fragrance"] = WorkingSetEntry(
             tag="z-fragrance", depth=DepthLevel.SUMMARY,
             tokens=200, last_accessed_turn=5,
         )
@@ -928,7 +928,7 @@ class TestContextHintModes:
         # Put 3 tags in working set at summary depth
         for name in ["fragrance-selection", "karak-chai", "whales"]:
             self._seed_tag_summary(engine, name)
-            engine._working_set[name] = WorkingSetEntry(
+            engine._paging.working_set[name] = WorkingSetEntry(
                 tag=name, depth=DepthLevel.SUMMARY,
                 tokens=100, last_accessed_turn=5,
             )
@@ -1122,7 +1122,7 @@ class TestPagingStatePersistence:
             tag="db", summary="Tag summary", summary_tokens=20,
         ), conversation_id=engine.config.conversation_id)
         engine.expand_topic("db", depth="full")
-        assert "db" in engine._working_set
+        assert "db" in engine._paging.working_set
 
         # Save state
         engine._save_state([])
@@ -1130,9 +1130,9 @@ class TestPagingStatePersistence:
         # Create new engine from same DB — should restore working set
         from virtual_context.engine import VirtualContextEngine
         engine2 = VirtualContextEngine(config=engine.config)
-        assert "db" in engine2._working_set
-        assert engine2._working_set["db"].depth == DepthLevel.FULL
-        assert engine2._working_set["db"].tokens > 0
+        assert "db" in engine2._paging.working_set
+        assert engine2._paging.working_set["db"].depth == DepthLevel.FULL
+        assert engine2._paging.working_set["db"].tokens > 0
 
 
 # ---------------------------------------------------------------------------
@@ -1275,7 +1275,7 @@ class TestTemporalNoBypass:
             full_text="Detailed architecture text with all implementation specifics. " * 20,
             full_tokens=300,
         ))
-        engine._working_set = {
+        engine._paging.working_set = {
             "architecture": WorkingSetEntry(
                 tag="architecture", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=3,
             ),
@@ -1334,7 +1334,7 @@ class TestSegmentLoadingGate:
         engine._store.save_tag_summary(TagSummary(
             tag="api", summary="API discussion.", summary_tokens=15,
         ), conversation_id=engine.config.conversation_id)
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
         }
 
@@ -1371,7 +1371,7 @@ class TestSegmentLoadingGate:
             full_text="Full auth text.", full_tokens=20,
             conversation_id=engine.config.conversation_id,
         ))
-        engine._working_set = {
+        engine._paging.working_set = {
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }
 
@@ -1467,7 +1467,7 @@ class TestCrossTagSegmentDedup:
             ), conversation_id=engine.config.conversation_id)
 
         # Put both tags in working set at FULL depth
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }
@@ -1487,7 +1487,7 @@ class TestCrossTagSegmentDedup:
         # We need to capture it — rebuild it the same way the engine does.
         full_segments_param = {}
         seen_refs: set = set()
-        for tag, entry in engine._working_set.items():
+        for tag, entry in engine._paging.working_set.items():
             from virtual_context.types import DepthLevel as DL
             if entry.depth in (DL.SEGMENTS, DL.FULL):
                 segs = engine._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
@@ -1530,7 +1530,7 @@ class TestCrossTagSegmentDedup:
             ), conversation_id=engine.config.conversation_id)
 
         # Put both tags at FULL depth
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }
