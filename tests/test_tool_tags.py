@@ -62,6 +62,22 @@ def _build_tag_turn_engine_mock():
     engine._working_set = {}
     engine._telemetry = MagicMock()
     engine._request_captures_provider = None
+    # Wire up TaggingPipeline so tag_turn delegation works
+    from virtual_context.core.tagging_pipeline import TaggingPipeline
+    engine._tagging = TaggingPipeline(
+        tag_generator=MagicMock(),
+        turn_tag_index=engine._turn_tag_index,
+        store=engine._store,
+        semantic=MagicMock(),
+        engine_state=engine._engine_state,
+        config=engine.config,
+        tag_splitter=engine._tag_splitter,
+        canonicalizer=None,
+        telemetry=engine._telemetry,
+        monitor=engine._monitor,
+        compactor=None,
+        save_state_callback=MagicMock(),
+    )
     return engine
 
 
