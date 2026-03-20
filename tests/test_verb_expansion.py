@@ -114,17 +114,17 @@ class TestQueryFactsWithVerbs:
 
 
 class TestExpandVerb:
-    """Test engine._expand_verb using mock embeddings."""
+    """Test FactQueryEngine._expand_verb using mock embeddings."""
 
     def test_expand_led_finds_leads(self):
         """Mock: 'led' and 'leads' are close, 'built' is far."""
         from unittest.mock import MagicMock, patch
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
-        engine._store.get_unique_fact_verbs.return_value = ["led", "leads", "built", "prefers"]
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
+        fqe._store.get_unique_fact_verbs.return_value = ["led", "leads", "built", "prefers"]
 
         # Simulate embeddings: led=[1,0,0], leads=[0.9,0.1,0], built=[0,1,0], prefers=[0,0,1]
         def fake_embed(texts):
@@ -136,10 +136,10 @@ class TestExpandVerb:
             }
             return [vecs.get(t, [0.0, 0.0, 0.0]) for t in texts]
 
-        engine._get_embed_fn = MagicMock(return_value=fake_embed)
+        fqe._get_embed_fn = MagicMock(return_value=fake_embed)
 
         # Call the real method
-        result = VirtualContextEngine._expand_verb(engine, "led")
+        result = FactQueryEngine._expand_verb(fqe, "led")
         assert "led" in result
         assert "leads" in result
         assert "built" not in result
@@ -147,40 +147,40 @@ class TestExpandVerb:
 
     def test_expand_returns_none_when_no_embed_fn(self):
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
-        engine._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
-        engine._get_embed_fn = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
+        fqe._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
+        fqe._get_embed_fn = MagicMock(return_value=None)
 
-        result = VirtualContextEngine._expand_verb(engine, "led")
-        # No embed fn and "led" doesn't match any verb cluster → None
+        result = FactQueryEngine._expand_verb(fqe, "led")
+        # No embed fn and "led" doesn't match any verb cluster -> None
         assert result is None
 
     def test_expand_returns_none_when_no_verbs(self):
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._get_embed_fn = MagicMock(return_value=lambda texts: [[0.0]] * len(texts))
-        engine._store = MagicMock()
-        engine._store.get_unique_fact_verbs.return_value = []
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._get_embed_fn = MagicMock(return_value=lambda texts: [[0.0]] * len(texts))
+        fqe._store = MagicMock()
+        fqe._store.get_unique_fact_verbs.return_value = []
 
-        result = VirtualContextEngine._expand_verb(engine, "led")
+        result = FactQueryEngine._expand_verb(fqe, "led")
         assert result is None
 
     def test_expand_returns_none_when_no_similar(self):
         """If no other verbs are similar, returns None (no expansion needed)."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
-        engine._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
+        fqe._store.get_unique_fact_verbs.return_value = ["built", "prefers"]
 
         # Orthogonal embeddings — no similarity
         def fake_embed(texts):
@@ -191,32 +191,32 @@ class TestExpandVerb:
             }
             return [vecs.get(t, [0.0, 0.0, 0.0]) for t in texts]
 
-        engine._get_embed_fn = MagicMock(return_value=fake_embed)
+        fqe._get_embed_fn = MagicMock(return_value=fake_embed)
 
-        result = VirtualContextEngine._expand_verb(engine, "led")
+        result = FactQueryEngine._expand_verb(fqe, "led")
         assert result is None
 
 
 class TestEngineQueryFactsIntegration:
-    """Test that engine.query_facts calls _expand_verb and passes verbs through."""
+    """Test that FactQueryEngine.query calls _expand_verb and passes verbs through."""
 
     def test_verb_expansion_passed_to_store(self):
         from unittest.mock import MagicMock, call
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
         from virtual_context.types import Fact
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._semantic_fact_search = MagicMock(return_value=[])
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._semantic_fact_search = MagicMock(return_value=[])
         # Return results so auto-relax doesn't trigger — must be Fact objects
         store.query_facts.return_value = [Fact(id="f1", subject="user", verb="led")]
 
         # Mock _expand_verb to return expanded list
-        engine._expand_verb = MagicMock(return_value=["led", "leads"])
+        fqe._expand_verb = MagicMock(return_value=["led", "leads"])
 
-        VirtualContextEngine.query_facts(engine, verb="led", subject="user")
+        FactQueryEngine.query(fqe, verb="led", subject="user")
 
         # Should call store with verbs instead of verb (first call)
         first_call = store.query_facts.call_args_list[0]
@@ -224,17 +224,17 @@ class TestEngineQueryFactsIntegration:
 
     def test_no_expansion_keeps_verb(self):
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._semantic_fact_search = MagicMock(return_value=[])
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._semantic_fact_search = MagicMock(return_value=[])
         store.query_facts.return_value = []
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe._expand_verb = MagicMock(return_value=None)
 
-        VirtualContextEngine.query_facts(engine, verb="led", subject="user")
+        FactQueryEngine.query(fqe, verb="led", subject="user")
 
         store.query_facts.assert_called_once_with(
             verb="led", subject="user", conversation_id="test-session"
@@ -246,19 +246,19 @@ class TestEngineQueryFactsIntegration:
         retry without object_contains.  Auto-relax was removed because it
         returned facts contradicting the reader's explicit filter (BUG-032)."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
-        engine._semantic_fact_search = MagicMock(return_value=[])
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
+        fqe._semantic_fact_search = MagicMock(return_value=[])
 
         store.query_facts.return_value = []
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="led", subject="user", object_contains="project"
+        result = FactQueryEngine.query(
+            fqe, verb="led", subject="user", object_contains="project"
         )
 
         assert result == []
@@ -268,20 +268,20 @@ class TestEngineQueryFactsIntegration:
     def test_no_relax_when_object_contains_has_results(self):
         """When object_contains produces results, don't retry."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
         from virtual_context.types import Fact
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
-        engine._semantic_fact_search = MagicMock(return_value=[])
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
+        fqe._semantic_fact_search = MagicMock(return_value=[])
         fact1 = Fact(id="f1", subject="user", verb="led", object="team")
         store.query_facts.return_value = [fact1]
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="led", subject="user", object_contains="team"
+        result = FactQueryEngine.query(
+            fqe, verb="led", subject="user", object_contains="team"
         )
 
         assert fact1 in result
@@ -289,18 +289,18 @@ class TestEngineQueryFactsIntegration:
     def test_no_relax_when_no_object_contains(self):
         """When object_contains not provided, no retry even on 0 results."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
-        engine._semantic_fact_search = MagicMock(return_value=[])
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
+        fqe._semantic_fact_search = MagicMock(return_value=[])
         store.query_facts.return_value = []
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="led", subject="user"
+        result = FactQueryEngine.query(
+            fqe, verb="led", subject="user"
         )
 
         assert result == []
@@ -308,7 +308,7 @@ class TestEngineQueryFactsIntegration:
 
 
 class TestSemanticFactSearch:
-    """Test engine._semantic_fact_search using mock embeddings."""
+    """Test FactQueryEngine._semantic_fact_search using mock embeddings."""
 
     def _make_fact(self, id, verb, what, status="active"):
         from virtual_context.types import Fact
@@ -317,11 +317,11 @@ class TestSemanticFactSearch:
     def test_finds_additional_facts_by_what_field(self):
         """Semantic search finds facts SQL missed due to verb mismatch."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
 
         # SQL found Fitbit (verb=uses), semantic should find Accu-Chek (verb=is testing)
         existing = [self._make_fact("f1", "uses", "User uses a Fitbit daily")]
@@ -329,7 +329,7 @@ class TestSemanticFactSearch:
         nebulizer = self._make_fact("f3", "is doing", "User is doing nebulizer treatments weekly")
         unrelated = self._make_fact("f4", "grows", "User grows herb plants on the balcony")
 
-        engine._store.query_facts.return_value = [existing[0], accu, nebulizer, unrelated]
+        fqe._store.query_facts.return_value = [existing[0], accu, nebulizer, unrelated]
 
         # Mock embed_fn: query "user use" is close to health-related facts
         def fake_embed(texts):
@@ -342,10 +342,10 @@ class TestSemanticFactSearch:
             }
             return [vecs.get(t, [0.0, 0.0, 0.0]) for t in texts]
 
-        engine._get_embed_fn = MagicMock(return_value=fake_embed)
+        fqe._get_embed_fn = MagicMock(return_value=fake_embed)
 
-        result = VirtualContextEngine._semantic_fact_search(
-            engine, existing=existing, subject="user", verb="use"
+        result = FactQueryEngine._semantic_fact_search(
+            fqe, existing=existing, subject="user", verb="use"
         )
 
         result_ids = {f.id for f in result}
@@ -357,69 +357,69 @@ class TestSemanticFactSearch:
     def test_returns_empty_without_embed_fn(self):
         """Gracefully returns [] when embeddings are unavailable."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine._get_embed_fn = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._get_embed_fn = MagicMock(return_value=None)
 
-        result = VirtualContextEngine._semantic_fact_search(
-            engine, existing=[], subject="user", verb="use"
+        result = FactQueryEngine._semantic_fact_search(
+            fqe, existing=[], subject="user", verb="use"
         )
         assert result == []
 
     def test_returns_empty_without_verb_or_object(self):
         """Requires at least verb or object_contains for a meaningful query."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine._get_embed_fn = MagicMock(return_value=lambda t: [[0.0]] * len(t))
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._get_embed_fn = MagicMock(return_value=lambda t: [[0.0]] * len(t))
 
-        result = VirtualContextEngine._semantic_fact_search(
-            engine, existing=[], subject="user"
+        result = FactQueryEngine._semantic_fact_search(
+            fqe, existing=[], subject="user"
         )
         assert result == []
 
     def test_deduplicates_existing_facts(self):
         """Facts already in existing are not returned again."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
 
         existing = [self._make_fact("f1", "uses", "User uses a Fitbit daily")]
         # Store returns the same fact that's already in existing
-        engine._store.query_facts.return_value = [existing[0]]
-        engine._get_embed_fn = MagicMock(return_value=lambda t: [[1.0, 0.0]] * len(t))
+        fqe._store.query_facts.return_value = [existing[0]]
+        fqe._get_embed_fn = MagicMock(return_value=lambda t: [[1.0, 0.0]] * len(t))
 
-        result = VirtualContextEngine._semantic_fact_search(
-            engine, existing=existing, subject="user", verb="use"
+        result = FactQueryEngine._semantic_fact_search(
+            fqe, existing=existing, subject="user", verb="use"
         )
         assert result == []
 
     def test_skips_facts_without_what_field(self):
         """Facts with empty 'what' are excluded from semantic comparison."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = MagicMock()
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = MagicMock()
 
         no_what = self._make_fact("f2", "is testing", "")
-        engine._store.query_facts.return_value = [no_what]
-        engine._get_embed_fn = MagicMock(return_value=lambda t: [[1.0, 0.0]] * len(t))
+        fqe._store.query_facts.return_value = [no_what]
+        fqe._get_embed_fn = MagicMock(return_value=lambda t: [[1.0, 0.0]] * len(t))
 
-        result = VirtualContextEngine._semantic_fact_search(
-            engine, existing=[], subject="user", verb="use"
+        result = FactQueryEngine._semantic_fact_search(
+            fqe, existing=[], subject="user", verb="use"
         )
         assert result == []
 
 
 class TestQueryFactsSemanticIntegration:
-    """Test that query_facts integrates semantic search correctly."""
+    """Test that FactQueryEngine.query integrates semantic search correctly."""
 
     def _make_fact(self, id, verb, what, status="active"):
         from virtual_context.types import Fact
@@ -428,21 +428,21 @@ class TestQueryFactsSemanticIntegration:
     def test_semantic_results_merged_into_output(self):
         """Semantic matches are appended to SQL results."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         sql_fact = self._make_fact("f1", "uses", "User uses a Fitbit")
         sem_fact = self._make_fact("f2", "is testing", "User is testing an Accu-Chek")
         store.query_facts.return_value = [sql_fact]
-        engine._semantic_fact_search = MagicMock(return_value=[sem_fact])
+        fqe._semantic_fact_search = MagicMock(return_value=[sem_fact])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="use", subject="user"
+        result = FactQueryEngine.query(
+            fqe, verb="use", subject="user"
         )
 
         assert len(result) == 2
@@ -452,22 +452,22 @@ class TestQueryFactsSemanticIntegration:
     def test_semantic_prevents_noisy_auto_relax(self):
         """When semantic search finds results, auto-relax doesn't trigger."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         sem_fact = self._make_fact("f2", "is testing", "User is testing an Accu-Chek health monitor")
 
         # SQL returns 0, but semantic finds 1
         store.query_facts.return_value = []
-        engine._semantic_fact_search = MagicMock(return_value=[sem_fact])
+        fqe._semantic_fact_search = MagicMock(return_value=[sem_fact])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="use", subject="user", object_contains="health"
+        result = FactQueryEngine.query(
+            fqe, verb="use", subject="user", object_contains="health"
         )
 
         assert len(result) == 1
@@ -478,20 +478,20 @@ class TestQueryFactsSemanticIntegration:
     def test_semantic_note_in_meta(self):
         """_return_meta includes semantic_note when semantic search adds facts."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         sem_fact = self._make_fact("f2", "is testing", "User is testing an Accu-Chek")
         store.query_facts.return_value = []
-        engine._semantic_fact_search = MagicMock(return_value=[sem_fact])
+        fqe._semantic_fact_search = MagicMock(return_value=[sem_fact])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="use", subject="user", _return_meta=True
+        result = FactQueryEngine.query(
+            fqe, verb="use", subject="user", _return_meta=True
         )
 
         assert result["semantic_note"] is not None
@@ -500,21 +500,21 @@ class TestQueryFactsSemanticIntegration:
     def test_semantic_respects_status_filter(self):
         """When status filter is used, only matching semantic results are included."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         active_fact = self._make_fact("f2", "is testing", "User is testing Accu-Chek", status="active")
         completed_fact = self._make_fact("f3", "used", "User used a different monitor", status="completed")
         store.query_facts.return_value = []
-        engine._semantic_fact_search = MagicMock(return_value=[active_fact, completed_fact])
+        fqe._semantic_fact_search = MagicMock(return_value=[active_fact, completed_fact])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="use", subject="user", status="active"
+        result = FactQueryEngine.query(
+            fqe, verb="use", subject="user", status="active"
         )
 
         # Only the active fact should be in results
@@ -524,13 +524,13 @@ class TestQueryFactsSemanticIntegration:
     def test_total_all_statuses_includes_semantic_matches(self):
         """Semantic matches are merged into the total_all_statuses calculation."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         sql_fact = self._make_fact("f1", "uses", "User uses Fitbit", status="active")
         sem_active = self._make_fact("f2", "is testing", "User is testing Accu-Chek", status="active")
@@ -539,10 +539,10 @@ class TestQueryFactsSemanticIntegration:
         # SQL query with status="active" returns f1
         # Unfiltered SQL query (no status) also returns just f1
         store.query_facts.side_effect = [[sql_fact], [sql_fact]]
-        engine._semantic_fact_search = MagicMock(return_value=[sem_active, sem_completed])
+        fqe._semantic_fact_search = MagicMock(return_value=[sem_active, sem_completed])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="use", subject="user", status="active", _return_meta=True
+        result = FactQueryEngine.query(
+            fqe, verb="use", subject="user", status="active", _return_meta=True
         )
 
         # Main facts: f1 (SQL) + f2 (semantic, active) = 2
@@ -555,18 +555,18 @@ class TestQueryFactsSemanticIntegration:
     @pytest.mark.regression("BUG-032")
     def test_semantic_search_respects_object_contains_filter(self):
         """Semantic search must post-filter against the reader's explicit
-        object_contains constraint.  Regression: 6d550036 — reader asked for
+        object_contains constraint.  Regression: 6d550036 -- reader asked for
         query_facts(verb='led', object_contains='project', status='active')
         but semantic search returned 'User leads a team of five engineers'
         because it ignores structured SQL filters, causing over-count."""
         from unittest.mock import MagicMock
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.fact_query import FactQueryEngine
 
         store = MagicMock()
-        engine = MagicMock(spec=VirtualContextEngine)
-        engine.config = MagicMock(conversation_id="test-session")
-        engine._store = store
-        engine._expand_verb = MagicMock(return_value=None)
+        fqe = MagicMock(spec=FactQueryEngine)
+        fqe._config = MagicMock(conversation_id="test-session")
+        fqe._store = store
+        fqe._expand_verb = MagicMock(return_value=None)
 
         # Fact that matches semantically but NOT object_contains="project"
         team_fact = self._make_fact("f-team", "leads", "User leads a team of five engineers")
@@ -574,10 +574,10 @@ class TestQueryFactsSemanticIntegration:
         project_fact = self._make_fact("f-proj", "leads", "User leads the migration project")
 
         store.query_facts.return_value = []
-        engine._semantic_fact_search = MagicMock(return_value=[team_fact, project_fact])
+        fqe._semantic_fact_search = MagicMock(return_value=[team_fact, project_fact])
 
-        result = VirtualContextEngine.query_facts(
-            engine, verb="led", subject="user", object_contains="project"
+        result = FactQueryEngine.query(
+            fqe, verb="led", subject="user", object_contains="project"
         )
 
         # Only the project fact should survive post-filtering
