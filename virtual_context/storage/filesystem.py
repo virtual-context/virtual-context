@@ -870,3 +870,33 @@ class FilesystemStore(ContextStore):
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
         return []
+
+    def save_request_capture(self, capture: dict) -> None:
+        captures_path = self.root / "_request_captures.json"
+        with self._lock:
+            existing = []
+            if captures_path.exists():
+                try:
+                    existing = json.loads(captures_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    existing = []
+            # Upsert by turn
+            existing = [c for c in existing if c.get("turn") != capture.get("turn")]
+            existing.append(capture)
+            # Prune to newest 50 (by ts)
+            if len(existing) > 50:
+                existing.sort(key=lambda c: c.get("ts", ""))
+                existing = existing[-50:]
+            captures_path.write_text(json.dumps(existing, indent=2))
+
+    def load_request_captures(self, limit: int = 50) -> list[dict]:
+        captures_path = self.root / "_request_captures.json"
+        with self._lock:
+            if not captures_path.exists():
+                return []
+            try:
+                data = json.loads(captures_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                return []
+            data.sort(key=lambda c: c.get("ts", ""))
+            return data[-limit:]

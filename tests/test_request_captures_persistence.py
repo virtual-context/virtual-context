@@ -129,3 +129,49 @@ class TestRequestCapturesPersistence:
         assert len(loaded) == 1
         assert loaded[0]["conversation_id"] == "c1"
         store2.close()
+
+
+class TestFilesystemRequestCaptures:
+    def test_save_and_load(self, tmp_path):
+        from virtual_context.storage.filesystem import FilesystemStore
+        store = FilesystemStore(tmp_path / "fs_store")
+        cap = {
+            "turn": 1, "ts": "2026-03-20T10:00:00+00:00",
+            "api_format": "anthropic", "model": "test", "stream": False,
+            "message_count": 1, "conversation_id": "",
+            "inbound_tags": [], "response_tags": [],
+            "passthrough": False,
+            "inbound_tokens": 0, "outbound_tokens": 0,
+            "inbound_bytes": 0, "outbound_bytes": 0,
+            "context_tokens": 0, "overhead_ms": 0,
+            "turns_dropped": 0, "turns_stubbed": 0,
+            "message_preview": "test",
+            "upstream_input_tokens": 0, "upstream_output_tokens": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        }
+        store.save_request_capture(cap)
+        loaded = store.load_request_captures()
+        assert len(loaded) == 1
+        assert loaded[0]["turn"] == 1
+
+    def test_prune_to_50(self, tmp_path):
+        from virtual_context.storage.filesystem import FilesystemStore
+        store = FilesystemStore(tmp_path / "fs_store")
+        for i in range(55):
+            store.save_request_capture({
+                "turn": i, "ts": f"2026-03-20T10:{i:02d}:00+00:00",
+                "api_format": "anthropic", "model": "test", "stream": False,
+                "message_count": 1, "conversation_id": "",
+                "inbound_tags": [], "response_tags": [],
+                "passthrough": False,
+                "inbound_tokens": 0, "outbound_tokens": 0,
+                "inbound_bytes": 0, "outbound_bytes": 0,
+                "context_tokens": 0, "overhead_ms": 0,
+                "turns_dropped": 0, "turns_stubbed": 0,
+                "message_preview": "",
+                "upstream_input_tokens": 0, "upstream_output_tokens": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            })
+        loaded = store.load_request_captures()
+        assert len(loaded) == 50
+        assert loaded[0]["turn"] == 5  # oldest 5 pruned
