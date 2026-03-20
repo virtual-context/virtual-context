@@ -91,6 +91,7 @@ def _is_stub_content(text: str) -> bool:
 from .core.engine_utils import extract_turn_pairs, get_recent_context
 from .core.paging_manager import PagingManager
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
+from .core.tagging_pipeline import TaggingPipeline
 
 
 class VirtualContextEngine:
@@ -167,6 +168,20 @@ class VirtualContextEngine:
         self._init_supersession_checker()
         self._fact_curator = None
         self._init_fact_curator()
+        self._tagging = TaggingPipeline(
+            tag_generator=self._tag_generator,
+            turn_tag_index=self._turn_tag_index,
+            store=self._store,
+            semantic=self._semantic,
+            engine_state=self._engine_state,
+            config=self.config,
+            tag_splitter=self._tag_splitter,
+            canonicalizer=self._canonicalizer,
+            telemetry=self._telemetry,
+            monitor=self._monitor,
+            compactor=self._compactor,
+            save_state_callback=self._save_state,
+        )
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
@@ -179,10 +194,12 @@ class VirtualContextEngine:
 
         # Restore persisted state if available
         self._load_persisted_state()
-        # Re-sync segmenter's index reference — _load_persisted_state replaces
-        # self._turn_tag_index with a new object, but the segmenter was initialized
+        # Re-sync delegate index references — _load_persisted_state replaces
+        # self._turn_tag_index with a new object, but delegates were initialized
         # with the old (empty) one.
         self._segmenter._turn_tag_index = self._turn_tag_index
+        self._tagging._turn_tag_index = self._turn_tag_index
+        self._tagging._engine_state = self._engine_state
         self._bootstrap_vocabulary()
 
     def close(self) -> None:
@@ -208,6 +225,44 @@ class VirtualContextEngine:
     @_embed_fn.setter
     def _embed_fn(self, value):
         self._semantic._embed_fn = value
+
+    @property
+    def _tag_generator(self) -> TagGenerator:
+        """Proxy to TaggingPipeline's tag generator (for test compat).
+
+        Before ``_tagging`` is created (during ``__init__``), reads/writes
+        go to the backing attribute ``__tag_generator``.  After that, reads
+        and writes go through ``_tagging._tag_generator`` so that tests
+        that monkey-patch ``engine._tag_generator`` also update the delegate.
+        """
+        tagging = self.__dict__.get("_tagging")
+        if tagging is not None:
+            return tagging._tag_generator
+        return self.__dict__.get("_VirtualContextEngine__tag_generator")  # type: ignore[return-value]
+
+    @_tag_generator.setter
+    def _tag_generator(self, value: TagGenerator) -> None:
+        tagging = self.__dict__.get("_tagging")
+        if tagging is not None:
+            tagging._tag_generator = value
+        else:
+            self.__dict__["_VirtualContextEngine__tag_generator"] = value
+
+    @property
+    def _tag_splitter(self):
+        """Proxy to TaggingPipeline's tag splitter (for test compat)."""
+        tagging = self.__dict__.get("_tagging")
+        if tagging is not None:
+            return tagging._tag_splitter
+        return self.__dict__.get("_VirtualContextEngine__tag_splitter")
+
+    @_tag_splitter.setter
+    def _tag_splitter(self, value) -> None:
+        tagging = self.__dict__.get("_tagging")
+        if tagging is not None:
+            tagging._tag_splitter = value
+        else:
+            self.__dict__["_VirtualContextEngine__tag_splitter"] = value
 
     @property
     def _working_set(self) -> dict[str, WorkingSetEntry]:
@@ -940,138 +995,16 @@ class VirtualContextEngine:
 
     @staticmethod
     def _is_tool_turn(messages: list[Message]) -> bool:
-        """Check if a turn is tool-only: has tool blocks in raw_content and empty text content."""
-        combined_text = " ".join(m.content for m in messages)
-        if combined_text.strip():
-            return False  # has real text content — use LLM tagger
-        has_tool_block = False
-        for m in messages:
-            if not m.raw_content:
-                continue
-            for block in m.raw_content:
-                if block.get("type") in ("tool_use", "tool_result"):
-                    has_tool_block = True
-                    break
-            if has_tool_block:
-                break
-        return has_tool_block
+        """Check if a turn is tool-only (delegates to TaggingPipeline)."""
+        return TaggingPipeline._is_tool_turn(messages)
 
     def tag_turn(
         self,
         conversation_history: list[Message],
         payload_tokens: int | None = None,
     ) -> CompactionSignal | None:
-        """Phase 1 of turn processing: tag the latest turn and check thresholds.
-
-        Fast (~2-3s with LLM tagger). Must complete before the next inbound
-        request so the turn-tag index is up-to-date for retrieval.
-
-        Returns a CompactionSignal if compaction is needed, None otherwise.
-
-        *payload_tokens* (proxy mode): actual client payload token count.
-        Overrides the stripped conversation_history token count in the
-        compaction monitor so thresholds trigger at the right level.
-        """
-        # Tag the latest round trip
-        _t_tag = time.monotonic()
-        latest_pair = self._get_latest_turn_pair(conversation_history)
-        sender = get_sender_name(latest_pair[0].metadata) if latest_pair else ""
-        if latest_pair:
-            combined_text = " ".join(m.content for m in latest_pair)
-
-            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
-            if self._is_tool_turn(latest_pair):
-                self._engine_state.tool_tag_counter += 1
-                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
-                self._turn_tag_index.append(TurnTagEntry(
-                    turn_number=len(self._turn_tag_index.entries),
-                    message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                    tags=[tag_name],
-                    primary_tag=tag_name,
-                    sender=sender or "",
-                    session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-                ))
-                latest_pair = None  # skip normal tagger flow below
-
-            # BUG-013: Skip empty turns with no tool blocks
-            elif not combined_text.strip():
-                latest_pair = None
-
-        if latest_pair:
-            store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-            n_context = self.config.tag_generator.context_lookback_pairs
-            context = self._get_recent_context(
-                conversation_history, n_context, current_text=combined_text,
-            )
-            tag_result = self._tag_generator.generate_tags(
-                combined_text, store_tags, context_turns=context,
-            )
-
-            # Retry with expanded context if only _general was produced
-            if tag_result.tags == ["_general"]:
-                expanded = self._get_recent_context(
-                    conversation_history, n_context * 2,
-                    current_text=combined_text,
-                )
-                if expanded:
-                    tag_result = self._tag_generator.generate_tags(
-                        combined_text, store_tags, context_turns=expanded,
-                    )
-
-            # Final fallback: inherit from most recent meaningful turn
-            if tag_result.tags == ["_general"]:
-                prev = self._turn_tag_index.latest_meaningful_tags()
-                if prev:
-                    tag_result = TagResult(
-                        tags=list(prev.tags),
-                        primary=prev.primary_tag,
-                        source="inherited",
-                    )
-
-            self._turn_tag_index.append(TurnTagEntry(
-                turn_number=len(self._turn_tag_index.entries),
-                message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                tags=tag_result.tags,
-                primary_tag=tag_result.primary,
-                fact_signals=tag_result.fact_signals,
-                sender=sender or "",
-                session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-            ))
-
-        self._engine_state.last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
-
-        # Check for overly-broad tags needing splitting
-        if self._tag_splitter:
-            self._check_and_split_broad_tags(conversation_history)
-
-        # Build snapshot (only count un-compacted messages)
-        snapshot = self._monitor.build_snapshot(
-            conversation_history[self._engine_state.compacted_through:],
-            payload_tokens=payload_tokens,
-        )
-
-        # Check thresholds
-        signal = self._monitor.check(snapshot)
-
-        if signal is None:
-            self._engine_state.last_compact_ms = 0.0
-            # Persist turn message text for post-restart recall
-            if latest_pair:
-                turn_num = len(self._turn_tag_index.entries) - 1
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        turn_num,
-                        latest_pair[0].content if len(latest_pair) > 0 else "",
-                        latest_pair[1].content if len(latest_pair) > 1 else "",
-                        user_raw_content=json.dumps(latest_pair[0].raw_content) if len(latest_pair) > 0 and latest_pair[0].raw_content else None,
-                        assistant_raw_content=json.dumps(latest_pair[1].raw_content) if len(latest_pair) > 1 and latest_pair[1].raw_content else None,
-                    )
-                except Exception:
-                    pass  # never block tagging for message persistence
-            self._save_state(conversation_history)
-
-        return signal
+        """Phase 1 of turn processing (delegates to TaggingPipeline)."""
+        return self._tagging.tag_turn(conversation_history, payload_tokens)
 
     def _run_compaction(
         self,
@@ -1259,75 +1192,8 @@ class VirtualContextEngine:
     def _check_and_split_broad_tags(
         self, conversation_history: list[Message],
     ) -> SplitResult | None:
-        """Check for overly-broad tags and split or summarize them."""
-        if not self._tag_splitter:
-            return None
-
-        cfg = self.config.tag_generator.tag_splitting
-        tag_counts = self._turn_tag_index.get_tag_counts()
-        total_turns = len(self._turn_tag_index.entries)
-
-        if total_turns == 0:
-            return None
-
-        # Find candidates: above both thresholds, not already processed
-        candidates = [
-            (tag, count) for tag, count in tag_counts.items()
-            if tag != "_general"
-            and tag not in self._engine_state.split_processed_tags
-            and count >= cfg.frequency_threshold
-            and count / total_turns >= cfg.frequency_pct_threshold
-        ]
-
-        if not candidates:
-            return None
-
-        # Pick highest-frequency first
-        candidates.sort(key=lambda x: -x[1])
-        tag, count = candidates[0]
-
-        # Collect turn content
-        turn_contents = self._collect_turn_text(tag, conversation_history)
-        if not turn_contents:
-            self._engine_state.split_processed_tags.add(tag)
-            return None
-
-        existing_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
-        result = self._tag_splitter.split(tag, turn_contents, existing_tags, total_turns)
-
-        if result.splittable:
-            # Apply split to TurnTagIndex
-            turn_to_new: dict[int, list[str]] = {}
-            for new_tag, turn_numbers in result.groups.items():
-                for tn in turn_numbers:
-                    turn_to_new.setdefault(tn, []).append(new_tag)
-            self._turn_tag_index.replace_tag(tag, turn_to_new)
-
-            # Register alias so old tag queries still resolve
-            if self._canonicalizer:
-                first_new = next(iter(result.groups))
-                self._canonicalizer.register_alias(tag, first_new)
-
-            # Update tagger vocabulary
-            if hasattr(self._tag_generator, '_tag_vocabulary'):
-                self._tag_generator._tag_vocabulary.pop(tag, None)
-                for new_tag, turns in result.groups.items():
-                    self._tag_generator._tag_vocabulary[new_tag] = len(turns)
-
-            logger.info(
-                "Split '%s' (%d turns) → %s",
-                tag, count, list(result.groups.keys()),
-            )
-        else:
-            # Fallback: build tag summary from raw turn text
-            self._build_broad_tag_summary(tag, conversation_history)
-            logger.info(
-                "Tag '%s' unsplittable (%s), built summary", tag, result.reason,
-            )
-
-        self._engine_state.split_processed_tags.add(tag)
-        self._engine_state.last_split_result = result
-        return result
+        """Check for overly-broad tags (delegates to TaggingPipeline)."""
+        return self._tagging._check_and_split_broad_tags(conversation_history)
 
     @staticmethod
     def _extract_turn_pairs(history: list[Message]) -> list[tuple[str, str]]:
@@ -1341,57 +1207,14 @@ class VirtualContextEngine:
     def _collect_turn_text(
         self, tag: str, history: list[Message],
     ) -> list[tuple[int, str]]:
-        """Collect truncated user text for turns tagged with the given tag."""
-        pairs = self._extract_turn_pairs(history)
-        result = []
-        for entry in self._turn_tag_index.entries:
-            if tag in entry.tags:
-                if entry.turn_number < len(pairs):
-                    text = pairs[entry.turn_number][0][:200]
-                    result.append((entry.turn_number, text))
-        return result
+        """Collect truncated user text (delegates to TaggingPipeline)."""
+        return self._tagging._collect_turn_text(tag, history)
 
     def _build_broad_tag_summary(
         self, tag: str, history: list[Message],
     ) -> None:
-        """Build a tag summary directly from raw turn text for unsplittable broad tags."""
-        if not self._compactor:
-            return
-
-        pairs = self._extract_turn_pairs(history)
-        texts = []
-        turn_numbers = []
-        for entry in self._turn_tag_index.entries:
-            if tag in entry.tags:
-                if entry.turn_number < len(pairs):
-                    user_text, assistant_text = pairs[entry.turn_number]
-                    texts.append(
-                        f"User: {user_text[:300]}\n"
-                        f"Assistant: {assistant_text[:300]}"
-                    )
-                    turn_numbers.append(entry.turn_number)
-
-        if not texts:
-            return
-
-        combined = "\n\n---\n\n".join(texts)
-        max_turn = max(turn_numbers) if turn_numbers else 0
-
-        synthetic = [StoredSummary(
-            ref=f"broad-{tag}",
-            tags=[tag],
-            summary=combined[:4000],
-            summary_tokens=len(combined[:4000]) // 4,
-        )]
-        summaries = self._compactor.compact_tag_summaries(
-            cover_tags=[tag],
-            tag_to_summaries={tag: synthetic},
-            tag_to_turns={tag: turn_numbers},
-            existing_tag_summaries={},
-            max_turn=max_turn,
-        )
-        for ts in summaries:
-            self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
+        """Build a tag summary for unsplittable broad tags (delegates to TaggingPipeline)."""
+        return self._tagging._build_broad_tag_summary(tag, history)
 
     def filter_history(
         self,
@@ -1560,13 +1383,8 @@ class VirtualContextEngine:
         return "supervised"
 
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
-        """Extract the most recent user+assistant pair."""
-        if len(history) < 2:
-            return None
-        for i in range(len(history) - 1, 0, -1):
-            if history[i].role == "assistant" and history[i-1].role == "user":
-                return [history[i-1], history[i]]
-        return None
+        """Extract the most recent user+assistant pair (delegates to TaggingPipeline)."""
+        return self._tagging._get_latest_turn_pair(history)
 
     def _get_embed_fn(self):
         """Lazy-load the embedding function for the context bleed gate."""
@@ -1655,265 +1473,8 @@ class VirtualContextEngine:
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
     ) -> int:
-        """Bootstrap TurnTagIndex from pre-existing conversation history.
-
-        Tags each user+assistant pair and appends entries to the live index.
-        Does NOT trigger compaction — the next on_turn_complete() handles that.
-
-        Args:
-            history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
-            progress_callback: Optional ``(done, total, entry)`` called after
-                each turn is ingested.  Used by the proxy for live progress.
-            turn_offset: Global turn number of the first pair. Used by catch-up
-                ingestion to prevent TurnTagIndex overwrites when multiple
-                batches are ingested sequentially.
-
-        Returns:
-            Number of turns ingested.
-        """
-        import sys as _sys
-        import time as _time
-        _tag_start = _time.time()
-
-        store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-        ingested = 0
-        _total_turns = len(history_pairs) // 2
-        n_context = self.config.tag_generator.context_lookback_pairs
-        running_session_date = ""
-
-        for i in range(0, len(history_pairs) - 1, 2):
-            user_msg = history_pairs[i]
-            asst_msg = history_pairs[i + 1]
-
-            sender = get_sender_name(user_msg.metadata) if user_msg.metadata else ""
-
-            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
-            if self._is_tool_turn([user_msg, asst_msg]):
-                self._engine_state.tool_tag_counter += 1
-                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
-                entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
-                    message_hash=hashlib.sha256(
-                        f"{user_msg.content} {asst_msg.content}".encode()
-                    ).hexdigest()[:16],
-                    tags=[tag_name],
-                    primary_tag=tag_name,
-                    sender=sender or "",
-                    session_date=running_session_date,
-                )
-                self._turn_tag_index.append(entry)
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
-                        user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                        assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                    )
-                except Exception:
-                    pass
-                ingested += 1
-                continue
-
-            # BUG-013: Skip empty turns with no tool blocks
-            if not user_msg.content.strip() and not asst_msg.content.strip():
-                logger.debug("Skipping empty turn at pair index %d", i // 2)
-                continue
-
-            # Track running session date BEFORE stub/tagger — stubs need timestamps too
-            m = _SESSION_HEADER_RE.search(user_msg.content)
-            if m:
-                running_session_date = m.group(1)
-            elif user_msg.timestamp:
-                running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-
-            # Stub turns (media attachments, image placeholders, etc.):
-            # skip tagger, assign _stub tag, preserve raw text for passthrough.
-            combined_for_stub = f"{user_msg.content} {asst_msg.content}"
-            if _is_stub_content(combined_for_stub):
-                entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
-                    message_hash=hashlib.sha256(combined_for_stub.encode()).hexdigest()[:16],
-                    tags=["_stub"],
-                    primary_tag="_stub",
-                    sender=sender or "",
-                    session_date=running_session_date,
-                )
-                self._turn_tag_index.append(entry)
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
-                    )
-                except Exception:
-                    pass
-                ingested += 1
-                logger.info(
-                    "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
-                    turn_offset + (i // 2), len(combined_for_stub),
-                    combined_for_stub[:60].replace("\n", " "),
-                )
-                if progress_callback:
-                    total = len(history_pairs) // 2
-                    progress_callback(ingested, total, entry)
-                continue
-
-            combined_text = f"{user_msg.content} {asst_msg.content}"
-            _turn_num = turn_offset + (i // 2)  # global turn number
-            _content_preview = combined_text[:60].replace("\n", " ")
-
-            # Flag short content that may be dominated by context
-            if len(combined_text) < 80:
-                logger.info(
-                    "TAGGER turn=%d SHORT_CONTENT len=%d \"%s\"",
-                    _turn_num, len(combined_text), _content_preview,
-                )
-
-            # Build context from preceding pairs in the flat history
-            context: list[str] | None = None
-            if i >= 2:
-                ctx_pairs: list[str] = []
-                start = max(0, i - n_context * 2)
-                for j in range(start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        ctx_pairs.append(history_pairs[j].content)
-                        ctx_pairs.append(history_pairs[j + 1].content)
-                context = ctx_pairs if ctx_pairs else None
-
-            # Context bleed gate (BUG-010): skip stale context on topic shift
-            _bleed_gate = "no_context"
-            _bleed_sim = -1.0
-            if (
-                context
-                and self.config.tag_generator.context_bleed_threshold > 0
-            ):
-                _relevant, _bleed_sim = self._context_is_relevant_with_score(combined_text, context)
-                if not _relevant:
-                    _bleed_gate = f"BLOCKED (similarity={_bleed_sim:.2f} threshold={self.config.tag_generator.context_bleed_threshold})"
-                    context = None
-                else:
-                    _bleed_gate = f"passed (similarity={_bleed_sim:.2f})"
-            elif context:
-                _bleed_gate = "disabled"
-
-            _ctx_preview = context[-2][:60].replace("\n", " ") if context and len(context) >= 2 else ""
-            logger.info(
-                "TAGGER turn=%d content_len=%d content_preview=\"%s\" "
-                "context_pairs=%d context_preview=\"%s\" bleed_gate=%s",
-                _turn_num, len(combined_text), _content_preview,
-                len(context) // 2 if context else 0, _ctx_preview, _bleed_gate,
-            )
-
-            tag_result = self._tag_generator.generate_tags(
-                combined_text, store_tags, context_turns=context,
-            )
-
-            logger.info(
-                "TAGGER turn=%d result primary=%s tags=%s source=%s",
-                _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
-            )
-
-            # Retry with expanded context on _general
-            if tag_result.tags == ["_general"] and i >= 2:
-                expanded_start = max(0, i - n_context * 4)
-                expanded_ctx: list[str] = []
-                for j in range(expanded_start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        expanded_ctx.append(history_pairs[j].content)
-                        expanded_ctx.append(history_pairs[j + 1].content)
-                # Gate expanded context too
-                _expanded_gate = "no_context"
-                if (
-                    expanded_ctx
-                    and self.config.tag_generator.context_bleed_threshold > 0
-                ):
-                    _rel, _sim = self._context_is_relevant_with_score(combined_text, expanded_ctx)
-                    if not _rel:
-                        _expanded_gate = f"BLOCKED (similarity={_sim:.2f})"
-                        expanded_ctx = []
-                    else:
-                        _expanded_gate = f"passed (similarity={_sim:.2f})"
-                if expanded_ctx:
-                    logger.info(
-                        "TAGGER turn=%d retry=expanded_context expanded_pairs=%d bleed_gate=%s",
-                        _turn_num, len(expanded_ctx) // 2, _expanded_gate,
-                    )
-                    tag_result = self._tag_generator.generate_tags(
-                        combined_text, store_tags, context_turns=expanded_ctx,
-                    )
-                    logger.info(
-                        "TAGGER turn=%d retry_result primary=%s tags=%s source=%s",
-                        _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
-                    )
-
-            # Final fallback: inherit from most recent meaningful turn
-            if tag_result.tags == ["_general"]:
-                prev = self._turn_tag_index.latest_meaningful_tags()
-                if prev:
-                    tag_result = TagResult(
-                        tags=list(prev.tags),
-                        primary=prev.primary_tag,
-                        source="inherited",
-                    )
-                    logger.info(
-                        "TAGGER turn=%d fallback=inherited from_turn=%d tags=%s",
-                        _turn_num, prev.turn_number, sorted(prev.tags),
-                    )
-
-            entry = TurnTagEntry(
-                turn_number=turn_offset + (i // 2),
-                message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                tags=tag_result.tags,
-                primary_tag=tag_result.primary,
-                sender=sender or "",
-                session_date=running_session_date,
-            )
-            self._turn_tag_index.append(entry)
-            try:
-                self._store.save_turn_message(
-                    self.config.conversation_id,
-                    entry.turn_number,
-                    user_msg.content,
-                    asst_msg.content,
-                    user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                    assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                )
-            except Exception:
-                pass
-            ingested += 1
-
-            # Stderr progress for visibility
-            if ingested % 5 == 0 or ingested == _total_turns:
-                _elapsed = _time.time() - _tag_start
-                _rate = ingested / _elapsed if _elapsed > 0 else 0
-                _eta = int((_total_turns - ingested) / _rate) if _rate > 0 else 0
-                _sys.stderr.write(
-                    f"\r  TAGGING: {ingested}/{_total_turns} turns | "
-                    f"{_rate:.1f} turn/s | ETA {_eta}s   "
-                )
-                _sys.stderr.flush()
-
-            if progress_callback:
-                total = len(history_pairs) // 2
-                progress_callback(ingested, total, entry)
-
-            # Refresh store tags every 10 turns so new tags influence later tagging
-            if ingested % 10 == 0:
-                store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-
-            # Periodic state save so session_date + tags are queryable during ingestion
-            if ingested % 20 == 0:
-                self._save_state(history_pairs)
-
-        # Final save after all turns ingested
-        self._save_state(history_pairs)
-        _sys.stderr.write("\n")
-        _sys.stderr.flush()
-        logger.info("Ingested %d historical turns into TurnTagIndex", ingested)
-        return ingested
+        """Bootstrap TurnTagIndex from pre-existing history (delegates to TaggingPipeline)."""
+        return self._tagging.ingest_history(history_pairs, progress_callback, turn_offset)
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
         """Retrieve relevant context for a message without assembling."""
