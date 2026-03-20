@@ -333,30 +333,55 @@ class AnthropicFormat(PayloadFormat):
             return []
 
         pairs: list[Message] = []
+        last_real_user: tuple[str, dict | None, "datetime | None"] | None = None
         i = 0
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
-                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                # Check if user message is tool_result-only (API scaffolding)
                 _user_raw = chat_msgs[i].get("content", "")
+                _is_tool_result = False
                 if isinstance(_user_raw, list):
                     _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
-                    if _ctypes and _ctypes <= {"tool_result"}:
-                        i += 2
-                        continue
+                    _is_tool_result = bool(_ctypes and _ctypes <= {"tool_result"})
+
+                if _is_tool_result:
+                    # Skip tool_result user message, but if the next assistant
+                    # has real text content, pair it with the last real user.
+                    asst_text = self.extract_message_text(chat_msgs[i + 1])
+                    if asst_text.strip() and last_real_user is not None:
+                        _u_text, _u_meta, _u_ts = last_real_user
+                        pairs.append(Message(
+                            role="user", content=_u_text,
+                            metadata=_u_meta, timestamp=_u_ts,
+                        ))
+                        pairs.append(Message(
+                            role="assistant", content=asst_text,
+                            timestamp=_u_ts,
+                        ))
+                        last_real_user = None
+                    i += 2
+                    continue
+
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
-                pairs.append(Message(
-                    role="user",
-                    content=text,
-                    metadata=meta or None,
-                    timestamp=ts,
-                ))
-                pairs.append(Message(
-                    role="assistant",
-                    content=self.extract_message_text(chat_msgs[i + 1]),
-                    timestamp=ts,
-                ))
+                asst_text = self.extract_message_text(chat_msgs[i + 1])
+
+                if asst_text.strip():
+                    # Normal pair: real user + assistant with text
+                    last_real_user = None
+                    pairs.append(Message(
+                        role="user", content=text,
+                        metadata=meta or None, timestamp=ts,
+                    ))
+                    pairs.append(Message(
+                        role="assistant", content=asst_text,
+                        timestamp=ts,
+                    ))
+                else:
+                    # Assistant is tool_use only — hold user for next text response
+                    last_real_user = (text, meta or None, ts)
+
                 i += 2
             else:
                 i += 1
@@ -589,30 +614,55 @@ class OpenAIFormat(PayloadFormat):
             return []
 
         pairs: list[Message] = []
+        last_real_user: tuple[str, dict | None, "datetime | None"] | None = None
         i = 0
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
-                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                # Check if user message is tool_result-only (API scaffolding)
                 _user_raw = chat_msgs[i].get("content", "")
+                _is_tool_result = False
                 if isinstance(_user_raw, list):
                     _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
-                    if _ctypes and _ctypes <= {"tool_result"}:
-                        i += 2
-                        continue
+                    _is_tool_result = bool(_ctypes and _ctypes <= {"tool_result"})
+
+                if _is_tool_result:
+                    # Skip tool_result user message, but if the next assistant
+                    # has real text content, pair it with the last real user.
+                    asst_text = self.extract_message_text(chat_msgs[i + 1])
+                    if asst_text.strip() and last_real_user is not None:
+                        _u_text, _u_meta, _u_ts = last_real_user
+                        pairs.append(Message(
+                            role="user", content=_u_text,
+                            metadata=_u_meta, timestamp=_u_ts,
+                        ))
+                        pairs.append(Message(
+                            role="assistant", content=asst_text,
+                            timestamp=_u_ts,
+                        ))
+                        last_real_user = None
+                    i += 2
+                    continue
+
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
-                pairs.append(Message(
-                    role="user",
-                    content=text,
-                    metadata=meta or None,
-                    timestamp=ts,
-                ))
-                pairs.append(Message(
-                    role="assistant",
-                    content=self.extract_message_text(chat_msgs[i + 1]),
-                    timestamp=ts,
-                ))
+                asst_text = self.extract_message_text(chat_msgs[i + 1])
+
+                if asst_text.strip():
+                    # Normal pair: real user + assistant with text
+                    last_real_user = None
+                    pairs.append(Message(
+                        role="user", content=text,
+                        metadata=meta or None, timestamp=ts,
+                    ))
+                    pairs.append(Message(
+                        role="assistant", content=asst_text,
+                        timestamp=ts,
+                    ))
+                else:
+                    # Assistant is tool_use only — hold user for next text response
+                    last_real_user = (text, meta or None, ts)
+
                 i += 2
             else:
                 i += 1
@@ -1183,30 +1233,55 @@ class OpenAIResponsesFormat(PayloadFormat):
             return []
 
         pairs: list[Message] = []
+        last_real_user: tuple[str, dict | None, "datetime | None"] | None = None
         i = 0
         while i + 1 < len(chat_msgs):
             if (chat_msgs[i].get("role") == "user"
                     and chat_msgs[i + 1].get("role") == "assistant"):
-                # Skip tool_result-only user messages (API scaffolding, not real conversation)
+                # Check if user message is tool_result-only (API scaffolding)
                 _user_raw = chat_msgs[i].get("content", "")
+                _is_tool_result = False
                 if isinstance(_user_raw, list):
                     _ctypes = {b.get("type") for b in _user_raw if isinstance(b, dict)}
-                    if _ctypes and _ctypes <= {"tool_result"}:
-                        i += 2
-                        continue
+                    _is_tool_result = bool(_ctypes and _ctypes <= {"tool_result"})
+
+                if _is_tool_result:
+                    # Skip tool_result user message, but if the next assistant
+                    # has real text content, pair it with the last real user.
+                    asst_text = self.extract_message_text(chat_msgs[i + 1])
+                    if asst_text.strip() and last_real_user is not None:
+                        _u_text, _u_meta, _u_ts = last_real_user
+                        pairs.append(Message(
+                            role="user", content=_u_text,
+                            metadata=_u_meta, timestamp=_u_ts,
+                        ))
+                        pairs.append(Message(
+                            role="assistant", content=asst_text,
+                            timestamp=_u_ts,
+                        ))
+                        last_real_user = None
+                    i += 2
+                    continue
+
                 text, meta = self.extract_message_text_with_meta(chat_msgs[i])
                 ts = extract_timestamp_from_metadata(meta) if meta else None
-                pairs.append(Message(
-                    role="user",
-                    content=text,
-                    metadata=meta or None,
-                    timestamp=ts,
-                ))
-                pairs.append(Message(
-                    role="assistant",
-                    content=self.extract_message_text(chat_msgs[i + 1]),
-                    timestamp=ts,
-                ))
+                asst_text = self.extract_message_text(chat_msgs[i + 1])
+
+                if asst_text.strip():
+                    # Normal pair: real user + assistant with text
+                    last_real_user = None
+                    pairs.append(Message(
+                        role="user", content=text,
+                        metadata=meta or None, timestamp=ts,
+                    ))
+                    pairs.append(Message(
+                        role="assistant", content=asst_text,
+                        timestamp=ts,
+                    ))
+                else:
+                    # Assistant is tool_use only — hold user for next text response
+                    last_real_user = (text, meta or None, ts)
+
                 i += 2
             else:
                 i += 1
