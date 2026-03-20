@@ -812,6 +812,137 @@ def _parse_provider_http_response(resp: httpx.Response) -> dict:
         return _parse_sse_response(resp.text)
 
 
+def _send_with_retry(
+    client: httpx.Client,
+    url: str,
+    headers: dict,
+    body: dict,
+    *,
+    label: str = "continuation",
+) -> tuple[httpx.Response, float]:
+    """Send an HTTP POST with retry on 429/503. Returns (response, duration_ms)."""
+    t0 = time.monotonic()
+    resp = client.post(url, headers=headers, json=body)
+    for _retry in range(3):
+        if resp.status_code < 300 or resp.status_code not in (429, 503):
+            break
+        wait = 2 ** (_retry + 1)
+        logger.warning(
+            "%s got HTTP %d, retrying in %ds (%d/3)",
+            label, resp.status_code, wait, _retry + 1,
+        )
+        time.sleep(wait)
+        resp = client.post(url, headers=headers, json=body)
+    return resp, round((time.monotonic() - t0) * 1000, 1)
+
+
+def _execute_pending_tools(
+    engine,
+    vc_tools: list[dict],
+    adapter: ProviderAdapter,
+    result: ToolLoopResult,
+    intent_context: str,
+    presented_refs: set[str],
+    presented_facts: set[str],
+) -> list[dict]:
+    """Execute pending VC tool calls, record them, return provider-formatted results."""
+    tool_results: list[dict] = []
+    for tc in vc_tools:
+        t0 = time.monotonic()
+        r_str = execute_vc_tool(
+            engine, tc["name"], tc["input"],
+            intent_context=intent_context,
+            presented_segment_refs=presented_refs,
+            presented_fact_ids=presented_facts,
+        )
+        dur = round((time.monotonic() - t0) * 1000, 1)
+        result.tool_calls.append(ToolCallRecord(
+            tool_name=tc["name"],
+            tool_input=tc["input"],
+            result_json=r_str,
+            duration_ms=dur,
+        ))
+        tool_results.append(
+            adapter.build_tool_result(tc["id"], tc["name"], r_str)
+        )
+    return tool_results
+
+
+def _extract_call_ids(tool_results: list[dict]) -> set[str]:
+    """Extract tool call IDs from provider-formatted tool results."""
+    ids: set[str] = set()
+    for tr in tool_results:
+        cid = tr.get("call_id") or tr.get("tool_call_id") or ""
+        if cid:
+            ids.add(cid)
+        if isinstance(tr.get("content"), list):
+            for block in tr["content"]:
+                if isinstance(block, dict) and block.get("tool_use_id"):
+                    ids.add(block["tool_use_id"])
+    return ids
+
+
+def _force_text_response(
+    client: httpx.Client,
+    url: str,
+    headers: dict,
+    cont_body: dict | None,
+    original_request: dict,
+    current_response: dict,
+    tool_results: list[dict],
+    adapter: ProviderAdapter,
+    result: ToolLoopResult,
+    engine,
+    model: str,
+    *,
+    label: str = "forced_final",
+) -> None:
+    """Build a tool-stripped continuation with a nudge and send it. Updates *result* in-place."""
+    cont_body = adapter.build_continuation(
+        cont_body, original_request, current_response, tool_results,
+    )
+    adapter.compress_previous_results(cont_body, _extract_call_ids(tool_results))
+    adapter.strip_tools(cont_body)
+
+    # Minimize thinking budget on forced answer (Gemini thinking models)
+    gen_cfg = cont_body.get("generationConfig")
+    if isinstance(gen_cfg, dict) and "thinkingConfig" in gen_cfg:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
+
+    # Append user nudge for all providers
+    nudge = (
+        "You have gathered enough information. "
+        "Answer the original question now in 1-2 sentences."
+    )
+    contents = cont_body.get("contents")
+    if isinstance(contents, list):
+        contents.append({"role": "user", "parts": [{"text": nudge}]})
+    messages = cont_body.get("messages")
+    if isinstance(messages, list):
+        messages.append({"role": "user", "content": nudge})
+
+    result.continuation_count += 1
+    result.raw_requests.append(copy.deepcopy(cont_body))
+
+    resp, dur = _send_with_retry(client, url, headers, cont_body, label=label)
+    if resp.status_code < 300:
+        data = _parse_provider_http_response(resp)
+        result.raw_responses.append(data)
+        fi, fo = adapter.extract_usage(data)
+        result.input_tokens += fi
+        result.output_tokens += fo
+        if hasattr(engine, '_telemetry') and engine._telemetry:
+            engine._telemetry.log(
+                "tool_loop", model, fi, fo,
+                duration_ms=dur, detail=label,
+            )
+        result.text += adapter.extract_text(data)
+        result.stop_reason = adapter.get_stop_reason(data)
+    else:
+        logger.error("%s failed after retries: HTTP %d", label, resp.status_code)
+        result.stop_reason = "error"
+
+
 def run_tool_loop(
     engine: VirtualContextEngine,
     initial_response: dict,
@@ -936,7 +1067,6 @@ def run_tool_loop(
                 ))
 
                 # Check for consecutive empty results from the same tool
-                # and append a strategy hint if the streak is long enough.
                 strategy_hint = ""
                 if _is_empty_result(result_str):
                     streak = 0
@@ -969,20 +1099,8 @@ def run_tool_loop(
                 cont_body, original_request, current_response, tool_results,
             )
 
-            # Compress previous rounds' tool results + assistant text
-            # to avoid content repetition across continuations.
-            # Extract call IDs from the tool_results we just appended.
-            current_call_ids: set[str] = set()
-            for tr in tool_results:
-                cid = tr.get("call_id") or tr.get("tool_call_id") or ""
-                if cid:
-                    current_call_ids.add(cid)
-                # Anthropic nests tool_use_id inside content blocks
-                if isinstance(tr.get("content"), list):
-                    for block in tr["content"]:
-                        if isinstance(block, dict) and block.get("tool_use_id"):
-                            current_call_ids.add(block["tool_use_id"])
-            adapter.compress_previous_results(cont_body, current_call_ids)
+            # Compress previous rounds' tool results to avoid repetition
+            adapter.compress_previous_results(cont_body, _extract_call_ids(tool_results))
 
             # Inject updated context into system prompt
             if new_prepend:
@@ -1007,22 +1125,10 @@ def run_tool_loop(
             result.raw_requests.append(copy.deepcopy(cont_body))
 
             # Send continuation (retry on 429/503 with backoff)
-            _cont_t0 = time.monotonic()
-            resp = client.post(url, headers=headers, json=cont_body)
-            for _retry in range(3):
-                if resp.status_code < 300:
-                    break
-                if resp.status_code not in (429, 503):
-                    break
-                wait = 2 ** (_retry + 1)  # 2, 4, 8 seconds
-                logger.warning(
-                    "Continuation %d got HTTP %d, retrying in %ds (%d/3)",
-                    result.continuation_count, resp.status_code,
-                    wait, _retry + 1,
-                )
-                time.sleep(wait)
-                resp = client.post(url, headers=headers, json=cont_body)
-            _cont_dur = round((time.monotonic() - _cont_t0) * 1000, 1)
+            resp, _cont_dur = _send_with_retry(
+                client, url, headers, cont_body,
+                label=f"continuation_{result.continuation_count}",
+            )
             if resp.status_code >= 300:
                 logger.error(
                     "Continuation %d failed: HTTP %d",
@@ -1064,8 +1170,7 @@ def run_tool_loop(
                     and vc_tools and not non_vc_in_cont):
                 # Detect redundant search loops: if the last N rounds
                 # were all vc_find_quote calls that returned found:true,
-                # the model already has the answer — strip tools and
-                # force a text response.
+                # the model already has the answer — force a text response.
                 if loop_i >= _REDUNDANT_SEARCH_THRESHOLD - 1:
                     recent = result.tool_calls[-(_REDUNDANT_SEARCH_THRESHOLD * max(len(vc_tools), 1)):]
                     all_find = all(r.tool_name == "vc_find_quote" for r in recent)
@@ -1076,101 +1181,18 @@ def run_tool_loop(
                             "— executing pending tools then forcing text",
                             loop_i + 1,
                         )
-                        # Execute the model's pending tool calls so the
-                        # forced-text request has ALL collected data.
-                        forced_results: list[dict] = []
-                        for tc in vc_tools:
-                            t0 = time.monotonic()
-                            r_str = execute_vc_tool(
-                                engine, tc["name"], tc["input"],
-                                intent_context=intent_context,
-                                presented_segment_refs=presented_refs,
-                                presented_fact_ids=presented_facts,
-                            )
-                            dur = round((time.monotonic() - t0) * 1000, 1)
-                            result.tool_calls.append(ToolCallRecord(
-                                tool_name=tc["name"],
-                                tool_input=tc["input"],
-                                result_json=r_str, duration_ms=dur,
-                            ))
-                            forced_results.append(
-                                adapter.build_tool_result(tc["id"], tc["name"], r_str)
-                            )
-
-                        # Build continuation with all tool data, then strip tools
-                        cont_body = adapter.build_continuation(
-                            cont_body, original_request, current_response,
-                            forced_results,
+                        forced_results = _execute_pending_tools(
+                            engine, vc_tools, adapter, result,
+                            intent_context, presented_refs, presented_facts,
                         )
-                        forced_ids: set[str] = set()
-                        for tr in forced_results:
-                            cid = tr.get("call_id") or tr.get("tool_call_id") or ""
-                            if cid:
-                                forced_ids.add(cid)
-                        adapter.compress_previous_results(cont_body, forced_ids)
-                        adapter.strip_tools(cont_body)
-
-                        # Minimize thinking budget on forced answer
-                        gen_cfg = cont_body.get("generationConfig")
-                        if isinstance(gen_cfg, dict) and "thinkingConfig" in gen_cfg:
-                            gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
-
-                        # Append nudge so the model responds with text
-                        _nudge = (
-                            "You have gathered enough information. "
-                            "Answer the original question now in 1-2 sentences."
+                        _force_text_response(
+                            client, url, headers, cont_body,
+                            original_request, current_response, forced_results,
+                            adapter, result, engine, model,
+                            label="forced_redundant",
                         )
-                        _contents = cont_body.get("contents")
-                        if isinstance(_contents, list):
-                            _contents.append({
-                                "role": "user",
-                                "parts": [{"text": _nudge}],
-                            })
-                        _messages = cont_body.get("messages")
-                        if isinstance(_messages, list):
-                            _messages.append({
-                                "role": "user",
-                                "content": _nudge,
-                            })
-
-                        result.continuation_count += 1
-                        result.raw_requests.append(copy.deepcopy(cont_body))
-                        _forced_t0 = time.monotonic()
-                        resp = client.post(url, headers=headers, json=cont_body)
-                        for _retry in range(3):
-                            if resp.status_code < 300:
-                                break
-                            wait = 2 ** (_retry + 1)
-                            logger.warning(
-                                "Forced text after redundant loop failed "
-                                "(HTTP %d), retrying in %ds (%d/3)",
-                                resp.status_code, wait, _retry + 1,
-                            )
-                            time.sleep(wait)
-                            resp = client.post(url, headers=headers, json=cont_body)
-                        _forced_dur = round((time.monotonic() - _forced_t0) * 1000, 1)
-                        if resp.status_code < 300:
-                            forced_data = _parse_provider_http_response(resp)
-                            result.raw_responses.append(forced_data)
-                            fi, fo = adapter.extract_usage(forced_data)
-                            result.input_tokens += fi
-                            result.output_tokens += fo
-                            if hasattr(engine, '_telemetry') and engine._telemetry:
-                                engine._telemetry.log(
-                                    "tool_loop", model,
-                                    fi, fo,
-                                    duration_ms=_forced_dur,
-                                    detail="forced_final",
-                                )
-                            result.text += adapter.extract_text(forced_data)
+                        if result.stop_reason != "error":
                             result.stop_reason = "redundant_loop"
-                        else:
-                            logger.error(
-                                "Forced text after redundant loop failed "
-                                "after retries: HTTP %d",
-                                resp.status_code,
-                            )
-                            result.stop_reason = "error"
                         break
                 continue  # loop again
 
@@ -1185,114 +1207,16 @@ def run_tool_loop(
                     "sending forced text continuation",
                     max_loops,
                 )
-                # Execute the last batch of tool calls so we can include
-                # their results in the forced continuation
-                tool_results_final: list[dict] = []
-                for tc in vc_tools:
-                    t0 = time.monotonic()
-                    result_str = execute_vc_tool(
-                        engine,
-                        tc["name"],
-                        tc["input"],
-                        intent_context=intent_context,
-                        presented_segment_refs=presented_refs,
-                        presented_fact_ids=presented_facts,
-                    )
-                    duration_ms = round((time.monotonic() - t0) * 1000, 1)
-                    result.tool_calls.append(ToolCallRecord(
-                        tool_name=tc["name"],
-                        tool_input=tc["input"],
-                        result_json=result_str,
-                        duration_ms=duration_ms,
-                    ))
-                    tool_results_final.append(
-                        adapter.build_tool_result(
-                            tc["id"], tc["name"], result_str,
-                        )
-                    )
-
-                # Build continuation WITHOUT tools to force text output.
-                # Do NOT reassemble context — the working set hasn't
-                # changed, and reassembly can re-inject expanded summaries
-                # that increase repetition.
-                cont_body = adapter.build_continuation(
-                    cont_body, original_request, current_response,
-                    tool_results_final,
+                forced_results = _execute_pending_tools(
+                    engine, vc_tools, adapter, result,
+                    intent_context, presented_refs, presented_facts,
                 )
-                # Compress prior rounds before the forced send
-                forced_call_ids: set[str] = set()
-                for tr in tool_results_final:
-                    cid = tr.get("call_id") or tr.get("tool_call_id") or ""
-                    if cid:
-                        forced_call_ids.add(cid)
-                adapter.compress_previous_results(cont_body, forced_call_ids)
-                adapter.strip_tools(cont_body)
-
-                # For Gemini thinking models: minimize thinking budget on
-                # the forced answer so tokens go to actual output text.
-                gen_cfg = cont_body.get("generationConfig")
-                if isinstance(gen_cfg, dict) and "thinkingConfig" in gen_cfg:
-                    gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
-
-                # Append a user nudge so the model responds with text
-                # instead of burning tokens on internal reasoning.
-                # Works for all providers: Gemini uses "contents"/"parts",
-                # Anthropic/OpenAI use "messages"/"content".
-                _nudge_text = (
-                    "You have gathered enough information. "
-                    "Answer the original question now in 1-2 sentences."
+                _force_text_response(
+                    client, url, headers, cont_body,
+                    original_request, current_response, forced_results,
+                    adapter, result, engine, model,
+                    label="forced_exhausted",
                 )
-                contents = cont_body.get("contents")
-                if isinstance(contents, list):
-                    contents.append({
-                        "role": "user",
-                        "parts": [{"text": _nudge_text}],
-                    })
-                messages = cont_body.get("messages")
-                if isinstance(messages, list):
-                    messages.append({
-                        "role": "user",
-                        "content": _nudge_text,
-                    })
-
-                result.continuation_count += 1
-                result.raw_requests.append(copy.deepcopy(cont_body))
-                _forced_t0 = time.monotonic()
-                resp = client.post(url, headers=headers, json=cont_body)
-                # Retry with exponential backoff (handles 429 rate limits)
-                for _retry in range(3):
-                    if resp.status_code < 300:
-                        break
-                    wait = 2 ** (_retry + 1)  # 2, 4, 8 seconds
-                    logger.warning(
-                        "Forced text continuation failed (HTTP %d), "
-                        "retrying in %ds (%d/3)",
-                        resp.status_code, wait, _retry + 1,
-                    )
-                    time.sleep(wait)
-                    resp = client.post(url, headers=headers, json=cont_body)
-                _forced_dur = round((time.monotonic() - _forced_t0) * 1000, 1)
-                if resp.status_code < 300:
-                    forced_data = _parse_provider_http_response(resp)
-                    result.raw_responses.append(forced_data)
-                    fi, fo = adapter.extract_usage(forced_data)
-                    result.input_tokens += fi
-                    result.output_tokens += fo
-                    if hasattr(engine, '_telemetry') and engine._telemetry:
-                        engine._telemetry.log(
-                            "tool_loop", model,
-                            fi, fo,
-                            duration_ms=_forced_dur,
-                            detail="forced_final",
-                        )
-                    result.text += adapter.extract_text(forced_data)
-                    result.stop_reason = adapter.get_stop_reason(forced_data)
-                else:
-                    logger.error(
-                        "Forced text continuation failed after retry: HTTP %d",
-                        resp.status_code,
-                    )
-                    result.stop_reason = "error"
             else:
                 result.stop_reason = stop_reason
 
