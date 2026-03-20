@@ -1,6 +1,10 @@
 """Tests for virtual_context.proxy.formats — PayloadFormat ABC + implementations."""
 
+from __future__ import annotations
+
 import json
+from unittest.mock import MagicMock
+
 import pytest
 
 from virtual_context.proxy.formats import (
@@ -11,6 +15,18 @@ from virtual_context.proxy.formats import (
     GeminiFormat,
     detect_format,
     get_format,
+)
+from virtual_context.proxy.server import (
+    _detect_api_format,
+    _extract_assistant_text,
+    _extract_delta_text,
+    _extract_history_pairs,
+    _extract_user_message,
+    _forward_headers,
+    _inject_context,
+    _last_text_block,
+    _strip_envelope,
+    _strip_vc_prompt,
 )
 
 
@@ -1701,3 +1717,759 @@ class TestResponsesStreamInterception:
         assert cont["input"][1]["type"] == "function_call"
         assert cont["input"][2]["type"] == "function_call_output"
         assert cont["input"][2]["output"] == "expanded cooking content"
+
+
+# ---------------------------------------------------------------------------
+# Tests moved from test_proxy.py — proxy.server format/parsing functions
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _detect_api_format
+# ---------------------------------------------------------------------------
+
+
+class TestDetectApiFormat:
+    def test_anthropic_system_field(self):
+        body = {"system": "You are helpful", "messages": [], "model": "claude-3"}
+        assert _detect_api_format(body) == "anthropic"
+
+    def test_anthropic_claude_model(self):
+        body = {"messages": [], "model": "claude-haiku-4-5-20251001"}
+        assert _detect_api_format(body) == "anthropic"
+
+    def test_openai_default(self):
+        body = {"messages": [], "model": "gpt-4o"}
+        assert _detect_api_format(body) == "openai"
+
+    def test_openai_no_model(self):
+        body = {"messages": []}
+        assert _detect_api_format(body) == "openai"
+
+    def test_anthropic_empty_system(self):
+        """Even empty string system field → anthropic."""
+        body = {"system": "", "messages": []}
+        assert _detect_api_format(body) == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# _extract_user_message
+# ---------------------------------------------------------------------------
+
+
+class TestExtractUserMessage:
+    def test_string_content(self):
+        body = {"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "How are you?"},
+        ]}
+        assert _extract_user_message(body) == "How are you?"
+
+    def test_content_blocks(self):
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "First part"},
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "second part"},
+            ]},
+        ]}
+        # Last text block extraction — returns only the final text block
+        assert _extract_user_message(body) == "second part"
+
+    def test_returns_last_user(self):
+        body = {"messages": [
+            {"role": "user", "content": "First"},
+            {"role": "assistant", "content": "Response"},
+            {"role": "user", "content": "Second"},
+        ]}
+        assert _extract_user_message(body) == "Second"
+
+    def test_no_user_message(self):
+        body = {"messages": [{"role": "assistant", "content": "Hi"}]}
+        assert _extract_user_message(body) == ""
+
+    def test_empty_messages(self):
+        body = {"messages": []}
+        assert _extract_user_message(body) == ""
+
+    def test_no_messages_key(self):
+        body = {}
+        assert _extract_user_message(body) == ""
+
+    def test_content_blocks_returns_last_text(self):
+        """With multiple text blocks, returns only the last one (skips thinking)."""
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "**Thinking about the question**\n\nLet me consider..."},
+                {"type": "text", "text": "What is the weather?"},
+            ]},
+        ]}
+        assert _extract_user_message(body) == "What is the weather?"
+
+    def test_skips_non_text_blocks(self):
+        """Non-text blocks are ignored; last text block is returned."""
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "First text"},
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "Actual question"},
+                {"type": "tool_result", "content": "result"},
+            ]},
+        ]}
+        assert _extract_user_message(body) == "Actual question"
+
+    @pytest.mark.regression("PROXY-005")
+    def test_tool_result_only_returns_empty(self):
+        """When last user message is pure tool_result, returns empty string."""
+        body = {"messages": [
+            {"role": "user", "content": "Search for pandas docs"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"q": "pandas"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "search results here"},
+            ]},
+        ]}
+        assert _extract_user_message(body) == ""
+
+
+# ---------------------------------------------------------------------------
+# _last_text_block
+# ---------------------------------------------------------------------------
+
+
+class TestLastTextBlock:
+    def test_single_text_block(self):
+        content = [{"type": "text", "text": "Hello"}]
+        assert _last_text_block(content) == "Hello"
+
+    def test_multiple_text_blocks_returns_last(self):
+        content = [
+            {"type": "text", "text": "**Thinking**\n\nI need to consider..."},
+            {"type": "text", "text": "Here is my answer."},
+        ]
+        assert _last_text_block(content) == "Here is my answer."
+
+    def test_skips_non_text_blocks(self):
+        content = [
+            {"type": "text", "text": "Thinking..."},
+            {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
+            {"type": "text", "text": "Final answer"},
+            {"type": "tool_use", "id": "t2", "name": "save", "input": {}},
+        ]
+        assert _last_text_block(content) == "Final answer"
+
+    def test_thinking_then_tool_use_then_response(self):
+        """Realistic OpenClaw pattern: thinking + tool_use + response."""
+        content = [
+            {"type": "text", "text": "**Crafting a response**\n\nLet me think..."},
+            {"type": "tool_use", "id": "t1", "name": "message", "input": {}},
+            {"type": "text", "text": "Good. I already opened the door."},
+        ]
+        assert _last_text_block(content) == "Good. I already opened the door."
+
+    def test_no_text_blocks(self):
+        content = [
+            {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
+            {"type": "image", "source": {}},
+        ]
+        assert _last_text_block(content) == ""
+
+    def test_empty_content(self):
+        assert _last_text_block([]) == ""
+
+    def test_single_block_with_thinking(self):
+        """Single text block that IS the actual content (no thinking)."""
+        content = [{"type": "text", "text": "Ack."}]
+        assert _last_text_block(content) == "Ack."
+
+
+# ---------------------------------------------------------------------------
+# _strip_vc_prompt
+# ---------------------------------------------------------------------------
+
+
+class TestStripVcPrompt:
+    def test_strips_marker(self):
+        text = "[vc:prompt]\n[Telegram Y (@y) id:123] hello world\n[message_id: 456]"
+        result = _strip_vc_prompt(text)
+        assert result == "[Telegram Y (@y) id:123] hello world\n[message_id: 456]"
+
+    def test_no_marker_returns_unchanged(self):
+        text = "just plain text"
+        assert _strip_vc_prompt(text) == text
+
+    def test_empty_string(self):
+        assert _strip_vc_prompt("") == ""
+
+    def test_marker_only(self):
+        assert _strip_vc_prompt("[vc:prompt]\n") == ""
+
+    def test_marker_not_at_start(self):
+        """Marker must be at the start to be stripped."""
+        text = "prefix [vc:prompt]\nsome content"
+        assert _strip_vc_prompt(text) == text
+
+
+# ---------------------------------------------------------------------------
+# _strip_envelope
+# ---------------------------------------------------------------------------
+
+
+class TestStripOpenclawEnvelope:
+    def test_empty_string(self):
+        assert _strip_envelope("") == ""
+
+    def test_plain_text_passthrough(self):
+        assert _strip_envelope("just a question") == "just a question"
+
+    def test_strips_vc_prompt_marker(self):
+        text = "[vc:prompt]\nhello world"
+        assert _strip_envelope(text) == "hello world"
+
+    def test_strips_channel_header(self):
+        text = "[Telegram Y (@yursilk) id:8049932331 +17m Sun 2026-02-15 22:07 EST] what time is it"
+        assert _strip_envelope(text) == "what time is it"
+
+    def test_strips_message_id_footer(self):
+        text = "some content\n[message_id: 8663]"
+        assert _strip_envelope(text) == "some content"
+
+    @pytest.mark.regression("PROXY-003")
+    def test_strips_full_envelope(self):
+        """Full OpenClaw message: [vc:prompt] + channel header + content + footer."""
+        text = (
+            "[vc:prompt]\n"
+            "[Telegram Y (@yursilk) id:8049932331 +17m Sun 2026-02-15 22:07 EST] "
+            "what time is it\n"
+            "[message_id: 8663]"
+        )
+        assert _strip_envelope(text) == "what time is it"
+
+    def test_strips_system_event(self):
+        text = (
+            "System: [2026-02-15T22:00:00Z] Model switched to claude-opus-4-6\n\n"
+            "[Telegram Y (@yursilk) id:123 +5m Sun] hello\n"
+            "[message_id: 456]"
+        )
+        assert _strip_envelope(text) == "hello"
+
+    def test_strips_system_event_with_vc_prompt(self):
+        text = (
+            "[vc:prompt]\n"
+            "System: [2026-02-15T22:00:00Z] Model switched\n\n"
+            "[Telegram Y (@yursilk) id:123 +5m Sun] question\n"
+            "[message_id: 456]"
+        )
+        assert _strip_envelope(text) == "question"
+
+    def test_vc_user_backward_compat(self):
+        """Old-format [vc:user]...[/vc:user] extracts inner content."""
+        text = "[vc:user]clean content here[/vc:user]\n[Telegram ...] more stuff"
+        assert _strip_envelope(text) == "clean content here"
+
+    def test_vc_prompt_then_vc_user(self):
+        """[vc:prompt] stripped first, then [vc:user] inner content extracted."""
+        text = "[vc:prompt]\n[vc:user]the question[/vc:user]\ngarbage"
+        assert _strip_envelope(text) == "the question"
+
+    def test_whatsapp_channel(self):
+        text = "[WhatsApp User id:12345 +2m Mon] how is the weather\n[message_id: 99]"
+        assert _strip_envelope(text) == "how is the weather"
+
+    def test_discord_channel(self):
+        text = "[Discord Bob id:777 +1m Tue] hello there\n[message_id: 42]"
+        assert _strip_envelope(text) == "hello there"
+
+    def test_no_id_in_header_not_stripped(self):
+        """Bracketed text without id:NNN is not treated as channel header."""
+        text = "[Some random bracket] content here"
+        assert _strip_envelope(text) == "[Some random bracket] content here"
+
+    def test_multiline_content_preserved(self):
+        text = (
+            "[Telegram Y id:123 +5m Sun] line one\n"
+            "line two\n"
+            "line three\n"
+            "[message_id: 456]"
+        )
+        assert _strip_envelope(text) == "line one\nline two\nline three"
+
+    def test_short_message_extraction(self):
+        """Short messages (where metadata dominates) are correctly extracted."""
+        text = (
+            "[vc:prompt]\n"
+            "[Telegram Y (@yursilk) id:8049932331 +3m Sun 2026-02-15 22:10 EST] "
+            "ok\n"
+            "[message_id: 8670]"
+        )
+        assert _strip_envelope(text) == "ok"
+
+    # Labeled metadata block stripping
+
+    def test_strips_labeled_metadata_blocks(self):
+        """Strips fenced JSON metadata blocks with labeled headers."""
+        text = (
+            '[vc:prompt]\n'
+            '\n\n'
+            'Conversation info (untrusted metadata):\n'
+            '```json\n'
+            '{\n'
+            '  "message_id": "12070",\n'
+            '  "sender_id": "7281617716"\n'
+            '}\n'
+            '```\n'
+            '\n'
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{\n'
+            '  "label": "Sania (7281617716)",\n'
+            '  "name": "Sania"\n'
+            '}\n'
+            '```\n'
+            '\n'
+            'What about charlotte tilbury wonder skin'
+        )
+        assert _strip_envelope(text) == "What about charlotte tilbury wonder skin"
+
+    def test_strips_metadata_with_reply_context(self):
+        """Strips metadata blocks including reply-context JSON."""
+        text = (
+            'Conversation info (untrusted metadata):\n'
+            '```json\n'
+            '{"message_id": "12065", "reply_to_id": "12062"}\n'
+            '```\n'
+            '\n'
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{"label": "Sania (7281617716)"}\n'
+            '```\n'
+            '\n'
+            'Replied message (untrusted, for context):\n'
+            '```json\n'
+            '{"sender_label": "Bast", "body": "What fell short?"}\n'
+            '```\n'
+            '\n'
+            'The finish was too dewy for my oily skin'
+        )
+        assert _strip_envelope(text) == "The finish was too dewy for my oily skin"
+
+    def test_preserves_user_code_fences(self):
+        """User code fences without labeled headers are NOT stripped."""
+        text = (
+            'Here is my code:\n'
+            '```python\n'
+            'def hello():\n'
+            '    print("hello")\n'
+            '```\n'
+            'Does this look right?'
+        )
+        assert _strip_envelope(text) == text
+
+    def test_metadata_then_user_code(self):
+        """Metadata stripped, user code preserved."""
+        text = (
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{"label": "Y (8049932331)"}\n'
+            '```\n'
+            '\n'
+            'Here is my code:\n'
+            '```python\n'
+            'x = 1\n'
+            '```\n'
+            'Fix this.'
+        )
+        assert _strip_envelope(text) == (
+            'Here is my code:\n'
+            '```python\n'
+            'x = 1\n'
+            '```\n'
+            'Fix this.'
+        )
+
+    def test_no_metadata_blocks_passthrough(self):
+        """Plain message without metadata passes through unchanged."""
+        text = "Need a dupe for Becca Backlight priming filter"
+        assert _strip_envelope(text) == text
+
+    # Integration tests with _extract_user_message
+
+    def test_extract_user_message_full_envelope(self):
+        """_extract_user_message strips full OpenClaw envelope."""
+        body = {"messages": [
+            {"role": "user", "content": (
+                "[vc:prompt]\n"
+                "[Telegram Y (@yursilk) id:123 +5m Sun] what time is it\n"
+                "[message_id: 789]"
+            )},
+        ]}
+        result = _extract_user_message(body)
+        assert result == "what time is it"
+
+    def test_extract_user_message_content_blocks(self):
+        """Content block array: envelope stripped from last text block."""
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "thinking overhead..."},
+                {"type": "text", "text": (
+                    "[vc:prompt]\n"
+                    "[Telegram Y id:123] actual question\n[message_id: 1]"
+                )},
+            ]},
+        ]}
+        result = _extract_user_message(body)
+        assert result == "actual question"
+
+    def test_extract_user_message_no_envelope_passthrough(self):
+        """Without OpenClaw envelope, message passes through unchanged."""
+        body = {"messages": [
+            {"role": "user", "content": "plain message no envelope"},
+        ]}
+        assert _extract_user_message(body) == "plain message no envelope"
+
+    def test_extract_message_text_strips_envelope(self):
+        """_extract_message_text strips full envelope."""
+        from virtual_context.proxy.server import _extract_message_text
+        msg = {"role": "user", "content": (
+            "[vc:prompt]\n"
+            "[Telegram Y id:99 +1m] the real content\n[message_id: 99]"
+        )}
+        result = _extract_message_text(msg)
+        assert result == "the real content"
+
+    @pytest.mark.regression("PROXY-003")
+    def test_history_pairs_strip_envelope(self):
+        """Historical user messages get full envelope stripped."""
+        body = {"messages": [
+            {"role": "user", "content": (
+                "[vc:prompt]\n"
+                "[Telegram Y id:1 +1m] first question\n[message_id: 1]"
+            )},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": (
+                "[vc:prompt]\n"
+                "[Telegram Y id:2 +2m] second question\n[message_id: 2]"
+            )},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 2
+        assert pairs[0].content == "first question"
+        assert pairs[1].content == "first answer"
+
+
+# ---------------------------------------------------------------------------
+# _inject_context
+# ---------------------------------------------------------------------------
+
+
+class TestInjectContext:
+    def test_empty_prepend_returns_body(self):
+        body = {"messages": [{"role": "user", "content": "Hi"}]}
+        result = _inject_context(body, "", "openai")
+        assert result is body  # no copy when empty
+
+    def test_openai_with_system_message(self):
+        body = {"messages": [
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "Hi"},
+        ]}
+        result = _inject_context(body, "context here", "openai")
+        content = result["messages"][0]["content"]
+        assert "Be helpful" in content
+        assert "<system-reminder>" in content
+        assert "context here" in content
+        # VC block appended after existing system prompt for cache friendliness
+        assert content.index("Be helpful") < content.index("<system-reminder>")
+
+    def test_openai_without_system_message(self):
+        body = {"messages": [{"role": "user", "content": "Hi"}]}
+        result = _inject_context(body, "context here", "openai")
+        assert result["messages"][0]["role"] == "system"
+        assert "context here" in result["messages"][0]["content"]
+        assert result["messages"][1]["role"] == "user"
+
+    def test_anthropic_string_system(self):
+        body = {"system": "Be helpful", "messages": []}
+        result = _inject_context(body, "context here", "anthropic")
+        assert "Be helpful" in result["system"]
+        assert "<system-reminder>" in result["system"]
+        assert "context here" in result["system"]
+        # VC block appended after existing system prompt for cache friendliness
+        assert result["system"].index("Be helpful") < result["system"].index("<system-reminder>")
+
+    def test_anthropic_no_system(self):
+        body = {"messages": []}
+        result = _inject_context(body, "context here", "anthropic")
+        assert "<system-reminder>" in result["system"]
+        assert "context here" in result["system"]
+
+    def test_anthropic_list_system(self):
+        body = {
+            "system": [{"type": "text", "text": "Existing system"}],
+            "messages": [],
+        }
+        result = _inject_context(body, "context here", "anthropic")
+        assert isinstance(result["system"], list)
+        assert result["system"][0]["text"] == "Existing system"
+        assert result["system"][1]["type"] == "text"
+        assert "context here" in result["system"][1]["text"]
+
+    def test_does_not_mutate_original(self):
+        body = {"messages": [
+            {"role": "system", "content": "Original"},
+            {"role": "user", "content": "Hi"},
+        ]}
+        original_content = body["messages"][0]["content"]
+        _inject_context(body, "injected", "openai")
+        assert body["messages"][0]["content"] == original_content
+
+
+# ---------------------------------------------------------------------------
+# _forward_headers
+# ---------------------------------------------------------------------------
+
+
+class TestForwardHeaders:
+    def test_strips_hop_by_hop(self):
+        headers = {
+            "Authorization": "Bearer sk-xxx",
+            "Content-Type": "application/json",
+            "Host": "api.openai.com",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+        }
+        result = _forward_headers(headers)
+        assert "Authorization" in result
+        assert "Content-Type" in result
+        assert "Host" not in result
+        assert "Connection" not in result
+        assert "Transfer-Encoding" not in result
+
+    def test_case_insensitive(self):
+        headers = {"host": "example.com", "connection": "close"}
+        result = _forward_headers(headers)
+        assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# _extract_delta_text
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDeltaText:
+    def test_openai_delta(self):
+        data = {"choices": [{"delta": {"content": "Hello"}}]}
+        assert _extract_delta_text(data, "openai") == "Hello"
+
+    def test_openai_empty_delta(self):
+        data = {"choices": [{"delta": {}}]}
+        assert _extract_delta_text(data, "openai") == ""
+
+    def test_openai_no_choices(self):
+        data = {}
+        assert _extract_delta_text(data, "openai") == ""
+
+    def test_anthropic_content_block_delta(self):
+        data = {"type": "content_block_delta", "delta": {"text": "World"}}
+        assert _extract_delta_text(data, "anthropic") == "World"
+
+    def test_anthropic_non_delta_event(self):
+        data = {"type": "message_start", "message": {}}
+        assert _extract_delta_text(data, "anthropic") == ""
+
+    def test_openai_none_content(self):
+        data = {"choices": [{"delta": {"content": None}}]}
+        assert _extract_delta_text(data, "openai") == ""
+
+
+# ---------------------------------------------------------------------------
+# _extract_assistant_text
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAssistantText:
+    def test_openai_response(self):
+        body = {"choices": [{"message": {"content": "Hello there"}}]}
+        assert _extract_assistant_text(body, "openai") == "Hello there"
+
+    def test_openai_no_choices(self):
+        body = {"choices": []}
+        assert _extract_assistant_text(body, "openai") == ""
+
+    def test_anthropic_response(self):
+        body = {"content": [
+            {"type": "text", "text": "Hello world"},
+        ]}
+        assert _extract_assistant_text(body, "anthropic") == "Hello world"
+
+    def test_anthropic_skips_thinking_blocks(self):
+        """Last text block extraction skips earlier thinking blocks."""
+        body = {"content": [
+            {"type": "text", "text": "**Planning**\n\nI need to think about this..."},
+            {"type": "text", "text": "Here is my actual answer."},
+        ]}
+        assert _extract_assistant_text(body, "anthropic") == "Here is my actual answer."
+
+    def test_anthropic_empty_content(self):
+        body = {"content": []}
+        assert _extract_assistant_text(body, "anthropic") == ""
+
+    def test_openai_none_content(self):
+        body = {"choices": [{"message": {"content": None}}]}
+        assert _extract_assistant_text(body, "openai") == ""
+
+
+# ---------------------------------------------------------------------------
+# ProxyState
+# ---------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# _extract_history_pairs
+# ---------------------------------------------------------------------------
+
+
+class TestExtractHistoryPairs:
+    def test_string_content(self):
+        body = {"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+            {"role": "user", "content": "Current question"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 2
+        assert pairs[0].role == "user"
+        assert pairs[0].content == "Hello"
+        assert pairs[1].role == "assistant"
+        assert pairs[1].content == "Hi there"
+
+    def test_content_blocks(self):
+        body = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Part 1"},
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "Part 2"},
+            ]},
+            {"role": "assistant", "content": "Response"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 2
+        # Last text block extraction — returns only final text block
+        assert pairs[0].content == "Part 2"
+        assert pairs[1].content == "Response"
+
+    def test_system_messages_excluded(self):
+        body = {"messages": [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 2
+        assert pairs[0].role == "user"
+        assert pairs[0].content == "Hello"
+
+    def test_single_user_message_no_history(self):
+        """First message ever — no history to extract."""
+        body = {"messages": [
+            {"role": "user", "content": "Hello"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert pairs == []
+
+    def test_odd_message_count(self):
+        """Multiple complete pairs with trailing current user message."""
+        body = {"messages": [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 4  # 2 complete pairs
+        assert pairs[0].content == "Q1"
+        assert pairs[1].content == "A1"
+        assert pairs[2].content == "Q2"
+        assert pairs[3].content == "A2"
+
+    def test_empty_messages(self):
+        body = {"messages": []}
+        assert _extract_history_pairs(body) == []
+
+    def test_no_messages_key(self):
+        body = {}
+        assert _extract_history_pairs(body) == []
+
+    def test_multiple_pairs(self):
+        body = {"messages": [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2"},
+            {"role": "user", "content": "Q3"},
+            {"role": "assistant", "content": "A3"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 6  # 3 complete pairs
+        assert pairs[4].content == "Q3"
+        assert pairs[5].content == "A3"
+
+    @pytest.mark.regression("PROXY-001")
+    def test_consecutive_user_messages_at_end(self):
+        """OpenClaw batches multiple Telegram messages as consecutive user turns.
+
+        When the trailing messages are [user, user], after dropping the last
+        user (current turn), the list ends with a user — history must still
+        be extracted from earlier pairs.
+        """
+        body = {"messages": [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2"},
+            {"role": "user", "content": "Batched msg 1"},
+            {"role": "user", "content": "Batched msg 2"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        assert len(pairs) == 4  # 2 complete pairs, batched users skipped
+        assert pairs[0].content == "Q1"
+        assert pairs[1].content == "A1"
+        assert pairs[2].content == "Q2"
+        assert pairs[3].content == "A2"
+
+    @pytest.mark.regression("PROXY-001")
+    def test_consecutive_user_messages_mid_conversation(self):
+        """Consecutive user messages in the middle should be skipped,
+        but pairs on both sides should be extracted."""
+        body = {"messages": [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Batch 1"},
+            {"role": "user", "content": "Batch 2"},
+            {"role": "user", "content": "Batch 3"},
+            {"role": "assistant", "content": "A2"},
+            {"role": "user", "content": "Q3"},
+            {"role": "assistant", "content": "A3"},
+            {"role": "user", "content": "Current"},
+        ]}
+        pairs = _extract_history_pairs(body)
+        # Pair walking: Q1+A1, then Batch1 (user) + Batch2 (user) → skip,
+        # Batch2 (user) + Batch3 (user) → skip, Batch3 (user) + A2 → skip
+        # (misaligned: Batch3 is user, A2 is assistant but Batch3 was already
+        # advanced past)... Actually the walker advances 1 at a time on mismatch:
+        # i=2: Batch1(user) + Batch2(user) → skip, i=3
+        # i=3: Batch2(user) + Batch3(user) → skip, i=4
+        # i=4: Batch3(user) + A2(assistant) → pair! i=6
+        # i=6: Q3(user) + A3(assistant) → pair! i=8
+        assert len(pairs) == 6  # 3 complete pairs
+        assert pairs[0].content == "Q1"
+        assert pairs[2].content == "Batch 3"
+        assert pairs[4].content == "Q3"
+
