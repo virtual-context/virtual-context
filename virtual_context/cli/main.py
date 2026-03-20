@@ -167,7 +167,7 @@ def cmd_telemetry(args):
     )
 
 
-# Backward compat alias
+# Legacy alias
 
 
 def cmd_init(args):
@@ -1043,7 +1043,7 @@ def main():
         help="Run interactive setup wizard (instances, ports, providers)",
     )
 
-    # telemetry (+ cost-report backward compat alias)
+    # telemetry (cost-report is a deprecated alias)
     subparsers.add_parser("telemetry", help="Show conversation telemetry report")
     subparsers.add_parser("cost-report", help="Show conversation cost report (alias for telemetry)")
 

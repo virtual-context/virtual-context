@@ -87,7 +87,7 @@ class BaseProvider(ABC):
 
         .. deprecated::
             The ``last_usage`` instance attribute is still written for
-            backward compatibility but should not be relied upon in
+            still written as a legacy alias but should not be relied upon in
             concurrent contexts.  Use the returned *usage* dict instead.
         """
         url = self._get_url()
@@ -199,7 +199,7 @@ class BaseProvider(ABC):
         )
 
 
-# Re-exports kept for backward compatibility
+# Re-exported for existing callers
 from ..types import LLMProvider  # noqa: E402, F401
 
 __all__ = ["BaseProvider", "LLMProvider", "LLMProviderError"]

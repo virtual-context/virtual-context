@@ -34,7 +34,6 @@ class FalkorDBFactStore:
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
-        """Create indexes and constraints."""
         try:
             self._graph.create_node_unique_constraint("Fact", "id")
         except Exception:
@@ -50,7 +49,6 @@ class FalkorDBFactStore:
                 pass
 
     def _query(self, cypher: str, params: dict | None = None) -> list[list]:
-        """Execute a Cypher query and return the result set."""
         result = self._graph.query(cypher, params=params or {})
         return result.result_set
 
@@ -77,7 +75,6 @@ class FalkorDBFactStore:
         }
 
     def _node_to_fact(self, node) -> Fact:
-        """Convert a FalkorDB Node to a Fact."""
         return Fact.from_dict(node.properties, dt_parser=_str_to_dt)
 
     # ------------------------------------------------------------------

@@ -76,7 +76,7 @@ from .helpers import (  # noqa: F401 — re-exported for tests
 from .message_filter import filter_body_messages as _filter_body_messages  # noqa: F401
 from .metrics import ProxyMetrics
 
-# --- Re-export state/registry/handlers for backward compatibility ---
+# --- Re-exported so existing imports from proxy.server still work ---
 from .state import SessionState, _IngestionCancelled, ProxyState  # noqa: F401
 from .registry import SessionRegistry  # noqa: F401
 from .handlers import (  # noqa: F401

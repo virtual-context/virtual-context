@@ -43,15 +43,12 @@ class TurnTagIndex:
         return tags
 
     def get_tags_for_turn(self, turn_number: int) -> TurnTagEntry | None:
-        """Look up pre-computed tags for a specific turn (O(1) via dict)."""
         return self._by_turn.get(turn_number)
 
     def get_entry_by_hash(self, message_hash: str) -> TurnTagEntry | None:
-        """Look up entry by message_hash (O(1) via dict)."""
         return self._by_hash.get(message_hash)
 
     def get_tag_velocity(self, tag: str, window_hours: float = 72) -> float:
-        """Compute velocity: entries per hour for a tag over a time window."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
         recent = [e for e in self.entries if e.timestamp >= cutoff and tag in e.tags]
         if not recent:

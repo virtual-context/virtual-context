@@ -38,7 +38,7 @@ def filter_body_messages(
     Pre-compaction mode (when *compacted_turn* == 0):
     - ``"off"``: skip all tag-based filtering, return body unchanged
     - ``"conservative"``: double the *recent_turns* protection window
-    - ``"aggressive"``: use *recent_turns* as-is (default, backward compatible)
+    - ``"aggressive"``: use *recent_turns* as-is (default)
 
     Returns (filtered_body, turns_dropped).
     """

@@ -62,7 +62,6 @@ class TelemetryLedger:
         turn_id: int | None = None,
         detail: str = "",
     ) -> TelemetryEvent:
-        """Create a TelemetryEvent via ModelCatalog and append it."""
         cost = self._catalog.calculate_cost(model, input_tokens, output_tokens)
         event = TelemetryEvent(
             timestamp=time.time(),

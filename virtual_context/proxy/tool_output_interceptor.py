@@ -215,7 +215,6 @@ class ToolOutputInterceptor:
         tool_name: str,
         rule: ToolOutputRule,
     ) -> str:
-        """Store full content in FTS5. Returns ref for the notice."""
         ref = f"tool_{uuid4().hex[:12]}"
         cap = rule.max_index_bytes if rule.max_index_bytes is not None else self.config.max_index_bytes
         self.store.store_tool_output(

@@ -206,7 +206,6 @@ class VirtualContextEngine:
         self._bootstrap_vocabulary()
 
     def close(self) -> None:
-        """Release backend resources held by the engine."""
         store = getattr(self, "_store", None)
         if store is not None and hasattr(store, "close"):
             try:
@@ -222,7 +221,6 @@ class VirtualContextEngine:
 
     @property
     def reference_date(self) -> date | None:
-        """Override 'today' for remember_when relative presets."""
         return self._reference_date
 
     @reference_date.setter
@@ -231,12 +229,10 @@ class VirtualContextEngine:
         self._temporal.reference_date = value
 
     def _init_canonicalizer(self) -> None:
-        """Initialize the tag canonicalizer with store aliases."""
         self._canonicalizer = TagCanonicalizer(store=self._store)
         self._canonicalizer.load()
 
     def _init_tag_generator(self) -> None:
-        """Build the tag generator from config."""
         llm_provider = None
 
         # Try to build an LLM provider for tagging
@@ -254,7 +250,6 @@ class VirtualContextEngine:
         )
 
     def _init_store(self) -> None:
-        """Initialize the storage backend via CompositeStore."""
         from .core.composite_store import CompositeStore
         from .storage.noop_fact_link_store import NoopFactLinkStore
 
@@ -368,7 +363,6 @@ class VirtualContextEngine:
         )
 
     def _init_compactor(self) -> None:
-        """Initialize the compactor with an LLM provider."""
         self._llm_provider = None
         self._compactor = None
 
@@ -389,7 +383,6 @@ class VirtualContextEngine:
             )
 
     def _init_tag_splitter(self) -> None:
-        """Initialize tag splitter if enabled in config."""
         self._tag_splitter = None
         cfg = self.config.tag_generator.tag_splitting
         if cfg.enabled and self._llm_provider:
@@ -478,7 +471,7 @@ class VirtualContextEngine:
 
     def _apply_persisted_state_to_delegates(self) -> None:
         """Wire restored state into delegates created after _load_persisted_state."""
-        # Restore paging working set (backward-compatible: old snapshots have empty list)
+        # Restore paging working set (old snapshots may have empty list)
         ws_entries = getattr(self, "_restored_working_set", [])
         self._paging.working_set = {ws.tag: ws for ws in ws_entries}
 
@@ -516,7 +509,6 @@ class VirtualContextEngine:
             )
 
     def _save_state(self, conversation_history: list[Message]) -> None:
-        """Persist current engine state to store."""
         try:
             # Persist telemetry rollup (totals + by_model) without raw events
             telemetry_dict = self._telemetry.to_dict()
@@ -545,7 +537,6 @@ class VirtualContextEngine:
             logger.error("Failed to save engine state: %s", e)
 
     def _init_supersession_checker(self) -> None:
-        """Initialize the supersession checker from config if enabled."""
         sc = self.config.supersession
         if not sc.enabled:
             return
@@ -581,7 +572,6 @@ class VirtualContextEngine:
             logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 
     def _init_fact_curator(self) -> None:
-        """Initialize the fact curator from config if enabled."""
         cc = self.config.curation
         if not cc.enabled:
             return
@@ -602,7 +592,6 @@ class VirtualContextEngine:
         logger.info("Fact curator initialized (provider=%s, model=%s)", provider_name, model)
 
     def _build_provider(self, provider_name: str, provider_config: dict):
-        """Build an LLM provider from config."""
         ptype = provider_config.get("type", provider_name)
 
         if ptype in ("generic_openai", "openrouter"):
@@ -659,7 +648,6 @@ class VirtualContextEngine:
         model_name: str = "",
         max_context_tokens: int | None = None,
     ) -> AssembledContext:
-        """Before sending to LLM: tag, retrieve, assemble enriched context (delegates to RetrievalAssembler)."""
         return self._retrieval.on_message_inbound(message, conversation_history, model_name, max_context_tokens)
 
     def tag_turn(
@@ -667,7 +655,6 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         payload_tokens: int | None = None,
     ) -> CompactionSignal | None:
-        """Phase 1 of turn processing (delegates to TaggingPipeline)."""
         return self._tagging.tag_turn(conversation_history, payload_tokens)
 
     def compact_if_needed(
@@ -676,7 +663,6 @@ class VirtualContextEngine:
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport | None:
-        """Phase 2 of turn processing: run compaction (delegates to CompactionPipeline)."""
         return self._compaction.compact_if_needed(conversation_history, signal, progress_callback)
 
     def on_turn_complete(
@@ -701,7 +687,6 @@ class VirtualContextEngine:
         current_tags: list[str],
         recent_turns: int | None = None,
     ) -> list[Message]:
-        """Filter conversation history by tag relevance (delegates to RetrievalAssembler)."""
         retrieval = getattr(self, "_retrieval", None)
         if retrieval is None:
             # Lightweight fallback for tests that bypass __init__ via __new__
@@ -715,7 +700,6 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
     ) -> CompactionReport | None:
-        """Trigger manual compaction regardless of thresholds (delegates to CompactionPipeline)."""
         return self._compaction.compact_manual(conversation_history)
 
     def ingest_history(
@@ -724,19 +708,15 @@ class VirtualContextEngine:
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
     ) -> int:
-        """Bootstrap TurnTagIndex from pre-existing history (delegates to TaggingPipeline)."""
         return self._tagging.ingest_history(history_pairs, progress_callback, turn_offset)
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
-        """Retrieve relevant context for a message without assembling (delegates to RetrievalAssembler)."""
         return self._retrieval.retrieve(message, active_tags)
 
     def transform(self, message: str, active_tags: list[str] | None = None, budget: int | None = None) -> str:
-        """Retrieve + assemble context block for a message (delegates to RetrievalAssembler)."""
         return self._retrieval.transform(message, active_tags, budget)
 
     def reassemble_context(self) -> str:
-        """Re-assemble context with the current working set (delegates to RetrievalAssembler)."""
         return self._retrieval.reassemble_context()
 
     # ------------------------------------------------------------------
@@ -744,19 +724,15 @@ class VirtualContextEngine:
     # ------------------------------------------------------------------
 
     def expand_topic(self, tag: str, depth: str = "full") -> dict:
-        """Expand a topic to deeper detail in the working set."""
         return self._paging.expand_topic(tag, depth)
 
     def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
-        """Collapse a topic to shallower detail. Returns freed tokens."""
         return self._paging.collapse_topic(tag, depth)
 
     def recall_all(self) -> dict:
-        """Load all tag summaries. Used by vc_recall_all tool."""
         return self._retrieval.recall_all()
 
     def get_working_set_summary(self) -> dict:
-        """Return current working set with budget info."""
         return self._paging.get_working_set_summary()
 
     def find_quote(
@@ -766,7 +742,6 @@ class VirtualContextEngine:
         intent_context: str = "",
         session_filter: str = "",
     ) -> dict:
-        """Search stored conversation text for a specific phrase or keyword."""
         return self._search.find_quote(query, max_results, intent_context=intent_context, session_filter=session_filter)
 
     def get_turns_by_tag(
@@ -774,19 +749,15 @@ class VirtualContextEngine:
         tag: str,
         conversation_history: list[Message] | None = None,
     ) -> dict:
-        """Return all raw turns associated with a tag, from both stored segments and live history."""
         return self._search.get_turns_by_tag(tag, conversation_history)
 
     def _parse_session_date(self, raw: str) -> date | None:
-        """Best-effort parse for session date strings from stored metadata."""
         return self._temporal._parse_session_date(raw)
 
     def _resolve_remember_when_range(self, time_range: dict) -> tuple[date, date, str]:
-        """Resolve tool time_range input to absolute [start_date, end_date]."""
         return self._temporal._resolve_remember_when_range(time_range)
 
     def query_facts(self, **kwargs) -> list | dict:
-        """Query structured facts by filters. Expands verb semantically, then delegates to store."""
         return self._facts.query(**kwargs)
 
     def remember_when(
@@ -795,7 +766,6 @@ class VirtualContextEngine:
         time_range: dict,
         max_results: int | None = None,
     ) -> dict:
-        """Find memory snippets for *query* constrained to a resolved date window."""
         return self._temporal.remember_when(query, time_range, max_results)
 
     # ------------------------------------------------------------------
@@ -880,11 +850,9 @@ class VirtualContextEngine:
         )
 
     def get_telemetry(self) -> TelemetryLedger:
-        """Return the telemetry ledger for this session."""
         return self._telemetry
 
     def cleanup(self, max_age_days: int | None = None, max_total_tokens: int | None = None) -> int:
-        """Run cleanup on the store. Returns count of segments deleted."""
         max_age = timedelta(days=max_age_days) if max_age_days else None
         return self._store.cleanup(max_age=max_age, max_total_tokens=max_total_tokens)
 

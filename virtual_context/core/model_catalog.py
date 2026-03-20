@@ -22,7 +22,6 @@ class ModelInfo:
 
 
 class ModelCatalog:
-    """Centralized model pricing loaded from a YAML file."""
 
     def __init__(self, path: str) -> None:
         self._models: dict[str, ModelInfo] = {}

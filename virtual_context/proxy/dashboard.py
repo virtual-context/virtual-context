@@ -36,7 +36,6 @@ _replay_lock: asyncio.Lock | None = None  # created lazily inside the event loop
 
 
 def _get_replay_lock() -> asyncio.Lock:
-    """Return the module-level replay lock, creating it lazily."""
     global _replay_lock
     if _replay_lock is None:
         _replay_lock = asyncio.Lock()
@@ -93,7 +92,7 @@ def _check_dashboard_auth(request: Request, dashboard_token: str) -> JSONRespons
     """Validate ``X-VC-Dashboard-Token`` header (or ``?token=`` query param) for mutating endpoints.
 
     Returns a 403 response if authentication fails, or ``None`` to allow access.
-    If *dashboard_token* is empty, auth is skipped (backward compatible).
+    If *dashboard_token* is empty, auth is skipped.
 
     Check order: header first, then ``token`` query parameter (needed for
     EventSource which cannot send custom headers).
@@ -357,7 +356,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/export")
     async def dashboard_export():
-        """Return the full metrics snapshot augmented with engine state."""
         from .. import __version__
 
         snap = metrics.snapshot()
@@ -411,7 +409,6 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/telemetry")
     async def dashboard_telemetry():
-        """Return current telemetry rollup (lightweight, no raw events)."""
         if metrics._telemetry_ledger:
             telem = metrics._telemetry_ledger.to_dict()
             telem.pop("events", None)
@@ -424,12 +421,10 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/requests")
     async def list_captured_requests():
-        """Return summaries of captured request bodies."""
         return JSONResponse(metrics.get_captured_requests_summary())
 
     @app.get("/dashboard/requests/{turn}")
     async def get_captured_request(turn: int):
-        """Return the full raw request body for a specific turn."""
         req = metrics.get_captured_request(turn)
         if req is None:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -441,7 +436,6 @@ def register_dashboard_routes(
 
     @app.post("/dashboard/replay/start")
     async def replay_start(request: Request):
-        """Start a replay run from a prompts file."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not state:
@@ -539,7 +533,6 @@ def register_dashboard_routes(
 
     @app.post("/dashboard/replay/stop")
     async def replay_stop(request: Request):
-        """Stop the running replay."""
         if err := _check_dashboard_auth(request, _token):
             return err
         cancel = _replay_state.get("cancel")
@@ -574,7 +567,6 @@ def register_dashboard_routes(
 
     @app.post("/dashboard/compact")
     async def dashboard_compact(request: Request):
-        """Trigger manual compaction regardless of thresholds."""
         if err := _check_dashboard_auth(request, _token):
             return err
         if not state:
@@ -819,7 +811,6 @@ async def _call_llm(
 
 
 def _get_provider_config(engine) -> dict:
-    """Extract LLM call config from the engine's provider."""
     from ..providers.generic_openai import GenericOpenAIProvider
 
     provider = engine._llm_provider

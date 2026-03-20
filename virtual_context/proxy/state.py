@@ -42,7 +42,6 @@ _PROVIDER_HOSTS: dict[str, str] = {
 
 
 def _derive_provider(upstream: str) -> str:
-    """Derive a provider name from an upstream URL."""
     if not upstream:
         return ""
     try:
@@ -174,7 +173,6 @@ class ProxyState:
         self._manual_passthrough = enabled
 
     def _transition_to(self, new_state: SessionState) -> None:
-        """Update internal state and emit a metric event."""
         old = self._state
         self._state = new_state
         if self.metrics and old != new_state:
@@ -251,7 +249,7 @@ class ProxyState:
             self._pending_tag = None
 
     def wait_for_complete(self) -> None:
-        """Block until tag + compact both finish (backward compat)."""
+        """Block until tag + compact both finish."""
         self.wait_for_tag()
         if self._pending_compact is not None:
             self._pending_compact.result()
@@ -517,7 +515,6 @@ class ProxyState:
         return True
 
     def _record_ingestion_watermark(self, history_pairs: list[Message], conversation_id: str) -> None:
-        """Store the first-message hash and turn count after successful ingestion."""
         import hashlib
         if history_pairs:
             self._ingested_first_hash[conversation_id] = (

@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 class ContextRetriever:
-    """Retrieve relevant summaries for an inbound message using tag overlap."""
 
     def __init__(
         self,

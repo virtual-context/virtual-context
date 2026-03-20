@@ -651,7 +651,6 @@ class PostgresStore(ContextStore):
         return cur.rowcount
 
     def delete_conversation(self, conversation_id: str) -> int:
-        """Delete all segments, facts, engine state, turn messages, and tag summaries for a conversation. Returns segment count deleted."""
         conn = self._get_conn()
         with conn.transaction():
             cur = conn.execute(

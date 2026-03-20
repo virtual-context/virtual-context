@@ -212,7 +212,6 @@ class PayloadFormat(ABC):
 
     @staticmethod
     def _msg_text(msg: dict) -> str:
-        """Extract plain text from a message content (str or content blocks)."""
         content = msg.get("content", "")
         if isinstance(content, str):
             return content
@@ -284,7 +283,6 @@ class AnthropicFormat(PayloadFormat):
         return ""
 
     def extract_user_raw_content(self, body: dict) -> list[dict] | None:
-        """Extract raw content blocks from the last user message."""
         messages = body.get("messages", [])
         for msg in reversed(messages):
             if msg.get("role") != "user":
@@ -297,7 +295,6 @@ class AnthropicFormat(PayloadFormat):
         return None
 
     def extract_assistant_raw_content(self, response_body: dict) -> list[dict] | None:
-        """Extract raw content blocks from assistant response."""
         content = response_body.get("content", [])
         if isinstance(content, list) and content:
             return content
@@ -312,7 +309,6 @@ class AnthropicFormat(PayloadFormat):
         return ""
 
     def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
-        """Extract message text and envelope metadata."""
         content = msg.get("content", "")
         if isinstance(content, str):
             return _extract_envelope_metadata(content)
@@ -593,7 +589,6 @@ class OpenAIFormat(PayloadFormat):
         return ""
 
     def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
-        """Extract message text and envelope metadata."""
         content = msg.get("content", "")
         if isinstance(content, str):
             return _extract_envelope_metadata(content)
@@ -866,7 +861,6 @@ class GeminiFormat(PayloadFormat):
         return _strip_envelope(text)
 
     def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
-        """Extract message text and envelope metadata."""
         parts = msg.get("parts", [])
         text = self._extract_text_from_parts(parts)
         return _extract_envelope_metadata(text)
@@ -1208,7 +1202,6 @@ class OpenAIResponsesFormat(PayloadFormat):
         return _strip_envelope(text)
 
     def extract_message_text_with_meta(self, msg: dict) -> tuple[str, dict]:
-        """Extract message text and envelope metadata."""
         content = msg.get("content", "")
         text = self._extract_text_from_content(content)
         return _extract_envelope_metadata(text)

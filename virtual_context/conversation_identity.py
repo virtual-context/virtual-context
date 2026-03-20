@@ -29,14 +29,12 @@ _VC_PROMPT_MARKER = "[vc:prompt]"
 
 
 def _candidate_to_uuid(layer: str, value: str) -> str:
-    """Derive a deterministic UUID from a layer name + value."""
     raw = f"{layer}:{value}"
     digest = hashlib.sha256(raw.encode()).hexdigest()
     return str(_uuid.UUID(digest[:32]))
 
 
 def _extract_conversation_info(body: dict) -> dict:
-    """Extract conversation_info from the first user message's envelope metadata."""
     if not body:
         return {}
 
@@ -80,7 +78,6 @@ def _extract_conversation_info(body: dict) -> dict:
 
 
 def _extract_system_prompt_hash(body: dict) -> str:
-    """Hash the system prompt from the body without copying the full text."""
     if not body:
         return ""
 
