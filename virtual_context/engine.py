@@ -91,7 +91,7 @@ def _is_stub_content(text: str) -> bool:
 
 
 from .core.paging_manager import PagingManager
-from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions, _parse_session_date as _parse_session_date_str
+from .core.quote_search import _parse_session_date as _parse_session_date_str
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
 
 
@@ -149,6 +149,11 @@ class VirtualContextEngine:
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
         from .core.fact_query import FactQueryEngine
         self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
+        from .core.search_engine import SearchEngine
+        self._search = SearchEngine(
+            store=self._store, semantic=self._semantic,
+            turn_tag_index=self._turn_tag_index, config=self.config,
+        )
         self._paging = PagingManager(
             store=self._store,
             token_counter=self._token_counter,
@@ -594,6 +599,7 @@ class VirtualContextEngine:
         self._turn_tag_index = TurnTagIndex()
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
+        self._search._turn_tag_index = self._turn_tag_index
         self._split_processed_tags = set(saved.split_processed_tags)
         # Restore paging working set (backward-compatible: old snapshots have empty list)
         self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
@@ -2075,19 +2081,6 @@ class VirtualContextEngine:
         """Auto-evict coldest topics to free `needed` tokens."""
         return self._paging._auto_evict(needed, exclude_tag)
 
-    # ------------------------------------------------------------------
-    # Description-aware search supplement for find_quote
-    # ------------------------------------------------------------------
-
-    def _supplement_from_descriptions(
-        self,
-        query: str,
-        results: list[QuoteResult],
-        max_results: int,
-    ) -> list[QuoteResult]:
-        """Add results from tags whose descriptions match query terms."""
-        return _supplement_from_descriptions(self._store, query, results, max_results, conversation_id=self.config.conversation_id)
-
     def find_quote(
         self,
         query: str,
@@ -2096,100 +2089,15 @@ class VirtualContextEngine:
         session_filter: str = "",
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
-        if max_results is None:
-            max_results = self.config.search.find_quote_default_results
-        return _find_quote(
-            self._store,
-            self._semantic,
-            query,
-            max_results,
-            intent_context=intent_context,
-            session_filter=session_filter,
-            conversation_id=self.config.conversation_id,
-        )
+        return self._search.find_quote(query, max_results, intent_context=intent_context, session_filter=session_filter)
 
     def get_turns_by_tag(
         self,
         tag: str,
         conversation_history: list[Message] | None = None,
     ) -> dict:
-        """Return all raw turns associated with a tag, from both stored segments and live history.
-
-        Stored turns come from compacted segments in the store.
-        Live turns come from the TurnTagIndex matched against conversation_history.
-        """
-        result: dict = {
-            "tag": tag,
-            "stored_turns": [],
-            "live_turns": [],
-            "total_turns": 0,
-        }
-
-        # Stored turns: segments matching this tag
-        segments = self._store.get_segments_by_tags(
-            tags=[tag], min_overlap=1, limit=500,
-            conversation_id=self.config.conversation_id,
-        )
-        seen_refs: set[str] = set()
-        for seg in segments:
-            if seg.ref in seen_refs:
-                continue
-            seen_refs.add(seg.ref)
-            meta = seg.metadata or SegmentMetadata(turn_count=0)
-            result["stored_turns"].append({
-                "segment_ref": seg.ref,
-                "messages": seg.messages,
-                "full_text": seg.full_text,
-                "summary": seg.summary,
-                "turn_count": meta.turn_count,
-                "created_at": str(seg.created_at),
-            })
-
-        # Live turns: TurnTagIndex entries where tag appears,
-        # paired with conversation_history messages or persisted turn_messages
-        history = conversation_history or []
-        missing_turn_numbers: list[int] = []
-        live_entries: list[tuple] = []  # (entry, msg_idx)
-        for entry in self._turn_tag_index.entries:
-            if tag not in entry.tags:
-                continue
-            msg_idx = entry.turn_number * 2
-            if msg_idx < len(history):
-                messages = [{"role": "user", "content": history[msg_idx].content}]
-                if msg_idx + 1 < len(history):
-                    messages.append({"role": "assistant", "content": history[msg_idx + 1].content})
-                result["live_turns"].append({
-                    "turn_number": entry.turn_number,
-                    "tags": entry.tags,
-                    "primary_tag": entry.primary_tag,
-                    "messages": messages,
-                })
-            else:
-                missing_turn_numbers.append(entry.turn_number)
-                live_entries.append(entry)
-
-        # Fall back to persisted turn_messages for restored turns
-        if missing_turn_numbers:
-            persisted = self._store.get_turn_messages(
-                self.config.conversation_id, missing_turn_numbers,
-            )
-            for entry in live_entries:
-                pair = persisted.get(entry.turn_number)
-                messages = []
-                if pair:
-                    if pair[0]:
-                        messages.append({"role": "user", "content": pair[0]})
-                    if pair[1]:
-                        messages.append({"role": "assistant", "content": pair[1]})
-                result["live_turns"].append({
-                    "turn_number": entry.turn_number,
-                    "tags": entry.tags,
-                    "primary_tag": entry.primary_tag,
-                    "messages": messages,
-                })
-
-        result["total_turns"] = len(result["stored_turns"]) + len(result["live_turns"])
-        return result
+        """Return all raw turns associated with a tag, from both stored segments and live history."""
+        return self._search.get_turns_by_tag(tag, conversation_history)
 
     def _parse_session_date(self, raw: str) -> date | None:
         """Best-effort parse for session date strings from stored metadata."""
