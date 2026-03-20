@@ -418,13 +418,13 @@ class TestContextHintMentionsFindQuote:
 
     def test_autonomous_hint_mentions_find_quote(self, tmp_path):
         engine = self._make_engine_with_hint(tmp_path)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "vc_find_quote" in hint
         assert "find_quote(query)" in hint
 
     def test_supervised_hint_mentions_find_quote(self, tmp_path):
         engine = self._make_engine_with_hint(tmp_path)
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "vc_find_quote" in hint
 
 

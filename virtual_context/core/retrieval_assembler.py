@@ -489,3 +489,34 @@ class RetrievalAssembler:
                 if deduped:
                     full_segments_param[tag] = deduped
         return ws_param, full_segments_param
+
+    # ------------------------------------------------------------------
+    # recall_all
+    # ------------------------------------------------------------------
+
+    def recall_all(self) -> dict:
+        """Load all tag summaries. Used by vc_recall_all tool."""
+        tag_summaries = self._store.get_all_tag_summaries(
+            conversation_id=self.config.conversation_id,
+        )
+        if not tag_summaries:
+            return {"found": False, "message": "No stored summaries yet."}
+        budget = self.config.assembler.tag_context_max_tokens
+        selected = []
+        total_tokens = 0
+        for ts in tag_summaries:
+            if total_tokens + ts.summary_tokens > budget:
+                break
+            selected.append({
+                "tag": ts.tag,
+                "summary": ts.summary,
+                "tokens": ts.summary_tokens,
+                "description": ts.description or "",
+            })
+            total_tokens += ts.summary_tokens
+        return {
+            "found": True,
+            "topics_loaded": len(selected),
+            "total_tokens": total_tokens,
+            "summaries": selected,
+        }

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 from virtual_context.types import EngineStateSnapshot, Message, TagResult, TurnTagEntry
 from virtual_context.engine import VirtualContextEngine
+from virtual_context.core.tagging_pipeline import TaggingPipeline
 from virtual_context.core.turn_tag_index import TurnTagIndex
 
 
@@ -39,7 +40,7 @@ def test_is_tool_turn_with_tool_use():
             {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "ls"}},
         ]),
     ]
-    assert VirtualContextEngine._is_tool_turn(msgs) is True
+    assert TaggingPipeline._is_tool_turn(msgs) is True
 
 
 # --- Task 3: Wire tool tag assignment into tag_turn() ---
@@ -50,8 +51,6 @@ def _build_tag_turn_engine_mock():
     engine._turn_tag_index = TurnTagIndex()
     from virtual_context.types import EngineState
     engine._engine_state = EngineState()
-    engine._is_tool_turn = VirtualContextEngine._is_tool_turn
-    engine._get_latest_turn_pair = VirtualContextEngine._get_latest_turn_pair.__get__(engine)
     engine._tag_splitter = None
     engine._monitor = MagicMock()
     engine._monitor.check.return_value = None
@@ -111,7 +110,7 @@ def test_is_tool_turn_without_tools():
         Message(role="user", content="hello"),
         Message(role="assistant", content="hi there"),
     ]
-    assert VirtualContextEngine._is_tool_turn(msgs) is False
+    assert TaggingPipeline._is_tool_turn(msgs) is False
 
 
 def test_is_tool_turn_mixed_content():
@@ -124,7 +123,7 @@ def test_is_tool_turn_mixed_content():
         Message(role="assistant", content="Here's what I found"),
     ]
     # content is non-empty, so this is NOT a tool-only turn
-    assert VirtualContextEngine._is_tool_turn(msgs) is False
+    assert TaggingPipeline._is_tool_turn(msgs) is False
 
 
 def test_is_tool_turn_empty_content_with_tools():
@@ -138,7 +137,7 @@ def test_is_tool_turn_empty_content_with_tools():
             {"type": "tool_use", "id": "t2", "name": "read", "input": {}},
         ]),
     ]
-    assert VirtualContextEngine._is_tool_turn(msgs) is True
+    assert TaggingPipeline._is_tool_turn(msgs) is True
 
 
 # --- Task 5: Persist and restore tool_tag_counter ---

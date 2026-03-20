@@ -648,11 +648,13 @@ class TestEngineCuration:
         from virtual_context.ingest.curator import FactCurator
         from virtual_context.types import Fact
         mock_llm = MockLLMProvider(response="0")
-        engine._fact_curator = FactCurator(
+        curator = FactCurator(
             llm_provider=mock_llm,
             model="test",
             config=cfg.curation,
         )
+        engine._retrieval._fact_curator = curator
+        engine._compaction._fact_curator = curator
 
         # Store two facts
         from virtual_context.types import Fact
