@@ -297,6 +297,19 @@ class TurnTagEntry:
 
 
 @dataclass
+class EngineState:
+    """Mutable shared state passed to engine delegates."""
+    compacted_through: int = 0
+    tool_tag_counter: int = 0
+    split_processed_tags: set[str] = field(default_factory=set)
+    trailing_fingerprint: str = ""
+    provider: str = ""
+    last_tag_ms: float = 0.0
+    last_compact_ms: float = 0.0
+    last_split_result: SplitResult | None = None
+
+
+@dataclass
 class EngineStateSnapshot:
     """Serializable snapshot of engine state for persistence across restarts."""
     conversation_id: str

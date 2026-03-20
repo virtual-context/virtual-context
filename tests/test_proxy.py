@@ -1391,7 +1391,7 @@ class TestEngineIngestHistory:
         from virtual_context.core.turn_tag_index import TurnTagIndex
         from virtual_context.engine import VirtualContextEngine
         engine._turn_tag_index = TurnTagIndex()
-        engine._tool_tag_counter = 0
+        engine._engine_state.tool_tag_counter = 0
         engine._is_tool_turn = VirtualContextEngine._is_tool_turn
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
@@ -2516,7 +2516,7 @@ class TestCompactionConcurrencyGuard:
             engine.tag_turn.return_value = None
             engine._turn_tag_index = MagicMock()
             engine._turn_tag_index.entries = []
-            engine._compacted_through = 0
+            engine._engine_state.compacted_through = 0
             MockEngine.return_value = engine
             app = create_app(upstream="http://fake:9999", config_path=None)
 
@@ -2977,7 +2977,7 @@ class TestLiveSessions:
         metrics = ProxyMetrics()
         engine = MagicMock()
         engine.config.conversation_id = "live-session-1"
-        engine._compacted_through = 0
+        engine._engine_state.compacted_through = 0
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.entries = []
         engine._turn_tag_index.get_active_tags.return_value = ["tag-a"]
@@ -3001,7 +3001,7 @@ class TestLiveSessions:
             live_sessions.append({
                 "conversation_id": sid,
                 "turn_count": len(s.conversation_history) // 2,
-                "compacted_through": getattr(s.engine, "_compacted_through", 0),
+                "compacted_through": s.engine._engine_state.compacted_through,
                 "tag_count": len(s.engine._turn_tag_index.entries),
                 "active_tags": list(
                     s.engine._turn_tag_index.get_active_tags(lookback=6)
@@ -4030,7 +4030,7 @@ def paging_test_client(tmp_path):
         engine.tag_turn.return_value = None
         engine._turn_tag_index = TurnTagIndex()
         engine._resolve_paging_mode.return_value = "autonomous"
-        engine._compacted_through = 0
+        engine._engine_state.compacted_through = 0
         engine.expand_topic.return_value = {
             "tag": "database",
             "depth": "full",
