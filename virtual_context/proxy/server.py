@@ -296,18 +296,25 @@ def create_app(
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
 
         # --- Raw request log: dump entire payload before any processing ---
+        # Check app.state for runtime-configurable log dir (cloud layer sets this)
+        _effective_log_dir = _request_log_dir or getattr(app.state, "request_log_dir", None)
+        if _effective_log_dir and isinstance(_effective_log_dir, (str, Path)):
+            _effective_log_dir = Path(_effective_log_dir)
+            _effective_log_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            _effective_log_dir = None
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
-        if _request_log_dir and body_bytes:
+        if _effective_log_dir and body_bytes:
             _seq = next(_log_seq)
             import datetime as _dt_log
             ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             _log_prefix = f"{_seq:06d}_{ts}_{path.replace('/', '_')}"
             # 1-inbound: raw request from client
-            req_log = _request_log_dir / f"{_log_prefix}.1-inbound.json"
-            _response_log_path = _request_log_dir / f"{_log_prefix}.3-from-llm.json"
-            _session_log_path = _request_log_dir / f"{_log_prefix}.session.json"
+            req_log = _effective_log_dir / f"{_log_prefix}.1-inbound.json"
+            _response_log_path = _effective_log_dir / f"{_log_prefix}.3-from-llm.json"
+            _session_log_path = _effective_log_dir / f"{_log_prefix}.session.json"
             try:
                 req_log.write_bytes(body_bytes)
             except Exception:
@@ -411,7 +418,7 @@ def create_app(
                     metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
-                    request_log_dir=_request_log_dir, log_prefix=_log_prefix,
+                    request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                 )
 
         # ---------------------------------------------------------------
@@ -534,7 +541,7 @@ def create_app(
                         conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
-                        request_log_dir=_request_log_dir, log_prefix=_log_prefix,
+                        request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     )
 
         # ---------------------------------------------------------------
@@ -674,11 +681,7 @@ def create_app(
                 print("[FILTER] Skipped filtering (mode=off, pre-compaction)")
 
         # Tool output interception: truncate large tool_result blocks.
-        # I6: deepcopy before interceptor so mutations don't affect the
-        # original body dict (which _inject_context also reads).
         if state and state.engine.config.tool_output.enabled:
-            import copy
-
             from .tool_output_interceptor import ToolOutputInterceptor
 
             interceptor = ToolOutputInterceptor(
@@ -688,7 +691,7 @@ def create_app(
             )
             interceptor._turn_counter = state._total_requests
             _pre = interceptor.stats.total_intercepted
-            body = interceptor.process(copy.deepcopy(body), fmt)
+            body = interceptor.process(body, fmt)
             _post = interceptor.stats.total_intercepted
             if _post > _pre:
                 print(f"[TOOL-INTERCEPT] Active: truncated {_post - _pre} tool_result(s), "
@@ -751,9 +754,9 @@ def create_app(
             state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
 
         # 2-to-llm: enriched body sent to the LLM (after filtering + context + tools)
-        if _request_log_dir and _log_prefix:
+        if _effective_log_dir and _log_prefix:
             try:
-                _to_llm_log = _request_log_dir / f"{_log_prefix}.2-to-llm.json"
+                _to_llm_log = _effective_log_dir / f"{_log_prefix}.2-to-llm.json"
                 _to_llm_log.write_text(json.dumps(enriched_body, default=str))
             except Exception:
                 pass
@@ -871,8 +874,8 @@ def create_app(
                 conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
                 paging_enabled=_intercept_vc_tools,
-                request_log_dir=_request_log_dir,
-                log_prefix=_log_prefix if _request_log_dir else "",
+                request_log_dir=_effective_log_dir,
+                log_prefix=_log_prefix if _effective_log_dir else "",
             )
         else:
             return await _handle_non_streaming(
@@ -880,7 +883,7 @@ def create_app(
                 metrics=metrics, turn=turn, turn_id=_turn_id, overhead_ms=overhead_ms,
                 conversation_id=_conversation_id, response_log_path=_response_log_path,
                 session_log_path=_session_log_path,
-                request_log_dir=_request_log_dir, log_prefix=_log_prefix,
+                request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
             )
 
     return app
