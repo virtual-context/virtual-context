@@ -651,7 +651,7 @@ class TestEngineAutoEvict:
             "hot": WorkingSetEntry(tag="hot", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=10),
         }
 
-        evicted, freed = engine._auto_evict(needed=200, exclude_tag="hot")
+        evicted, freed = engine._paging._auto_evict(needed=200, exclude_tag="hot")
         # Should evict "cold" first (lowest last_accessed_turn)
         assert "cold" in evicted
 
@@ -662,7 +662,7 @@ class TestEngineAutoEvict:
             "other": WorkingSetEntry(tag="other", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=2),
         }
 
-        evicted, freed = engine._auto_evict(needed=200, exclude_tag="target")
+        evicted, freed = engine._paging._auto_evict(needed=200, exclude_tag="target")
         assert "target" not in evicted
         assert "other" in evicted
 
@@ -683,18 +683,18 @@ class TestCalculateDepthTokens:
 
     def test_none_returns_zero(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        assert engine._calculate_depth_tokens("any", DepthLevel.NONE) == 0
+        assert engine._paging.calculate_depth_tokens("any", DepthLevel.NONE) == 0
 
     def test_summary_uses_tag_summary(self, tmp_path):
         engine = self._make_engine(tmp_path)
         engine._store.save_tag_summary(TagSummary(
             tag="db", summary="Database summary.", summary_tokens=42,
         ), conversation_id=engine.config.conversation_id)
-        assert engine._calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
+        assert engine._paging.calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
 
     def test_summary_missing_returns_zero(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        assert engine._calculate_depth_tokens("missing", DepthLevel.SUMMARY) == 0
+        assert engine._paging.calculate_depth_tokens("missing", DepthLevel.SUMMARY) == 0
 
     def test_segments_sums_segment_summaries(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -706,7 +706,7 @@ class TestCalculateDepthTokens:
                 conversation_id=engine.config.conversation_id,
             ))
         # Should sum summary_tokens: 10 + 20 + 30 = 60
-        assert engine._calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
+        assert engine._paging.calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
 
     def test_full_sums_full_tokens(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -717,7 +717,7 @@ class TestCalculateDepthTokens:
                 summary="s", summary_tokens=5,
                 full_text="x" * 400, full_tokens=100,
             ))
-        assert engine._calculate_depth_tokens("auth", DepthLevel.FULL) == 200
+        assert engine._paging.calculate_depth_tokens("auth", DepthLevel.FULL) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -774,36 +774,36 @@ class TestResolvePagingMode:
 
     def test_empty_list_always_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=[])
-        assert engine._resolve_paging_mode("claude-opus-4") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("claude-opus-4") == "supervised"
 
     def test_opus_matches(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
-        assert engine._resolve_paging_mode("claude-opus-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-opus-4") == "autonomous"
 
     def test_sonnet_matches(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-sonnet-4"])
-        assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
     def test_prefix_match(self, tmp_path):
         """Prefix match: 'gpt-4' matches 'gpt-4-turbo'."""
         engine = self._make_engine(tmp_path, autonomous_models=["gpt-4"])
-        assert engine._resolve_paging_mode("gpt-4-turbo") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("gpt-4-turbo") == "autonomous"
 
     def test_haiku_not_in_list(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
-        assert engine._resolve_paging_mode("claude-haiku-3") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("claude-haiku-3") == "supervised"
 
     def test_unknown_model_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
-        assert engine._resolve_paging_mode("qwen3:4b") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("qwen3:4b") == "supervised"
 
     def test_empty_model_name_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
-        assert engine._resolve_paging_mode("") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("") == "supervised"
 
     def test_case_insensitive(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["Claude-Sonnet-4"])
-        assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
 
 class TestContextHintModes:
@@ -839,7 +839,7 @@ class TestContextHintModes:
     def test_default_hint_no_paging(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
         self._seed_tag_summary(engine, "database")
-        hint = engine._build_context_hint()
+        hint = engine._retrieval._build_context_hint()
         assert "<context-topics>" in hint
         assert "database" in hint
         # Default hint should NOT mention expand_topic
@@ -848,14 +848,14 @@ class TestContextHintModes:
     def test_supervised_hint(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "expand_topic" in hint
         assert "api" in hint
 
     def test_autonomous_hint_has_budget(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "auth")
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "budget=" in hint
         assert "available=" in hint
         assert "expand_topic" in hint
@@ -865,7 +865,7 @@ class TestContextHintModes:
         engine = self._make_engine(tmp_path, paging_enabled=True)
         engine._engine_state.compacted_through = 0  # no compaction yet
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert hint == ""
 
     @pytest.mark.regression("PROXY-024")
@@ -881,7 +881,7 @@ class TestContextHintModes:
             tag="z-fragrance", depth=DepthLevel.SUMMARY,
             tokens=200, last_accessed_turn=5,
         )
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # z-fragrance should appear despite being last alphabetically
         assert "z-fragrance" in hint
         # And it should appear BEFORE the depth:none tags
@@ -898,7 +898,7 @@ class TestContextHintModes:
         # Seed 50 tags
         for i in range(50):
             self._seed_tag_summary(engine, f"topic-{i:03d}")
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # Count how many topic- tags appear in the hint
         count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
         # With compact format, we should fit significantly more than 9
@@ -932,7 +932,7 @@ class TestContextHintModes:
                 tag=name, depth=DepthLevel.SUMMARY,
                 tokens=100, last_accessed_turn=5,
             )
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # All 3 expanded tags MUST survive truncation
         assert "fragrance-selection" in hint
         assert "karak-chai" in hint
@@ -944,7 +944,7 @@ class TestContextHintModes:
         engine = self._make_engine(tmp_path, paging_enabled=True)
         for i in range(50):
             self._seed_tag_summary(engine, f"topic-{i:03d}")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
         assert count >= 25, f"Only {count}/50 tags fit in supervised mode"
 
@@ -958,7 +958,7 @@ class TestContextHintModes:
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "Sania's cycle tracking via Mira" in hint
 
     def test_autonomous_hint_omits_description_when_empty(self, tmp_path):
@@ -971,7 +971,7 @@ class TestContextHintModes:
             summary_tokens=20,
             source_turn_numbers=[0, 1],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "database" in hint
         # The " — " separator should not appear since description is empty
         # The tag should appear without a trailing description
@@ -988,7 +988,7 @@ class TestContextHintModes:
             summary_tokens=25,
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "Weekly meal prep and grocery optimization" in hint
 
     def test_default_hint_uses_description(self, tmp_path):
@@ -1001,7 +1001,7 @@ class TestContextHintModes:
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2, 3],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint()
+        hint = engine._retrieval._build_context_hint()
         # Default hint uses description when available instead of summary[:60]
         assert "Interval training and HR zone programming" in hint
 

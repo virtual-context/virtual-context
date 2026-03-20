@@ -26,20 +26,15 @@ from .token_counter import create_token_counter
 from .types import (
     AssembledContext,
     CompactionReport,
-    CompactionResult,
     CompactionSignal,
     DEFAULT_CHAT_MODEL,
-    DepthLevel,
     EngineState,
     EngineStateSnapshot,
     Message,
     RetrievalResult,
-    SplitResult,
-    TagSummary,
     ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
-    WorkingSetEntry,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +75,7 @@ def _is_stub_content(text: str) -> bool:
 from .core.compaction_pipeline import CompactionPipeline
 from .core.paging_manager import PagingManager
 from .core.retrieval_assembler import RetrievalAssembler
-from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
+from .core.semantic_search import SemanticSearchManager
 from .core.tagging_pipeline import TaggingPipeline
 
 
@@ -230,94 +225,6 @@ class VirtualContextEngine:
             self.close()
         except Exception:
             pass
-
-    @property
-    def _tag_generator(self) -> TagGenerator:
-        """Proxy to TaggingPipeline's tag generator (for test compat).
-
-        Before ``_tagging`` is created (during ``__init__``), reads/writes
-        go to the backing attribute ``__tag_generator``.  After that, reads
-        and writes go through ``_tagging._tag_generator`` so that tests
-        that monkey-patch ``engine._tag_generator`` also update the delegate.
-        """
-        tagging = self.__dict__.get("_tagging")
-        if tagging is not None:
-            return tagging._tag_generator
-        return self.__dict__.get("_VirtualContextEngine__tag_generator")  # type: ignore[return-value]
-
-    @_tag_generator.setter
-    def _tag_generator(self, value: TagGenerator) -> None:
-        tagging = self.__dict__.get("_tagging")
-        if tagging is not None:
-            tagging._tag_generator = value
-        else:
-            self.__dict__["_VirtualContextEngine__tag_generator"] = value
-
-    @property
-    def _tag_splitter(self):
-        """Proxy to TaggingPipeline's tag splitter (for test compat)."""
-        tagging = self.__dict__.get("_tagging")
-        if tagging is not None:
-            return tagging._tag_splitter
-        return self.__dict__.get("_VirtualContextEngine__tag_splitter")
-
-    @_tag_splitter.setter
-    def _tag_splitter(self, value) -> None:
-        tagging = self.__dict__.get("_tagging")
-        if tagging is not None:
-            tagging._tag_splitter = value
-        else:
-            self.__dict__["_VirtualContextEngine__tag_splitter"] = value
-
-    @property
-    def _compactor(self):
-        """Proxy to CompactionPipeline's compactor (for test compat).
-
-        Before ``_compaction`` is created (during ``__init__``), reads/writes
-        go to the backing attribute ``__compactor``.  After that, reads
-        and writes go through ``_compaction._compactor`` so that tests
-        that monkey-patch ``engine._compactor`` also update the delegate.
-        """
-        compaction = self.__dict__.get("_compaction")
-        if compaction is not None:
-            return compaction._compactor
-        return self.__dict__.get("_VirtualContextEngine__compactor")
-
-    @_compactor.setter
-    def _compactor(self, value) -> None:
-        compaction = self.__dict__.get("_compaction")
-        tagging = self.__dict__.get("_tagging")
-        if compaction is not None:
-            compaction._compactor = value
-        if tagging is not None:
-            tagging._compactor = value
-        if compaction is None:
-            self.__dict__["_VirtualContextEngine__compactor"] = value
-
-    @property
-    def _fact_curator(self):
-        """Proxy to RetrievalAssembler's fact curator (for test compat).
-
-        Before ``_retrieval`` is created (during ``__init__``), reads/writes
-        go to the backing attribute.  After that, reads and writes go through
-        ``_retrieval._fact_curator`` so that tests that monkey-patch
-        ``engine._fact_curator`` also update the delegate.
-        """
-        retrieval = self.__dict__.get("_retrieval")
-        if retrieval is not None:
-            return retrieval._fact_curator
-        return self.__dict__.get("_VirtualContextEngine__fact_curator")
-
-    @_fact_curator.setter
-    def _fact_curator(self, value) -> None:
-        retrieval = self.__dict__.get("_retrieval")
-        compaction = self.__dict__.get("_compaction")
-        if retrieval is not None:
-            retrieval._fact_curator = value
-        if compaction is not None:
-            compaction._fact_curator = value
-        if retrieval is None:
-            self.__dict__["_VirtualContextEngine__fact_curator"] = value
 
     @property
     def reference_date(self) -> date | None:
@@ -514,15 +421,6 @@ class VirtualContextEngine:
         else:
             self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
-
-    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch (delegates to CompactionPipeline)
-
-    def _compact_and_store(
-        self, segments: list, compact_messages_len: int,
-        progress_callback: Callable[..., None] | None = None,
-    ) -> list[CompactionResult]:
-        """Compact segments in batches (delegates to CompactionPipeline)."""
-        return self._compaction._compact_and_store(segments, compact_messages_len, progress_callback)
 
     def _load_persisted_state(self) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available."""
@@ -759,11 +657,6 @@ class VirtualContextEngine:
         """Before sending to LLM: tag, retrieve, assemble enriched context (delegates to RetrievalAssembler)."""
         return self._retrieval.on_message_inbound(message, conversation_history, model_name, max_context_tokens)
 
-    @staticmethod
-    def _is_tool_turn(messages: list[Message]) -> bool:
-        """Check if a turn is tool-only (delegates to TaggingPipeline)."""
-        return TaggingPipeline._is_tool_turn(messages)
-
     def tag_turn(
         self,
         conversation_history: list[Message],
@@ -771,15 +664,6 @@ class VirtualContextEngine:
     ) -> CompactionSignal | None:
         """Phase 1 of turn processing (delegates to TaggingPipeline)."""
         return self._tagging.tag_turn(conversation_history, payload_tokens)
-
-    def _run_compaction(
-        self,
-        conversation_history: list[Message],
-        compact_messages: list[Message],
-        progress_callback: Callable[..., None] | None = None,
-    ) -> CompactionReport:
-        """Shared compaction core (delegates to CompactionPipeline)."""
-        return self._compaction._run_compaction(conversation_history, compact_messages, progress_callback)
 
     def compact_if_needed(
         self,
@@ -806,24 +690,6 @@ class VirtualContextEngine:
             return None
         return self.compact_if_needed(conversation_history, signal)
 
-    def _check_and_split_broad_tags(
-        self, conversation_history: list[Message],
-    ) -> SplitResult | None:
-        """Check for overly-broad tags (delegates to TaggingPipeline)."""
-        return self._tagging._check_and_split_broad_tags(conversation_history)
-
-    def _collect_turn_text(
-        self, tag: str, history: list[Message],
-    ) -> list[tuple[int, str]]:
-        """Collect truncated user text (delegates to TaggingPipeline)."""
-        return self._tagging._collect_turn_text(tag, history)
-
-    def _build_broad_tag_summary(
-        self, tag: str, history: list[Message],
-    ) -> None:
-        """Build a tag summary for unsplittable broad tags (delegates to TaggingPipeline)."""
-        return self._tagging._build_broad_tag_summary(tag, history)
-
     def filter_history(
         self,
         conversation_history: list[Message],
@@ -839,34 +705,6 @@ class VirtualContextEngine:
             retrieval._engine_state = self._engine_state
             retrieval._turn_tag_index = self._turn_tag_index
         return retrieval.filter_history(conversation_history, current_tags, recent_turns)
-
-    def _get_active_tags(self, history: list[Message]) -> list[str]:
-        """Get tags from recent turns via live index (delegates to RetrievalAssembler)."""
-        return self._retrieval._get_active_tags(history)
-
-    def _build_context_hint(self, paging_mode: str | None = None) -> str:
-        """Build a topic list for post-compaction prompts (delegates to RetrievalAssembler)."""
-        return self._retrieval._build_context_hint(paging_mode)
-
-    def _build_autonomous_hint(self, tag_summaries: list) -> str:
-        """Build autonomous paging hint (delegates to RetrievalAssembler)."""
-        return self._retrieval._build_autonomous_hint(tag_summaries)
-
-    def _build_supervised_hint(self, tag_summaries: list) -> str:
-        """Build supervised paging hint (delegates to RetrievalAssembler)."""
-        return self._retrieval._build_supervised_hint(tag_summaries)
-
-    def _build_default_hint(self, tag_summaries: list) -> str:
-        """Build default hint (delegates to RetrievalAssembler)."""
-        return self._retrieval._build_default_hint(tag_summaries)
-
-    def _resolve_paging_mode(self, model_name: str = "") -> str:
-        """Check if model is trusted for autonomous paging (delegates to RetrievalAssembler)."""
-        return self._retrieval._resolve_paging_mode(model_name)
-
-    def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
-        """Extract the most recent user+assistant pair (delegates to TaggingPipeline)."""
-        return self._tagging._get_latest_turn_pair(history)
 
     def compact_manual(
         self,
@@ -910,46 +748,11 @@ class VirtualContextEngine:
 
     def recall_all(self) -> dict:
         """Load all tag summaries. Used by vc_recall_all tool."""
-        tag_summaries = self._store.get_all_tag_summaries(
-            conversation_id=self.config.conversation_id,
-        )
-        if not tag_summaries:
-            return {"found": False, "message": "No stored summaries yet."}
-        budget = self.config.assembler.tag_context_max_tokens
-        selected = []
-        total_tokens = 0
-        for ts in tag_summaries:
-            if total_tokens + ts.summary_tokens > budget:
-                break
-            selected.append({
-                "tag": ts.tag,
-                "summary": ts.summary,
-                "tokens": ts.summary_tokens,
-                "description": ts.description or "",
-            })
-            total_tokens += ts.summary_tokens
-        return {
-            "found": True,
-            "topics_loaded": len(selected),
-            "total_tokens": total_tokens,
-            "summaries": selected,
-        }
+        return self._retrieval.recall_all()
 
     def get_working_set_summary(self) -> dict:
         """Return current working set with budget info."""
         return self._paging.get_working_set_summary()
-
-    def _load_working_set_segments(self) -> tuple[dict | None, dict | None]:
-        """Load full segments for working-set tags (delegates to RetrievalAssembler)."""
-        return self._retrieval._load_working_set_segments()
-
-    def _calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
-        """Calculate token cost for a tag at a given depth level."""
-        return self._paging.calculate_depth_tokens(tag, depth)
-
-    def _auto_evict(self, needed: int, exclude_tag: str = "") -> tuple[list[str], int]:
-        """Auto-evict coldest topics to free `needed` tokens."""
-        return self._paging._auto_evict(needed, exclude_tag)
 
     def find_quote(
         self,
