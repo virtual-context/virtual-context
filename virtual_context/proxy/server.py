@@ -303,6 +303,11 @@ def create_app(
             _effective_log_dir = Path(_effective_log_dir)
             _effective_log_dir.mkdir(parents=True, exist_ok=True)
         else:
+            logger.warning(
+                "DIAG_LOG_DIR state=%r config=%r effective=%r type=%s",
+                _state_log_dir, _request_log_dir, _effective_log_dir,
+                type(_effective_log_dir).__name__,
+            )
             _effective_log_dir = None
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
@@ -318,8 +323,8 @@ def create_app(
             _session_log_path = _effective_log_dir / f"{_log_prefix}.session.json"
             try:
                 req_log.write_bytes(body_bytes)
-            except Exception:
-                pass  # never let logging break the request
+            except Exception as _log_err:
+                logger.error("DIAG_WRITE_FAIL 1-inbound: %s path=%s", _log_err, req_log)
 
         # --- DIAGNOSTIC: full passthrough (bypass all VC processing) ---
         # Remove this block after testing.
