@@ -4,19 +4,21 @@
 
 # virtual-context
 
-**Manage your Agent's Context - Seamlessly lowering costs, improving reasoning, and having unlimited memory **
-*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#Benchmark-Results)*
+**100x your Agent's Context - Seamlessly lowering costs, improving reasoning, and having unlimited memory **
 
+*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#Benchmark-Results)*
 
 virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules to maintain a living, compressed memory of unbounded conversations.
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways.  
 
-Knowledge-Memory systems with complex vector databases are only additive to context, and they compete for context that you are working on right now.
+Knowledge-Memory systems with complex vector databases are only *additive* to context, and they compete for context that you are working on right now.
 
 virtual-context takes a fundamentally different approach.  By creating a 'kernel' layer for the LLM to 'write' and 'read', virtual-context allows treating agentic / conversational text the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed.
 
-This allows us to use agents as if they have literally unlimited memory, reasoning well over all of it.  Update your client to believe they have a 20M context window and watch virtual-context work. 
+This allows us to use agents as if they have literally unlimited memory, reasoning well over all of it.  
+
+Update your client to believe they have a 20M context window and watch virtual-context work. 
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
