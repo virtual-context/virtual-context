@@ -120,7 +120,7 @@ def filter_body_messages(
             # unconditionally. Their content is in VC summaries and
             # retrievable via vc_expand_topic.
             keep_pair[pair_idx] = False
-            logger.info("T%d DROP (paging: below compacted watermark %d)", pair_idx, compacted_turn)
+            logger.debug("T%d DROP (paging: below compacted watermark %d)", pair_idx, compacted_turn)
         else:
             entry = turn_tag_index.get_tags_for_turn(pair_idx)
             if entry is None:
@@ -128,7 +128,7 @@ def filter_body_messages(
             elif "rule" in entry.tags or set(entry.tags) & tag_set:
                 keep_pair[pair_idx] = True
             else:
-                logger.info("T%d DROP (no tag match: turn_tags=%s query_tags=%s)", pair_idx, entry.tags, matched_tags)
+                logger.debug("T%d DROP (no tag match: turn_tags=%s query_tags=%s)", pair_idx, entry.tags, matched_tags)
 
     _kept = sum(keep_pair)
     _dropped = total_pairs - _kept
