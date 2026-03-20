@@ -154,6 +154,8 @@ class VirtualContextEngine:
         self._temporal = TemporalResolver(
             store=self._store, search_engine=self._search, config=self.config,
         )
+        from .core.tool_query import ToolQueryRunner
+        self._tool_query = ToolQueryRunner(engine=self, config=self.config)
         self._paging = PagingManager(
             store=self._store,
             token_counter=self._token_counter,
@@ -2195,135 +2197,21 @@ class VirtualContextEngine:
         ToolLoopResult
             Final text, tool call records, and usage metrics.
         """
-        import httpx
-
-        from .core.tool_loop import (
-            _parse_provider_http_response,
-            get_adapter,
-            run_tool_loop,
-            vc_tool_definitions,
-        )
-
-        adapter = get_adapter(provider, api_key, api_url)
-
-        # Decide whether to inject VC tools
-        inject_vc = force_tools or (
-            self.config.paging.enabled and self._compacted_through > 0
-        )
-        all_tools: list[dict] = []
-        if inject_vc:
-            all_tools.extend(vc_tool_definitions())
-        if tools:
-            all_tools.extend(tools)
-
-        # Convert tool definitions to provider format
-        converted_tools = adapter.convert_tool_defs(all_tools) if all_tools else None
-
-        # Wrap VC context in <system-reminder> so inject_context can
-        # find-and-replace on reassembly instead of stacking.
-        wrapped_system = f"<system-reminder>\n{system}\n</system-reminder>" if system else ""
-
-        # Build provider-specific request body
-        body = adapter.build_request_body(
+        return self._tool_query.query_with_tools(
+            messages,
             model=model,
-            messages=messages,
-            system=wrapped_system,
+            system=system,
             max_tokens=max_tokens,
+            api_key=api_key,
+            api_url=api_url,
             temperature=temperature,
-            tools=converted_tools,
+            tools=tools,
+            force_tools=force_tools,
+            require_tools=require_tools,
+            max_loops=max_loops,
+            provider=provider,
+            extended_thinking=extended_thinking,
         )
-
-        # Optional tool-policy override for thresholded behavior.
-        if converted_tools and require_tools is not None:
-            if provider == "anthropic":
-                if require_tools:
-                    body["tool_choice"] = {"type": "any"}
-                else:
-                    body.pop("tool_choice", None)
-            elif provider in {"openai", "openrouter", "openai-codex", "openai_codex"}:
-                if require_tools:
-                    body["tool_choice"] = "required"
-                else:
-                    body.pop("tool_choice", None)
-            elif provider == "gemini":
-                if require_tools:
-                    body["tool_config"] = {
-                        "function_calling_config": {"mode": "ANY"}
-                    }
-                else:
-                    body.pop("tool_config", None)
-
-        # Extended thinking: inject thinking params for Anthropic
-        if extended_thinking and provider == "anthropic":
-            body["thinking"] = {"type": "enabled", "budget_tokens": 10000}
-            body["temperature"] = 1
-            # max_tokens must exceed thinking budget
-            if body.get("max_tokens", 0) <= 10000:
-                body["max_tokens"] = 16000
-            # tool_choice "any" is incompatible with thinking
-            if body.get("tool_choice", {}).get("type") == "any":
-                body["tool_choice"] = {"type": "auto"}
-        # Extended thinking: inject reasoning effort for OpenAI Responses API
-        if extended_thinking and provider == "openai-responses":
-            body["reasoning"] = {"effort": "high", "summary": "auto"}
-
-        url = adapter.get_url(model)
-        headers = adapter.get_headers()
-        if extended_thinking and provider == "anthropic":
-            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-
-        with httpx.Client(timeout=300.0) as client:
-            resp = client.post(url, headers=headers, json=body)
-            # Retry on 503 (Gemini overloaded) up to 2 times
-            for _retry in range(2):
-                if resp.status_code != 503:
-                    break
-                import time as _time
-                _time.sleep(5)
-                resp = client.post(url, headers=headers, json=body)
-
-        if resp.status_code >= 300:
-            raise RuntimeError(
-                f"{provider} API error {resp.status_code}: {resp.text[:500]}"
-            )
-
-        data = _parse_provider_http_response(resp)
-
-        # Check for VC tool calls
-        tool_calls = adapter.extract_tool_calls(data)
-        has_vc_tools = any(
-            tc["name"].startswith("vc_") for tc in tool_calls
-        )
-
-        if has_vc_tools:
-            effective_loops = (
-                max_loops
-                if max_loops is not None
-                else self.config.paging.max_tool_loops
-            )
-            # Pass extra headers (e.g. anthropic-beta for extended thinking)
-            _extra_hdrs = {}
-            if extended_thinking and provider == "anthropic":
-                _extra_hdrs["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-            loop_result = run_tool_loop(
-                self, data, body, adapter,
-                url=url, max_loops=effective_loops,
-                extra_headers=_extra_hdrs or None,
-            )
-            # Prepend the initial request to raw_requests
-            loop_result.raw_requests.insert(0, body)
-            return loop_result
-
-        # No tool calls — return text directly
-        result = ToolLoopResult()
-        result.raw_requests.append(body)
-        result.raw_responses.append(data)
-        input_toks, output_toks = adapter.extract_usage(data)
-        result.input_tokens = input_toks
-        result.output_tokens = output_toks
-        result.stop_reason = adapter.get_stop_reason(data)
-        result.text = adapter.extract_text(data)
-        return result
 
     def get_telemetry(self) -> TelemetryLedger:
         """Return the telemetry ledger for this session."""
