@@ -156,6 +156,13 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
     created_at TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS request_captures (
+    turn INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    recorded_at DOUBLE PRECISION NOT NULL,
+    data_json TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
@@ -879,6 +886,38 @@ class PostgresStore(ContextStore):
             QuoteResult(text=row["excerpt"], tag=row["tool_name"], segment_ref=row["ref"], session_date="", match_type="tool_output")
             for row in rows
         ]
+
+    def save_request_capture(self, capture: dict) -> None:
+        conn = self._get_conn()
+        import time as _time
+        conn.execute(
+            """INSERT INTO request_captures (turn, ts, recorded_at, data_json)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (turn) DO UPDATE SET ts=EXCLUDED.ts, recorded_at=EXCLUDED.recorded_at, data_json=EXCLUDED.data_json""",
+            (capture["turn"], capture.get("ts", ""), _time.time(), json.dumps(capture)),
+        )
+        conn.execute(
+            """DELETE FROM request_captures WHERE turn NOT IN (
+                SELECT turn FROM request_captures ORDER BY recorded_at DESC LIMIT 50
+            )"""
+        )
+
+    def load_request_captures(self, limit: int = 50) -> list[dict]:
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            try:
+                result.append(json.loads(row["data_json"]))
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass
+        return result
 
     # ------------------------------------------------------------------
     # StateStore
