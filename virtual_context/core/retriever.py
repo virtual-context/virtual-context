@@ -170,6 +170,10 @@ class ContextRetriever:
         skipped_tags = [t for t in tag_result.tags if t in active_tags]
 
         if not query_tags:
+            logger.info(
+                "Retriever: no query tags after filtering (message_tags=%s, active_tags=%s, skipped=%s)",
+                tag_result.tags, list(active_tags), skipped_tags,
+            )
             # Summary floor: post-compaction, no query tags — inject all tag summaries
             if post_compaction:
                 token_budget = self.config.tag_context_max_tokens
@@ -241,6 +245,10 @@ class ContextRetriever:
             limit=overfetch_limit,
             conversation_id=self._conversation_id,
         )
+        logger.info(
+            "Retriever: get_summaries_by_tags returned %d results for tags=%s (min_overlap=%d, limit=%d)",
+            len(summaries), expanded_tags, strategy.min_overlap, overfetch_limit,
+        )
 
         # IDF re-rank: score each result by weighted tag overlap
         idf_weights = self._compute_idf_weights()
@@ -263,6 +271,12 @@ class ContextRetriever:
         # Sort by score descending, take top max_results
         scored.sort(key=lambda x: x[0], reverse=True)
         ranked = [s for _, s in scored[:strategy.max_results]]
+        if scored:
+            logger.info(
+                "Retriever: IDF ranked %d→%d results (top scores: %s)",
+                len(scored), len(ranked),
+                ", ".join(f"{tag}={score:.2f}" for score, s in scored[:5] for tag in [s.primary_tag]),
+            )
 
         # Apply token budget
         selected: list[StoredSummary] = []
@@ -270,10 +284,18 @@ class ContextRetriever:
         total_tokens = 0
         for summary in ranked:
             if total_tokens + summary.summary_tokens > token_budget:
+                logger.info(
+                    "Retriever: '%s' SKIP (budget exhausted: need %dt, have %dt remaining of %dt)",
+                    summary.primary_tag, summary.summary_tokens, token_budget - total_tokens, token_budget,
+                )
                 break
             selected.append(summary)
             selected_refs.add(summary.ref)
             total_tokens += summary.summary_tokens
+            logger.info(
+                "Retriever: '%s' INCLUDE (%dt, budget %d/%dt used)",
+                summary.primary_tag, summary.summary_tokens, total_tokens, token_budget,
+            )
 
         # Alias ride-along: if a query tag made it into the selected results,
         # find additional segments via its aliases that didn't make max_results.
