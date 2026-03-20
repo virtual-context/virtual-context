@@ -30,7 +30,8 @@ class ProxyMetrics:
     MAX_EVENTS = 50_000
     MAX_AGE_S = 86_400  # 24 hours
 
-    def __init__(self, context_window: int = 120_000, telemetry_ledger=None, db_path: str | None = None) -> None:
+    def __init__(self, context_window: int = 120_000, telemetry_ledger=None,
+                 db_path: str | None = None, store=None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
         self._events: list[dict] = []
@@ -60,6 +61,15 @@ class ProxyMetrics:
                 self._seq = row[0] + 1
             # Load existing events into memory for snapshot/events_since
             self._load_from_db()
+
+        self._store = store
+        if self._store:
+            try:
+                persisted = self._store.load_request_captures(limit=50)
+                if persisted:
+                    self.restore_request_captures(persisted)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -328,6 +338,7 @@ class ProxyMetrics:
                 "turns_stubbed": turns_stubbed,
                 "message_preview": message_preview,
             })
+            self._persist_capture(turn)
 
     def capture_enriched(self, turn: int, body: dict) -> None:
         """Capture the enriched request body sent to the LLM."""
@@ -335,6 +346,7 @@ class ProxyMetrics:
             for req in self._request_bodies:
                 if req["turn"] == turn:
                     req["enriched"] = body
+                    self._persist_capture(turn)
                     return
 
     def capture_response(
@@ -357,6 +369,7 @@ class ProxyMetrics:
                         req["cache_creation_input_tokens"] = cache_creation_input_tokens
                     if cache_read_input_tokens:
                         req["cache_read_input_tokens"] = cache_read_input_tokens
+                    self._persist_capture(turn)
                     return
 
     def update_request_tags(
@@ -367,6 +380,7 @@ class ProxyMetrics:
                 if req["turn"] == turn:
                     if response_tags is not None:
                         req["response_tags"] = response_tags
+                    self._persist_capture(turn)
                     return
 
     def get_captured_request(self, turn: int) -> dict | None:
@@ -408,5 +422,45 @@ class ProxyMetrics:
     def restore_request_captures(self, captures: list[dict]) -> None:
         """Restore persisted request captures into the ring buffer."""
         with self._lock:
+            existing_turns = {r["turn"] for r in self._request_bodies}
             for cap in captures:
-                self._request_bodies.append(cap)
+                if cap.get("turn") not in existing_turns:
+                    self._request_bodies.append(cap)
+                    existing_turns.add(cap["turn"])
+
+    def _persist_capture(self, turn: int) -> None:
+        """Persist the summary fields of a capture to the store (if configured)."""
+        if not self._store:
+            return
+        for req in self._request_bodies:
+            if req["turn"] == turn:
+                summary = {
+                    "turn": req["turn"],
+                    "ts": req["ts"],
+                    "api_format": req["api_format"],
+                    "model": req["model"],
+                    "stream": req.get("stream", False),
+                    "message_count": req["message_count"],
+                    "conversation_id": req.get("conversation_id", ""),
+                    "inbound_tags": req.get("inbound_tags", []),
+                    "response_tags": req.get("response_tags", []),
+                    "passthrough": req.get("passthrough", False),
+                    "inbound_tokens": req.get("inbound_tokens", 0),
+                    "outbound_tokens": req.get("outbound_tokens", 0),
+                    "inbound_bytes": req.get("inbound_bytes", 0),
+                    "outbound_bytes": req.get("outbound_bytes", 0),
+                    "context_tokens": req.get("context_tokens", 0),
+                    "overhead_ms": req.get("overhead_ms", 0),
+                    "turns_dropped": req.get("turns_dropped", 0),
+                    "turns_stubbed": req.get("turns_stubbed", 0),
+                    "message_preview": req.get("message_preview", ""),
+                    "upstream_input_tokens": req.get("upstream_input_tokens", 0),
+                    "upstream_output_tokens": req.get("upstream_output_tokens", 0),
+                    "cache_creation_input_tokens": req.get("cache_creation_input_tokens", 0),
+                    "cache_read_input_tokens": req.get("cache_read_input_tokens", 0),
+                }
+                try:
+                    self._store.save_request_capture(summary)
+                except Exception:
+                    pass
+                return
