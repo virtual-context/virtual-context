@@ -4,13 +4,17 @@
 
 # virtual-context
 
-**100x your agent's context. Lower costs. Better reasoning. Unlimited memory.**
+**100x your agent's context by virtualizing it. Better reasoning. Unlimited memory. Lower costs.**
 
 *95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#benchmark-results)*
 
-Your client sets `contextWindow: 20000000`. Your model's real window is 200K. virtual-context sits between them and makes it work — the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal. The result isn't just "it doesn't crash" — it's measurably better than raw full context.
+Your client sets `contextWindow: 20000000` (20 million). Your model's real window is 200K. virtual-context sits between them and makes it work, the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal. 
 
-This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive* — they retrieve chunks and compete for the context window your agent is working in right now. virtual-context *manages* the window itself: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The client thinks it has 20M tokens. The model sees 60K of curated signal. Nothing is lost — everything is addressable, at varying levels of compression.
+The result is measurably better reasoning, recall and cost than raw full context.
+
+This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive*, they retrieve chunks and compete for the context window your agent is working in right now.  These systems are not working to evict or curate the context to what you really need.  
+
+virtual-context *manages* the window itself: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The client thinks it has 20M tokens. The model sees 60K of curated signal. Nothing is lost.  Everything is addressable, at varying levels of compression.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -59,9 +63,9 @@ These approaches are complementary, but optimize different failure modes.
 
 virtual-context combines retrieval and compaction, then adds explicit tools for overview/time/fact recall under strict token budgets.
 
-## Cloud Offering
+## Cloud Offering / No Infrastructure
 
-[https://virtual-context.com](http://virtual-context.com)offers the fastest way to get going, just sign up and change your base-url.  You'll get statistics, visibility into the context window and cost savings reports. 
+[https://virtual-context.com](https://virtual-context.com) offers the fastest way to get going, just sign up and change your base-url.  You'll get statistics, visibility into the context window and cost savings reports. 
 
 ## Local Install
 
