@@ -4,48 +4,40 @@
 
 # virtual-context
 
-**Manage your Agent's Context - Seamlessly lowering costs, improving reasoning, and having unlimited memory **
-*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#Benchmark-Results)*
+**100x your agent's context. Lower costs. Better reasoning. Unlimited memory.**
 
+*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#benchmark-results)*
 
-virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules to maintain a living, compressed memory of unbounded conversations.
+Your client sets `contextWindow: 20000000`. Your model's real window is 200K. virtual-context sits between them and makes it work — the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal. The result isn't just "it doesn't crash" — it's measurably better than raw full context.
 
-LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways.  
-
-Knowledge-Memory systems with complex vector databases are only additive to context, and they compete for context that you are working on right now.
-
-virtual-context takes a fundamentally different approach.  By creating a 'kernel' layer for the LLM to 'write' and 'read', virtual-context allows treating agentic / conversational text the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed.
-
-This allows us to use agents as if they have literally unlimited memory, reasoning well over all of it.  Update your client to believe they have a 20M context window and watch virtual-context work. 
+This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive* — they retrieve chunks and compete for the context window your agent is working in right now. virtual-context *manages* the window itself: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The client thinks it has 20M tokens. The model sees 60K of curated signal. Nothing is lost — everything is addressable, at varying levels of compression.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
-Layer 1: Segment summaries + Facts per tag           (compressed pages, per-topic summaries / Facts) 
+Layer 1: Segment summaries + Facts per tag   (compressed pages, per-topic summaries)
 Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-eye view)
 ```
 
-The result: an Agent that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.  
-
+The result: an agent that recalls details from turn 12 at turn 1000 with the same fidelity as if the conversation just started.
 
 ### Configurable Context Ceiling
 
-Most teams set `context_window` to whatever the model supports... 128K, 200K, 1M, and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200k tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
+Most teams set `context_window` to whatever the model supports — 128K, 200K, 1M — and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200K tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
 
-virtual-context lets you set an artificial context ceiling well below the model's maximum:
+virtual-context lets you set an artificial ceiling well below the model's maximum:
 
 ```yaml
-context_window: 60000  ## run a 200K model at 60k
-  compaction:
-    soft_threshold: 0.70 
-    hard_threshold: 0.90 
-
+context_window: 60000  # run a 200K model at 60K
+compaction:
+  soft_threshold: 0.70
+  hard_threshold: 0.90
 ```
 
-The compression hierarchy (raw turns → segment summaries → tag summaries) keeps the window within this budget. When the ceiling is hit, compaction fires: stale turns are summarized, facts are extracted and indexed, and the working set reshapes around what's active. The result is a smaller, denser context where every token carries signal.
+The compression hierarchy keeps the window within this budget. When the ceiling is hit, compaction fires: stale turns are summarized, facts are extracted and indexed, and the working set reshapes around what's active.
 
 **Cost impact:** A 200K-capable model running at 60K uses ~70% fewer input tokens per request.
 
-**Quality impact:** Concentrated context means the model's attention isn't spread across 200K tokens of mostly-stale history. Relevant facts surface through targeted retrieval and structured tools rather than hoping the model notices them buried in a long window. The managed context window becomes a feature, not a limitation.
+**Quality impact:** The model's attention isn't spread across 200K tokens of mostly-stale history. Relevant facts surface through targeted retrieval and structured tools rather than hoping the model notices them buried in a long window.
 
 ## Virtual-Context vs RAG vs Compaction
 
