@@ -885,17 +885,17 @@ async def _replay_worker(
 
                 t_start = time.monotonic()
 
-                # 1. Wait for previous on_turn_complete
+                # Wait for previous on_turn_complete
                 t0 = time.monotonic()
                 await asyncio.to_thread(state.wait_for_complete)
                 wait_ms = round((time.monotonic() - t0) * 1000, 1)
 
-                # 2. Append user message to history
+                # Append user message to history
                 state.conversation_history.append(
                     Message(role="user", content=prompt)
                 )
 
-                # 3. Engine: tag + retrieve + assemble
+                # Engine: tag + retrieve + assemble
                 t1 = time.monotonic()
                 assembled = await asyncio.to_thread(
                     state.engine.on_message_inbound,
@@ -906,13 +906,13 @@ async def _replay_worker(
 
                 system_text = assembled.prepend_text
 
-                # 4. Filter history by tag relevance
+                # Filter history by tag relevance
                 filtered = state.engine.filter_history(
                     state.conversation_history,
                     current_tags=assembled.matched_tags,
                 )
 
-                # 5. Build messages for LLM
+                # Build messages for LLM
                 api_messages = []
                 for m in filtered:
                     api_messages.append({"role": m.role, "content": m.content})
@@ -922,7 +922,7 @@ async def _replay_worker(
                     api_messages[-1] = dict(api_messages[-1])
                     api_messages[-1]["content"] += "\n\n(Answer in 2 lines.)"
 
-                # 6. Call LLM (format depends on provider)
+                # Call LLM (format depends on provider)
                 try:
                     assistant_text = await _call_llm(
                         client, prov, system_text, api_messages,
@@ -931,12 +931,12 @@ async def _replay_worker(
                     logger.error("Replay LLM error at turn %d: %s", i, e)
                     assistant_text = f"[replay error: {e}]"
 
-                # 7. Append assistant response
+                # Append assistant response
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text)
                 )
 
-                # 8. Emit request event (same shape as catch_all)
+                # Emit request event (same shape as catch_all)
                 turn = len(state.conversation_history) // 2 - 1
                 context_tokens = len(system_text) // 4 if system_text else 0
                 total_turns = len(state.conversation_history) // 2
@@ -964,13 +964,13 @@ async def _replay_worker(
                     "input_tokens": input_tokens,
                 })
 
-                # 9. Fire on_turn_complete in background
+                # Fire on_turn_complete in background
                 state.fire_turn_complete(list(state.conversation_history))
 
                 completed = i + 1
                 _replay_state["turn"] = completed
 
-                # 10. Emit progress event
+                # Emit progress event
                 elapsed_ms = round((time.monotonic() - t_start) * 1000, 1)
                 metrics.record({
                     "type": "replay_progress",

@@ -111,7 +111,7 @@ def consolidate_tags(
     Returns:
         ConsolidationResult with groups found and counts of writes.
     """
-    # 1. Gather tags + descriptions
+    # Gather tags + descriptions
     all_tags = store.get_all_tags()
     tag_summaries = {ts.tag: ts for ts in store.get_all_tag_summaries()}
 
@@ -136,7 +136,7 @@ def consolidate_tags(
 
     logger.info("Consolidating %d tags...", len(tag_entries))
 
-    # 2. Phase 1 — batch tag entries and call LLM for each batch
+    # Batch tag entries and call LLM for each batch
     all_groups: list[ConsolidationGroup] = []
     for batch_start in range(0, len(tag_entries), batch_size):
         batch = tag_entries[batch_start:batch_start + batch_size]
@@ -157,7 +157,7 @@ def consolidate_tags(
         logger.info("No consolidation groups identified.")
         return ConsolidationResult()
 
-    # Phase 2 — cross-batch merge: if a tag is canonical in one group
+    # Cross-batch merge: if a tag is canonical in one group
     # and an alias in another, merge the groups transitively.
     all_groups = _merge_transitive_groups(all_groups)
 
@@ -170,7 +170,7 @@ def consolidate_tags(
     if dry_run:
         return result
 
-    # 3. Write aliases
+    # Write aliases
     existing_aliases = store.get_tag_aliases()
     for group in all_groups:
         for alias in group.aliases:
@@ -180,7 +180,7 @@ def consolidate_tags(
 
     logger.info("Wrote %d new aliases.", result.aliases_written)
 
-    # 4. Backfill segment_tags — add canonical tag to segments that have alias tags
+    # Backfill segment_tags — add canonical tag to segments that have alias tags
     result.segment_tags_added = _backfill_segment_tags(store, all_groups)
     logger.info("Backfilled %d segment_tags entries.", result.segment_tags_added)
 

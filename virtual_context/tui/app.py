@@ -237,7 +237,7 @@ class VChatApp(App):
         assembled = AssembledContext()
         system_text = ""
 
-        # 1. Engine: tag + retrieve + assemble
+        # Engine: tag + retrieve + assemble
         if self.engine:
             try:
                 assembled = self.engine.on_message_inbound(
@@ -253,7 +253,7 @@ class VChatApp(App):
                     f"Engine error: {e}",
                 )
 
-        # 2. Filter history by tag relevance, then build messages for Anthropic
+        # Filter history by tag relevance, then build messages for Anthropic
         if self.engine:
             filtered = self.engine.filter_history(
                 self._conversation_history,
@@ -280,7 +280,7 @@ class VChatApp(App):
             "filtered_history": len(filtered),
         }
 
-        # 3. Stream response
+        # Stream response
         self.call_from_thread(self._chat_view.begin_assistant_message)
         full_response = []
 
@@ -304,7 +304,7 @@ class VChatApp(App):
             Message(role="assistant", content=assistant_text)
         )
 
-        # 4. Engine: turn complete
+        # Engine: turn complete
         compaction = None
         # Start with inbound tags as fallback
         tags: list[str] = assembled.matched_tags or []
@@ -328,7 +328,7 @@ class VChatApp(App):
                     f"Turn-complete error: {e}",
                 )
 
-        # 5. Compute actual tokens sent (system + all messages)
+        # Compute actual tokens sent (system + all messages)
         payload_chars = len(system_text)
         for m in api_messages:
             payload_chars += len(m.get("content", ""))
@@ -340,7 +340,7 @@ class VChatApp(App):
         msg_count = len(api_messages)
         turns_in_payload = (msg_count + 1) // 2  # round up for unpaired user msg
 
-        # 6. Record turn
+        # Record turn
         self._turn_counter += 1
         turn = TurnRecord(
             turn_number=self._turn_counter,

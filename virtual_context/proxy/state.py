@@ -750,12 +750,12 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         cancelled = False
         try:
-            # Phase 1: tag all initial history
+            # Tag all initial history
             self._ingest_pairs_with_progress(
                 initial_pairs, baseline=baseline, cumulative_total=cumulative_total or None,
             )
 
-            # Phase 2: catch-up loop — tag any turns that arrived during ingestion
+            # Catch-up loop — tag any turns that arrived during ingestion
             for _ in range(10):  # bounded to avoid infinite loops
                 if self._ingestion_cancel.is_set():
                     break

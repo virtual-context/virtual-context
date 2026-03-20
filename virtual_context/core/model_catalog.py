@@ -58,14 +58,14 @@ class ModelCatalog:
                 self._alias_map[alias.lower()] = name
 
     def _resolve(self, model_name: str) -> ModelInfo | None:
-        # 1. Exact match
+        # Exact match
         if model_name in self._models:
             return self._models[model_name]
-        # 2. Alias match
+        # Alias match
         canonical = self._alias_map.get(model_name.lower())
         if canonical:
             return self._models[canonical]
-        # 3. Substring match (e.g. "haiku" in "claude-haiku-4-5-20251001")
+        # Substring match (e.g. "haiku" in "claude-haiku-4-5-20251001")
         name_lower = model_name.lower()
         for key, model in self._models.items():
             if name_lower in key.lower() or key.lower() in name_lower:

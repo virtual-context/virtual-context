@@ -86,22 +86,22 @@ def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
     if not text:
         return text, metadata
 
-    # 1. Strip [vc:prompt] marker and any trailing whitespace
+    # Strip [vc:prompt] marker and any trailing whitespace
     if text.startswith(_VC_PROMPT_MARKER):
         text = text[len(_VC_PROMPT_MARKER):].lstrip()
 
-    # 1b. Strip MemOS preamble
+    # Strip MemOS preamble
     if text.startswith("# Role"):
         idx = text.find(_MEMOS_QUERY_DELIM)
         if idx != -1:
             text = text[idx + len(_MEMOS_QUERY_DELIM):].lstrip()
 
-    # 2. Handle [vc:user]...[/vc:user] — inner content is already clean
+    # Handle [vc:user]...[/vc:user] — inner content is already clean
     m = _VC_USER_RE.match(text)
     if m:
         return m.group(1).strip(), metadata
 
-    # 3. Strip labeled metadata blocks from the front
+    # Strip labeled metadata blocks from the front
     while True:
         stripped = text.lstrip()
         m = _METADATA_BLOCK_RE.match(stripped)
@@ -119,13 +119,13 @@ def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
             text = stripped
             break
 
-    # 4. Strip System: [...] event lines
+    # Strip System: [...] event lines
     text = _SYSTEM_EVENT_RE.sub("", text)
 
-    # 5. Strip channel header  [ChannelName ... id:NNN ...]
+    # Strip channel header  [ChannelName ... id:NNN ...]
     text = _CHANNEL_HEADER_RE.sub("", text)
 
-    # 6. Strip [message_id: NNN] footer
+    # Strip [message_id: NNN] footer
     text = _MESSAGE_ID_RE.sub("", text)
 
     return text.strip(), metadata

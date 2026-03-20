@@ -222,7 +222,7 @@ class FactQueryEngine:
         matches = [verb]
         seen = {verb.lower()}
 
-        # 1. Manual cluster expansion
+        # Manual cluster expansion
         cluster = self._VERB_CLUSTER_MAP.get(verb.lower())
         if cluster:
             for synonym in cluster:
@@ -230,7 +230,7 @@ class FactQueryEngine:
                     matches.append(all_verbs_lower[synonym])
                     seen.add(synonym)
 
-        # 2. Embedding-based expansion
+        # Embedding-based expansion
         embed_fn = self._get_embed_fn()
         if embed_fn is not None:
             from .math_utils import rank_by_embedding

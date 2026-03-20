@@ -458,7 +458,7 @@ def stub_compacted_messages(
     if not messages:
         return body, 0
 
-    # Phase 1: identify user-text message indices (messages with extractable text
+    # Identify user-text message indices (messages with extractable text
     # that are NOT tool_result-only).
     user_text_indices: list[int] = []
     for i, msg in enumerate(messages):
@@ -485,7 +485,7 @@ def stub_compacted_messages(
     if not user_text_indices:
         return body, 0
 
-    # Phase 2: group messages into turns.
+    # Group messages into turns.
     # Each turn spans from one user-text message to the next.
     turn_groups: list[tuple[int, int]] = []  # (start_idx, end_idx_exclusive)
     for g, uti in enumerate(user_text_indices):
@@ -495,7 +495,7 @@ def stub_compacted_messages(
             end = len(messages)
         turn_groups.append((uti, end))
 
-    # Phase 3: hash each turn group and match against the index.
+    # Hash each turn group and match against the index.
     stubs: list[tuple[int, int, object]] = []  # (start, end, TurnTagEntry)
     for start, end in turn_groups:
         msg = messages[start]
@@ -520,7 +520,7 @@ def stub_compacted_messages(
     if not stubs:
         return body, 0
 
-    # Phase 4: build new message list, replacing stub ranges with lightweight markers.
+    # Build new message list, replacing stub ranges with lightweight markers.
     stub_starts: dict[int, tuple[int, int, object]] = {
         s[0]: s for s in sorted(stubs, key=lambda s: s[0])
     }
