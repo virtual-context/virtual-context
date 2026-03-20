@@ -401,13 +401,17 @@ class SQLiteStore(ContextStore):
             pass
         # FTS index on facts (searches subject, verb, object, what)
         try:
+            # Check if FTS table already exists before creating — rebuild is
+            # only needed on first creation when facts table already has rows.
+            fts_existed = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts_fts'"
+            ).fetchone() is not None
             conn.executescript(FACTS_FTS_SQL)
             conn.executescript(FACTS_FTS_TRIGGER_SQL)
-            # Content-sync FTS tables need 'rebuild' to populate from
-            # existing rows (direct INSERT doesn't work for content= tables).
-            fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-            if fact_count > 0:
-                conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            if not fts_existed:
+                fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+                if fact_count > 0:
+                    conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
         except sqlite3.OperationalError:
             pass
         # Tool output storage for intercepted large tool_result blocks
@@ -917,19 +921,27 @@ class SQLiteStore(ContextStore):
         except Exception:
             pass
 
+        # Batch-fetch distinct tags per conversation (avoids N+1)
+        conv_ids = [row["conversation_id"] for row in rows]
+        tags_by_conv: dict[str, list[str]] = {cid: [] for cid in conv_ids}
+        if conv_ids:
+            placeholders = ",".join("?" for _ in conv_ids)
+            tag_rows = conn.execute(f"""
+                SELECT s.conversation_id, st.tag
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.conversation_id IN ({placeholders})
+                GROUP BY s.conversation_id, st.tag
+                ORDER BY st.tag
+            """, conv_ids).fetchall()
+            for tr in tag_rows:
+                tags_by_conv[tr["conversation_id"]].append(tr["tag"])
+
         results = []
         for row in rows:
             total_full = row["total_full_tokens"]
             total_summary = row["total_summary_tokens"]
             ratio = round(total_summary / total_full, 3) if total_full > 0 else 0.0
-
-            tag_rows = conn.execute("""
-                SELECT DISTINCT st.tag
-                FROM segment_tags st
-                JOIN segments s ON s.ref = st.segment_ref
-                WHERE s.conversation_id = ?
-                ORDER BY st.tag
-            """, (row["conversation_id"],)).fetchall()
 
             results.append(ConversationStats(
                 conversation_id=row["conversation_id"],
@@ -937,7 +949,7 @@ class SQLiteStore(ContextStore):
                 total_full_tokens=total_full,
                 total_summary_tokens=total_summary,
                 compression_ratio=ratio,
-                distinct_tags=[r["tag"] for r in tag_rows],
+                distinct_tags=tags_by_conv.get(row["conversation_id"], []),
                 oldest_segment=_str_to_dt(row["oldest"]) if row["oldest"] else None,
                 newest_segment=_str_to_dt(row["newest"]) if row["newest"] else None,
                 compaction_model=row["compaction_model"] or "",

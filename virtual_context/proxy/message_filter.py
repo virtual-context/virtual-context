@@ -6,10 +6,13 @@ Pure functions — no ProxyState dependency. Extracted from proxy/server.py.
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from ..core.turn_tag_index import TurnTagIndex
 from ._envelope import _strip_envelope
 from .formats import PayloadFormat, detect_format
+
+logger = logging.getLogger(__name__)
 
 
 def filter_body_messages(
@@ -348,12 +351,10 @@ def filter_body_messages(
                 _final_tr.add(block["tool_use_id"])
     _orphaned = _final_tr - _final_tu
     if _orphaned:
-        import sys
-        print(
-            f"[MSG-FILTER] PROXY-004c safety: {len(_orphaned)} orphaned "
-            f"tool_result(s) after filtering — returning unfiltered body "
-            f"to avoid 400 (ids: {list(_orphaned)[:3]})",
-            file=sys.stderr,
+        logger.info(
+            "MSG-FILTER PROXY-004c safety: %d orphaned tool_result(s) after filtering "
+            "-- returning unfiltered body to avoid 400 (ids: %s)",
+            len(_orphaned), list(_orphaned)[:3],
         )
         return body, 0
 

@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -159,13 +158,13 @@ def create_app(
                     ):
                         engine.config.conversation_id = latest.conversation_id
                         engine._load_persisted_state()
-                        print(
-                            f"Lossless restart: restored conversation {latest.conversation_id[:12]} "
-                            f"({len(latest.turn_tag_entries)} turns, compacted={latest.compacted_through})",
-                            flush=True,
+                        logger.info(
+                            "Lossless restart: restored conversation %s (%d turns, compacted=%d)",
+                            latest.conversation_id[:12], len(latest.turn_tag_entries),
+                            latest.compacted_through,
                         )
                 except Exception as _e:
-                    print(f"Lossless restart failed: {_e}", flush=True)
+                    logger.info("Lossless restart failed: %s", _e)
 
         if shared_metrics is not None:
             metrics = shared_metrics
@@ -199,7 +198,7 @@ def create_app(
             f", label={instance_label}" if instance_label else "",
         )
     except Exception as e:
-        print(f"Engine init failed: {e}", file=sys.stderr)
+        logger.info("Engine init failed: %s", e)
         metrics = shared_metrics or ProxyMetrics()
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
@@ -232,9 +231,9 @@ def create_app(
                     for stale in existing[: len(existing) - keep_files]:
                         stale.unlink(missing_ok=True)
                     pruned = len(existing) - keep_files
-                    print(f"Request log: pruned {pruned} old files, kept {keep_files} in {_request_log_dir}", flush=True)
+                    logger.info("Request log: pruned %d old files, kept %d in %s", pruned, keep_files, _request_log_dir)
                 else:
-                    print(f"Request log: {len(existing)} existing files in {_request_log_dir}", flush=True)
+                    logger.info("Request log: %d existing files in %s", len(existing), _request_log_dir)
         except Exception:
             pass  # engine may be a mock in tests
 
@@ -297,15 +296,16 @@ def create_app(
 
         # --- Raw request log: dump entire payload before any processing ---
         # Check app.state for runtime-configurable log dir (cloud layer sets this)
+        # app.state takes priority over config default (cloud overrides engine config)
         _state_log_dir = getattr(app.state, "request_log_dir", None)
-        _effective_log_dir = _request_log_dir or _state_log_dir
+        _effective_log_dir = _state_log_dir or _request_log_dir
         if _effective_log_dir and isinstance(_effective_log_dir, (str, Path)):
             _effective_log_dir = Path(_effective_log_dir)
             _effective_log_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[REQUEST_LOG] effective={_effective_log_dir} from={'config' if _request_log_dir else 'app.state'}", flush=True)
+            logger.info("REQUEST_LOG effective=%s from=%s", _effective_log_dir, "config" if _request_log_dir else "app.state")
         else:
             _effective_log_dir = None
-            print(f"[REQUEST_LOG] DISABLED _request_log_dir={_request_log_dir} app.state={_state_log_dir} type={type(_state_log_dir)}", flush=True)
+            logger.info("REQUEST_LOG DISABLED _request_log_dir=%s app.state=%s type=%s", _request_log_dir, _state_log_dir, type(_state_log_dir))
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
@@ -332,7 +332,7 @@ def create_app(
                 _pt_msgs = len(_pt_body.get("messages", []))
                 _pt_cm = "YES" if _pt_body.get("context_management") else "NO"
                 _pt_kb = round(len(body_bytes) / 1024, 1)
-                print(f"[PASSTHROUGH] stream={_pt_stream} msgs={_pt_msgs} cm={_pt_cm} payload={_pt_kb}KB")
+                logger.info("PASSTHROUGH stream=%s msgs=%d cm=%s payload=%sKB", _pt_stream, _pt_msgs, _pt_cm, _pt_kb)
             except Exception:
                 pass
             return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
@@ -400,7 +400,7 @@ def create_app(
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         _msg_count = len(fmt.get_messages(body))
         _sid = state.engine.config.conversation_id[:12] if state else "none"
-        print(f"[{_now}] POST /{path} msgs={_msg_count} stream={is_streaming} conversation={_sid} payload={_payload_kb}KB")
+        logger.info("%s POST /%s msgs=%d stream=%s conversation=%s payload=%sKB", _now, path, _msg_count, is_streaming, _sid, _payload_kb)
 
         if not user_message:
             # Tool-result or non-text turn — skip VC enrichment but
@@ -520,13 +520,14 @@ def create_app(
                     body = _pt_interceptor.process(body, fmt)
                     _post_stats = _pt_interceptor.stats.total_intercepted
                     if _post_stats > _pre_stats:
-                        print(f"[TOOL-INTERCEPT] Passthrough: truncated {_post_stats - _pre_stats} tool_result(s), "
-                              f"saved {_pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned}B")
+                        logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
+                                    _post_stats - _pre_stats,
+                                    _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
 
-                print(
-                    f"[T{turn}] PASSTHROUGH {api_format} "
-                    f"stream={is_streaming} state={current_state.value} "
-                    f"| {user_message[:60]}"
+                logger.info(
+                    "T%d PASSTHROUGH %s stream=%s state=%s | %s",
+                    turn, api_format, is_streaming, current_state.value,
+                    user_message[:60],
                 )
 
                 if is_streaming:
@@ -608,10 +609,9 @@ def create_app(
                     _cw, _sys_tok, _tools_tok,
                 )
                 if _budget_promoted:
-                    print(
-                        f"[BUDGET] Client overhead ({_sys_tok + _tools_tok}t) exceeds "
-                        f"context_window ({_cw}t). "
-                        f"Auto-promoted to {_effective_budget}t."
+                    logger.info(
+                        "BUDGET Client overhead (%dt) exceeds context_window (%dt). Auto-promoted to %dt.",
+                        _sys_tok + _tools_tok, _cw, _effective_budget,
                     )
                     metrics.record({
                         "type": "budget_auto_promoted",
@@ -639,7 +639,7 @@ def create_app(
                     fmt=fmt,
                 )
                 if turns_stubbed:
-                    print(f"[STUB] Stubbed {turns_stubbed} compacted turns")
+                    logger.info("STUB Stubbed %d compacted turns", turns_stubbed)
         except (TypeError, ValueError, AttributeError):
             pass
 
@@ -679,9 +679,9 @@ def create_app(
             )
             if turns_dropped:
                 _phase = f"mode={_pcf_mode}, pre-compaction" if _pre_compaction else "post-compaction"
-                print(f"[FILTER] Dropped {turns_dropped} turns ({_phase})")
+                logger.info("FILTER Dropped %d turns (%s)", turns_dropped, _phase)
             elif _pre_compaction and _pcf_mode == "off":
-                print("[FILTER] Skipped filtering (mode=off, pre-compaction)")
+                logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
 
         # Tool output interception: truncate large tool_result blocks.
         if state and state.engine.config.tool_output.enabled:
@@ -697,8 +697,9 @@ def create_app(
             body = interceptor.process(body, fmt)
             _post = interceptor.stats.total_intercepted
             if _post > _pre:
-                print(f"[TOOL-INTERCEPT] Active: truncated {_post - _pre} tool_result(s), "
-                      f"saved {interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned}B")
+                logger.info("TOOL-INTERCEPT Active: truncated %d tool_result(s), saved %dB",
+                            _post - _pre,
+                            interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned)
 
         enriched_body = _inject_context(body, prepend_text, api_format)
 
@@ -726,15 +727,14 @@ def create_app(
                 )
                 paging_enabled = True
                 _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
-                print(
-                    f"[PAGING] Tools injected: {_vc_names} "
-                    f"(total tools: {len(enriched_body.get('tools', []))}, "
-                    f"policy={'required' if require_tools else 'optional'}, "
-                    f"turns={tool_turn_count}, "
-                    f"compacted_through={compacted_count})"
+                logger.info(
+                    "PAGING Tools injected: %s (total tools: %d, policy=%s, turns=%d, compacted_through=%d)",
+                    _vc_names, len(enriched_body.get("tools", [])),
+                    "required" if require_tools else "optional",
+                    tool_turn_count, compacted_count,
                 )
             else:
-                print(f"[PAGING] Mode={_paging_mode} for model={enriched_body.get('model', '?')} — tools NOT injected")
+                logger.info("PAGING Mode=%s for model=%s -- tools NOT injected", _paging_mode, enriched_body.get("model", "?"))
 
         # Inject vc_find_quote for tool output retrieval (when paging didn't already inject it)
         tool_output_find_quote = False
@@ -750,7 +750,7 @@ def create_app(
             if _fq_def:
                 enriched_body = fmt.inject_tools(enriched_body, _fq_def)
                 tool_output_find_quote = True
-                print("[TOOL-OUTPUT] Injected vc_find_quote tool for truncated output retrieval")
+                logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
 
         # Track enriched payload size
         if state:
@@ -788,10 +788,9 @@ def create_app(
         # PROXY-025: Over-budget alert
         if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
             _excess = outbound_tokens - _effective_budget
-            print(
-                f"[BUDGET] Payload {outbound_tokens}t exceeds budget "
-                f"{_effective_budget}t by {_excess}t. "
-                f"Uncompacted turns pending compaction."
+            logger.info(
+                "BUDGET Payload %dt exceeds budget %dt by %dt. Uncompacted turns pending compaction.",
+                outbound_tokens, _effective_budget, _excess,
             )
             metrics.record({
                 "type": "budget_exceeded",
@@ -840,14 +839,13 @@ def create_app(
         # Log request to terminal for debugging
         _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
         _flag_str = ""
-        print(
-            f"[T{turn}] POST {api_format} stream={is_streaming} "
-            f"tags=[{_tags_str}]{_flag_str} "
-            f"msgs={len(body.get('messages', []))} "
-            f"dropped={turns_dropped} "
-            f"stubbed={turns_stubbed} "
-            f"ctx={context_tokens}t in={inbound_tokens}t out={outbound_tokens}t "
-            f"vc={overhead_ms}ms | {user_message[:60]}"
+        logger.info(
+            "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d "
+            "ctx=%dt in=%dt out=%dt vc=%sms | %s",
+            turn, api_format, is_streaming, _tags_str, _flag_str,
+            len(body.get("messages", [])), turns_dropped, turns_stubbed,
+            context_tokens, inbound_tokens, outbound_tokens,
+            overhead_ms, user_message[:60],
         )
 
         # Capture pre-filter request body for dashboard inspection

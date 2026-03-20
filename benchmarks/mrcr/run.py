@@ -150,10 +150,7 @@ def _compute_summary(results: list[dict], args: argparse.Namespace) -> dict:
 
             if n_key not in per_needle_combined:
                 per_needle_combined[n_key] = {"count": 0}
-            per_needle_combined[n_key]["count"] = max(
-                per_needle_combined[n_key]["count"],
-                per_needle_combined[n_key].get("count", 0),
-            )
+            per_needle_combined[n_key]["count"] += 1
             per_needle_combined[n_key].setdefault(f"{method}_scores", []).append(score)
 
             if bin_key not in per_bin_combined:
