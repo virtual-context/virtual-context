@@ -75,26 +75,7 @@ class Neo4jFactStore:
     def _record_to_fact(self, record) -> Fact:
         """Convert a Neo4j record/node to a Fact dataclass."""
         props = dict(record) if not hasattr(record, "data") else record.data()
-        return Fact(
-            id=props["id"],
-            subject=props.get("subject", ""),
-            verb=props.get("verb", ""),
-            object=props.get("object", ""),
-            status=props.get("status", "active"),
-            what=props.get("what", ""),
-            who=props.get("who", ""),
-            when_date=props.get("when_date", ""),
-            where=props.get("where_val", ""),
-            why=props.get("why", ""),
-            fact_type=props.get("fact_type", "personal"),
-            tags=json.loads(props.get("tags_json", "[]")),
-            segment_ref=props.get("segment_ref", ""),
-            conversation_id=props.get("conversation_id", ""),
-            turn_numbers=json.loads(props.get("turn_numbers_json", "[]")),
-            mentioned_at=_str_to_dt(props["mentioned_at"]) if props.get("mentioned_at") else datetime.now(timezone.utc),
-            session_date=props.get("session_date", ""),
-            superseded_by=props.get("superseded_by"),
-        )
+        return Fact.from_dict(props, dt_parser=_str_to_dt)
 
     # ------------------------------------------------------------------
     # FactStore

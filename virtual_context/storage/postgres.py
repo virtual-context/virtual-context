@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS tag_aliases (
 );
 
 CREATE TABLE IF NOT EXISTS tag_summaries (
-    tag TEXT PRIMARY KEY,
+    tag TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     summary_tokens INTEGER NOT NULL DEFAULT 0,
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tag, conversation_id)
 );
 
 CREATE TABLE IF NOT EXISTS engine_state (
@@ -376,26 +378,7 @@ class PostgresStore(ContextStore):
         return result
 
     def _row_to_fact(self, row: dict) -> Fact:
-        return Fact(
-            id=row["id"],
-            subject=row.get("subject", ""),
-            verb=row.get("verb", ""),
-            object=row.get("object", ""),
-            status=row.get("status", "active"),
-            what=row.get("what", ""),
-            who=row.get("who", ""),
-            when_date=row.get("when_date", ""),
-            where=row.get("where", ""),
-            why=row.get("why", ""),
-            fact_type=row.get("fact_type", "personal"),
-            tags=json.loads(row.get("tags_json", "[]")),
-            segment_ref=row.get("segment_ref", ""),
-            conversation_id=row.get("conversation_id", ""),
-            turn_numbers=json.loads(row.get("turn_numbers_json", "[]")),
-            mentioned_at=_str_to_dt(row["mentioned_at"]) if row.get("mentioned_at") else datetime.now(timezone.utc),
-            session_date=row.get("session_date", ""),
-            superseded_by=row.get("superseded_by"),
-        )
+        return Fact.from_dict(row, dt_parser=_str_to_dt)
 
     def _row_to_fact_link(self, row: dict) -> FactLink:
         return FactLink(
@@ -585,8 +568,8 @@ class PostgresStore(ContextStore):
                 usage_count=row["usage_count"],
                 total_full_tokens=row["total_full"],
                 total_summary_tokens=row["total_summary"],
-                oldest=_str_to_dt(row["oldest"]),
-                newest=_str_to_dt(row["newest"]),
+                oldest_segment=_str_to_dt(row["oldest"]),
+                newest_segment=_str_to_dt(row["newest"]),
             )
             for row in rows
         ]
@@ -615,9 +598,9 @@ class PostgresStore(ContextStore):
                 segment_count=row["seg_count"],
                 total_full_tokens=row["total_full"],
                 total_summary_tokens=row["total_summary"],
-                oldest=_str_to_dt(row["oldest"]),
-                newest=_str_to_dt(row["newest"]),
-                tags=[r["tag"] for r in tag_rows],
+                oldest_segment=_str_to_dt(row["oldest"]),
+                newest_segment=_str_to_dt(row["newest"]),
+                distinct_tags=[r["tag"] for r in tag_rows],
                 compaction_model=row["compaction_model"],
             ))
         return results
@@ -655,17 +638,17 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO tag_summaries
-            (tag, summary, description, summary_tokens, source_segment_refs, source_turn_numbers,
+            (tag, conversation_id, summary, description, summary_tokens, source_segment_refs, source_turn_numbers,
              covers_through_turn, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (tag) DO UPDATE SET
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (tag, conversation_id) DO UPDATE SET
                 summary=EXCLUDED.summary, description=EXCLUDED.description,
                 summary_tokens=EXCLUDED.summary_tokens,
                 source_segment_refs=EXCLUDED.source_segment_refs,
                 source_turn_numbers=EXCLUDED.source_turn_numbers,
                 covers_through_turn=EXCLUDED.covers_through_turn,
                 updated_at=EXCLUDED.updated_at""",
-            (tag_summary.tag, tag_summary.summary, getattr(tag_summary, "description", ""),
+            (tag_summary.tag, conversation_id, tag_summary.summary, getattr(tag_summary, "description", ""),
              tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
              json.dumps(tag_summary.source_turn_numbers), tag_summary.covers_through_turn,
              _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
@@ -673,7 +656,7 @@ class PostgresStore(ContextStore):
 
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM tag_summaries WHERE tag = %s", (tag,)).fetchone()
+        row = conn.execute("SELECT * FROM tag_summaries WHERE tag = %s AND conversation_id = %s", (tag, conversation_id)).fetchone()
         if not row:
             return None
         return TagSummary(
@@ -888,10 +871,15 @@ class PostgresStore(ContextStore):
                 for e in state.turn_tag_entries
             ],
             "split_processed_tags": list(state.split_processed_tags) if state.split_processed_tags else [],
-            "working_set": {
-                tag: {"depth": ws.depth.value, "loaded_refs": list(ws.loaded_refs)}
-                for tag, ws in (state.working_set or {}).items()
-            } if state.working_set else {},
+            "working_set": [
+                {
+                    "tag": ws.tag,
+                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                    "tokens": ws.tokens,
+                    "last_accessed_turn": ws.last_accessed_turn,
+                }
+                for ws in (state.working_set or [])
+            ],
             "trailing_fingerprint": state.trailing_fingerprint or "",
             "request_captures": state.request_captures,
             "provider": state.provider,
@@ -916,13 +904,30 @@ class PostgresStore(ContextStore):
             request_captures = []
             provider = ""
         elif isinstance(raw, dict):
-            entries_list = raw.get("entries", [])
+            entries_list = raw.get("entries", raw.get("turn_tag_entries", []))
             split_tags = set(raw.get("split_processed_tags", []))
-            ws_raw = raw.get("working_set", {})
-            working_set = {
-                tag: WorkingSetEntry(depth=DepthLevel(ws["depth"]), loaded_refs=set(ws.get("loaded_refs", [])))
-                for tag, ws in ws_raw.items()
-            }
+            ws_raw = raw.get("working_set", [])
+            if isinstance(ws_raw, dict):
+                # Legacy format: convert dict to list
+                working_set = [
+                    WorkingSetEntry(
+                        tag=tag,
+                        depth=DepthLevel(ws["depth"]),
+                        tokens=ws.get("tokens", 0),
+                        last_accessed_turn=ws.get("last_accessed_turn", 0),
+                    )
+                    for tag, ws in ws_raw.items()
+                ]
+            else:
+                working_set = [
+                    WorkingSetEntry(
+                        tag=ws["tag"],
+                        depth=DepthLevel(ws["depth"]),
+                        tokens=ws.get("tokens", 0),
+                        last_accessed_turn=ws.get("last_accessed_turn", 0),
+                    )
+                    for ws in ws_raw
+                ]
             fingerprint = raw.get("trailing_fingerprint", "")
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
@@ -1205,6 +1210,27 @@ class PostgresStore(ContextStore):
             (fact_ids,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def query_experience_facts_by_date(
+        self,
+        start_date: str,
+        end_date: str,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[Fact]:
+        conn = self._get_conn()
+        sql = """SELECT * FROM facts
+                 WHERE fact_type = 'experience'
+                   AND status = 'completed'
+                   AND session_date >= %s AND session_date <= %s"""
+        params: list = [start_date, end_date + "~"]
+        if conversation_id:
+            sql += " AND conversation_id = %s"
+            params.append(conversation_id)
+        sql += " ORDER BY session_date ASC LIMIT %s"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_fact(row) for row in rows]
 
     # ------------------------------------------------------------------
     # FactLinkStore

@@ -10,7 +10,7 @@ virtual-context orchestrates a layered pipeline of LLM inference, embedding simi
 
 LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
 
-virtual-context takes a fundamentally different approach. It treats LLM context the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed.
+virtual-context takes a fundamentally different approach.  By creating a 'kernel' layer for the LLM to 'write' and 'read', virtual-context allows treating agentic / conversational text the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed.
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -21,7 +21,6 @@ Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-e
 The result: an Agent that recalls details from turn 12 at turn 200 with the same fidelity as if the conversation just started.  
 
 
-
 ### Configurable Context Ceiling
 
 Most teams set `context_window` to whatever the model supports... 128K, 200K, 1M, and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200k tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
@@ -29,9 +28,9 @@ Most teams set `context_window` to whatever the model supports... 128K, 200K, 1M
 virtual-context lets you set an artificial context ceiling well below the model's maximum:
 
 ```yaml
-context_window: 200000
+context_window: 60000  ## run a 200K model at 60k
   compaction:
-    soft_threshold: 0.30 ## run a 200K model at 60k
+    soft_threshold: 0.70 
     hard_threshold: 0.90 
 
 ```
@@ -158,6 +157,48 @@ if report:
 ```
 
 Everything happens synchronously, in-process.
+
+### OpenClaw Settings
+
+Set these to allow OpenClaw to maintain large context windows from a client perspective: 
+
+```
+  // 1. History limits (the real bottleneck most users will hit)
+  // channels.<provider> (e.g. channels.telegram)
+  "historyLimit": 99999,
+  "dmHistoryLimit": 99999
+
+  // global fallback
+  "messages": { "groupChat": { "historyLimit": 99999 } }
+
+  // 2. Model context window — must be on the provider in the per-agent models.json, with
+  // explicit model entries:
+  "anthropic": {
+    "baseUrl": "https://anthropic.virtual-context.com?vckey=...",
+    "api": "anthropic-messages",
+    "models": [
+      {
+        "id": "claude-opus-4-6",
+        "contextWindow": 2000000,  // Note this is 2M
+        ...
+      }
+    ]
+  }
+```
+
+  Just setting baseUrl alone isn't enough — without model entries, it falls back to pi-ai's
+  hardcoded 200K. And models.overrides in the global config is display only — it doesn't affect
+  actual windowing.
+
+```
+  3. Context pruning — disable it so the proxy controls windowing:
+  "agents": {
+    "defaults": {
+      "contextPruning": { "mode": "off" },
+      "contextTokens": 2000000 // Note this is 2M
+    }
+  }
+```
 
 ### MCP Server (Model Context Protocol)
 

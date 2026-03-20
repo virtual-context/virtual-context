@@ -297,12 +297,15 @@ def create_app(
 
         # --- Raw request log: dump entire payload before any processing ---
         # Check app.state for runtime-configurable log dir (cloud layer sets this)
-        _effective_log_dir = _request_log_dir or getattr(app.state, "request_log_dir", None)
+        _state_log_dir = getattr(app.state, "request_log_dir", None)
+        _effective_log_dir = _request_log_dir or _state_log_dir
         if _effective_log_dir and isinstance(_effective_log_dir, (str, Path)):
             _effective_log_dir = Path(_effective_log_dir)
             _effective_log_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[REQUEST_LOG] effective={_effective_log_dir} from={'config' if _request_log_dir else 'app.state'}", flush=True)
         else:
             _effective_log_dir = None
+            print(f"[REQUEST_LOG] DISABLED _request_log_dir={_request_log_dir} app.state={_state_log_dir} type={type(_state_log_dir)}", flush=True)
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
