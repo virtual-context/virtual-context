@@ -473,6 +473,15 @@ class SQLiteStore(ContextStore):
                 DROP TABLE tag_summaries;
                 ALTER TABLE tag_summaries_new RENAME TO tag_summaries;
             """)
+        # Request capture persistence for proxy dashboard
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS request_captures (
+                turn INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                data_json TEXT NOT NULL
+            );
+        """)
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -1911,6 +1920,43 @@ class SQLiteStore(ContextStore):
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Request capture persistence
+    # ------------------------------------------------------------------
+
+    def save_request_capture(self, capture: dict) -> None:
+        conn = self._get_conn()
+        import time as _time
+        conn.execute(
+            """INSERT OR REPLACE INTO request_captures (turn, ts, recorded_at, data_json)
+            VALUES (?, ?, ?, ?)""",
+            (capture["turn"], capture.get("ts", ""), _time.time(), json.dumps(capture)),
+        )
+        # Prune: keep only the newest 50
+        conn.execute(
+            """DELETE FROM request_captures WHERE turn NOT IN (
+                SELECT turn FROM request_captures ORDER BY recorded_at DESC LIMIT 50
+            )"""
+        )
+        conn.commit()
+
+    def load_request_captures(self, limit: int = 50) -> list[dict]:
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except Exception:
+            return []
+        result = []
+        for (data_json,) in rows:
+            try:
+                result.append(json.loads(data_json))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
 
     def close(self) -> None:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
