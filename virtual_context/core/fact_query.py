@@ -53,7 +53,6 @@ class FactQueryEngine:
         self._config = config
 
     def _get_embed_fn(self):
-        """Convenience wrapper around SemanticSearchManager.get_embed_fn()."""
         return self._semantic.get_embed_fn()
 
     def query(self, **kwargs) -> list | dict:

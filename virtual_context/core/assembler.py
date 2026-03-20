@@ -60,7 +60,7 @@ class ContextAssembler:
         - SUMMARY: tag summary (current default)
         - SEGMENTS: individual segment summaries
         - FULL: StoredSegment.full_text
-        When working_set is None, all tags served as SUMMARY (backward compat).
+        When working_set is None, all tags served as SUMMARY.
 
         max_context_tokens: If set, caps the total VC context (core + hint + tags)
         to fit within available headroom. Used by proxy to prevent exceeding
@@ -347,7 +347,6 @@ class ContextAssembler:
         return core[:max_chars]
 
     def _tag_priority(self, tag: str) -> int:
-        """Get priority for a tag from tag rules."""
         for rule in self.tag_rules:
             if fnmatch.fnmatch(tag, rule.match):
                 return rule.priority

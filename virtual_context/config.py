@@ -62,7 +62,6 @@ def _discover_config() -> Path | None:
 
 
 def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
-    """Parse the tag_generator section."""
     keyword_raw = raw.get("keyword_fallback", {})
     keyword_fallback = None
     if keyword_raw:
@@ -106,7 +105,6 @@ def _parse_tag_generator(raw: dict[str, Any]) -> TagGeneratorConfig:
 
 
 def _parse_tag_rules(raw_list: list[dict[str, Any]]) -> list[TagPromptRule]:
-    """Parse the tag_rules section."""
     rules = []
     for entry in raw_list:
         rules.append(TagPromptRule(
@@ -119,7 +117,6 @@ def _parse_tag_rules(raw_list: list[dict[str, Any]]) -> list[TagPromptRule]:
 
 
 def _parse_strategy_configs(raw: dict[str, Any]) -> dict[str, StrategyConfig]:
-    """Parse strategy_config section."""
     configs = {}
     for name, conf in raw.items():
         configs[name] = StrategyConfig(
@@ -134,7 +131,6 @@ def _parse_strategy_configs(raw: dict[str, Any]) -> dict[str, StrategyConfig]:
 
 
 def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualContextConfig:
-    """Build a VirtualContextConfig from a raw dict."""
     # Tag generator
     tag_gen_raw = raw.get("tag_generator", {})
     tag_generator = _parse_tag_generator(tag_gen_raw)
@@ -259,7 +255,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
     )
 
-    # Telemetry (backward compat: also accept "cost_tracking")
+    # Telemetry (also accepts legacy "cost_tracking" key)
     telemetry_raw = raw.get("telemetry", raw.get("cost_tracking", {}))
     telemetry_config = TelemetryConfig(
         enabled=telemetry_raw.get("enabled", False),

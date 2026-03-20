@@ -188,7 +188,7 @@ class DomainCompactor:
         model_name: str = "",
         tag_rules: list[TagPromptRule] | None = None,
         telemetry_ledger: TelemetryLedger | None = None,
-        cost_tracker=None,  # deprecated, ignored — kept for backward compat
+        cost_tracker=None,  # deprecated, ignored — remove when callers updated
     ) -> None:
         self.llm = llm_provider
         self.config = config
@@ -302,7 +302,6 @@ class DomainCompactor:
         self, segment: TaggedSegment, fact_signals: list[FactSignal] | None = None,
         prev_context: str = "",
     ) -> CompactionResult:
-        """Summarize a single segment."""
         conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
 
@@ -764,7 +763,6 @@ class DomainCompactor:
         turn_numbers: list[int],
         max_turn: int,
     ) -> TagSummary:
-        """Build a single tag summary by rolling up segment summaries via LLM."""
         combined = "\n\n---\n\n".join(
             f"[Segment {s.ref}, tags: {', '.join(s.tags)}]\n{s.summary}"
             for s in summaries

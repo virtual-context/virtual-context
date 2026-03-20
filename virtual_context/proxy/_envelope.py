@@ -18,7 +18,7 @@ _VC_PROMPT_MARKER = "[vc:prompt]\n"
 _MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
 
 # Conversation marker: injected into assistant responses, extracted from inbound history
-# Accepts both legacy "vc:session" and current "vc:conversation" for backward compat
+# Accepts both legacy "vc:session" and current "vc:conversation"
 _VC_CONVERSATION_RE = re.compile(r"<!-- vc:(?:session|conversation)=([a-f0-9-]+) -->")
 
 # OpenClaw envelope patterns — consistent across all channels
@@ -64,7 +64,7 @@ def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
 
     1. ``[vc:prompt]`` marker from the virtual-context-tagger plugin
     2. MemOS "# Role" preamble — strips everything before the query delimiter
-    3. ``[vc:user]...[/vc:user]`` backward-compatible wrapper (extracts
+    3. ``[vc:user]...[/vc:user]`` legacy wrapper (extracts
        inner content and returns immediately — inner content is already clean)
     4. Labeled metadata blocks — ``Label (qualifier):\\n```json\\n{...}\\n```\\n``
        Strips any number of fenced JSON blocks with labeled headers from the
@@ -209,5 +209,5 @@ def _strip_envelope(text: str) -> str:
     return stripped
 
 
-# Backward-compatible alias
+# Legacy alias — remove when OpenClaw callers are updated
 _strip_openclaw_envelope = _strip_envelope

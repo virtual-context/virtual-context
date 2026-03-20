@@ -17,7 +17,6 @@ def str_to_dt(s: str) -> datetime:
 
 
 def extract_excerpt(text: str, query: str, context_chars: int = 200) -> str:
-    """Extract text around the first occurrence of query."""
     idx = text.lower().find(query.lower())
     if idx == -1:
         return text[:context_chars * 2]

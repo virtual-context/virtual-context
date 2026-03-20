@@ -13,15 +13,13 @@ class ContextStore(ABC):
 
     @abstractmethod
     def store_segment(self, segment: StoredSegment) -> str:
-        """Store a segment. Idempotent on ref (upsert). Returns ref."""
+        """Upsert by ref. Returns ref."""
 
     @abstractmethod
-    def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
-        """Retrieve full segment by ref. None if not found."""
+    def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None: ...
 
     @abstractmethod
-    def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None:
-        """Retrieve lightweight summary by ref. None if not found."""
+    def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None: ...
 
     @abstractmethod
     def get_summaries_by_tags(
@@ -42,8 +40,7 @@ class ContextStore(ABC):
         tags: list[str] | None = None,
         limit: int = 5,
         conversation_id: str | None = None,
-    ) -> list[StoredSummary]:
-        """Search summaries by keyword. Ordered by relevance."""
+    ) -> list[StoredSummary]: ...
 
     @abstractmethod
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
@@ -58,32 +55,27 @@ class ContextStore(ABC):
         """Return aggregate statistics grouped by conversation_id, newest first."""
 
     @abstractmethod
-    def get_tag_aliases(self) -> dict[str, str]:
-        """Get all tag alias mappings."""
+    def get_tag_aliases(self) -> dict[str, str]: ...
 
     @abstractmethod
-    def set_tag_alias(self, alias: str, canonical: str) -> None:
-        """Register a tag alias mapping."""
+    def set_tag_alias(self, alias: str, canonical: str) -> None: ...
 
     @abstractmethod
-    def delete_segment(self, ref: str) -> bool:
-        """Delete a segment by ref. Returns True if deleted."""
+    def delete_segment(self, ref: str) -> bool: ...
 
     @abstractmethod
     def cleanup(
         self,
         max_age: timedelta | None = None,
         max_total_tokens: int | None = None,
-    ) -> int:
-        """Remove old/excess segments. Returns count deleted."""
+    ) -> int: ...
 
     @abstractmethod
     def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
-        """Store or update a tag summary. Upsert on (tag, conversation_id)."""
+        """Upsert on (tag, conversation_id)."""
 
     @abstractmethod
-    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
-        """Retrieve a tag summary by tag name and conversation. None if not found."""
+    def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None: ...
 
     @abstractmethod
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
@@ -112,24 +104,22 @@ class ContextStore(ABC):
         min_overlap: int = 1,
         limit: int = 20,
         conversation_id: str | None = None,
-    ) -> list[StoredSegment]:
-        """Retrieve full segments (including full_text) matching tags by overlap."""
+    ) -> list[StoredSegment]: ...
 
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
-        """Store embedding vectors for text chunks of a segment. Idempotent (replaces)."""
+        """Idempotent: replaces any existing chunks for this segment."""
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        """Retrieve all stored chunk embeddings. Returns empty list if none."""
         return []
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
-        """Persist engine state (TurnTagIndex + watermark). Upsert by conversation_id."""
+        """Upsert by conversation_id."""
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
-        """Load persisted engine state for a conversation. None if not found."""
+        return None
 
     def load_latest_engine_state(self) -> EngineStateSnapshot | None:
-        """Load the most recently saved engine state (any conversation). None if empty."""
+        return None
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
         """Return {trailing_fingerprint: conversation_id} for all persisted conversations.
@@ -151,7 +141,7 @@ class ContextStore(ABC):
         user_raw_content: str | None = None,
         assistant_raw_content: str | None = None,
     ) -> None:
-        """Persist turn message text. Upsert by (conversation_id, turn_number)."""
+        """Upsert by (conversation_id, turn_number)."""
 
     def get_turn_messages(
         self,
@@ -200,7 +190,6 @@ class ContextStore(ABC):
     # ------------------------------------------------------------------
 
     def store_facts(self, facts: list[Fact]) -> int:
-        """Store extracted facts. Returns count stored."""
         return 0
 
     def query_facts(
@@ -216,15 +205,12 @@ class ContextStore(ABC):
         limit: int = 50,
         conversation_id: str | None = None,
     ) -> list[Fact]:
-        """Query facts by structured filters."""
         return []
 
     def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
-        """Return all distinct non-empty verbs from non-superseded facts."""
         return []
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
-        """Get all facts extracted from a given segment."""
         return []
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
@@ -232,17 +218,14 @@ class ContextStore(ABC):
         return []
 
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        """Mark old_fact_id as superseded by new_fact_id."""
         pass
 
     def update_fact_fields(
         self, fact_id: str, verb: str, object: str, status: str, what: str
     ) -> None:
-        """Update structured fields on a fact (used after supersession merge)."""
         pass
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
-        """Return {tag: fact_count} for context hint annotations."""
         return {}
 
     def query_experience_facts_by_date(
@@ -265,7 +248,6 @@ class ContextStore(ABC):
     # ------------------------------------------------------------------
 
     def delete_conversation(self, conversation_id: str) -> int:
-        """Delete all segments, facts, engine state, turn messages, and tag summaries for a conversation. Returns segment count deleted."""
         return 0
 
     def store_tool_output(
@@ -278,7 +260,6 @@ class ContextStore(ABC):
         content: str,
         original_bytes: int,
     ) -> None:
-        """Store full tool output for FTS5 search via find_quote."""
         pass
 
     def search_tool_outputs(
@@ -287,13 +268,10 @@ class ContextStore(ABC):
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list:
-        """Search indexed tool outputs by FTS. Returns list of QuoteResult."""
         return []
 
     def save_request_capture(self, capture: dict) -> None:
-        """Persist a single request capture summary. Prunes to *limit* newest."""
         pass
 
     def load_request_captures(self, limit: int = 50) -> list[dict]:
-        """Load persisted request capture summaries, newest last."""
         return []

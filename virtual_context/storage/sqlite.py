@@ -972,7 +972,6 @@ class SQLiteStore(ContextStore):
         return cursor.rowcount > 0
 
     def delete_conversation(self, conversation_id: str) -> int:
-        """Delete all segments and engine state for a conversation. Returns segment count deleted."""
         conn = self._get_conn()
         cursor = conn.execute(
             "DELETE FROM segments WHERE conversation_id = ?", (conversation_id,),
@@ -1043,7 +1042,7 @@ class SQLiteStore(ContextStore):
         ).fetchone()
         if not row:
             return None
-        # Backward compat: description column may not exist in old rows
+        # description column may not exist in pre-v0.2 rows
         desc = ""
         try:
             desc = row["description"]
@@ -1213,7 +1212,6 @@ class SQLiteStore(ContextStore):
         conn.commit()
 
     def _parse_engine_state_row(self, row) -> EngineStateSnapshot:
-        """Parse a SQLite row into an EngineStateSnapshot."""
         raw = json.loads(row["turn_tag_entries"])
         # Support both old format (list of entries) and new format (dict with split_processed_tags)
         if isinstance(raw, dict):
@@ -1624,7 +1622,6 @@ class SQLiteStore(ContextStore):
     # ------------------------------------------------------------------
 
     def store_fact_links(self, links: list[FactLink]) -> int:
-        """Store fact links, returning the number stored."""
         if not links:
             return 0
         conn = self._get_conn()
@@ -1755,7 +1752,6 @@ class SQLiteStore(ContextStore):
         return results
 
     def delete_fact_links(self, fact_id: str) -> int:
-        """Delete all links where fact_id is source or target. Returns count deleted."""
         conn = self._get_conn()
         cursor = conn.execute(
             "DELETE FROM fact_links WHERE source_fact_id = ? OR target_fact_id = ?",
@@ -1801,7 +1797,6 @@ class SQLiteStore(ContextStore):
         return count
 
     def _row_to_fact_link(self, row: sqlite3.Row) -> FactLink:
-        """Convert a sqlite3.Row to a FactLink dataclass."""
         return FactLink(
             id=row["id"],
             source_fact_id=row["source_fact_id"],

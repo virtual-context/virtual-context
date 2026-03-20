@@ -30,7 +30,6 @@ class Neo4jFactStore:
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
-        """Create indexes and constraints for optimal query performance."""
         with self._driver.session() as session:
             # Unique constraint on Fact.id
             session.run(
@@ -50,7 +49,6 @@ class Neo4jFactStore:
             )
 
     def _fact_to_props(self, fact: Fact) -> dict:
-        """Convert a Fact dataclass to a Neo4j properties dict."""
         return {
             "id": fact.id,
             "subject": fact.subject,
@@ -73,7 +71,6 @@ class Neo4jFactStore:
         }
 
     def _record_to_fact(self, record) -> Fact:
-        """Convert a Neo4j record/node to a Fact dataclass."""
         props = dict(record) if not hasattr(record, "data") else record.data()
         return Fact.from_dict(props, dt_parser=_str_to_dt)
 

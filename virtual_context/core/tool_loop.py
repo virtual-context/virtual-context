@@ -4,7 +4,7 @@ Extracted from proxy/server.py so that the engine, benchmark, and CLI
 can use VC paging tools without going through the HTTP proxy.
 
 Provider adapters live in provider_adapters.py and are re-exported here
-for backward compatibility.
+for existing importers.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import httpx
 
 from ..types import ToolCallRecord, ToolLoopResult
 
-# Re-export adapter classes for backward compatibility
+# Re-exported for existing importers
 from .provider_adapters import (  # noqa: F401
     AnthropicAdapter,
     GeminiAdapter,

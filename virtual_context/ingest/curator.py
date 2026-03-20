@@ -24,7 +24,6 @@ _SYSTEM = (
 
 
 class FactCurator:
-    """Filter a facts list down to query-relevant facts using an LLM."""
 
     def __init__(
         self,

@@ -262,11 +262,9 @@ class RetrievalAssembler:
     # ------------------------------------------------------------------
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
-        """Retrieve relevant context for a message without assembling."""
         return self._retriever.retrieve(message, current_active_tags=active_tags or [])
 
     def transform(self, message: str, active_tags: list[str] | None = None, budget: int | None = None) -> str:
-        """Retrieve + assemble context block for a message. Returns prepend text."""
         result = self.retrieve(message, active_tags)
         if not result.summaries:
             return ""
@@ -367,7 +365,6 @@ class RetrievalAssembler:
     # ------------------------------------------------------------------
 
     def _get_active_tags(self, history: list[Message]) -> list[str]:
-        """Get tags from recent turns via live index."""
         lookback = self.config.retriever.active_tag_lookback
         return list(self._turn_tag_index.get_active_tags(lookback=lookback))
 
@@ -495,7 +492,6 @@ class RetrievalAssembler:
     # ------------------------------------------------------------------
 
     def recall_all(self) -> dict:
-        """Load all tag summaries. Used by vc_recall_all tool."""
         tag_summaries = self._store.get_all_tag_summaries(
             conversation_id=self.config.conversation_id,
         )

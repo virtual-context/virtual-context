@@ -39,49 +39,41 @@ class ProviderAdapter(ABC):
         self._base_url = api_url
 
     @abstractmethod
-    def get_headers(self) -> dict:
-        """Return HTTP headers for API requests."""
+    def get_headers(self) -> dict: ...
 
     @abstractmethod
-    def get_url(self, model: str = "") -> str:
-        """Return the API endpoint URL."""
+    def get_url(self, model: str = "") -> str: ...
 
     @abstractmethod
     def build_request_body(
         self, *, model: str, messages: list[dict], system: str,
         max_tokens: int, temperature: float, tools: list[dict] | None,
-    ) -> dict:
-        """Build the provider-specific request body."""
+    ) -> dict: ...
 
     @abstractmethod
-    def convert_tool_defs(self, anthropic_defs: list[dict]) -> list[dict]:
-        """Convert Anthropic-format tool definitions to provider format."""
+    def convert_tool_defs(self, anthropic_defs: list[dict]) -> list[dict]: ...
 
     @abstractmethod
-    def extract_text(self, response: dict) -> str:
-        """Extract text content from a response."""
+    def extract_text(self, response: dict) -> str: ...
 
     @abstractmethod
     def extract_tool_calls(self, response: dict) -> list[dict]:
-        """Extract tool calls, normalized to ``[{id, name, input}]``."""
+        """Normalized to ``[{id, name, input}]``."""
 
     @abstractmethod
     def extract_usage(self, response: dict) -> tuple[int, int]:
-        """Return ``(input_tokens, output_tokens)`` from a response."""
+        """Return ``(input_tokens, output_tokens)``."""
 
     @abstractmethod
-    def is_tool_use_stop(self, response: dict) -> bool:
-        """Return True if the response stopped due to tool use."""
+    def is_tool_use_stop(self, response: dict) -> bool: ...
 
     @abstractmethod
-    def get_stop_reason(self, response: dict) -> str:
-        """Return a normalized stop reason string."""
+    def get_stop_reason(self, response: dict) -> str: ...
 
     @abstractmethod
     def build_tool_result(
         self, tool_call_id: str, tool_name: str, content: str,
-    ) -> dict:
-        """Build a single provider-specific tool result entry."""
+    ) -> dict: ...
 
     @abstractmethod
     def build_continuation(
@@ -104,8 +96,7 @@ class ProviderAdapter(ABC):
         """
 
     @abstractmethod
-    def strip_tools(self, body: dict) -> None:
-        """Remove tool definitions from a request body (in-place)."""
+    def strip_tools(self, body: dict) -> None: ...
 
     def relax_tool_choice(self, body: dict) -> None:
         """Downgrade tool_choice from 'any'/'required' to 'auto' (in-place).

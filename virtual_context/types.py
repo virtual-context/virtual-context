@@ -235,7 +235,7 @@ class TagResult:
     fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
 
 
-# Pattern constants — canonical definitions in patterns.py, re-exported here for compat
+# Re-exported for existing callers; canonical definitions in patterns.py
 from .patterns import DEFAULT_TEMPORAL_PATTERNS  # noqa: F401
 
 
@@ -781,7 +781,7 @@ class TelemetryConfig:
     models_file: str = "models.yaml"
 
 
-# Backward compat alias — old configs may reference CostTrackingConfig
+# Deprecated: old configs may reference CostTrackingConfig
 CostTrackingConfig = TelemetryConfig
 
 
@@ -879,5 +879,5 @@ class VirtualContextConfig:
 
     @property
     def cost_tracking(self) -> TelemetryConfig:
-        """Backward compat alias for ``telemetry``."""
+        """Deprecated — use ``telemetry`` directly."""
         return self.telemetry

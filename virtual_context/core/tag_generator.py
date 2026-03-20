@@ -197,7 +197,6 @@ def detect_temporal_heuristic(text: str, patterns: list[re.Pattern]) -> bool:
 
 
 class LLMTagGenerator:
-    """Generate semantic tags using a local LLM."""
 
     def __init__(
         self,
@@ -206,7 +205,7 @@ class LLMTagGenerator:
         canonicalizer: TagCanonicalizer | None = None,
         telemetry_ledger: TelemetryLedger | None = None,
         embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
-        cost_tracker=None,  # deprecated, ignored — kept for backward compat
+        cost_tracker=None,  # deprecated, ignored — legacy parameter
     ) -> None:
         self.llm = llm_provider
         self.config = config
@@ -484,7 +483,6 @@ class LLMTagGenerator:
 
 
 class KeywordTagGenerator:
-    """Deterministic tag generation using keywords and regex patterns."""
 
     def __init__(self, config: KeywordTagConfig) -> None:
         self.config = config
@@ -544,9 +542,8 @@ def build_tag_generator(
     canonicalizer: TagCanonicalizer | None = None,
     telemetry_ledger: TelemetryLedger | None = None,
     embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
-    cost_tracker=None,  # deprecated, ignored — kept for backward compat
+    cost_tracker=None,  # deprecated, ignored — re-exported for existing callers
 ) -> TagGenerator:
-    """Build a tag generator from config. Falls back to keyword if no LLM available."""
     if config.type == "llm" and llm_provider is not None:
         return LLMTagGenerator(
             llm_provider=llm_provider, config=config,

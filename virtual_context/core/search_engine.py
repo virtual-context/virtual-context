@@ -49,7 +49,6 @@ class SearchEngine:
         intent_context: str = "",
         session_filter: str = "",
     ) -> dict:
-        """Search stored conversation text for a specific phrase or keyword."""
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
         return _find_quote(

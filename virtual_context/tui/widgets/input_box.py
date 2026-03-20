@@ -32,5 +32,4 @@ class InputBox(TextArea):
                 self.clear()
 
     def action_newline(self) -> None:
-        """Insert a newline at the cursor."""
         self.insert("\n")
