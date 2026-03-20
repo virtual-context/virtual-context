@@ -302,10 +302,8 @@ def create_app(
         if _effective_log_dir and isinstance(_effective_log_dir, (str, Path)):
             _effective_log_dir = Path(_effective_log_dir)
             _effective_log_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("REQUEST_LOG effective=%s from=%s", _effective_log_dir, "config" if _request_log_dir else "app.state")
         else:
             _effective_log_dir = None
-            logger.info("REQUEST_LOG DISABLED _request_log_dir=%s app.state=%s type=%s", _request_log_dir, _state_log_dir, type(_state_log_dir))
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
