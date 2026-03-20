@@ -126,7 +126,7 @@ class HeadlessRunner:
         assembled = AssembledContext()
         system_text = ""
 
-        # 1. Engine: tag + retrieve + assemble
+        # Engine: tag + retrieve + assemble
         if self.engine:
             try:
                 t0 = time.perf_counter()
@@ -138,7 +138,7 @@ class HeadlessRunner:
             except Exception as e:
                 print(f"Engine error: {e}", file=sys.stderr)
 
-        # 2. Filter history by tag relevance
+        # Filter history by tag relevance
         if self.engine:
             t0 = time.perf_counter()
             filtered = self.engine.filter_history(
@@ -170,7 +170,7 @@ class HeadlessRunner:
             "filtered_history": len(filtered),
         }
 
-        # 3. Stream response (collect all chunks)
+        # Stream response (collect all chunks)
         full_response: list[str] = []
         t0 = time.perf_counter()
         try:
@@ -188,7 +188,7 @@ class HeadlessRunner:
             Message(role="assistant", content=assistant_text)
         )
 
-        # 4. Compute token estimate (doesn't need on_turn_complete)
+        # Compute token estimate (doesn't need on_turn_complete)
         payload_chars = len(system_text)
         for m in api_messages:
             payload_chars += len(m.get("content", ""))
@@ -197,7 +197,7 @@ class HeadlessRunner:
         msg_count = len(api_messages)
         turns_in_payload = (msg_count + 1) // 2
 
-        # 5. Record turn (tags filled in after on_turn_complete)
+        # Record turn (tags filled in after on_turn_complete)
         self._turn_counter += 1
         turn = TurnRecord(
             turn_number=self._turn_counter,
@@ -212,7 +212,7 @@ class HeadlessRunner:
         )
         self._turns.append(turn)
 
-        # 6. Fire on_turn_complete in background
+        # Fire on_turn_complete in background
         if self.engine:
             history_snapshot = list(self._conversation_history)
             self._pending_complete = self._pool.submit(

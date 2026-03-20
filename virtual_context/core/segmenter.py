@@ -76,10 +76,10 @@ class TopicSegmenter:
         if not messages:
             return []
 
-        # Step 1: pair into turns
+        # Pair messages into turns
         pairs = self._pair_turns(messages)
 
-        # Step 2: tag each turn pair
+        # Tag each turn pair
         tagged: list[tuple[TurnPair, TagResult]] = []
         for i, pair in enumerate(pairs):
             # Skip empty/whitespace turns (stripped images, media, etc.)
@@ -114,8 +114,8 @@ class TopicSegmenter:
                 tag_result.source, preview,
             )
 
-        # Step 3: group contiguous same-primary-tag pairs,
-        #         split on session date change or temporal gap
+        # Group contiguous same-primary-tag pairs,
+        # split on session date change or temporal gap
         segments: list[TaggedSegment] = []
         current_group: list[tuple[TurnPair, TagResult]] = []
         running_session: str = ""  # tracks session date across all pairs
