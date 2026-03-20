@@ -545,6 +545,13 @@ async def _handle_streaming(
                         tool_ms = round(
                             (time.monotonic() - t_tool) * 1000, 1,
                         )
+                        _input_preview = json.dumps(tool["input"])[:120]
+                        _result_preview = result_str[:200].replace("\n", " ")
+                        logger.info(
+                            "TOOL_CALL %s %dms input=%s result_len=%d preview=%s",
+                            tool["name"], tool_ms, _input_preview,
+                            len(result_str), _result_preview,
+                        )
                         if metrics:
                             metrics.record({
                                 "type": "tool_intercept",
@@ -675,6 +682,13 @@ async def _handle_streaming(
                             )
                         except Exception:
                             pass  # never let logging break the request
+
+                    logger.info(
+                        "CONTINUATION round=%d status=%d tools=%s",
+                        loop_i + 1,
+                        cont_resp.status_code,
+                        [t["name"] for t in vc_tools],
+                    )
 
                     if cont_resp.status_code >= 300:
                         logger.error(
