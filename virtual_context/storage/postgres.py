@@ -585,14 +585,24 @@ class PostgresStore(ContextStore):
             GROUP BY conversation_id, compaction_model
             ORDER BY MAX(created_at) DESC
         """).fetchall()
+        # Batch-fetch distinct tags per conversation (avoids N+1)
+        conv_ids = [row["conversation_id"] for row in rows]
+        tags_by_conv: dict[str, list[str]] = {cid: [] for cid in conv_ids}
+        if conv_ids:
+            tag_rows = conn.execute(
+                """SELECT s.conversation_id, st.tag
+                FROM segment_tags st
+                JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.conversation_id = ANY(%s)
+                GROUP BY s.conversation_id, st.tag
+                ORDER BY st.tag""",
+                (conv_ids,),
+            ).fetchall()
+            for tr in tag_rows:
+                tags_by_conv[tr["conversation_id"]].append(tr["tag"])
+
         results = []
         for row in rows:
-            tag_rows = conn.execute(
-                """SELECT DISTINCT st.tag FROM segment_tags st
-                JOIN segments s ON s.ref = st.segment_ref
-                WHERE s.conversation_id = %s""",
-                (row["conversation_id"],),
-            ).fetchall()
             results.append(ConversationStats(
                 conversation_id=row["conversation_id"],
                 segment_count=row["seg_count"],
@@ -600,7 +610,7 @@ class PostgresStore(ContextStore):
                 total_summary_tokens=row["total_summary"],
                 oldest_segment=_str_to_dt(row["oldest"]),
                 newest_segment=_str_to_dt(row["newest"]),
-                distinct_tags=[r["tag"] for r in tag_rows],
+                distinct_tags=tags_by_conv.get(row["conversation_id"], []),
                 compaction_model=row["compaction_model"],
             ))
         return results

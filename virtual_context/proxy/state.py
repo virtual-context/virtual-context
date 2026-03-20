@@ -293,11 +293,10 @@ class ProxyState:
             _tags = entry.tags if entry else []
             _primary = entry.primary_tag if entry else ""
             _needs_compact = signal is not None
-            print(
-                f"[T{turn}] TAG {int(tag_ms)}ms "
-                f"tags=[{', '.join(_tags)}] primary={_primary}"
-                + (" → COMPACT queued" if _needs_compact else ""),
-                flush=True,
+            logger.info(
+                "T%d TAG %dms tags=[%s] primary=%s%s",
+                turn, int(tag_ms), ", ".join(_tags), _primary,
+                " -> COMPACT queued" if _needs_compact else "",
             )
             logger.info(
                 "T%d tagged (%dms) conversation=%s compacted_through=%d history=%d%s",
@@ -341,14 +340,15 @@ class ProxyState:
                 if isinstance(split_result, SplitResult):
                     if split_result.splittable:
                         new_tags = list(split_result.groups.keys())
-                        print(
-                            f"[T{turn}] SPLIT \"{split_result.tag}\" → "
-                            f"{new_tags} ({sum(len(v) for v in split_result.groups.values())} turns)"
+                        logger.info(
+                            "T%d SPLIT \"%s\" -> %s (%d turns)",
+                            turn, split_result.tag, new_tags,
+                            sum(len(v) for v in split_result.groups.values()),
                         )
                     else:
-                        print(
-                            f"[T{turn}] SUMMARIZED \"{split_result.tag}\" "
-                            f"(unsplittable: {split_result.reason})"
+                        logger.info(
+                            "T%d SUMMARIZED \"%s\" (unsplittable: %s)",
+                            turn, split_result.tag, split_result.reason,
                         )
                     self.metrics.record({
                         "type": "tag_split",
@@ -406,9 +406,10 @@ class ProxyState:
                 compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 if report is not None:
-                    print(
-                        f"[T{turn}] COMPACT {int(compact_ms)}ms "
-                        f"freed={report.tokens_freed}t segments={report.segments_compacted}"
+                    logger.info(
+                        "T%d COMPACT %dms freed=%dt segments=%d",
+                        turn, int(compact_ms), report.tokens_freed,
+                        report.segments_compacted,
                     )
                     logger.info(
                         "T%d compaction (%dms): %d segments, freed %d tokens, tags=%s, "
@@ -460,10 +461,9 @@ class ProxyState:
             if signal is None:
                 return
             turn = len(self.engine._turn_tag_index.entries)
-            print(
-                f"[POST-INGEST] Compaction needed: {snapshot.total_tokens}t/"
-                f"{snapshot.budget_tokens}t ({signal.priority}) "
-                f"— running immediately"
+            logger.info(
+                "POST-INGEST Compaction needed: %dt/%dt (%s) -- running immediately",
+                snapshot.total_tokens, snapshot.budget_tokens, signal.priority,
             )
             self._run_compact(history, signal, turn)
         except Exception as e:
@@ -499,9 +499,9 @@ class ProxyState:
             conversation_id[:12], old_first_hash, new_first_hash,
             old_turns, new_turns, threshold * 100,
         )
-        print(
-            f"[INGEST] History widened: {old_turns}→{new_turns} turns, "
-            f"prefix changed — full re-ingest (conversation={conversation_id[:12]})"
+        logger.info(
+            "INGEST History widened: %d->%d turns, prefix changed -- full re-ingest (conversation=%s)",
+            old_turns, new_turns, conversation_id[:12],
         )
 
         # Clear all conversation state
@@ -546,12 +546,8 @@ class ProxyState:
             self._ingested_conversations.add(conversation_id)
             self._record_ingestion_watermark(history_pairs, conversation_id)
 
-            print(
-                f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
-                f"(conversation={conversation_id[:12]})"
-            )
             logger.info(
-                "History ingestion: %d turns in %dms (conversation=%s)",
+                "INGEST %d turns in %dms (conversation=%s)",
                 turns, int(elapsed_ms), conversation_id[:12],
             )
 
@@ -671,10 +667,9 @@ class ProxyState:
                 # the last callback and the cancel taking effect.
                 existing_turns = len(self.engine._turn_tag_index.entries)
 
-                print(
-                    f"[INGEST] Cancel at T{done}/{total}, "
-                    f"resuming from T{existing_turns} "
-                    f"(conversation={conversation_id[:12]})"
+                logger.info(
+                    "INGEST Cancel at T%d/%d, resuming from T%d (conversation=%s)",
+                    done, total, existing_turns, conversation_id[:12],
                 )
 
                 # Verify hash at handoff point
@@ -739,9 +734,9 @@ class ProxyState:
                 "indexed=%s new=%s — history may have diverged",
                 prev_turn, entry.message_hash, new_hash,
             )
-            print(
-                f"[INGEST] WARNING: hash mismatch at T{prev_turn} "
-                f"(indexed={entry.message_hash} vs new={new_hash})"
+            logger.info(
+                "INGEST WARNING: hash mismatch at T%d (indexed=%s vs new=%s)",
+                prev_turn, entry.message_hash, new_hash,
             )
         else:
             logger.info(
@@ -865,12 +860,8 @@ class ProxyState:
         turns = self.engine.ingest_history(pairs, progress_callback=on_progress, turn_offset=baseline)
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
-        print(
-            f"[INGEST] {turns} turns in {int(elapsed_ms)}ms "
-            f"(conversation={conversation_id[:12]})"
-        )
         logger.info(
-            "History ingestion: %d turns in %dms (conversation=%s)",
+            "INGEST %d turns in %dms (conversation=%s)",
             turns, int(elapsed_ms), conversation_id[:12],
         )
 
