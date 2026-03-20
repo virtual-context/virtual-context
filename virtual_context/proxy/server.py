@@ -417,6 +417,7 @@ def create_app(
                     metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
+                    request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                 )
             else:
                 return await _handle_non_streaming(
@@ -540,6 +541,7 @@ def create_app(
                         conversation_id=_conversation_id,
                         passthrough=True, response_log_path=_response_log_path,
                         session_log_path=_session_log_path,
+                        request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     )
                 else:
                     return await _handle_non_streaming(
