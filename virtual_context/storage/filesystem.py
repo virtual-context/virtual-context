@@ -800,6 +800,10 @@ class FilesystemStore(ContextStore):
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------
 
+    def delete_conversation(self, conversation_id: str) -> int:
+        """Delete all segments for a conversation. Returns segment count deleted."""
+        return 0
+
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
         """Return snippet info for orphan tags.
 

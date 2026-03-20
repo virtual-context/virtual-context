@@ -235,7 +235,7 @@ def create_app(
                 else:
                     logger.info("Request log: %d existing files in %s", len(existing), _request_log_dir)
         except Exception:
-            pass  # engine may be a mock in tests
+            logger.debug("request log pruning failed", exc_info=True)  # engine may be a mock in tests
 
     import itertools as _itertools
     _log_seq = _itertools.count(1)  # atomic monotonic counter for filenames
@@ -750,7 +750,7 @@ def create_app(
                 _to_llm_log = _effective_log_dir / f"{_log_prefix}.2-to-llm.json"
                 _to_llm_log.write_text(json.dumps(enriched_body, default=str))
             except Exception:
-                pass
+                logger.debug("enriched body log write failed", exc_info=True)
 
         is_streaming = body.get("stream", False)
 

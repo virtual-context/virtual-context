@@ -53,6 +53,7 @@ def _derive_provider(upstream: str) -> str:
                 return name
         return host.split(".")[0] if host else ""
     except Exception:
+        logger.debug("provider name extraction failed", exc_info=True)
         return ""
 
 
@@ -200,7 +201,7 @@ class ProxyState:
             tag_summary_count = len(summaries)
             tag_summary_tokens = sum(ts.summary_tokens for ts in summaries)
         except Exception:
-            pass
+            logger.debug("tag summary stats collection failed", exc_info=True)
 
         # Estimate history size in tokens (chars / 4)
         history_tokens = 0

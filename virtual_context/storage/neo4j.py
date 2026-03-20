@@ -115,7 +115,7 @@ class Neo4jFactStore:
         status: str | None = None, fact_type: str | None = None,
         tags: list[str] | None = None, limit: int = 50,
     ) -> list[Fact]:
-        conditions: list[str] = ["f.superseded_by IS NULL"]
+        conditions: list[str] = ["(f.superseded_by IS NULL OR f.superseded_by = '')"]
         params: dict = {"limit": limit}
 
         if subject:
@@ -168,7 +168,7 @@ class Neo4jFactStore:
     def get_unique_fact_verbs(self) -> list[str]:
         with self._driver.session() as session:
             result = session.run(
-                "MATCH (f:Fact) WHERE f.verb <> '' AND f.superseded_by IS NULL "
+                "MATCH (f:Fact) WHERE f.verb <> '' AND (f.superseded_by IS NULL OR f.superseded_by = '') "
                 "RETURN DISTINCT f.verb AS verb"
             )
             return [record["verb"] for record in result]
@@ -199,7 +199,7 @@ class Neo4jFactStore:
         where = " OR ".join(conds)
         with self._driver.session() as session:
             result = session.run(
-                f"MATCH (f:Fact) WHERE f.superseded_by IS NULL AND ({where}) "
+                f"MATCH (f:Fact) WHERE (f.superseded_by IS NULL OR f.superseded_by = '') AND ({where}) "
                 f"RETURN f ORDER BY f.mentioned_at DESC LIMIT $limit",
                 **params,
             )
@@ -316,7 +316,7 @@ class Neo4jFactStore:
             result = session.run(
                 f"""MATCH (seed:Fact)-[r:FACT_LINK*1..{depth}]-(linked:Fact)
                 WHERE seed.id IN $ids
-                  AND linked.superseded_by IS NULL
+                  AND (linked.superseded_by IS NULL OR linked.superseded_by = '')
                   AND NOT linked.id IN $ids
                 WITH seed, linked, r[0] AS first_rel
                 RETURN DISTINCT linked AS fact,

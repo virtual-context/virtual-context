@@ -201,7 +201,7 @@ def register_dashboard_routes(
                         snap["context_window"] = engine.config.monitor.context_window
                         snap["current_conversation_id"] = engine.config.conversation_id
                     except Exception:
-                        pass
+                        logger.debug("SSE engine snapshot failed", exc_info=True)
 
                 # Add live conversations from registry
                 live_conversations = []
@@ -210,7 +210,7 @@ def register_dashboard_routes(
                         try:
                             live_conversations.append(s.live_snapshot())
                         except Exception:
-                            pass
+                            logger.debug("live snapshot failed for conversation %s", sid, exc_info=True)
                 snap["live_conversations"] = live_conversations
 
                 if instance_label:
@@ -330,7 +330,7 @@ def register_dashboard_routes(
                 try:
                     live_conversations.append(s.live_snapshot())
                 except Exception:
-                    pass
+                    logger.debug("live snapshot failed for conversation %s", sid, exc_info=True)
         return JSONResponse(live_conversations)
 
     @app.post("/dashboard/conversations/{conversation_id}/passthrough")

@@ -127,6 +127,15 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._engine_state = EngineState()  # mutable shared state for delegates
+        self._reference_date: date | None = None  # override "today" for remember_when relative presets
+        self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
+        self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
+
+        # Restore persisted state BEFORE creating delegates so they get the
+        # final turn_tag_index / engine_state — no re-sync needed.
+        self._load_persisted_state()
+
+        # Create delegates with the (possibly restored) turn_tag_index
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
         from .core.fact_query import FactQueryEngine
         self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
@@ -193,22 +202,7 @@ class VirtualContextEngine:
             token_counter=self._token_counter,
         )
         self._retrieval._set_semantic(self._semantic)
-        self._reference_date: date | None = None  # override "today" for remember_when relative presets
-        self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
-        self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
-
-        # Restore persisted state if available
-        self._load_persisted_state()
-        # Re-sync delegate index references — _load_persisted_state replaces
-        # self._turn_tag_index with a new object, but delegates were initialized
-        # with the old (empty) one.
-        self._segmenter._turn_tag_index = self._turn_tag_index
-        self._tagging._turn_tag_index = self._turn_tag_index
-        self._tagging._engine_state = self._engine_state
-        self._compaction._turn_tag_index = self._turn_tag_index
-        self._compaction._engine_state = self._engine_state
-        self._retrieval._turn_tag_index = self._turn_tag_index
-        self._retrieval._engine_state = self._engine_state
+        self._apply_persisted_state_to_delegates()
         self._bootstrap_vocabulary()
 
     def close(self) -> None:
@@ -423,7 +417,13 @@ class VirtualContextEngine:
         self._telemetry = TelemetryLedger(self._model_catalog)
 
     def _load_persisted_state(self) -> None:
-        """Restore TurnTagIndex and compaction watermark from store if available."""
+        """Restore TurnTagIndex and compaction watermark from store if available.
+
+        Only sets state on ``self`` (turn_tag_index, engine_state, config).
+        Delegate-specific wiring (``_search``, ``_paging``) is deferred to
+        ``_apply_persisted_state_to_delegates`` which runs after delegate
+        creation.
+        """
         try:
             saved = self._store.load_engine_state(self.config.conversation_id)
         except Exception:
@@ -436,10 +436,7 @@ class VirtualContextEngine:
         self._turn_tag_index = TurnTagIndex()
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
-        self._search._turn_tag_index = self._turn_tag_index
         self._engine_state.split_processed_tags = set(saved.split_processed_tags)
-        # Restore paging working set (backward-compatible: old snapshots have empty list)
-        self._paging.working_set = {ws.tag: ws for ws in (saved.working_set or [])}
         self._engine_state.trailing_fingerprint = saved.trailing_fingerprint
         # Restore telemetry counters from persisted rollup
         if saved.telemetry_rollup:
@@ -448,11 +445,13 @@ class VirtualContextEngine:
         self._restored_request_captures = saved.request_captures or []
         self._engine_state.provider = saved.provider or ""
         self._engine_state.tool_tag_counter = saved.tool_tag_counter or 0
+        # Stash working set entries for _apply_persisted_state_to_delegates
+        self._restored_working_set = saved.working_set or []
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
-            len(self._paging.working_set),
+            len(self._restored_working_set),
         )
 
         # Validate watermark against actual stored segments.
@@ -476,6 +475,12 @@ class VirtualContextEngine:
                         self._engine_state.compacted_through = 0
             except Exception:
                 pass  # Don't crash on validation failure
+
+    def _apply_persisted_state_to_delegates(self) -> None:
+        """Wire restored state into delegates created after _load_persisted_state."""
+        # Restore paging working set (backward-compatible: old snapshots have empty list)
+        ws_entries = getattr(self, "_restored_working_set", [])
+        self._paging.working_set = {ws.tag: ws for ws in ws_entries}
 
     def _bootstrap_vocabulary(self) -> None:
         """Load historical tag frequencies into the tagger's vocabulary.

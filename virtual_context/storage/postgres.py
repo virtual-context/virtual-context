@@ -398,9 +398,9 @@ class PostgresStore(ContextStore):
 
     def store_segment(self, segment: StoredSegment) -> str:
         conn = self._get_conn()
-        primary_tag = segment.primary_tag if isinstance(segment.primary_tag, str) else json.dumps(segment.primary_tag, default=str)
-        summary_text = segment.summary if isinstance(segment.summary, str) else json.dumps(segment.summary, default=str)
-        full_text = segment.full_text if isinstance(segment.full_text, str) else json.dumps(segment.full_text, default=str)
+        primary_tag = segment.primary_tag
+        summary_text = segment.summary
+        full_text = segment.full_text
         metadata_dict = {
             "entities": segment.metadata.entities,
             "key_decisions": segment.metadata.key_decisions,
@@ -435,10 +435,9 @@ class PostgresStore(ContextStore):
             )
             conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (segment.ref,))
             for tag in segment.tags:
-                normalized = tag if isinstance(tag, str) else json.dumps(tag, default=str)
                 conn.execute(
                     "INSERT INTO segment_tags (segment_ref, tag) VALUES (%s, %s)",
-                    (segment.ref, normalized),
+                    (segment.ref, tag),
                 )
         return segment.ref
 
@@ -643,6 +642,28 @@ class PostgresStore(ContextStore):
         cutoff = _dt_to_str(datetime.now(timezone.utc) - max_age)
         cur = conn.execute("DELETE FROM segments WHERE created_at < %s", (cutoff,))
         return cur.rowcount
+
+    def delete_conversation(self, conversation_id: str) -> int:
+        """Delete all segments, facts, engine state, turn messages, and tag summaries for a conversation. Returns segment count deleted."""
+        conn = self._get_conn()
+        with conn.transaction():
+            cur = conn.execute(
+                "DELETE FROM segments WHERE conversation_id = %s", (conversation_id,),
+            )
+            deleted = cur.rowcount
+            conn.execute(
+                "DELETE FROM engine_state WHERE conversation_id = %s", (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM facts WHERE conversation_id = %s", (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM turn_messages WHERE conversation_id = %s", (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM tag_summaries WHERE conversation_id = %s", (conversation_id,),
+            )
+        return deleted
 
     def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
         conn = self._get_conn()

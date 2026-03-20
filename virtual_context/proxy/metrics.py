@@ -129,7 +129,7 @@ class ProxyMetrics:
                     )
                     self._db.commit()
                 except Exception:
-                    pass  # never block event recording for DB errors
+                    logger.debug("metrics DB write failed", exc_info=True)  # never block event recording for DB errors
             # Debug: log every event for diagnostics
             etype = event.get("type", "?")
             conv = event.get("conversation_id", "")[:12]
@@ -243,7 +243,7 @@ class ProxyMetrics:
                         telem_dict.pop("events", None)
                         telemetry = telem_dict
                 except Exception:
-                    pass
+                    logger.debug("telemetry snapshot failed", exc_info=True)
 
             return {
                 "type": "snapshot",
