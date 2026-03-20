@@ -160,10 +160,10 @@ async def _handle_streaming(
                 "error": True,
                 "conversation_id": conversation_id,
             })
-        print(
-            f"[T{turn}] ERROR {upstream.status_code} "
-            f"llm={int(upstream_ms)}ms | {error_bytes[:200].decode('utf-8', errors='replace')}",
-            flush=True,
+        logger.info(
+            "T%d ERROR %d llm=%dms | %s",
+            turn, upstream.status_code, int(upstream_ms),
+            error_bytes[:200].decode("utf-8", errors="replace"),
         )
         try:
             error_body = json.loads(error_bytes)
@@ -220,12 +220,10 @@ async def _handle_streaming(
                 duration_ms=upstream_ms,
                 detail="streaming",
             )
-        print(
-            f"[T{turn}] RESPONSE stream={True} "
-            f"llm={int(upstream_ms)}ms "
-            f"total={int(round(overhead_ms + upstream_ms))}ms "
-            f"chars={len(assistant_text)}",
-            flush=True,
+        logger.info(
+            "T%d RESPONSE stream=True llm=%dms total=%dms chars=%d",
+            turn, int(upstream_ms), int(round(overhead_ms + upstream_ms)),
+            len(assistant_text),
         )
         if response_log_path:
             try:
@@ -1117,12 +1115,10 @@ async def _handle_non_streaming(
             detail="non_streaming",
         )
 
-    print(
-        f"[T{turn}] RESPONSE stream=False "
-        f"llm={int(upstream_ms)}ms "
-        f"total={int(round(overhead_ms + upstream_ms))}ms "
-        f"chars={len(assistant_text or '')}",
-        flush=True,
+    logger.info(
+        "T%d RESPONSE stream=False llm=%dms total=%dms chars=%d",
+        turn, int(upstream_ms), int(round(overhead_ms + upstream_ms)),
+        len(assistant_text or ""),
     )
 
     # Session state dump

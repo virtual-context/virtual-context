@@ -453,7 +453,7 @@ def run_vc_ingest_only(
         _clear_compaction_state(storage_dir, question.question_id)
 
     internal_openai_token = ""
-    if tagger_provider == "openai" or (summarizer_provider or tagger_provider) == "openai":
+    if tagger_provider == "openai" or summarizer_provider == "openai":
         internal_openai_token = _resolve_openai_bearer_token()
 
     cfg_dict = _build_vc_config(

@@ -857,24 +857,11 @@ class VirtualContextEngine:
         core_context = self._assembler.load_core_context()
 
         # Paging: load content at working set depth levels
-        # Working-set paging applies uniformly; time-scoped retrieval now runs
-        # through vc_remember_when instead of a temporal retrieval branch.
-        ws_param = None
-        full_segments_param = None
-        if self.config.paging.enabled and self._working_set:
-            ws_param = self._working_set
-            # Load full segments for tags at SEGMENTS or FULL depth
-            full_segments_param = {}
-            seen_refs: set[str] = set()
+        ws_param, full_segments_param = self._load_working_set_segments()
+        if ws_param:
+            # Update last_accessed_turn for tags matched by current query
+            query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
             for tag, entry in self._working_set.items():
-                if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
-                    segs = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500, conversation_id=self.config.conversation_id)
-                    deduped = [s for s in segs if s.ref not in seen_refs]
-                    seen_refs.update(s.ref for s in deduped)
-                    if deduped:
-                        full_segments_param[tag] = deduped
-                # Update last_accessed_turn for tags matched by current query
-                query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
                 if tag in query_tags:
                     entry.last_accessed_turn = len(self._turn_tag_index.entries)
 
@@ -1998,22 +1985,7 @@ class VirtualContextEngine:
         context_hint = self._build_context_hint(paging_mode=_pm)
         core_context = self._assembler.load_core_context()
 
-        ws_param = None
-        full_segments_param = None
-        if self.config.paging.enabled and self._working_set:
-            ws_param = self._working_set
-            full_segments_param = {}
-            seen_refs: set[str] = set()
-            for tag, entry in self._working_set.items():
-                if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
-                    segs = self._store.get_segments_by_tags(
-                        tags=[tag], min_overlap=1, limit=500,
-                        conversation_id=self.config.conversation_id,
-                    )
-                    deduped = [s for s in segs if s.ref not in seen_refs]
-                    seen_refs.update(s.ref for s in deduped)
-                    if deduped:
-                        full_segments_param[tag] = deduped
+        ws_param, full_segments_param = self._load_working_set_segments()
 
         uncompacted = (history or [])[self._compacted_through:]
         assembled = self._assembler.assemble(
@@ -2069,6 +2041,29 @@ class VirtualContextEngine:
     def get_working_set_summary(self) -> dict:
         """Return current working set with budget info."""
         return self._paging.get_working_set_summary()
+
+    def _load_working_set_segments(self) -> tuple[dict | None, dict | None]:
+        """Load full segments for working-set tags at SEGMENTS or FULL depth.
+
+        Returns ``(working_set_dict, full_segments_dict)`` for the assembler,
+        or ``(None, None)`` if paging is disabled or the working set is empty.
+        """
+        if not self.config.paging.enabled or not self._working_set:
+            return None, None
+        ws_param = self._working_set
+        full_segments_param: dict = {}
+        seen_refs: set[str] = set()
+        for tag, entry in self._working_set.items():
+            if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
+                segs = self._store.get_segments_by_tags(
+                    tags=[tag], min_overlap=1, limit=500,
+                    conversation_id=self.config.conversation_id,
+                )
+                deduped = [s for s in segs if s.ref not in seen_refs]
+                seen_refs.update(s.ref for s in deduped)
+                if deduped:
+                    full_segments_param[tag] = deduped
+        return ws_param, full_segments_param
 
     def _calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
         """Calculate token cost for a tag at a given depth level."""
