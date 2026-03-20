@@ -253,8 +253,6 @@ def create_app(
         _app_title += f" [{instance_label}]"
     app = FastAPI(title=_app_title, lifespan=lifespan)
     app.state.instance_label = instance_label
-    # DIAGNOSTIC: set to True to bypass all VC processing (pure passthrough)
-    app.state._force_passthrough = bool(os.environ.get("VC_FORCE_PASSTHROUGH"))
     # Pluggable session resolver: if set, called instead of the built-in
     # SessionRegistry.  Signature:
     #   (request, body, conversation_id) -> (ProxyState, is_new)
@@ -325,21 +323,6 @@ def create_app(
                 req_log.write_bytes(body_bytes)
             except Exception as _log_err:
                 logger.error("DIAG_WRITE_FAIL 1-inbound: %s path=%s", _log_err, req_log)
-
-        # --- DIAGNOSTIC: full passthrough (bypass all VC processing) ---
-        # Remove this block after testing.
-        if getattr(app.state, "_force_passthrough", False):
-            try:
-                _pt_body = json.loads(body_bytes)
-                _pt_stream = _pt_body.get("stream", "NOT SET")
-                _pt_msgs = len(_pt_body.get("messages", []))
-                _pt_cm = "YES" if _pt_body.get("context_management") else "NO"
-                _pt_kb = round(len(body_bytes) / 1024, 1)
-                logger.info("PASSTHROUGH stream=%s msgs=%d cm=%s payload=%sKB", _pt_stream, _pt_msgs, _pt_cm, _pt_kb)
-            except Exception:
-                pass
-            return await _passthrough_bytes(client, request.method, url, fwd_headers, body_bytes)
-        # --- END DIAGNOSTIC ---
 
         try:
             body = json.loads(body_bytes)
