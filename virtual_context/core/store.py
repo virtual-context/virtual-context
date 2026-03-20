@@ -289,3 +289,11 @@ class ContextStore(ABC):
     ) -> list:
         """Search indexed tool outputs by FTS. Returns list of QuoteResult."""
         return []
+
+    def save_request_capture(self, capture: dict) -> None:
+        """Persist a single request capture summary. Prunes to *limit* newest."""
+        pass
+
+    def load_request_captures(self, limit: int = 50) -> list[dict]:
+        """Load persisted request capture summaries, newest last."""
+        return []
