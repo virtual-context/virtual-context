@@ -111,6 +111,7 @@ class ContextAssembler:
                 depth = working_set[tag].depth
 
             if depth == DepthLevel.NONE:
+                logger.info("Tag '%s' SKIP (depth=NONE, hint-only)", tag)
                 continue
 
             if depth == DepthLevel.FULL and full_segments and tag in full_segments:
@@ -121,16 +122,22 @@ class ContextAssembler:
                 # SUMMARY depth or fallback
                 summaries = summaries_by_tag.get(tag, [])
                 if not summaries:
+                    logger.info("Tag '%s' SKIP (no summaries available)", tag)
                     continue
                 section = self._format_tag_section(tag, summaries)
 
             section_tokens = self.token_counter(section)
 
             if tag_tokens + section_tokens > tag_budget:
+                logger.info("Tag '%s' SKIP (budget exhausted: need %dt, have %dt remaining of %dt)",
+                            tag, section_tokens, tag_budget - tag_tokens, tag_budget)
                 break
 
             tag_sections[tag] = section
             tag_tokens += section_tokens
+            logger.info("Tag '%s' INCLUDE (%s, %dt, budget %d/%dt used)",
+                        tag, depth.value if hasattr(depth, 'value') else depth,
+                        section_tokens, tag_tokens, tag_budget)
 
         # Collect segment refs that were included in the assembled context
         presented_refs: set[str] = set()
@@ -190,6 +197,8 @@ class ContextAssembler:
                 if drop_tag not in tag_sections:
                     continue
                 dropped_tokens = self.token_counter(tag_sections[drop_tag])
+                logger.info("Tag '%s' DROP (hard cap: %dt over budget %dt, freeing %dt)",
+                            drop_tag, prepend_tokens, token_budget, dropped_tokens)
                 del tag_sections[drop_tag]
                 tag_tokens -= dropped_tokens
                 # Rebuild prepend_text

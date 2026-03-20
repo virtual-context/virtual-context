@@ -560,23 +560,12 @@ def create_app(
                             raw_content=fmt.extract_user_raw_content(body))
                 )
 
-                # Compute available headroom for VC context injection
-                _available_for_vc: int | None = None
-                try:
-                    _upstream_limit = int(state.engine.config.proxy.upstream_context_limit)
-                    _output_budget = body.get("max_tokens", 4096)
-                    _overhead = 5000  # tools, XML wrappers, safety margin
-                    _available_for_vc = max(0, _upstream_limit - _inbound_tokens - _output_budget - _overhead)
-                except (TypeError, ValueError, AttributeError):
-                    pass  # headroom unknown — assembler uses default budget
-
                 t1 = time.monotonic()
                 assembled = await asyncio.to_thread(
                     state.engine.on_message_inbound,
                     user_message,
                     state.conversation_history,
                     body.get("model", ""),
-                    max_context_tokens=_available_for_vc,
                 )
                 inbound_ms = round((time.monotonic() - t1) * 1000, 1)
 

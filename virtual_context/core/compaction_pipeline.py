@@ -129,8 +129,18 @@ class CompactionPipeline:
         compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
 
         if not compact_messages:
+            logger.info(
+                "Compaction skipped: no messages between watermark=%d and protected zone "
+                "(history=%d msgs, protected=%d turns)",
+                self._engine_state.compacted_through, len(conversation_history), protected_turns,
+            )
             return None
 
+        logger.info(
+            "Compacting %d messages (watermark=%d, history=%d, protected=%d turns)",
+            len(compact_messages), self._engine_state.compacted_through,
+            len(conversation_history), protected_turns,
+        )
         report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
 
         self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
