@@ -134,8 +134,8 @@ class ProxyState:
         self._total_requests: int = 0
 
         # Set provider on engine for persistence (only if not already restored)
-        if self.provider and not getattr(engine, '_provider', ''):
-            engine._provider = self.provider
+        if self.provider and not engine._engine_state.provider:
+            engine._engine_state.provider = self.provider
 
         # Wire up request captures persistence: engine pulls from metrics at save time
         if metrics:
@@ -220,7 +220,7 @@ class ProxyState:
             "conversation_id": engine.config.conversation_id,
             "turn_count": len(self.conversation_history) // 2,
             "total_requests": self._total_requests,
-            "compacted_through": getattr(engine, "_compacted_through", 0),
+            "compacted_through": engine._engine_state.compacted_through,
             "tag_count": len(idx.entries),
             "distinct_tags": len(all_tags),
             "active_tags": list(idx.get_active_tags(lookback=6)),
@@ -301,7 +301,7 @@ class ProxyState:
             logger.info(
                 "T%d tagged (%dms) conversation=%s compacted_through=%d history=%d%s",
                 turn, int(tag_ms), conversation_id[:12],
-                getattr(self.engine, "_compacted_through", 0),
+                self.engine._engine_state.compacted_through,
                 len(history),
                 " compact_queued" if _needs_compact else "",
             )
@@ -336,7 +336,7 @@ class ProxyState:
                 })
 
                 # Emit tag split event if splitting occurred
-                split_result = getattr(self.engine, '_last_split_result', None)
+                split_result = self.engine._engine_state.last_split_result
                 if isinstance(split_result, SplitResult):
                     if split_result.splittable:
                         new_tags = list(split_result.groups.keys())
@@ -358,7 +358,7 @@ class ProxyState:
                         "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
                         "conversation_id": conversation_id,
                     })
-                    self.engine._last_split_result = None  # consume
+                    self.engine._engine_state.last_split_result = None  # consume
 
             # Fire compaction in background if needed
             if signal is not None:
@@ -439,9 +439,7 @@ class ProxyState:
                             "summary_tokens": summary_tokens,
                             "tags": report.tags,
                             "tag_summaries_built": report.tag_summaries_built,
-                            "compacted_through": getattr(
-                                self.engine, "_compacted_through", 0
-                            ),
+                            "compacted_through": self.engine._engine_state.compacted_through,
                             "conversation_id": conversation_id,
                         })
                 else:
@@ -510,7 +508,7 @@ class ProxyState:
         except Exception as e:
             logger.warning("Failed to delete conversation during widening reset: %s", e)
         self.engine._turn_tag_index = TurnTagIndex()
-        self.engine._compacted_through = 0
+        self.engine._engine_state.compacted_through = 0
         self._ingested_conversations.discard(conversation_id)
         self._ingested_first_hash.pop(conversation_id, None)
         self._ingested_turn_count.pop(conversation_id, None)

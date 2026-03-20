@@ -697,13 +697,13 @@ def run_vc(
     #    - recompact: compacted_through == 0 but TurnTagIndex has entries → skip ingestion, re-compact
     #    - fresh: nothing cached → ingest + compact
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._compacted_through > 0
+    fully_cached = engine._engine_state.compacted_through > 0
     tags_only = not fully_cached and n_index_entries > 0
 
     if fully_cached:
         logger.info(
             "VC [%s]: CACHE HIT — %d turns indexed, compacted_through=%d. Skipping ingestion + compaction.",
-            question.question_id, n_index_entries, engine._compacted_through,
+            question.question_id, n_index_entries, engine._engine_state.compacted_through,
         )
         compaction_events = -1  # sentinel: cached
         timings["ingest_s"] = 0.0
@@ -857,7 +857,7 @@ def run_vc(
     # Mirror proxy behavior: VC context goes into system/instructions,
     # user message contains ONLY the question.
     context_hint = assembled.context_hint
-    use_raw_history = engine._compacted_through == 0
+    use_raw_history = engine._engine_state.compacted_through == 0
     question_tail = _question_block(
         question, diagnostic_rationale=reader_diagnostic_rationale,
     )
@@ -915,12 +915,12 @@ def run_vc(
     )
 
     reader_api_url = API_URLS.get(reader_provider, "")
-    require_tools = engine._compacted_through > 0
+    require_tools = engine._engine_state.compacted_through > 0
     logger.info(
         "VC [%s]: reader tool policy: %s (compacted_through=%d)",
         question.question_id,
         "required" if require_tools else "optional",
-        engine._compacted_through,
+        engine._engine_state.compacted_through,
     )
     loop_result = engine.query_with_tools(
         messages=[{"role": "user", "content": user_prompt}],
@@ -1123,7 +1123,7 @@ def run_vc_ingest_only(
 
     # Check cache status
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._compacted_through > 0
+    fully_cached = engine._engine_state.compacted_through > 0
 
     if fully_cached:
         logger.info("VC [%s]: CACHE HIT — skipping ingest+compact", question.question_id)

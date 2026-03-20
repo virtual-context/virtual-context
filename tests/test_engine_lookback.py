@@ -49,7 +49,7 @@ class TestOnMessageInboundLookback:
 
     def _patch_tagger(self, engine, mock_tagger):
         """Replace the tagger in both the engine and the retriever."""
-        engine._tag_generator = mock_tagger
+        engine._tagging._tag_generator = mock_tagger
         engine._retriever.tag_generator = mock_tagger
         # Null out the embedding-based inbound tagger so the retriever
         # falls back to tag_generator (which we just mocked).
@@ -209,7 +209,7 @@ class TestOnTurnCompleteLookback:
             mock_tagger.generate_tags = MagicMock(return_value=TagResult(
                 tags=["database"], primary="database", source="mock",
             ))
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             # Build history with 2 database turns + short response
             history = _build_history(
@@ -258,7 +258,7 @@ class TestOnTurnCompleteLookback:
 
             mock_tagger = MagicMock()
             mock_tagger.generate_tags = MagicMock(side_effect=mock_generate)
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             history = _build_history(
                 ("How do I optimize the users table?",
@@ -289,7 +289,7 @@ class TestOnTurnCompleteLookback:
             mock_tagger.generate_tags = MagicMock(return_value=TagResult(
                 tags=["database", "indexing"], primary="database", source="llm",
             ))
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             history = _build_history(
                 ("How do I optimize the users table?",
@@ -315,7 +315,7 @@ class TestOnTurnCompleteLookback:
             mock_tagger.generate_tags = MagicMock(return_value=TagResult(
                 tags=["database"], primary="database", source="llm",
             ))
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             # 5 turns of history
             history = _build_history(
@@ -367,7 +367,7 @@ class TestIngestHistoryLookback:
 
             mock_tagger = MagicMock()
             mock_tagger.generate_tags = MagicMock(side_effect=mock_generate)
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             history = _build_history(
                 ("How do I make pasta?", "Boil water, add pasta, cook 8 minutes."),
@@ -390,7 +390,7 @@ class TestIngestHistoryLookback:
             mock_tagger.generate_tags = MagicMock(return_value=TagResult(
                 tags=["database"], primary="database", source="mock",
             ))
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             history = _build_history(
                 ("First about databases", "Use PostgreSQL."),
@@ -422,7 +422,7 @@ class TestIngestHistoryLookback:
 
             mock_tagger = MagicMock()
             mock_tagger.generate_tags = MagicMock(side_effect=mock_generate)
-            engine._tag_generator = mock_tagger
+            engine._tagging._tag_generator = mock_tagger
 
             history = _build_history(
                 ("How do I set up a database?", "Use PostgreSQL."),

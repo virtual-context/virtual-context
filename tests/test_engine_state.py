@@ -188,7 +188,7 @@ class TestEngineStateIntegration:
                 tags=[f"tag-{i}"],
                 primary_tag=f"tag-{i}",
             ))
-        engine1._compacted_through = 4
+        engine1._engine_state.compacted_through = 4
 
         # Store a segment so watermark validation passes on reload
         from virtual_context.types import Message, StoredSegment, SegmentMetadata
@@ -216,7 +216,7 @@ class TestEngineStateIntegration:
 
         # State should be restored
         assert engine2.config.conversation_id == conversation_id
-        assert engine2._compacted_through == 4
+        assert engine2._engine_state.compacted_through == 4
         assert len(engine2._turn_tag_index.entries) == 5
         assert engine2._turn_tag_index.entries[0].tags == ["tag-0"]
         assert engine2._turn_tag_index.entries[4].tags == ["tag-4"]

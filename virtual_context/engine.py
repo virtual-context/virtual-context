@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
-import time
-from calendar import monthrange
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from collections.abc import Callable
 from pathlib import Path
 
 from .config import load_config
 from .core.assembler import ContextAssembler
-from .core.hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
 from .core.compactor import DomainCompactor
 from .core.model_catalog import ModelCatalog
 from .core.telemetry import TelemetryLedger
@@ -30,34 +25,21 @@ from .storage.sqlite import SQLiteStore
 from .token_counter import create_token_counter
 from .types import (
     AssembledContext,
-    ChunkEmbedding,
     CompactionReport,
-    CompactionResult,
     CompactionSignal,
     DEFAULT_CHAT_MODEL,
-    DepthLevel,
+    EngineState,
     EngineStateSnapshot,
     Message,
-    QuoteResult,
     RetrievalResult,
-    SegmentMetadata,
-    SplitResult,
-    StoredSegment,
-    StoredSummary,
-    TagResult,
-    TagSummary,
     ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
-    WorkingSetEntry,
-    get_sender_name,
 )
 
 logger = logging.getLogger(__name__)
 
 _SESSION_HEADER_RE = re.compile(r'\[Session from ([^\]]+)\]')
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_ISO_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
 # Patterns for stub content detection (media attachments, image placeholders, etc.)
@@ -90,9 +72,11 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
+from .core.compaction_pipeline import CompactionPipeline
 from .core.paging_manager import PagingManager
-from .core.quote_search import find_quote as _find_quote, supplement_from_descriptions as _supplement_from_descriptions, _parse_session_date as _parse_session_date_str
-from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
+from .core.retrieval_assembler import RetrievalAssembler
+from .core.semantic_search import SemanticSearchManager
+from .core.tagging_pipeline import TaggingPipeline
 
 
 class VirtualContextEngine:
@@ -142,11 +126,21 @@ class VirtualContextEngine:
         self._init_retriever()
         self._init_compactor()
         self._init_tag_splitter()
-        self._compacted_through = 0  # message index watermark: messages before this already compacted
-        self._tool_tag_counter = 0  # sequential counter for tool_N tags
-        self._last_tag_ms: float = 0.0
-        self._last_compact_ms: float = 0.0
+        self._engine_state = EngineState()  # mutable shared state for delegates
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
+        from .core.fact_query import FactQueryEngine
+        self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
+        from .core.search_engine import SearchEngine
+        self._search = SearchEngine(
+            store=self._store, semantic=self._semantic,
+            turn_tag_index=self._turn_tag_index, config=self.config,
+        )
+        from .core.temporal_resolver import TemporalResolver
+        self._temporal = TemporalResolver(
+            store=self._store, search_engine=self._search, config=self.config,
+        )
+        from .core.tool_query import ToolQueryRunner
+        self._tool_query = ToolQueryRunner(engine=self, config=self.config)
         self._paging = PagingManager(
             store=self._store,
             token_counter=self._token_counter,
@@ -155,30 +149,66 @@ class VirtualContextEngine:
             paging_enabled=self.config.paging.enabled,
             conversation_id=self.config.conversation_id,
         )
-        self._split_processed_tags: set[str] = set()
         self._supersession_checker = None
         self._init_supersession_checker()
         self._fact_curator = None
         self._init_fact_curator()
-        self._last_split_result: SplitResult | None = None
-        self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
-        self.reference_date: date | None = None  # override "today" for remember_when relative presets
+        self._tagging = TaggingPipeline(
+            tag_generator=self._tag_generator,
+            turn_tag_index=self._turn_tag_index,
+            store=self._store,
+            semantic=self._semantic,
+            engine_state=self._engine_state,
+            config=self.config,
+            tag_splitter=self._tag_splitter,
+            canonicalizer=self._canonicalizer,
+            telemetry=self._telemetry,
+            monitor=self._monitor,
+            compactor=self._compactor,
+            save_state_callback=self._save_state,
+        )
+        self._compaction = CompactionPipeline(
+            compactor=self._compactor,
+            segmenter=self._segmenter,
+            store=self._store,
+            turn_tag_index=self._turn_tag_index,
+            engine_state=self._engine_state,
+            config=self.config,
+            supersession_checker=self._supersession_checker,
+            fact_curator=self._fact_curator,
+            semantic=self._semantic,
+            telemetry=self._telemetry,
+            save_state_callback=self._save_state,
+        )
+        self._retrieval = RetrievalAssembler(
+            retriever=self._retriever,
+            assembler=self._assembler,
+            monitor=self._monitor,
+            paging=self._paging,
+            store=self._store,
+            turn_tag_index=self._turn_tag_index,
+            engine_state=self._engine_state,
+            fact_curator=self._fact_curator,
+            config=self.config,
+            token_counter=self._token_counter,
+        )
+        self._retrieval._set_semantic(self._semantic)
+        self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
-        self._provider: str = ""  # set by ProxyState, persisted in engine state
-
-        # Cached state from last on_message_inbound call (used by reassemble_context)
-        self._last_retrieval_result: RetrievalResult | None = None
-        self._last_conversation_history: list[Message] | None = None
-        self._last_model_name: str = ""
-        self._presented_segment_refs: set[str] = set()
 
         # Restore persisted state if available
         self._load_persisted_state()
-        # Re-sync segmenter's index reference — _load_persisted_state replaces
-        # self._turn_tag_index with a new object, but the segmenter was initialized
+        # Re-sync delegate index references — _load_persisted_state replaces
+        # self._turn_tag_index with a new object, but delegates were initialized
         # with the old (empty) one.
         self._segmenter._turn_tag_index = self._turn_tag_index
+        self._tagging._turn_tag_index = self._turn_tag_index
+        self._tagging._engine_state = self._engine_state
+        self._compaction._turn_tag_index = self._turn_tag_index
+        self._compaction._engine_state = self._engine_state
+        self._retrieval._turn_tag_index = self._turn_tag_index
+        self._retrieval._engine_state = self._engine_state
         self._bootstrap_vocabulary()
 
     def close(self) -> None:
@@ -197,22 +227,14 @@ class VirtualContextEngine:
             pass
 
     @property
-    def _embed_fn(self):
-        """Proxy to SemanticSearchManager's embed function (for test compat)."""
-        return self._semantic._embed_fn
+    def reference_date(self) -> date | None:
+        """Override 'today' for remember_when relative presets."""
+        return self._reference_date
 
-    @_embed_fn.setter
-    def _embed_fn(self, value):
-        self._semantic._embed_fn = value
-
-    @property
-    def _working_set(self) -> dict[str, WorkingSetEntry]:
-        """Proxy to PagingManager's working set (for backward compat)."""
-        return self._paging.working_set
-
-    @_working_set.setter
-    def _working_set(self, value: dict[str, WorkingSetEntry]):
-        self._paging.working_set = value
+    @reference_date.setter
+    def reference_date(self, value: date | None) -> None:
+        self._reference_date = value
+        self._temporal.reference_date = value
 
     def _init_canonicalizer(self) -> None:
         """Initialize the tag canonicalizer with store aliases."""
@@ -234,7 +256,7 @@ class VirtualContextEngine:
         self._tag_generator: TagGenerator = build_tag_generator(
             self.config.tag_generator, llm_provider,
             canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
-            embed_fn_factory=self._get_embed_fn,
+            embed_fn_factory=lambda: self._semantic.get_embed_fn(),
         )
 
     def _init_store(self) -> None:
@@ -400,184 +422,6 @@ class VirtualContextEngine:
             self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
 
-    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch → DB after each batch
-
-    def _compact_and_store(
-        self, segments: list, compact_messages_len: int,
-        progress_callback: Callable[..., None] | None = None,
-    ) -> list[CompactionResult]:
-        """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
-        batch immediately so results are visible in the DB incrementally."""
-        from .types import FactSignal
-
-        all_results: list[CompactionResult] = []
-        batch_size = self._COMPACT_BATCH_SIZE
-
-        # D1: Gather fact signals from TurnTagIndex scoped per segment.
-        # Build a segment-to-turn mapping using turn_offset and each segment's
-        # turn_count, then collect only the fact signals for each segment's
-        # source turns.
-        turn_offset = self._compacted_through // 2
-        seg_cursor = turn_offset
-        segment_signals: dict[str, list[FactSignal]] = {}
-        for seg in segments:
-            seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
-            signals: list[FactSignal] = []
-            for t in range(seg_cursor, seg_cursor + seg_turn_count):
-                entry = self._turn_tag_index.get_tags_for_turn(t)
-                if entry and entry.fact_signals:
-                    signals.extend(entry.fact_signals)
-            if signals:
-                segment_signals[seg.id] = signals
-            seg_cursor += seg_turn_count
-
-        for start in range(0, len(segments), batch_size):
-            batch = segments[start:start + batch_size]
-            batch_num = start // batch_size + 1
-            total_batches = (len(segments) + batch_size - 1) // batch_size
-            logger.info(
-                "Compacting batch %d/%d (%d segments)...",
-                batch_num, total_batches, len(batch),
-            )
-            # D1: Pass per-segment signals to the compactor for verification.
-            fact_signals_by_segment = {
-                seg.id: segment_signals[seg.id]
-                for seg in batch if seg.id in segment_signals
-            } or None
-            # Filter out stub segments (media placeholders, image stubs) — not worth
-            # LLM summarization. Real short messages ("im good") should be compacted
-            # normally since they belong to their parent topic segment.
-            def _is_passthrough(s):
-                text = " ".join(m.content for m in s.messages)
-                return _is_stub_content(text)
-            compactable = [s for s in batch if not _is_passthrough(s)]
-            stubs = [s for s in batch if _is_passthrough(s)]
-            for seg in stubs:
-                text = " ".join(m.content for m in seg.messages).strip()
-                logger.info(
-                    "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s — using raw text as summary",
-                    seg.id[:8], seg.token_count, seg.primary_tag,
-                )
-                results_tiny = [CompactionResult(
-                    segment_id=seg.id,
-                    primary_tag=seg.primary_tag,
-                    tags=seg.tags,
-                    summary=text or f"[empty turn: {seg.primary_tag}]",
-                    summary_tokens=seg.token_count,
-                    full_text=text,
-                    original_tokens=seg.token_count,
-                    messages=[{"role": m.role, "content": m.content} for m in seg.messages],
-                    metadata=SegmentMetadata(
-                        turn_count=seg.turn_count,
-                        session_date=getattr(seg, "session_date", ""),
-                    ),
-                    compression_ratio=1.0,
-                    timestamp=seg.start_timestamp,
-                )]
-                all_results.extend(results_tiny)
-                for result in results_tiny:
-                    stored = StoredSegment(
-                        ref=result.segment_id,
-                        conversation_id=self.config.conversation_id,
-                        primary_tag=result.primary_tag,
-                        tags=result.tags,
-                        summary=result.summary,
-                        summary_tokens=result.summary_tokens,
-                        full_text=result.full_text,
-                        full_tokens=result.original_tokens,
-                        messages=result.messages,
-                        metadata=result.metadata,
-                        compaction_model="passthrough",
-                        compression_ratio=1.0,
-                        start_timestamp=result.timestamp,
-                        end_timestamp=result.timestamp,
-                    )
-                    self._store.store_segment(stored)
-            if not compactable:
-                continue
-            batch = compactable
-            results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
-            # Store each result to DB right away
-            for i, result in enumerate(results):
-                stored = StoredSegment(
-                    ref=result.segment_id,
-                    conversation_id=self.config.conversation_id,
-                    primary_tag=result.primary_tag,
-                    tags=result.tags,
-                    summary=result.summary,
-                    summary_tokens=result.summary_tokens,
-                    full_text=result.full_text,
-                    full_tokens=result.original_tokens,
-                    messages=result.messages,
-                    metadata=result.metadata,
-                    compaction_model=self._compactor.model_name,
-                    compression_ratio=result.compression_ratio,
-                    start_timestamp=result.timestamp,
-                    end_timestamp=result.timestamp,
-                )
-                self._store.store_segment(stored)
-                self._embed_and_store_chunks(stored)
-                if progress_callback:
-                    try:
-                        progress_callback(
-                            len(all_results) + i + 1, len(segments), result,
-                            phase="segment_stored",
-                        )
-                    except Exception:
-                        pass
-                # D1: Store extracted facts with provenance
-                if result.facts:
-                    for fact in result.facts:
-                        fact.segment_ref = stored.ref
-                        fact.conversation_id = self.config.conversation_id
-                    self._store.store_facts(result.facts)
-                    logger.info(
-                        "  Stored %d facts for segment %s",
-                        len(result.facts), result.primary_tag,
-                    )
-                    # D1: Run supersession + fact linking
-                    _superseded_count = 0
-                    _links_count = 0
-                    if self._supersession_checker:
-                        try:
-                            if hasattr(self._supersession_checker, 'check_and_link'):
-                                _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
-                            else:
-                                _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
-                            if _superseded_count:
-                                logger.info(
-                                    "  Superseded %d facts for segment %s",
-                                    _superseded_count, result.primary_tag,
-                                )
-                            if _links_count:
-                                logger.info(
-                                    "  Linked %d facts for segment %s",
-                                    _links_count, result.primary_tag,
-                                )
-                        except Exception as e:
-                            logger.warning("Supersession/linking failed: %s", e)
-                    if progress_callback:
-                        try:
-                            progress_callback(
-                                len(all_results) + i + 1, len(segments), result,
-                                phase="facts_extracted",
-                                fact_count=len(result.facts),
-                                superseded_count=_superseded_count,
-                                links_count=_links_count,
-                            )
-                        except Exception:
-                            pass
-                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
-                logger.info(
-                    "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                    start + i + 1, len(segments), result.primary_tag,
-                    session_date or 'none',
-                    result.original_tokens, result.summary_tokens,
-                )
-            all_results.extend(results)
-
-        return all_results
-
     def _load_persisted_state(self) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available."""
         try:
@@ -588,33 +432,34 @@ class VirtualContextEngine:
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
-        self._compacted_through = saved.compacted_through
+        self._engine_state.compacted_through = saved.compacted_through
         self._turn_tag_index = TurnTagIndex()
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
-        self._split_processed_tags = set(saved.split_processed_tags)
+        self._search._turn_tag_index = self._turn_tag_index
+        self._engine_state.split_processed_tags = set(saved.split_processed_tags)
         # Restore paging working set (backward-compatible: old snapshots have empty list)
-        self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
-        self._trailing_fingerprint = saved.trailing_fingerprint
+        self._paging.working_set = {ws.tag: ws for ws in (saved.working_set or [])}
+        self._engine_state.trailing_fingerprint = saved.trailing_fingerprint
         # Restore telemetry counters from persisted rollup
         if saved.telemetry_rollup:
             self._telemetry.restore_from_rollup(saved.telemetry_rollup)
         # Stash request captures for ProxyState to pick up after init
         self._restored_request_captures = saved.request_captures or []
-        self._provider = saved.provider or ""
-        self._tool_tag_counter = saved.tool_tag_counter or 0
+        self._engine_state.provider = saved.provider or ""
+        self._engine_state.tool_tag_counter = saved.tool_tag_counter or 0
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
-            len(self._working_set),
+            len(self._paging.working_set),
         )
 
         # Validate watermark against actual stored segments.
         # If the store has no segments for this conversation (e.g., user deleted
         # the conversation or segments were purged), reset the watermark so
         # ingested history can be compacted fresh.
-        if self._compacted_through > 0:
+        if self._engine_state.compacted_through > 0:
             try:
                 segs = self._store.get_segments_by_tags(
                     tags=["_general"], min_overlap=0, limit=1,
@@ -626,9 +471,9 @@ class VirtualContextEngine:
                     if not tags:
                         logger.warning(
                             "Watermark=%d but store has no segments for conversation %s — resetting to 0",
-                            self._compacted_through, self.config.conversation_id[:12],
+                            self._engine_state.compacted_through, self.config.conversation_id[:12],
                         )
-                        self._compacted_through = 0
+                        self._engine_state.compacted_through = 0
             except Exception:
                 pass  # Don't crash on validation failure
 
@@ -680,16 +525,16 @@ class VirtualContextEngine:
                     pass
             self._store.save_engine_state(EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
-                compacted_through=self._compacted_through,
+                compacted_through=self._engine_state.compacted_through,
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=len(conversation_history) // 2,
-                split_processed_tags=sorted(self._split_processed_tags),
-                working_set=list(self._working_set.values()),
-                trailing_fingerprint=self._trailing_fingerprint,
+                split_processed_tags=sorted(self._engine_state.split_processed_tags),
+                working_set=list(self._paging.working_set.values()),
+                trailing_fingerprint=self._engine_state.trailing_fingerprint,
                 telemetry_rollup=telemetry_dict,
                 request_captures=captures,
-                provider=self._provider,
-                tool_tag_counter=self._tool_tag_counter,
+                provider=self._engine_state.provider,
+                tool_tag_counter=self._engine_state.tool_tag_counter,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
@@ -715,7 +560,7 @@ class VirtualContextEngine:
                 config=sc,
                 graph_links=True,
                 telemetry_ledger=self._telemetry,
-                embed_fn=self._get_embed_fn(),
+                embed_fn=self._semantic.get_embed_fn(),
             )
             logger.info("Fact link checker initialized (provider=%s, model=%s, graph_links=True)", provider_name, model)
         else:
@@ -726,7 +571,7 @@ class VirtualContextEngine:
                 store=self._store,
                 config=sc,
                 telemetry_ledger=self._telemetry,
-                embed_fn=self._get_embed_fn(),
+                embed_fn=self._semantic.get_embed_fn(),
             )
             logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 
@@ -809,371 +654,16 @@ class VirtualContextEngine:
         model_name: str = "",
         max_context_tokens: int | None = None,
     ) -> AssembledContext:
-        """Before sending to LLM: tag, retrieve, assemble enriched context."""
-        # Determine active tags from recent tag results
-        # Post-compaction: don't suppress retrieval — stored summaries are needed
-        # since raw turns have been compacted away
-        if self._compacted_through > 0:
-            active_tags = []
-        else:
-            active_tags = self._get_active_tags(conversation_history)
-
-        # Compute current utilization (only count un-compacted history)
-        snapshot = self._monitor.build_snapshot(
-            conversation_history[self._compacted_through:]
-        )
-        utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
-
-        # Build context for inbound tagger.
-        # Include recent turns even post-compaction so query-time tagging can
-        # use immediate conversational cues.
-        n_context = self.config.tag_generator.context_lookback_pairs
-        # For inbound, the current message is not yet in history — no need to exclude
-        context = self._get_recent_context(
-            conversation_history, n_context, exclude_last=0,
-        )
-
-        # Retrieve relevant tag summaries
-        retrieval_result = self._retriever.retrieve(
-            message=message,
-            current_active_tags=active_tags,
-            current_utilization=utilization,
-            post_compaction=(self._compacted_through > 0),
-            context_turns=context,
-        )
-
-        # D2: Curate facts down to query-relevant subset before assembly
-        if self._fact_curator and retrieval_result.facts:
-            retrieval_result.facts = self._fact_curator.curate(
-                retrieval_result.facts,
-                question=message,
-            )
-
-        # Build context awareness hint (post-compaction only)
-        _paging_mode = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
-        context_hint = self._build_context_hint(paging_mode=_paging_mode)
-
-        # Load core context
-        core_context = self._assembler.load_core_context()
-
-        # Paging: load content at working set depth levels
-        ws_param, full_segments_param = self._load_working_set_segments()
-        if ws_param:
-            # Update last_accessed_turn for tags matched by current query
-            query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
-            for tag, entry in self._working_set.items():
-                if tag in query_tags:
-                    entry.last_accessed_turn = len(self._turn_tag_index.entries)
-
-        # Assemble enriched context — only pass uncompacted messages
-        uncompacted = conversation_history[self._compacted_through:]
-        assembled = self._assembler.assemble(
-            core_context=core_context,
-            retrieval_result=retrieval_result,
-            conversation_history=uncompacted,
-            token_budget=self.config.context_window,
-            context_hint=context_hint,
-            working_set=ws_param,
-            full_segments=full_segments_param,
-            max_context_tokens=max_context_tokens,
-        )
-
-        # Expose the message's own tags for downstream use (e.g. history filtering).
-        # Use tags_from_message (what the tag generator produced for this message)
-        # rather than tags_matched (which only includes tags found in the store).
-        message_tags = retrieval_result.retrieval_metadata.get(
-            "tags_from_message", retrieval_result.tags_matched
-        )
-
-        # Retry with expanded context if only _general was produced.
-        # Applies both pre- and post-compaction.
-        if message_tags == ["_general"]:
-            expanded = self._get_recent_context(
-                conversation_history, n_context * 2, exclude_last=0,
-            )
-            if expanded:
-                retry_result = self._retriever.retrieve(
-                    message=message,
-                    current_active_tags=active_tags,
-                    current_utilization=utilization,
-                    post_compaction=(self._compacted_through > 0),
-                    context_turns=expanded,
-                )
-                retry_tags = retry_result.retrieval_metadata.get(
-                    "tags_from_message", retry_result.tags_matched
-                )
-                if retry_tags != ["_general"]:
-                    message_tags = retry_tags
-                    retrieval_result = retry_result
-
-        # Final fallback: inherit from most recent meaningful turn in the index
-        if message_tags == ["_general"]:
-            prev = self._turn_tag_index.latest_meaningful_tags()
-            if prev:
-                message_tags = list(prev.tags)
-
-        assembled.matched_tags = message_tags
-        assembled.context_hint = context_hint
-
-        # Cache for reassemble_context() — used after paging tool execution
-        self._last_retrieval_result = retrieval_result
-        self._last_conversation_history = conversation_history
-        self._last_model_name = model_name
-        self._presented_segment_refs = set(assembled.presented_segment_refs)
-
-        return assembled
-
-    @staticmethod
-    def _is_tool_turn(messages: list[Message]) -> bool:
-        """Check if a turn is tool-only: has tool blocks in raw_content and empty text content."""
-        combined_text = " ".join(m.content for m in messages)
-        if combined_text.strip():
-            return False  # has real text content — use LLM tagger
-        has_tool_block = False
-        for m in messages:
-            if not m.raw_content:
-                continue
-            for block in m.raw_content:
-                if block.get("type") in ("tool_use", "tool_result"):
-                    has_tool_block = True
-                    break
-            if has_tool_block:
-                break
-        return has_tool_block
+        """Before sending to LLM: tag, retrieve, assemble enriched context (delegates to RetrievalAssembler)."""
+        return self._retrieval.on_message_inbound(message, conversation_history, model_name, max_context_tokens)
 
     def tag_turn(
         self,
         conversation_history: list[Message],
         payload_tokens: int | None = None,
     ) -> CompactionSignal | None:
-        """Phase 1 of turn processing: tag the latest turn and check thresholds.
-
-        Fast (~2-3s with LLM tagger). Must complete before the next inbound
-        request so the turn-tag index is up-to-date for retrieval.
-
-        Returns a CompactionSignal if compaction is needed, None otherwise.
-
-        *payload_tokens* (proxy mode): actual client payload token count.
-        Overrides the stripped conversation_history token count in the
-        compaction monitor so thresholds trigger at the right level.
-        """
-        # Tag the latest round trip
-        _t_tag = time.monotonic()
-        latest_pair = self._get_latest_turn_pair(conversation_history)
-        sender = get_sender_name(latest_pair[0].metadata) if latest_pair else ""
-        if latest_pair:
-            combined_text = " ".join(m.content for m in latest_pair)
-
-            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
-            if self._is_tool_turn(latest_pair):
-                self._tool_tag_counter += 1
-                tag_name = f"tool_{self._tool_tag_counter}"
-                self._turn_tag_index.append(TurnTagEntry(
-                    turn_number=len(self._turn_tag_index.entries),
-                    message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                    tags=[tag_name],
-                    primary_tag=tag_name,
-                    sender=sender or "",
-                    session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-                ))
-                latest_pair = None  # skip normal tagger flow below
-
-            # BUG-013: Skip empty turns with no tool blocks
-            elif not combined_text.strip():
-                latest_pair = None
-
-        if latest_pair:
-            store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-            n_context = self.config.tag_generator.context_lookback_pairs
-            context = self._get_recent_context(
-                conversation_history, n_context, current_text=combined_text,
-            )
-            tag_result = self._tag_generator.generate_tags(
-                combined_text, store_tags, context_turns=context,
-            )
-
-            # Retry with expanded context if only _general was produced
-            if tag_result.tags == ["_general"]:
-                expanded = self._get_recent_context(
-                    conversation_history, n_context * 2,
-                    current_text=combined_text,
-                )
-                if expanded:
-                    tag_result = self._tag_generator.generate_tags(
-                        combined_text, store_tags, context_turns=expanded,
-                    )
-
-            # Final fallback: inherit from most recent meaningful turn
-            if tag_result.tags == ["_general"]:
-                prev = self._turn_tag_index.latest_meaningful_tags()
-                if prev:
-                    tag_result = TagResult(
-                        tags=list(prev.tags),
-                        primary=prev.primary_tag,
-                        source="inherited",
-                    )
-
-            self._turn_tag_index.append(TurnTagEntry(
-                turn_number=len(self._turn_tag_index.entries),
-                message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                tags=tag_result.tags,
-                primary_tag=tag_result.primary,
-                fact_signals=tag_result.fact_signals,
-                sender=sender or "",
-                session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-            ))
-
-        self._last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
-
-        # Check for overly-broad tags needing splitting
-        if self._tag_splitter:
-            self._check_and_split_broad_tags(conversation_history)
-
-        # Build snapshot (only count un-compacted messages)
-        snapshot = self._monitor.build_snapshot(
-            conversation_history[self._compacted_through:],
-            payload_tokens=payload_tokens,
-        )
-
-        # Check thresholds
-        signal = self._monitor.check(snapshot)
-
-        if signal is None:
-            self._last_compact_ms = 0.0
-            # Persist turn message text for post-restart recall
-            if latest_pair:
-                turn_num = len(self._turn_tag_index.entries) - 1
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        turn_num,
-                        latest_pair[0].content if len(latest_pair) > 0 else "",
-                        latest_pair[1].content if len(latest_pair) > 1 else "",
-                        user_raw_content=json.dumps(latest_pair[0].raw_content) if len(latest_pair) > 0 and latest_pair[0].raw_content else None,
-                        assistant_raw_content=json.dumps(latest_pair[1].raw_content) if len(latest_pair) > 1 and latest_pair[1].raw_content else None,
-                    )
-                except Exception:
-                    pass  # never block tagging for message persistence
-            self._save_state(conversation_history)
-
-        return signal
-
-    def _run_compaction(
-        self,
-        conversation_history: list[Message],
-        compact_messages: list[Message],
-        progress_callback: Callable[..., None] | None = None,
-    ) -> CompactionReport:
-        """Shared compaction core: segment, compact, store, build tag summaries.
-
-        Called by both ``compact_if_needed`` (threshold-triggered) and
-        ``compact_manual`` (explicit) after their respective guard checks
-        have selected *compact_messages*.
-
-        Returns a CompactionReport (never None — callers handle None guards).
-        """
-        # Segment and compact in batches (results stored to DB incrementally)
-        turn_offset = self._compacted_through // 2
-        segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
-        logger.info(
-            "Segmented %d messages into %d segments (watermark=%d)",
-            len(compact_messages), len(segments), self._compacted_through,
-        )
-        results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
-
-        # Advance watermark past compacted messages
-        self._compacted_through += len(compact_messages)
-
-        tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
-        tags = list({tag for r in results for tag in r.tags})
-
-        # Build/update tag summaries — only for tags in newly compacted segments
-        tag_summaries_built = 0
-        cover_tags: list[str] = []
-        if results and self._compactor:
-            # Only rebuild tag summaries for tags that were just compacted
-            compacted_tags = {tag for r in results for tag in r.tags}
-            cover_tags = [
-                t for t in self._turn_tag_index.compute_cover_set()
-                if t in compacted_tags
-            ]
-            # Primary tag guarantee: ensure every segment's primary_tag gets
-            # a tag summary, even if the greedy set cover dropped it.
-            # Without this, ephemeral topics (2-3 turns) lose their most
-            # specific tag to broader tags that cover more segments.
-            cover_set = set(cover_tags)
-            for r in results:
-                if r.primary_tag and r.primary_tag not in cover_set:
-                    cover_tags.append(r.primary_tag)
-                    cover_set.add(r.primary_tag)
-            if cover_tags:
-                # Gather segment summaries per cover tag
-                tag_to_summaries: dict[str, list] = {}
-                for tag in cover_tags:
-                    summaries = self._store.get_summaries_by_tags(
-                        tags=[tag], min_overlap=1, limit=50,
-                        conversation_id=self.config.conversation_id,
-                    )
-                    if summaries:
-                        tag_to_summaries[tag] = summaries
-
-                # Gather turn numbers per tag from index
-                tag_to_turns: dict[str, list[int]] = {}
-                for entry in self._turn_tag_index.entries:
-                    for tag in entry.tags:
-                        if tag in cover_tags:
-                            tag_to_turns.setdefault(tag, []).append(entry.turn_number)
-
-                # Load existing tag summaries for staleness check
-                existing_tag_summaries = {}
-                for tag in cover_tags:
-                    ts = self._store.get_tag_summary(tag, conversation_id=self.config.conversation_id)
-                    if ts:
-                        existing_tag_summaries[tag] = ts
-
-                if self._turn_tag_index.entries:
-                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
-
-                    new_tag_summaries = self._compactor.compact_tag_summaries(
-                        cover_tags=cover_tags,
-                        tag_to_summaries=tag_to_summaries,
-                        tag_to_turns=tag_to_turns,
-                        existing_tag_summaries=existing_tag_summaries,
-                        max_turn=max_turn,
-                    )
-
-                    for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
-                        if progress_callback:
-                            try:
-                                progress_callback(
-                                    ts_i + 1, len(new_tag_summaries), None,
-                                    phase="tag_summary_built",
-                                    tag=ts.tag,
-                                )
-                            except Exception:
-                                pass
-                    tag_summaries_built = len(new_tag_summaries)
-
-        report = CompactionReport(
-            segments_compacted=len(results),
-            tokens_freed=tokens_freed,
-            tags=tags,
-            results=results,
-            tag_summaries_built=tag_summaries_built,
-            cover_tags=cover_tags,
-        )
-
-        # Enforce TTL from tag rules
-        if self.config.tag_rules:
-            min_ttl = min(
-                (r.ttl_days for r in self.config.tag_rules if r.ttl_days is not None),
-                default=None,
-            )
-            if min_ttl is not None:
-                self._store.cleanup(max_age=timedelta(days=min_ttl))
-
-        return report
+        """Phase 1 of turn processing (delegates to TaggingPipeline)."""
+        return self._tagging.tag_turn(conversation_history, payload_tokens)
 
     def compact_if_needed(
         self,
@@ -1181,49 +671,8 @@ class VirtualContextEngine:
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport | None:
-        """Phase 2 of turn processing: run compaction.
-
-        Slow (~10s with LLM summarizer). Can run in background after
-        tag_turn() completes — the next request only needs the tag index.
-
-        *signal*: the CompactionSignal returned by tag_turn().
-        """
-        _t_compact = time.monotonic()
-
-        if self._compactor is None:
-            logger.warning(
-                "Compaction triggered but no LLM provider configured. "
-                "Configure a provider in the providers section."
-            )
-            return None
-
-        logger.info(
-            f"Compaction triggered ({signal.priority}): "
-            f"{signal.current_tokens}/{signal.budget_tokens} tokens, "
-            f"overflow={signal.overflow_tokens}"
-        )
-
-        # Select messages to compact (not in protected zone)
-        protected_turns = self.config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2  # user + assistant per turn
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        # Messages to compact: everything between watermark and protected zone.
-        # Compact all available messages (not just the minimum) so compaction
-        # fires infrequently — one big batch instead of many small ones.
-        compact_messages = conversation_history[self._compacted_through:-protected_count]
-
-        if not compact_messages:
-            return None
-
-        report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
-
-        self._last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
-        self._save_state(conversation_history)
-        return report
+        """Phase 2 of turn processing: run compaction (delegates to CompactionPipeline)."""
+        return self._compaction.compact_if_needed(conversation_history, signal, progress_callback)
 
     def on_turn_complete(
         self,
@@ -1241,445 +690,28 @@ class VirtualContextEngine:
             return None
         return self.compact_if_needed(conversation_history, signal)
 
-    def _check_and_split_broad_tags(
-        self, conversation_history: list[Message],
-    ) -> SplitResult | None:
-        """Check for overly-broad tags and split or summarize them."""
-        if not self._tag_splitter:
-            return None
-
-        cfg = self.config.tag_generator.tag_splitting
-        tag_counts = self._turn_tag_index.get_tag_counts()
-        total_turns = len(self._turn_tag_index.entries)
-
-        if total_turns == 0:
-            return None
-
-        # Find candidates: above both thresholds, not already processed
-        candidates = [
-            (tag, count) for tag, count in tag_counts.items()
-            if tag != "_general"
-            and tag not in self._split_processed_tags
-            and count >= cfg.frequency_threshold
-            and count / total_turns >= cfg.frequency_pct_threshold
-        ]
-
-        if not candidates:
-            return None
-
-        # Pick highest-frequency first
-        candidates.sort(key=lambda x: -x[1])
-        tag, count = candidates[0]
-
-        # Collect turn content
-        turn_contents = self._collect_turn_text(tag, conversation_history)
-        if not turn_contents:
-            self._split_processed_tags.add(tag)
-            return None
-
-        existing_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
-        result = self._tag_splitter.split(tag, turn_contents, existing_tags, total_turns)
-
-        if result.splittable:
-            # Apply split to TurnTagIndex
-            turn_to_new: dict[int, list[str]] = {}
-            for new_tag, turn_numbers in result.groups.items():
-                for tn in turn_numbers:
-                    turn_to_new.setdefault(tn, []).append(new_tag)
-            self._turn_tag_index.replace_tag(tag, turn_to_new)
-
-            # Register alias so old tag queries still resolve
-            if self._canonicalizer:
-                first_new = next(iter(result.groups))
-                self._canonicalizer.register_alias(tag, first_new)
-
-            # Update tagger vocabulary
-            if hasattr(self._tag_generator, '_tag_vocabulary'):
-                self._tag_generator._tag_vocabulary.pop(tag, None)
-                for new_tag, turns in result.groups.items():
-                    self._tag_generator._tag_vocabulary[new_tag] = len(turns)
-
-            logger.info(
-                "Split '%s' (%d turns) → %s",
-                tag, count, list(result.groups.keys()),
-            )
-        else:
-            # Fallback: build tag summary from raw turn text
-            self._build_broad_tag_summary(tag, conversation_history)
-            logger.info(
-                "Tag '%s' unsplittable (%s), built summary", tag, result.reason,
-            )
-
-        self._split_processed_tags.add(tag)
-        self._last_split_result = result
-        return result
-
-    @staticmethod
-    def _extract_turn_pairs(history: list[Message]) -> list[tuple[str, str]]:
-        """Extract user→assistant turn pairs from history, handling non-alternating messages.
-
-        Returns list of (user_text, assistant_text) tuples. Skips preamble-only
-        user messages (e.g., MemOS '# Role' injections) and handles consecutive
-        user messages by using the last user message before each assistant response.
-        """
-        pairs: list[tuple[str, str]] = []
-        last_user_text = ""
-        for msg in history:
-            if msg.role == "user":
-                last_user_text = msg.content
-            elif msg.role == "assistant" and last_user_text:
-                pairs.append((last_user_text, msg.content))
-                last_user_text = ""
-        return pairs
-
-    def _collect_turn_text(
-        self, tag: str, history: list[Message],
-    ) -> list[tuple[int, str]]:
-        """Collect truncated user text for turns tagged with the given tag."""
-        pairs = self._extract_turn_pairs(history)
-        result = []
-        for entry in self._turn_tag_index.entries:
-            if tag in entry.tags:
-                if entry.turn_number < len(pairs):
-                    text = pairs[entry.turn_number][0][:200]
-                    result.append((entry.turn_number, text))
-        return result
-
-    def _build_broad_tag_summary(
-        self, tag: str, history: list[Message],
-    ) -> None:
-        """Build a tag summary directly from raw turn text for unsplittable broad tags."""
-        if not self._compactor:
-            return
-
-        pairs = self._extract_turn_pairs(history)
-        texts = []
-        turn_numbers = []
-        for entry in self._turn_tag_index.entries:
-            if tag in entry.tags:
-                if entry.turn_number < len(pairs):
-                    user_text, assistant_text = pairs[entry.turn_number]
-                    texts.append(
-                        f"User: {user_text[:300]}\n"
-                        f"Assistant: {assistant_text[:300]}"
-                    )
-                    turn_numbers.append(entry.turn_number)
-
-        if not texts:
-            return
-
-        combined = "\n\n---\n\n".join(texts)
-        max_turn = max(turn_numbers) if turn_numbers else 0
-
-        synthetic = [StoredSummary(
-            ref=f"broad-{tag}",
-            tags=[tag],
-            summary=combined[:4000],
-            summary_tokens=len(combined[:4000]) // 4,
-        )]
-        summaries = self._compactor.compact_tag_summaries(
-            cover_tags=[tag],
-            tag_to_summaries={tag: synthetic},
-            tag_to_turns={tag: turn_numbers},
-            existing_tag_summaries={},
-            max_turn=max_turn,
-        )
-        for ts in summaries:
-            self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
-
     def filter_history(
         self,
         conversation_history: list[Message],
         current_tags: list[str],
         recent_turns: int | None = None,
     ) -> list[Message]:
-        """Filter conversation history by tag relevance.
-
-        Pre-compaction behaviour is governed by
-        ``config.assembler.pre_compaction_filtering``:
-
-        * ``"off"``          – no tag-based drops (all turns pass through)
-        * ``"conservative"`` – tag-based drops with doubled protection window
-                               (``monitor.protected_recent_turns * 2``)
-        * ``"aggressive"``   – tag-based drops with standard protection window
-                               (``monitor.protected_recent_turns``)
-
-        Post-compaction (``_compacted_through > 0``): always uses standard
-        ``monitor.protected_recent_turns`` regardless of mode setting.
-
-        Returns a new list — the original is not mutated.
-        """
-        mode = getattr(
-            getattr(self.config, "assembler", None),
-            "pre_compaction_filtering", "aggressive",
-        )
-        watermark = getattr(self, "_compacted_through", 0)
-        pre_compaction = watermark == 0
-
-        # Determine protection window
-        if recent_turns is not None:
-            # Explicit override (e.g. from tests)
-            protected = recent_turns
-        elif pre_compaction and mode == "off":
-            return list(conversation_history)
-        elif pre_compaction and mode == "conservative":
-            protected = self.config.monitor.protected_recent_turns * 2
-        else:
-            # aggressive, or post-compaction
-            protected = self.config.monitor.protected_recent_turns
-
-        total = len(conversation_history)
-        protected_count = protected * 2  # each turn = 2 messages
-
-        if total <= protected_count:
-            return list(conversation_history)
-
-        # Skip compacted messages — their content is in stored summaries
-        older = conversation_history[watermark:-protected_count]
-        recent = conversation_history[-protected_count:]
-
-        current_tag_set = set(current_tags)
-        filtered: list[Message] = []
-
-        # Walk older messages in pairs (user, assistant)
-        i = 0
-        while i < len(older):
-            if i + 1 < len(older):
-                pair = [older[i], older[i + 1]]
-                step = 2
-            else:
-                filtered.append(older[i])
-                break
-
-            turn_idx = (watermark + i) // 2
-            entry = self._turn_tag_index.get_tags_for_turn(turn_idx)
-
-            if entry is None:
-                # No tag data — conservatively include
-                filtered.extend(pair)
-            elif "rule" in entry.tags or set(entry.tags) & current_tag_set:
-                filtered.extend(pair)
-            # else: no overlap — drop this turn
-
-            i += step
-
-        filtered.extend(recent)
-        return filtered
-
-    def _get_active_tags(self, history: list[Message]) -> list[str]:
-        """Get tags from recent turns via live index."""
-        lookback = self.config.retriever.active_tag_lookback
-        return list(self._turn_tag_index.get_active_tags(lookback=lookback))
-
-    def _build_context_hint(self, paging_mode: str | None = None) -> str:
-        """Build a topic list for post-compaction prompts.
-
-        *paging_mode* overrides the resolved mode (``"autonomous"`` or
-        ``"supervised"``).  The proxy passes this from the per-request model
-        check; headless/MCP callers omit it and the method resolves from config.
-
-        When paging is enabled, builds a richer hint with depth info and budget.
-        Mode determines detail level:
-        - supervised: topic list with depth, "call expand_topic for detail"
-        - autonomous: full budget dashboard with token costs
-
-        Returns empty string if compaction hasn't occurred or the feature is disabled.
-        """
-        if not self.config.assembler.context_hint_enabled:
-            return ""
-        if getattr(self, "_compacted_through", 0) == 0:
-            return ""
-
-        tag_summaries = self._store.get_all_tag_summaries(
-            conversation_id=self.config.conversation_id,
-        )
-        if not tag_summaries:
-            return ""
-
-        # Determine paging mode
-        paging_enabled = self.config.paging.enabled
-        if paging_mode is None and paging_enabled:
-            paging_mode = self._resolve_paging_mode()
-
-        if paging_enabled and paging_mode == "autonomous":
-            hint = self._build_autonomous_hint(tag_summaries)
-        elif paging_enabled and paging_mode == "supervised":
-            hint = self._build_supervised_hint(tag_summaries)
-        else:
-            hint = self._build_default_hint(tag_summaries)
-
-        return hint
-
-    def _build_autonomous_hint(self, tag_summaries: list) -> str:
-        return build_autonomous_hint(
-            tag_summaries=tag_summaries,
-            working_set=self._working_set,
-            budget=self.config.assembler.tag_context_max_tokens,
-            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
-            token_counter=self._token_counter,
-            calculate_depth_tokens=self._calculate_depth_tokens,
-            fact_counts=self._store.get_fact_count_by_tags(conversation_id=self.config.conversation_id),
-            max_tool_rounds=self.config.paging.max_tool_loops,
-        )
-
-    def _build_supervised_hint(self, tag_summaries: list) -> str:
-        return build_supervised_hint(
-            tag_summaries=tag_summaries,
-            working_set=self._working_set,
-            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
-            token_counter=self._token_counter,
-            max_tool_rounds=self.config.paging.max_tool_loops,
-        )
-
-    def _build_default_hint(self, tag_summaries: list) -> str:
-        return build_default_hint(
-            tag_summaries=tag_summaries,
-            max_hint_tokens=self.config.assembler.context_hint_max_tokens,
-            token_counter=self._token_counter,
-        )
-
-    def _resolve_paging_mode(self, model_name: str = "") -> str:
-        """Check if *model_name* is trusted for autonomous paging.
-
-        Uses prefix matching against the config's ``autonomous_models``
-        entries (which default to a sensible built-in set).  Returns
-        ``"autonomous"`` if matched, ``"supervised"`` otherwise.
-        """
-        model = model_name.lower()
-        if not model:
-            return "supervised"
-        for pattern in self.config.paging.autonomous_models:
-            if model.startswith(pattern.lower()):
-                return "autonomous"
-        return "supervised"
-
-    def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
-        """Extract the most recent user+assistant pair."""
-        if len(history) < 2:
-            return None
-        for i in range(len(history) - 1, 0, -1):
-            if history[i].role == "assistant" and history[i-1].role == "user":
-                return [history[i-1], history[i]]
-        return None
-
-    def _get_embed_fn(self):
-        """Lazy-load the embedding function for the context bleed gate."""
-        return self._semantic.get_embed_fn()
-
-    def _embed_and_store_chunks(self, stored: "StoredSegment") -> None:
-        """Chunk a segment's full_text, embed, and store vectors."""
-        self._semantic.embed_and_store_chunks(stored)
-
-    def _semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
-        """Embedding-based semantic search over stored chunk vectors."""
-        return self._semantic.semantic_search(query, max_results)
-
-    def _backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        """One-time backfill: embed all existing segments' full_text."""
-        return self._semantic.backfill_chunk_embeddings()
-
-    def _context_is_relevant(
-        self, current_text: str, context_pairs: list[str],
-    ) -> bool:
-        """Check if current turn is semantically similar to the most recent context pair."""
-        return self._semantic.context_is_relevant(current_text, context_pairs)
-
-    def _context_is_relevant_with_score(
-        self, current_text: str, context_pairs: list[str],
-    ) -> tuple[bool, float]:
-        """Like _context_is_relevant but also returns the similarity score."""
-        return self._semantic.context_is_relevant_with_score(current_text, context_pairs)
-
-    def _get_recent_context(
-        self, history: list[Message], n_pairs: int, exclude_last: int = 2,
-        current_text: str | None = None,
-    ) -> list[str] | None:
-        """Collect up to *n_pairs* recent user+assistant text strings.
-
-        Walks backward from the end of *history* (skipping the last
-        *exclude_last* messages which are the current turn) and returns
-        alternating user/assistant content strings.
-
-        When *current_text* is provided and ``context_bleed_threshold > 0``,
-        an embedding similarity gate checks whether the current turn is
-        semantically related to the most recent context pair.  If the
-        similarity is below the threshold (topic shift), context is skipped
-        to prevent stale tags from bleeding across topics (BUG-010).
-
-        Returns ``None`` when no context is available or when the gate blocks.
-        """
-        # Messages available for context (before the current turn)
-        if exclude_last > 0 and len(history) > exclude_last:
-            avail = history[:-exclude_last]
-        elif exclude_last == 0:
-            avail = list(history)
-        else:
-            avail = []
-        if not avail:
-            return None
-
-        pairs: list[str] = []
-        # Walk backward collecting user+assistant pairs
-        i = len(avail) - 1
-        collected = 0
-        while i >= 1 and collected < n_pairs:
-            if avail[i].role == "assistant" and avail[i - 1].role == "user":
-                # Prepend so order is chronological
-                pairs.insert(0, avail[i].content)
-                pairs.insert(0, avail[i - 1].content)
-                collected += 1
-                i -= 2
-            else:
-                i -= 1
-
-        if not pairs:
-            return None
-
-        # Context bleed gate (BUG-010): skip context on topic shift
-        if (
-            current_text
-            and self.config.tag_generator.context_bleed_threshold > 0
-            and not self._context_is_relevant(current_text, pairs)
-        ):
-            logger.debug("Context bleed gate: topic shift detected, skipping context")
-            return None
-
-        return pairs
+        """Filter conversation history by tag relevance (delegates to RetrievalAssembler)."""
+        retrieval = getattr(self, "_retrieval", None)
+        if retrieval is None:
+            # Lightweight fallback for tests that bypass __init__ via __new__
+            retrieval = RetrievalAssembler.__new__(RetrievalAssembler)
+            retrieval.config = self.config
+            retrieval._engine_state = self._engine_state
+            retrieval._turn_tag_index = self._turn_tag_index
+        return retrieval.filter_history(conversation_history, current_tags, recent_turns)
 
     def compact_manual(
         self,
         conversation_history: list[Message],
     ) -> CompactionReport | None:
-        """Trigger manual compaction regardless of thresholds.
-
-        Uses the same pipeline as on_turn_complete: respects the compaction
-        watermark, protected recent turns, advances the watermark, stores
-        segments, and rebuilds tag summaries for affected tags.
-        """
-        if self._compactor is None:
-            logger.warning("No LLM provider configured for compaction")
-            return None
-
-        if not conversation_history:
-            return None
-
-        # Select messages to compact (same logic as on_turn_complete)
-        protected_turns = self.config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        compact_messages = conversation_history[self._compacted_through:-protected_count]
-
-        if not compact_messages:
-            return None
-
-        report = self._run_compaction(conversation_history, compact_messages)
-
-        self._save_state(conversation_history)
-        return report
+        """Trigger manual compaction regardless of thresholds (delegates to CompactionPipeline)."""
+        return self._compaction.compact_manual(conversation_history)
 
     def ingest_history(
         self,
@@ -1687,317 +719,20 @@ class VirtualContextEngine:
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
     ) -> int:
-        """Bootstrap TurnTagIndex from pre-existing conversation history.
-
-        Tags each user+assistant pair and appends entries to the live index.
-        Does NOT trigger compaction — the next on_turn_complete() handles that.
-
-        Args:
-            history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
-            progress_callback: Optional ``(done, total, entry)`` called after
-                each turn is ingested.  Used by the proxy for live progress.
-            turn_offset: Global turn number of the first pair. Used by catch-up
-                ingestion to prevent TurnTagIndex overwrites when multiple
-                batches are ingested sequentially.
-
-        Returns:
-            Number of turns ingested.
-        """
-        import sys as _sys
-        import time as _time
-        _tag_start = _time.time()
-
-        store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-        ingested = 0
-        _total_turns = len(history_pairs) // 2
-        n_context = self.config.tag_generator.context_lookback_pairs
-        running_session_date = ""
-
-        for i in range(0, len(history_pairs) - 1, 2):
-            user_msg = history_pairs[i]
-            asst_msg = history_pairs[i + 1]
-
-            sender = get_sender_name(user_msg.metadata) if user_msg.metadata else ""
-
-            # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
-            if self._is_tool_turn([user_msg, asst_msg]):
-                self._tool_tag_counter += 1
-                tag_name = f"tool_{self._tool_tag_counter}"
-                entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
-                    message_hash=hashlib.sha256(
-                        f"{user_msg.content} {asst_msg.content}".encode()
-                    ).hexdigest()[:16],
-                    tags=[tag_name],
-                    primary_tag=tag_name,
-                    sender=sender or "",
-                    session_date=running_session_date,
-                )
-                self._turn_tag_index.append(entry)
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
-                        user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                        assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                    )
-                except Exception:
-                    pass
-                ingested += 1
-                continue
-
-            # BUG-013: Skip empty turns with no tool blocks
-            if not user_msg.content.strip() and not asst_msg.content.strip():
-                logger.debug("Skipping empty turn at pair index %d", i // 2)
-                continue
-
-            # Track running session date BEFORE stub/tagger — stubs need timestamps too
-            m = _SESSION_HEADER_RE.search(user_msg.content)
-            if m:
-                running_session_date = m.group(1)
-            elif user_msg.timestamp:
-                running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-
-            # Stub turns (media attachments, image placeholders, etc.):
-            # skip tagger, assign _stub tag, preserve raw text for passthrough.
-            combined_for_stub = f"{user_msg.content} {asst_msg.content}"
-            if _is_stub_content(combined_for_stub):
-                entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
-                    message_hash=hashlib.sha256(combined_for_stub.encode()).hexdigest()[:16],
-                    tags=["_stub"],
-                    primary_tag="_stub",
-                    sender=sender or "",
-                    session_date=running_session_date,
-                )
-                self._turn_tag_index.append(entry)
-                try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
-                    )
-                except Exception:
-                    pass
-                ingested += 1
-                logger.info(
-                    "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
-                    turn_offset + (i // 2), len(combined_for_stub),
-                    combined_for_stub[:60].replace("\n", " "),
-                )
-                if progress_callback:
-                    total = len(history_pairs) // 2
-                    progress_callback(ingested, total, entry)
-                continue
-
-            combined_text = f"{user_msg.content} {asst_msg.content}"
-            _turn_num = turn_offset + (i // 2)  # global turn number
-            _content_preview = combined_text[:60].replace("\n", " ")
-
-            # Flag short content that may be dominated by context
-            if len(combined_text) < 80:
-                logger.info(
-                    "TAGGER turn=%d SHORT_CONTENT len=%d \"%s\"",
-                    _turn_num, len(combined_text), _content_preview,
-                )
-
-            # Build context from preceding pairs in the flat history
-            context: list[str] | None = None
-            if i >= 2:
-                ctx_pairs: list[str] = []
-                start = max(0, i - n_context * 2)
-                for j in range(start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        ctx_pairs.append(history_pairs[j].content)
-                        ctx_pairs.append(history_pairs[j + 1].content)
-                context = ctx_pairs if ctx_pairs else None
-
-            # Context bleed gate (BUG-010): skip stale context on topic shift
-            _bleed_gate = "no_context"
-            _bleed_sim = -1.0
-            if (
-                context
-                and self.config.tag_generator.context_bleed_threshold > 0
-            ):
-                _relevant, _bleed_sim = self._context_is_relevant_with_score(combined_text, context)
-                if not _relevant:
-                    _bleed_gate = f"BLOCKED (similarity={_bleed_sim:.2f} threshold={self.config.tag_generator.context_bleed_threshold})"
-                    context = None
-                else:
-                    _bleed_gate = f"passed (similarity={_bleed_sim:.2f})"
-            elif context:
-                _bleed_gate = "disabled"
-
-            _ctx_preview = context[-2][:60].replace("\n", " ") if context and len(context) >= 2 else ""
-            logger.info(
-                "TAGGER turn=%d content_len=%d content_preview=\"%s\" "
-                "context_pairs=%d context_preview=\"%s\" bleed_gate=%s",
-                _turn_num, len(combined_text), _content_preview,
-                len(context) // 2 if context else 0, _ctx_preview, _bleed_gate,
-            )
-
-            tag_result = self._tag_generator.generate_tags(
-                combined_text, store_tags, context_turns=context,
-            )
-
-            logger.info(
-                "TAGGER turn=%d result primary=%s tags=%s source=%s",
-                _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
-            )
-
-            # Retry with expanded context on _general
-            if tag_result.tags == ["_general"] and i >= 2:
-                expanded_start = max(0, i - n_context * 4)
-                expanded_ctx: list[str] = []
-                for j in range(expanded_start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        expanded_ctx.append(history_pairs[j].content)
-                        expanded_ctx.append(history_pairs[j + 1].content)
-                # Gate expanded context too
-                _expanded_gate = "no_context"
-                if (
-                    expanded_ctx
-                    and self.config.tag_generator.context_bleed_threshold > 0
-                ):
-                    _rel, _sim = self._context_is_relevant_with_score(combined_text, expanded_ctx)
-                    if not _rel:
-                        _expanded_gate = f"BLOCKED (similarity={_sim:.2f})"
-                        expanded_ctx = []
-                    else:
-                        _expanded_gate = f"passed (similarity={_sim:.2f})"
-                if expanded_ctx:
-                    logger.info(
-                        "TAGGER turn=%d retry=expanded_context expanded_pairs=%d bleed_gate=%s",
-                        _turn_num, len(expanded_ctx) // 2, _expanded_gate,
-                    )
-                    tag_result = self._tag_generator.generate_tags(
-                        combined_text, store_tags, context_turns=expanded_ctx,
-                    )
-                    logger.info(
-                        "TAGGER turn=%d retry_result primary=%s tags=%s source=%s",
-                        _turn_num, tag_result.primary, sorted(tag_result.tags), tag_result.source,
-                    )
-
-            # Final fallback: inherit from most recent meaningful turn
-            if tag_result.tags == ["_general"]:
-                prev = self._turn_tag_index.latest_meaningful_tags()
-                if prev:
-                    tag_result = TagResult(
-                        tags=list(prev.tags),
-                        primary=prev.primary_tag,
-                        source="inherited",
-                    )
-                    logger.info(
-                        "TAGGER turn=%d fallback=inherited from_turn=%d tags=%s",
-                        _turn_num, prev.turn_number, sorted(prev.tags),
-                    )
-
-            entry = TurnTagEntry(
-                turn_number=turn_offset + (i // 2),
-                message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
-                tags=tag_result.tags,
-                primary_tag=tag_result.primary,
-                sender=sender or "",
-                session_date=running_session_date,
-            )
-            self._turn_tag_index.append(entry)
-            try:
-                self._store.save_turn_message(
-                    self.config.conversation_id,
-                    entry.turn_number,
-                    user_msg.content,
-                    asst_msg.content,
-                    user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                    assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                )
-            except Exception:
-                pass
-            ingested += 1
-
-            # Stderr progress for visibility
-            if ingested % 5 == 0 or ingested == _total_turns:
-                _elapsed = _time.time() - _tag_start
-                _rate = ingested / _elapsed if _elapsed > 0 else 0
-                _eta = int((_total_turns - ingested) / _rate) if _rate > 0 else 0
-                _sys.stderr.write(
-                    f"\r  TAGGING: {ingested}/{_total_turns} turns | "
-                    f"{_rate:.1f} turn/s | ETA {_eta}s   "
-                )
-                _sys.stderr.flush()
-
-            if progress_callback:
-                total = len(history_pairs) // 2
-                progress_callback(ingested, total, entry)
-
-            # Refresh store tags every 10 turns so new tags influence later tagging
-            if ingested % 10 == 0:
-                store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
-
-            # Periodic state save so session_date + tags are queryable during ingestion
-            if ingested % 20 == 0:
-                self._save_state(history_pairs)
-
-        # Final save after all turns ingested
-        self._save_state(history_pairs)
-        _sys.stderr.write("\n")
-        _sys.stderr.flush()
-        logger.info("Ingested %d historical turns into TurnTagIndex", ingested)
-        return ingested
+        """Bootstrap TurnTagIndex from pre-existing history (delegates to TaggingPipeline)."""
+        return self._tagging.ingest_history(history_pairs, progress_callback, turn_offset)
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
-        """Retrieve relevant context for a message without assembling."""
-        return self._retriever.retrieve(message, current_active_tags=active_tags or [])
+        """Retrieve relevant context for a message without assembling (delegates to RetrievalAssembler)."""
+        return self._retrieval.retrieve(message, active_tags)
 
     def transform(self, message: str, active_tags: list[str] | None = None, budget: int | None = None) -> str:
-        """Retrieve + assemble context block for a message. Returns prepend text."""
-        result = self.retrieve(message, active_tags)
-        if not result.summaries:
-            return ""
-        core_context = self._assembler.load_core_context()
-        assembled = self._assembler.assemble(
-            core_context=core_context,
-            retrieval_result=result,
-            conversation_history=[],
-            token_budget=budget or self.config.context_window,
-        )
-        return assembled.prepend_text
+        """Retrieve + assemble context block for a message (delegates to RetrievalAssembler)."""
+        return self._retrieval.transform(message, active_tags, budget)
 
     def reassemble_context(self) -> str:
-        """Re-assemble context with the current working set.
-
-        Call after ``expand_topic()`` / ``collapse_topic()`` to get an
-        updated ``prepend_text`` that reflects the new depth levels.
-        Reuses the retrieval result from the most recent
-        ``on_message_inbound()`` call — no re-tagging or re-retrieval.
-
-        Returns the updated prepend_text, or "" if no prior inbound call.
-        """
-        rr = getattr(self, "_last_retrieval_result", None)
-        history = getattr(self, "_last_conversation_history", None)
-        if rr is None:
-            return ""
-
-        model_name = getattr(self, "_last_model_name", "")
-        _pm = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
-        context_hint = self._build_context_hint(paging_mode=_pm)
-        core_context = self._assembler.load_core_context()
-
-        ws_param, full_segments_param = self._load_working_set_segments()
-
-        uncompacted = (history or [])[self._compacted_through:]
-        assembled = self._assembler.assemble(
-            core_context=core_context,
-            retrieval_result=rr,
-            conversation_history=uncompacted,
-            token_budget=self.config.context_window,
-            context_hint=context_hint,
-            working_set=ws_param,
-            full_segments=full_segments_param,
-        )
-        return assembled.prepend_text
+        """Re-assemble context with the current working set (delegates to RetrievalAssembler)."""
+        return self._retrieval.reassemble_context()
 
     # ------------------------------------------------------------------
     # Paging API: expand / collapse / working set
@@ -2013,78 +748,11 @@ class VirtualContextEngine:
 
     def recall_all(self) -> dict:
         """Load all tag summaries. Used by vc_recall_all tool."""
-        tag_summaries = self._store.get_all_tag_summaries(
-            conversation_id=self.config.conversation_id,
-        )
-        if not tag_summaries:
-            return {"found": False, "message": "No stored summaries yet."}
-        budget = self.config.assembler.tag_context_max_tokens
-        selected = []
-        total_tokens = 0
-        for ts in tag_summaries:
-            if total_tokens + ts.summary_tokens > budget:
-                break
-            selected.append({
-                "tag": ts.tag,
-                "summary": ts.summary,
-                "tokens": ts.summary_tokens,
-                "description": ts.description or "",
-            })
-            total_tokens += ts.summary_tokens
-        return {
-            "found": True,
-            "topics_loaded": len(selected),
-            "total_tokens": total_tokens,
-            "summaries": selected,
-        }
+        return self._retrieval.recall_all()
 
     def get_working_set_summary(self) -> dict:
         """Return current working set with budget info."""
         return self._paging.get_working_set_summary()
-
-    def _load_working_set_segments(self) -> tuple[dict | None, dict | None]:
-        """Load full segments for working-set tags at SEGMENTS or FULL depth.
-
-        Returns ``(working_set_dict, full_segments_dict)`` for the assembler,
-        or ``(None, None)`` if paging is disabled or the working set is empty.
-        """
-        if not self.config.paging.enabled or not self._working_set:
-            return None, None
-        ws_param = self._working_set
-        full_segments_param: dict = {}
-        seen_refs: set[str] = set()
-        for tag, entry in self._working_set.items():
-            if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
-                segs = self._store.get_segments_by_tags(
-                    tags=[tag], min_overlap=1, limit=500,
-                    conversation_id=self.config.conversation_id,
-                )
-                deduped = [s for s in segs if s.ref not in seen_refs]
-                seen_refs.update(s.ref for s in deduped)
-                if deduped:
-                    full_segments_param[tag] = deduped
-        return ws_param, full_segments_param
-
-    def _calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
-        """Calculate token cost for a tag at a given depth level."""
-        return self._paging.calculate_depth_tokens(tag, depth)
-
-    def _auto_evict(self, needed: int, exclude_tag: str = "") -> tuple[list[str], int]:
-        """Auto-evict coldest topics to free `needed` tokens."""
-        return self._paging._auto_evict(needed, exclude_tag)
-
-    # ------------------------------------------------------------------
-    # Description-aware search supplement for find_quote
-    # ------------------------------------------------------------------
-
-    def _supplement_from_descriptions(
-        self,
-        query: str,
-        results: list[QuoteResult],
-        max_results: int,
-    ) -> list[QuoteResult]:
-        """Add results from tags whose descriptions match query terms."""
-        return _supplement_from_descriptions(self._store, query, results, max_results, conversation_id=self.config.conversation_id)
 
     def find_quote(
         self,
@@ -2094,498 +762,27 @@ class VirtualContextEngine:
         session_filter: str = "",
     ) -> dict:
         """Search stored conversation text for a specific phrase or keyword."""
-        if max_results is None:
-            max_results = self.config.search.find_quote_default_results
-        return _find_quote(
-            self._store,
-            self._semantic,
-            query,
-            max_results,
-            intent_context=intent_context,
-            session_filter=session_filter,
-            conversation_id=self.config.conversation_id,
-        )
+        return self._search.find_quote(query, max_results, intent_context=intent_context, session_filter=session_filter)
 
     def get_turns_by_tag(
         self,
         tag: str,
         conversation_history: list[Message] | None = None,
     ) -> dict:
-        """Return all raw turns associated with a tag, from both stored segments and live history.
-
-        Stored turns come from compacted segments in the store.
-        Live turns come from the TurnTagIndex matched against conversation_history.
-        """
-        result: dict = {
-            "tag": tag,
-            "stored_turns": [],
-            "live_turns": [],
-            "total_turns": 0,
-        }
-
-        # Stored turns: segments matching this tag
-        segments = self._store.get_segments_by_tags(
-            tags=[tag], min_overlap=1, limit=500,
-            conversation_id=self.config.conversation_id,
-        )
-        seen_refs: set[str] = set()
-        for seg in segments:
-            if seg.ref in seen_refs:
-                continue
-            seen_refs.add(seg.ref)
-            meta = seg.metadata or SegmentMetadata(turn_count=0)
-            result["stored_turns"].append({
-                "segment_ref": seg.ref,
-                "messages": seg.messages,
-                "full_text": seg.full_text,
-                "summary": seg.summary,
-                "turn_count": meta.turn_count,
-                "created_at": str(seg.created_at),
-            })
-
-        # Live turns: TurnTagIndex entries where tag appears,
-        # paired with conversation_history messages or persisted turn_messages
-        history = conversation_history or []
-        missing_turn_numbers: list[int] = []
-        live_entries: list[tuple] = []  # (entry, msg_idx)
-        for entry in self._turn_tag_index.entries:
-            if tag not in entry.tags:
-                continue
-            msg_idx = entry.turn_number * 2
-            if msg_idx < len(history):
-                messages = [{"role": "user", "content": history[msg_idx].content}]
-                if msg_idx + 1 < len(history):
-                    messages.append({"role": "assistant", "content": history[msg_idx + 1].content})
-                result["live_turns"].append({
-                    "turn_number": entry.turn_number,
-                    "tags": entry.tags,
-                    "primary_tag": entry.primary_tag,
-                    "messages": messages,
-                })
-            else:
-                missing_turn_numbers.append(entry.turn_number)
-                live_entries.append(entry)
-
-        # Fall back to persisted turn_messages for restored turns
-        if missing_turn_numbers:
-            persisted = self._store.get_turn_messages(
-                self.config.conversation_id, missing_turn_numbers,
-            )
-            for entry in live_entries:
-                pair = persisted.get(entry.turn_number)
-                messages = []
-                if pair:
-                    if pair[0]:
-                        messages.append({"role": "user", "content": pair[0]})
-                    if pair[1]:
-                        messages.append({"role": "assistant", "content": pair[1]})
-                result["live_turns"].append({
-                    "turn_number": entry.turn_number,
-                    "tags": entry.tags,
-                    "primary_tag": entry.primary_tag,
-                    "messages": messages,
-                })
-
-        result["total_turns"] = len(result["stored_turns"]) + len(result["live_turns"])
-        return result
+        """Return all raw turns associated with a tag, from both stored segments and live history."""
+        return self._search.get_turns_by_tag(tag, conversation_history)
 
     def _parse_session_date(self, raw: str) -> date | None:
         """Best-effort parse for session date strings from stored metadata."""
-        return _parse_session_date_str(raw)
+        return self._temporal._parse_session_date(raw)
 
     def _resolve_remember_when_range(self, time_range: dict) -> tuple[date, date, str]:
         """Resolve tool time_range input to absolute [start_date, end_date]."""
-        if not isinstance(time_range, dict):
-            raise ValueError("time_range must be an object")
-
-        kind = str(time_range.get("kind", "")).strip().lower()
-        today = self.reference_date or datetime.now(timezone.utc).date()
-
-        if kind == "relative":
-            preset = str(time_range.get("preset", "")).strip().lower()
-            if preset == "last_24_hours":
-                return today - timedelta(days=2), today, preset
-            if preset == "last_7_days":
-                return today - timedelta(days=7), today, preset
-            if preset == "last_30_days":
-                return today - timedelta(days=30), today, preset
-            if preset == "last_90_days":
-                return today - timedelta(days=90), today, preset
-            if preset == "this_week":
-                start = today - timedelta(days=today.weekday())
-                return start, start + timedelta(days=6), preset
-            if preset == "last_week":
-                this_week_start = today - timedelta(days=today.weekday())
-                start = this_week_start - timedelta(days=7)
-                return start, start + timedelta(days=6), preset
-            if preset == "this_month":
-                start = date(today.year, today.month, 1)
-                end = date(today.year, today.month, monthrange(today.year, today.month)[1])
-                return start, end, preset
-            if preset == "last_month":
-                year = today.year
-                month = today.month - 1
-                if month == 0:
-                    month = 12
-                    year -= 1
-                start = date(year, month, 1)
-                end = date(year, month, monthrange(year, month)[1])
-                return start, end, preset
-            if preset == "this_year":
-                return date(today.year, 1, 1), date(today.year, 12, 31), preset
-            if preset == "last_year":
-                y = today.year - 1
-                return date(y, 1, 1), date(y, 12, 31), preset
-            raise ValueError(f"unsupported relative preset: {preset}")
-
-        if kind == "between_dates":
-            start_raw = str(time_range.get("start", "")).strip()
-            end_raw = str(time_range.get("end", "")).strip()
-            if not start_raw or not end_raw:
-                raise ValueError("between_dates requires start and end")
-
-            def parse_boundary(raw: str, is_end: bool) -> date:
-                if _ISO_DATE_RE.match(raw):
-                    return date.fromisoformat(raw)
-                if _ISO_MONTH_RE.match(raw):
-                    y, mo = [int(x) for x in raw.split("-")]
-                    if is_end:
-                        return date(y, mo, monthrange(y, mo)[1])
-                    return date(y, mo, 1)
-                raise ValueError(f"invalid date format: {raw}")
-
-            start = parse_boundary(start_raw, is_end=False)
-            end = parse_boundary(end_raw, is_end=True)
-            if end < start:
-                raise ValueError("time_range end must be >= start")
-            return start, end, "between_dates"
-
-        raise ValueError("time_range.kind must be 'relative' or 'between_dates'")
+        return self._temporal._resolve_remember_when_range(time_range)
 
     def query_facts(self, **kwargs) -> list | dict:
-        """Query structured facts by filters. Expands verb semantically, then delegates to store.
-
-        Returns list[Fact] normally.  When called with ``_return_meta=True``
-        (used by the tool loop), returns a dict with ``facts``, ``expanded_verbs``,
-        ``object_relaxed``, and ``semantic_note`` keys so the caller can
-        annotate the response.
-        """
-        return_meta = kwargs.pop("_return_meta", False)
-        intent_context = kwargs.pop("_intent_context", "") or ""
-        expanded_verbs: list[str] | None = None
-        semantic_note: str | None = None
-
-        # Scope all store queries to this conversation
-        kwargs.setdefault("conversation_id", self.config.conversation_id)
-
-        # Save original params before verb expansion mutates kwargs
-        orig_verb = kwargs.get("verb")
-        orig_subject = kwargs.get("subject")
-        orig_object = kwargs.get("object_contains")
-        status_filter = kwargs.get("status")
-
-        verb = kwargs.get("verb")
-        if verb and not kwargs.get("verbs"):
-            expanded = self._expand_verb(verb)
-            if expanded and len(expanded) > 1:
-                expanded_verbs = expanded
-                kwargs["verbs"] = expanded
-                kwargs.pop("verb", None)
-                # Verb expansion widens the query significantly — bump the
-                # SQL limit so rare-verb facts don't get cut off by ORDER BY
-                # mentioned_at DESC.  Scale with number of expanded verbs.
-                if "limit" not in kwargs:
-                    kwargs["limit"] = max(50, len(expanded) * 10)
-
-        results = self._store.query_facts(**kwargs)
-
-        # Semantic search: find additional facts via embedding on 'what'
-        # field.  Runs before auto-relax so it can provide precise results
-        # and prevent the noisy fallback that drops object_contains.
-        sem_all = self._semantic_fact_search(
-            existing=results,
-            subject=orig_subject,
-            verb=orig_verb,
-            object_contains=orig_object,
-            intent_context=intent_context,
-        )
-        if sem_all:
-            sem_filtered = sem_all
-            if status_filter:
-                sem_filtered = [f for f in sem_filtered if f.status == status_filter]
-            # Respect the reader's explicit object_contains filter —
-            # semantic search ignores structured constraints when building
-            # candidates, so post-filter here to avoid returning facts
-            # that contradict the reader's request (BUG-032).
-            if orig_object:
-                obj_lower = orig_object.lower()
-                sem_filtered = [
-                    f for f in sem_filtered
-                    if obj_lower in (f.object or "").lower()
-                    or obj_lower in (f.what or "").lower()
-                ]
-            if sem_filtered:
-                results = results + sem_filtered
-                semantic_note = f"semantic search added {len(sem_filtered)} fact(s)"
-
-        # Tag-based sibling discovery: when we have some results, use their
-        # tags to find related facts the structured query missed (e.g. "made
-        # apple pie" when the reader searched verb="baked").
-        if results and orig_subject:
-            result_ids = {f.id for f in results}
-            # Collect tags from current results
-            seed_tags: set[str] = set()
-            for f in results:
-                seed_tags.update(f.tags)
-            if seed_tags:
-                siblings = self._store.query_facts(
-                    subject=orig_subject,
-                    tags=list(seed_tags),
-                    limit=50,
-                    conversation_id=self.config.conversation_id,
-                )
-                new_siblings = [s for s in siblings if s.id not in result_ids]
-                if new_siblings:
-                    results = results + new_siblings
-                    sibling_note = f"tag siblings added {len(new_siblings)} fact(s)"
-                    semantic_note = (
-                        f"{semantic_note}; {sibling_note}" if semantic_note
-                        else sibling_note
-                    )
-
-        # Auto-relax removed (BUG-032): dropping object_contains returns facts
-        # that contradict the reader's explicit constraint, causing over-counting.
-        # If 0 results, the reader should broaden its own query intentionally.
-
-        # Relevance re-ranking: sort results by embedding similarity to the
-        # reader's question so the most relevant facts appear first.  Without
-        # this, results are ordered by ingestion timestamp (mentioned_at DESC)
-        # which is essentially random with respect to the query.
-        if results and intent_context.strip():
-            results = self._rerank_facts(results, intent_context)
-
-        # Auto-follow fact links when graph_links is enabled
-        linked_facts = []
-        _graph_links = getattr(getattr(self, "config", None), "facts", None)
-        if _graph_links and _graph_links.graph_links and results:
-            fact_ids = [f.id for f in results]
-            linked_facts = self._store.get_linked_facts(fact_ids, depth=1)
-            # Deduplicate — don't include linked facts already in primary results
-            primary_ids = set(fact_ids)
-            linked_facts = [lf for lf in linked_facts if lf.fact.id not in primary_ids]
-
-        if return_meta:
-            meta: dict = {
-                "facts": results,
-                "expanded_verbs": expanded_verbs,
-                "object_relaxed": False,  # auto-relax removed (BUG-032)
-                "semantic_note": semantic_note,
-            }
-            if linked_facts:
-                meta["linked_facts"] = linked_facts
-            # When status was filtered, also query without status so the
-            # caller can show total_all_statuses — prevents the reader from
-            # splitting into per-status calls and never seeing the grand total.
-            if status_filter:
-                # Strip both status and object_contains — we want the
-                # grand total for this verb+subject across all statuses.
-                # object_contains uses strict LIKE at the store layer and
-                # would return 0 when the auto-relax only happened above.
-                unfiltered = {
-                    k: v
-                    for k, v in kwargs.items()
-                    if k not in ("status", "object_contains")
-                }
-                all_facts = self._store.query_facts(**unfiltered)
-                # Merge semantic matches into the unfiltered total
-                if sem_all:
-                    all_ids = {f.id for f in all_facts}
-                    for f in sem_all:
-                        if f.id not in all_ids:
-                            all_facts.append(f)
-                            all_ids.add(f.id)
-                status_counts: dict[str, int] = {}
-                for f in all_facts:
-                    s = f.status or "unknown"
-                    status_counts[s] = status_counts.get(s, 0) + 1
-                meta["all_statuses"] = status_counts
-                meta["total_all_statuses"] = len(all_facts)
-            return meta
-        return results
-
-    # Manual verb synonym clusters.  If the query verb matches any member
-    # of a cluster (case-insensitive), all other members that actually exist
-    # in the fact store are included in the expansion — regardless of
-    # embedding similarity.  This catches contextual synonyms that small
-    # embedding models miss (e.g. "visited" ↔ "returned from").
-    _VERB_CLUSTERS: list[set[str]] = [
-        {
-            "visited", "returned from", "got back from", "completed",
-            "went on", "took", "explored", "toured", "traveled to",
-            "went to", "hiked", "drove to", "flew to", "camped at",
-            "stayed at",
-        },
-        {"bought", "purchased", "ordered", "got", "acquired", "picked up"},
-        {"started", "began", "launched", "kicked off", "initiated"},
-        {"finished", "completed", "wrapped up", "ended", "concluded"},
-        {"likes", "enjoys", "loves", "prefers", "is fond of", "is a fan of"},
-        {"dislikes", "hates", "avoids", "is not a fan of"},
-        {"made", "created", "built", "crafted", "prepared", "cooked", "baked"},
-        {"joined", "enrolled in", "signed up for", "registered for"},
-        {"quit", "left", "resigned from", "stopped", "dropped out of"},
-        {"moved to", "relocated to", "settled in", "is moving to"},
-    ]
-
-    # Pre-built lookup: lowercase verb → set of cluster synonyms
-    _VERB_CLUSTER_MAP: dict[str, set[str]] = {}
-    for _cluster in _VERB_CLUSTERS:
-        _lower_cluster = {v.lower() for v in _cluster}
-        for _v in _lower_cluster:
-            _VERB_CLUSTER_MAP[_v] = _lower_cluster
-
-    def _expand_verb(self, verb: str) -> list[str] | None:
-        """Find semantically similar verbs in the facts DB via embedding similarity.
-
-        Also includes manual synonym clusters for contextual synonyms that
-        embeddings miss.  Returns list of matching verbs (including original)
-        if expansions found, None if no expansions.
-        """
-        all_verbs = self._store.get_unique_fact_verbs(conversation_id=self.config.conversation_id)
-        if not all_verbs:
-            return None
-        all_verbs_lower = {v.lower(): v for v in all_verbs}
-
-        matches = [verb]
-        seen = {verb.lower()}
-
-        # 1. Manual cluster expansion
-        cluster = self._VERB_CLUSTER_MAP.get(verb.lower())
-        if cluster:
-            for synonym in cluster:
-                if synonym not in seen and synonym in all_verbs_lower:
-                    matches.append(all_verbs_lower[synonym])
-                    seen.add(synonym)
-
-        # 2. Embedding-based expansion
-        embed_fn = self._get_embed_fn()
-        if embed_fn is not None:
-            from .core.math_utils import rank_by_embedding
-
-            scored = rank_by_embedding(
-                verb, all_verbs, all_verbs, embed_fn, threshold=0.53,
-            )
-            for _, v in scored:
-                if v.lower() not in seen:
-                    matches.append(v)
-                    seen.add(v.lower())
-
-        return matches if len(matches) > 1 else None
-
-    def _semantic_fact_search(
-        self,
-        existing: list,
-        subject: str | None = None,
-        verb: str | None = None,
-        object_contains: str | None = None,
-        intent_context: str = "",
-    ) -> list:
-        """Find additional facts by embedding similarity on the ``what`` field.
-
-        Builds a natural-language query from the provided structured params
-        (and optionally the user's question via *intent_context*), retrieves
-        all facts for the given subject, and returns those whose ``what``
-        field is semantically close to the query but that were NOT already
-        in *existing*.  Returns an empty list when embeddings are unavailable
-        or no new matches are found.
-        """
-        # Need at least a verb or object to form a meaningful query
-        if not verb and not object_contains:
-            return []
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None:
-            return []
-
-        # Build query string from whatever params were provided.
-        # When intent_context (the user's question) is available, use it
-        # as the primary query — it carries richer semantic signal than the
-        # short structured params (e.g. "How many health-related devices
-        # do I use?" vs just "user use").
-        if intent_context.strip():
-            query_str = intent_context.strip()
-            # The intent_context may be the full enriched prompt (context
-            # summaries + question).  Strip the <virtual-context> block so
-            # only the trailing question/instruction remains.
-            for _vc_end_tag in ("</system-reminder>", "</virtual-context>"):
-                if _vc_end_tag in query_str:
-                    query_str = query_str.split(_vc_end_tag)[-1].strip()
-            # Strip leading preamble that the benchmark wraps around the
-            # context block — only keep meaningful trailing text.
-            m = re.search(r"(?:^|\n)\s*Question:\s*(.+)", query_str, re.IGNORECASE)
-            if m:
-                query_str = m.group(1).strip()
-                # Remove trailing "Answer:" marker if present
-                query_str = re.sub(r"\s*Answer:\s*$", "", query_str).strip()
-        else:
-            parts: list[str] = []
-            if subject:
-                parts.append(subject)
-            if verb:
-                parts.append(verb)
-            if object_contains:
-                parts.append(object_contains)
-            query_str = " ".join(parts)
-
-        # Broad candidate set: all facts for this subject (no verb/object filter)
-        cand_kwargs: dict = {"limit": 200, "conversation_id": self.config.conversation_id}
-        if subject:
-            cand_kwargs["subject"] = subject
-        candidates = self._store.query_facts(**cand_kwargs)
-
-        # Exclude already-found facts and facts without a 'what' description
-        existing_ids = {f.id for f in existing}
-        candidates = [f for f in candidates if f.id not in existing_ids and f.what]
-        if not candidates:
-            return []
-
-        from .core.math_utils import rank_by_embedding
-
-        scored = rank_by_embedding(
-            query_str, candidates, [f.what for f in candidates],
-            embed_fn, threshold=0.35,
-        )
-        return [fact for _, fact in scored]
-
-    def _rerank_facts(self, facts: list, intent_context: str) -> list:
-        """Re-rank *facts* by embedding similarity to the reader's question.
-
-        Extracts the question from *intent_context*, embeds it alongside
-        each fact's ``what`` field, and returns facts sorted by descending
-        cosine similarity.  Falls back to the original order if embeddings
-        are unavailable.
-        """
-        embed_fn = self._get_embed_fn()
-        if embed_fn is None or not facts:
-            return facts
-
-        # Extract just the question from intent_context
-        query_str = intent_context.strip()
-        for _tag in ("</system-reminder>", "</virtual-context>"):
-            if _tag in query_str:
-                query_str = query_str.split(_tag)[-1].strip()
-        m = re.search(r"(?:^|\n)\s*Question:\s*(.+)", query_str, re.IGNORECASE)
-        if m:
-            query_str = m.group(1).strip()
-            query_str = re.sub(r"\s*Answer:\s*$", "", query_str).strip()
-        if not query_str:
-            return facts
-
-        from .core.math_utils import rank_by_embedding
-
-        whats = [f.what or f"{f.subject} {f.verb} {f.object}" for f in facts]
-        scored = rank_by_embedding(
-            query_str, facts, whats, embed_fn, threshold=-1.0,
-        )
-        return [fact for _, fact in scored]
+        """Query structured facts by filters. Expands verb semantically, then delegates to store."""
+        return self._facts.query(**kwargs)
 
     def remember_when(
         self,
@@ -2594,82 +791,7 @@ class VirtualContextEngine:
         max_results: int | None = None,
     ) -> dict:
         """Find memory snippets for *query* constrained to a resolved date window."""
-        if max_results is None:
-            max_results = self.config.search.remember_when_max_results
-        if not query.strip():
-            return {"error": "empty query"}
-
-        try:
-            start, end, resolved_kind = self._resolve_remember_when_range(time_range)
-        except ValueError as exc:
-            return {"error": str(exc)}
-
-        # Overfetch, then filter by session_date bounds.
-        raw = self.find_quote(query=query, max_results=max(max_results * 4, 20))
-        if not raw.get("found"):
-            return {
-                "query": query,
-                "found": False,
-                "range": {
-                    "kind": resolved_kind,
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
-                },
-                "results": [],
-                "message": raw.get("message", "No matches found."),
-            }
-
-        filtered: list[dict] = []
-        for item in raw.get("results", []):
-            session = str(item.get("session", "")).strip()
-            parsed = self._parse_session_date(session)
-            if parsed is None:
-                # No parseable session date -> exclude from time-filtered recall.
-                continue
-            if start <= parsed <= end:
-                filtered.append(item)
-            if len(filtered) >= max_results:
-                break
-
-        # Also query structured facts within the date window.
-        # Return completed experience facts — these are the most relevant
-        # for "what did I do" temporal questions.
-        fact_results: list[dict] = []
-        try:
-            start_str = start.strftime("%Y/%m/%d")
-            end_str = end.strftime("%Y/%m/%d")
-            facts = self._store.query_experience_facts_by_date(
-                start_date=start_str,
-                end_date=end_str,
-                limit=max_results * 5,
-                conversation_id=self.config.conversation_id or None,
-            )
-            for f in facts:
-                fact_results.append({
-                    "type": "fact",
-                    "what": f.what or f"{f.subject} {f.verb} {f.object}",
-                    "when": f.when_date or f.session_date or "",
-                    "where": f.where or "",
-                    "status": f.status or "",
-                })
-        except Exception as exc:
-            logger.warning("remember_when fact query failed: %s", exc)
-
-        return {
-            "query": query,
-            "found": bool(filtered) or bool(fact_results),
-            "range": {
-                "kind": resolved_kind,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-            "results": filtered,
-            "facts_in_window": fact_results,
-            "message": (
-                f"No matches for '{query}' in the requested time window."
-                if not filtered and not fact_results else ""
-            ),
-        }
+        return self._temporal.remember_when(query, time_range, max_results)
 
     # ------------------------------------------------------------------
     # query_with_tools: sync tool loop for non-proxy callers
@@ -2736,143 +858,25 @@ class VirtualContextEngine:
         ToolLoopResult
             Final text, tool call records, and usage metrics.
         """
-        import httpx
-
-        from .core.tool_loop import (
-            _parse_provider_http_response,
-            get_adapter,
-            run_tool_loop,
-            vc_tool_definitions,
-        )
-
-        adapter = get_adapter(provider, api_key, api_url)
-
-        # Decide whether to inject VC tools
-        inject_vc = force_tools or (
-            self.config.paging.enabled and self._compacted_through > 0
-        )
-        all_tools: list[dict] = []
-        if inject_vc:
-            all_tools.extend(vc_tool_definitions())
-        if tools:
-            all_tools.extend(tools)
-
-        # Convert tool definitions to provider format
-        converted_tools = adapter.convert_tool_defs(all_tools) if all_tools else None
-
-        # Wrap VC context in <system-reminder> so inject_context can
-        # find-and-replace on reassembly instead of stacking.
-        wrapped_system = f"<system-reminder>\n{system}\n</system-reminder>" if system else ""
-
-        # Build provider-specific request body
-        body = adapter.build_request_body(
+        return self._tool_query.query_with_tools(
+            messages,
             model=model,
-            messages=messages,
-            system=wrapped_system,
+            system=system,
             max_tokens=max_tokens,
+            api_key=api_key,
+            api_url=api_url,
             temperature=temperature,
-            tools=converted_tools,
+            tools=tools,
+            force_tools=force_tools,
+            require_tools=require_tools,
+            max_loops=max_loops,
+            provider=provider,
+            extended_thinking=extended_thinking,
         )
-
-        # Optional tool-policy override for thresholded behavior.
-        if converted_tools and require_tools is not None:
-            if provider == "anthropic":
-                if require_tools:
-                    body["tool_choice"] = {"type": "any"}
-                else:
-                    body.pop("tool_choice", None)
-            elif provider in {"openai", "openrouter", "openai-codex", "openai_codex"}:
-                if require_tools:
-                    body["tool_choice"] = "required"
-                else:
-                    body.pop("tool_choice", None)
-            elif provider == "gemini":
-                if require_tools:
-                    body["tool_config"] = {
-                        "function_calling_config": {"mode": "ANY"}
-                    }
-                else:
-                    body.pop("tool_config", None)
-
-        # Extended thinking: inject thinking params for Anthropic
-        if extended_thinking and provider == "anthropic":
-            body["thinking"] = {"type": "enabled", "budget_tokens": 10000}
-            body["temperature"] = 1
-            # max_tokens must exceed thinking budget
-            if body.get("max_tokens", 0) <= 10000:
-                body["max_tokens"] = 16000
-            # tool_choice "any" is incompatible with thinking
-            if body.get("tool_choice", {}).get("type") == "any":
-                body["tool_choice"] = {"type": "auto"}
-        # Extended thinking: inject reasoning effort for OpenAI Responses API
-        if extended_thinking and provider == "openai-responses":
-            body["reasoning"] = {"effort": "high", "summary": "auto"}
-
-        url = adapter.get_url(model)
-        headers = adapter.get_headers()
-        if extended_thinking and provider == "anthropic":
-            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-
-        with httpx.Client(timeout=300.0) as client:
-            resp = client.post(url, headers=headers, json=body)
-            # Retry on 503 (Gemini overloaded) up to 2 times
-            for _retry in range(2):
-                if resp.status_code != 503:
-                    break
-                import time as _time
-                _time.sleep(5)
-                resp = client.post(url, headers=headers, json=body)
-
-        if resp.status_code >= 300:
-            raise RuntimeError(
-                f"{provider} API error {resp.status_code}: {resp.text[:500]}"
-            )
-
-        data = _parse_provider_http_response(resp)
-
-        # Check for VC tool calls
-        tool_calls = adapter.extract_tool_calls(data)
-        has_vc_tools = any(
-            tc["name"].startswith("vc_") for tc in tool_calls
-        )
-
-        if has_vc_tools:
-            effective_loops = (
-                max_loops
-                if max_loops is not None
-                else self.config.paging.max_tool_loops
-            )
-            # Pass extra headers (e.g. anthropic-beta for extended thinking)
-            _extra_hdrs = {}
-            if extended_thinking and provider == "anthropic":
-                _extra_hdrs["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-            loop_result = run_tool_loop(
-                self, data, body, adapter,
-                url=url, max_loops=effective_loops,
-                extra_headers=_extra_hdrs or None,
-            )
-            # Prepend the initial request to raw_requests
-            loop_result.raw_requests.insert(0, body)
-            return loop_result
-
-        # No tool calls — return text directly
-        result = ToolLoopResult()
-        result.raw_requests.append(body)
-        result.raw_responses.append(data)
-        input_toks, output_toks = adapter.extract_usage(data)
-        result.input_tokens = input_toks
-        result.output_tokens = output_toks
-        result.stop_reason = adapter.get_stop_reason(data)
-        result.text = adapter.extract_text(data)
-        return result
 
     def get_telemetry(self) -> TelemetryLedger:
         """Return the telemetry ledger for this session."""
         return self._telemetry
-
-    def get_cost_report(self):
-        """Backward compat: return a TelemetryRollup from the ledger."""
-        return self._telemetry.total()
 
     def cleanup(self, max_age_days: int | None = None, max_total_tokens: int | None = None) -> int:
         """Run cleanup on the store. Returns count of segments deleted."""

@@ -403,7 +403,7 @@ class TestContextHintMentionsFindQuote:
     def _make_engine_with_hint(self, tmp_path, mode="autonomous"):
         engine = _make_engine(tmp_path, paging_enabled=True)
         # Simulate post-compaction state
-        engine._compacted_through = 10
+        engine._engine_state.compacted_through = 10
         # Store a tag summary so hint is non-empty
         engine._store.save_tag_summary(TagSummary(
             tag="health",
@@ -418,13 +418,13 @@ class TestContextHintMentionsFindQuote:
 
     def test_autonomous_hint_mentions_find_quote(self, tmp_path):
         engine = self._make_engine_with_hint(tmp_path)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "vc_find_quote" in hint
         assert "find_quote(query)" in hint
 
     def test_supervised_hint_mentions_find_quote(self, tmp_path):
         engine = self._make_engine_with_hint(tmp_path)
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "vc_find_quote" in hint
 
 

@@ -385,7 +385,7 @@ class TestEngineTagSplitting:
 
             mock_llm = MagicMock()
             mock_llm.complete.return_value = (llm_response, {})
-            engine._tag_splitter = TagSplitter(
+            engine._tagging._tag_splitter = TagSplitter(
                 llm=mock_llm,
                 config=config.tag_generator.tag_splitting,
             )
@@ -433,11 +433,11 @@ class TestEngineTagSplitting:
             ))
 
         history = self._make_history(50)
-        result = engine._check_and_split_broad_tags(history)
+        result = engine._tagging._check_and_split_broad_tags(history)
 
         assert result is not None
         assert result.splittable is True
-        assert "troubleshooting" in engine._split_processed_tags
+        assert "troubleshooting" in engine._engine_state.split_processed_tags
 
     def test_below_threshold_no_split(self, tmp_path):
         """10/100 turns (10%) below 15 threshold — no split triggered."""
@@ -451,7 +451,7 @@ class TestEngineTagSplitting:
             ))
 
         history = self._make_history(100)
-        result = engine._check_and_split_broad_tags(history)
+        result = engine._tagging._check_and_split_broad_tags(history)
 
         assert result is None
 
@@ -474,7 +474,7 @@ class TestEngineTagSplitting:
             ))
 
         history = self._make_history(50)
-        engine._check_and_split_broad_tags(history)
+        engine._tagging._check_and_split_broad_tags(history)
 
         # Verify old tag removed from split turns
         for i in range(5):
@@ -501,14 +501,14 @@ class TestEngineTagSplitting:
             ))
 
         history = self._make_history(50)
-        result = engine._check_and_split_broad_tags(history)
+        result = engine._tagging._check_and_split_broad_tags(history)
 
         assert result is not None
         assert result.splittable is False
         # Tag should still be in entries
         assert "cycle-tracking" in engine._turn_tag_index.entries[0].tags
         # But should be marked as processed
-        assert "cycle-tracking" in engine._split_processed_tags
+        assert "cycle-tracking" in engine._engine_state.split_processed_tags
 
     def test_split_not_retriggered(self, tmp_path):
         """Once processed, a tag is not split again."""
@@ -531,11 +531,11 @@ class TestEngineTagSplitting:
         history = self._make_history(50)
 
         # First call: should split
-        result1 = engine._check_and_split_broad_tags(history)
+        result1 = engine._tagging._check_and_split_broad_tags(history)
         assert result1 is not None
 
         # Second call: should skip (already processed)
-        result2 = engine._check_and_split_broad_tags(history)
+        result2 = engine._tagging._check_and_split_broad_tags(history)
         assert result2 is None
 
     def test_general_tag_excluded(self, tmp_path):
@@ -544,7 +544,7 @@ class TestEngineTagSplitting:
         self._populate_index(engine, "_general", 30)
 
         history = self._make_history(30)
-        result = engine._check_and_split_broad_tags(history)
+        result = engine._tagging._check_and_split_broad_tags(history)
 
         assert result is None
 
@@ -584,7 +584,7 @@ class TestEngineTagSplitting:
             Message(role="assistant", content="Let me try a different approach."),
         ]
 
-        turn_contents = engine._collect_turn_text("troubleshooting", history)
+        turn_contents = engine._tagging._collect_turn_text("troubleshooting", history)
 
         # All 3 turns should have non-empty real content (not preambles).
         # BUG-012: With turn_number * 2 indexing, turn 0 gets the preamble,

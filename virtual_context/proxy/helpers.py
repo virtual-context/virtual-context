@@ -476,11 +476,11 @@ def _dump_session_state(
             pass
 
         # Split processed tags
-        split_tags = list(getattr(engine, "_split_processed_tags", set()))
+        split_tags = list(engine._engine_state.split_processed_tags)
 
         # Working set (paging state)
         working_set_dump: list[dict] = []
-        ws = getattr(engine, "_working_set", None)
+        ws = getattr(engine._paging, "working_set", None)
         if ws:
             for tag, entry in ws.items():
                 working_set_dump.append({
@@ -494,7 +494,7 @@ def _dump_session_state(
             "conversation_id": engine.config.conversation_id,
             "session_state": state._state.value if hasattr(state._state, "value") else str(state._state),  # type: ignore[attr-defined]
             "turn_count": len(state.conversation_history) // 2,  # type: ignore[attr-defined]
-            "compacted_through": getattr(engine, "_compacted_through", 0),
+            "compacted_through": engine._engine_state.compacted_through,
             "turn_tag_index": entries,
             "tag_counts": dict(sorted(tag_counts.items(), key=lambda x: -x[1])),
             "tag_summaries": tag_summaries,

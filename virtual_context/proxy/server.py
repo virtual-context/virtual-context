@@ -635,12 +635,12 @@ def create_app(
         # PROXY-025: Stub compacted messages via hash matching
         turns_stubbed = 0
         try:
-            if state and int(state.engine._compacted_through) > 0:
+            if state and int(state.engine._engine_state.compacted_through) > 0:
                 from .message_filter import stub_compacted_messages
                 body, turns_stubbed = stub_compacted_messages(
                     body,
                     state.engine._turn_tag_index,
-                    state.engine._compacted_through,
+                    state.engine._engine_state.compacted_through,
                     fmt=fmt,
                 )
                 if turns_stubbed:
@@ -672,7 +672,7 @@ def create_app(
                 state.engine.config.assembler,
                 "pre_compaction_filtering", "aggressive",
             )
-            _pre_compaction = getattr(state.engine, "_compacted_through", 0) == 0
+            _pre_compaction = state.engine._engine_state.compacted_through == 0
             body, turns_dropped = _filter_body_messages(
                 body,
                 state.engine._turn_tag_index,
@@ -715,13 +715,13 @@ def create_app(
             and fmt.supports_tool_interception
             and state.engine.config.paging.enabled
         ):
-            _paging_mode = state.engine._resolve_paging_mode(
+            _paging_mode = state.engine._retrieval._resolve_paging_mode(
                 enriched_body.get("model", ""),
             )
             if _paging_mode == "autonomous":
                 tool_turn_count = len(state.engine._turn_tag_index.entries)
                 try:
-                    compacted_count = int(getattr(state.engine, "_compacted_through", 0))
+                    compacted_count = int(state.engine._engine_state.compacted_through)
                 except (TypeError, ValueError):
                     compacted_count = 0
                 require_tools = compacted_count > 0
@@ -823,9 +823,7 @@ def create_app(
             "context_tokens": context_tokens,
             "budget": assembled.budget_breakdown if assembled else {},
             "history_len": len(state.conversation_history) if state else 0,
-            "compacted_through": getattr(
-                state.engine, "_compacted_through", 0
-            ) if state else 0,
+            "compacted_through": state.engine._engine_state.compacted_through if state else 0,
             "wait_ms": wait_ms,
             "inbound_ms": inbound_ms,
             "overhead_ms": overhead_ms,
