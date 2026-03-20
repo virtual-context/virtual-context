@@ -893,7 +893,7 @@ async def _handle_streaming(
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
-                        payload_tokens=state._last_payload_tokens or None,
+                        payload_tokens=state._last_enriched_payload_tokens or None,
                         turn_id=turn_id,
                     )
                 _marker_sid = state.engine.config.conversation_id
@@ -994,7 +994,7 @@ async def _handle_streaming(
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
-                        payload_tokens=state._last_payload_tokens or None,
+                        payload_tokens=state._last_enriched_payload_tokens or None,
                         turn_id=turn_id,
                     )
 
@@ -1095,7 +1095,7 @@ async def _handle_non_streaming(
         if not passthrough:
             state.fire_turn_complete(
                 list(state.conversation_history),
-                payload_tokens=state._last_payload_tokens or None,
+                payload_tokens=state._last_enriched_payload_tokens or None,
                 turn_id=turn_id,
             )
 

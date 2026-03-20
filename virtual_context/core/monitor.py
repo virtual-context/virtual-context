@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 from ..types import CompactionSignal, ContextSnapshot, MonitorConfig
+
+logger = logging.getLogger(__name__)
 
 
 class ContextMonitor:
@@ -34,6 +37,11 @@ class ContextMonitor:
 
         if usage_ratio >= self.config.hard_threshold:
             overflow = snapshot.total_tokens - int(budget * self.config.soft_threshold)
+            logger.info(
+                "Compaction check: %d/%dt (%.0f%%) >= hard %.0f%% — triggering",
+                snapshot.total_tokens, budget, usage_ratio * 100,
+                self.config.hard_threshold * 100,
+            )
             return CompactionSignal(
                 priority="hard",
                 current_tokens=snapshot.total_tokens,
@@ -43,6 +51,11 @@ class ContextMonitor:
 
         if usage_ratio >= self.config.soft_threshold:
             overflow = snapshot.total_tokens - int(budget * self.config.soft_threshold)
+            logger.info(
+                "Compaction check: %d/%dt (%.0f%%) >= soft %.0f%% — triggering",
+                snapshot.total_tokens, budget, usage_ratio * 100,
+                self.config.soft_threshold * 100,
+            )
             return CompactionSignal(
                 priority="soft",
                 current_tokens=snapshot.total_tokens,
@@ -50,6 +63,11 @@ class ContextMonitor:
                 overflow_tokens=overflow,
             )
 
+        logger.info(
+            "Compaction check: %d/%dt (%.0f%%) below soft %.0f%% — no compaction",
+            snapshot.total_tokens, budget, usage_ratio * 100,
+            self.config.soft_threshold * 100,
+        )
         return None
 
     def force_compact(self) -> CompactionSignal:
