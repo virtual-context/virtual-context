@@ -437,7 +437,7 @@ class TestEngineTagSplitting:
 
         assert result is not None
         assert result.splittable is True
-        assert "troubleshooting" in engine._split_processed_tags
+        assert "troubleshooting" in engine._engine_state.split_processed_tags
 
     def test_below_threshold_no_split(self, tmp_path):
         """10/100 turns (10%) below 15 threshold — no split triggered."""
@@ -508,7 +508,7 @@ class TestEngineTagSplitting:
         # Tag should still be in entries
         assert "cycle-tracking" in engine._turn_tag_index.entries[0].tags
         # But should be marked as processed
-        assert "cycle-tracking" in engine._split_processed_tags
+        assert "cycle-tracking" in engine._engine_state.split_processed_tags
 
     def test_split_not_retriggered(self, tmp_path):
         """Once processed, a tag is not split again."""

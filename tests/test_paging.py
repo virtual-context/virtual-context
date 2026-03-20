@@ -825,7 +825,7 @@ class TestContextHintModes:
         )
         engine = VirtualContextEngine(config=cfg)
         # Simulate post-compaction state
-        engine._compacted_through = 4
+        engine._engine_state.compacted_through = 4
         return engine
 
     def _seed_tag_summary(self, engine, tag, summary="Discussion about topic."):
@@ -863,7 +863,7 @@ class TestContextHintModes:
 
     def test_hint_empty_before_compaction(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
-        engine._compacted_through = 0  # no compaction yet
+        engine._engine_state.compacted_through = 0  # no compaction yet
         self._seed_tag_summary(engine, "api")
         hint = engine._build_context_hint(paging_mode="supervised")
         assert hint == ""
@@ -921,7 +921,7 @@ class TestContextHintModes:
             ),
         )
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 4
+        engine._engine_state.compacted_through = 4
         # Seed 80 tags at depth:none
         for i in range(80):
             self._seed_tag_summary(engine, f"filler-{i:03d}")
@@ -1177,7 +1177,7 @@ class TestReassembleContext:
         ))
 
         # Simulate post-compaction state so context hint is generated
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         engine._turn_tag_index.append(TurnTagEntry(
             turn_number=1, message_hash="abc123", tags=["database"], primary_tag="database",
         ))
@@ -1250,7 +1250,7 @@ class TestTemporalNoBypass:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         return engine
 
     @pytest.mark.regression("BUG-015")
@@ -1323,7 +1323,7 @@ class TestSegmentLoadingGate:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         return engine
 
     @pytest.mark.regression("BUG-016")
@@ -1417,7 +1417,7 @@ class TestCrossTagSegmentDedup:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 0
+        engine._engine_state.compacted_through = 0
         return engine
 
     def test_on_message_inbound_deduplicates_shared_segments(self, tmp_path):

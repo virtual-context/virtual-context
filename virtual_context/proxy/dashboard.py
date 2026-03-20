@@ -196,9 +196,7 @@ def register_dashboard_routes(
                             engine._turn_tag_index.get_active_tags(lookback=6)
                         )
                         snap["store_tag_count"] = len(engine._store.get_all_tags())
-                        snap["compacted_through"] = getattr(
-                            engine, "_compacted_through", 0
-                        )
+                        snap["compacted_through"] = engine._engine_state.compacted_through
                         snap["history_len"] = len(state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
                         snap["current_conversation_id"] = engine.config.conversation_id
@@ -315,7 +313,7 @@ def register_dashboard_routes(
                 )
             # Reset in-memory watermark if deleting the current conversation
             if conversation_id == state.engine.config.conversation_id:
-                state.engine._compacted_through = 0
+                state.engine._engine_state.compacted_through = 0
             logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
         except Exception as exc:
@@ -400,9 +398,7 @@ def register_dashboard_routes(
                 snap["conversation_turns"] = len(
                     state.conversation_history
                 ) // 2
-                snap["compacted_through"] = getattr(
-                    engine, "_compacted_through", 0
-                )
+                snap["compacted_through"] = engine._engine_state.compacted_through
             except Exception as e:
                 logger.error("Export error: %s", e, exc_info=True)
                 snap["_export_error"] = "Failed to export engine state"
@@ -622,9 +618,7 @@ def register_dashboard_routes(
                     "summary_tokens": summary_tokens,
                     "tags": report.tags,
                     "tag_summaries_built": report.tag_summaries_built,
-                    "compacted_through": getattr(
-                        state.engine, "_compacted_through", 0
-                    ),
+                    "compacted_through": state.engine._engine_state.compacted_through,
                 })
 
             return JSONResponse({
@@ -962,9 +956,7 @@ async def _replay_worker(
                     "context_tokens": context_tokens,
                     "budget": assembled.budget_breakdown,
                     "history_len": len(state.conversation_history),
-                    "compacted_through": getattr(
-                        state.engine, "_compacted_through", 0
-                    ),
+                    "compacted_through": state.engine._engine_state.compacted_through,
                     "wait_ms": wait_ms,
                     "inbound_ms": inbound_ms,
                     "total_turns": total_turns,

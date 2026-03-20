@@ -403,7 +403,7 @@ class TestContextHintMentionsFindQuote:
     def _make_engine_with_hint(self, tmp_path, mode="autonomous"):
         engine = _make_engine(tmp_path, paging_enabled=True)
         # Simulate post-compaction state
-        engine._compacted_through = 10
+        engine._engine_state.compacted_through = 10
         # Store a tag summary so hint is non-empty
         engine._store.save_tag_summary(TagSummary(
             tag="health",

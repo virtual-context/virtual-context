@@ -35,6 +35,7 @@ from .types import (
     CompactionSignal,
     DEFAULT_CHAT_MODEL,
     DepthLevel,
+    EngineState,
     EngineStateSnapshot,
     Message,
     QuoteResult,
@@ -138,10 +139,7 @@ class VirtualContextEngine:
         self._init_retriever()
         self._init_compactor()
         self._init_tag_splitter()
-        self._compacted_through = 0  # message index watermark: messages before this already compacted
-        self._tool_tag_counter = 0  # sequential counter for tool_N tags
-        self._last_tag_ms: float = 0.0
-        self._last_compact_ms: float = 0.0
+        self._engine_state = EngineState()  # mutable shared state for delegates
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
         from .core.fact_query import FactQueryEngine
         self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
@@ -164,17 +162,13 @@ class VirtualContextEngine:
             paging_enabled=self.config.paging.enabled,
             conversation_id=self.config.conversation_id,
         )
-        self._split_processed_tags: set[str] = set()
         self._supersession_checker = None
         self._init_supersession_checker()
         self._fact_curator = None
         self._init_fact_curator()
-        self._last_split_result: SplitResult | None = None
-        self._trailing_fingerprint: str = ""  # set by proxy for session matching on restart
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
-        self._provider: str = ""  # set by ProxyState, persisted in engine state
 
         # Cached state from last on_message_inbound call (used by reassemble_context)
         self._last_retrieval_result: RetrievalResult | None = None
@@ -436,7 +430,7 @@ class VirtualContextEngine:
         # Build a segment-to-turn mapping using turn_offset and each segment's
         # turn_count, then collect only the fact signals for each segment's
         # source turns.
-        turn_offset = self._compacted_through // 2
+        turn_offset = self._engine_state.compacted_through // 2
         seg_cursor = turn_offset
         segment_signals: dict[str, list[FactSignal]] = {}
         for seg in segments:
@@ -607,22 +601,22 @@ class VirtualContextEngine:
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
-        self._compacted_through = saved.compacted_through
+        self._engine_state.compacted_through = saved.compacted_through
         self._turn_tag_index = TurnTagIndex()
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
         self._search._turn_tag_index = self._turn_tag_index
-        self._split_processed_tags = set(saved.split_processed_tags)
+        self._engine_state.split_processed_tags = set(saved.split_processed_tags)
         # Restore paging working set (backward-compatible: old snapshots have empty list)
         self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
-        self._trailing_fingerprint = saved.trailing_fingerprint
+        self._engine_state.trailing_fingerprint = saved.trailing_fingerprint
         # Restore telemetry counters from persisted rollup
         if saved.telemetry_rollup:
             self._telemetry.restore_from_rollup(saved.telemetry_rollup)
         # Stash request captures for ProxyState to pick up after init
         self._restored_request_captures = saved.request_captures or []
-        self._provider = saved.provider or ""
-        self._tool_tag_counter = saved.tool_tag_counter or 0
+        self._engine_state.provider = saved.provider or ""
+        self._engine_state.tool_tag_counter = saved.tool_tag_counter or 0
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
@@ -634,7 +628,7 @@ class VirtualContextEngine:
         # If the store has no segments for this conversation (e.g., user deleted
         # the conversation or segments were purged), reset the watermark so
         # ingested history can be compacted fresh.
-        if self._compacted_through > 0:
+        if self._engine_state.compacted_through > 0:
             try:
                 segs = self._store.get_segments_by_tags(
                     tags=["_general"], min_overlap=0, limit=1,
@@ -646,9 +640,9 @@ class VirtualContextEngine:
                     if not tags:
                         logger.warning(
                             "Watermark=%d but store has no segments for conversation %s — resetting to 0",
-                            self._compacted_through, self.config.conversation_id[:12],
+                            self._engine_state.compacted_through, self.config.conversation_id[:12],
                         )
-                        self._compacted_through = 0
+                        self._engine_state.compacted_through = 0
             except Exception:
                 pass  # Don't crash on validation failure
 
@@ -700,16 +694,16 @@ class VirtualContextEngine:
                     pass
             self._store.save_engine_state(EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
-                compacted_through=self._compacted_through,
+                compacted_through=self._engine_state.compacted_through,
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=len(conversation_history) // 2,
-                split_processed_tags=sorted(self._split_processed_tags),
+                split_processed_tags=sorted(self._engine_state.split_processed_tags),
                 working_set=list(self._working_set.values()),
-                trailing_fingerprint=self._trailing_fingerprint,
+                trailing_fingerprint=self._engine_state.trailing_fingerprint,
                 telemetry_rollup=telemetry_dict,
                 request_captures=captures,
-                provider=self._provider,
-                tool_tag_counter=self._tool_tag_counter,
+                provider=self._engine_state.provider,
+                tool_tag_counter=self._engine_state.tool_tag_counter,
             ))
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
@@ -833,14 +827,14 @@ class VirtualContextEngine:
         # Determine active tags from recent tag results
         # Post-compaction: don't suppress retrieval — stored summaries are needed
         # since raw turns have been compacted away
-        if self._compacted_through > 0:
+        if self._engine_state.compacted_through > 0:
             active_tags = []
         else:
             active_tags = self._get_active_tags(conversation_history)
 
         # Compute current utilization (only count un-compacted history)
         snapshot = self._monitor.build_snapshot(
-            conversation_history[self._compacted_through:]
+            conversation_history[self._engine_state.compacted_through:]
         )
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
 
@@ -858,7 +852,7 @@ class VirtualContextEngine:
             message=message,
             current_active_tags=active_tags,
             current_utilization=utilization,
-            post_compaction=(self._compacted_through > 0),
+            post_compaction=(self._engine_state.compacted_through > 0),
             context_turns=context,
         )
 
@@ -886,7 +880,7 @@ class VirtualContextEngine:
                     entry.last_accessed_turn = len(self._turn_tag_index.entries)
 
         # Assemble enriched context — only pass uncompacted messages
-        uncompacted = conversation_history[self._compacted_through:]
+        uncompacted = conversation_history[self._engine_state.compacted_through:]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=retrieval_result,
@@ -916,7 +910,7 @@ class VirtualContextEngine:
                     message=message,
                     current_active_tags=active_tags,
                     current_utilization=utilization,
-                    post_compaction=(self._compacted_through > 0),
+                    post_compaction=(self._engine_state.compacted_through > 0),
                     context_turns=expanded,
                 )
                 retry_tags = retry_result.retrieval_metadata.get(
@@ -986,8 +980,8 @@ class VirtualContextEngine:
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn(latest_pair):
-                self._tool_tag_counter += 1
-                tag_name = f"tool_{self._tool_tag_counter}"
+                self._engine_state.tool_tag_counter += 1
+                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
                 self._turn_tag_index.append(TurnTagEntry(
                     turn_number=len(self._turn_tag_index.entries),
                     message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
@@ -1043,7 +1037,7 @@ class VirtualContextEngine:
                 session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             ))
 
-        self._last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
+        self._engine_state.last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
 
         # Check for overly-broad tags needing splitting
         if self._tag_splitter:
@@ -1051,7 +1045,7 @@ class VirtualContextEngine:
 
         # Build snapshot (only count un-compacted messages)
         snapshot = self._monitor.build_snapshot(
-            conversation_history[self._compacted_through:],
+            conversation_history[self._engine_state.compacted_through:],
             payload_tokens=payload_tokens,
         )
 
@@ -1059,7 +1053,7 @@ class VirtualContextEngine:
         signal = self._monitor.check(snapshot)
 
         if signal is None:
-            self._last_compact_ms = 0.0
+            self._engine_state.last_compact_ms = 0.0
             # Persist turn message text for post-restart recall
             if latest_pair:
                 turn_num = len(self._turn_tag_index.entries) - 1
@@ -1093,16 +1087,16 @@ class VirtualContextEngine:
         Returns a CompactionReport (never None — callers handle None guards).
         """
         # Segment and compact in batches (results stored to DB incrementally)
-        turn_offset = self._compacted_through // 2
+        turn_offset = self._engine_state.compacted_through // 2
         segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
         logger.info(
             "Segmented %d messages into %d segments (watermark=%d)",
-            len(compact_messages), len(segments), self._compacted_through,
+            len(compact_messages), len(segments), self._engine_state.compacted_through,
         )
         results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
 
         # Advance watermark past compacted messages
-        self._compacted_through += len(compact_messages)
+        self._engine_state.compacted_through += len(compact_messages)
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
@@ -1234,14 +1228,14 @@ class VirtualContextEngine:
         # Messages to compact: everything between watermark and protected zone.
         # Compact all available messages (not just the minimum) so compaction
         # fires infrequently — one big batch instead of many small ones.
-        compact_messages = conversation_history[self._compacted_through:-protected_count]
+        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
 
         if not compact_messages:
             return None
 
         report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
 
-        self._last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
+        self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
         self._save_state(conversation_history)
         return report
 
@@ -1279,7 +1273,7 @@ class VirtualContextEngine:
         candidates = [
             (tag, count) for tag, count in tag_counts.items()
             if tag != "_general"
-            and tag not in self._split_processed_tags
+            and tag not in self._engine_state.split_processed_tags
             and count >= cfg.frequency_threshold
             and count / total_turns >= cfg.frequency_pct_threshold
         ]
@@ -1294,7 +1288,7 @@ class VirtualContextEngine:
         # Collect turn content
         turn_contents = self._collect_turn_text(tag, conversation_history)
         if not turn_contents:
-            self._split_processed_tags.add(tag)
+            self._engine_state.split_processed_tags.add(tag)
             return None
 
         existing_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
@@ -1330,8 +1324,8 @@ class VirtualContextEngine:
                 "Tag '%s' unsplittable (%s), built summary", tag, result.reason,
             )
 
-        self._split_processed_tags.add(tag)
-        self._last_split_result = result
+        self._engine_state.split_processed_tags.add(tag)
+        self._engine_state.last_split_result = result
         return result
 
     @staticmethod
@@ -1433,7 +1427,7 @@ class VirtualContextEngine:
             getattr(self.config, "assembler", None),
             "pre_compaction_filtering", "aggressive",
         )
-        watermark = getattr(self, "_compacted_through", 0)
+        watermark = self._engine_state.compacted_through
         pre_compaction = watermark == 0
 
         # Determine protection window
@@ -1507,7 +1501,7 @@ class VirtualContextEngine:
         """
         if not self.config.assembler.context_hint_enabled:
             return ""
-        if getattr(self, "_compacted_through", 0) == 0:
+        if self._engine_state.compacted_through == 0:
             return ""
 
         tag_summaries = self._store.get_all_tag_summaries(
@@ -1691,7 +1685,7 @@ class VirtualContextEngine:
             logger.info("Not enough messages outside protected zone to compact")
             return None
 
-        compact_messages = conversation_history[self._compacted_through:-protected_count]
+        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
 
         if not compact_messages:
             return None
@@ -1741,8 +1735,8 @@ class VirtualContextEngine:
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn([user_msg, asst_msg]):
-                self._tool_tag_counter += 1
-                tag_name = f"tool_{self._tool_tag_counter}"
+                self._engine_state.tool_tag_counter += 1
+                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
                 entry = TurnTagEntry(
                     turn_number=turn_offset + (i // 2),
                     message_hash=hashlib.sha256(
@@ -2007,7 +2001,7 @@ class VirtualContextEngine:
 
         ws_param, full_segments_param = self._load_working_set_segments()
 
-        uncompacted = (history or [])[self._compacted_through:]
+        uncompacted = (history or [])[self._engine_state.compacted_through:]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
