@@ -59,7 +59,8 @@ def _build_tag_turn_engine_mock():
     engine._store.get_all_tags.return_value = []
     engine.config = MagicMock()
     engine.config.conversation_id = "test"
-    engine._working_set = {}
+    engine._paging = MagicMock()
+    engine._paging.working_set = {}
     engine._telemetry = MagicMock()
     engine._request_captures_provider = None
     # Wire up TaggingPipeline so tag_turn delegation works

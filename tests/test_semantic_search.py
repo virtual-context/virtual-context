@@ -221,13 +221,13 @@ class TestFindQuoteSemanticFallback:
         engine = _make_engine(tmp_path)
         engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
 
-        # Mock _semantic_search to verify it's not called when FTS fills quota
-        engine._semantic_search = MagicMock(return_value=[])
+        # Mock semantic_search to verify it's not called when FTS fills quota
+        engine._semantic.semantic_search = MagicMock(return_value=[])
 
         # max_results=1 so FTS finding 1 result fills the quota
         result = engine.find_quote("arrived", max_results=1)
         assert result["found"] is True
-        engine._semantic_search.assert_not_called()
+        engine._semantic.semantic_search.assert_not_called()
 
     def test_fts_hit_still_supplements_with_semantic(self, tmp_path):
         """When FTS finds matches but has remaining slots, semantic supplements."""
@@ -271,7 +271,7 @@ class TestFindQuoteSemanticFallback:
         engine = _make_engine(tmp_path)
         engine._store.store_segment(_make_segment())
         # Ensure embed_fn returns None (no sentence-transformers)
-        engine._embed_fn = None
+        engine._semantic._embed_fn = None
 
         result = engine.find_quote("nonexistent_term_xyz")
         assert result["found"] is False
@@ -314,8 +314,8 @@ class TestFindQuoteSemanticFallback:
 class TestSemanticSearchMethod:
     def test_returns_empty_when_no_embed_fn(self, tmp_path):
         engine = _make_engine(tmp_path)
-        engine._embed_fn = None
-        assert engine._semantic_search("test") == []
+        engine._semantic._embed_fn = None
+        assert engine._semantic.semantic_search("test") == []
 
     def test_deduplicates_by_segment(self, tmp_path):
         """Best chunk per segment only — no duplicate segment refs."""
@@ -330,9 +330,9 @@ class TestSemanticSearchMethod:
         engine._store.store_chunk_embeddings("seg-1", chunks)
 
         # Mock embed_fn to return a query vector close to both chunks
-        engine._embed_fn = lambda texts: [[0.95, 0.05]]
+        engine._semantic._embed_fn = lambda texts: [[0.95, 0.05]]
 
-        results = engine._semantic_search("test query")
+        results = engine._semantic.semantic_search("test query")
         # Should get at most 1 result (deduplicated)
         segment_refs = [r.segment_ref for r in results]
         assert len(set(segment_refs)) == len(segment_refs)
@@ -349,9 +349,9 @@ class TestSemanticSearchMethod:
         engine._store.store_chunk_embeddings("seg-1", chunks)
 
         # Query vector orthogonal to chunk → cosine sim = 0
-        engine._embed_fn = lambda texts: [[1.0, 0.0]]
+        engine._semantic._embed_fn = lambda texts: [[1.0, 0.0]]
 
-        results = engine._semantic_search("test query")
+        results = engine._semantic.semantic_search("test query")
         assert len(results) == 0
 
 
@@ -363,20 +363,20 @@ class TestCompactionEmbedsChunks:
     def test_compaction_stores_chunk_embeddings(self, tmp_path):
         """After compaction, chunk embeddings exist in the store."""
         engine = _make_engine(tmp_path)
-        # Track calls to _embed_and_store_chunks
+        # Track calls to embed_and_store_chunks
         called_with = []
-        original = engine._embed_and_store_chunks
+        original = engine._semantic.embed_and_store_chunks
 
         def tracking_embed(stored):
             called_with.append(stored.ref)
             return original(stored)
 
-        engine._embed_and_store_chunks = tracking_embed
+        engine._semantic.embed_and_store_chunks = tracking_embed
 
         # Manually store a segment to verify the hook is called
         seg = _make_segment()
         engine._store.store_segment(seg)
-        engine._embed_and_store_chunks(seg)
+        engine._semantic.embed_and_store_chunks(seg)
 
         # If embed_fn is available, chunks should be stored
         # (may be empty if sentence-transformers not installed)
