@@ -8,7 +8,10 @@ and format delegation all live here.
 from __future__ import annotations
 
 import json as _json
+import logging
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from ..types import Message
 from .formats import (
@@ -453,14 +456,14 @@ def _dump_session_state(
                     "covers_through_turn": ts.covers_through_turn,
                 })
         except Exception:
-            pass
+            logger.debug("tag summaries collection failed", exc_info=True)
 
         # Tag aliases
         aliases: dict[str, str] = {}
         try:
             aliases = engine._store.get_tag_aliases()
         except Exception:
-            pass
+            logger.debug("tag aliases collection failed", exc_info=True)
 
         # Tag stats from store
         tag_stats = []
@@ -473,7 +476,7 @@ def _dump_session_state(
                     "total_summary_tokens": st.total_summary_tokens,
                 })
         except Exception:
-            pass
+            logger.debug("tag stats collection failed", exc_info=True)
 
         # Split processed tags
         split_tags = list(engine._engine_state.split_processed_tags)
@@ -513,4 +516,4 @@ def _dump_session_state(
             encoding="utf-8",
         )
     except Exception:
-        pass  # never let session dump break the request
+        logger.debug("session dump failed", exc_info=True)  # never let session dump break the request

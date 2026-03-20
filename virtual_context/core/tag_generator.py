@@ -242,7 +242,7 @@ class LLMTagGenerator:
                 max_tokens=self.config.max_tokens,
             )
             duration_ms = (time.time() - t0) * 1000
-            self._log_usage(duration_ms=duration_ms)
+            self._log_usage(duration_ms=duration_ms, usage=_usage)
             result = self._parse_response(response)
         except Exception as e:
             logger.warning(f"LLM tag generation failed: {e}")
@@ -463,10 +463,11 @@ class LLMTagGenerator:
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
         self._tag_vocabulary.update(tag_counts)
 
-    def _log_usage(self, duration_ms: float = 0.0) -> None:
+    def _log_usage(self, duration_ms: float = 0.0, usage: dict | None = None) -> None:
         if not self._telemetry:
             return
-        usage = getattr(self.llm, "last_usage", {})
+        if usage is None:
+            usage = getattr(self.llm, "last_usage", {})
         if not usage:
             return
         input_tokens = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)

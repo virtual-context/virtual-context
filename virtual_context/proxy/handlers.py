@@ -237,7 +237,7 @@ async def _handle_streaming(
                     encoding="utf-8",
                 )
             except Exception:
-                pass
+                logger.debug("streaming response log write failed", exc_info=True)
         return assistant_text, upstream_ms
 
     async def _inner_stream():
@@ -681,7 +681,7 @@ async def _handle_streaming(
                                 _cont_resp_text or "", encoding="utf-8",
                             )
                         except Exception:
-                            pass  # never let logging break the request
+                            logger.debug("continuation log write failed", exc_info=True)  # never let logging break the request
 
                     logger.info(
                         "CONTINUATION round=%d status=%d tools=%s",
@@ -699,7 +699,7 @@ async def _handle_streaming(
                             try:
                                 await cont_resp.aclose()
                             except Exception:
-                                pass
+                                logger.debug("continuation response close failed", exc_info=True)
                         break
 
                     if not _cont_is_streaming:
@@ -1021,7 +1021,7 @@ async def _handle_streaming(
                     f"{log_prefix}.4-to-client.txt",
                 ).write_bytes(b"".join(client_chunks))
             except Exception:
-                pass
+                logger.debug("client response log write failed", exc_info=True)
 
     return StreamingResponse(
         stream_generator(),
@@ -1069,7 +1069,7 @@ async def _handle_non_streaming(
                 encoding="utf-8",
             )
         except Exception:
-            pass
+            logger.debug("upstream response log write failed", exc_info=True)
 
     # Capture response for dashboard inspector
     _ns_raw = response_body.get("usage", {})
@@ -1152,7 +1152,7 @@ async def _handle_non_streaming(
                 encoding="utf-8",
             )
         except Exception:
-            pass
+            logger.debug("client response log write failed", exc_info=True)
 
     return JSONResponse(
         content=response_body,

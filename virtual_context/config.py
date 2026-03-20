@@ -142,73 +142,82 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     # Tag rules
     tag_rules = _parse_tag_rules(raw.get("tag_rules", []))
 
+    # Dataclass defaults (single source of truth for default values)
+    _vc_defaults = VirtualContextConfig()
+    _mon_defaults = MonitorConfig()
+    _seg_defaults = SegmenterConfig()
+    _cmp_defaults = CompactorConfig()
+    _sum_defaults = SummarizationConfig()
+    _sto_defaults = StorageConfig()
+    _sch_defaults = SearchConfig()
+
     # Compaction / monitor
     compaction = raw.get("compaction", {})
     monitor_config = MonitorConfig(
-        context_window=raw.get("context_window", 120_000),
-        soft_threshold=compaction.get("soft_threshold", 0.70),
-        hard_threshold=compaction.get("hard_threshold", 0.85),
-        protected_recent_turns=compaction.get("protected_recent_turns", 6),
+        context_window=raw.get("context_window", _vc_defaults.context_window),
+        soft_threshold=compaction.get("soft_threshold", _mon_defaults.soft_threshold),
+        hard_threshold=compaction.get("hard_threshold", _mon_defaults.hard_threshold),
+        protected_recent_turns=compaction.get("protected_recent_turns", _mon_defaults.protected_recent_turns),
     )
     segmenter_config = SegmenterConfig(
-        session_gap_minutes=compaction.get("session_gap_minutes", 30),
-        tag_overlap_threshold=compaction.get("tag_overlap_threshold", 0.5),
-        max_segment_turns=compaction.get("max_segment_turns", 20),
-        tool_result_segment_threshold=compaction.get("tool_result_segment_threshold", 50000),
+        session_gap_minutes=compaction.get("session_gap_minutes", _seg_defaults.session_gap_minutes),
+        tag_overlap_threshold=compaction.get("tag_overlap_threshold", _seg_defaults.tag_overlap_threshold),
+        max_segment_turns=compaction.get("max_segment_turns", _seg_defaults.max_segment_turns),
+        tool_result_segment_threshold=compaction.get("tool_result_segment_threshold", _seg_defaults.tool_result_segment_threshold),
     )
     compactor_config = CompactorConfig(
-        summary_ratio=compaction.get("summary_ratio", 0.15),
-        min_summary_tokens=compaction.get("min_summary_tokens", 200),
-        max_summary_tokens=compaction.get("max_summary_tokens", 2000),
-        max_concurrent_summaries=compaction.get("max_concurrent_summaries", 4),
-        overflow_buffer=compaction.get("overflow_buffer", 1.2),
-        llm_token_overhead=compaction.get("llm_token_overhead", 2000),
+        summary_ratio=compaction.get("summary_ratio", _cmp_defaults.summary_ratio),
+        min_summary_tokens=compaction.get("min_summary_tokens", _cmp_defaults.min_summary_tokens),
+        max_summary_tokens=compaction.get("max_summary_tokens", _cmp_defaults.max_summary_tokens),
+        max_concurrent_summaries=compaction.get("max_concurrent_summaries", _cmp_defaults.max_concurrent_summaries),
+        overflow_buffer=compaction.get("overflow_buffer", _cmp_defaults.overflow_buffer),
+        llm_token_overhead=compaction.get("llm_token_overhead", _cmp_defaults.llm_token_overhead),
     )
 
     # Summarization
     summ_raw = raw.get("summarization", {})
     summarization = SummarizationConfig(
-        provider=summ_raw.get("provider", "ollama"),
-        model=summ_raw.get("model", "qwen3:4b-instruct-2507-fp16"),
-        max_tokens=summ_raw.get("max_tokens", 1000),
-        temperature=summ_raw.get("temperature", 0.3),
+        provider=summ_raw.get("provider", _sum_defaults.provider),
+        model=summ_raw.get("model", _sum_defaults.model),
+        max_tokens=summ_raw.get("max_tokens", _sum_defaults.max_tokens),
+        temperature=summ_raw.get("temperature", _sum_defaults.temperature),
     )
 
     # Storage
     storage_raw = raw.get("storage", {})
-    backend = storage_raw.get("backend", "sqlite")
+    backend = storage_raw.get("backend", _sto_defaults.backend)
     fs_raw = storage_raw.get("filesystem", {})
     sqlite_raw = storage_raw.get("sqlite", {})
     pg_raw = storage_raw.get("postgres", {})
     neo4j_raw = storage_raw.get("neo4j", {})
     fdb_raw = storage_raw.get("falkordb", {})
-    storage_root = raw.get("storage_root", ".virtualcontext")
+    storage_root = raw.get("storage_root", _vc_defaults.storage_root)
     storage_config = StorageConfig(
         backend=backend,
         root=fs_raw.get("root", storage_root + "/store"),
         sqlite_path=sqlite_raw.get("path", storage_root + "/store.db"),
-        postgres_dsn=pg_raw.get("dsn", ""),
-        neo4j_uri=neo4j_raw.get("uri", ""),
-        neo4j_user=neo4j_raw.get("user", "neo4j"),
-        neo4j_password=neo4j_raw.get("password", ""),
-        falkordb_host=fdb_raw.get("host", "localhost"),
-        falkordb_port=fdb_raw.get("port", 6379),
-        falkordb_password=fdb_raw.get("password", ""),
+        postgres_dsn=pg_raw.get("dsn", _sto_defaults.postgres_dsn),
+        neo4j_uri=neo4j_raw.get("uri", _sto_defaults.neo4j_uri),
+        neo4j_user=neo4j_raw.get("user", _sto_defaults.neo4j_user),
+        neo4j_password=neo4j_raw.get("password", _sto_defaults.neo4j_password),
+        falkordb_host=fdb_raw.get("host", _sto_defaults.falkordb_host),
+        falkordb_port=fdb_raw.get("port", _sto_defaults.falkordb_port),
+        falkordb_password=fdb_raw.get("password", _sto_defaults.falkordb_password),
     )
 
     # Search (find_quote excerpts and snippet lengths)
     search_raw = raw.get("search", {})
     search_config = SearchConfig(
-        excerpt_context_chars=search_raw.get("excerpt_context_chars", 200),
-        fts_snippet_chars=search_raw.get("fts_snippet_chars", 500),
-        tool_output_snippet_chars=search_raw.get("tool_output_snippet_chars", 100),
-        postgres_max_words=search_raw.get("postgres_max_words", 100),
-        find_quote_max_results=search_raw.get("find_quote_max_results", 20),
-        find_quote_default_results=search_raw.get("find_quote_default_results", 5),
-        remember_when_max_results=search_raw.get("remember_when_max_results", 5),
-        semantic_search_max_results=search_raw.get("semantic_search_max_results", 5),
-        query_facts_default_limit=search_raw.get("query_facts_default_limit", 50),
-        search_facts_max_results=search_raw.get("search_facts_max_results", 10),
+        excerpt_context_chars=search_raw.get("excerpt_context_chars", _sch_defaults.excerpt_context_chars),
+        fts_snippet_chars=search_raw.get("fts_snippet_chars", _sch_defaults.fts_snippet_chars),
+        tool_output_snippet_chars=search_raw.get("tool_output_snippet_chars", _sch_defaults.tool_output_snippet_chars),
+        postgres_max_words=search_raw.get("postgres_max_words", _sch_defaults.postgres_max_words),
+        find_quote_max_results=search_raw.get("find_quote_max_results", _sch_defaults.find_quote_max_results),
+        find_quote_default_results=search_raw.get("find_quote_default_results", _sch_defaults.find_quote_default_results),
+        remember_when_max_results=search_raw.get("remember_when_max_results", _sch_defaults.remember_when_max_results),
+        semantic_search_max_results=search_raw.get("semantic_search_max_results", _sch_defaults.semantic_search_max_results),
+        query_facts_default_limit=search_raw.get("query_facts_default_limit", _sch_defaults.query_facts_default_limit),
+        search_facts_max_results=search_raw.get("search_facts_max_results", _sch_defaults.search_facts_max_results),
     )
 
     # Facts
@@ -221,31 +230,33 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     )
 
     # Assembly
+    _asm_defaults = AssemblerConfig()
     assembly_raw = raw.get("assembly", {})
     assembler_config = AssemblerConfig(
-        core_context_max_tokens=assembly_raw.get("core_context_max_tokens", 18_000),
-        tag_context_max_tokens=assembly_raw.get("tag_context_max_tokens", 30_000),
-        facts_max_tokens=assembly_raw.get("facts_max_tokens", 20_000),
+        core_context_max_tokens=assembly_raw.get("core_context_max_tokens", _asm_defaults.core_context_max_tokens),
+        tag_context_max_tokens=assembly_raw.get("tag_context_max_tokens", _asm_defaults.tag_context_max_tokens),
+        facts_max_tokens=assembly_raw.get("facts_max_tokens", _asm_defaults.facts_max_tokens),
         core_files=assembly_raw.get("core_files", []),
-        recent_turns_always_included=assembly_raw.get("recent_turns_always_included", 3),
-        context_hint_enabled=assembly_raw.get("context_hint_enabled", True),
-        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", 2000),
-        pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", "aggressive"),
+        recent_turns_always_included=assembly_raw.get("recent_turns_always_included", _asm_defaults.recent_turns_always_included),
+        context_hint_enabled=assembly_raw.get("context_hint_enabled", _asm_defaults.context_hint_enabled),
+        context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", _asm_defaults.context_hint_max_tokens),
+        pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", _asm_defaults.pre_compaction_filtering),
     )
 
     # Retrieval
+    _ret_defaults = RetrieverConfig()
     retrieval_raw = raw.get("retrieval", {})
     strategy_raw = retrieval_raw.get("strategy_config", {})
     strategy_configs = _parse_strategy_configs(strategy_raw)
     retriever_config = RetrieverConfig(
-        skip_active_tags=retrieval_raw.get("skip_active_tags", True),
-        active_tag_lookback=retrieval_raw.get("active_tag_lookback", 4),
+        skip_active_tags=retrieval_raw.get("skip_active_tags", _ret_defaults.skip_active_tags),
+        active_tag_lookback=retrieval_raw.get("active_tag_lookback", _ret_defaults.active_tag_lookback),
         tag_context_max_tokens=assembler_config.tag_context_max_tokens,
         strategy_configs=strategy_configs,
-        anchorless_lookback=retrieval_raw.get("anchorless_lookback", 6),
-        inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", "embedding"),
-        embedding_model=retrieval_raw.get("embedding_model", "all-MiniLM-L6-v2"),
-        embedding_threshold=retrieval_raw.get("embedding_threshold", 0.3),
+        anchorless_lookback=retrieval_raw.get("anchorless_lookback", _ret_defaults.anchorless_lookback),
+        inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", _ret_defaults.inbound_tagger_type),
+        embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
+        embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
     )
 
     # Telemetry (backward compat: also accept "cost_tracking")
@@ -279,22 +290,14 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     )
 
     # Paging settings
+    _pag_defaults = PagingConfig()
     paging_raw = raw.get("paging", {})
     paging_config = PagingConfig(
-        enabled=paging_raw.get("enabled", False),
-        autonomous_models=paging_raw.get("autonomous_models", [
-            "claude-sonnet-4", "claude-opus-4",
-            "claude-3-5-sonnet", "claude-3.5-sonnet",
-            "claude-3-7-sonnet", "claude-3.7-sonnet",
-            "claude-3-opus",
-            "gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-5",
-            "o1", "o3", "o4-mini",
-            "gemini-2.5-pro", "gemini-2.5-flash",
-            "gemini-3", "gemini-2.0-flash",
-        ]),
-        auto_promote=paging_raw.get("auto_promote", True),
-        auto_evict=paging_raw.get("auto_evict", True),
-        max_tool_loops=paging_raw.get("max_tool_loops", PagingConfig.max_tool_loops),
+        enabled=paging_raw.get("enabled", _pag_defaults.enabled),
+        autonomous_models=paging_raw.get("autonomous_models", _pag_defaults.autonomous_models),
+        auto_promote=paging_raw.get("auto_promote", _pag_defaults.auto_promote),
+        auto_evict=paging_raw.get("auto_evict", _pag_defaults.auto_evict),
+        max_tool_loops=paging_raw.get("max_tool_loops", _pag_defaults.max_tool_loops),
     )
 
     # Tool output interception

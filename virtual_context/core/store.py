@@ -264,6 +264,10 @@ class ContextStore(ABC):
     # Tool Output Storage
     # ------------------------------------------------------------------
 
+    def delete_conversation(self, conversation_id: str) -> int:
+        """Delete all segments, facts, engine state, turn messages, and tag summaries for a conversation. Returns segment count deleted."""
+        return 0
+
     def store_tool_output(
         self,
         ref: str,

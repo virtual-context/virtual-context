@@ -542,21 +542,9 @@ class SQLiteStore(ContextStore):
 
     def store_segment(self, segment: StoredSegment) -> str:
         conn = self._get_conn()
-        primary_tag = (
-            segment.primary_tag
-            if isinstance(segment.primary_tag, str)
-            else json.dumps(segment.primary_tag, ensure_ascii=True, default=str)
-        )
-        summary_text = (
-            segment.summary
-            if isinstance(segment.summary, str)
-            else json.dumps(segment.summary, ensure_ascii=True, default=str)
-        )
-        full_text = (
-            segment.full_text
-            if isinstance(segment.full_text, str)
-            else json.dumps(segment.full_text, ensure_ascii=True, default=str)
-        )
+        primary_tag = segment.primary_tag
+        summary_text = segment.summary
+        full_text = segment.full_text
         metadata_dict = {
             "entities": segment.metadata.entities,
             "key_decisions": segment.metadata.key_decisions,
@@ -597,12 +585,9 @@ class SQLiteStore(ContextStore):
             # Update tags
             conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
             for tag in segment.tags:
-                normalized_tag = (
-                    tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=True, default=str)
-                )
                 conn.execute(
                     "INSERT INTO segment_tags (segment_ref, tag) VALUES (?, ?)",
-                    (segment.ref, normalized_tag),
+                    (segment.ref, tag),
                 )
 
             conn.execute("COMMIT")
