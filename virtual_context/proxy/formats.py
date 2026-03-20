@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Shared helpers (provider-agnostic) — canonical definitions in _envelope.py
