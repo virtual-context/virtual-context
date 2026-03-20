@@ -88,6 +88,7 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
+from .core.engine_utils import extract_turn_pairs, get_recent_context
 from .core.paging_manager import PagingManager
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
 
@@ -1330,21 +1331,12 @@ class VirtualContextEngine:
 
     @staticmethod
     def _extract_turn_pairs(history: list[Message]) -> list[tuple[str, str]]:
-        """Extract user→assistant turn pairs from history, handling non-alternating messages.
+        """Extract user->assistant turn pairs from history.
 
-        Returns list of (user_text, assistant_text) tuples. Skips preamble-only
-        user messages (e.g., MemOS '# Role' injections) and handles consecutive
-        user messages by using the last user message before each assistant response.
+        Thin wrapper around :func:`extract_turn_pairs` — kept temporarily
+        until callers migrate to delegates.
         """
-        pairs: list[tuple[str, str]] = []
-        last_user_text = ""
-        for msg in history:
-            if msg.role == "user":
-                last_user_text = msg.content
-            elif msg.role == "assistant" and last_user_text:
-                pairs.append((last_user_text, msg.content))
-                last_user_text = ""
-        return pairs
+        return extract_turn_pairs(history)
 
     def _collect_turn_text(
         self, tag: str, history: list[Message],
@@ -1610,55 +1602,17 @@ class VirtualContextEngine:
     ) -> list[str] | None:
         """Collect up to *n_pairs* recent user+assistant text strings.
 
-        Walks backward from the end of *history* (skipping the last
-        *exclude_last* messages which are the current turn) and returns
-        alternating user/assistant content strings.
-
-        When *current_text* is provided and ``context_bleed_threshold > 0``,
-        an embedding similarity gate checks whether the current turn is
-        semantically related to the most recent context pair.  If the
-        similarity is below the threshold (topic shift), context is skipped
-        to prevent stale tags from bleeding across topics (BUG-010).
-
-        Returns ``None`` when no context is available or when the gate blocks.
+        Thin wrapper around :func:`get_recent_context` — kept temporarily
+        until callers migrate to delegates.
         """
-        # Messages available for context (before the current turn)
-        if exclude_last > 0 and len(history) > exclude_last:
-            avail = history[:-exclude_last]
-        elif exclude_last == 0:
-            avail = list(history)
-        else:
-            avail = []
-        if not avail:
-            return None
-
-        pairs: list[str] = []
-        # Walk backward collecting user+assistant pairs
-        i = len(avail) - 1
-        collected = 0
-        while i >= 1 and collected < n_pairs:
-            if avail[i].role == "assistant" and avail[i - 1].role == "user":
-                # Prepend so order is chronological
-                pairs.insert(0, avail[i].content)
-                pairs.insert(0, avail[i - 1].content)
-                collected += 1
-                i -= 2
-            else:
-                i -= 1
-
-        if not pairs:
-            return None
-
-        # Context bleed gate (BUG-010): skip context on topic shift
-        if (
-            current_text
-            and self.config.tag_generator.context_bleed_threshold > 0
-            and not self._context_is_relevant(current_text, pairs)
-        ):
-            logger.debug("Context bleed gate: topic shift detected, skipping context")
-            return None
-
-        return pairs
+        return get_recent_context(
+            history,
+            n_pairs,
+            semantic=self._semantic,
+            bleed_threshold=self.config.tag_generator.context_bleed_threshold,
+            exclude_last=exclude_last,
+            current_text=current_text,
+        )
 
     def compact_manual(
         self,
