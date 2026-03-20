@@ -205,6 +205,12 @@ class CompositeStore:
     def list_engine_state_fingerprints(self) -> dict[str, str]:
         return self._state.list_engine_state_fingerprints()
 
+    def save_request_capture(self, capture: dict) -> None:
+        return self._state.save_request_capture(capture)
+
+    def load_request_captures(self, limit: int = 50) -> list[dict]:
+        return self._state.load_request_captures(limit=limit)
+
     # ------------------------------------------------------------------
     # SearchStore
     # ------------------------------------------------------------------
@@ -242,7 +248,6 @@ class CompositeStore:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close all unique sub-stores that support close()."""
         closed: set[int] = set()
         for sub in (self._segments, self._facts, self._fact_links, self._state, self._search):
             sid = id(sub)
