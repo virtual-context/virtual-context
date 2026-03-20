@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,7 +25,6 @@ from .storage.sqlite import SQLiteStore
 from .token_counter import create_token_counter
 from .types import (
     AssembledContext,
-    ChunkEmbedding,
     CompactionReport,
     CompactionResult,
     CompactionSignal,
@@ -37,17 +33,13 @@ from .types import (
     EngineState,
     EngineStateSnapshot,
     Message,
-    QuoteResult,
     RetrievalResult,
     SplitResult,
-    StoredSegment,
-    TagResult,
     TagSummary,
     ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
     WorkingSetEntry,
-    get_sender_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +78,6 @@ def _is_stub_content(text: str) -> bool:
 
 
 from .core.compaction_pipeline import CompactionPipeline
-from .core.engine_utils import extract_turn_pairs, get_recent_context
 from .core.paging_manager import PagingManager
 from .core.retrieval_assembler import RetrievalAssembler
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
@@ -241,15 +232,6 @@ class VirtualContextEngine:
             pass
 
     @property
-    def _embed_fn(self):
-        """Proxy to SemanticSearchManager's embed function (for test compat)."""
-        return self._semantic._embed_fn
-
-    @_embed_fn.setter
-    def _embed_fn(self, value):
-        self._semantic._embed_fn = value
-
-    @property
     def _tag_generator(self) -> TagGenerator:
         """Proxy to TaggingPipeline's tag generator (for test compat).
 
@@ -313,15 +295,6 @@ class VirtualContextEngine:
             self.__dict__["_VirtualContextEngine__compactor"] = value
 
     @property
-    def _working_set(self) -> dict[str, WorkingSetEntry]:
-        """Proxy to PagingManager's working set (for backward compat)."""
-        return self._paging.working_set
-
-    @_working_set.setter
-    def _working_set(self, value: dict[str, WorkingSetEntry]):
-        self._paging.working_set = value
-
-    @property
     def _fact_curator(self):
         """Proxy to RetrievalAssembler's fact curator (for test compat).
 
@@ -376,7 +349,7 @@ class VirtualContextEngine:
         self._tag_generator: TagGenerator = build_tag_generator(
             self.config.tag_generator, llm_provider,
             canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
-            embed_fn_factory=self._get_embed_fn,
+            embed_fn_factory=lambda: self._semantic.get_embed_fn(),
         )
 
     def _init_store(self) -> None:
@@ -568,7 +541,7 @@ class VirtualContextEngine:
         self._search._turn_tag_index = self._turn_tag_index
         self._engine_state.split_processed_tags = set(saved.split_processed_tags)
         # Restore paging working set (backward-compatible: old snapshots have empty list)
-        self._working_set = {ws.tag: ws for ws in (saved.working_set or [])}
+        self._paging.working_set = {ws.tag: ws for ws in (saved.working_set or [])}
         self._engine_state.trailing_fingerprint = saved.trailing_fingerprint
         # Restore telemetry counters from persisted rollup
         if saved.telemetry_rollup:
@@ -581,7 +554,7 @@ class VirtualContextEngine:
             "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
             saved.conversation_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
-            len(self._working_set),
+            len(self._paging.working_set),
         )
 
         # Validate watermark against actual stored segments.
@@ -658,7 +631,7 @@ class VirtualContextEngine:
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=len(conversation_history) // 2,
                 split_processed_tags=sorted(self._engine_state.split_processed_tags),
-                working_set=list(self._working_set.values()),
+                working_set=list(self._paging.working_set.values()),
                 trailing_fingerprint=self._engine_state.trailing_fingerprint,
                 telemetry_rollup=telemetry_dict,
                 request_captures=captures,
@@ -689,7 +662,7 @@ class VirtualContextEngine:
                 config=sc,
                 graph_links=True,
                 telemetry_ledger=self._telemetry,
-                embed_fn=self._get_embed_fn(),
+                embed_fn=self._semantic.get_embed_fn(),
             )
             logger.info("Fact link checker initialized (provider=%s, model=%s, graph_links=True)", provider_name, model)
         else:
@@ -700,7 +673,7 @@ class VirtualContextEngine:
                 store=self._store,
                 config=sc,
                 telemetry_ledger=self._telemetry,
-                embed_fn=self._get_embed_fn(),
+                embed_fn=self._semantic.get_embed_fn(),
             )
             logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 
@@ -839,15 +812,6 @@ class VirtualContextEngine:
         """Check for overly-broad tags (delegates to TaggingPipeline)."""
         return self._tagging._check_and_split_broad_tags(conversation_history)
 
-    @staticmethod
-    def _extract_turn_pairs(history: list[Message]) -> list[tuple[str, str]]:
-        """Extract user->assistant turn pairs from history.
-
-        Thin wrapper around :func:`extract_turn_pairs` — kept temporarily
-        until callers migrate to delegates.
-        """
-        return extract_turn_pairs(history)
-
     def _collect_turn_text(
         self, tag: str, history: list[Message],
     ) -> list[tuple[int, str]]:
@@ -903,52 +867,6 @@ class VirtualContextEngine:
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
         """Extract the most recent user+assistant pair (delegates to TaggingPipeline)."""
         return self._tagging._get_latest_turn_pair(history)
-
-    def _get_embed_fn(self):
-        """Lazy-load the embedding function for the context bleed gate."""
-        return self._semantic.get_embed_fn()
-
-    def _embed_and_store_chunks(self, stored: "StoredSegment") -> None:
-        """Chunk a segment's full_text, embed, and store vectors."""
-        self._semantic.embed_and_store_chunks(stored)
-
-    def _semantic_search(self, query: str, max_results: int = 5) -> list[QuoteResult]:
-        """Embedding-based semantic search over stored chunk vectors."""
-        return self._semantic.semantic_search(query, max_results)
-
-    def _backfill_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        """One-time backfill: embed all existing segments' full_text."""
-        return self._semantic.backfill_chunk_embeddings()
-
-    def _context_is_relevant(
-        self, current_text: str, context_pairs: list[str],
-    ) -> bool:
-        """Check if current turn is semantically similar to the most recent context pair."""
-        return self._semantic.context_is_relevant(current_text, context_pairs)
-
-    def _context_is_relevant_with_score(
-        self, current_text: str, context_pairs: list[str],
-    ) -> tuple[bool, float]:
-        """Like _context_is_relevant but also returns the similarity score."""
-        return self._semantic.context_is_relevant_with_score(current_text, context_pairs)
-
-    def _get_recent_context(
-        self, history: list[Message], n_pairs: int, exclude_last: int = 2,
-        current_text: str | None = None,
-    ) -> list[str] | None:
-        """Collect up to *n_pairs* recent user+assistant text strings.
-
-        Thin wrapper around :func:`get_recent_context` — kept temporarily
-        until callers migrate to delegates.
-        """
-        return get_recent_context(
-            history,
-            n_pairs,
-            semantic=self._semantic,
-            bleed_threshold=self.config.tag_generator.context_bleed_threshold,
-            exclude_last=exclude_last,
-            current_text=current_text,
-        )
 
     def compact_manual(
         self,
@@ -1156,10 +1074,6 @@ class VirtualContextEngine:
     def get_telemetry(self) -> TelemetryLedger:
         """Return the telemetry ledger for this session."""
         return self._telemetry
-
-    def get_cost_report(self):
-        """Backward compat: return a TelemetryRollup from the ledger."""
-        return self._telemetry.total()
 
     def cleanup(self, max_age_days: int | None = None, max_total_tokens: int | None = None) -> int:
         """Run cleanup on the store. Returns count of segments deleted."""

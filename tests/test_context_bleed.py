@@ -57,7 +57,7 @@ def _make_engine(threshold=0.1):
         },
     })
     engine = VirtualContextEngine(config=config)
-    engine._embed_fn = _mock_embed_fn
+    engine._semantic._embed_fn = _mock_embed_fn
     return engine
 
 
@@ -89,7 +89,7 @@ class TestContextBleedGate:
             TurnTagEntry(turn_number=1, message_hash="b", tags=["transit-schedule"], primary_tag="transit-schedule")
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="what do you love bast? I love helping you navigate complex problems.",
         )
@@ -120,7 +120,7 @@ class TestContextBleedGate:
             TurnTagEntry(turn_number=1, message_hash="b", tags=["transit-schedule"], primary_tag="transit-schedule")
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="which is faster during rush hour? The train is faster, about 45 minutes door to door.",
         )
@@ -159,7 +159,7 @@ class TestContextBleedGate:
         )
 
         # Most recent context pair is T2 (identity), which is relevant to T3
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="of course. It's clear she means a lot to you.",
         )
@@ -190,7 +190,7 @@ class TestContextBleedGate:
             TurnTagEntry(turn_number=1, message_hash="b", tags=["transit-schedule"], primary_tag="transit-schedule")
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="what about the cost difference over a month? At 20 workdays, the bus saves you $45/month compared to the train.",
         )
@@ -221,7 +221,7 @@ class TestContextBleedGate:
             TurnTagEntry(turn_number=1, message_hash="b", tags=["database", "indexing"], primary_tag="database")
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="yes. I'll add both indexes to the migration.",
         )
@@ -245,7 +245,7 @@ class TestContextBleedConfig:
             ),
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="what do you love bast? I love helping you navigate complex problems.",
         )
@@ -254,7 +254,7 @@ class TestContextBleedConfig:
     def test_graceful_degradation_no_embeddings(self):
         """When no embed function is available, gate should pass through."""
         engine = _make_engine()
-        engine._embed_fn = None  # simulate no sentence-transformers
+        engine._semantic._embed_fn = None  # simulate no sentence-transformers
         history = _make_history(
             (
                 "NJ transit from River Edge, what time?",
@@ -266,7 +266,7 @@ class TestContextBleedConfig:
             ),
         )
 
-        ctx = engine._get_recent_context(
+        ctx = engine._tagging._get_recent_context(
             history, 5,
             current_text="what do you love bast? I love helping you navigate complex problems.",
         )
@@ -286,5 +286,5 @@ class TestContextBleedConfig:
             ),
         )
 
-        ctx = engine._get_recent_context(history, 5)
+        ctx = engine._tagging._get_recent_context(history, 5)
         assert ctx is not None, "Context should not be blocked without current_text"

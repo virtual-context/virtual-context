@@ -480,7 +480,7 @@ def _dump_session_state(
 
         # Working set (paging state)
         working_set_dump: list[dict] = []
-        ws = getattr(engine, "_working_set", None)
+        ws = getattr(engine._paging, "working_set", None)
         if ws:
             for tag, entry in ws.items():
                 working_set_dump.append({
