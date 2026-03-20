@@ -40,10 +40,8 @@ from .types import (
     Message,
     QuoteResult,
     RetrievalResult,
-    SegmentMetadata,
     SplitResult,
     StoredSegment,
-    StoredSummary,
     TagResult,
     TagSummary,
     ToolLoopResult,
@@ -88,6 +86,7 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
+from .core.compaction_pipeline import CompactionPipeline
 from .core.engine_utils import extract_turn_pairs, get_recent_context
 from .core.paging_manager import PagingManager
 from .core.semantic_search import SemanticSearchManager, chunk_segment_text as _chunk_segment_text
@@ -182,6 +181,19 @@ class VirtualContextEngine:
             compactor=self._compactor,
             save_state_callback=self._save_state,
         )
+        self._compaction = CompactionPipeline(
+            compactor=self._compactor,
+            segmenter=self._segmenter,
+            store=self._store,
+            turn_tag_index=self._turn_tag_index,
+            engine_state=self._engine_state,
+            config=self.config,
+            supersession_checker=self._supersession_checker,
+            fact_curator=self._fact_curator,
+            semantic=self._semantic,
+            telemetry=self._telemetry,
+            save_state_callback=self._save_state,
+        )
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
@@ -200,6 +212,8 @@ class VirtualContextEngine:
         self._segmenter._turn_tag_index = self._turn_tag_index
         self._tagging._turn_tag_index = self._turn_tag_index
         self._tagging._engine_state = self._engine_state
+        self._compaction._turn_tag_index = self._turn_tag_index
+        self._compaction._engine_state = self._engine_state
         self._bootstrap_vocabulary()
 
     def close(self) -> None:
@@ -263,6 +277,31 @@ class VirtualContextEngine:
             tagging._tag_splitter = value
         else:
             self.__dict__["_VirtualContextEngine__tag_splitter"] = value
+
+    @property
+    def _compactor(self):
+        """Proxy to CompactionPipeline's compactor (for test compat).
+
+        Before ``_compaction`` is created (during ``__init__``), reads/writes
+        go to the backing attribute ``__compactor``.  After that, reads
+        and writes go through ``_compaction._compactor`` so that tests
+        that monkey-patch ``engine._compactor`` also update the delegate.
+        """
+        compaction = self.__dict__.get("_compaction")
+        if compaction is not None:
+            return compaction._compactor
+        return self.__dict__.get("_VirtualContextEngine__compactor")
+
+    @_compactor.setter
+    def _compactor(self, value) -> None:
+        compaction = self.__dict__.get("_compaction")
+        tagging = self.__dict__.get("_tagging")
+        if compaction is not None:
+            compaction._compactor = value
+        if tagging is not None:
+            tagging._compactor = value
+        if compaction is None:
+            self.__dict__["_VirtualContextEngine__compactor"] = value
 
     @property
     def _working_set(self) -> dict[str, WorkingSetEntry]:
@@ -469,183 +508,14 @@ class VirtualContextEngine:
             self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
 
-    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch → DB after each batch
+    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch (delegates to CompactionPipeline)
 
     def _compact_and_store(
         self, segments: list, compact_messages_len: int,
         progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
-        """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
-        batch immediately so results are visible in the DB incrementally."""
-        from .types import FactSignal
-
-        all_results: list[CompactionResult] = []
-        batch_size = self._COMPACT_BATCH_SIZE
-
-        # D1: Gather fact signals from TurnTagIndex scoped per segment.
-        # Build a segment-to-turn mapping using turn_offset and each segment's
-        # turn_count, then collect only the fact signals for each segment's
-        # source turns.
-        turn_offset = self._engine_state.compacted_through // 2
-        seg_cursor = turn_offset
-        segment_signals: dict[str, list[FactSignal]] = {}
-        for seg in segments:
-            seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
-            signals: list[FactSignal] = []
-            for t in range(seg_cursor, seg_cursor + seg_turn_count):
-                entry = self._turn_tag_index.get_tags_for_turn(t)
-                if entry and entry.fact_signals:
-                    signals.extend(entry.fact_signals)
-            if signals:
-                segment_signals[seg.id] = signals
-            seg_cursor += seg_turn_count
-
-        for start in range(0, len(segments), batch_size):
-            batch = segments[start:start + batch_size]
-            batch_num = start // batch_size + 1
-            total_batches = (len(segments) + batch_size - 1) // batch_size
-            logger.info(
-                "Compacting batch %d/%d (%d segments)...",
-                batch_num, total_batches, len(batch),
-            )
-            # D1: Pass per-segment signals to the compactor for verification.
-            fact_signals_by_segment = {
-                seg.id: segment_signals[seg.id]
-                for seg in batch if seg.id in segment_signals
-            } or None
-            # Filter out stub segments (media placeholders, image stubs) — not worth
-            # LLM summarization. Real short messages ("im good") should be compacted
-            # normally since they belong to their parent topic segment.
-            def _is_passthrough(s):
-                text = " ".join(m.content for m in s.messages)
-                return _is_stub_content(text)
-            compactable = [s for s in batch if not _is_passthrough(s)]
-            stubs = [s for s in batch if _is_passthrough(s)]
-            for seg in stubs:
-                text = " ".join(m.content for m in seg.messages).strip()
-                logger.info(
-                    "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s — using raw text as summary",
-                    seg.id[:8], seg.token_count, seg.primary_tag,
-                )
-                results_tiny = [CompactionResult(
-                    segment_id=seg.id,
-                    primary_tag=seg.primary_tag,
-                    tags=seg.tags,
-                    summary=text or f"[empty turn: {seg.primary_tag}]",
-                    summary_tokens=seg.token_count,
-                    full_text=text,
-                    original_tokens=seg.token_count,
-                    messages=[{"role": m.role, "content": m.content} for m in seg.messages],
-                    metadata=SegmentMetadata(
-                        turn_count=seg.turn_count,
-                        session_date=getattr(seg, "session_date", ""),
-                    ),
-                    compression_ratio=1.0,
-                    timestamp=seg.start_timestamp,
-                )]
-                all_results.extend(results_tiny)
-                for result in results_tiny:
-                    stored = StoredSegment(
-                        ref=result.segment_id,
-                        conversation_id=self.config.conversation_id,
-                        primary_tag=result.primary_tag,
-                        tags=result.tags,
-                        summary=result.summary,
-                        summary_tokens=result.summary_tokens,
-                        full_text=result.full_text,
-                        full_tokens=result.original_tokens,
-                        messages=result.messages,
-                        metadata=result.metadata,
-                        compaction_model="passthrough",
-                        compression_ratio=1.0,
-                        start_timestamp=result.timestamp,
-                        end_timestamp=result.timestamp,
-                    )
-                    self._store.store_segment(stored)
-            if not compactable:
-                continue
-            batch = compactable
-            results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
-            # Store each result to DB right away
-            for i, result in enumerate(results):
-                stored = StoredSegment(
-                    ref=result.segment_id,
-                    conversation_id=self.config.conversation_id,
-                    primary_tag=result.primary_tag,
-                    tags=result.tags,
-                    summary=result.summary,
-                    summary_tokens=result.summary_tokens,
-                    full_text=result.full_text,
-                    full_tokens=result.original_tokens,
-                    messages=result.messages,
-                    metadata=result.metadata,
-                    compaction_model=self._compactor.model_name,
-                    compression_ratio=result.compression_ratio,
-                    start_timestamp=result.timestamp,
-                    end_timestamp=result.timestamp,
-                )
-                self._store.store_segment(stored)
-                self._embed_and_store_chunks(stored)
-                if progress_callback:
-                    try:
-                        progress_callback(
-                            len(all_results) + i + 1, len(segments), result,
-                            phase="segment_stored",
-                        )
-                    except Exception:
-                        pass
-                # D1: Store extracted facts with provenance
-                if result.facts:
-                    for fact in result.facts:
-                        fact.segment_ref = stored.ref
-                        fact.conversation_id = self.config.conversation_id
-                    self._store.store_facts(result.facts)
-                    logger.info(
-                        "  Stored %d facts for segment %s",
-                        len(result.facts), result.primary_tag,
-                    )
-                    # D1: Run supersession + fact linking
-                    _superseded_count = 0
-                    _links_count = 0
-                    if self._supersession_checker:
-                        try:
-                            if hasattr(self._supersession_checker, 'check_and_link'):
-                                _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
-                            else:
-                                _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
-                            if _superseded_count:
-                                logger.info(
-                                    "  Superseded %d facts for segment %s",
-                                    _superseded_count, result.primary_tag,
-                                )
-                            if _links_count:
-                                logger.info(
-                                    "  Linked %d facts for segment %s",
-                                    _links_count, result.primary_tag,
-                                )
-                        except Exception as e:
-                            logger.warning("Supersession/linking failed: %s", e)
-                    if progress_callback:
-                        try:
-                            progress_callback(
-                                len(all_results) + i + 1, len(segments), result,
-                                phase="facts_extracted",
-                                fact_count=len(result.facts),
-                                superseded_count=_superseded_count,
-                                links_count=_links_count,
-                            )
-                        except Exception:
-                            pass
-                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
-                logger.info(
-                    "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                    start + i + 1, len(segments), result.primary_tag,
-                    session_date or 'none',
-                    result.original_tokens, result.summary_tokens,
-                )
-            all_results.extend(results)
-
-        return all_results
+        """Compact segments in batches (delegates to CompactionPipeline)."""
+        return self._compaction._compact_and_store(segments, compact_messages_len, progress_callback)
 
     def _load_persisted_state(self) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available."""
@@ -1012,116 +882,8 @@ class VirtualContextEngine:
         compact_messages: list[Message],
         progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport:
-        """Shared compaction core: segment, compact, store, build tag summaries.
-
-        Called by both ``compact_if_needed`` (threshold-triggered) and
-        ``compact_manual`` (explicit) after their respective guard checks
-        have selected *compact_messages*.
-
-        Returns a CompactionReport (never None — callers handle None guards).
-        """
-        # Segment and compact in batches (results stored to DB incrementally)
-        turn_offset = self._engine_state.compacted_through // 2
-        segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
-        logger.info(
-            "Segmented %d messages into %d segments (watermark=%d)",
-            len(compact_messages), len(segments), self._engine_state.compacted_through,
-        )
-        results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
-
-        # Advance watermark past compacted messages
-        self._engine_state.compacted_through += len(compact_messages)
-
-        tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
-        tags = list({tag for r in results for tag in r.tags})
-
-        # Build/update tag summaries — only for tags in newly compacted segments
-        tag_summaries_built = 0
-        cover_tags: list[str] = []
-        if results and self._compactor:
-            # Only rebuild tag summaries for tags that were just compacted
-            compacted_tags = {tag for r in results for tag in r.tags}
-            cover_tags = [
-                t for t in self._turn_tag_index.compute_cover_set()
-                if t in compacted_tags
-            ]
-            # Primary tag guarantee: ensure every segment's primary_tag gets
-            # a tag summary, even if the greedy set cover dropped it.
-            # Without this, ephemeral topics (2-3 turns) lose their most
-            # specific tag to broader tags that cover more segments.
-            cover_set = set(cover_tags)
-            for r in results:
-                if r.primary_tag and r.primary_tag not in cover_set:
-                    cover_tags.append(r.primary_tag)
-                    cover_set.add(r.primary_tag)
-            if cover_tags:
-                # Gather segment summaries per cover tag
-                tag_to_summaries: dict[str, list] = {}
-                for tag in cover_tags:
-                    summaries = self._store.get_summaries_by_tags(
-                        tags=[tag], min_overlap=1, limit=50,
-                        conversation_id=self.config.conversation_id,
-                    )
-                    if summaries:
-                        tag_to_summaries[tag] = summaries
-
-                # Gather turn numbers per tag from index
-                tag_to_turns: dict[str, list[int]] = {}
-                for entry in self._turn_tag_index.entries:
-                    for tag in entry.tags:
-                        if tag in cover_tags:
-                            tag_to_turns.setdefault(tag, []).append(entry.turn_number)
-
-                # Load existing tag summaries for staleness check
-                existing_tag_summaries = {}
-                for tag in cover_tags:
-                    ts = self._store.get_tag_summary(tag, conversation_id=self.config.conversation_id)
-                    if ts:
-                        existing_tag_summaries[tag] = ts
-
-                if self._turn_tag_index.entries:
-                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
-
-                    new_tag_summaries = self._compactor.compact_tag_summaries(
-                        cover_tags=cover_tags,
-                        tag_to_summaries=tag_to_summaries,
-                        tag_to_turns=tag_to_turns,
-                        existing_tag_summaries=existing_tag_summaries,
-                        max_turn=max_turn,
-                    )
-
-                    for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
-                        if progress_callback:
-                            try:
-                                progress_callback(
-                                    ts_i + 1, len(new_tag_summaries), None,
-                                    phase="tag_summary_built",
-                                    tag=ts.tag,
-                                )
-                            except Exception:
-                                pass
-                    tag_summaries_built = len(new_tag_summaries)
-
-        report = CompactionReport(
-            segments_compacted=len(results),
-            tokens_freed=tokens_freed,
-            tags=tags,
-            results=results,
-            tag_summaries_built=tag_summaries_built,
-            cover_tags=cover_tags,
-        )
-
-        # Enforce TTL from tag rules
-        if self.config.tag_rules:
-            min_ttl = min(
-                (r.ttl_days for r in self.config.tag_rules if r.ttl_days is not None),
-                default=None,
-            )
-            if min_ttl is not None:
-                self._store.cleanup(max_age=timedelta(days=min_ttl))
-
-        return report
+        """Shared compaction core (delegates to CompactionPipeline)."""
+        return self._compaction._run_compaction(conversation_history, compact_messages, progress_callback)
 
     def compact_if_needed(
         self,
@@ -1129,49 +891,8 @@ class VirtualContextEngine:
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
     ) -> CompactionReport | None:
-        """Phase 2 of turn processing: run compaction.
-
-        Slow (~10s with LLM summarizer). Can run in background after
-        tag_turn() completes — the next request only needs the tag index.
-
-        *signal*: the CompactionSignal returned by tag_turn().
-        """
-        _t_compact = time.monotonic()
-
-        if self._compactor is None:
-            logger.warning(
-                "Compaction triggered but no LLM provider configured. "
-                "Configure a provider in the providers section."
-            )
-            return None
-
-        logger.info(
-            f"Compaction triggered ({signal.priority}): "
-            f"{signal.current_tokens}/{signal.budget_tokens} tokens, "
-            f"overflow={signal.overflow_tokens}"
-        )
-
-        # Select messages to compact (not in protected zone)
-        protected_turns = self.config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2  # user + assistant per turn
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        # Messages to compact: everything between watermark and protected zone.
-        # Compact all available messages (not just the minimum) so compaction
-        # fires infrequently — one big batch instead of many small ones.
-        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
-
-        if not compact_messages:
-            return None
-
-        report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
-
-        self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
-        self._save_state(conversation_history)
-        return report
+        """Phase 2 of turn processing: run compaction (delegates to CompactionPipeline)."""
+        return self._compaction.compact_if_needed(conversation_history, signal, progress_callback)
 
     def on_turn_complete(
         self,
@@ -1436,36 +1157,8 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
     ) -> CompactionReport | None:
-        """Trigger manual compaction regardless of thresholds.
-
-        Uses the same pipeline as on_turn_complete: respects the compaction
-        watermark, protected recent turns, advances the watermark, stores
-        segments, and rebuilds tag summaries for affected tags.
-        """
-        if self._compactor is None:
-            logger.warning("No LLM provider configured for compaction")
-            return None
-
-        if not conversation_history:
-            return None
-
-        # Select messages to compact (same logic as on_turn_complete)
-        protected_turns = self.config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
-
-        if not compact_messages:
-            return None
-
-        report = self._run_compaction(conversation_history, compact_messages)
-
-        self._save_state(conversation_history)
-        return report
+        """Trigger manual compaction regardless of thresholds (delegates to CompactionPipeline)."""
+        return self._compaction.compact_manual(conversation_history)
 
     def ingest_history(
         self,
