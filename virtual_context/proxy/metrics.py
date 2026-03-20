@@ -13,6 +13,45 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+# Summary fields persisted for request captures and returned by get_captured_requests_summary.
+# Keys with no default are read directly (KeyError if missing); keys with defaults use .get().
+_SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
+    "turn": ...,
+    "ts": ...,
+    "api_format": ...,
+    "model": ...,
+    "stream": False,
+    "message_count": ...,
+    "conversation_id": "",
+    "inbound_tags": [],
+    "response_tags": [],
+    "passthrough": False,
+    "inbound_tokens": 0,
+    "outbound_tokens": 0,
+    "inbound_bytes": 0,
+    "outbound_bytes": 0,
+    "context_tokens": 0,
+    "overhead_ms": 0,
+    "turns_dropped": 0,
+    "turns_stubbed": 0,
+    "message_preview": "",
+    "upstream_input_tokens": 0,
+    "upstream_output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+
+
+def _extract_summary(req: dict) -> dict:
+    """Build a summary dict from a request capture, using only persisted fields."""
+    out: dict = {}
+    for key, default in _SUMMARY_FIELDS_DEFAULTS.items():
+        if default is ...:
+            out[key] = req[key]
+        else:
+            out[key] = req.get(key, default)
+    return out
+
 
 class ProxyMetrics:
     """Collects structured events from the proxy pipeline.
@@ -69,7 +108,7 @@ class ProxyMetrics:
                 if persisted:
                     self.restore_request_captures(persisted)
             except Exception:
-                pass
+                logger.debug("Failed to restore request captures from store", exc_info=True)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -393,31 +432,7 @@ class ProxyMetrics:
     def get_captured_requests_summary(self) -> list[dict]:
         """Return summaries (without full messages/system) for the list view."""
         with self._lock:
-            return [{
-                "turn": r["turn"],
-                "ts": r["ts"],
-                "api_format": r["api_format"],
-                "model": r["model"],
-                "stream": r.get("stream", False),
-                "message_count": r["message_count"],
-                "conversation_id": r.get("conversation_id", ""),
-                "inbound_tags": r.get("inbound_tags", []),
-                "response_tags": r.get("response_tags", []),
-                "passthrough": r.get("passthrough", False),
-                "inbound_tokens": r.get("inbound_tokens", 0),
-                "outbound_tokens": r.get("outbound_tokens", 0),
-                "inbound_bytes": r.get("inbound_bytes", 0),
-                "outbound_bytes": r.get("outbound_bytes", 0),
-                "context_tokens": r.get("context_tokens", 0),
-                "overhead_ms": r.get("overhead_ms", 0),
-                "turns_dropped": r.get("turns_dropped", 0),
-                "turns_stubbed": r.get("turns_stubbed", 0),
-                "message_preview": r.get("message_preview", ""),
-                "upstream_input_tokens": r.get("upstream_input_tokens", 0),
-                "upstream_output_tokens": r.get("upstream_output_tokens", 0),
-                "cache_creation_input_tokens": r.get("cache_creation_input_tokens", 0),
-                "cache_read_input_tokens": r.get("cache_read_input_tokens", 0),
-            } for r in self._request_bodies]
+            return [_extract_summary(r) for r in self._request_bodies]
 
     def restore_request_captures(self, captures: list[dict]) -> None:
         """Restore persisted request captures into the ring buffer."""
@@ -434,33 +449,8 @@ class ProxyMetrics:
             return
         for req in self._request_bodies:
             if req["turn"] == turn:
-                summary = {
-                    "turn": req["turn"],
-                    "ts": req["ts"],
-                    "api_format": req["api_format"],
-                    "model": req["model"],
-                    "stream": req.get("stream", False),
-                    "message_count": req["message_count"],
-                    "conversation_id": req.get("conversation_id", ""),
-                    "inbound_tags": req.get("inbound_tags", []),
-                    "response_tags": req.get("response_tags", []),
-                    "passthrough": req.get("passthrough", False),
-                    "inbound_tokens": req.get("inbound_tokens", 0),
-                    "outbound_tokens": req.get("outbound_tokens", 0),
-                    "inbound_bytes": req.get("inbound_bytes", 0),
-                    "outbound_bytes": req.get("outbound_bytes", 0),
-                    "context_tokens": req.get("context_tokens", 0),
-                    "overhead_ms": req.get("overhead_ms", 0),
-                    "turns_dropped": req.get("turns_dropped", 0),
-                    "turns_stubbed": req.get("turns_stubbed", 0),
-                    "message_preview": req.get("message_preview", ""),
-                    "upstream_input_tokens": req.get("upstream_input_tokens", 0),
-                    "upstream_output_tokens": req.get("upstream_output_tokens", 0),
-                    "cache_creation_input_tokens": req.get("cache_creation_input_tokens", 0),
-                    "cache_read_input_tokens": req.get("cache_read_input_tokens", 0),
-                }
                 try:
-                    self._store.save_request_capture(summary)
+                    self._store.save_request_capture(_extract_summary(req))
                 except Exception:
-                    pass
+                    logger.debug("Failed to persist request capture turn=%s", turn, exc_info=True)
                 return
