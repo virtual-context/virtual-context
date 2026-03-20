@@ -228,6 +228,8 @@ class VirtualContextEngine:
             provider_name = self.config.tag_generator.provider
             provider_config = self.config.providers.get(provider_name, {})
             llm_provider = self._build_provider(provider_name, provider_config)
+            if llm_provider:
+                llm_provider._llm_log_path = getattr(self.config.proxy, "llm_calls_log", "") or ""
 
         self._tag_generator: TagGenerator = build_tag_generator(
             self.config.tag_generator, llm_provider,
@@ -357,6 +359,8 @@ class VirtualContextEngine:
         provider_name = self.config.summarization.provider
         provider_config = self.config.providers.get(provider_name, {})
         self._llm_provider = self._build_provider(provider_name, provider_config)
+        if self._llm_provider:
+            self._llm_provider._llm_log_path = getattr(self.config.proxy, "llm_calls_log", "") or ""
 
         if self._llm_provider:
             self._compactor = DomainCompactor(

@@ -786,6 +786,7 @@ class ProxyInstanceConfig:
 class ProxyConfig:
     request_log_dir: str = ".virtualcontext/request_log"
     request_log_max_files: int = 50
+    llm_calls_log: str = ""  # path for JSONL log of all LLM calls (tagger, compactor, etc.)
     upstream_context_limit: int = 200_000  # max tokens the upstream model accepts
     history_widening_threshold: float = 0.10  # 10% growth + prefix change triggers re-ingest
     instances: list[ProxyInstanceConfig] = field(default_factory=list)
