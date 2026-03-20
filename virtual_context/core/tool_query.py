@@ -107,7 +107,7 @@ class ToolQueryRunner:
 
         # Decide whether to inject VC tools
         inject_vc = force_tools or (
-            self._config.paging.enabled and self._engine._compacted_through > 0
+            self._config.paging.enabled and self._engine._engine_state.compacted_through > 0
         )
         all_tools: list[dict] = []
         if inject_vc:
