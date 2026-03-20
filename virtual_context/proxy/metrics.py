@@ -43,7 +43,6 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
 
 
 def _extract_summary(req: dict) -> dict:
-    """Build a summary dict from a request capture, using only persisted fields."""
     out: dict = {}
     for key, default in _SUMMARY_FIELDS_DEFAULTS.items():
         if default is ...:
@@ -115,7 +114,6 @@ class ProxyMetrics:
     # ------------------------------------------------------------------
 
     def _load_from_db(self) -> None:
-        """Load events from SQLite into memory. Must be called during __init__."""
         if not self._db:
             return
         cutoff = time.time() - self.MAX_AGE_S
@@ -217,7 +215,6 @@ class ProxyMetrics:
             return [e for e in self._events if e["_seq"] > seq]
 
     def snapshot(self) -> dict:
-        """Aggregate stats for the initial SSE load."""
         with self._lock:
             self._evict_old()
             requests = [e for e in self._events if e.get("type") == "request"]
@@ -380,7 +377,6 @@ class ProxyMetrics:
             self._persist_capture(turn)
 
     def capture_enriched(self, turn: int, body: dict) -> None:
-        """Capture the enriched request body sent to the LLM."""
         with self._lock:
             for req in self._request_bodies:
                 if req["turn"] == turn:
@@ -395,7 +391,6 @@ class ProxyMetrics:
         cache_creation_input_tokens: int = 0,
         cache_read_input_tokens: int = 0,
     ) -> None:
-        """Capture the LLM response body and upstream token usage."""
         with self._lock:
             for req in self._request_bodies:
                 if req["turn"] == turn:
@@ -430,12 +425,10 @@ class ProxyMetrics:
             return None
 
     def get_captured_requests_summary(self) -> list[dict]:
-        """Return summaries (without full messages/system) for the list view."""
         with self._lock:
             return [_extract_summary(r) for r in self._request_bodies]
 
     def restore_request_captures(self, captures: list[dict]) -> None:
-        """Restore persisted request captures into the ring buffer."""
         with self._lock:
             existing_turns = {r["turn"] for r in self._request_bodies}
             for cap in captures:
@@ -444,13 +437,15 @@ class ProxyMetrics:
                     existing_turns.add(cap["turn"])
 
     def _persist_capture(self, turn: int) -> None:
-        """Persist the summary fields of a capture to the store (if configured)."""
         if not self._store:
+            logger.warning("CAPTURE_PERSIST store=None turn=%s", turn)
             return
         for req in self._request_bodies:
             if req["turn"] == turn:
                 try:
-                    self._store.save_request_capture(_extract_summary(req))
+                    summary = _extract_summary(req)
+                    self._store.save_request_capture(summary)
+                    logger.info("CAPTURE_PERSIST turn=%s ok", turn)
                 except Exception:
-                    logger.debug("Failed to persist request capture turn=%s", turn, exc_info=True)
+                    logger.warning("CAPTURE_PERSIST turn=%s FAILED", turn, exc_info=True)
                 return
