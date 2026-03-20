@@ -78,28 +78,7 @@ class FalkorDBFactStore:
 
     def _node_to_fact(self, node) -> Fact:
         """Convert a FalkorDB Node to a Fact."""
-        props = node.properties
-        sup = props.get("superseded_by", "")
-        return Fact(
-            id=props["id"],
-            subject=props.get("subject", ""),
-            verb=props.get("verb", ""),
-            object=props.get("object", ""),
-            status=props.get("status", "active"),
-            what=props.get("what", ""),
-            who=props.get("who", ""),
-            when_date=props.get("when_date", ""),
-            where=props.get("where_val", ""),
-            why=props.get("why", ""),
-            fact_type=props.get("fact_type", "personal"),
-            tags=json.loads(props.get("tags_json", "[]")),
-            segment_ref=props.get("segment_ref", ""),
-            conversation_id=props.get("conversation_id", ""),
-            turn_numbers=json.loads(props.get("turn_numbers_json", "[]")),
-            mentioned_at=_str_to_dt(props["mentioned_at"]) if props.get("mentioned_at") else datetime.now(timezone.utc),
-            session_date=props.get("session_date", ""),
-            superseded_by=sup if sup else None,
-        )
+        return Fact.from_dict(node.properties, dt_parser=_str_to_dt)
 
     # ------------------------------------------------------------------
     # FactStore

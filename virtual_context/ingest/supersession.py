@@ -377,19 +377,12 @@ class FactSupersessionChecker:
         if not pool:
             return []
 
-        from ..core.math_utils import cosine_similarity
+        from ..core.math_utils import rank_by_embedding
 
         whats = [f.what or f"{f.subject} {f.verb} {f.object}" for f in pool]
-        texts = [query_text] + whats
-        vectors = self._embed_fn(texts)
-        query_vec = vectors[0]
-
-        scored = []
-        for i, f in enumerate(pool):
-            sim = cosine_similarity(query_vec, vectors[i + 1])
-            if sim >= threshold:
-                scored.append((sim, f))
-        scored.sort(key=lambda x: -x[0])
+        scored = rank_by_embedding(
+            query_text, pool, whats, self._embed_fn, threshold=threshold,
+        )
         return [f for _, f in scored[:top_k]]
 
     def _log_usage(self, detail: str, duration_ms: float = 0.0) -> None:
