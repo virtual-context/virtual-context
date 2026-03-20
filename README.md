@@ -4,13 +4,19 @@
 
 # virtual-context
 
-**Manage your Agents Context - Seamlessly lowering costs, improving reasoning, and having unlimited memory **
+**Manage your Agent's Context - Seamlessly lowering costs, improving reasoning, and having unlimited memory **
+*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#Benchmark-Results)*
+
 
 virtual-context orchestrates a layered pipeline of LLM inference, embedding similarity, deterministic heuristics, and algorithmic rules to maintain a living, compressed memory of unbounded conversations.
 
-LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways. The architecture decision from turn 12 vanishes when turn 80 arrives. The legal filing deadline gets evicted because the user asked about dinner recipes. A vague question like "what did we discuss earlier?" returns nothing because it doesn't embed close to anything specific.
+LLMs have fixed context windows. When conversations grow long, most systems do one of two things: silently drop your oldest messages, or embed everything into a vector database and hope cosine similarity finds what matters. Both fail in predictable ways.  
+
+Knowledge-Memory systems with complex vector databases are only additive to context, and they compete for context that you are working on right now.
 
 virtual-context takes a fundamentally different approach.  By creating a 'kernel' layer for the LLM to 'write' and 'read', virtual-context allows treating agentic / conversational text the way an operating system treats RAM: tagging every exchange by topic, compressing intelligently, and paging in the right context exactly when needed.
+
+This allows us to use agents as if they have literally unlimited memory, reasoning well over all of it.  Update your client to believe they have a 20M context window and watch virtual-context work. 
 
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
@@ -63,7 +69,7 @@ virtual-context combines retrieval and compaction, then adds explicit tools for 
 
 ## Cloud Offering
 
-virtual-context.com offers the fastest way to get going, just sign up and change your base-url.  You'll get statistics, visibility into the context window and cost savings reports. 
+[https://virtual-context.com](http://virtual-context.com)offers the fastest way to get going, just sign up and change your base-url.  You'll get statistics, visibility into the context window and cost savings reports. 
 
 ## Local Install
 
@@ -186,7 +192,7 @@ Set these to allow OpenClaw to maintain large context windows from a client pers
   }
 ```
 
-  Just setting baseUrl alone isn't enough — without model entries, it falls back to pi-ai's
+  Just setting baseUrl alone isn't enough - without model entries, it falls back to pi-ai's
   hardcoded 200K. And models.overrides in the global config is display only — it doesn't affect
   actual windowing.
 
