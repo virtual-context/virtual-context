@@ -23,7 +23,7 @@ def _make_engine(tmp_path: Path, tagger: MockTagGenerator | None = None):
     })
     engine = VirtualContextEngine(config=config)
     if tagger:
-        engine._tag_generator = tagger
+        engine._tagging._tag_generator = tagger
     return engine
 
 

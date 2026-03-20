@@ -5,7 +5,8 @@ import pytest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from virtual_context.engine import VirtualContextEngine, _chunk_segment_text
+from virtual_context.engine import VirtualContextEngine
+from virtual_context.core.semantic_search import chunk_segment_text as _chunk_segment_text
 from virtual_context.types import (
     ChunkEmbedding,
     PagingConfig,

@@ -1390,12 +1390,10 @@ class TestEngineIngestHistory:
         engine = MagicMock()
         from virtual_context.core.turn_tag_index import TurnTagIndex
         from virtual_context.core.tagging_pipeline import TaggingPipeline
-        from virtual_context.engine import VirtualContextEngine
         from virtual_context.types import EngineState
         engine._turn_tag_index = TurnTagIndex()
         engine_state = EngineState()
         engine._engine_state = engine_state
-        engine._is_tool_turn = VirtualContextEngine._is_tool_turn
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
         engine.config.tag_generator.context_lookback_pairs = 5
@@ -4047,7 +4045,7 @@ def paging_test_client(tmp_path):
         engine.on_turn_complete.return_value = None
         engine.tag_turn.return_value = None
         engine._turn_tag_index = TurnTagIndex()
-        engine._resolve_paging_mode.return_value = "autonomous"
+        engine._retrieval._resolve_paging_mode.return_value = "autonomous"
         engine._engine_state.compacted_through = 0
         engine.expand_topic.return_value = {
             "tag": "database",

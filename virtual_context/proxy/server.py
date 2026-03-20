@@ -715,7 +715,7 @@ def create_app(
             and fmt.supports_tool_interception
             and state.engine.config.paging.enabled
         ):
-            _paging_mode = state.engine._resolve_paging_mode(
+            _paging_mode = state.engine._retrieval._resolve_paging_mode(
                 enriched_body.get("model", ""),
             )
             if _paging_mode == "autonomous":
