@@ -1389,14 +1389,29 @@ class TestEngineIngestHistory:
         """Create a mock engine with the config attributes needed by ingest_history."""
         engine = MagicMock()
         from virtual_context.core.turn_tag_index import TurnTagIndex
-        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.core.tagging_pipeline import TaggingPipeline
+        from virtual_context.types import EngineState
         engine._turn_tag_index = TurnTagIndex()
-        engine._tool_tag_counter = 0
-        engine._is_tool_turn = VirtualContextEngine._is_tool_turn
+        engine_state = EngineState()
+        engine._engine_state = engine_state
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
         engine.config.tag_generator.context_lookback_pairs = 5
         engine.config.tag_generator.context_bleed_threshold = 0
+        engine._tagging = TaggingPipeline(
+            tag_generator=MagicMock(),
+            turn_tag_index=engine._turn_tag_index,
+            store=engine._store,
+            semantic=MagicMock(),
+            engine_state=engine_state,
+            config=engine.config,
+            tag_splitter=None,
+            canonicalizer=None,
+            telemetry=MagicMock(),
+            monitor=MagicMock(),
+            compactor=None,
+            save_state_callback=MagicMock(),
+        )
         return engine
 
     def test_ingest_five_pairs(self):
@@ -1411,8 +1426,9 @@ class TestEngineIngestHistory:
             TagResult(tags=["auth", "jwt"], primary="auth", source="keyword"),
             TagResult(tags=["deploy", "ci"], primary="deploy", source="keyword"),
         ]
-        engine._tag_generator = MagicMock()
-        engine._tag_generator.generate_tags.side_effect = tag_results
+        mock_tagger = MagicMock()
+        mock_tagger.generate_tags.side_effect = tag_results
+        engine._tagging._tag_generator = mock_tagger
 
         # Call the real method on the mock
         from virtual_context.engine import VirtualContextEngine
@@ -1434,7 +1450,6 @@ class TestEngineIngestHistory:
 
     def test_ingest_empty_returns_zero(self):
         engine = self._make_mock_engine()
-        engine._tag_generator = MagicMock()
 
         from virtual_context.engine import VirtualContextEngine
         result = VirtualContextEngine.ingest_history(engine, [])
@@ -1445,10 +1460,11 @@ class TestEngineIngestHistory:
     def test_ingest_refreshes_store_tags(self):
         """Store tags are refreshed every 10 turns."""
         engine = self._make_mock_engine()
-        engine._tag_generator = MagicMock()
-        engine._tag_generator.generate_tags.return_value = TagResult(
+        mock_tagger = MagicMock()
+        mock_tagger.generate_tags.return_value = TagResult(
             tags=["tag"], primary="tag", source="keyword"
         )
+        engine._tagging._tag_generator = mock_tagger
 
         from virtual_context.engine import VirtualContextEngine
         # 15 pairs = 30 messages
@@ -2516,7 +2532,7 @@ class TestCompactionConcurrencyGuard:
             engine.tag_turn.return_value = None
             engine._turn_tag_index = MagicMock()
             engine._turn_tag_index.entries = []
-            engine._compacted_through = 0
+            engine._engine_state.compacted_through = 0
             MockEngine.return_value = engine
             app = create_app(upstream="http://fake:9999", config_path=None)
 
@@ -2977,7 +2993,7 @@ class TestLiveSessions:
         metrics = ProxyMetrics()
         engine = MagicMock()
         engine.config.conversation_id = "live-session-1"
-        engine._compacted_through = 0
+        engine._engine_state.compacted_through = 0
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.entries = []
         engine._turn_tag_index.get_active_tags.return_value = ["tag-a"]
@@ -3001,7 +3017,7 @@ class TestLiveSessions:
             live_sessions.append({
                 "conversation_id": sid,
                 "turn_count": len(s.conversation_history) // 2,
-                "compacted_through": getattr(s.engine, "_compacted_through", 0),
+                "compacted_through": s.engine._engine_state.compacted_through,
                 "tag_count": len(s.engine._turn_tag_index.entries),
                 "active_tags": list(
                     s.engine._turn_tag_index.get_active_tags(lookback=6)
@@ -4029,8 +4045,8 @@ def paging_test_client(tmp_path):
         engine.on_turn_complete.return_value = None
         engine.tag_turn.return_value = None
         engine._turn_tag_index = TurnTagIndex()
-        engine._resolve_paging_mode.return_value = "autonomous"
-        engine._compacted_through = 0
+        engine._retrieval._resolve_paging_mode.return_value = "autonomous"
+        engine._engine_state.compacted_through = 0
         engine.expand_topic.return_value = {
             "tag": "database",
             "depth": "full",

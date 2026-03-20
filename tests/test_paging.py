@@ -525,8 +525,8 @@ class TestEnginePagingAPI:
         assert result["tag"] == "database"
         assert result["depth"] == "full"
         assert result["tokens_added"] > 0
-        assert "database" in engine._working_set
-        assert engine._working_set["database"].depth == DepthLevel.FULL
+        assert "database" in engine._paging.working_set
+        assert engine._paging.working_set["database"].depth == DepthLevel.FULL
 
     def test_expand_to_segments(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -534,7 +534,7 @@ class TestEnginePagingAPI:
 
         result = engine.expand_topic("api", depth="segments")
         assert result["depth"] == "segments"
-        assert engine._working_set["api"].depth == DepthLevel.SEGMENTS
+        assert engine._paging.working_set["api"].depth == DepthLevel.SEGMENTS
 
     def test_expand_to_summary(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -542,7 +542,7 @@ class TestEnginePagingAPI:
 
         result = engine.expand_topic("auth", depth="summary")
         assert result["depth"] == "summary"
-        assert engine._working_set["auth"].depth == DepthLevel.SUMMARY
+        assert engine._paging.working_set["auth"].depth == DepthLevel.SUMMARY
 
     def test_expand_none_delegates_to_collapse(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -550,12 +550,12 @@ class TestEnginePagingAPI:
 
         # First expand to full
         engine.expand_topic("db", depth="full")
-        assert "db" in engine._working_set
+        assert "db" in engine._paging.working_set
 
         # Expand with "none" should collapse
         result = engine.expand_topic("db", depth="none")
         assert result["depth"] == "none"
-        assert "db" not in engine._working_set
+        assert "db" not in engine._paging.working_set
 
     def test_collapse_to_summary(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -563,14 +563,14 @@ class TestEnginePagingAPI:
 
         # Expand to full first
         engine.expand_topic("database", depth="full")
-        old_tokens = engine._working_set["database"].tokens
+        old_tokens = engine._paging.working_set["database"].tokens
 
         # Collapse to summary
         result = engine.collapse_topic("database", depth="summary")
         assert result["tag"] == "database"
         assert result["depth"] == "summary"
         assert result["tokens_freed"] > 0
-        assert engine._working_set["database"].depth == DepthLevel.SUMMARY
+        assert engine._paging.working_set["database"].depth == DepthLevel.SUMMARY
 
     def test_collapse_to_none_removes(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
@@ -579,7 +579,7 @@ class TestEnginePagingAPI:
 
         result = engine.collapse_topic("auth", depth="none")
         assert result["depth"] == "none"
-        assert "auth" not in engine._working_set
+        assert "auth" not in engine._paging.working_set
 
     def test_collapse_nonexistent_tag(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -611,9 +611,9 @@ class TestEnginePagingAPI:
         result = engine.expand_topic("new-topic", depth="full")
 
         # old-topic should have been evicted (collapsed or removed)
-        if "old-topic" in engine._working_set:
+        if "old-topic" in engine._paging.working_set:
             # Collapsed to summary
-            assert engine._working_set["old-topic"].depth == DepthLevel.SUMMARY
+            assert engine._paging.working_set["old-topic"].depth == DepthLevel.SUMMARY
         assert result.get("evicted_tags", []) != [] or "error" in result
 
     def test_no_evict_when_disabled(self, tmp_path):
@@ -645,24 +645,24 @@ class TestEngineAutoEvict:
         engine = self._make_engine(tmp_path)
 
         # Manually set working set with different access turns
-        engine._working_set = {
+        engine._paging.working_set = {
             "cold": WorkingSetEntry(tag="cold", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=1),
             "warm": WorkingSetEntry(tag="warm", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=5),
             "hot": WorkingSetEntry(tag="hot", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=10),
         }
 
-        evicted, freed = engine._auto_evict(needed=200, exclude_tag="hot")
+        evicted, freed = engine._paging._auto_evict(needed=200, exclude_tag="hot")
         # Should evict "cold" first (lowest last_accessed_turn)
         assert "cold" in evicted
 
     def test_excludes_specified_tag(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        engine._working_set = {
+        engine._paging.working_set = {
             "target": WorkingSetEntry(tag="target", depth=DepthLevel.FULL, tokens=500, last_accessed_turn=1),
             "other": WorkingSetEntry(tag="other", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=2),
         }
 
-        evicted, freed = engine._auto_evict(needed=200, exclude_tag="target")
+        evicted, freed = engine._paging._auto_evict(needed=200, exclude_tag="target")
         assert "target" not in evicted
         assert "other" in evicted
 
@@ -683,18 +683,18 @@ class TestCalculateDepthTokens:
 
     def test_none_returns_zero(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        assert engine._calculate_depth_tokens("any", DepthLevel.NONE) == 0
+        assert engine._paging.calculate_depth_tokens("any", DepthLevel.NONE) == 0
 
     def test_summary_uses_tag_summary(self, tmp_path):
         engine = self._make_engine(tmp_path)
         engine._store.save_tag_summary(TagSummary(
             tag="db", summary="Database summary.", summary_tokens=42,
         ), conversation_id=engine.config.conversation_id)
-        assert engine._calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
+        assert engine._paging.calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
 
     def test_summary_missing_returns_zero(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        assert engine._calculate_depth_tokens("missing", DepthLevel.SUMMARY) == 0
+        assert engine._paging.calculate_depth_tokens("missing", DepthLevel.SUMMARY) == 0
 
     def test_segments_sums_segment_summaries(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -706,7 +706,7 @@ class TestCalculateDepthTokens:
                 conversation_id=engine.config.conversation_id,
             ))
         # Should sum summary_tokens: 10 + 20 + 30 = 60
-        assert engine._calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
+        assert engine._paging.calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
 
     def test_full_sums_full_tokens(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -717,7 +717,7 @@ class TestCalculateDepthTokens:
                 summary="s", summary_tokens=5,
                 full_text="x" * 400, full_tokens=100,
             ))
-        assert engine._calculate_depth_tokens("auth", DepthLevel.FULL) == 200
+        assert engine._paging.calculate_depth_tokens("auth", DepthLevel.FULL) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -774,36 +774,36 @@ class TestResolvePagingMode:
 
     def test_empty_list_always_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=[])
-        assert engine._resolve_paging_mode("claude-opus-4") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("claude-opus-4") == "supervised"
 
     def test_opus_matches(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
-        assert engine._resolve_paging_mode("claude-opus-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-opus-4") == "autonomous"
 
     def test_sonnet_matches(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-sonnet-4"])
-        assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
     def test_prefix_match(self, tmp_path):
         """Prefix match: 'gpt-4' matches 'gpt-4-turbo'."""
         engine = self._make_engine(tmp_path, autonomous_models=["gpt-4"])
-        assert engine._resolve_paging_mode("gpt-4-turbo") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("gpt-4-turbo") == "autonomous"
 
     def test_haiku_not_in_list(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
-        assert engine._resolve_paging_mode("claude-haiku-3") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("claude-haiku-3") == "supervised"
 
     def test_unknown_model_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4", "claude-sonnet-4"])
-        assert engine._resolve_paging_mode("qwen3:4b") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("qwen3:4b") == "supervised"
 
     def test_empty_model_name_supervised(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["claude-opus-4"])
-        assert engine._resolve_paging_mode("") == "supervised"
+        assert engine._retrieval._resolve_paging_mode("") == "supervised"
 
     def test_case_insensitive(self, tmp_path):
         engine = self._make_engine(tmp_path, autonomous_models=["Claude-Sonnet-4"])
-        assert engine._resolve_paging_mode("claude-sonnet-4") == "autonomous"
+        assert engine._retrieval._resolve_paging_mode("claude-sonnet-4") == "autonomous"
 
 
 class TestContextHintModes:
@@ -825,7 +825,7 @@ class TestContextHintModes:
         )
         engine = VirtualContextEngine(config=cfg)
         # Simulate post-compaction state
-        engine._compacted_through = 4
+        engine._engine_state.compacted_through = 4
         return engine
 
     def _seed_tag_summary(self, engine, tag, summary="Discussion about topic."):
@@ -839,7 +839,7 @@ class TestContextHintModes:
     def test_default_hint_no_paging(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
         self._seed_tag_summary(engine, "database")
-        hint = engine._build_context_hint()
+        hint = engine._retrieval._build_context_hint()
         assert "<context-topics>" in hint
         assert "database" in hint
         # Default hint should NOT mention expand_topic
@@ -848,14 +848,14 @@ class TestContextHintModes:
     def test_supervised_hint(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "expand_topic" in hint
         assert "api" in hint
 
     def test_autonomous_hint_has_budget(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
         self._seed_tag_summary(engine, "auth")
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "budget=" in hint
         assert "available=" in hint
         assert "expand_topic" in hint
@@ -863,9 +863,9 @@ class TestContextHintModes:
 
     def test_hint_empty_before_compaction(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
-        engine._compacted_through = 0  # no compaction yet
+        engine._engine_state.compacted_through = 0  # no compaction yet
         self._seed_tag_summary(engine, "api")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert hint == ""
 
     @pytest.mark.regression("PROXY-024")
@@ -877,11 +877,11 @@ class TestContextHintModes:
             self._seed_tag_summary(engine, f"a-tag-{i:02d}")
         # Put z-fragrance in working set at summary depth
         self._seed_tag_summary(engine, "z-fragrance")
-        engine._working_set["z-fragrance"] = WorkingSetEntry(
+        engine._paging.working_set["z-fragrance"] = WorkingSetEntry(
             tag="z-fragrance", depth=DepthLevel.SUMMARY,
             tokens=200, last_accessed_turn=5,
         )
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # z-fragrance should appear despite being last alphabetically
         assert "z-fragrance" in hint
         # And it should appear BEFORE the depth:none tags
@@ -898,7 +898,7 @@ class TestContextHintModes:
         # Seed 50 tags
         for i in range(50):
             self._seed_tag_summary(engine, f"topic-{i:03d}")
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # Count how many topic- tags appear in the hint
         count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
         # With compact format, we should fit significantly more than 9
@@ -921,18 +921,18 @@ class TestContextHintModes:
             ),
         )
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 4
+        engine._engine_state.compacted_through = 4
         # Seed 80 tags at depth:none
         for i in range(80):
             self._seed_tag_summary(engine, f"filler-{i:03d}")
         # Put 3 tags in working set at summary depth
         for name in ["fragrance-selection", "karak-chai", "whales"]:
             self._seed_tag_summary(engine, name)
-            engine._working_set[name] = WorkingSetEntry(
+            engine._paging.working_set[name] = WorkingSetEntry(
                 tag=name, depth=DepthLevel.SUMMARY,
                 tokens=100, last_accessed_turn=5,
             )
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         # All 3 expanded tags MUST survive truncation
         assert "fragrance-selection" in hint
         assert "karak-chai" in hint
@@ -944,7 +944,7 @@ class TestContextHintModes:
         engine = self._make_engine(tmp_path, paging_enabled=True)
         for i in range(50):
             self._seed_tag_summary(engine, f"topic-{i:03d}")
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
         assert count >= 25, f"Only {count}/50 tags fit in supervised mode"
 
@@ -958,7 +958,7 @@ class TestContextHintModes:
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "Sania's cycle tracking via Mira" in hint
 
     def test_autonomous_hint_omits_description_when_empty(self, tmp_path):
@@ -971,7 +971,7 @@ class TestContextHintModes:
             summary_tokens=20,
             source_turn_numbers=[0, 1],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="autonomous")
+        hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
         assert "database" in hint
         # The " — " separator should not appear since description is empty
         # The tag should appear without a trailing description
@@ -988,7 +988,7 @@ class TestContextHintModes:
             summary_tokens=25,
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint(paging_mode="supervised")
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
         assert "Weekly meal prep and grocery optimization" in hint
 
     def test_default_hint_uses_description(self, tmp_path):
@@ -1001,7 +1001,7 @@ class TestContextHintModes:
             summary_tokens=30,
             source_turn_numbers=[0, 1, 2, 3],
         ), conversation_id=engine.config.conversation_id)
-        hint = engine._build_context_hint()
+        hint = engine._retrieval._build_context_hint()
         # Default hint uses description when available instead of summary[:60]
         assert "Interval training and HR zone programming" in hint
 
@@ -1122,7 +1122,7 @@ class TestPagingStatePersistence:
             tag="db", summary="Tag summary", summary_tokens=20,
         ), conversation_id=engine.config.conversation_id)
         engine.expand_topic("db", depth="full")
-        assert "db" in engine._working_set
+        assert "db" in engine._paging.working_set
 
         # Save state
         engine._save_state([])
@@ -1130,9 +1130,9 @@ class TestPagingStatePersistence:
         # Create new engine from same DB — should restore working set
         from virtual_context.engine import VirtualContextEngine
         engine2 = VirtualContextEngine(config=engine.config)
-        assert "db" in engine2._working_set
-        assert engine2._working_set["db"].depth == DepthLevel.FULL
-        assert engine2._working_set["db"].tokens > 0
+        assert "db" in engine2._paging.working_set
+        assert engine2._paging.working_set["db"].depth == DepthLevel.FULL
+        assert engine2._paging.working_set["db"].tokens > 0
 
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1177,7 @@ class TestReassembleContext:
         ))
 
         # Simulate post-compaction state so context hint is generated
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         engine._turn_tag_index.append(TurnTagEntry(
             turn_number=1, message_hash="abc123", tags=["database"], primary_tag="database",
         ))
@@ -1250,7 +1250,7 @@ class TestTemporalNoBypass:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         return engine
 
     @pytest.mark.regression("BUG-015")
@@ -1275,7 +1275,7 @@ class TestTemporalNoBypass:
             full_text="Detailed architecture text with all implementation specifics. " * 20,
             full_tokens=300,
         ))
-        engine._working_set = {
+        engine._paging.working_set = {
             "architecture": WorkingSetEntry(
                 tag="architecture", depth=DepthLevel.FULL, tokens=300, last_accessed_turn=3,
             ),
@@ -1323,7 +1323,7 @@ class TestSegmentLoadingGate:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 2
+        engine._engine_state.compacted_through = 2
         return engine
 
     @pytest.mark.regression("BUG-016")
@@ -1334,7 +1334,7 @@ class TestSegmentLoadingGate:
         engine._store.save_tag_summary(TagSummary(
             tag="api", summary="API discussion.", summary_tokens=15,
         ), conversation_id=engine.config.conversation_id)
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
         }
 
@@ -1371,7 +1371,7 @@ class TestSegmentLoadingGate:
             full_text="Full auth text.", full_tokens=20,
             conversation_id=engine.config.conversation_id,
         ))
-        engine._working_set = {
+        engine._paging.working_set = {
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }
 
@@ -1417,7 +1417,7 @@ class TestCrossTagSegmentDedup:
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=cfg)
-        engine._compacted_through = 0
+        engine._engine_state.compacted_through = 0
         return engine
 
     def test_on_message_inbound_deduplicates_shared_segments(self, tmp_path):
@@ -1467,7 +1467,7 @@ class TestCrossTagSegmentDedup:
             ), conversation_id=engine.config.conversation_id)
 
         # Put both tags in working set at FULL depth
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }
@@ -1487,7 +1487,7 @@ class TestCrossTagSegmentDedup:
         # We need to capture it — rebuild it the same way the engine does.
         full_segments_param = {}
         seen_refs: set = set()
-        for tag, entry in engine._working_set.items():
+        for tag, entry in engine._paging.working_set.items():
             from virtual_context.types import DepthLevel as DL
             if entry.depth in (DL.SEGMENTS, DL.FULL):
                 segs = engine._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=50)
@@ -1530,7 +1530,7 @@ class TestCrossTagSegmentDedup:
             ), conversation_id=engine.config.conversation_id)
 
         # Put both tags at FULL depth
-        engine._working_set = {
+        engine._paging.working_set = {
             "api": WorkingSetEntry(tag="api", depth=DepthLevel.FULL, tokens=500),
             "auth": WorkingSetEntry(tag="auth", depth=DepthLevel.FULL, tokens=500),
         }

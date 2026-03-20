@@ -481,7 +481,7 @@ def run_vc_ingest_only(
     messages = _messages_to_vc(question)
 
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._compacted_through > 0
+    fully_cached = engine._engine_state.compacted_through > 0
 
     if fully_cached:
         logger.info("VC [%s]: CACHE HIT — skipping ingest+compact", question.question_id)
@@ -628,13 +628,13 @@ def run_vc(
 
     # 3. Check cache
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._compacted_through > 0
+    fully_cached = engine._engine_state.compacted_through > 0
     tags_only = not fully_cached and n_index_entries > 0
 
     if fully_cached:
         logger.info(
             "VC [%s]: CACHE HIT — %d turns indexed, compacted_through=%d",
-            question.question_id, n_index_entries, engine._compacted_through,
+            question.question_id, n_index_entries, engine._engine_state.compacted_through,
         )
         compaction_events = -1
         timings["ingest_s"] = 0.0
@@ -750,7 +750,7 @@ def run_vc(
     # 5. Build reader prompt
     t0 = time.time()
 
-    use_raw_history = engine._compacted_through == 0
+    use_raw_history = engine._engine_state.compacted_through == 0
 
     # MRCR question already contains the prepend instruction, but we reinforce it
     prepend_instruction = (
@@ -805,7 +805,7 @@ def run_vc(
     )
 
     reader_api_url = API_URLS.get(reader_provider, "")
-    require_tools = engine._compacted_through > 0
+    require_tools = engine._engine_state.compacted_through > 0
 
     loop_result = engine.query_with_tools(
         messages=[{"role": "user", "content": user_prompt}],

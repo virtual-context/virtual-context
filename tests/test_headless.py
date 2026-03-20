@@ -167,8 +167,10 @@ class TestRuleTagFiltering:
 
         # Manually set up the turn tag index
         from virtual_context.core.turn_tag_index import TurnTagIndex
+        from virtual_context.types import EngineState
 
         engine._turn_tag_index = TurnTagIndex()
+        engine._engine_state = EngineState()
 
         # Turn 0: teeth + rule (a behavioral instruction alongside teeth topic)
         engine._turn_tag_index.append(TurnTagEntry(
@@ -208,6 +210,8 @@ class TestRuleTagFiltering:
         engine = VirtualContextEngine.__new__(VirtualContextEngine)
         engine.config = sample_config
         engine._turn_tag_index = TurnTagIndex()
+        from virtual_context.types import EngineState
+        engine._engine_state = EngineState()
 
         # Turn 0: pure teeth (no rule)
         engine._turn_tag_index.append(TurnTagEntry(

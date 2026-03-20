@@ -215,7 +215,8 @@ def mock_engine():
     engine._turn_tag_index.get_tags_for_turn.return_value = None
     engine._store = MagicMock()
     engine._store.get_all_tags.return_value = []
-    engine._compacted_through = 0
+    from virtual_context.types import EngineState
+    engine._engine_state = EngineState()
     engine.config = MagicMock()
     engine.config.monitor.context_window = 120000
     engine.config.conversation_id = "test-session"
@@ -390,7 +391,7 @@ class TestMetricsIntegration:
         )
         engine.tag_turn.return_value = signal
         engine.compact_if_needed.return_value = report
-        engine._compacted_through = 20
+        engine._engine_state.compacted_through = 20
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.get_tags_for_turn.return_value = None
 
@@ -908,7 +909,7 @@ class TestDashboardCompact:
             tag_summaries_built=1,
         )
         engine.compact_manual = MagicMock(return_value=report)
-        engine._compacted_through = 10
+        engine._engine_state.compacted_through = 10
 
         resp = client.post("/dashboard/compact")
         assert resp.status_code == 200

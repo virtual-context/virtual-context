@@ -83,9 +83,10 @@ class TestPassthroughFilter:
             facts=[],
         )]
         mock_compactor.model_name = "test-model"
-        engine._compactor = mock_compactor
+        engine._compaction._compactor = mock_compactor
+        engine._tagging._compactor = mock_compactor
 
-        results = engine._compact_and_store([seg], 2)
+        results = engine._compaction._compact_and_store([seg], 2)
 
         # The compactor should have been called (NOT passthrough)
         assert mock_compactor.compact.called, (
@@ -122,9 +123,10 @@ class TestPassthroughFilter:
         engine = VirtualContextEngine(config=cfg)
 
         mock_compactor = MagicMock()
-        engine._compactor = mock_compactor
+        engine._compaction._compactor = mock_compactor
+        engine._tagging._compactor = mock_compactor
 
-        results = engine._compact_and_store([seg], 2)
+        results = engine._compaction._compact_and_store([seg], 2)
 
         # Compactor should NOT have been called (passthrough)
         assert not mock_compactor.compact.called, (
