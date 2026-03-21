@@ -427,9 +427,6 @@ class VirtualContextEngine:
         self.config.conversation_id = saved.conversation_id
         self._engine_state.compacted_through = saved.compacted_through
         # Populate in-place so all existing references (retriever, etc.) see the restored entries
-        self._turn_tag_index.entries.clear()
-        self._turn_tag_index._by_turn.clear()
-        self._turn_tag_index._by_hash.clear()
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
         self._engine_state.split_processed_tags = set(saved.split_processed_tags)
