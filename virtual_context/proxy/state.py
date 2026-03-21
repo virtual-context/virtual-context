@@ -466,23 +466,38 @@ class ProxyState:
                 logger.error("compact_if_needed error: %s", e, exc_info=True)
 
     def _compact_after_ingestion(self, history: list[Message]) -> None:
-        """Check compaction threshold after ingestion and compact if needed."""
+        """Compact immediately after ingestion — no threshold check needed.
+
+        After ingesting 300 turns, they all need segmenting/summarizing regardless
+        of token count. The monitor threshold is for live requests where we decide
+        IF compaction should run. Post-ingestion, we know it should.
+        """
         try:
-            monitor = getattr(self.engine, "_monitor", None)
-            if monitor is None:
-                return
-            snapshot = monitor.build_snapshot(history)
-            signal = monitor.check(snapshot)
-            if signal is None:
+            from ..types import CompactionSignal
+            # Use conversation_history (full proxy history) not just ingestion pairs
+            compact_history = self.conversation_history if self.conversation_history else history
+            protected = self.engine.config.monitor.protected_recent_turns * 2
+            watermark = self.engine._engine_state.compacted_through
+            compactable = len(compact_history) - watermark - protected
+            if compactable <= 0:
+                logger.info("POST-INGEST: no compactable messages (history=%d, watermark=%d, protected=%d)",
+                            len(compact_history), watermark, protected)
                 return
             turn = len(self.engine._turn_tag_index.entries)
-            logger.info(
-                "POST-INGEST Compaction needed: %dt/%dt (%s) -- running immediately",
-                snapshot.total_tokens, snapshot.budget_tokens, signal.priority,
+            # Force compaction signal — bypass threshold check
+            signal = CompactionSignal(
+                priority="soft",
+                current_tokens=compactable * 100,  # rough estimate, doesn't matter — compaction runs regardless
+                budget_tokens=self.engine.config.monitor.context_window,
+                overflow_tokens=compactable * 50,
             )
-            self._run_compact(history, signal, turn)
+            logger.info(
+                "POST-INGEST Compacting %d messages immediately (history=%d, watermark=%d, protected=%d)",
+                compactable, len(compact_history), watermark, protected,
+            )
+            self._run_compact(compact_history, signal, turn)
         except Exception as e:
-            logger.error("Post-ingestion compaction check error: %s", e, exc_info=True)
+            logger.error("Post-ingestion compaction error: %s", e, exc_info=True)
 
     def _history_ingested(self) -> bool:
         return self.engine.config.conversation_id in self._ingested_conversations
