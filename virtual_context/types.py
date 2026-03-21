@@ -553,6 +553,7 @@ class RetrievalResult:
     cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
     temporal: bool = False  # True when the query references a time position
     facts: list[Fact] = field(default_factory=list)  # D1: matching facts
+    retrieval_scores: dict[str, float] = field(default_factory=dict)  # primary_tag → IDF score
 
 
 # ---------------------------------------------------------------------------
