@@ -177,6 +177,19 @@ class ContextRetriever:
         skipped_tags = [t for t in tag_result.tags if t in active_tags]
 
         if not query_tags:
+            # _general fallback: use previous turn's tags for focused retrieval
+            if self._turn_tag_index:
+                prev = self._turn_tag_index.latest_meaningful_tags()
+                if prev:
+                    query_tags = [t for t in prev.tags if t not in self._turn_tag_index._NON_INHERITABLE_TAGS]
+                    if query_tags:
+                        logger.info(
+                            "Retriever: _general fallback → using previous turn tags %s (T%d)",
+                            query_tags, prev.turn_number,
+                        )
+                        retrieval_metadata["general_fallback"] = "previous_turn"
+
+        if not query_tags:
             logger.info(
                 "Retriever: no query tags after filtering (message_tags=%s, active_tags=%s, skipped=%s)",
                 tag_result.tags, list(active_tags), skipped_tags,
