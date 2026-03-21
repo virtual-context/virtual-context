@@ -1064,12 +1064,12 @@ class SQLiteStore(ContextStore):
         conn = self._get_conn()
         if conversation_id is not None:
             rows = conn.execute(
-                "SELECT * FROM tag_summaries WHERE conversation_id = ? ORDER BY tag",
+                "SELECT * FROM tag_summaries WHERE conversation_id = ? ORDER BY updated_at DESC",
                 (conversation_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM tag_summaries ORDER BY tag"
+                "SELECT * FROM tag_summaries ORDER BY updated_at DESC"
             ).fetchall()
         results: list[TagSummary] = []
         for row in rows:
