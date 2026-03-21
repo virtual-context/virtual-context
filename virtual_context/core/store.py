@@ -15,6 +15,10 @@ class ContextStore(ABC):
     def store_segment(self, segment: StoredSegment) -> str:
         """Upsert by ref. Returns ref."""
 
+    def update_segment(self, segment: StoredSegment) -> None:
+        """Update an existing segment in-place (same ref). Falls back to store_segment (upsert)."""
+        self.store_segment(segment)
+
     @abstractmethod
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None: ...
 

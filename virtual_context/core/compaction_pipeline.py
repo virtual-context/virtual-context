@@ -405,26 +405,41 @@ class CompactionPipeline:
                 continue
             batch = compactable
             results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
-            # Store each result to DB right away
+            # Store each result — merge into existing segment if possible
+            merge_lookback = self._config.compactor.merge_lookback
+            max_seg_tokens = self._config.compactor.max_segment_tokens
             for i, result in enumerate(results):
-                stored = StoredSegment(
-                    ref=result.segment_id,
-                    conversation_id=self._config.conversation_id,
-                    primary_tag=result.primary_tag,
-                    tags=result.tags,
-                    summary=result.summary,
-                    summary_tokens=result.summary_tokens,
-                    full_text=result.full_text,
-                    full_tokens=result.original_tokens,
-                    messages=result.messages,
-                    metadata=result.metadata,
-                    compaction_model=self._compactor.model_name,
-                    compression_ratio=result.compression_ratio,
-                    start_timestamp=result.timestamp,
-                    end_timestamp=result.timestamp,
-                )
-                self._store.store_segment(stored)
-                self._semantic.embed_and_store_chunks(stored)
+                merged = False
+                if merge_lookback > 0:
+                    merged = self._try_merge_segment(result, merge_lookback, max_seg_tokens)
+
+                if not merged:
+                    stored = StoredSegment(
+                        ref=result.segment_id,
+                        conversation_id=self._config.conversation_id,
+                        primary_tag=result.primary_tag,
+                        tags=result.tags,
+                        summary=result.summary,
+                        summary_tokens=result.summary_tokens,
+                        full_text=result.full_text,
+                        full_tokens=result.original_tokens,
+                        messages=result.messages,
+                        metadata=result.metadata,
+                        compaction_model=self._compactor.model_name,
+                        compression_ratio=result.compression_ratio,
+                        start_timestamp=result.timestamp,
+                        end_timestamp=result.timestamp,
+                    )
+                    self._store.store_segment(stored)
+                    self._semantic.embed_and_store_chunks(stored)
+                    session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
+                    logger.info(
+                        "  COMPACT NEW segment %d/%d: %s (session_date=%s, %dt→%dt)",
+                        start + i + 1, len(segments), result.primary_tag,
+                        session_date or 'none',
+                        result.original_tokens, result.summary_tokens,
+                    )
+
                 if progress_callback:
                     try:
                         progress_callback(
@@ -434,16 +449,16 @@ class CompactionPipeline:
                     except Exception:
                         pass
                 # D1: Store extracted facts with provenance
+                _seg_ref = stored.ref if not merged else result.segment_id
                 if result.facts:
                     for fact in result.facts:
-                        fact.segment_ref = stored.ref
+                        fact.segment_ref = _seg_ref
                         fact.conversation_id = self._config.conversation_id
                     self._store.store_facts(result.facts)
                     logger.info(
                         "  Stored %d facts for segment %s",
                         len(result.facts), result.primary_tag,
                     )
-                    # D1: Run supersession + fact linking
                     _superseded_count = 0
                     _links_count = 0
                     if self._supersession_checker:
@@ -475,13 +490,104 @@ class CompactionPipeline:
                             )
                         except Exception:
                             pass
-                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
-                logger.info(
-                    "  Stored segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                    start + i + 1, len(segments), result.primary_tag,
-                    session_date or 'none',
-                    result.original_tokens, result.summary_tokens,
-                )
             all_results.extend(results)
 
         return all_results
+
+    def _try_merge_segment(self, result, merge_lookback: int, max_tokens: int) -> bool:
+        """Attempt to merge *result* into an existing segment with the same primary tag.
+
+        Returns True if merged, False if no suitable candidate found.
+        """
+        from ..types import StoredSegment
+
+        candidates = self._store.get_segments_by_tags(
+            tags=[result.primary_tag],
+            min_overlap=1,
+            limit=merge_lookback,
+            conversation_id=self._config.conversation_id,
+        )
+        # Filter to same primary_tag (get_segments_by_tags matches any tag overlap)
+        candidates = [c for c in candidates if c.primary_tag == result.primary_tag]
+
+        if not candidates:
+            logger.info(
+                "  MERGE skip: no existing segments for primary_tag=%s",
+                result.primary_tag,
+            )
+            return False
+
+        for candidate in candidates:
+            combined_tokens = candidate.full_tokens + result.original_tokens
+            if combined_tokens > max_tokens:
+                logger.info(
+                    "  MERGE skip: %s + new (%dt + %dt = %dt) exceeds max %dt",
+                    candidate.ref[:8], candidate.full_tokens,
+                    result.original_tokens, combined_tokens, max_tokens,
+                )
+                continue
+
+            # Merge: combine text and messages, re-summarize
+            merged_full_text = candidate.full_text + "\n\n---\n\n" + result.full_text
+            merged_messages = list(candidate.messages) + list(result.messages)
+
+            # Re-summarize the combined content
+            from ..types import Message, TaggedSegment
+
+            synthetic_messages = [
+                Message(role=m.get("role", "user"), content=m.get("content", ""))
+                for m in merged_messages
+            ]
+            synthetic_seg = TaggedSegment(
+                id=candidate.ref,
+                messages=synthetic_messages,
+                tags=list(set(candidate.tags) | set(result.tags)),
+                primary_tag=result.primary_tag,
+                token_count=combined_tokens,
+                turn_count=(candidate.metadata.turn_count if candidate.metadata else 0)
+                    + (result.metadata.turn_count if result.metadata else 0),
+            )
+            re_summarized = self._compactor.compact([synthetic_seg])
+            if not re_summarized:
+                logger.warning("  MERGE failed: re-summarization returned empty for %s", candidate.ref[:8])
+                return False
+            new_summary = re_summarized[0]
+
+            # Merge metadata
+            old_tc = candidate.metadata.turn_count if candidate.metadata else 0
+            new_tc = result.metadata.turn_count if result.metadata else 0
+            merged_tags = list(set(candidate.tags) | set(result.tags))
+
+            updated = StoredSegment(
+                ref=candidate.ref,
+                conversation_id=self._config.conversation_id,
+                primary_tag=result.primary_tag,
+                tags=merged_tags,
+                summary=new_summary.summary,
+                summary_tokens=new_summary.summary_tokens,
+                full_text=merged_full_text,
+                full_tokens=combined_tokens,
+                messages=merged_messages,
+                metadata=candidate.metadata,
+                compaction_model=self._compactor.model_name,
+                compression_ratio=new_summary.compression_ratio,
+                start_timestamp=candidate.start_timestamp,
+                end_timestamp=result.timestamp,
+            )
+            if updated.metadata:
+                updated.metadata.turn_count = old_tc + new_tc
+
+            self._store.update_segment(updated)
+            self._semantic.embed_and_store_chunks(updated)
+
+            # Update the result's segment_id so fact provenance points to the merged segment
+            result.segment_id = candidate.ref
+
+            logger.info(
+                "  COMPACT MERGE: appended %d turns to segment %s (tag=%s, %dt → %dt)",
+                new_tc, candidate.ref[:8], result.primary_tag,
+                candidate.full_tokens, combined_tokens,
+            )
+            return True
+
+        return False
