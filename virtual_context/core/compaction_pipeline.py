@@ -330,7 +330,6 @@ class CompactionPipeline:
         from datetime import datetime, timezone
 
         from ..types import CompactionResult, FactSignal, Message, SegmentMetadata, StoredSegment
-        from .tag_scoring import compute_tag_overlap_score
 
         _ensure_engine_imports()
 
@@ -413,31 +412,45 @@ class CompactionPipeline:
 
             # --- Merge check: find best existing segment to merge with ---
             if merge_lookback > 0:
+                from .tag_scoring import compute_relatedness
                 candidates = self._store.get_segments_by_tags(
                     tags=seg.tags, min_overlap=1, limit=merge_lookback,
                     conversation_id=self._config.conversation_id,
                 )
                 seg_tags = set(seg.tags)
+                seg_text = " ".join(m.content for m in seg.messages)[:2000]
+                # Load stored embeddings for candidates
+                stored_embeddings = self._store.load_tag_summary_embeddings(
+                    conversation_id=self._config.conversation_id,
+                )
+                embed_fn = self._semantic.get_embed_fn() if self._semantic else None
                 best_score = 0.0
-                best_overlap = 0.0
                 best_candidate = None
 
                 for candidate in candidates:
                     combined_tokens = candidate.full_tokens + seg.token_count
                     if combined_tokens > max_seg_tokens:
                         continue
-                    _, overlap = compute_tag_overlap_score(seg_tags, set(candidate.tags))
-                    if overlap < merge_threshold:
+                    # Multi-signal relatedness: tag overlap + embedding + keyword
+                    cand_embedding = stored_embeddings.get(candidate.primary_tag)
+                    relatedness = compute_relatedness(
+                        tags_a=seg_tags,
+                        tags_b=set(candidate.tags),
+                        text_a=seg_text,
+                        text_b=candidate.summary[:2000] if candidate.summary else "",
+                        embedding_b=cand_embedding,
+                        embed_fn=embed_fn,
+                    )
+                    if relatedness < merge_threshold:
                         continue
                     try:
                         age_days = (now - candidate.created_at).days
                     except (TypeError, AttributeError):
                         age_days = 30
                     recency = max(0.5, 1.0 - age_days / 60)
-                    combined_score = overlap * recency
+                    combined_score = relatedness * recency
                     if combined_score > best_score:
                         best_score = combined_score
-                        best_overlap = overlap
                         best_candidate = candidate
 
                 if best_candidate is not None:
@@ -455,10 +468,10 @@ class CompactionPipeline:
                     seg.tags = list(set(best_candidate.tags) | seg_tags)
                     logger.info(
                         "MERGE PREP: segment '%s' (%s) merging with stored %s "
-                        "(%s, %d existing turns, overlap=%.2f)",
+                        "(%s, %d existing turns, relatedness=%.2f)",
                         seg.id[:8], seg.primary_tag,
                         best_candidate.ref[:8], best_candidate.primary_tag,
-                        old_tc, best_overlap,
+                        old_tc, best_score,
                     )
 
             compactable.append(seg)

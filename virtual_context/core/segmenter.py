@@ -55,11 +55,13 @@ class TopicSegmenter:
         config: SegmenterConfig,
         token_counter: Callable[[str], int] | None = None,
         turn_tag_index=None,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
     ) -> None:
         self.tag_generator = tag_generator
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self._turn_tag_index = turn_tag_index
+        self._embed_fn = embed_fn
 
     def segment(
         self, messages: list[Message], turn_offset: int = 0
@@ -135,17 +137,23 @@ class TopicSegmenter:
                     tag_changed = False  # merge on empty/general-only
                     overlap = 1.0
                 else:
-                    shared = meaningful_prev & meaningful_curr
-                    overlap = len(shared) / min(
-                        len(meaningful_prev), len(meaningful_curr)
+                    from .tag_scoring import compute_relatedness
+                    prev_text = " ".join(m.content for m in current_group[-1][0].messages)
+                    curr_text = " ".join(m.content for m in pair.messages)
+                    overlap = compute_relatedness(
+                        tags_a=meaningful_prev,
+                        tags_b=meaningful_curr,
+                        text_a=prev_text,
+                        text_b=curr_text,
+                        embed_fn=self._embed_fn,
                     )
                     tag_changed = overlap < self.config.tag_overlap_threshold
                     turn_idx = tagged.index((pair, result))
                     logger.info(
-                        "SEGMENT overlap turn=%d prev_tags=%s curr_tags=%s "
-                        "shared=%s overlap=%.3f threshold=%.1f → %s",
+                        "SEGMENT relatedness turn=%d prev_tags=%s curr_tags=%s "
+                        "score=%.3f threshold=%.1f → %s",
                         turn_offset + turn_idx, sorted(meaningful_prev),
-                        sorted(meaningful_curr), sorted(shared), overlap,
+                        sorted(meaningful_curr), overlap,
                         self.config.tag_overlap_threshold,
                         "SPLIT" if tag_changed else "MERGE",
                     )

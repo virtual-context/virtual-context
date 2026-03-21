@@ -320,11 +320,13 @@ class VirtualContextEngine:
         )
 
     def _init_segmenter(self) -> None:
+        embed_fn = self._semantic.get_embed_fn() if hasattr(self, '_semantic') else None
         self._segmenter = TopicSegmenter(
             tag_generator=self._tag_generator,
             config=self.config.segmenter,
             token_counter=self._token_counter,
             turn_tag_index=self._turn_tag_index,
+            embed_fn=embed_fn,
         )
 
     def _init_assembler(self) -> None:
