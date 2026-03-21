@@ -519,6 +519,22 @@ class ProxyState:
 
         return True
 
+    def _advance_compaction_watermark(self) -> None:
+        """Advance compacted_through to cover the current conversation_history.
+
+        Called after ingestion completes so that re-ingested messages (already
+        compacted in the previous session) are not re-compacted. New messages
+        appended after this point will be past the watermark and compactable.
+        """
+        try:
+            new_wm = len(self.conversation_history)
+            old_wm = int(self.engine._engine_state.compacted_through)
+            if new_wm > old_wm:
+                self.engine._engine_state.compacted_through = new_wm
+                logger.info("Compaction watermark advanced: %d → %d (post-ingestion)", old_wm, new_wm)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
     def _record_ingestion_watermark(self, history_pairs: list[Message], conversation_id: str) -> None:
         import hashlib
         if history_pairs:
@@ -545,6 +561,7 @@ class ProxyState:
             turns = self.engine.ingest_history(history_pairs)
             elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
             self._ingested_conversations.add(conversation_id)
+            self._advance_compaction_watermark()
             self._record_ingestion_watermark(history_pairs, conversation_id)
 
             logger.info(
@@ -622,6 +639,7 @@ class ProxyState:
             needed_turns = len(history_pairs) // 2
             if existing_turns >= needed_turns:
                 self._ingested_conversations.add(conversation_id)
+                self._advance_compaction_watermark()
                 logger.info(
                     "Skipping ingestion: persisted index (%d) covers history (%d)",
                     existing_turns, needed_turns,
@@ -643,6 +661,7 @@ class ProxyState:
                 history_pairs = list(history_pairs[existing_turns * 2:])
                 if not history_pairs:
                     self._ingested_conversations.add(conversation_id)
+                    self._advance_compaction_watermark()
                     return
 
             # ---- PROXY-013: cancel-and-resume if already running ----
@@ -680,6 +699,7 @@ class ProxyState:
                 history_pairs = list(history_pairs[existing_turns * 2:])
                 if not history_pairs:
                     self._ingested_conversations.add(conversation_id)
+                    self._advance_compaction_watermark()
                     self._transition_to(SessionState.ACTIVE)
                     return
                 needed_turns = len(history_pairs) // 2 + existing_turns
@@ -792,6 +812,7 @@ class ProxyState:
         finally:
             if not cancelled:
                 self._ingested_conversations.add(conversation_id)
+                self._advance_compaction_watermark()
                 # Record watermark for history widening detection
                 latest = self._latest_body
                 if latest:

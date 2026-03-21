@@ -425,7 +425,10 @@ class VirtualContextEngine:
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
-        self._engine_state.compacted_through = saved.compacted_through
+        # Reset compacted_through to 0 — the persisted value was an index into the
+        # previous session's conversation_history which no longer exists. The proxy
+        # advances this after ingestion completes to cover re-ingested messages.
+        self._engine_state.compacted_through = 0
         # Populate in-place so all existing references (retriever, etc.) see the restored entries
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
