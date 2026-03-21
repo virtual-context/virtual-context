@@ -310,9 +310,13 @@ class CompactionPipeline:
         self, segments: list, compact_messages_len: int,
         progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
-        """Compact segments one at a time with inline merge check before each
-        LLM call, then store immediately so results are visible in the DB
-        incrementally."""
+        """Two-pass compact and store.
+
+        Pass 1 (sequential, no LLM): handle stubs, check store for merge
+        candidates, combine turns where matches are found.
+
+        Pass 2 (batch, LLM): compact all prepared segments, then store results.
+        """
         from datetime import datetime, timezone
 
         from ..types import CompactionResult, FactSignal, Message, SegmentMetadata, StoredSegment
@@ -323,9 +327,6 @@ class CompactionPipeline:
         all_results: list[CompactionResult] = []
 
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
-        # Build a segment-to-turn mapping using turn_offset and each segment's
-        # turn_count, then collect only the fact signals for each segment's
-        # source turns.
         turn_offset = self._engine_state.compacted_through // 2
         seg_cursor = turn_offset
         segment_signals: dict[str, list[FactSignal]] = {}
@@ -344,15 +345,19 @@ class CompactionPipeline:
         max_seg_tokens = self._config.compactor.max_segment_tokens
         merge_threshold = self._config.compactor.merge_overlap_threshold
 
-        for seg_idx, seg in enumerate(segments):
-            # ----------------------------------------------------------
-            # 1. Stub check — passthrough, no LLM call
-            # ----------------------------------------------------------
+        # ==================================================================
+        # Pass 1: Sequential pre-pass — stubs + merge check (no LLM calls)
+        # ==================================================================
+        compactable: list = []  # segments ready for LLM compaction
+        now = datetime.now(timezone.utc)
+
+        for seg in segments:
+            # --- Stub passthrough (no LLM) ---
             text = " ".join(m.content for m in seg.messages)
             if _is_stub_content_fn(text):
                 text = text.strip()
                 logger.info(
-                    "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s — using raw text as summary",
+                    "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s",
                     seg.id[:8], seg.token_count, seg.primary_tag,
                 )
                 result = CompactionResult(
@@ -391,26 +396,18 @@ class CompactionPipeline:
                 all_results.append(result)
                 if progress_callback:
                     try:
-                        progress_callback(
-                            len(all_results), len(segments), result,
-                            phase="segment_stored",
-                        )
+                        progress_callback(len(all_results), len(segments), result, phase="segment_stored")
                     except Exception:
                         pass
                 continue
 
-            # ----------------------------------------------------------
-            # 2. Merge check — find best existing segment to merge with
-            # ----------------------------------------------------------
+            # --- Merge check: find best existing segment to merge with ---
             if merge_lookback > 0:
                 candidates = self._store.get_segments_by_tags(
-                    tags=seg.tags,
-                    min_overlap=1,
-                    limit=merge_lookback,
+                    tags=seg.tags, min_overlap=1, limit=merge_lookback,
                     conversation_id=self._config.conversation_id,
                 )
                 seg_tags = set(seg.tags)
-                now = datetime.now(timezone.utc)
                 best_score = 0.0
                 best_overlap = 0.0
                 best_candidate = None
@@ -419,69 +416,70 @@ class CompactionPipeline:
                     combined_tokens = candidate.full_tokens + seg.token_count
                     if combined_tokens > max_seg_tokens:
                         continue
-
                     _, overlap = compute_tag_overlap_score(seg_tags, set(candidate.tags))
                     if overlap < merge_threshold:
                         continue
-
-                    # Recency bias: segments created today get 1.0, 60 days ago get 0.5
                     try:
                         age_days = (now - candidate.created_at).days
                     except (TypeError, AttributeError):
                         age_days = 30
                     recency = max(0.5, 1.0 - age_days / 60)
                     combined_score = overlap * recency
-
                     if combined_score > best_score:
                         best_score = combined_score
                         best_overlap = overlap
                         best_candidate = candidate
 
                 if best_candidate is not None:
-                    # Reconstruct Message objects from candidate's stored messages
+                    # Combine turns: prepend existing segment's messages
                     candidate_messages = [
                         Message(role=m.get("role", "user"), content=m.get("content", ""))
                         for m in best_candidate.messages
                     ]
-                    # Prepend candidate messages to segment
                     seg.messages = candidate_messages + list(seg.messages)
                     seg.merge_ref = best_candidate.ref
-                    seg.token_count = best_candidate.full_tokens + seg.token_count
+                    seg.token_count += best_candidate.full_tokens
                     seg.start_timestamp = best_candidate.start_timestamp
-                    seg.turn_count = (
-                        (best_candidate.metadata.turn_count if best_candidate.metadata else 0)
-                        + seg.turn_count
-                    )
+                    old_tc = best_candidate.metadata.turn_count if best_candidate.metadata else len(best_candidate.messages) // 2
+                    seg.turn_count += old_tc
                     seg.tags = list(set(best_candidate.tags) | seg_tags)
                     logger.info(
-                        "MERGE PREP: segment '%s' (%s) merging with stored %s (%s, overlap=%.2f)",
+                        "MERGE PREP: segment '%s' (%s) merging with stored %s "
+                        "(%s, %d existing turns, overlap=%.2f)",
                         seg.id[:8], seg.primary_tag,
                         best_candidate.ref[:8], best_candidate.primary_tag,
-                        best_overlap,
+                        old_tc, best_overlap,
                     )
 
-            # ----------------------------------------------------------
-            # 3. Compact — single segment, one LLM call
-            # ----------------------------------------------------------
-            fact_signals_by_segment = (
-                {seg.id: segment_signals[seg.id]}
-                if seg.id in segment_signals
-                else None
-            )
-            results = self._compactor.compact([seg], fact_signals_by_segment=fact_signals_by_segment)
-            if not results:
-                continue
-            result = results[0]
+            compactable.append(seg)
 
-            # ----------------------------------------------------------
-            # 4. Store or update
-            # ----------------------------------------------------------
+        if not compactable:
+            return all_results
+
+        logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges)",
+                    len(all_results), len(compactable),
+                    sum(1 for s in compactable if s.merge_ref))
+
+        # ==================================================================
+        # Pass 2: Batch LLM compaction + store
+        # ==================================================================
+        fact_signals_by_segment = {
+            seg.id: segment_signals[seg.id]
+            for seg in compactable if seg.id in segment_signals
+        } or None
+
+        results = self._compactor.compact(compactable, fact_signals_by_segment=fact_signals_by_segment)
+
+        for seg_idx, result in enumerate(results):
+            seg = compactable[seg_idx]
+
+            # Store or update
             if seg.merge_ref:
                 stored = StoredSegment(
                     ref=seg.merge_ref,
                     conversation_id=self._config.conversation_id,
                     primary_tag=result.primary_tag,
-                    tags=result.tags,
+                    tags=seg.tags,
                     summary=result.summary,
                     summary_tokens=result.summary_tokens,
                     full_text=result.full_text,
@@ -498,10 +496,10 @@ class CompactionPipeline:
                 result.segment_id = seg.merge_ref
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
-                    "  COMPACT MERGED segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                    seg_idx + 1, len(segments), result.primary_tag,
+                    "  COMPACT MERGED %d/%d: %s (session_date=%s, %dt→%dt, %d turns)",
+                    seg_idx + 1, len(results), result.primary_tag,
                     session_date or 'none',
-                    result.original_tokens, result.summary_tokens,
+                    result.original_tokens, result.summary_tokens, seg.turn_count,
                 )
             else:
                 stored = StoredSegment(
@@ -524,23 +522,18 @@ class CompactionPipeline:
                 self._semantic.embed_and_store_chunks(stored)
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
-                    "  COMPACT NEW segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                    seg_idx + 1, len(segments), result.primary_tag,
+                    "  COMPACT NEW %d/%d: %s (session_date=%s, %dt→%dt, %d turns)",
+                    seg_idx + 1, len(results), result.primary_tag,
                     session_date or 'none',
-                    result.original_tokens, result.summary_tokens,
+                    result.original_tokens, result.summary_tokens, seg.turn_count,
                 )
 
             all_results.append(result)
 
-            # ----------------------------------------------------------
-            # 5. Facts + progress
-            # ----------------------------------------------------------
+            # Facts + progress
             if progress_callback:
                 try:
-                    progress_callback(
-                        len(all_results), len(segments), result,
-                        phase="segment_stored",
-                    )
+                    progress_callback(len(all_results), len(segments), result, phase="segment_stored")
                 except Exception:
                     pass
 
@@ -550,10 +543,7 @@ class CompactionPipeline:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
                 self._store.store_facts(result.facts)
-                logger.info(
-                    "  Stored %d facts for segment %s",
-                    len(result.facts), result.primary_tag,
-                )
+                logger.info("  Stored %d facts for segment %s", len(result.facts), result.primary_tag)
                 _superseded_count = 0
                 _links_count = 0
                 if self._supersession_checker:
@@ -563,15 +553,9 @@ class CompactionPipeline:
                         else:
                             _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
                         if _superseded_count:
-                            logger.info(
-                                "  Superseded %d facts for segment %s",
-                                _superseded_count, result.primary_tag,
-                            )
+                            logger.info("  Superseded %d facts for segment %s", _superseded_count, result.primary_tag)
                         if _links_count:
-                            logger.info(
-                                "  Linked %d facts for segment %s",
-                                _links_count, result.primary_tag,
-                            )
+                            logger.info("  Linked %d facts for segment %s", _links_count, result.primary_tag)
                     except Exception as e:
                         logger.warning("Supersession/linking failed: %s", e)
                 if progress_callback:
