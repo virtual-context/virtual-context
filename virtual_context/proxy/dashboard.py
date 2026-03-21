@@ -636,6 +636,7 @@ def register_dashboard_routes(
         resp = _build_settings_response(state.engine.config)
         if instance_label:
             resp["instance_label"] = instance_label
+        resp["non_virtualizable_floor"] = getattr(state, "_last_non_virtualizable_floor", 0)
         return JSONResponse(resp)
 
     @app.put("/dashboard/settings")
