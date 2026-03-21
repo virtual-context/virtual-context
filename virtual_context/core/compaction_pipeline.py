@@ -495,28 +495,39 @@ class CompactionPipeline:
         return all_results
 
     def _try_merge_segment(self, result, merge_lookback: int, max_tokens: int) -> bool:
-        """Attempt to merge *result* into an existing segment with the same primary tag.
+        """Attempt to merge *result* into an existing segment by tag overlap scoring.
+
+        Uses Jaccard overlap ratio instead of primary-tag-only matching.
+        Among candidates above the threshold, picks the highest-scoring one
+        with a recency bias toward recently created segments.
 
         Returns True if merged, False if no suitable candidate found.
         """
         from ..types import StoredSegment
+        from .tag_scoring import compute_tag_overlap_score
+        from datetime import datetime, timezone
 
+        result_tags = set(result.tags)
+        threshold = self._config.compactor.merge_overlap_threshold
+
+        # Fetch candidates matching ANY of the result's tags
         candidates = self._store.get_segments_by_tags(
-            tags=[result.primary_tag],
+            tags=result.tags,
             min_overlap=1,
             limit=merge_lookback,
             conversation_id=self._config.conversation_id,
         )
-        # Filter to same primary_tag (get_segments_by_tags matches any tag overlap)
-        candidates = [c for c in candidates if c.primary_tag == result.primary_tag]
 
         if not candidates:
             logger.info(
-                "  MERGE skip: no existing segments for primary_tag=%s",
-                result.primary_tag,
+                "  MERGE skip: no existing segments for tags=%s",
+                result.tags,
             )
             return False
 
+        # Score and rank candidates by tag overlap * recency
+        now = datetime.now(timezone.utc)
+        scored_candidates: list[tuple[float, float, object]] = []  # (combined_score, overlap, candidate)
         for candidate in candidates:
             combined_tokens = candidate.full_tokens + result.original_tokens
             if combined_tokens > max_tokens:
@@ -527,67 +538,92 @@ class CompactionPipeline:
                 )
                 continue
 
-            # Merge: combine text and messages, re-summarize
-            merged_full_text = candidate.full_text + "\n\n---\n\n" + result.full_text
-            merged_messages = list(candidate.messages) + list(result.messages)
+            _, overlap = compute_tag_overlap_score(result_tags, set(candidate.tags))
+            if overlap < threshold:
+                continue
 
-            # Re-summarize the combined content
-            from ..types import Message, TaggedSegment
+            # Recency bias: segments created today get 1.0, 30 days ago get 0.5
+            try:
+                age_days = (now - candidate.created_at).days
+            except (TypeError, AttributeError):
+                age_days = 30
+            recency = max(0.5, 1.0 - age_days / 60)
+            combined_score = overlap * recency
+            scored_candidates.append((combined_score, overlap, candidate))
 
-            synthetic_messages = [
-                Message(role=m.get("role", "user"), content=m.get("content", ""))
-                for m in merged_messages
-            ]
-            synthetic_seg = TaggedSegment(
-                id=candidate.ref,
-                messages=synthetic_messages,
-                tags=list(set(candidate.tags) | set(result.tags)),
-                primary_tag=result.primary_tag,
-                token_count=combined_tokens,
-                turn_count=(candidate.metadata.turn_count if candidate.metadata else 0)
-                    + (result.metadata.turn_count if result.metadata else 0),
-            )
-            re_summarized = self._compactor.compact([synthetic_seg])
-            if not re_summarized:
-                logger.warning("  MERGE failed: re-summarization returned empty for %s", candidate.ref[:8])
-                return False
-            new_summary = re_summarized[0]
-
-            # Merge metadata
-            old_tc = candidate.metadata.turn_count if candidate.metadata else 0
-            new_tc = result.metadata.turn_count if result.metadata else 0
-            merged_tags = list(set(candidate.tags) | set(result.tags))
-
-            updated = StoredSegment(
-                ref=candidate.ref,
-                conversation_id=self._config.conversation_id,
-                primary_tag=result.primary_tag,
-                tags=merged_tags,
-                summary=new_summary.summary,
-                summary_tokens=new_summary.summary_tokens,
-                full_text=merged_full_text,
-                full_tokens=combined_tokens,
-                messages=merged_messages,
-                metadata=candidate.metadata,
-                compaction_model=self._compactor.model_name,
-                compression_ratio=new_summary.compression_ratio,
-                start_timestamp=candidate.start_timestamp,
-                end_timestamp=result.timestamp,
-            )
-            if updated.metadata:
-                updated.metadata.turn_count = old_tc + new_tc
-
-            self._store.update_segment(updated)
-            self._semantic.embed_and_store_chunks(updated)
-
-            # Update the result's segment_id so fact provenance points to the merged segment
-            result.segment_id = candidate.ref
-
+        if not scored_candidates:
+            best_overlaps = []
+            for c in candidates:
+                _, ov = compute_tag_overlap_score(result_tags, set(c.tags))
+                best_overlaps.append(ov)
+            best = max(best_overlaps) if best_overlaps else 0.0
             logger.info(
-                "  COMPACT MERGE: appended %d turns to segment %s (tag=%s, %dt → %dt)",
-                new_tc, candidate.ref[:8], result.primary_tag,
-                candidate.full_tokens, combined_tokens,
+                "  MERGE skip: best overlap %.2f below threshold %.2f for tags=%s",
+                best, threshold, result.tags,
             )
-            return True
+            return False
 
-        return False
+        # Pick the best candidate
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        _, best_overlap, candidate = scored_candidates[0]
+
+        # Merge: combine text and messages, re-summarize
+        combined_tokens = candidate.full_tokens + result.original_tokens
+        merged_full_text = candidate.full_text + "\n\n---\n\n" + result.full_text
+        merged_messages = list(candidate.messages) + list(result.messages)
+
+        from ..types import Message, TaggedSegment
+
+        synthetic_messages = [
+            Message(role=m.get("role", "user"), content=m.get("content", ""))
+            for m in merged_messages
+        ]
+        synthetic_seg = TaggedSegment(
+            id=candidate.ref,
+            messages=synthetic_messages,
+            tags=list(set(candidate.tags) | set(result.tags)),
+            primary_tag=result.primary_tag,
+            token_count=combined_tokens,
+            turn_count=(candidate.metadata.turn_count if candidate.metadata else 0)
+                + (result.metadata.turn_count if result.metadata else 0),
+        )
+        re_summarized = self._compactor.compact([synthetic_seg])
+        if not re_summarized:
+            logger.warning("  MERGE failed: re-summarization returned empty for %s", candidate.ref[:8])
+            return False
+        new_summary = re_summarized[0]
+
+        old_tc = candidate.metadata.turn_count if candidate.metadata else 0
+        new_tc = result.metadata.turn_count if result.metadata else 0
+        merged_tags = list(set(candidate.tags) | set(result.tags))
+
+        updated = StoredSegment(
+            ref=candidate.ref,
+            conversation_id=self._config.conversation_id,
+            primary_tag=result.primary_tag,
+            tags=merged_tags,
+            summary=new_summary.summary,
+            summary_tokens=new_summary.summary_tokens,
+            full_text=merged_full_text,
+            full_tokens=combined_tokens,
+            messages=merged_messages,
+            metadata=candidate.metadata,
+            compaction_model=self._compactor.model_name,
+            compression_ratio=new_summary.compression_ratio,
+            start_timestamp=candidate.start_timestamp,
+            end_timestamp=result.timestamp,
+        )
+        if updated.metadata:
+            updated.metadata.turn_count = old_tc + new_tc
+
+        self._store.update_segment(updated)
+        self._semantic.embed_and_store_chunks(updated)
+
+        result.segment_id = candidate.ref
+
+        logger.info(
+            "  COMPACT MERGE: appended %d turns to segment %s (tag=%s, overlap=%.2f, %dt → %dt)",
+            new_tc, candidate.ref[:8], result.primary_tag,
+            best_overlap, candidate.full_tokens, combined_tokens,
+        )
+        return True
