@@ -722,11 +722,11 @@ class PostgresStore(ContextStore):
                               jsonb_array_elements_text(ts.source_segment_refs::jsonb) je
                        WHERE s.ref = je AND s.conversation_id = %s
                    )
-                   ORDER BY ts.tag""",
+                   ORDER BY ts.updated_at DESC""",
                 (conversation_id, conversation_id),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM tag_summaries ORDER BY tag").fetchall()
+            rows = conn.execute("SELECT * FROM tag_summaries ORDER BY updated_at DESC").fetchall()
         return [
             TagSummary(
                 tag=row["tag"], summary=row["summary"],
