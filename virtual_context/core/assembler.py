@@ -178,8 +178,10 @@ class ContextAssembler:
                             key, score, tokens, pool_used, pool)
             else:  # fact
                 if facts_tokens + tokens > facts_cap:
+                    logger.debug("Fact #%s SKIP (facts cap: %d+%d > %d)", key, facts_tokens, tokens, facts_cap)
                     continue
                 if pool_used + tokens > pool:
+                    logger.debug("Fact #%s SKIP (pool: need %dt, have %dt remaining)", key, tokens, pool - pool_used)
                     continue
                 selected_fact_indices.append(int(key))
                 facts_tokens += tokens
@@ -191,7 +193,7 @@ class ContextAssembler:
 
         # Format selected facts (budget already enforced by pool allocation)
         selected_facts = [retrieval_result.facts[i] for i in sorted(selected_fact_indices)]
-        facts_text = self._format_facts(selected_facts, pool) if selected_facts else ""
+        facts_text = self._format_facts(selected_facts, facts_tokens + 100) if selected_facts else ""
         facts_tokens_actual = self.token_counter(facts_text) if facts_text else 0
 
         # Track presented segment refs
