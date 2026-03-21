@@ -711,6 +711,7 @@ class CompactorConfig:
     llm_token_overhead: int = 2000  # extra tokens for thinking/reasoning overhead
     merge_lookback: int = 5         # check last N segments for merge candidate
     max_segment_tokens: int = 2000  # don't merge if combined full_text would exceed this
+    merge_overlap_threshold: float = 0.4  # minimum tag overlap ratio (Jaccard) to merge
 
 
 @dataclass

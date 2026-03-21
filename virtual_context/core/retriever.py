@@ -275,18 +275,16 @@ class ContextRetriever:
         query_tag_set = set(query_tags)
         related_tag_set = set(related_query_tags)
 
+        from .tag_scoring import compute_tag_overlap_score
+
         scored: list[tuple[float, StoredSummary]] = []
         for summary in summaries:
             summary_tag_set = set(summary.tags)
             # Primary matches: full IDF weight
-            primary_score = sum(
-                idf_weights.get(t, 1.0) for t in query_tag_set & summary_tag_set
-            )
+            primary_score, _ = compute_tag_overlap_score(query_tag_set, summary_tag_set, idf_weights)
             # Related matches: 0.5x IDF weight
-            related_score = 0.5 * sum(
-                idf_weights.get(t, 1.0) for t in related_tag_set & summary_tag_set
-            )
-            scored.append((primary_score + related_score, summary))
+            related_score, _ = compute_tag_overlap_score(related_tag_set, summary_tag_set, idf_weights)
+            scored.append((primary_score + 0.5 * related_score, summary))
 
         # Sort by score descending, take top max_results
         scored.sort(key=lambda x: x[0], reverse=True)
