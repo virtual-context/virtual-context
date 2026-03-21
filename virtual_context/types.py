@@ -719,11 +719,16 @@ class AssemblerConfig:
     core_context_max_tokens: int = 18_000
     tag_context_max_tokens: int = 30_000
     facts_max_tokens: int = 20_000
+    context_injection_max_tokens: int = 0  # 0 = auto (tag + facts budgets)
     core_files: list[dict] = field(default_factory=list)
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
     context_hint_max_tokens: int = 2000
     pre_compaction_filtering: str = "aggressive"  # "off" | "conservative" | "aggressive"
+
+    def __post_init__(self):
+        if self.context_injection_max_tokens == 0:
+            self.context_injection_max_tokens = self.tag_context_max_tokens + self.facts_max_tokens
 
 
 @dataclass
