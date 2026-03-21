@@ -386,8 +386,7 @@ class ContextRetriever:
         # Fetch facts: prefetch by tag relevance or fetch all
         if self.config.prefetch_facts and expanded_tags:
             facts = self._fetch_facts_by_tags(expanded_tags)
-            all_count = len(self._fetch_all_facts())
-            logger.info("Retriever: facts=%d/%d (prefetch tags=%s)", len(facts), all_count, expanded_tags)
+            logger.info("Retriever: facts=%d (prefetch tags=%s)", len(facts), expanded_tags)
         else:
             facts = self._fetch_all_facts()
             logger.info("Retriever: facts=%d (all, prefetch=%s)", len(facts),

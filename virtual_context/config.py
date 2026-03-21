@@ -171,6 +171,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         llm_token_overhead=compaction.get("llm_token_overhead", _cmp_defaults.llm_token_overhead),
         merge_lookback=compaction.get("merge_lookback", _cmp_defaults.merge_lookback),
         max_segment_tokens=compaction.get("max_segment_tokens", _cmp_defaults.max_segment_tokens),
+        merge_overlap_threshold=compaction.get("merge_overlap_threshold", _cmp_defaults.merge_overlap_threshold),
     )
 
     # Summarization
@@ -240,7 +241,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         context_hint_enabled=assembly_raw.get("context_hint_enabled", _asm_defaults.context_hint_enabled),
         context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", _asm_defaults.context_hint_max_tokens),
         pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", _asm_defaults.pre_compaction_filtering),
-        context_injection_max_tokens=assembly_raw.get("context_injection_max_tokens", 0),
+        context_injection_max_tokens=assembly_raw.get("context_injection_max_tokens", -1),
     )
 
     # Retrieval

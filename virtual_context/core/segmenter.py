@@ -78,6 +78,8 @@ class TopicSegmenter:
         if not messages:
             return []
 
+        from .tag_scoring import compute_relatedness
+
         # Pair messages into turns
         pairs = self._pair_turns(messages)
 
@@ -123,7 +125,7 @@ class TopicSegmenter:
         running_session: str = ""  # tracks session date across all pairs
         group_session: str = ""    # session date for the current group
 
-        for pair, result in tagged:
+        for turn_idx, (pair, result) in enumerate(tagged):
             parsed = _parse_session_date(pair)
             if parsed:
                 running_session = parsed
@@ -137,7 +139,6 @@ class TopicSegmenter:
                     tag_changed = False  # merge on empty/general-only
                     overlap = 1.0
                 else:
-                    from .tag_scoring import compute_relatedness
                     prev_text = " ".join(m.content for m in current_group[-1][0].messages)
                     curr_text = " ".join(m.content for m in pair.messages)
                     overlap = compute_relatedness(
@@ -148,7 +149,6 @@ class TopicSegmenter:
                         embed_fn=self._embed_fn,
                     )
                     tag_changed = overlap < self.config.tag_overlap_threshold
-                    turn_idx = tagged.index((pair, result))
                     logger.info(
                         "SEGMENT relatedness turn=%d prev_tags=%s curr_tags=%s "
                         "score=%.3f threshold=%.1f → %s",
@@ -166,7 +166,6 @@ class TopicSegmenter:
                 temporal_gap = self._has_temporal_gap(current_group[-1][0], pair)
 
                 if tag_changed or session_changed or temporal_gap:
-                    turn_idx = tagged.index((pair, result))
                     if session_changed:
                         reason = f"session_changed session={parsed}"
                     elif temporal_gap:

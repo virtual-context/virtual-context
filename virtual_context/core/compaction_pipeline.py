@@ -330,6 +330,7 @@ class CompactionPipeline:
         from datetime import datetime, timezone
 
         from ..types import CompactionResult, FactSignal, Message, SegmentMetadata, StoredSegment
+        from .tag_scoring import compute_relatedness
 
         _ensure_engine_imports()
 
@@ -359,6 +360,12 @@ class CompactionPipeline:
         # ==================================================================
         compactable: list = []  # segments ready for LLM compaction
         now = datetime.now(timezone.utc)
+
+        # P1: pre-load embeddings and embed_fn once (not per-segment)
+        stored_embeddings = self._store.load_tag_summary_embeddings(
+            conversation_id=self._config.conversation_id,
+        )
+        embed_fn = self._semantic.get_embed_fn() if self._semantic else None
 
         for seg in segments:
             # --- Stub passthrough (no LLM) ---
@@ -412,18 +419,19 @@ class CompactionPipeline:
 
             # --- Merge check: find best existing segment to merge with ---
             if merge_lookback > 0:
-                from .tag_scoring import compute_relatedness
                 candidates = self._store.get_segments_by_tags(
                     tags=seg.tags, min_overlap=1, limit=merge_lookback,
                     conversation_id=self._config.conversation_id,
                 )
                 seg_tags = set(seg.tags)
                 seg_text = " ".join(m.content for m in seg.messages)[:2000]
-                # Load stored embeddings for candidates
-                stored_embeddings = self._store.load_tag_summary_embeddings(
-                    conversation_id=self._config.conversation_id,
-                )
-                embed_fn = self._semantic.get_embed_fn() if self._semantic else None
+                # B4: Pre-compute segment embedding once (not per-candidate)
+                seg_embedding = None
+                if embed_fn and seg_text:
+                    try:
+                        seg_embedding = embed_fn([seg_text])[0]
+                    except Exception:
+                        pass
                 best_score = 0.0
                 best_candidate = None
 
@@ -438,8 +446,8 @@ class CompactionPipeline:
                         tags_b=set(candidate.tags),
                         text_a=seg_text,
                         text_b=candidate.summary[:2000] if candidate.summary else "",
+                        embedding_a=seg_embedding,
                         embedding_b=cand_embedding,
-                        embed_fn=embed_fn,
                     )
                     if relatedness < merge_threshold:
                         continue
