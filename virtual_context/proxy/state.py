@@ -130,6 +130,7 @@ class ProxyState:
         self._initial_payload_tokens: int | None = None
         self._last_payload_tokens: int = 0
         self._last_enriched_payload_tokens: int = 0
+        self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
 
@@ -239,6 +240,7 @@ class ProxyState:
             "initial_payload_tokens": self._initial_payload_tokens,
             "last_payload_tokens": self._last_payload_tokens,
             "last_enriched_payload_tokens": self._last_enriched_payload_tokens,
+            "non_virtualizable_floor": self._last_non_virtualizable_floor,
         }
         return snap
 

@@ -361,11 +361,10 @@ def create_app(
         if state and state.metrics:
             metrics = state.metrics
 
-        # Use accurate token counter from engine when available (e.g. tiktoken)
-        if state and hasattr(state.engine, "_token_counter"):
-            _tc = state.engine._token_counter
-            if callable(_tc) and not hasattr(_tc, '_mock_name'):
-                fmt.set_token_counter(_tc)
+        # Use format-specific token counter (anthropic tokenizer for Anthropic,
+        # tiktoken for others, with fallback chain)
+        from ..token_counter import get_counter_for_format
+        fmt.set_token_counter(get_counter_for_format(fmt.name))
 
         api_format = fmt.name
         user_message = fmt.extract_user_message(body)
@@ -761,6 +760,27 @@ def create_app(
         # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
         if state:
             state._last_enriched_payload_tokens = outbound_tokens
+            # Non-virtualizable floor: everything in the outbound payload except VC context
+            _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
+            state._last_non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
+            # Warn if context_window is at or below the floor
+            try:
+                _cw = int(state.engine.config.monitor.context_window)
+                if _cw <= state._last_non_virtualizable_floor * 1.1:
+                    logger.warning(
+                        "NON_VIRTUALIZABLE floor=%dt exceeds context_window=%dt — "
+                        "VC context cannot be effectively injected",
+                        state._last_non_virtualizable_floor, _cw,
+                    )
+                    metrics.record({
+                        "type": "non_virtualizable_warning",
+                        "floor": state._last_non_virtualizable_floor,
+                        "context_window": _cw,
+                        "outbound_tokens": outbound_tokens,
+                        "vc_tokens": _vc_tokens,
+                    })
+            except (TypeError, ValueError):
+                pass
 
         # PROXY-025: Over-budget alert
         if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
@@ -779,7 +799,7 @@ def create_app(
         # Record request event
         turn = len(state.engine._turn_tag_index.entries) if state else 0
         _turn_id = uuid.uuid4().hex[:12]
-        context_tokens = len(prepend_text) // 4 if prepend_text else 0
+        context_tokens = fmt._count(prepend_text) if prepend_text else 0
         total_turns = turn
         overhead_ms = round(wait_ms + inbound_ms, 1)
         _conversation_id = state.engine.config.conversation_id if state else ""
