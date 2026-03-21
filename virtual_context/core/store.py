@@ -263,6 +263,12 @@ class ContextStore(ABC):
     ) -> None:
         pass
 
+    def get_actionable_fact_tags(
+        self, tags: list[str], conversation_id: str | None = None,
+    ) -> set[str]:
+        """Return subset of tags that have non-superseded active/completed/personal facts."""
+        return set()
+
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return {}
 

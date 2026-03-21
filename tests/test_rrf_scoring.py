@@ -149,3 +149,62 @@ class TestRRFFusion:
         # auth should rank highest (appears in both IDF and BM25)
         if "database" in scores:
             assert scores["auth"] >= scores["database"]
+
+
+# ---------------------------------------------------------------------------
+# Dampening tests
+# ---------------------------------------------------------------------------
+from virtual_context.core.retrieval_scoring import (
+    apply_gravity_dampening,
+    apply_hub_dampening,
+    apply_resolution_boost,
+)
+
+
+class TestDampening:
+    def test_gravity_halves_unsupported_embedding(self):
+        embed = {"auth": 0.8, "cooking": 0.3}
+        bm25 = {"auth": 0.0}  # no BM25 support for auth
+        apply_gravity_dampening(embed, bm25, threshold=0.5, factor=0.5)
+        assert embed["auth"] == 0.4  # halved
+        assert embed["cooking"] == 0.3  # below threshold, untouched
+
+    def test_gravity_skips_when_bm25_present(self):
+        embed = {"auth": 0.8}
+        bm25 = {"auth": 1.5}  # BM25 supports this
+        apply_gravity_dampening(embed, bm25, threshold=0.5, factor=0.5)
+        assert embed["auth"] == 0.8  # untouched
+
+    def test_hub_penalizes_high_count_tags(self):
+        fused = {"common": 0.5, "rare": 0.5}
+        # 11 tags: p90_idx=9 -> counts[9]=40, max=100, so common (100) > p90 (40)
+        tag_stats = {"common": 100, "rare": 2, "other1": 3, "other2": 5, "other3": 8,
+                     "other4": 10, "other5": 15, "other6": 20, "other7": 25, "other8": 30, "other9": 40}
+        apply_hub_dampening(fused, tag_stats, set(), penalty_strength=0.6, min_score_fraction=0.2)
+        assert fused["common"] < 0.5  # penalized
+        assert fused["rare"] == 0.5  # untouched
+
+    def test_hub_exempts_query_tags(self):
+        fused = {"common": 0.5}
+        # 11 tags: p90_idx=9 -> counts[9]=45, max=100, so common (100) > p90 (45)
+        tag_stats = {"common": 100, "other1": 5, "other2": 10, "other3": 15,
+                     "other4": 20, "other5": 25, "other6": 30, "other7": 35, "other8": 40,
+                     "other9": 45, "other10": 3}
+        apply_hub_dampening(fused, tag_stats, {"common"}, penalty_strength=0.6, min_score_fraction=0.2)
+        assert fused["common"] == 0.5  # exempt — in query tags
+
+    def test_resolution_boosts_actionable(self):
+        fused = {"auth": 0.5, "cooking": 0.5}
+        apply_resolution_boost(fused, {"auth"}, boost=1.15)
+        assert fused["auth"] == 0.5 * 1.15
+        assert fused["cooking"] == 0.5  # no facts
+
+    def test_all_dampening_toggleable(self):
+        """Each filter respects its enabled flag."""
+        from virtual_context.types import DampeningConfig, ScoringConfig
+        cfg = ScoringConfig(dampening=DampeningConfig(
+            hub_enabled=False, gravity_enabled=False, resolution_enabled=False,
+        ))
+        assert not cfg.dampening.hub_enabled
+        assert not cfg.dampening.gravity_enabled
+        assert not cfg.dampening.resolution_enabled

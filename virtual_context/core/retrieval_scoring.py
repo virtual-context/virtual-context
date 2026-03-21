@@ -142,15 +142,87 @@ def compute_embedding_candidates(
     return result
 
 
+def apply_gravity_dampening(
+    embed_scores: dict[str, float],
+    bm25_scores: dict[str, float],
+    threshold: float = 0.5,
+    factor: float = 0.5,
+) -> None:
+    """Pre-RRF: halve embedding scores that have zero BM25 support (in-place)."""
+    for tag in list(embed_scores.keys()):
+        if bm25_scores.get(tag, 0) == 0 and embed_scores[tag] > threshold:
+            old = embed_scores[tag]
+            embed_scores[tag] = old * factor
+            logger.info("Retriever: GRAVITY '%s': embedding %.3f->%.3f (bm25=0, no keyword support)",
+                        tag, old, embed_scores[tag])
+
+
+def apply_hub_dampening(
+    fused_scores: dict[str, float],
+    tag_stats: dict[str, int],
+    query_tags: set[str],
+    penalty_strength: float = 0.6,
+    min_score_fraction: float = 0.2,
+) -> None:
+    """Post-RRF: penalize high-segment-count tags (in-place)."""
+    if not tag_stats:
+        return
+    counts = sorted(tag_stats.values())
+    if len(counts) < 2:
+        return
+    p90_idx = int(len(counts) * 0.9)
+    p90 = counts[p90_idx]
+    max_count = counts[-1]
+    if p90 >= max_count:
+        return
+
+    above_p90 = sum(1 for t in fused_scores if tag_stats.get(t, 0) > p90)
+    if above_p90:
+        logger.info("Retriever: HUB dampening stats: p90=%d, max=%d, %d tags above p90",
+                    p90, max_count, above_p90)
+
+    for tag in list(fused_scores.keys()):
+        seg_count = tag_stats.get(tag, 0)
+        if seg_count <= p90:
+            continue
+        if tag in query_tags:
+            logger.info("Retriever: HUB exempt '%s': segments=%d above p90 but in query tags", tag, seg_count)
+            continue
+        old = fused_scores[tag]
+        penalty = 1.0 - penalty_strength * (seg_count - p90) / (max_count - p90)
+        fused_scores[tag] = old * max(min_score_fraction, penalty)
+        logger.info("Retriever: HUB '%s': score %.4f->%.4f (segments=%d, p90=%d, penalty=%.2f)",
+                    tag, old, fused_scores[tag], seg_count, p90, penalty)
+
+
+def apply_resolution_boost(
+    fused_scores: dict[str, float],
+    actionable_tags: set[str],
+    boost: float = 1.15,
+) -> None:
+    """Post-RRF: boost fact-bearing tags (in-place)."""
+    boosted = 0
+    for tag in list(fused_scores.keys()):
+        if tag in actionable_tags:
+            old = fused_scores[tag]
+            fused_scores[tag] = old * boost
+            logger.info("Retriever: RESOLUTION boost '%s': score %.4f->%.4f (has actionable facts)",
+                        tag, old, fused_scores[tag])
+            boosted += 1
+    if boosted:
+        logger.info("Retriever: RESOLUTION: %d/%d candidates boosted", boosted, len(fused_scores))
+
+
 def score_candidates(
     query_tags: list[str],
     related_tags: list[str],
     query_text: str,
     query_embedding: list[float] | None,
-    store: ContextStore,
+    store: "ContextStore",
     idf_weights: dict[str, float],
     conversation_id: str | None,
-    config: ScoringConfig,
+    config: "ScoringConfig",
+    tag_stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """3-signal RRF fusion. Returns ({tag: fused_score}, {tag: signal_breakdown})."""
 
@@ -166,6 +238,17 @@ def score_candidates(
         limit=config.embedding_limit,
         min_threshold=config.embedding_min_threshold,
     )
+
+    # --- Phase 2: Dampening (pre-RRF) ---
+    dampening = config.dampening
+
+    # Gravity (pre-RRF): halve embedding scores with zero BM25 support
+    if dampening.gravity_enabled and embed_scores:
+        apply_gravity_dampening(
+            embed_scores, bm25_scores,
+            threshold=dampening.gravity_threshold,
+            factor=dampening.gravity_factor,
+        )
 
     # Union all candidates
     all_tags = set(idf_scores) | set(bm25_scores) | set(embed_scores)
@@ -195,6 +278,27 @@ def score_candidates(
 
     # RRF fusion
     fused = rrf_fuse(rankings, weights, k=config.rrf_k)
+
+    # --- Phase 2: Dampening (post-RRF) ---
+
+    # Hub dampening (post-RRF)
+    if dampening.hub_enabled and tag_stats:
+        apply_hub_dampening(
+            fused, tag_stats, set(query_tags),
+            penalty_strength=dampening.hub_penalty_strength,
+            min_score_fraction=dampening.hub_min_score,
+        )
+
+    # Resolution boost (post-RRF)
+    if dampening.resolution_enabled:
+        try:
+            actionable = store.get_actionable_fact_tags(
+                list(all_tags), conversation_id=conversation_id,
+            )
+            if actionable:
+                apply_resolution_boost(fused, actionable, boost=dampening.resolution_boost)
+        except Exception:
+            pass
 
     # Build breakdowns for logging
     breakdowns: dict[str, dict] = {}
