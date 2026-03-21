@@ -710,6 +710,7 @@ class RetrieverConfig:
     inbound_tagger_type: str = "embedding"  # "embedding" (default) or "llm"
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_threshold: float = 0.3
+    prefetch_facts: bool = True            # filter facts by query tags instead of fetching all
 
 
 @dataclass
