@@ -249,6 +249,7 @@ class ContextRetriever:
         from .retrieval_scoring import score_candidates
 
         idf_weights = self._compute_idf_weights()
+        tag_stats = {ts.tag: ts.usage_count for ts in self.store.get_all_tags(conversation_id=self._conversation_id)}
         scores, breakdowns = score_candidates(
             query_tags=query_tags,
             related_tags=related_query_tags,
@@ -258,6 +259,7 @@ class ContextRetriever:
             idf_weights=idf_weights,
             conversation_id=self._conversation_id,
             config=self.config.scoring,
+            tag_stats=tag_stats,
         )
         retrieval_scores = scores
 

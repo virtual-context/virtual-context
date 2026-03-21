@@ -718,6 +718,19 @@ class CompactorConfig:
 
 
 @dataclass
+class DampeningConfig:
+    """Toggleable post-retrieval dampening filters."""
+    hub_enabled: bool = True
+    hub_penalty_strength: float = 0.6
+    hub_min_score: float = 0.2
+    gravity_enabled: bool = True
+    gravity_threshold: float = 0.5
+    gravity_factor: float = 0.5
+    resolution_enabled: bool = True
+    resolution_boost: float = 1.15
+
+
+@dataclass
 class ScoringConfig:
     """Weights and limits for 3-signal RRF retrieval scoring."""
     idf_weight: float = 0.50
@@ -727,6 +740,7 @@ class ScoringConfig:
     bm25_limit: int = 20
     embedding_limit: int = 20
     embedding_min_threshold: float = 0.25
+    dampening: DampeningConfig = field(default_factory=DampeningConfig)
 
 
 @dataclass

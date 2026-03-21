@@ -12,6 +12,7 @@ import yaml
 from .types import (
     AssemblerConfig,
     CompactorConfig,
+    DampeningConfig,
     TelemetryConfig,
     FactsConfig,
     SearchConfig,
@@ -251,6 +252,18 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     strategy_configs = _parse_strategy_configs(strategy_raw)
     scoring_raw = retrieval_raw.get("scoring", {})
     _sc_defaults = ScoringConfig()
+    dampening_raw = scoring_raw.get("dampening", {})
+    _damp_defaults = DampeningConfig()
+    dampening_config = DampeningConfig(
+        hub_enabled=dampening_raw.get("hub_enabled", _damp_defaults.hub_enabled),
+        hub_penalty_strength=dampening_raw.get("hub_penalty_strength", _damp_defaults.hub_penalty_strength),
+        hub_min_score=dampening_raw.get("hub_min_score", _damp_defaults.hub_min_score),
+        gravity_enabled=dampening_raw.get("gravity_enabled", _damp_defaults.gravity_enabled),
+        gravity_threshold=dampening_raw.get("gravity_threshold", _damp_defaults.gravity_threshold),
+        gravity_factor=dampening_raw.get("gravity_factor", _damp_defaults.gravity_factor),
+        resolution_enabled=dampening_raw.get("resolution_enabled", _damp_defaults.resolution_enabled),
+        resolution_boost=dampening_raw.get("resolution_boost", _damp_defaults.resolution_boost),
+    )
     scoring_config = ScoringConfig(
         idf_weight=scoring_raw.get("idf_weight", _sc_defaults.idf_weight),
         bm25_weight=scoring_raw.get("bm25_weight", _sc_defaults.bm25_weight),
@@ -259,6 +272,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         bm25_limit=scoring_raw.get("bm25_limit", _sc_defaults.bm25_limit),
         embedding_limit=scoring_raw.get("embedding_limit", _sc_defaults.embedding_limit),
         embedding_min_threshold=scoring_raw.get("embedding_min_threshold", _sc_defaults.embedding_min_threshold),
+        dampening=dampening_config,
     )
     retriever_config = RetrieverConfig(
         skip_active_tags=retrieval_raw.get("skip_active_tags", _ret_defaults.skip_active_tags),

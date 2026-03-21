@@ -1189,6 +1189,31 @@ class PostgresStore(ContextStore):
                 pass
         return result
 
+    def get_actionable_fact_tags(
+        self, tags: list[str], conversation_id: str | None = None,
+    ) -> set[str]:
+        if not tags:
+            return set()
+        conn = self._get_conn()
+        placeholders = ",".join("%s" for _ in tags)
+        params: list = list(tags)
+        conv_clause = ""
+        if conversation_id is not None:
+            conv_clause = " AND f.conversation_id = %s"
+            params.append(conversation_id)
+        try:
+            rows = conn.execute(
+                f"""SELECT DISTINCT ft.tag FROM fact_tags ft
+                JOIN facts f ON f.id = ft.fact_id
+                WHERE ft.tag IN ({placeholders})
+                AND f.superseded_by IS NULL
+                AND (f.status IN ('active', 'completed') OR f.fact_type = 'personal'){conv_clause}""",
+                params,
+            ).fetchall()
+            return {row["tag"] for row in rows}
+        except Exception:
+            return set()
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------

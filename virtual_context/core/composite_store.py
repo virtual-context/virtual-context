@@ -190,6 +190,9 @@ class CompositeStore:
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
         return self._facts.get_superseded_facts(fact_ids)
 
+    def get_actionable_fact_tags(self, tags: list[str], conversation_id: str | None = None) -> set[str]:
+        return self._facts.get_actionable_fact_tags(tags, conversation_id=conversation_id)
+
     # ------------------------------------------------------------------
     # FactLinkStore
     # ------------------------------------------------------------------
