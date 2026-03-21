@@ -140,6 +140,11 @@ class CompositeStore:
     ) -> dict[int, tuple[str, str, str | None, str | None]]:
         return self._segments.get_turn_messages(conversation_id, turn_numbers)
 
+    def load_recent_turn_messages(
+        self, conversation_id: str, limit: int = 100,
+    ) -> list[tuple[int, str, str]]:
+        return self._segments.load_recent_turn_messages(conversation_id, limit=limit)
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------

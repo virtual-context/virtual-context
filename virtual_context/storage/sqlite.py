@@ -1356,6 +1356,23 @@ class SQLiteStore(ContextStore):
             for row in rows
         }
 
+    def load_recent_turn_messages(
+        self,
+        conversation_id: str,
+        limit: int = 100,
+    ) -> list[tuple[int, str, str]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT turn_number, user_content, assistant_content
+            FROM turn_messages
+            WHERE conversation_id = ?
+            ORDER BY turn_number DESC
+            LIMIT ?""",
+            (conversation_id, limit),
+        ).fetchall()
+        # Return in ascending order (oldest first)
+        return [(r["turn_number"], r["user_content"], r["assistant_content"]) for r in reversed(rows)]
+
     # ------------------------------------------------------------------
     # D1: Fact Extraction
     # ------------------------------------------------------------------
