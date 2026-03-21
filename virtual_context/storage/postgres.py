@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
     data_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
+    tag TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    embedding_json TEXT NOT NULL,
+    PRIMARY KEY (tag, conversation_id)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
@@ -1130,6 +1137,57 @@ class PostgresStore(ContextStore):
             (conversation_id, limit),
         ).fetchall()
         return [(r["turn_number"], r["user_content"], r["assistant_content"]) for r in reversed(rows)]
+
+    def search_tag_summaries_fts(
+        self, query: str, limit: int = 20, conversation_id: str | None = None,
+    ) -> list[tuple[str, float]]:
+        conn = self._get_conn()
+        tsquery = " & ".join(query.split()[:10])
+        try:
+            sql = """SELECT ts.tag,
+                    ts_rank(to_tsvector('english', ts.summary), to_tsquery('english', %s)) as score
+                FROM tag_summaries ts
+                WHERE to_tsvector('english', ts.summary) @@ to_tsquery('english', %s)"""
+            params: list = [tsquery, tsquery]
+            if conversation_id is not None:
+                sql += " AND ts.conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY score DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            return [(row["tag"], float(row["score"])) for row in rows]
+        except Exception:
+            return []
+
+    def store_tag_summary_embedding(
+        self, tag: str, conversation_id: str, embedding: list[float],
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tag, conversation_id) DO UPDATE SET embedding_json = EXCLUDED.embedding_json""",
+            (tag, conversation_id, json.dumps(embedding)),
+        )
+
+    def load_tag_summary_embeddings(
+        self, conversation_id: str | None = None,
+    ) -> dict[str, list[float]]:
+        conn = self._get_conn()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT tag, embedding_json FROM tag_summary_embeddings WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT tag, embedding_json FROM tag_summary_embeddings").fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["tag"]] = json.loads(row["embedding_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
 
     # ------------------------------------------------------------------
     # FactStore
