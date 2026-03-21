@@ -567,7 +567,7 @@ class RetrievalResult:
     cost_report: RetrievalCostReport = field(default_factory=RetrievalCostReport)
     temporal: bool = False  # True when the query references a time position
     facts: list[Fact] = field(default_factory=list)  # D1: matching facts
-    retrieval_scores: dict[str, float] = field(default_factory=dict)  # primary_tag → IDF score
+    retrieval_scores: dict[str, float] = field(default_factory=dict)  # primary_tag → RRF fused score
     query_embedding: list[float] | None = None
 
 
@@ -750,7 +750,7 @@ class AssemblerConfig:
     core_context_max_tokens: int = 18_000
     tag_context_max_tokens: int = 30_000
     facts_max_tokens: int = 20_000
-    context_injection_max_tokens: int = 0  # 0 = auto (tag + facts budgets)
+    context_injection_max_tokens: int = -1  # -1 = auto (tag + facts budgets)
     core_files: list[dict] = field(default_factory=list)
     recent_turns_always_included: int = 3
     context_hint_enabled: bool = True
@@ -758,7 +758,7 @@ class AssemblerConfig:
     pre_compaction_filtering: str = "aggressive"  # "off" | "conservative" | "aggressive"
 
     def __post_init__(self):
-        if self.context_injection_max_tokens == 0:
+        if self.context_injection_max_tokens < 0:
             self.context_injection_max_tokens = self.tag_context_max_tokens + self.facts_max_tokens
 
 

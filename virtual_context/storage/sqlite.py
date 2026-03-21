@@ -530,8 +530,8 @@ class SQLiteStore(ContextStore):
                 if ts_count > 0:
                     conn.execute("INSERT INTO tag_summaries_fts(tag_summaries_fts) VALUES('rebuild')")
                     conn.commit()
-        except Exception:
-            pass
+        except Exception as _fts_err:
+            logger.warning("tag_summaries_fts rebuild failed: %s", _fts_err)
         # Tag summary embeddings for retrieval scoring
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
