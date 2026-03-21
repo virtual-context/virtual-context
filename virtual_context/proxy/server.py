@@ -120,6 +120,7 @@ def create_app(
     shared_engine: VirtualContextEngine | None = None,
     shared_metrics: ProxyMetrics | None = None,
     instance_label: str = "",
+    instance_upstream_limit: int = 0,
 ) -> FastAPI:
     """Create the FastAPI proxy application.
 
@@ -175,6 +176,9 @@ def create_app(
             )
         # Create the default session (used by dashboard and first requests)
         default_state = ProxyState(engine, metrics=metrics, upstream=upstream)
+
+        if instance_upstream_limit:
+            default_state._instance_upstream_limit = instance_upstream_limit
 
         # If lossless restart recovered state, mark session as already ingested
         # so the proxy doesn't re-ingest history on first request.
@@ -370,6 +374,21 @@ def create_app(
         user_message = fmt.extract_user_message(body)
         is_streaming = body.get("stream", False)
 
+        # Resolve upstream context window limit for this model
+        from ..model_limits import resolve_upstream_limit
+        _model_name = body.get("model", "")
+        if state:
+            state._last_model = _model_name
+        try:
+            _instance_limit = int(getattr(state, '_instance_upstream_limit', 0)) if state else 0
+        except (TypeError, ValueError):
+            _instance_limit = 0
+        try:
+            _global_limit = int(state.engine.config.proxy.upstream_context_limit) if state else 0
+        except (TypeError, ValueError, AttributeError):
+            _global_limit = 0
+        _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
+
         # Ground truth: actual byte-measured inbound token count
         _payload_kb = round(len(body_bytes) / 1024, 1)
         _inbound_bytes = len(body_bytes)
@@ -509,6 +528,23 @@ def create_app(
                         logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
                                     _post_stats - _pre_stats,
                                     _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
+
+                # Upstream context enforcement
+                if _inbound_tokens > _upstream_limit:
+                    from .message_filter import trim_to_upstream_limit
+                    body, _pt_trimmed = trim_to_upstream_limit(body, _upstream_limit, fmt)
+                    if _pt_trimmed:
+                        logger.info(
+                            "PASSTHROUGH_TRIM: payload~%dt exceeds upstream=%dt, trimmed %d pairs",
+                            _inbound_tokens, _upstream_limit, _pt_trimmed,
+                        )
+                        metrics.record({
+                            "type": "upstream_trim",
+                            "path": "passthrough",
+                            "original_tokens": _inbound_tokens,
+                            "upstream_limit": _upstream_limit,
+                            "pairs_trimmed": _pt_trimmed,
+                        })
 
                 logger.info(
                     "T%d PASSTHROUGH %s stream=%s state=%s | %s",
@@ -782,6 +818,29 @@ def create_app(
             except (TypeError, ValueError):
                 pass
 
+        # Upstream context enforcement — trim if enriched payload exceeds upstream limit
+        _upstream_trimmed = 0
+        _pre_trim_tokens = outbound_tokens
+        if outbound_tokens > _upstream_limit - body.get("max_tokens", 4096):
+            from .message_filter import trim_to_upstream_limit
+            enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
+            if _upstream_trimmed:
+                _outbound_json = json.dumps(enriched_body, default=str)
+                _outbound_bytes = len(_outbound_json.encode("utf-8"))
+                outbound_tokens = fmt._count(_outbound_json)
+                logger.info(
+                    "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
+                    _pre_trim_tokens, _upstream_limit, _upstream_trimmed, outbound_tokens,
+                )
+                metrics.record({
+                    "type": "upstream_trim",
+                    "path": "active",
+                    "original_tokens": _pre_trim_tokens,
+                    "upstream_limit": _upstream_limit,
+                    "pairs_trimmed": _upstream_trimmed,
+                    "final_tokens": outbound_tokens,
+                })
+
         # PROXY-025: Over-budget alert
         if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
             _excess = outbound_tokens - _effective_budget
@@ -834,12 +893,15 @@ def create_app(
         # Log request to terminal for debugging
         _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
         _flag_str = ""
+        _out_str = f"out={outbound_tokens}t"
+        if _upstream_trimmed:
+            _out_str = f"out={outbound_tokens}t TRIMMED from {_pre_trim_tokens}t"
         logger.info(
             "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d "
-            "ctx=%dt in=%dt out=%dt vc=%sms | %s",
+            "ctx=%dt in=%dt %s upstream=%dt vc=%sms | %s",
             turn, api_format, is_streaming, _tags_str, _flag_str,
             len(body.get("messages", [])), turns_dropped, turns_stubbed,
-            context_tokens, inbound_tokens, outbound_tokens,
+            context_tokens, inbound_tokens, _out_str, _upstream_limit,
             overhead_ms, user_message[:60],
         )
 

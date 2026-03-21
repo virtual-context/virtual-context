@@ -637,6 +637,17 @@ def register_dashboard_routes(
         if instance_label:
             resp["instance_label"] = instance_label
         resp["non_virtualizable_floor"] = getattr(state, "_last_non_virtualizable_floor", 0)
+
+        # Upstream context limit (resolved from last request's model)
+        from ..model_limits import resolve_upstream_limit
+        try:
+            _inst_lim = getattr(state, '_instance_upstream_limit', 0)
+            _global_lim = state.engine.config.proxy.upstream_context_limit
+            _model = getattr(state, '_last_model', '')
+            resp["upstream_context_limit"] = resolve_upstream_limit(_model, _inst_lim, _global_lim)
+        except Exception:
+            resp["upstream_context_limit"] = 200_000
+
         return JSONResponse(resp)
 
     @app.put("/dashboard/settings")
