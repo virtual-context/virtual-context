@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 
 from ..core.turn_tag_index import TurnTagIndex
 from ._envelope import _strip_envelope
@@ -560,3 +561,124 @@ def stub_compacted_messages(
     body = dict(body)
     body[_msg_key] = new_messages
     return body, len(stubs)
+
+
+# ---------------------------------------------------------------------------
+# Upstream context-window trimming
+# ---------------------------------------------------------------------------
+
+
+def _get_message_key(fmt) -> str:
+    """Return the body key holding the message array for this format."""
+    name = fmt.name
+    if name == "gemini":
+        return "contents"
+    if name == "openai_responses":
+        return "input"
+    return "messages"
+
+
+def trim_to_upstream_limit(
+    body: dict,
+    upstream_limit: int,
+    fmt,
+) -> tuple[dict, int]:
+    """Trim oldest message pairs so payload fits within upstream context window.
+
+    Uses adaptive batch removal: estimate excess fraction, drop proportional
+    batch of oldest pairs, re-estimate with empirical tokens-per-pair.
+
+    Always protects the last 2 user/assistant pairs (current + previous turn).
+    System prompt and tools are never trimmed.
+
+    Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
+    """
+    total = fmt.estimate_payload_tokens(body)
+    output_budget = body.get("max_tokens", 4096)
+    input_limit = upstream_limit - output_budget
+
+    if total <= input_limit:
+        return body, 0
+
+    msg_key = _get_message_key(fmt)
+    original_messages = body.get(msg_key, [])
+    if not original_messages:
+        return body, 0
+
+    # Identify system prefix (not trimmable)
+    system_prefix = 0
+    if original_messages and original_messages[0].get("role") in ("system",):
+        system_prefix = 1
+
+    # Identify user/assistant pairs (indices relative to original_messages)
+    pairs: list[tuple[int, int]] = []
+    i = system_prefix
+    while i < len(original_messages) - 1:
+        if original_messages[i].get("role") in ("user", "human"):
+            pairs.append((i, i + 1))
+            i += 2
+        else:
+            i += 1
+
+    if len(pairs) <= 2:
+        return body, 0
+
+    fixed = fmt._estimate_system_tokens(body) + fmt.estimate_tools_tokens(body)
+    msg_tokens = total - fixed
+    available = input_limit - fixed
+
+    if msg_tokens <= 0:
+        return body, 0
+
+    total_pairs_removed = 0
+    trimmable_count = len(pairs) - 2
+    tokens_before = total
+
+    # When available <= 0, system+tools+max_tokens already exceed the limit.
+    # Best effort: drop all trimmable pairs.
+    if available <= 0:
+        total_pairs_removed = trimmable_count
+        drop_indices: set[int] = set()
+        for pair_idx in range(total_pairs_removed):
+            u_idx, a_idx = pairs[pair_idx]
+            drop_indices.add(u_idx)
+            drop_indices.add(a_idx)
+        new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
+        trimmed_body = dict(body)
+        trimmed_body[msg_key] = new_messages
+        return trimmed_body, total_pairs_removed
+
+    for _iteration in range(3):
+        if msg_tokens <= available:
+            break
+
+        if total_pairs_removed > 0:
+            tokens_per_pair = (tokens_before - total) / total_pairs_removed
+            pairs_needed = math.ceil((msg_tokens - available) / max(tokens_per_pair, 1))
+        else:
+            excess_ratio = (msg_tokens - available) / msg_tokens
+            pairs_needed = math.ceil(excess_ratio * trimmable_count)
+
+        pairs_needed = max(1, min(pairs_needed, trimmable_count - total_pairs_removed))
+        if pairs_needed <= 0:
+            break
+
+        total_pairs_removed += pairs_needed
+
+        drop_indices: set[int] = set()
+        for pair_idx in range(total_pairs_removed):
+            u_idx, a_idx = pairs[pair_idx]
+            drop_indices.add(u_idx)
+            drop_indices.add(a_idx)
+
+        new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
+        trimmed_body = dict(body)
+        trimmed_body[msg_key] = new_messages
+
+        total = fmt.estimate_payload_tokens(trimmed_body)
+        msg_tokens = total - fixed
+
+    if total_pairs_removed == 0:
+        return body, 0
+
+    return trimmed_body, total_pairs_removed
