@@ -107,6 +107,7 @@ class EmbeddingTagGenerator:
             tags=tags,
             primary=primary,
             source="embedding",
+            query_embedding=text_embedding,
         )
 
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
