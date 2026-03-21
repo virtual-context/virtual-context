@@ -520,14 +520,16 @@ class ProxyState:
         return True
 
     def _advance_compaction_watermark(self) -> None:
-        """Advance compacted_through to cover the current conversation_history.
+        """Advance compacted_through to cover all already-processed messages.
 
-        Called after ingestion completes so that re-ingested messages (already
-        compacted in the previous session) are not re-compacted. New messages
-        appended after this point will be past the watermark and compactable.
+        Uses the larger of conversation_history length and TurnTagIndex entries * 2,
+        because at the "skip ingestion" path the conversation_history may only have
+        the current request while the TurnTagIndex has 207 restored entries.
         """
         try:
-            new_wm = len(self.conversation_history)
+            history_wm = len(self.conversation_history)
+            index_wm = len(self.engine._turn_tag_index.entries) * 2
+            new_wm = max(history_wm, index_wm)
             old_wm = int(self.engine._engine_state.compacted_through)
             if new_wm > old_wm:
                 self.engine._engine_state.compacted_through = new_wm
