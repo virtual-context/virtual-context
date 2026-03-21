@@ -54,6 +54,9 @@ class CompositeStore:
     def store_segment(self, segment: StoredSegment) -> str:
         return self._segments.store_segment(segment)
 
+    def update_segment(self, segment: StoredSegment) -> None:
+        self._segments.update_segment(segment)
+
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         return self._segments.get_segment(ref, conversation_id=conversation_id)
 
