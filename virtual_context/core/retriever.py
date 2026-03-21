@@ -149,6 +149,7 @@ class ContextRetriever:
             )
 
         retrieval_metadata: dict = {}
+        retrieval_scores: dict[str, float] = {}
 
         # Temporal detection is now advisory; time-scoped recall is tool-driven
         # via vc_remember_when rather than an automatic retriever branch.
@@ -277,6 +278,12 @@ class ContextRetriever:
         # Sort by score descending, take top max_results
         scored.sort(key=lambda x: x[0], reverse=True)
         ranked = [s for _, s in scored[:strategy.max_results]]
+
+        # Build retrieval_scores: primary_tag → max IDF score
+        for score, s in scored:
+            if s.primary_tag not in retrieval_scores or score > retrieval_scores[s.primary_tag]:
+                retrieval_scores[s.primary_tag] = score
+
         if scored:
             logger.info(
                 "Retriever: IDF ranked %d→%d results (top scores: %s)",
@@ -395,6 +402,7 @@ class ContextRetriever:
             total_tokens=total_tokens,
             facts=facts,
             retrieval_metadata=retrieval_metadata,
+            retrieval_scores=retrieval_scores,
             cost_report=RetrievalCostReport(
                 tokens_retrieved=total_tokens,
                 budget_fraction_used=total_tokens / token_budget if token_budget > 0 else 0.0,
