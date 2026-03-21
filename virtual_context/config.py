@@ -21,6 +21,7 @@ from .types import (
     ProxyConfig,
     ProxyInstanceConfig,
     RetrieverConfig,
+    ScoringConfig,
     SegmenterConfig,
     StorageConfig,
     StrategyConfig,
@@ -247,6 +248,17 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     retrieval_raw = raw.get("retrieval", {})
     strategy_raw = retrieval_raw.get("strategy_config", {})
     strategy_configs = _parse_strategy_configs(strategy_raw)
+    scoring_raw = retrieval_raw.get("scoring", {})
+    _sc_defaults = ScoringConfig()
+    scoring_config = ScoringConfig(
+        idf_weight=scoring_raw.get("idf_weight", _sc_defaults.idf_weight),
+        bm25_weight=scoring_raw.get("bm25_weight", _sc_defaults.bm25_weight),
+        embedding_weight=scoring_raw.get("embedding_weight", _sc_defaults.embedding_weight),
+        rrf_k=scoring_raw.get("rrf_k", _sc_defaults.rrf_k),
+        bm25_limit=scoring_raw.get("bm25_limit", _sc_defaults.bm25_limit),
+        embedding_limit=scoring_raw.get("embedding_limit", _sc_defaults.embedding_limit),
+        embedding_min_threshold=scoring_raw.get("embedding_min_threshold", _sc_defaults.embedding_min_threshold),
+    )
     retriever_config = RetrieverConfig(
         skip_active_tags=retrieval_raw.get("skip_active_tags", _ret_defaults.skip_active_tags),
         active_tag_lookback=retrieval_raw.get("active_tag_lookback", _ret_defaults.active_tag_lookback),
@@ -256,6 +268,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", _ret_defaults.inbound_tagger_type),
         embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
+        scoring=scoring_config,
     )
 
     # Telemetry (also accepts legacy "cost_tracking" key)

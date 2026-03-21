@@ -233,6 +233,7 @@ class TagResult:
     temporal: bool = False  # True when query references a time position ("first thing", "early on")
     related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
     fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
+    query_embedding: list[float] | None = None
 
 
 # Re-exported for existing callers; canonical definitions in patterns.py
@@ -567,6 +568,7 @@ class RetrievalResult:
     temporal: bool = False  # True when the query references a time position
     facts: list[Fact] = field(default_factory=list)  # D1: matching facts
     retrieval_scores: dict[str, float] = field(default_factory=dict)  # primary_tag → IDF score
+    query_embedding: list[float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +718,18 @@ class CompactorConfig:
 
 
 @dataclass
+class ScoringConfig:
+    """Weights and limits for 3-signal RRF retrieval scoring."""
+    idf_weight: float = 0.50
+    bm25_weight: float = 0.30
+    embedding_weight: float = 0.20
+    rrf_k: int = 60
+    bm25_limit: int = 20
+    embedding_limit: int = 20
+    embedding_min_threshold: float = 0.25
+
+
+@dataclass
 class RetrieverConfig:
     skip_active_tags: bool = True
     active_tag_lookback: int = 4
@@ -728,6 +742,7 @@ class RetrieverConfig:
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_threshold: float = 0.3
     prefetch_facts: bool = True            # filter facts by query tags instead of fetching all
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
 
 
 @dataclass
