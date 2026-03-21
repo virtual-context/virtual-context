@@ -61,3 +61,39 @@ class TestResolveUpstreamLimit:
 
     def test_empty_model_fallback(self):
         assert resolve_upstream_limit("") == 200_000
+
+
+class TestConfigParsing:
+    def test_instance_upstream_limit_parsed(self):
+        from virtual_context.config import load_config
+        import tempfile, os, yaml
+        cfg_data = {
+            "proxy": {
+                "instances": [
+                    {"port": 5757, "upstream": "https://api.anthropic.com",
+                     "upstream_context_limit": 1_000_000},
+                    {"port": 5758, "upstream": "https://api.openai.com",
+                     "upstream_context_limit": 128_000},
+                ]
+            },
+            "providers": {"default": {"provider": "ollama", "model": "test"}},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(cfg_data, f)
+            path = f.name
+        try:
+            config = load_config(path, validate=False)
+            assert config.proxy.instances[0].upstream_context_limit == 1_000_000
+            assert config.proxy.instances[1].upstream_context_limit == 128_000
+        finally:
+            os.unlink(path)
+
+    def test_global_default_is_zero(self):
+        from virtual_context.types import ProxyConfig
+        cfg = ProxyConfig()
+        assert cfg.upstream_context_limit == 0
+
+    def test_instance_default_is_zero(self):
+        from virtual_context.types import ProxyInstanceConfig
+        cfg = ProxyInstanceConfig()
+        assert cfg.upstream_context_limit == 0
