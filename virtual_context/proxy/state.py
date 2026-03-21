@@ -133,6 +133,9 @@ class ProxyState:
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
+        # Upstream context window enforcement
+        self._instance_upstream_limit: int = 0  # set by create_app from ProxyInstanceConfig
+        self._last_model: str = ""  # last model name seen (for dashboard)
 
         # Set provider on engine for persistence (only if not already restored)
         if self.provider and not engine._engine_state.provider:

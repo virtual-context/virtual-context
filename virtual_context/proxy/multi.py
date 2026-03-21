@@ -60,6 +60,7 @@ async def run_multi_instance(
             shared_engine=inst_engine,
             shared_metrics=inst_metrics,
             instance_label=inst.label,
+            instance_upstream_limit=inst.upstream_context_limit,
         )
         config = uvicorn.Config(
             app,
