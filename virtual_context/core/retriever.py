@@ -148,6 +148,8 @@ class ContextRetriever:
                 message, store_tags, context_turns=context_turns,
             )
 
+        query_embedding = getattr(tag_result, 'query_embedding', None)
+
         retrieval_metadata: dict = {}
         retrieval_scores: dict[str, float] = {}
 
@@ -236,77 +238,62 @@ class ContextRetriever:
                 ),
             )
 
-        # Determine strategy and budget
-        strategy = self.config.strategy_configs.get("default")
-        if strategy is None:
-            from ..types import StrategyConfig
-            strategy = StrategyConfig()
-
-        # Scale budget by utilization — as context fills, retrieve less
-        budget_fraction = strategy.max_budget_fraction
-        if current_utilization > 0.5:
-            scale = max(0.1, 1.0 - current_utilization)
-            budget_fraction *= scale
-
-        token_budget = int(self.config.tag_context_max_tokens * budget_fraction)
-
         # Expand query with related tags from tagger
         related_query_tags = [
             t for t in tag_result.related_tags
             if t not in set(query_tags) and t != "_general"
         ]
         expanded_tags = list(set(query_tags) | set(related_query_tags))
+        query_tag_set = set(query_tags)
 
-        # Overfetch 3x for IDF re-ranking
-        overfetch_limit = strategy.max_results * 3
-        summaries = self.store.get_summaries_by_tags(
-            tags=expanded_tags,
-            min_overlap=strategy.min_overlap,
-            limit=overfetch_limit,
+        from .retrieval_scoring import score_candidates
+
+        idf_weights = self._compute_idf_weights()
+        scores, breakdowns = score_candidates(
+            query_tags=query_tags,
+            related_tags=related_query_tags,
+            query_text=message,
+            query_embedding=query_embedding,
+            store=self.store,
+            idf_weights=idf_weights,
+            conversation_id=self._conversation_id,
+            config=self.config.scoring,
+        )
+        retrieval_scores = scores
+
+        # Fetch summaries for top-scored tags and apply token budget
+        strategy = self.config.strategy_configs.get("default")
+        if strategy is None:
+            from ..types import StrategyConfig
+            strategy = StrategyConfig()
+
+        budget_fraction = strategy.max_budget_fraction
+        if current_utilization > 0.5:
+            scale = max(0.1, 1.0 - current_utilization)
+            budget_fraction *= scale
+        token_budget = int(self.config.tag_context_max_tokens * budget_fraction)
+
+        top_tags = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)[:strategy.max_results]
+
+        # Fetch summaries for all top-scored tags at once, then rank by RRF score
+        all_summaries = self.store.get_summaries_by_tags(
+            tags=top_tags, min_overlap=1,
+            limit=strategy.max_results * 3,
             conversation_id=self._conversation_id,
         )
-        logger.info(
-            "Retriever: get_summaries_by_tags returned %d results for tags=%s (min_overlap=%d, limit=%d)",
-            len(summaries), expanded_tags, strategy.min_overlap, overfetch_limit,
-        )
+        # Sort by (RRF fused score of best matching tag, IDF query-tag overlap) descending
+        def _summary_sort_key(s: StoredSummary) -> tuple[float, float]:
+            best_rrf = max((scores.get(t, 0.0) for t in s.tags), default=0.0)
+            idf_overlap = sum(idf_weights.get(t, 1.0) for t in s.tags if t in query_tag_set)
+            return (best_rrf, idf_overlap)
+        all_summaries.sort(key=_summary_sort_key, reverse=True)
 
-        # IDF re-rank: score each result by weighted tag overlap
-        idf_weights = self._compute_idf_weights()
-        query_tag_set = set(query_tags)
-        related_tag_set = set(related_query_tags)
-
-        from .tag_scoring import compute_tag_overlap_score
-
-        scored: list[tuple[float, StoredSummary]] = []
-        for summary in summaries:
-            summary_tag_set = set(summary.tags)
-            # Primary matches: full IDF weight
-            primary_score, _ = compute_tag_overlap_score(query_tag_set, summary_tag_set, idf_weights)
-            # Related matches: 0.5x IDF weight
-            related_score, _ = compute_tag_overlap_score(related_tag_set, summary_tag_set, idf_weights)
-            scored.append((primary_score + 0.5 * related_score, summary))
-
-        # Sort by score descending, take top max_results
-        scored.sort(key=lambda x: x[0], reverse=True)
-        ranked = [s for _, s in scored[:strategy.max_results]]
-
-        # Build retrieval_scores: primary_tag → max IDF score
-        for score, s in scored:
-            if s.primary_tag not in retrieval_scores or score > retrieval_scores[s.primary_tag]:
-                retrieval_scores[s.primary_tag] = score
-
-        if scored:
-            logger.info(
-                "Retriever: IDF ranked %d→%d results (top scores: %s)",
-                len(scored), len(ranked),
-                ", ".join(f"{tag}={score:.2f}" for score, s in scored[:5] for tag in [s.primary_tag]),
-            )
-
-        # Apply token budget
         selected: list[StoredSummary] = []
         selected_refs: set[str] = set()
         total_tokens = 0
-        for summary in ranked:
+        for summary in all_summaries:
+            if summary.ref in selected_refs:
+                continue
             if total_tokens + summary.summary_tokens > token_budget:
                 logger.info(
                     "Retriever: '%s' SKIP (budget exhausted: need %dt, have %dt remaining of %dt)",
@@ -414,6 +401,7 @@ class ContextRetriever:
             facts=facts,
             retrieval_metadata=retrieval_metadata,
             retrieval_scores=retrieval_scores,
+            query_embedding=query_embedding,
             cost_report=RetrievalCostReport(
                 tokens_retrieved=total_tokens,
                 budget_fraction_used=total_tokens / token_budget if token_budget > 0 else 0.0,
