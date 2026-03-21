@@ -84,6 +84,9 @@ class ContextRetriever:
         if not tag_summaries:
             return [], 0
 
+        # Most recently updated summaries fill the budget first
+        tag_summaries.sort(key=lambda ts: ts.updated_at, reverse=True)
+
         selected: list[StoredSummary] = []
         total_tokens = 0
         for ts in tag_summaries:
