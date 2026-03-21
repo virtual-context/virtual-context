@@ -397,6 +397,7 @@ class TaggedSegment:
     end_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     turn_count: int = 0
     session_date: str = ""         # propagated from constituent turns
+    merge_ref: str = ""            # when set, update this existing segment instead of creating new
 
 
 @dataclass
