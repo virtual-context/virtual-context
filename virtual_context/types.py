@@ -308,6 +308,18 @@ class EngineState:
     last_compact_ms: float = 0.0
     last_split_result: SplitResult | None = None
 
+    def history_offset(self, history_len: int) -> int:
+        """Effective index into conversation_history for slicing past compacted messages.
+
+        After a session restart, compacted_through may exceed the current
+        history length (the history only contains messages from the current
+        session, not the prior one whose messages were already compacted).
+        In that case, return 0 — everything in the current history is new.
+        """
+        if self.compacted_through >= history_len:
+            return 0
+        return self.compacted_through
+
 
 @dataclass
 class EngineStateSnapshot:

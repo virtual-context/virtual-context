@@ -115,8 +115,9 @@ class RetrievalAssembler:
             active_tags = self._get_active_tags(conversation_history)
 
         # Compute current utilization (only count un-compacted history)
+        _offset = self._engine_state.history_offset(len(conversation_history))
         snapshot = self._monitor.build_snapshot(
-            conversation_history[self._engine_state.compacted_through:]
+            conversation_history[_offset:]
         )
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
 
@@ -162,7 +163,7 @@ class RetrievalAssembler:
                     entry.last_accessed_turn = len(self._turn_tag_index.entries)
 
         # Assemble enriched context -- only pass uncompacted messages
-        uncompacted = conversation_history[self._engine_state.compacted_through:]
+        uncompacted = conversation_history[_offset:]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=retrieval_result,
@@ -245,7 +246,8 @@ class RetrievalAssembler:
 
         ws_param, full_segments_param = self._load_working_set_segments()
 
-        uncompacted = (history or [])[self._engine_state.compacted_through:]
+        _hist = history or []
+        uncompacted = _hist[self._engine_state.history_offset(len(_hist)):]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
@@ -329,7 +331,8 @@ class RetrievalAssembler:
             return list(conversation_history)
 
         # Skip compacted messages -- their content is in stored summaries
-        older = conversation_history[watermark:-protected_count]
+        offset = self._engine_state.history_offset(total)
+        older = conversation_history[offset:-protected_count]
         recent = conversation_history[-protected_count:]
 
         current_tag_set = set(current_tags)
