@@ -138,6 +138,14 @@ class TopicSegmenter:
                 if not meaningful_prev or not meaningful_curr:
                     tag_changed = False  # merge on empty/general-only
                     overlap = 1.0
+                elif current_group[-1][1].primary == result.primary and not (parsed and parsed != group_session):
+                    # Same primary tag + same session = always group together
+                    tag_changed = False
+                    overlap = 1.0
+                    logger.info(
+                        "SEGMENT same-tag turn=%d primary=%s — forced merge (same tag, same session)",
+                        turn_offset + turn_idx, result.primary,
+                    )
                 else:
                     prev_text = " ".join(m.content for m in current_group[-1][0].messages)
                     curr_text = " ".join(m.content for m in pair.messages)
