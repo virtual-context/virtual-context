@@ -68,6 +68,12 @@ class ContextRetriever:
         except Exception:
             return []
 
+    def _fetch_facts_by_tags(self, tags: list[str], limit: int = 500) -> list:
+        try:
+            return self.store.query_facts(tags=tags, limit=limit, conversation_id=self._conversation_id)
+        except Exception:
+            return []
+
     def _load_all_tag_summaries(self, token_budget: int) -> tuple[list[StoredSummary], int]:
         """Load all tag summaries within *token_budget*.
 
@@ -372,12 +378,22 @@ class ContextRetriever:
             "query_expanded": len(related_query_tags) > 0,
         })
 
+        # Fetch facts: prefetch by tag relevance or fetch all
+        if self.config.prefetch_facts and expanded_tags:
+            facts = self._fetch_facts_by_tags(expanded_tags)
+            all_count = len(self._fetch_all_facts())
+            logger.info("Retriever: facts=%d/%d (prefetch tags=%s)", len(facts), all_count, expanded_tags)
+        else:
+            facts = self._fetch_all_facts()
+            logger.info("Retriever: facts=%d (all, prefetch=%s)", len(facts),
+                        "off" if not self.config.prefetch_facts else "no-tags")
+
         return RetrievalResult(
             tags_matched=matched_tags,
             summaries=selected,
             full_detail=full_detail,
             total_tokens=total_tokens,
-            facts=self._fetch_all_facts(),
+            facts=facts,
             retrieval_metadata=retrieval_metadata,
             cost_report=RetrievalCostReport(
                 tokens_retrieved=total_tokens,
