@@ -799,6 +799,8 @@ def create_app(
             # Non-virtualizable floor: everything in the outbound payload except VC context
             _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
             state._last_non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
+            logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
+                        state._last_non_virtualizable_floor, _vc_tokens, outbound_tokens)
             # Warn if context_window is at or below the floor
             try:
                 _cw = int(state.engine.config.monitor.context_window)
