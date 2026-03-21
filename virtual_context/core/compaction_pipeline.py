@@ -275,6 +275,16 @@ class CompactionPipeline:
 
                     for ts_i, ts in enumerate(new_tag_summaries):
                         self._store.save_tag_summary(ts, conversation_id=self._config.conversation_id)
+                        # Compute and store tag summary embedding for RRF scoring
+                        try:
+                            embed_fn = self._semantic.get_embed_fn()
+                            if embed_fn and ts.summary:
+                                emb = embed_fn([ts.summary[:2000]])[0]
+                                self._store.store_tag_summary_embedding(
+                                    ts.tag, self._config.conversation_id, emb,
+                                )
+                        except Exception as e:
+                            logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
                         if progress_callback:
                             try:
                                 progress_callback(
