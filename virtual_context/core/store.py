@@ -159,6 +159,18 @@ class ContextStore(ABC):
         """
         return {}
 
+    def load_recent_turn_messages(
+        self,
+        conversation_id: str,
+        limit: int = 100,
+    ) -> list[tuple[int, str, str]]:
+        """Load the most recent turn messages, ordered by turn_number ascending.
+
+        Returns list of (turn_number, user_content, assistant_content).
+        Used to rebuild conversation_history after restart.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Cross-cutting queries (used by consolidator, tool loop, etc.)
     # ------------------------------------------------------------------

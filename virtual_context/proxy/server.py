@@ -574,6 +574,20 @@ def create_app(
         # ---------------------------------------------------------------
         # ACTIVE path: full enrichment
         # ---------------------------------------------------------------
+
+        # One-time history rebuild from client payload if persisted history is insufficient
+        if state:
+            _expected = len(state.engine._turn_tag_index.entries)
+            _have = len(state.conversation_history) // 2
+            if _have < _expected and _expected > 0:
+                _client_pairs = _extract_history_pairs(body)
+                if _client_pairs and len(_client_pairs) // 2 > _have:
+                    state.conversation_history = list(_client_pairs)
+                    logger.info(
+                        "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d pairs)",
+                        _have, _expected, len(_client_pairs) // 2,
+                    )
+
         prepend_text = ""
         assembled = None
         wait_ms = 0.0

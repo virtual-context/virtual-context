@@ -130,6 +130,7 @@ class VirtualContextEngine:
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
+        self._restored_conversation_history: list[tuple[int, str, str]] = []  # (turn, user, asst) from store
 
         # Restore persisted state BEFORE creating delegates so they get the
         # final turn_tag_index / engine_state — no re-sync needed.
@@ -443,11 +444,19 @@ class VirtualContextEngine:
         self._engine_state.tool_tag_counter = saved.tool_tag_counter or 0
         # Stash working set entries for _apply_persisted_state_to_delegates
         self._restored_working_set = saved.working_set or []
+        # Load conversation history from turn messages for post-restart rebuild
+        try:
+            self._restored_conversation_history = self._store.load_recent_turn_messages(
+                saved.conversation_id, limit=200,
+            )
+        except Exception:
+            self._restored_conversation_history = []
         logger.info(
-            "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, split_processed=%d, working_set=%d",
+            "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, "
+            "split_processed=%d, working_set=%d, history_messages=%d",
             saved.conversation_id[:12], saved.compacted_through,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
-            len(self._restored_working_set),
+            len(self._restored_working_set), len(self._restored_conversation_history),
         )
 
         # Validate watermark against actual stored segments.

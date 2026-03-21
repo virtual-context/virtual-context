@@ -148,6 +148,19 @@ class ProxyState:
         if metrics and engine._restored_request_captures:
             metrics.restore_request_captures(engine._restored_request_captures)
             engine._restored_request_captures = []
+        # Restore conversation history from persisted turn messages
+        if engine._restored_conversation_history:
+            for _turn, _user, _asst in engine._restored_conversation_history:
+                self.conversation_history.append(
+                    Message(role="user", content=_user)
+                )
+                self.conversation_history.append(
+                    Message(role="assistant", content=_asst)
+                )
+            logger.info("Restored conversation_history: %d messages from %d turns",
+                        len(self.conversation_history),
+                        len(engine._restored_conversation_history))
+            engine._restored_conversation_history = []
 
     @property
     def turn_offset(self) -> int:
