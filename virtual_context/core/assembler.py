@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -67,7 +68,6 @@ class ContextAssembler:
         the upstream model's context limit.
         """
         core_budget = self.config.core_context_max_tokens
-        tag_budget = self.config.tag_context_max_tokens
 
         # Truncate core context to budget
         core = self._truncate_core(core_context, core_budget)
@@ -75,16 +75,6 @@ class ContextAssembler:
 
         # Context hint tokens
         hint_tokens = self.token_counter(context_hint) if context_hint else 0
-
-        # Headroom cap: if max_context_tokens is set, reduce tag budget so
-        # total VC context (core + hint + tags) fits within available headroom.
-        if max_context_tokens is not None:
-            available_for_tags = max_context_tokens - core_tokens - hint_tokens
-            tag_budget = max(0, min(tag_budget, available_for_tags))
-
-        # Build tag sections
-        tag_sections: dict[str, str] = {}
-        tag_tokens = 0
 
         # Group summaries by primary_tag
         summaries_by_tag: dict[str, list[StoredSummary]] = {}
@@ -104,42 +94,107 @@ class ContextAssembler:
             reverse=True,
         )
 
+        # --- Unified pool allocation ---
+        pool = self.config.context_injection_max_tokens
+        # Headroom cap (proxy mode)
+        if max_context_tokens is not None:
+            available = max(0, max_context_tokens - core_tokens - hint_tokens)
+            pool = min(pool, available)
+        tag_cap = self.config.tag_context_max_tokens
+        facts_cap = self.config.facts_max_tokens
+
+        # Build all tag section candidates
+        _built_sections: dict[str, str] = {}
+        _section_tokens: dict[str, int] = {}
         for tag in sorted_tags:
-            # Determine depth for this tag
             depth = DepthLevel.SUMMARY
             if working_set and tag in working_set:
                 depth = working_set[tag].depth
-
             if depth == DepthLevel.NONE:
                 logger.info("Tag '%s' SKIP (depth=NONE, hint-only)", tag)
                 continue
-
             if depth == DepthLevel.FULL and full_segments and tag in full_segments:
                 section = self._format_full_section(tag, full_segments[tag])
             elif depth == DepthLevel.SEGMENTS and full_segments and tag in full_segments:
                 section = self._format_segments_section(tag, full_segments[tag])
             else:
-                # SUMMARY depth or fallback
-                summaries = summaries_by_tag.get(tag, [])
-                if not summaries:
+                sums = summaries_by_tag.get(tag, [])
+                if not sums:
                     logger.info("Tag '%s' SKIP (no summaries available)", tag)
                     continue
-                section = self._format_tag_section(tag, summaries)
+                section = self._format_tag_section(tag, sums)
+            _built_sections[tag] = section
+            _section_tokens[tag] = self.token_counter(section)
 
-            section_tokens = self.token_counter(section)
+        # Score all candidates
+        scored_items: list[tuple[float, str, str, int]] = []  # (score, kind, key, tokens)
 
-            if tag_tokens + section_tokens > tag_budget:
-                logger.info("Tag '%s' SKIP (budget exhausted: need %dt, have %dt remaining of %dt)",
-                            tag, section_tokens, tag_budget - tag_tokens, tag_budget)
-                break
+        for tag in _built_sections:
+            score = retrieval_result.retrieval_scores.get(tag, float(self._tag_priority(tag)))
+            scored_items.append((score, "tag", tag, _section_tokens[tag]))
 
-            tag_sections[tag] = section
-            tag_tokens += section_tokens
-            logger.info("Tag '%s' INCLUDE (%s, %dt, budget %d/%dt used)",
-                        tag, depth.value if hasattr(depth, 'value') else depth,
-                        section_tokens, tag_tokens, tag_budget)
+        # Score facts
+        expanded_tags = set(
+            retrieval_result.retrieval_metadata.get("tags_queried", [])
+            + retrieval_result.retrieval_metadata.get("related_tags_used", [])
+        )
+        _fact_lines: dict[int, str] = {}
+        for i, fact in enumerate(retrieval_result.facts):
+            line = fact.format_for_prompt()
+            line_tokens = self.token_counter(line)
+            tag_overlap = len(set(fact.tags) & expanded_tags) if expanded_tags else 0
+            try:
+                age_days = (datetime.now(timezone.utc) - fact.mentioned_at).days
+            except (TypeError, AttributeError):
+                age_days = 365
+            recency = 0.1 * max(0.0, 1.0 - age_days / 365)
+            fact_score = tag_overlap + recency
+            scored_items.append((fact_score, "fact", str(i), line_tokens))
+            _fact_lines[i] = line
 
-        # Collect segment refs that were included in the assembled context
+        # Sort by score descending
+        scored_items.sort(key=lambda x: x[0], reverse=True)
+
+        # Greedy fill with soft caps
+        tag_tokens = 0
+        facts_tokens = 0
+        pool_used = 0
+        tag_sections: dict[str, str] = {}
+        selected_fact_indices: list[int] = []
+
+        for score, kind, key, tokens in scored_items:
+            if kind == "tag":
+                if tag_tokens + tokens > tag_cap:
+                    logger.info("Tag '%s' SKIP (tag cap: %d+%d > %d)", key, tag_tokens, tokens, tag_cap)
+                    continue
+                if pool_used + tokens > pool:
+                    logger.info("Tag '%s' SKIP (pool: need %dt, have %dt remaining of %dt)",
+                                key, tokens, pool - pool_used, pool)
+                    continue
+                tag_sections[key] = _built_sections[key]
+                tag_tokens += tokens
+                pool_used += tokens
+                logger.info("Pool: '%s' INCLUDE (tag, score=%.2f, %dt, pool %d/%dt)",
+                            key, score, tokens, pool_used, pool)
+            else:  # fact
+                if facts_tokens + tokens > facts_cap:
+                    continue
+                if pool_used + tokens > pool:
+                    continue
+                selected_fact_indices.append(int(key))
+                facts_tokens += tokens
+                pool_used += tokens
+
+        logger.info("Pool allocation: tags=%dt (%d sections), facts=%dt (%d facts), total=%d/%dt",
+                    tag_tokens, len(tag_sections), facts_tokens, len(selected_fact_indices),
+                    pool_used, pool)
+
+        # Format selected facts (budget already enforced by pool allocation)
+        selected_facts = [retrieval_result.facts[i] for i in sorted(selected_fact_indices)]
+        facts_text = self._format_facts(selected_facts, pool) if selected_facts else ""
+        facts_tokens_actual = self.token_counter(facts_text) if facts_text else 0
+
+        # Track presented segment refs
         presented_refs: set[str] = set()
         for s in retrieval_result.summaries:
             if s.primary_tag in tag_sections and s.ref:
@@ -151,14 +206,9 @@ class ContextAssembler:
                         if seg.ref:
                             presented_refs.add(seg.ref)
 
-        # Facts budget tier — between tags and conversation
-        facts_budget = self.config.facts_max_tokens
-        facts_text = self._format_facts(retrieval_result.facts, facts_budget)
-        facts_tokens = self.token_counter(facts_text) if facts_text else 0
-
         # Conversation budget = remaining tokens
         conversation_budget = (
-            token_budget - core_tokens - tag_tokens - hint_tokens - facts_tokens
+            token_budget - core_tokens - tag_tokens - hint_tokens - facts_tokens_actual
         )
 
         # Trim conversation to budget
@@ -217,7 +267,7 @@ class ContextAssembler:
                 if prepend_tokens <= token_budget:
                     break
 
-        total_tokens = core_tokens + tag_tokens + facts_tokens + conv_tokens
+        total_tokens = core_tokens + tag_tokens + facts_tokens_actual + conv_tokens
 
         return AssembledContext(
             core_context=core,
@@ -229,7 +279,7 @@ class ContextAssembler:
                 "core": core_tokens,
                 "context_hint": hint_tokens,
                 "tags": tag_tokens,
-                "facts": facts_tokens,
+                "facts": facts_tokens_actual,
                 "conversation": conv_tokens,
             },
             prepend_text=prepend_text,
