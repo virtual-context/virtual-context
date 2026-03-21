@@ -172,6 +172,28 @@ class ContextStore(ABC):
         return []
 
     # ------------------------------------------------------------------
+    # Tag summary search (used by RRF retrieval scoring)
+    # ------------------------------------------------------------------
+
+    def search_tag_summaries_fts(
+        self, query: str, limit: int = 20, conversation_id: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """FTS search on tag summary text. Returns [(tag, bm25_score)]."""
+        return []
+
+    def store_tag_summary_embedding(
+        self, tag: str, conversation_id: str, embedding: list[float],
+    ) -> None:
+        """Store embedding vector for a tag summary."""
+        pass
+
+    def load_tag_summary_embeddings(
+        self, conversation_id: str | None = None,
+    ) -> dict[str, list[float]]:
+        """Load all tag summary embeddings. Returns {tag: embedding_vector}."""
+        return {}
+
+    # ------------------------------------------------------------------
     # Cross-cutting queries (used by consolidator, tool loop, etc.)
     # ------------------------------------------------------------------
 

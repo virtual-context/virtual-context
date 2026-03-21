@@ -190,6 +190,24 @@ def _sanitize_fts_query(query: str) -> str:
     return f'"{escaped}"'
 
 
+def _sanitize_fts_query_terms(query: str) -> str:
+    """Sanitize user input as individual OR-joined terms for BM25 scoring.
+
+    Unlike ``_sanitize_fts_query`` (phrase match), this splits the query
+    into individual words and joins them with OR so that BM25 scoring
+    rewards documents matching *any* of the query terms.
+
+    Each term is individually quoted to prevent FTS5 operator injection.
+    Returns an empty string if no valid terms are found.
+    """
+    terms = []
+    for word in query.split():
+        cleaned = word.strip().replace('"', '""')
+        if cleaned:
+            terms.append(f'"{cleaned}"')
+    return " OR ".join(terms)
+
+
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
@@ -480,6 +498,47 @@ class SQLiteStore(ContextStore):
                 ts TEXT NOT NULL,
                 recorded_at REAL NOT NULL,
                 data_json TEXT NOT NULL
+            );
+        """)
+        # Tag summary FTS for BM25 retrieval scoring
+        try:
+            conn.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS tag_summaries_fts
+                    USING fts5(summary, content=tag_summaries, content_rowid=rowid);
+            """)
+            conn.executescript("""
+                CREATE TRIGGER IF NOT EXISTS tag_summaries_fts_ai AFTER INSERT ON tag_summaries BEGIN
+                    INSERT INTO tag_summaries_fts(rowid, summary) VALUES (new.rowid, new.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS tag_summaries_fts_ad AFTER DELETE ON tag_summaries BEGIN
+                    INSERT INTO tag_summaries_fts(tag_summaries_fts, rowid, summary)
+                        VALUES('delete', old.rowid, old.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS tag_summaries_fts_au AFTER UPDATE ON tag_summaries BEGIN
+                    INSERT INTO tag_summaries_fts(tag_summaries_fts, rowid, summary)
+                        VALUES('delete', old.rowid, old.summary);
+                    INSERT INTO tag_summaries_fts(rowid, summary) VALUES (new.rowid, new.summary);
+                END;
+            """)
+        except sqlite3.OperationalError:
+            pass
+        # Backfill tag_summaries_fts if empty but tag_summaries has data
+        try:
+            fts_count = conn.execute("SELECT count(*) FROM tag_summaries_fts").fetchone()[0]
+            if fts_count == 0:
+                ts_count = conn.execute("SELECT count(*) FROM tag_summaries").fetchone()[0]
+                if ts_count > 0:
+                    conn.execute("INSERT INTO tag_summaries_fts(tag_summaries_fts) VALUES('rebuild')")
+                    conn.commit()
+        except Exception:
+            pass
+        # Tag summary embeddings for retrieval scoring
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
+                tag TEXT NOT NULL,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                embedding_json TEXT NOT NULL,
+                PRIMARY KEY (tag, conversation_id)
             );
         """)
         conn.commit()
@@ -1966,6 +2025,66 @@ class SQLiteStore(ContextStore):
         for (data_json,) in rows:
             try:
                 result.append(json.loads(data_json))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+
+    # ------------------------------------------------------------------
+    # Tag summary search (RRF retrieval scoring)
+    # ------------------------------------------------------------------
+
+    def search_tag_summaries_fts(
+        self, query: str, limit: int = 20, conversation_id: str | None = None,
+    ) -> list[tuple[str, float]]:
+        conn = self._get_conn()
+        try:
+            sanitized = _sanitize_fts_query_terms(query)
+            if not sanitized:
+                return []
+            conv_clause = ""
+            params: list = [sanitized]
+            if conversation_id is not None:
+                conv_clause = " AND ts.conversation_id = ?"
+                params.append(conversation_id)
+            rows = conn.execute(
+                f"""SELECT ts.tag, bm25(tag_summaries_fts) as score
+                FROM tag_summaries_fts fts
+                JOIN tag_summaries ts ON ts.rowid = fts.rowid
+                WHERE tag_summaries_fts MATCH ?{conv_clause}
+                ORDER BY score
+                LIMIT ?""",
+                params + [limit],
+            ).fetchall()
+            return [(row["tag"], -row["score"]) for row in rows]
+        except Exception:
+            return []
+
+    def store_tag_summary_embedding(
+        self, tag: str, conversation_id: str, embedding: list[float],
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
+            VALUES (?, ?, ?)""",
+            (tag, conversation_id, json.dumps(embedding)),
+        )
+        conn.commit()
+
+    def load_tag_summary_embeddings(
+        self, conversation_id: str | None = None,
+    ) -> dict[str, list[float]]:
+        conn = self._get_conn()
+        if conversation_id is not None:
+            rows = conn.execute(
+                "SELECT tag, embedding_json FROM tag_summary_embeddings WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT tag, embedding_json FROM tag_summary_embeddings").fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["tag"]] = json.loads(row["embedding_json"])
             except (json.JSONDecodeError, TypeError):
                 pass
         return result

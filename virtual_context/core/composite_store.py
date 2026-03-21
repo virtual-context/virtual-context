@@ -114,6 +114,15 @@ class CompositeStore:
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         return self._segments.get_all_tag_summaries(conversation_id=conversation_id)
 
+    def search_tag_summaries_fts(self, query: str, limit: int = 20, conversation_id: str | None = None) -> list[tuple[str, float]]:
+        return self._segments.search_tag_summaries_fts(query, limit=limit, conversation_id=conversation_id)
+
+    def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float]) -> None:
+        return self._segments.store_tag_summary_embedding(tag, conversation_id, embedding)
+
+    def load_tag_summary_embeddings(self, conversation_id: str | None = None) -> dict[str, list[float]]:
+        return self._segments.load_tag_summary_embeddings(conversation_id=conversation_id)
+
     def get_segments_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 20,
         conversation_id: str | None = None,
