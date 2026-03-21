@@ -55,8 +55,6 @@ class CompactionPipeline:
     Constructor dependencies mirror what the engine previously wired internally.
     """
 
-    _COMPACT_BATCH_SIZE = 20  # segments per compaction batch -> DB after each batch
-
     def __init__(
         self,
         compactor: DomainCompactor | None,
@@ -312,14 +310,17 @@ class CompactionPipeline:
         self, segments: list, compact_messages_len: int,
         progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
-        """Compact segments in batches of ``_COMPACT_BATCH_SIZE`` and store each
-        batch immediately so results are visible in the DB incrementally."""
-        from ..types import CompactionResult, FactSignal, SegmentMetadata, StoredSegment
+        """Compact segments one at a time with inline merge check before each
+        LLM call, then store immediately so results are visible in the DB
+        incrementally."""
+        from datetime import datetime, timezone
+
+        from ..types import CompactionResult, FactSignal, Message, SegmentMetadata, StoredSegment
+        from .tag_scoring import compute_tag_overlap_score
 
         _ensure_engine_imports()
 
         all_results: list[CompactionResult] = []
-        batch_size = self._COMPACT_BATCH_SIZE
 
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
         # Build a segment-to-turn mapping using turn_offset and each segment's
@@ -339,34 +340,22 @@ class CompactionPipeline:
                 segment_signals[seg.id] = signals
             seg_cursor += seg_turn_count
 
-        for start in range(0, len(segments), batch_size):
-            batch = segments[start:start + batch_size]
-            batch_num = start // batch_size + 1
-            total_batches = (len(segments) + batch_size - 1) // batch_size
-            logger.info(
-                "Compacting batch %d/%d (%d segments)...",
-                batch_num, total_batches, len(batch),
-            )
-            # D1: Pass per-segment signals to the compactor for verification.
-            fact_signals_by_segment = {
-                seg.id: segment_signals[seg.id]
-                for seg in batch if seg.id in segment_signals
-            } or None
-            # Filter out stub segments (media placeholders, image stubs) — not worth
-            # LLM summarization. Real short messages ("im good") should be compacted
-            # normally since they belong to their parent topic segment.
-            def _is_passthrough(s):
-                text = " ".join(m.content for m in s.messages)
-                return _is_stub_content_fn(text)
-            compactable = [s for s in batch if not _is_passthrough(s)]
-            stubs = [s for s in batch if _is_passthrough(s)]
-            for seg in stubs:
-                text = " ".join(m.content for m in seg.messages).strip()
+        merge_lookback = self._config.compactor.merge_lookback
+        max_seg_tokens = self._config.compactor.max_segment_tokens
+        merge_threshold = self._config.compactor.merge_overlap_threshold
+
+        for seg_idx, seg in enumerate(segments):
+            # ----------------------------------------------------------
+            # 1. Stub check — passthrough, no LLM call
+            # ----------------------------------------------------------
+            text = " ".join(m.content for m in seg.messages)
+            if _is_stub_content_fn(text):
+                text = text.strip()
                 logger.info(
                     "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s — using raw text as summary",
                     seg.id[:8], seg.token_count, seg.primary_tag,
                 )
-                results_tiny = [CompactionResult(
+                result = CompactionResult(
                     segment_id=seg.id,
                     primary_tag=seg.primary_tag,
                     tags=seg.tags,
@@ -381,249 +370,220 @@ class CompactionPipeline:
                     ),
                     compression_ratio=1.0,
                     timestamp=seg.start_timestamp,
-                )]
-                all_results.extend(results_tiny)
-                for result in results_tiny:
-                    stored = StoredSegment(
-                        ref=result.segment_id,
-                        conversation_id=self._config.conversation_id,
-                        primary_tag=result.primary_tag,
-                        tags=result.tags,
-                        summary=result.summary,
-                        summary_tokens=result.summary_tokens,
-                        full_text=result.full_text,
-                        full_tokens=result.original_tokens,
-                        messages=result.messages,
-                        metadata=result.metadata,
-                        compaction_model="passthrough",
-                        compression_ratio=1.0,
-                        start_timestamp=result.timestamp,
-                        end_timestamp=result.timestamp,
-                    )
-                    self._store.store_segment(stored)
-            if not compactable:
-                continue
-            batch = compactable
-            results = self._compactor.compact(batch, fact_signals_by_segment=fact_signals_by_segment)
-            # Store each result — merge into existing segment if possible
-            merge_lookback = self._config.compactor.merge_lookback
-            max_seg_tokens = self._config.compactor.max_segment_tokens
-            for i, result in enumerate(results):
-                merged = False
-                if merge_lookback > 0:
-                    merged = self._try_merge_segment(result, merge_lookback, max_seg_tokens)
-
-                if not merged:
-                    stored = StoredSegment(
-                        ref=result.segment_id,
-                        conversation_id=self._config.conversation_id,
-                        primary_tag=result.primary_tag,
-                        tags=result.tags,
-                        summary=result.summary,
-                        summary_tokens=result.summary_tokens,
-                        full_text=result.full_text,
-                        full_tokens=result.original_tokens,
-                        messages=result.messages,
-                        metadata=result.metadata,
-                        compaction_model=self._compactor.model_name,
-                        compression_ratio=result.compression_ratio,
-                        start_timestamp=result.timestamp,
-                        end_timestamp=result.timestamp,
-                    )
-                    self._store.store_segment(stored)
-                    self._semantic.embed_and_store_chunks(stored)
-                    session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
-                    logger.info(
-                        "  COMPACT NEW segment %d/%d: %s (session_date=%s, %dt→%dt)",
-                        start + i + 1, len(segments), result.primary_tag,
-                        session_date or 'none',
-                        result.original_tokens, result.summary_tokens,
-                    )
-
+                )
+                stored = StoredSegment(
+                    ref=result.segment_id,
+                    conversation_id=self._config.conversation_id,
+                    primary_tag=result.primary_tag,
+                    tags=result.tags,
+                    summary=result.summary,
+                    summary_tokens=result.summary_tokens,
+                    full_text=result.full_text,
+                    full_tokens=result.original_tokens,
+                    messages=result.messages,
+                    metadata=result.metadata,
+                    compaction_model="passthrough",
+                    compression_ratio=1.0,
+                    start_timestamp=result.timestamp,
+                    end_timestamp=result.timestamp,
+                )
+                self._store.store_segment(stored)
+                all_results.append(result)
                 if progress_callback:
                     try:
                         progress_callback(
-                            len(all_results) + i + 1, len(segments), result,
+                            len(all_results), len(segments), result,
                             phase="segment_stored",
                         )
                     except Exception:
                         pass
-                # D1: Store extracted facts with provenance
-                _seg_ref = stored.ref if not merged else result.segment_id
-                if result.facts:
-                    for fact in result.facts:
-                        fact.segment_ref = _seg_ref
-                        fact.conversation_id = self._config.conversation_id
-                    self._store.store_facts(result.facts)
-                    logger.info(
-                        "  Stored %d facts for segment %s",
-                        len(result.facts), result.primary_tag,
+                continue
+
+            # ----------------------------------------------------------
+            # 2. Merge check — find best existing segment to merge with
+            # ----------------------------------------------------------
+            if merge_lookback > 0:
+                candidates = self._store.get_segments_by_tags(
+                    tags=seg.tags,
+                    min_overlap=1,
+                    limit=merge_lookback,
+                    conversation_id=self._config.conversation_id,
+                )
+                seg_tags = set(seg.tags)
+                now = datetime.now(timezone.utc)
+                best_score = 0.0
+                best_overlap = 0.0
+                best_candidate = None
+
+                for candidate in candidates:
+                    combined_tokens = candidate.full_tokens + seg.token_count
+                    if combined_tokens > max_seg_tokens:
+                        continue
+
+                    _, overlap = compute_tag_overlap_score(seg_tags, set(candidate.tags))
+                    if overlap < merge_threshold:
+                        continue
+
+                    # Recency bias: segments created today get 1.0, 60 days ago get 0.5
+                    try:
+                        age_days = (now - candidate.created_at).days
+                    except (TypeError, AttributeError):
+                        age_days = 30
+                    recency = max(0.5, 1.0 - age_days / 60)
+                    combined_score = overlap * recency
+
+                    if combined_score > best_score:
+                        best_score = combined_score
+                        best_overlap = overlap
+                        best_candidate = candidate
+
+                if best_candidate is not None:
+                    # Reconstruct Message objects from candidate's stored messages
+                    candidate_messages = [
+                        Message(role=m.get("role", "user"), content=m.get("content", ""))
+                        for m in best_candidate.messages
+                    ]
+                    # Prepend candidate messages to segment
+                    seg.messages = candidate_messages + list(seg.messages)
+                    seg.merge_ref = best_candidate.ref
+                    seg.token_count = best_candidate.full_tokens + seg.token_count
+                    seg.start_timestamp = best_candidate.start_timestamp
+                    seg.turn_count = (
+                        (best_candidate.metadata.turn_count if best_candidate.metadata else 0)
+                        + seg.turn_count
                     )
-                    _superseded_count = 0
-                    _links_count = 0
-                    if self._supersession_checker:
-                        try:
-                            if hasattr(self._supersession_checker, 'check_and_link'):
-                                _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
-                            else:
-                                _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
-                            if _superseded_count:
-                                logger.info(
-                                    "  Superseded %d facts for segment %s",
-                                    _superseded_count, result.primary_tag,
-                                )
-                            if _links_count:
-                                logger.info(
-                                    "  Linked %d facts for segment %s",
-                                    _links_count, result.primary_tag,
-                                )
-                        except Exception as e:
-                            logger.warning("Supersession/linking failed: %s", e)
-                    if progress_callback:
-                        try:
-                            progress_callback(
-                                len(all_results) + i + 1, len(segments), result,
-                                phase="facts_extracted",
-                                fact_count=len(result.facts),
-                                superseded_count=_superseded_count,
-                                links_count=_links_count,
+                    seg.tags = list(set(best_candidate.tags) | seg_tags)
+                    logger.info(
+                        "MERGE PREP: segment '%s' (%s) merging with stored %s (%s, overlap=%.2f)",
+                        seg.id[:8], seg.primary_tag,
+                        best_candidate.ref[:8], best_candidate.primary_tag,
+                        best_overlap,
+                    )
+
+            # ----------------------------------------------------------
+            # 3. Compact — single segment, one LLM call
+            # ----------------------------------------------------------
+            fact_signals_by_segment = (
+                {seg.id: segment_signals[seg.id]}
+                if seg.id in segment_signals
+                else None
+            )
+            results = self._compactor.compact([seg], fact_signals_by_segment=fact_signals_by_segment)
+            if not results:
+                continue
+            result = results[0]
+
+            # ----------------------------------------------------------
+            # 4. Store or update
+            # ----------------------------------------------------------
+            if seg.merge_ref:
+                stored = StoredSegment(
+                    ref=seg.merge_ref,
+                    conversation_id=self._config.conversation_id,
+                    primary_tag=result.primary_tag,
+                    tags=result.tags,
+                    summary=result.summary,
+                    summary_tokens=result.summary_tokens,
+                    full_text=result.full_text,
+                    full_tokens=result.original_tokens,
+                    messages=result.messages,
+                    metadata=result.metadata,
+                    compaction_model=self._compactor.model_name,
+                    compression_ratio=result.compression_ratio,
+                    start_timestamp=seg.start_timestamp,
+                    end_timestamp=result.timestamp,
+                )
+                self._store.update_segment(stored)
+                self._semantic.embed_and_store_chunks(stored)
+                result.segment_id = seg.merge_ref
+                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
+                logger.info(
+                    "  COMPACT MERGED segment %d/%d: %s (session_date=%s, %dt→%dt)",
+                    seg_idx + 1, len(segments), result.primary_tag,
+                    session_date or 'none',
+                    result.original_tokens, result.summary_tokens,
+                )
+            else:
+                stored = StoredSegment(
+                    ref=result.segment_id,
+                    conversation_id=self._config.conversation_id,
+                    primary_tag=result.primary_tag,
+                    tags=result.tags,
+                    summary=result.summary,
+                    summary_tokens=result.summary_tokens,
+                    full_text=result.full_text,
+                    full_tokens=result.original_tokens,
+                    messages=result.messages,
+                    metadata=result.metadata,
+                    compaction_model=self._compactor.model_name,
+                    compression_ratio=result.compression_ratio,
+                    start_timestamp=result.timestamp,
+                    end_timestamp=result.timestamp,
+                )
+                self._store.store_segment(stored)
+                self._semantic.embed_and_store_chunks(stored)
+                session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
+                logger.info(
+                    "  COMPACT NEW segment %d/%d: %s (session_date=%s, %dt→%dt)",
+                    seg_idx + 1, len(segments), result.primary_tag,
+                    session_date or 'none',
+                    result.original_tokens, result.summary_tokens,
+                )
+
+            all_results.append(result)
+
+            # ----------------------------------------------------------
+            # 5. Facts + progress
+            # ----------------------------------------------------------
+            if progress_callback:
+                try:
+                    progress_callback(
+                        len(all_results), len(segments), result,
+                        phase="segment_stored",
+                    )
+                except Exception:
+                    pass
+
+            _seg_ref = stored.ref
+            if result.facts:
+                for fact in result.facts:
+                    fact.segment_ref = _seg_ref
+                    fact.conversation_id = self._config.conversation_id
+                self._store.store_facts(result.facts)
+                logger.info(
+                    "  Stored %d facts for segment %s",
+                    len(result.facts), result.primary_tag,
+                )
+                _superseded_count = 0
+                _links_count = 0
+                if self._supersession_checker:
+                    try:
+                        if hasattr(self._supersession_checker, 'check_and_link'):
+                            _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
+                        else:
+                            _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
+                        if _superseded_count:
+                            logger.info(
+                                "  Superseded %d facts for segment %s",
+                                _superseded_count, result.primary_tag,
                             )
-                        except Exception:
-                            pass
-            all_results.extend(results)
+                        if _links_count:
+                            logger.info(
+                                "  Linked %d facts for segment %s",
+                                _links_count, result.primary_tag,
+                            )
+                    except Exception as e:
+                        logger.warning("Supersession/linking failed: %s", e)
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            len(all_results), len(segments), result,
+                            phase="facts_extracted",
+                            fact_count=len(result.facts),
+                            superseded_count=_superseded_count,
+                            links_count=_links_count,
+                        )
+                    except Exception:
+                        pass
 
         return all_results
-
-    def _try_merge_segment(self, result, merge_lookback: int, max_tokens: int) -> bool:
-        """Attempt to merge *result* into an existing segment by tag overlap scoring.
-
-        Uses Jaccard overlap ratio instead of primary-tag-only matching.
-        Among candidates above the threshold, picks the highest-scoring one
-        with a recency bias toward recently created segments.
-
-        Returns True if merged, False if no suitable candidate found.
-        """
-        from ..types import StoredSegment
-        from .tag_scoring import compute_tag_overlap_score
-        from datetime import datetime, timezone
-
-        result_tags = set(result.tags)
-        threshold = self._config.compactor.merge_overlap_threshold
-
-        # Fetch candidates matching ANY of the result's tags
-        candidates = self._store.get_segments_by_tags(
-            tags=result.tags,
-            min_overlap=1,
-            limit=merge_lookback,
-            conversation_id=self._config.conversation_id,
-        )
-
-        if not candidates:
-            logger.info(
-                "  MERGE skip: no existing segments for tags=%s",
-                result.tags,
-            )
-            return False
-
-        # Score and rank candidates by tag overlap * recency
-        now = datetime.now(timezone.utc)
-        scored_candidates: list[tuple[float, float, object]] = []  # (combined_score, overlap, candidate)
-        for candidate in candidates:
-            combined_tokens = candidate.full_tokens + result.original_tokens
-            if combined_tokens > max_tokens:
-                logger.info(
-                    "  MERGE skip: %s + new (%dt + %dt = %dt) exceeds max %dt",
-                    candidate.ref[:8], candidate.full_tokens,
-                    result.original_tokens, combined_tokens, max_tokens,
-                )
-                continue
-
-            _, overlap = compute_tag_overlap_score(result_tags, set(candidate.tags))
-            if overlap < threshold:
-                continue
-
-            # Recency bias: segments created today get 1.0, 30 days ago get 0.5
-            try:
-                age_days = (now - candidate.created_at).days
-            except (TypeError, AttributeError):
-                age_days = 30
-            recency = max(0.5, 1.0 - age_days / 60)
-            combined_score = overlap * recency
-            scored_candidates.append((combined_score, overlap, candidate))
-
-        if not scored_candidates:
-            best_overlaps = []
-            for c in candidates:
-                _, ov = compute_tag_overlap_score(result_tags, set(c.tags))
-                best_overlaps.append(ov)
-            best = max(best_overlaps) if best_overlaps else 0.0
-            logger.info(
-                "  MERGE skip: best overlap %.2f below threshold %.2f for tags=%s",
-                best, threshold, result.tags,
-            )
-            return False
-
-        # Pick the best candidate
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        _, best_overlap, candidate = scored_candidates[0]
-
-        # Merge: combine text and messages, re-summarize
-        combined_tokens = candidate.full_tokens + result.original_tokens
-        merged_full_text = candidate.full_text + "\n\n---\n\n" + result.full_text
-        merged_messages = list(candidate.messages) + list(result.messages)
-
-        from ..types import Message, TaggedSegment
-
-        synthetic_messages = [
-            Message(role=m.get("role", "user"), content=m.get("content", ""))
-            for m in merged_messages
-        ]
-        synthetic_seg = TaggedSegment(
-            id=candidate.ref,
-            messages=synthetic_messages,
-            tags=list(set(candidate.tags) | set(result.tags)),
-            primary_tag=result.primary_tag,
-            token_count=combined_tokens,
-            turn_count=(candidate.metadata.turn_count if candidate.metadata else 0)
-                + (result.metadata.turn_count if result.metadata else 0),
-        )
-        re_summarized = self._compactor.compact([synthetic_seg])
-        if not re_summarized:
-            logger.warning("  MERGE failed: re-summarization returned empty for %s", candidate.ref[:8])
-            return False
-        new_summary = re_summarized[0]
-
-        old_tc = candidate.metadata.turn_count if candidate.metadata else 0
-        new_tc = result.metadata.turn_count if result.metadata else 0
-        merged_tags = list(set(candidate.tags) | set(result.tags))
-
-        updated = StoredSegment(
-            ref=candidate.ref,
-            conversation_id=self._config.conversation_id,
-            primary_tag=result.primary_tag,
-            tags=merged_tags,
-            summary=new_summary.summary,
-            summary_tokens=new_summary.summary_tokens,
-            full_text=merged_full_text,
-            full_tokens=combined_tokens,
-            messages=merged_messages,
-            metadata=candidate.metadata,
-            compaction_model=self._compactor.model_name,
-            compression_ratio=new_summary.compression_ratio,
-            start_timestamp=candidate.start_timestamp,
-            end_timestamp=result.timestamp,
-        )
-        if updated.metadata:
-            updated.metadata.turn_count = old_tc + new_tc
-
-        self._store.update_segment(updated)
-        self._semantic.embed_and_store_chunks(updated)
-
-        result.segment_id = candidate.ref
-
-        logger.info(
-            "  COMPACT MERGE: appended %d turns to segment %s (tag=%s, overlap=%.2f, %dt → %dt)",
-            new_tc, candidate.ref[:8], result.primary_tag,
-            best_overlap, candidate.full_tokens, combined_tokens,
-        )
-        return True
