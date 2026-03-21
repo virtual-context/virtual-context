@@ -126,36 +126,21 @@ class CompactionPipeline:
         # Messages to compact: everything between watermark and protected zone.
         # Compact all available messages (not just the minimum) so compaction
         # fires infrequently — one big batch instead of many small ones.
-        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
+        offset = self._engine_state.history_offset(len(conversation_history))
+        compact_messages = conversation_history[offset:-protected_count]
 
         if not compact_messages:
             logger.info(
-                "Compaction skipped: no messages between watermark=%d and protected zone "
+                "Compaction skipped: no messages between offset=%d (watermark=%d) and protected zone "
                 "(history=%d msgs, protected=%d turns)",
-                self._engine_state.compacted_through, len(conversation_history), protected_turns,
+                offset, self._engine_state.compacted_through,
+                len(conversation_history), protected_turns,
             )
             return None
 
-        # Hash guard: check if first pair in compact range was already processed
-        # (defensive against watermark/index mismatch after restart)
-        if len(compact_messages) >= 2:
-            import hashlib
-            _guard_text = f"{compact_messages[0].content} {compact_messages[1].content}"
-            _guard_hash = hashlib.sha256(_guard_text.encode()).hexdigest()[:16]
-            _guard_entry = self._turn_tag_index.get_entry_by_hash(_guard_hash)
-            if _guard_entry is not None:
-                _wm_turn = self._engine_state.compacted_through // 2
-                if _guard_entry.turn_number < _wm_turn:
-                    logger.warning(
-                        "Compaction hash guard: first pair (hash=%s) matches turn %d "
-                        "which is below watermark turn %d — skipping to prevent re-compaction",
-                        _guard_hash, _guard_entry.turn_number, _wm_turn,
-                    )
-                    return None
-
         logger.info(
-            "Compacting %d messages (watermark=%d, history=%d, protected=%d turns)",
-            len(compact_messages), self._engine_state.compacted_through,
+            "Compacting %d messages (offset=%d, watermark=%d, history=%d, protected=%d turns)",
+            len(compact_messages), offset, self._engine_state.compacted_through,
             len(conversation_history), protected_turns,
         )
         report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
@@ -189,7 +174,8 @@ class CompactionPipeline:
             logger.info("Not enough messages outside protected zone to compact")
             return None
 
-        compact_messages = conversation_history[self._engine_state.compacted_through:-protected_count]
+        offset = self._engine_state.history_offset(len(conversation_history))
+        compact_messages = conversation_history[offset:-protected_count]
 
         if not compact_messages:
             return None
