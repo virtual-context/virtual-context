@@ -168,6 +168,8 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         max_concurrent_summaries=compaction.get("max_concurrent_summaries", _cmp_defaults.max_concurrent_summaries),
         overflow_buffer=compaction.get("overflow_buffer", _cmp_defaults.overflow_buffer),
         llm_token_overhead=compaction.get("llm_token_overhead", _cmp_defaults.llm_token_overhead),
+        merge_lookback=compaction.get("merge_lookback", _cmp_defaults.merge_lookback),
+        max_segment_tokens=compaction.get("max_segment_tokens", _cmp_defaults.max_segment_tokens),
     )
 
     # Summarization

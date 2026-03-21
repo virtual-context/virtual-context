@@ -709,6 +709,8 @@ class CompactorConfig:
     max_concurrent_summaries: int = 4
     overflow_buffer: float = 1.2
     llm_token_overhead: int = 2000  # extra tokens for thinking/reasoning overhead
+    merge_lookback: int = 5         # check last N segments for merge candidate
+    max_segment_tokens: int = 2000  # don't merge if combined full_text would exceed this
 
 
 @dataclass
