@@ -377,11 +377,17 @@ class ProxyState:
                     })
                     self.engine._engine_state.last_split_result = None  # consume
 
-            # Fire compaction in background if needed
+            # Fire compaction in background if needed — but NOT during ingestion.
+            # During ingestion, only a fraction of turns are tagged. Compacting now
+            # would process hundreds of untagged turns via expensive LLM fallback.
+            # Post-ingestion compaction handles this once ingestion completes.
             if signal is not None:
-                self._pending_compact = self._compact_pool.submit(
-                    self._run_compact, history, signal, turn,
-                )
+                if self._state == SessionState.INGESTING:
+                    logger.info("T%d compaction deferred (ingestion in progress)", turn)
+                else:
+                    self._pending_compact = self._compact_pool.submit(
+                        self._run_compact, history, signal, turn,
+                    )
 
         except Exception as e:
             logger.error("tag_turn error: %s", e, exc_info=True)
