@@ -538,8 +538,22 @@ class ProxyState:
         Uses the larger of conversation_history length and TurnTagIndex entries * 2,
         because at the "skip ingestion" path the conversation_history may only have
         the current request while the TurnTagIndex has 207 restored entries.
+
+        On a fresh volume (no stored segments), don't advance — everything needs
+        first-time compaction.
         """
         try:
+            # Don't advance if there are no stored segments — everything needs first-time compaction
+            existing_tags = self.engine._store.get_all_tags(
+                conversation_id=self.engine.config.conversation_id,
+            )
+            if not existing_tags:
+                logger.info(
+                    "Compaction watermark: no stored segments, keeping at %d for first-time compaction",
+                    self.engine._engine_state.compacted_through,
+                )
+                return
+
             history_wm = len(self.conversation_history)
             index_wm = len(self.engine._turn_tag_index.entries) * 2
             new_wm = max(history_wm, index_wm)
