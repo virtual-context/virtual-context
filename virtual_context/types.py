@@ -860,6 +860,39 @@ class ProxyConfig:
 
 
 @dataclass
+class PreparedPayload:
+    """Result of prepare_payload() -- enriched request body ready for forwarding or returning."""
+    body: dict
+    enriched_body: dict          # may differ from body for active path (has injected context)
+    conversation_id: str
+    is_passthrough: bool
+    turn: int
+    turn_id: str
+    api_format: str
+    user_message: str
+    is_streaming: bool
+    inbound_tokens: int
+    outbound_tokens: int
+    context_tokens: int
+    non_virtualizable_floor: int
+    upstream_limit: int
+    tags_matched: list[str]
+    budget_breakdown: dict
+    turns_dropped: int
+    turns_stubbed: int
+    wait_ms: float
+    inbound_ms: float
+    overhead_ms: float
+    assembled: object | None     # AssembledContext for active path, None for passthrough
+    pre_filter_body: dict | None  # body before filtering (for metrics capture)
+    paging_enabled: bool
+    tool_output_find_quote: bool
+    inbound_bytes: int
+    outbound_bytes: int
+    metadata: dict = field(default_factory=dict)  # catch-all for anything else
+
+
+@dataclass
 class ToolOutputRule:
     match: str = "*"
     truncate_threshold: int | None = None

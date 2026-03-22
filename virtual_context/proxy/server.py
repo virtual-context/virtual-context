@@ -36,7 +36,7 @@ from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
 )
-from ..types import Message, SplitResult  # noqa: F401 — re-exported
+from ..types import Message, PreparedPayload, SplitResult  # noqa: F401 — re-exported
 
 from .dashboard import register_dashboard_routes
 from .formats import (
@@ -107,6 +107,686 @@ def _compute_effective_budget(
     if overhead >= context_window:
         return overhead + 10_000, True
     return context_window, False
+
+
+# ---------------------------------------------------------------------------
+# prepare_payload — extracted from catch_all() for reuse by REST API
+# ---------------------------------------------------------------------------
+
+async def prepare_payload(
+    body: dict,
+    state: "ProxyState | None",
+    fmt: "PayloadFormat",
+    metrics: "ProxyMetrics",
+    *,
+    body_bytes: bytes = b"",
+    inbound_conversation_id: str = "",
+    log_dir: Path | None = None,
+    log_prefix: str = "",
+) -> PreparedPayload:
+    """Enrich a request body with virtual-context, returning a PreparedPayload.
+
+    Encapsulates the passthrough and active enrichment paths previously inline
+    in ``catch_all()``.  Pure extraction — identical behaviour to the original.
+    """
+    import asyncio
+    import time
+
+    api_format = fmt.name
+    user_message = fmt.extract_user_message(body)
+    is_streaming = body.get("stream", False)
+
+    # Resolve upstream context window limit for this model
+    from .helpers import (
+        _extract_history_pairs,
+        _inject_context,
+        _inject_vc_tools,
+    )
+    from ..model_limits import resolve_upstream_limit
+
+    _model_name = body.get("model", "")
+    if state:
+        state._last_model = _model_name
+    try:
+        _instance_limit = int(getattr(state, '_instance_upstream_limit', 0)) if state else 0
+    except (TypeError, ValueError):
+        _instance_limit = 0
+    try:
+        _global_limit = int(state.engine.config.proxy.upstream_context_limit) if state else 0
+    except (TypeError, ValueError, AttributeError):
+        _global_limit = 0
+    _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
+
+    # Ground truth: actual byte-measured inbound token count
+    _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
+    _inbound_bytes = len(body_bytes)
+    _inbound_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace")) if body_bytes else 0
+    if state:
+        state._last_payload_kb = _payload_kb
+        state._last_payload_tokens = _inbound_tokens
+        if state._initial_payload_kb is None:
+            state._initial_payload_kb = _payload_kb
+            state._initial_payload_tokens = _inbound_tokens
+
+    # ---------------------------------------------------------------
+    # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
+    # ---------------------------------------------------------------
+    if state:
+        state._total_requests += 1
+        current_state = state.session_state
+
+        # Fresh session starts ACTIVE but may need ingestion — check and
+        # redirect to passthrough path if there's history to ingest.
+        if (
+            current_state == SessionState.ACTIVE
+            and state.engine.config.conversation_id not in state._ingested_conversations
+        ):
+            history_pairs = _extract_history_pairs(body)
+            needed = len(history_pairs) // 2
+            existing = len(state.engine._turn_tag_index.entries)
+            if needed > 0 and existing < needed:
+                current_state = SessionState.PASSTHROUGH
+
+        if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
+            # Store latest body for catch-up loop
+            state._latest_body = body
+
+            # On first request: kick off non-blocking ingestion
+            if not state._history_ingested():
+                history_pairs = _extract_history_pairs(body)
+                if history_pairs:
+                    state.conversation_history = list(history_pairs)
+                await asyncio.to_thread(
+                    state.start_ingestion_if_needed, history_pairs,
+                )
+
+            state.conversation_history.append(
+                Message(role="user", content=user_message,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_content=fmt.extract_user_raw_content(body))
+            )
+
+            _conversation_id = state.engine.config.conversation_id
+            turn = len(state.engine._turn_tag_index.entries)
+            _turn_id = uuid.uuid4().hex[:12]
+
+            # Tool output interception applies even in passthrough —
+            # truncating large tool_result blocks reduces upstream tokens
+            # regardless of whether VC context is being injected.
+            if state.engine.config.tool_output.enabled:
+                from .tool_output_interceptor import ToolOutputInterceptor
+
+                _pt_interceptor = ToolOutputInterceptor(
+                    config=state.engine.config.tool_output,
+                    store=state.engine._store,
+                    conversation_id=state.engine.config.conversation_id,
+                )
+                _pt_interceptor._turn_counter = state._total_requests
+                _pre_stats = _pt_interceptor.stats.total_intercepted
+                body = _pt_interceptor.process(body, fmt)
+                _post_stats = _pt_interceptor.stats.total_intercepted
+                if _post_stats > _pre_stats:
+                    logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
+                                _post_stats - _pre_stats,
+                                _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
+
+            # Passthrough payload trimming — trim to upstream_limit * ratio
+            _pt_ratio = state.engine.config.proxy.passthrough_trim_ratio if state else 0.40
+            _pt_limit = int(_upstream_limit * _pt_ratio) if _pt_ratio > 0 else _upstream_limit
+            if _inbound_tokens > _pt_limit:
+                from .message_filter import trim_to_upstream_limit
+                body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
+                if _pt_trimmed:
+                    logger.info(
+                        "PASSTHROUGH_TRIM: payload=%dt trimmed to %dt (ratio=%.0f%%, upstream=%dt)",
+                        _inbound_tokens, _pt_limit, _pt_ratio * 100, _upstream_limit,
+                    )
+                    metrics.record({
+                        "type": "upstream_trim",
+                        "path": "passthrough",
+                        "original_tokens": _inbound_tokens,
+                        "passthrough_limit": _pt_limit,
+                        "upstream_limit": _upstream_limit,
+                        "pairs_trimmed": _pt_trimmed,
+                    })
+
+            # Compute outbound tokens (after trim + tool interception)
+            _outbound_tokens = fmt._count(json.dumps(body, default=str))
+            _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
+
+            # Record passthrough request event with accurate post-trim values
+            metrics.record({
+                "type": "request",
+                "turn": turn,
+                "turn_id": _turn_id,
+                "message_preview": user_message[:60],
+                "api_format": api_format,
+                "streaming": is_streaming,
+                "tags": [],
+                "temporal": False,
+                "context_tokens": 0,
+                "budget": {},
+                "history_len": len(state.conversation_history),
+                "compacted_through": 0,
+                "wait_ms": 0,
+                "inbound_ms": 0,
+                "overhead_ms": 0,
+                "total_turns": turn,
+                "filtered_turns": turn,
+                "inbound_tokens": _inbound_tokens,
+                "outbound_tokens": _outbound_tokens,
+                "input_tokens": _outbound_tokens,
+                "raw_input_tokens": _inbound_tokens,
+                "system_tokens": 0,
+                "turns_dropped": 0,
+                "conversation_id": _conversation_id,
+                "passthrough": True,
+            })
+
+            metrics.capture_request(
+                turn, body, api_format,
+                conversation_id=_conversation_id,
+                passthrough=True,
+                inbound_tokens=_inbound_tokens,
+                outbound_tokens=_outbound_tokens,
+                inbound_bytes=_inbound_bytes,
+                outbound_bytes=_outbound_bytes,
+                message_preview=user_message[:60],
+            )
+
+            logger.info(
+                "T%d PASSTHROUGH %s stream=%s state=%s in=%dt out=%dt | %s",
+                turn, api_format, is_streaming, current_state.value,
+                _inbound_tokens, _outbound_tokens, user_message[:60],
+            )
+
+            return PreparedPayload(
+                body=body,
+                enriched_body=body,
+                conversation_id=_conversation_id,
+                is_passthrough=True,
+                turn=turn,
+                turn_id=_turn_id,
+                api_format=api_format,
+                user_message=user_message,
+                is_streaming=is_streaming,
+                inbound_tokens=_inbound_tokens,
+                outbound_tokens=_outbound_tokens,
+                context_tokens=0,
+                non_virtualizable_floor=0,
+                upstream_limit=_upstream_limit,
+                tags_matched=[],
+                budget_breakdown={},
+                turns_dropped=0,
+                turns_stubbed=0,
+                wait_ms=0,
+                inbound_ms=0,
+                overhead_ms=0,
+                assembled=None,
+                pre_filter_body=None,
+                paging_enabled=False,
+                tool_output_find_quote=False,
+                inbound_bytes=_inbound_bytes,
+                outbound_bytes=_outbound_bytes,
+            )
+
+    # ---------------------------------------------------------------
+    # ACTIVE path: full enrichment
+    # ---------------------------------------------------------------
+
+    # One-time history rebuild from client payload if persisted history is insufficient
+    if state:
+        _expected = len(state.engine._turn_tag_index.entries)
+        _have = len(state.conversation_history) // 2
+        if _have < _expected and _expected > 0:
+            _client_pairs = _extract_history_pairs(body)
+            if _client_pairs and len(_client_pairs) // 2 > _have:
+                state.conversation_history = list(_client_pairs)
+                logger.info(
+                    "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d pairs)",
+                    _have, _expected, len(_client_pairs) // 2,
+                )
+
+    prepend_text = ""
+    assembled = None
+    wait_ms = 0.0
+    inbound_ms = 0.0
+    if state:
+        try:
+            t0 = time.monotonic()
+            await asyncio.to_thread(state.wait_for_tag)
+            # Backpressure: if last tag_turn hit the hard threshold,
+            # wait for pending compaction to finish before proceeding.
+            # Soft threshold → async (no wait), hard → block until caught up.
+            if state._last_compact_priority == "hard":
+                await asyncio.to_thread(state.wait_for_complete)
+            wait_ms = round((time.monotonic() - t0) * 1000, 1)
+
+            state.conversation_history.append(
+                Message(role="user", content=user_message,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_content=fmt.extract_user_raw_content(body))
+            )
+
+            t1 = time.monotonic()
+            assembled = await asyncio.to_thread(
+                state.engine.on_message_inbound,
+                user_message,
+                state.conversation_history,
+                body.get("model", ""),
+            )
+            inbound_ms = round((time.monotonic() - t1) * 1000, 1)
+
+            prepend_text = assembled.prepend_text
+        except Exception as e:
+            logger.error("Engine error (forwarding unmodified): %s", e)
+
+    # PROXY-025: Budget auto-promotion
+    _effective_budget = 0
+    _budget_promoted = False
+    try:
+        if state:
+            _cw = int(state.engine.config.context_window)
+            _effective_budget = _cw
+            _sys_tok = fmt._estimate_system_tokens(body)
+            _tools_tok = fmt.estimate_tools_tokens(body)
+            _effective_budget, _budget_promoted = _compute_effective_budget(
+                _cw, _sys_tok, _tools_tok,
+            )
+            if _budget_promoted:
+                logger.info(
+                    "BUDGET Client overhead (%dt) exceeds context_window (%dt). Auto-promoted to %dt.",
+                    _sys_tok + _tools_tok, _cw, _effective_budget,
+                )
+                metrics.record({
+                    "type": "budget_auto_promoted",
+                    "original": _cw,
+                    "promoted": _effective_budget,
+                    "overhead": _sys_tok + _tools_tok,
+                    "system_tokens": _sys_tok,
+                    "tools_tokens": _tools_tok,
+                })
+    except (TypeError, ValueError, AttributeError):
+        _effective_budget = 0
+
+    # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
+    _pre_filter_body = body
+
+    # PROXY-025: Stub compacted messages via hash matching
+    turns_stubbed = 0
+    try:
+        if state and int(state.engine._engine_state.compacted_through) > 0:
+            from .message_filter import stub_compacted_messages
+            body, turns_stubbed = stub_compacted_messages(
+                body,
+                state.engine._turn_tag_index,
+                state.engine._engine_state.compacted_through,
+                fmt=fmt,
+            )
+            if turns_stubbed:
+                logger.info("STUB Stubbed %d compacted turns", turns_stubbed)
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+    # Filter irrelevant history turns from the request body
+    turns_dropped = 0
+    _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
+    if _real_tags and state:
+        # Use protected_recent_turns (compaction protection) for the
+        # drop filter — NOT recent_turns_always_included (assembly).
+        # The drop filter removes raw history from the client payload;
+        # it should respect the same protection window as compaction.
+        recent = state.engine.config.monitor.protected_recent_turns
+        # PROXY-023: when paging is active, drop compacted turns so the
+        # LLM relies on VC summaries + vc_expand_topic for old content.
+        # NOTE: compacted_through is a lifetime segment index, not a
+        # body-local pair index.  The stub filter already handles
+        # replacement of compacted turns via hash matching.  Passing
+        # the raw watermark to filter_body_messages would over-drop
+        # because pair_idx (0..N) != turn_number, especially in proxy
+        # mode where the client may have done its own compaction.
+        # Disabled: the stub filter is the correct mechanism for
+        # handling compacted turns in proxy mode.
+        _ct = 0
+        _pcf_mode = getattr(
+            state.engine.config.assembler,
+            "pre_compaction_filtering", "aggressive",
+        )
+        _pre_compaction = state.engine._engine_state.compacted_through == 0
+        body, turns_dropped = _filter_body_messages(
+            body,
+            state.engine._turn_tag_index,
+            _real_tags,
+            recent_turns=recent,
+            compacted_turn=_ct,
+            fmt=fmt,
+            pre_compaction_mode=_pcf_mode,
+        )
+        if turns_dropped:
+            _phase = f"mode={_pcf_mode}, pre-compaction" if _pre_compaction else "post-compaction"
+            logger.info("FILTER Dropped %d turns (%s)", turns_dropped, _phase)
+        elif _pre_compaction and _pcf_mode == "off":
+            logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
+
+    # Tool output interception: truncate large tool_result blocks.
+    if state and state.engine.config.tool_output.enabled:
+        from .tool_output_interceptor import ToolOutputInterceptor
+
+        interceptor = ToolOutputInterceptor(
+            config=state.engine.config.tool_output,
+            store=state.engine._store,
+            conversation_id=state.engine.config.conversation_id,
+        )
+        interceptor._turn_counter = state._total_requests
+        _pre = interceptor.stats.total_intercepted
+        body = interceptor.process(body, fmt)
+        _post = interceptor.stats.total_intercepted
+        if _post > _pre:
+            logger.info("TOOL-INTERCEPT Active: truncated %d tool_result(s), saved %dB",
+                        _post - _pre,
+                        interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned)
+
+    enriched_body = _inject_context(body, prepend_text, api_format)
+
+    # Inject VC paging tools for autonomous mode (formats that support it)
+    paging_enabled = False
+    if (
+        state
+        and fmt.supports_tool_interception
+        and state.engine.config.paging.enabled
+    ):
+        _paging_mode = state.engine._retrieval._resolve_paging_mode(
+            enriched_body.get("model", ""),
+        )
+        if _paging_mode == "autonomous":
+            tool_turn_count = len(state.engine._turn_tag_index.entries)
+            try:
+                compacted_count = int(state.engine._engine_state.compacted_through)
+            except (TypeError, ValueError):
+                compacted_count = 0
+            require_tools = compacted_count > 0
+            enriched_body = _inject_vc_tools(
+                enriched_body,
+                state.engine,
+                require_tool_use=require_tools,
+            )
+            paging_enabled = True
+            _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
+            logger.info(
+                "PAGING Tools injected: %s (total tools: %d, policy=%s, turns=%d, compacted_through=%d)",
+                _vc_names, len(enriched_body.get("tools", [])),
+                "required" if require_tools else "optional",
+                tool_turn_count, compacted_count,
+            )
+        else:
+            logger.info("PAGING Mode=%s for model=%s -- tools NOT injected", _paging_mode, enriched_body.get("model", "?"))
+
+    # Inject vc_find_quote for tool output retrieval (when paging didn't already inject it)
+    tool_output_find_quote = False
+    if (
+        not paging_enabled
+        and state
+        and fmt.supports_tool_interception
+        and state.engine.config.tool_output.enabled
+    ):
+        from ..core.tool_loop import vc_tool_definitions
+        _all_defs = vc_tool_definitions()
+        _fq_def = [d for d in _all_defs if d["name"] == "vc_find_quote"]
+        if _fq_def:
+            enriched_body = fmt.inject_tools(enriched_body, _fq_def)
+            tool_output_find_quote = True
+            logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
+
+    # Track enriched payload size
+    if state:
+        state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
+
+    # 2-to-llm: enriched body sent to the LLM (after filtering + context + tools)
+    if log_dir and log_prefix:
+        try:
+            _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
+            _to_llm_log.write_text(json.dumps(enriched_body, default=str))
+        except Exception:
+            logger.debug("enriched body log write failed", exc_info=True)
+
+    is_streaming = body.get("stream", False)
+
+    # Component-level estimate (diagnostic breakdown, not source of truth)
+    system_tokens = fmt._estimate_system_tokens(body)
+
+    # Ground truth: actual byte-measured outbound token count
+    _outbound_json = json.dumps(enriched_body, default=str)
+    _outbound_bytes = len(_outbound_json.encode("utf-8"))
+    outbound_tokens = fmt._count(_outbound_json)
+
+    # Ground truth: inbound tokens (what the client sent us, measured above)
+    inbound_tokens = _inbound_tokens
+
+    # Legacy aliases for downstream consumers
+    input_tokens = outbound_tokens
+    raw_input_tokens = inbound_tokens
+
+    # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
+    _non_virtualizable_floor = 0
+    if state:
+        state._last_enriched_payload_tokens = outbound_tokens
+        # Non-virtualizable floor: everything in the outbound payload except VC context
+        _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
+        state._last_non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
+        _non_virtualizable_floor = state._last_non_virtualizable_floor
+        logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
+                    state._last_non_virtualizable_floor, _vc_tokens, outbound_tokens)
+        # Warn if context_window is at or below the floor
+        try:
+            _cw = int(state.engine.config.monitor.context_window)
+            if _cw <= state._last_non_virtualizable_floor * 1.1:
+                logger.warning(
+                    "NON_VIRTUALIZABLE floor=%dt exceeds context_window=%dt — "
+                    "VC context cannot be effectively injected",
+                    state._last_non_virtualizable_floor, _cw,
+                )
+                metrics.record({
+                    "type": "non_virtualizable_warning",
+                    "floor": state._last_non_virtualizable_floor,
+                    "context_window": _cw,
+                    "outbound_tokens": outbound_tokens,
+                    "vc_tokens": _vc_tokens,
+                })
+        except (TypeError, ValueError):
+            pass
+
+    # Upstream context enforcement — trim if enriched payload exceeds upstream limit
+    _upstream_trimmed = 0
+    _pre_trim_tokens = outbound_tokens
+    if outbound_tokens > _upstream_limit - body.get("max_tokens", 4096):
+        from .message_filter import trim_to_upstream_limit
+        enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
+        if _upstream_trimmed:
+            _outbound_json = json.dumps(enriched_body, default=str)
+            _outbound_bytes = len(_outbound_json.encode("utf-8"))
+            outbound_tokens = fmt._count(_outbound_json)
+            logger.info(
+                "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
+                _pre_trim_tokens, _upstream_limit, _upstream_trimmed, outbound_tokens,
+            )
+            metrics.record({
+                "type": "upstream_trim",
+                "path": "active",
+                "original_tokens": _pre_trim_tokens,
+                "upstream_limit": _upstream_limit,
+                "pairs_trimmed": _upstream_trimmed,
+                "final_tokens": outbound_tokens,
+            })
+
+    # PROXY-025: Over-budget alert
+    if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
+        _excess = outbound_tokens - _effective_budget
+        logger.info(
+            "BUDGET Payload %dt exceeds budget %dt by %dt. Uncompacted turns pending compaction.",
+            outbound_tokens, _effective_budget, _excess,
+        )
+        metrics.record({
+            "type": "budget_exceeded",
+            "total": outbound_tokens,
+            "budget": _effective_budget,
+            "excess": _excess,
+        })
+
+    # Record request event
+    turn = len(state.engine._turn_tag_index.entries) if state else 0
+    _turn_id = uuid.uuid4().hex[:12]
+    context_tokens = fmt._count(prepend_text) if prepend_text else 0
+    total_turns = turn
+    overhead_ms = round(wait_ms + inbound_ms, 1)
+    _conversation_id = state.engine.config.conversation_id if state else ""
+    metrics.record({
+        "type": "request",
+        "turn": turn,
+        "turn_id": _turn_id,
+        "model": body.get("model", ""),
+        "message_preview": user_message[:60],
+        "api_format": api_format,
+        "streaming": is_streaming,
+        "tags": assembled.matched_tags if assembled else [],
+        "context_tokens": context_tokens,
+        "budget": assembled.budget_breakdown if assembled else {},
+        "history_len": len(state.conversation_history) if state else 0,
+        "compacted_through": state.engine._engine_state.compacted_through if state else 0,
+        "wait_ms": wait_ms,
+        "inbound_ms": inbound_ms,
+        "overhead_ms": overhead_ms,
+        "total_turns": total_turns,
+        "filtered_turns": total_turns - turns_dropped,
+        "inbound_tokens": inbound_tokens,
+        "outbound_tokens": outbound_tokens,
+        "input_tokens": input_tokens,       # legacy alias for outbound
+        "raw_input_tokens": raw_input_tokens,  # legacy alias for inbound
+        "system_tokens": system_tokens,      # component estimate
+        "turns_dropped": turns_dropped,
+        "turns_stubbed": turns_stubbed,
+        "conversation_id": _conversation_id,
+    })
+
+    # Persist request context for dashboard recall page
+    if state and assembled:
+        try:
+            _retrieval_meta = getattr(assembled, 'retrieval_metadata', {}) or {}
+            _budget = assembled.budget_breakdown or {}
+            _retrieval_scores = getattr(assembled, 'retrieval_scores', {}) or {}
+            # Build segments_injected: [{ref, tag, tokens, score}]
+            _seg_injected = []
+            if hasattr(assembled, 'presented_segment_refs') and assembled.presented_segment_refs:
+                # Map refs to tags from the retrieval result summaries
+                _ref_to_summary = {}
+                if hasattr(assembled, '_retrieval_summaries'):
+                    for s in assembled._retrieval_summaries:
+                        _ref_to_summary[s.ref] = s
+                for ref in assembled.presented_segment_refs:
+                    _seg_injected.append({
+                        "ref": ref,
+                        "tag": _ref_to_summary.get(ref, type('', (), {"primary_tag": ""})()).primary_tag if ref in _ref_to_summary else "",
+                        "tokens": 0,
+                        "score": 0.0,
+                    })
+            # Simpler approach: use tag_sections which we know
+            if not _seg_injected and hasattr(assembled, 'tag_sections') and assembled.tag_sections:
+                for tag in assembled.tag_sections:
+                    _seg_injected.append({
+                        "ref": "",
+                        "tag": tag,
+                        "tokens": len(assembled.tag_sections[tag]) // 4,
+                        "score": _retrieval_scores.get(tag, 0.0) if isinstance(_retrieval_scores, dict) else 0.0,
+                    })
+            # Build facts_injected: [fact_id, ...]
+            _facts_injected = []
+            if hasattr(assembled, 'facts_text') and assembled.facts_text:
+                # Extract fact IDs from the facts — they're in the retrieval result
+                pass  # fact IDs not directly available from assembled context
+            state.engine._store.save_request_context({
+                "conversation_id": _conversation_id,
+                "request_turn": turn,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user_message": user_message[:500],
+                "inbound_tags": assembled.matched_tags or [],
+                "retrieval_method": _retrieval_meta.get("strategy", "rrf"),
+                "candidates_found": _retrieval_meta.get("candidates_found", 0),
+                "candidates_selected": _retrieval_meta.get("summaries_returned", 0),
+                "segments_injected": _seg_injected,
+                "facts_injected": _facts_injected,
+                "facts_count": _budget.get("facts", 0),
+                "facts_tags": _retrieval_meta.get("tags_queried", []),
+                "pool_used": _budget.get("tags", 0) + _budget.get("facts", 0),
+                "pool_budget": state.engine.config.assembler.context_injection_max_tokens,
+                "total_context_tokens": context_tokens,
+                "non_virtualizable_floor": state._last_non_virtualizable_floor,
+                "tool_call_count": 0,
+            })
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).debug("Failed to save request context: %s", e)
+
+    # Log request to terminal for debugging
+    _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
+    _flag_str = ""
+    _out_str = f"out={outbound_tokens}t"
+    if _upstream_trimmed:
+        _out_str = f"out={outbound_tokens}t TRIMMED from {_pre_trim_tokens}t"
+    logger.info(
+        "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d "
+        "ctx=%dt in=%dt %s upstream=%dt vc=%sms | %s",
+        turn, api_format, is_streaming, _tags_str, _flag_str,
+        len(body.get("messages", [])), turns_dropped, turns_stubbed,
+        context_tokens, inbound_tokens, _out_str, _upstream_limit,
+        overhead_ms, user_message[:60],
+    )
+
+    # Capture pre-filter request body for dashboard inspection
+    metrics.capture_request(
+        turn, _pre_filter_body, api_format,
+        inbound_tags=assembled.matched_tags if assembled else [],
+        conversation_id=_conversation_id,
+        inbound_tokens=inbound_tokens,
+        outbound_tokens=outbound_tokens,
+        inbound_bytes=_inbound_bytes,
+        outbound_bytes=_outbound_bytes,
+        context_tokens=context_tokens,
+        overhead_ms=overhead_ms,
+        turns_dropped=turns_dropped,
+        turns_stubbed=turns_stubbed,
+        message_preview=user_message[:60],
+    )
+    # Capture enriched body (what we actually send to the LLM)
+    metrics.capture_enriched(turn, enriched_body)
+
+    return PreparedPayload(
+        body=body,
+        enriched_body=enriched_body,
+        conversation_id=_conversation_id,
+        is_passthrough=False,
+        turn=turn,
+        turn_id=_turn_id,
+        api_format=api_format,
+        user_message=user_message,
+        is_streaming=is_streaming,
+        inbound_tokens=inbound_tokens,
+        outbound_tokens=outbound_tokens,
+        context_tokens=context_tokens,
+        non_virtualizable_floor=_non_virtualizable_floor,
+        upstream_limit=_upstream_limit,
+        tags_matched=assembled.matched_tags if assembled else [],
+        budget_breakdown=assembled.budget_breakdown if assembled else {},
+        turns_dropped=turns_dropped,
+        turns_stubbed=turns_stubbed,
+        wait_ms=wait_ms,
+        inbound_ms=inbound_ms,
+        overhead_ms=overhead_ms,
+        assembled=assembled,
+        pre_filter_body=_pre_filter_body,
+        paging_enabled=paging_enabled,
+        tool_output_find_quote=tool_output_find_quote,
+        inbound_bytes=_inbound_bytes,
+        outbound_bytes=_outbound_bytes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,33 +1062,8 @@ def create_app(
         user_message = fmt.extract_user_message(body)
         is_streaming = body.get("stream", False)
 
-        # Resolve upstream context window limit for this model
-        from ..model_limits import resolve_upstream_limit
-        _model_name = body.get("model", "")
-        if state:
-            state._last_model = _model_name
-        try:
-            _instance_limit = int(getattr(state, '_instance_upstream_limit', 0)) if state else 0
-        except (TypeError, ValueError):
-            _instance_limit = 0
-        try:
-            _global_limit = int(state.engine.config.proxy.upstream_context_limit) if state else 0
-        except (TypeError, ValueError, AttributeError):
-            _global_limit = 0
-        _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
-
-        # Ground truth: actual byte-measured inbound token count
-        _payload_kb = round(len(body_bytes) / 1024, 1)
-        _inbound_bytes = len(body_bytes)
-        _inbound_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace"))
-        if state:
-            state._last_payload_kb = _payload_kb
-            state._last_payload_tokens = _inbound_tokens
-            if state._initial_payload_kb is None:
-                state._initial_payload_kb = _payload_kb
-                state._initial_payload_tokens = _inbound_tokens
-
         import datetime as _dt
+        _payload_kb = round(len(body_bytes) / 1024, 1)
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         _msg_count = len(fmt.get_messages(body))
         _sid = state.engine.config.conversation_id[:12] if state else "none"
@@ -438,601 +1093,59 @@ def create_app(
                 )
 
         # ---------------------------------------------------------------
-        # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
+        # Enrichment: passthrough or active path via prepare_payload()
         # ---------------------------------------------------------------
-        if state:
-            state._total_requests += 1
-            current_state = state.session_state
+        result = await prepare_payload(
+            body, state, fmt, metrics,
+            body_bytes=body_bytes,
+            inbound_conversation_id=inbound_conversation_id,
+            log_dir=_effective_log_dir,
+            log_prefix=_log_prefix,
+        )
 
-            # Fresh session starts ACTIVE but may need ingestion — check and
-            # redirect to passthrough path if there's history to ingest.
-            if (
-                current_state == SessionState.ACTIVE
-                and state.engine.config.conversation_id not in state._ingested_conversations
-            ):
-                history_pairs = _extract_history_pairs(body)
-                needed = len(history_pairs) // 2
-                existing = len(state.engine._turn_tag_index.entries)
-                if needed > 0 and existing < needed:
-                    current_state = SessionState.PASSTHROUGH
-
-            if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
-                # Store latest body for catch-up loop
-                state._latest_body = body
-
-                # On first request: kick off non-blocking ingestion
-                if not state._history_ingested():
-                    history_pairs = _extract_history_pairs(body)
-                    if history_pairs:
-                        state.conversation_history = list(history_pairs)
-                    await asyncio.to_thread(
-                        state.start_ingestion_if_needed, history_pairs,
-                    )
-
-                state.conversation_history.append(
-                    Message(role="user", content=user_message,
-                            timestamp=datetime.now(timezone.utc),
-                            raw_content=fmt.extract_user_raw_content(body))
-                )
-
-                _conversation_id = state.engine.config.conversation_id
-                turn = len(state.engine._turn_tag_index.entries)
-                _turn_id = uuid.uuid4().hex[:12]
-
-                # Tool output interception applies even in passthrough —
-                # truncating large tool_result blocks reduces upstream tokens
-                # regardless of whether VC context is being injected.
-                if state.engine.config.tool_output.enabled:
-                    from .tool_output_interceptor import ToolOutputInterceptor
-
-                    _pt_interceptor = ToolOutputInterceptor(
-                        config=state.engine.config.tool_output,
-                        store=state.engine._store,
-                        conversation_id=state.engine.config.conversation_id,
-                    )
-                    _pt_interceptor._turn_counter = state._total_requests
-                    _pre_stats = _pt_interceptor.stats.total_intercepted
-                    body = _pt_interceptor.process(body, fmt)
-                    _post_stats = _pt_interceptor.stats.total_intercepted
-                    if _post_stats > _pre_stats:
-                        logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
-                                    _post_stats - _pre_stats,
-                                    _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
-
-                # Passthrough payload trimming — trim to upstream_limit * ratio
-                _pt_ratio = state.engine.config.proxy.passthrough_trim_ratio if state else 0.40
-                _pt_limit = int(_upstream_limit * _pt_ratio) if _pt_ratio > 0 else _upstream_limit
-                if _inbound_tokens > _pt_limit:
-                    from .message_filter import trim_to_upstream_limit
-                    body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
-                    if _pt_trimmed:
-                        logger.info(
-                            "PASSTHROUGH_TRIM: payload=%dt trimmed to %dt (ratio=%.0f%%, upstream=%dt)",
-                            _inbound_tokens, _pt_limit, _pt_ratio * 100, _upstream_limit,
-                        )
-                        metrics.record({
-                            "type": "upstream_trim",
-                            "path": "passthrough",
-                            "original_tokens": _inbound_tokens,
-                            "passthrough_limit": _pt_limit,
-                            "upstream_limit": _upstream_limit,
-                            "pairs_trimmed": _pt_trimmed,
-                        })
-
-                # Compute outbound tokens (after trim + tool interception)
-                _outbound_tokens = fmt._count(json.dumps(body, default=str))
-                _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
-
-                # Record passthrough request event with accurate post-trim values
-                metrics.record({
-                    "type": "request",
-                    "turn": turn,
-                    "turn_id": _turn_id,
-                    "message_preview": user_message[:60],
-                    "api_format": api_format,
-                    "streaming": is_streaming,
-                    "tags": [],
-                    "temporal": False,
-                    "context_tokens": 0,
-                    "budget": {},
-                    "history_len": len(state.conversation_history),
-                    "compacted_through": 0,
-                    "wait_ms": 0,
-                    "inbound_ms": 0,
-                    "overhead_ms": 0,
-                    "total_turns": turn,
-                    "filtered_turns": turn,
-                    "inbound_tokens": _inbound_tokens,
-                    "outbound_tokens": _outbound_tokens,
-                    "input_tokens": _outbound_tokens,
-                    "raw_input_tokens": _inbound_tokens,
-                    "system_tokens": 0,
-                    "turns_dropped": 0,
-                    "conversation_id": _conversation_id,
-                    "passthrough": True,
-                })
-
-                metrics.capture_request(
-                    turn, body, api_format,
-                    conversation_id=_conversation_id,
-                    passthrough=True,
-                    inbound_tokens=_inbound_tokens,
-                    outbound_tokens=_outbound_tokens,
-                    inbound_bytes=_inbound_bytes,
-                    outbound_bytes=_outbound_bytes,
-                    message_preview=user_message[:60],
-                )
-
-                logger.info(
-                    "T%d PASSTHROUGH %s stream=%s state=%s in=%dt out=%dt | %s",
-                    turn, api_format, is_streaming, current_state.value,
-                    _inbound_tokens, _outbound_tokens, user_message[:60],
-                )
-
-                if is_streaming:
-                    return await _handle_streaming(
-                        client, url, fwd_headers, body, api_format, state,
-                        metrics=metrics, turn=turn, turn_id=_turn_id,
-                        conversation_id=_conversation_id,
-                        passthrough=True, response_log_path=_response_log_path,
-                        session_log_path=_session_log_path,
-                        request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
-                    )
-                else:
-                    return await _handle_non_streaming(
-                        client, url, fwd_headers, body, api_format, state,
-                        metrics=metrics, turn=turn, turn_id=_turn_id,
-                        conversation_id=_conversation_id,
-                        passthrough=True, response_log_path=_response_log_path,
-                        session_log_path=_session_log_path,
-                        request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
-                    )
-
-        # ---------------------------------------------------------------
-        # ACTIVE path: full enrichment
-        # ---------------------------------------------------------------
-
-        # One-time history rebuild from client payload if persisted history is insufficient
-        if state:
-            _expected = len(state.engine._turn_tag_index.entries)
-            _have = len(state.conversation_history) // 2
-            if _have < _expected and _expected > 0:
-                _client_pairs = _extract_history_pairs(body)
-                if _client_pairs and len(_client_pairs) // 2 > _have:
-                    state.conversation_history = list(_client_pairs)
-                    logger.info(
-                        "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d pairs)",
-                        _have, _expected, len(_client_pairs) // 2,
-                    )
-
-        prepend_text = ""
-        assembled = None
-        wait_ms = 0.0
-        inbound_ms = 0.0
-        if state:
-            try:
-                t0 = time.monotonic()
-                await asyncio.to_thread(state.wait_for_tag)
-                # Backpressure: if last tag_turn hit the hard threshold,
-                # wait for pending compaction to finish before proceeding.
-                # Soft threshold → async (no wait), hard → block until caught up.
-                if state._last_compact_priority == "hard":
-                    await asyncio.to_thread(state.wait_for_complete)
-                wait_ms = round((time.monotonic() - t0) * 1000, 1)
-
-                state.conversation_history.append(
-                    Message(role="user", content=user_message,
-                            timestamp=datetime.now(timezone.utc),
-                            raw_content=fmt.extract_user_raw_content(body))
-                )
-
-                t1 = time.monotonic()
-                assembled = await asyncio.to_thread(
-                    state.engine.on_message_inbound,
-                    user_message,
-                    state.conversation_history,
-                    body.get("model", ""),
-                )
-                inbound_ms = round((time.monotonic() - t1) * 1000, 1)
-
-                prepend_text = assembled.prepend_text
-            except Exception as e:
-                logger.error("Engine error (forwarding unmodified): %s", e)
-
-        # PROXY-025: Budget auto-promotion
-        _effective_budget = 0
-        _budget_promoted = False
-        try:
-            if state:
-                _cw = int(state.engine.config.context_window)
-                _effective_budget = _cw
-                _sys_tok = fmt._estimate_system_tokens(body)
-                _tools_tok = fmt.estimate_tools_tokens(body)
-                _effective_budget, _budget_promoted = _compute_effective_budget(
-                    _cw, _sys_tok, _tools_tok,
-                )
-                if _budget_promoted:
-                    logger.info(
-                        "BUDGET Client overhead (%dt) exceeds context_window (%dt). Auto-promoted to %dt.",
-                        _sys_tok + _tools_tok, _cw, _effective_budget,
-                    )
-                    metrics.record({
-                        "type": "budget_auto_promoted",
-                        "original": _cw,
-                        "promoted": _effective_budget,
-                        "overhead": _sys_tok + _tools_tok,
-                        "system_tokens": _sys_tok,
-                        "tools_tokens": _tools_tok,
-                    })
-        except (TypeError, ValueError, AttributeError):
-            _effective_budget = 0
-
-        # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
-        _pre_filter_body = body
-
-        # PROXY-025: Stub compacted messages via hash matching
-        turns_stubbed = 0
-        try:
-            if state and int(state.engine._engine_state.compacted_through) > 0:
-                from .message_filter import stub_compacted_messages
-                body, turns_stubbed = stub_compacted_messages(
-                    body,
-                    state.engine._turn_tag_index,
-                    state.engine._engine_state.compacted_through,
-                    fmt=fmt,
-                )
-                if turns_stubbed:
-                    logger.info("STUB Stubbed %d compacted turns", turns_stubbed)
-        except (TypeError, ValueError, AttributeError):
-            pass
-
-        # Filter irrelevant history turns from the request body
-        turns_dropped = 0
-        _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
-        if _real_tags and state:
-            # Use protected_recent_turns (compaction protection) for the
-            # drop filter — NOT recent_turns_always_included (assembly).
-            # The drop filter removes raw history from the client payload;
-            # it should respect the same protection window as compaction.
-            recent = state.engine.config.monitor.protected_recent_turns
-            # PROXY-023: when paging is active, drop compacted turns so the
-            # LLM relies on VC summaries + vc_expand_topic for old content.
-            # NOTE: compacted_through is a lifetime segment index, not a
-            # body-local pair index.  The stub filter already handles
-            # replacement of compacted turns via hash matching.  Passing
-            # the raw watermark to filter_body_messages would over-drop
-            # because pair_idx (0..N) != turn_number, especially in proxy
-            # mode where the client may have done its own compaction.
-            # Disabled: the stub filter is the correct mechanism for
-            # handling compacted turns in proxy mode.
-            _ct = 0
-            _pcf_mode = getattr(
-                state.engine.config.assembler,
-                "pre_compaction_filtering", "aggressive",
-            )
-            _pre_compaction = state.engine._engine_state.compacted_through == 0
-            body, turns_dropped = _filter_body_messages(
-                body,
-                state.engine._turn_tag_index,
-                _real_tags,
-                recent_turns=recent,
-                compacted_turn=_ct,
-                fmt=fmt,
-                pre_compaction_mode=_pcf_mode,
-            )
-            if turns_dropped:
-                _phase = f"mode={_pcf_mode}, pre-compaction" if _pre_compaction else "post-compaction"
-                logger.info("FILTER Dropped %d turns (%s)", turns_dropped, _phase)
-            elif _pre_compaction and _pcf_mode == "off":
-                logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
-
-        # Tool output interception: truncate large tool_result blocks.
-        if state and state.engine.config.tool_output.enabled:
-            from .tool_output_interceptor import ToolOutputInterceptor
-
-            interceptor = ToolOutputInterceptor(
-                config=state.engine.config.tool_output,
-                store=state.engine._store,
-                conversation_id=state.engine.config.conversation_id,
-            )
-            interceptor._turn_counter = state._total_requests
-            _pre = interceptor.stats.total_intercepted
-            body = interceptor.process(body, fmt)
-            _post = interceptor.stats.total_intercepted
-            if _post > _pre:
-                logger.info("TOOL-INTERCEPT Active: truncated %d tool_result(s), saved %dB",
-                            _post - _pre,
-                            interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned)
-
-        enriched_body = _inject_context(body, prepend_text, api_format)
-
-        # Inject VC paging tools for autonomous mode (formats that support it)
-        paging_enabled = False
-        if (
-            state
-            and fmt.supports_tool_interception
-            and state.engine.config.paging.enabled
-        ):
-            _paging_mode = state.engine._retrieval._resolve_paging_mode(
-                enriched_body.get("model", ""),
-            )
-            if _paging_mode == "autonomous":
-                tool_turn_count = len(state.engine._turn_tag_index.entries)
-                try:
-                    compacted_count = int(state.engine._engine_state.compacted_through)
-                except (TypeError, ValueError):
-                    compacted_count = 0
-                require_tools = compacted_count > 0
-                enriched_body = _inject_vc_tools(
-                    enriched_body,
-                    state.engine,
-                    require_tool_use=require_tools,
-                )
-                paging_enabled = True
-                _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
-                logger.info(
-                    "PAGING Tools injected: %s (total tools: %d, policy=%s, turns=%d, compacted_through=%d)",
-                    _vc_names, len(enriched_body.get("tools", [])),
-                    "required" if require_tools else "optional",
-                    tool_turn_count, compacted_count,
+        if result.is_passthrough:
+            if result.is_streaming:
+                return await _handle_streaming(
+                    client, url, fwd_headers, result.body, result.api_format, state,
+                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    conversation_id=result.conversation_id,
+                    passthrough=True, response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
+                    request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                 )
             else:
-                logger.info("PAGING Mode=%s for model=%s -- tools NOT injected", _paging_mode, enriched_body.get("model", "?"))
-
-        # Inject vc_find_quote for tool output retrieval (when paging didn't already inject it)
-        tool_output_find_quote = False
-        if (
-            not paging_enabled
-            and state
-            and fmt.supports_tool_interception
-            and state.engine.config.tool_output.enabled
-        ):
-            from ..core.tool_loop import vc_tool_definitions
-            _all_defs = vc_tool_definitions()
-            _fq_def = [d for d in _all_defs if d["name"] == "vc_find_quote"]
-            if _fq_def:
-                enriched_body = fmt.inject_tools(enriched_body, _fq_def)
-                tool_output_find_quote = True
-                logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
-
-        # Track enriched payload size
-        if state:
-            state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
-
-        # 2-to-llm: enriched body sent to the LLM (after filtering + context + tools)
-        if _effective_log_dir and _log_prefix:
-            try:
-                _to_llm_log = _effective_log_dir / f"{_log_prefix}.2-to-llm.json"
-                _to_llm_log.write_text(json.dumps(enriched_body, default=str))
-            except Exception:
-                logger.debug("enriched body log write failed", exc_info=True)
-
-        is_streaming = body.get("stream", False)
-
-        # Component-level estimate (diagnostic breakdown, not source of truth)
-        system_tokens = fmt._estimate_system_tokens(body)
-
-        # Ground truth: actual byte-measured outbound token count
-        _outbound_json = json.dumps(enriched_body, default=str)
-        _outbound_bytes = len(_outbound_json.encode("utf-8"))
-        outbound_tokens = fmt._count(_outbound_json)
-
-        # Ground truth: inbound tokens (what the client sent us, measured above)
-        inbound_tokens = _inbound_tokens
-
-        # Legacy aliases for downstream consumers
-        input_tokens = outbound_tokens
-        raw_input_tokens = inbound_tokens
-
-        # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
-        if state:
-            state._last_enriched_payload_tokens = outbound_tokens
-            # Non-virtualizable floor: everything in the outbound payload except VC context
-            _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
-            state._last_non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
-            logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
-                        state._last_non_virtualizable_floor, _vc_tokens, outbound_tokens)
-            # Warn if context_window is at or below the floor
-            try:
-                _cw = int(state.engine.config.monitor.context_window)
-                if _cw <= state._last_non_virtualizable_floor * 1.1:
-                    logger.warning(
-                        "NON_VIRTUALIZABLE floor=%dt exceeds context_window=%dt — "
-                        "VC context cannot be effectively injected",
-                        state._last_non_virtualizable_floor, _cw,
-                    )
-                    metrics.record({
-                        "type": "non_virtualizable_warning",
-                        "floor": state._last_non_virtualizable_floor,
-                        "context_window": _cw,
-                        "outbound_tokens": outbound_tokens,
-                        "vc_tokens": _vc_tokens,
-                    })
-            except (TypeError, ValueError):
-                pass
-
-        # Upstream context enforcement — trim if enriched payload exceeds upstream limit
-        _upstream_trimmed = 0
-        _pre_trim_tokens = outbound_tokens
-        if outbound_tokens > _upstream_limit - body.get("max_tokens", 4096):
-            from .message_filter import trim_to_upstream_limit
-            enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
-            if _upstream_trimmed:
-                _outbound_json = json.dumps(enriched_body, default=str)
-                _outbound_bytes = len(_outbound_json.encode("utf-8"))
-                outbound_tokens = fmt._count(_outbound_json)
-                logger.info(
-                    "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
-                    _pre_trim_tokens, _upstream_limit, _upstream_trimmed, outbound_tokens,
+                return await _handle_non_streaming(
+                    client, url, fwd_headers, result.body, result.api_format, state,
+                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    conversation_id=result.conversation_id,
+                    passthrough=True, response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
+                    request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                 )
-                metrics.record({
-                    "type": "upstream_trim",
-                    "path": "active",
-                    "original_tokens": _pre_trim_tokens,
-                    "upstream_limit": _upstream_limit,
-                    "pairs_trimmed": _upstream_trimmed,
-                    "final_tokens": outbound_tokens,
-                })
-
-        # PROXY-025: Over-budget alert
-        if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
-            _excess = outbound_tokens - _effective_budget
-            logger.info(
-                "BUDGET Payload %dt exceeds budget %dt by %dt. Uncompacted turns pending compaction.",
-                outbound_tokens, _effective_budget, _excess,
-            )
-            metrics.record({
-                "type": "budget_exceeded",
-                "total": outbound_tokens,
-                "budget": _effective_budget,
-                "excess": _excess,
-            })
-
-        # Record request event
-        turn = len(state.engine._turn_tag_index.entries) if state else 0
-        _turn_id = uuid.uuid4().hex[:12]
-        context_tokens = fmt._count(prepend_text) if prepend_text else 0
-        total_turns = turn
-        overhead_ms = round(wait_ms + inbound_ms, 1)
-        _conversation_id = state.engine.config.conversation_id if state else ""
-        metrics.record({
-            "type": "request",
-            "turn": turn,
-            "turn_id": _turn_id,
-            "model": body.get("model", ""),
-            "message_preview": user_message[:60],
-            "api_format": api_format,
-            "streaming": is_streaming,
-            "tags": assembled.matched_tags if assembled else [],
-            "context_tokens": context_tokens,
-            "budget": assembled.budget_breakdown if assembled else {},
-            "history_len": len(state.conversation_history) if state else 0,
-            "compacted_through": state.engine._engine_state.compacted_through if state else 0,
-            "wait_ms": wait_ms,
-            "inbound_ms": inbound_ms,
-            "overhead_ms": overhead_ms,
-            "total_turns": total_turns,
-            "filtered_turns": total_turns - turns_dropped,
-            "inbound_tokens": inbound_tokens,
-            "outbound_tokens": outbound_tokens,
-            "input_tokens": input_tokens,       # legacy alias for outbound
-            "raw_input_tokens": raw_input_tokens,  # legacy alias for inbound
-            "system_tokens": system_tokens,      # component estimate
-            "turns_dropped": turns_dropped,
-            "turns_stubbed": turns_stubbed,
-            "conversation_id": _conversation_id,
-        })
-
-        # Persist request context for dashboard recall page
-        if state and assembled:
-            try:
-                _retrieval_meta = getattr(assembled, 'retrieval_metadata', {}) or {}
-                _budget = assembled.budget_breakdown or {}
-                _retrieval_scores = getattr(assembled, 'retrieval_scores', {}) or {}
-                # Build segments_injected: [{ref, tag, tokens, score}]
-                _seg_injected = []
-                if hasattr(assembled, 'presented_segment_refs') and assembled.presented_segment_refs:
-                    # Map refs to tags from the retrieval result summaries
-                    _ref_to_summary = {}
-                    if hasattr(assembled, '_retrieval_summaries'):
-                        for s in assembled._retrieval_summaries:
-                            _ref_to_summary[s.ref] = s
-                    for ref in assembled.presented_segment_refs:
-                        _seg_injected.append({
-                            "ref": ref,
-                            "tag": _ref_to_summary.get(ref, type('', (), {"primary_tag": ""})()).primary_tag if ref in _ref_to_summary else "",
-                            "tokens": 0,
-                            "score": 0.0,
-                        })
-                # Simpler approach: use tag_sections which we know
-                if not _seg_injected and hasattr(assembled, 'tag_sections') and assembled.tag_sections:
-                    for tag in assembled.tag_sections:
-                        _seg_injected.append({
-                            "ref": "",
-                            "tag": tag,
-                            "tokens": len(assembled.tag_sections[tag]) // 4,
-                            "score": _retrieval_scores.get(tag, 0.0) if isinstance(_retrieval_scores, dict) else 0.0,
-                        })
-                # Build facts_injected: [fact_id, ...]
-                _facts_injected = []
-                if hasattr(assembled, 'facts_text') and assembled.facts_text:
-                    # Extract fact IDs from the facts — they're in the retrieval result
-                    pass  # fact IDs not directly available from assembled context
-                state.engine._store.save_request_context({
-                    "conversation_id": _conversation_id,
-                    "request_turn": turn,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "user_message": user_message[:500],
-                    "inbound_tags": assembled.matched_tags or [],
-                    "retrieval_method": _retrieval_meta.get("strategy", "rrf"),
-                    "candidates_found": _retrieval_meta.get("candidates_found", 0),
-                    "candidates_selected": _retrieval_meta.get("summaries_returned", 0),
-                    "segments_injected": _seg_injected,
-                    "facts_injected": _facts_injected,
-                    "facts_count": _budget.get("facts", 0),
-                    "facts_tags": _retrieval_meta.get("tags_queried", []),
-                    "pool_used": _budget.get("tags", 0) + _budget.get("facts", 0),
-                    "pool_budget": state.engine.config.assembler.context_injection_max_tokens,
-                    "total_context_tokens": context_tokens,
-                    "non_virtualizable_floor": state._last_non_virtualizable_floor,
-                    "tool_call_count": 0,
-                })
-            except Exception as e:
-                import logging as _log
-                _log.getLogger(__name__).debug("Failed to save request context: %s", e)
-
-        # Log request to terminal for debugging
-        _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
-        _flag_str = ""
-        _out_str = f"out={outbound_tokens}t"
-        if _upstream_trimmed:
-            _out_str = f"out={outbound_tokens}t TRIMMED from {_pre_trim_tokens}t"
-        logger.info(
-            "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d "
-            "ctx=%dt in=%dt %s upstream=%dt vc=%sms | %s",
-            turn, api_format, is_streaming, _tags_str, _flag_str,
-            len(body.get("messages", [])), turns_dropped, turns_stubbed,
-            context_tokens, inbound_tokens, _out_str, _upstream_limit,
-            overhead_ms, user_message[:60],
-        )
-
-        # Capture pre-filter request body for dashboard inspection
-        metrics.capture_request(
-            turn, _pre_filter_body, api_format,
-            inbound_tags=assembled.matched_tags if assembled else [],
-            conversation_id=_conversation_id,
-            inbound_tokens=inbound_tokens,
-            outbound_tokens=outbound_tokens,
-            inbound_bytes=_inbound_bytes,
-            outbound_bytes=_outbound_bytes,
-            context_tokens=context_tokens,
-            overhead_ms=overhead_ms,
-            turns_dropped=turns_dropped,
-            turns_stubbed=turns_stubbed,
-            message_preview=user_message[:60],
-        )
-        # Capture enriched body (what we actually send to the LLM)
-        metrics.capture_enriched(turn, enriched_body)
-
-        _intercept_vc_tools = paging_enabled or tool_output_find_quote
-
-        if is_streaming:
-            return await _handle_streaming(
-                client, url, fwd_headers, enriched_body, api_format, state,
-                metrics=metrics, turn=turn, turn_id=_turn_id, overhead_ms=overhead_ms,
-                conversation_id=_conversation_id, response_log_path=_response_log_path,
-                session_log_path=_session_log_path,
-                paging_enabled=_intercept_vc_tools,
-                request_log_dir=_effective_log_dir,
-                log_prefix=_log_prefix if _effective_log_dir else "",
-            )
         else:
-            return await _handle_non_streaming(
-                client, url, fwd_headers, enriched_body, api_format, state,
-                metrics=metrics, turn=turn, turn_id=_turn_id, overhead_ms=overhead_ms,
-                conversation_id=_conversation_id, response_log_path=_response_log_path,
-                session_log_path=_session_log_path,
-                request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
-            )
+            _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote
+
+            if result.is_streaming:
+                return await _handle_streaming(
+                    client, url, fwd_headers, result.enriched_body, result.api_format, state,
+                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    overhead_ms=result.overhead_ms,
+                    conversation_id=result.conversation_id,
+                    response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
+                    paging_enabled=_intercept_vc_tools,
+                    request_log_dir=_effective_log_dir,
+                    log_prefix=_log_prefix if _effective_log_dir else "",
+                )
+            else:
+                return await _handle_non_streaming(
+                    client, url, fwd_headers, result.enriched_body, result.api_format, state,
+                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    overhead_ms=result.overhead_ms,
+                    conversation_id=result.conversation_id,
+                    response_log_path=_response_log_path,
+                    session_log_path=_session_log_path,
+                    request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                )
 
     return app
