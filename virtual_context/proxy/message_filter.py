@@ -621,7 +621,11 @@ def trim_to_upstream_limit(
         if msg.get("role") not in ("user", "human"):
             i += 1
             continue
-        # Start of a turn: user message
+        # Verify next message is assistant — skip consecutive users
+        if original_messages[i + 1].get("role") not in ("assistant",):
+            i += 1
+            continue
+        # Start of a turn: user message + assistant response
         chain_indices = [i, i + 1]  # user + assistant
         j = i + 2
         # Extend chain through tool rounds: tool_result user → assistant → ...
@@ -637,6 +641,9 @@ def trim_to_upstream_limit(
                 is_tool_result = bool(ctypes and ctypes <= {"tool_result"})
             if not is_tool_result:
                 break  # real user message, not part of tool chain
+            # Verify next message is assistant before extending
+            if j + 1 >= len(original_messages) or original_messages[j + 1].get("role") != "assistant":
+                break  # tool_result without following assistant — malformed, stop
             # tool_result user + next assistant = part of chain
             chain_indices.extend([j, j + 1])
             j += 2
@@ -702,4 +709,61 @@ def trim_to_upstream_limit(
     if total_pairs_removed == 0:
         return body, 0
 
+    # Post-trim cleanup: remove any orphaned tool_use/tool_result pairs
+    # that survived trimming without their counterpart.
+    trimmed_body = _cleanup_orphaned_tools(trimmed_body, msg_key)
+
     return trimmed_body, total_pairs_removed
+
+
+def _cleanup_orphaned_tools(body: dict, msg_key: str) -> dict:
+    """Remove messages with orphaned tool_use or tool_result blocks."""
+    messages = body.get(msg_key, [])
+    if not messages:
+        return body
+
+    for _pass in range(3):  # max 3 passes (removing one orphan may expose another)
+        # Collect all tool_use IDs and tool_result IDs
+        tool_use_ids: set[str] = set()
+        tool_result_ids: set[str] = set()
+        for m in messages:
+            content = m.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and "id" in b:
+                    tool_use_ids.add(b["id"])
+                elif b.get("type") == "tool_result" and "tool_use_id" in b:
+                    tool_result_ids.add(b["tool_use_id"])
+
+        orphan_use_ids = tool_use_ids - tool_result_ids
+        orphan_result_ids = tool_result_ids - tool_use_ids
+        if not orphan_use_ids and not orphan_result_ids:
+            break
+
+        # Remove messages containing orphaned blocks
+        cleaned: list[dict] = []
+        for m in messages:
+            content = m.get("content", [])
+            if not isinstance(content, list):
+                cleaned.append(m)
+                continue
+            has_orphan = False
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("id") in orphan_use_ids:
+                    has_orphan = True
+                    break
+                if b.get("type") == "tool_result" and b.get("tool_use_id") in orphan_result_ids:
+                    has_orphan = True
+                    break
+            if not has_orphan:
+                cleaned.append(m)
+        messages = cleaned
+
+    body = dict(body)
+    body[msg_key] = messages
+    return body
