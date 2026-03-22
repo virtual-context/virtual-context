@@ -326,6 +326,14 @@ class ContextStore(ABC):
         """Load a single tool call by ID."""
         return None
 
+    def save_request_context(self, context: dict) -> None:
+        """Persist retrieval/assembly context for a request."""
+        pass
+
+    def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        """Load recent request contexts for a conversation."""
+        return []
+
     def save_request_capture(self, capture: dict) -> None:
         pass
 

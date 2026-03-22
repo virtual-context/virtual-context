@@ -180,6 +180,28 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS idx_tool_calls_conv ON tool_calls(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_group ON tool_calls(group_id);
 
+CREATE TABLE IF NOT EXISTS request_context (
+    id SERIAL PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    request_turn INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    user_message TEXT NOT NULL,
+    inbound_tags TEXT NOT NULL,
+    retrieval_method TEXT NOT NULL,
+    candidates_found INTEGER NOT NULL,
+    candidates_selected INTEGER NOT NULL,
+    segments_injected TEXT NOT NULL,
+    facts_injected TEXT NOT NULL,
+    facts_count INTEGER NOT NULL,
+    facts_tags TEXT NOT NULL,
+    pool_used INTEGER NOT NULL,
+    pool_budget INTEGER NOT NULL,
+    total_context_tokens INTEGER NOT NULL,
+    non_virtualizable_floor INTEGER NOT NULL,
+    tool_call_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_request_context_conv ON request_context(conversation_id);
+
 CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
     tag TEXT NOT NULL,
     conversation_id TEXT NOT NULL DEFAULT '',
@@ -1589,6 +1611,66 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         row = conn.execute("SELECT * FROM tool_calls WHERE id = %s", (call_id,)).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Request context persistence (dashboard recall page)
+    # ------------------------------------------------------------------
+
+    def save_request_context(self, context: dict) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO request_context
+            (conversation_id, request_turn, timestamp, user_message, inbound_tags,
+             retrieval_method, candidates_found, candidates_selected,
+             segments_injected, facts_injected, facts_count, facts_tags,
+             pool_used, pool_budget, total_context_tokens,
+             non_virtualizable_floor, tool_call_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                context.get("conversation_id", ""),
+                context.get("request_turn", 0),
+                context.get("timestamp", ""),
+                context.get("user_message", ""),
+                json.dumps(context.get("inbound_tags", [])),
+                context.get("retrieval_method", ""),
+                context.get("candidates_found", 0),
+                context.get("candidates_selected", 0),
+                json.dumps(context.get("segments_injected", [])),
+                json.dumps(context.get("facts_injected", [])),
+                context.get("facts_count", 0),
+                json.dumps(context.get("facts_tags", [])),
+                context.get("pool_used", 0),
+                context.get("pool_budget", 0),
+                context.get("total_context_tokens", 0),
+                context.get("non_virtualizable_floor", 0),
+                context.get("tool_call_count", 0),
+            ),
+        )
+        conv_id = context.get("conversation_id", "")
+        conn.execute(
+            """DELETE FROM request_context WHERE id NOT IN (
+                SELECT id FROM request_context WHERE conversation_id = %s
+                ORDER BY id DESC LIMIT 50
+            ) AND conversation_id = %s""",
+            (conv_id, conv_id),
+        )
+
+    def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM request_context WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
+            (conversation_id, limit),
+        ).fetchall()
+        result = []
+        for row in reversed(rows):
+            d = dict(row)
+            for json_field in ("inbound_tags", "segments_injected", "facts_injected", "facts_tags"):
+                try:
+                    d[json_field] = json.loads(d.get(json_field, "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    d[json_field] = []
+            result.append(d)
+        return result
 
     # ------------------------------------------------------------------
     # Lifecycle
