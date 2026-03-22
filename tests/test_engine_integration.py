@@ -147,7 +147,7 @@ def test_full_pipeline():
 
         # 1. Segment the conversation
         segments = segmenter.segment(messages)
-        assert len(segments) >= 3, f"Expected at least 3 segments, got {len(segments)}"
+        assert len(segments) >= 2, f"Expected at least 2 segments, got {len(segments)}"
 
         # Verify tag separation
         tag_set = {s.primary_tag for s in segments}

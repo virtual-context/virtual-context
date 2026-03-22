@@ -118,91 +118,130 @@ class TopicSegmenter:
                 tag_result.source, preview,
             )
 
-        # Group contiguous same-primary-tag pairs,
-        # split on session date change or temporal gap
-        segments: list[TaggedSegment] = []
-        current_group: list[tuple[TurnPair, TagResult]] = []
-        running_session: str = ""  # tracks session date across all pairs
-        group_session: str = ""    # session date for the current group
+        # Group turns into topic segments using a segment library.
+        # Each turn is scored against ALL existing segments (not just the previous turn).
+        # If a turn matches an existing segment, it's appended there. Otherwise, a new
+        # segment is created. This handles A-B-A-B topic interleaving correctly.
+        #
+        # Segment library: list of (group, group_session, group_tags, group_tokens)
+        # where group is the accumulating list of (TurnPair, TagResult) pairs.
+        segment_library: list[tuple[list[tuple[TurnPair, TagResult]], str, set[str], int]] = []
+        running_session: str = ""
+        max_seg_tokens = self.config.max_segment_turns * 200 if self.config.max_segment_turns > 0 else 999_999
+        # Use the configured max_segment_tokens from compactor if available, else estimate
+        threshold = self.config.tag_overlap_threshold
 
         for turn_idx, (pair, result) in enumerate(tagged):
             parsed = _parse_session_date(pair)
             if parsed:
                 running_session = parsed
-            if current_group:
-                prev_tags = set(current_group[-1][1].tags)
-                curr_tags = set(result.tags)
-                meaningful_prev = {t for t in prev_tags if t != "_general"}
-                meaningful_curr = {t for t in curr_tags if t != "_general"}
 
-                if not meaningful_prev or not meaningful_curr:
-                    tag_changed = False  # merge on empty/general-only
-                    overlap = 1.0
-                elif current_group[-1][1].primary == result.primary and not (parsed and parsed != group_session):
-                    # Same primary tag + same session = always group together
-                    tag_changed = False
-                    overlap = 1.0
-                    logger.info(
-                        "SEGMENT same-tag turn=%d primary=%s — forced merge (same tag, same session)",
-                        turn_offset + turn_idx, result.primary,
-                    )
+            curr_tags = set(result.tags)
+            meaningful_curr = {t for t in curr_tags if t != "_general"}
+            turn_text = " ".join(m.content for m in pair.messages)
+            turn_tokens = self.token_counter(turn_text)
+
+            # Score against ALL existing segments in the library
+            best_seg_idx = -1
+            best_score = 0.0
+            best_reason = ""
+
+            for seg_idx, (group, group_session, group_tags, group_tokens) in enumerate(segment_library):
+                # Skip if adding this turn would exceed token cap
+                if group_tokens + turn_tokens > max_seg_tokens:
+                    continue
+
+                # Skip if max turn count exceeded
+                if self.config.max_segment_turns > 0 and len(group) >= self.config.max_segment_turns:
+                    continue
+
+                # Skip if different session (session boundaries are hard splits)
+                # A new session header means this turn belongs in a new or matching-session segment
+                if parsed and group_session and parsed != group_session:
+                    continue
+                if parsed and not group_session:
+                    # First session header seen — this turn starts a new session era,
+                    # don't merge with pre-session segments
+                    continue
+
+                # Skip if temporal gap between last turn in group and this turn
+                if group and self._has_temporal_gap(group[-1][0], pair):
+                    continue
+
+                meaningful_group = {t for t in group_tags if t != "_general"}
+                if not meaningful_group or not meaningful_curr:
+                    # General-only: score as 1.0 (merge with anything)
+                    score = 1.0
+                    reason = "general"
+                elif result.primary == group[-1][1].primary:
+                    # Same primary tag = strong match
+                    score = 1.0
+                    reason = "same-primary"
                 else:
-                    prev_text = " ".join(m.content for m in current_group[-1][0].messages)
-                    curr_text = " ".join(m.content for m in pair.messages)
-                    overlap = compute_relatedness(
-                        tags_a=meaningful_prev,
+                    # Compute relatedness
+                    group_text = " ".join(m.content for p, _ in group[-2:] for m in p.messages)
+                    score = compute_relatedness(
+                        tags_a=meaningful_group,
                         tags_b=meaningful_curr,
-                        text_a=prev_text,
-                        text_b=curr_text,
+                        text_a=group_text[:2000],
+                        text_b=turn_text[:2000],
                         embed_fn=self._embed_fn,
                     )
-                    tag_changed = overlap < self.config.tag_overlap_threshold
+                    reason = f"relatedness={score:.3f}"
+
+                if score >= threshold and (score > best_score or best_seg_idx == -1):
+                    best_score = score
+                    best_seg_idx = seg_idx
+                    best_reason = reason
+
+            if best_seg_idx >= 0:
+                # Append to existing segment
+                group, group_session, group_tags, group_tokens = segment_library[best_seg_idx]
+                group.append((pair, result))
+                group_tags.update(meaningful_curr)
+                segment_library[best_seg_idx] = (group, group_session, group_tags, group_tokens + turn_tokens)
+                logger.debug(
+                    "SEGMENT turn=%d APPEND to seg#%d (%s, %d turns, %s)",
+                    turn_offset + turn_idx, best_seg_idx,
+                    group[-1][1].primary, len(group), best_reason,
+                )
+            else:
+                # Create new segment
+                new_tags = set(meaningful_curr)
+                segment_library.append((
+                    [(pair, result)],
+                    running_session,
+                    new_tags,
+                    turn_tokens,
+                ))
+                logger.debug(
+                    "SEGMENT turn=%d NEW seg#%d primary=%s tags=%s (%dt)",
+                    turn_offset + turn_idx, len(segment_library) - 1,
+                    result.primary, sorted(meaningful_curr), turn_tokens,
+                )
+
+        # Build final segments from the library
+        segments: list[TaggedSegment] = []
+        single_turn = 0
+        for group, group_session, group_tags, group_tokens in segment_library:
+            if group:
+                seg = self._build_segment(group, group_session)
+                segments.append(seg)
+                if len(group) == 1:
+                    single_turn += 1
+                if len(group) >= 3:
                     logger.info(
-                        "SEGMENT relatedness turn=%d prev_tags=%s curr_tags=%s "
-                        "score=%.3f threshold=%.1f → %s",
-                        turn_offset + turn_idx, sorted(meaningful_prev),
-                        sorted(meaningful_curr), overlap,
-                        self.config.tag_overlap_threshold,
-                        "SPLIT" if tag_changed else "MERGE",
+                        "SEGMENT built: '%s' %d turns %dt tags=%s",
+                        seg.primary_tag, len(group), group_tokens, sorted(group_tags),
                     )
 
-                # Hard cap on segment size
-                max_cap = self.config.max_segment_turns > 0 and len(current_group) >= self.config.max_segment_turns
-                if max_cap:
-                    tag_changed = True
-                session_changed = parsed and parsed != group_session
-                temporal_gap = self._has_temporal_gap(current_group[-1][0], pair)
-
-                if tag_changed or session_changed or temporal_gap:
-                    if session_changed:
-                        reason = f"session_changed session={parsed}"
-                    elif temporal_gap:
-                        last_ts = _latest_timestamp(current_group[-1][0])
-                        new_ts = _earliest_timestamp(pair)
-                        gap_min = int((new_ts - last_ts).total_seconds() / 60) if last_ts and new_ts else 0
-                        reason = f"temporal_gap minutes={gap_min}"
-                    elif max_cap:
-                        reason = f"max_segment_turns limit={self.config.max_segment_turns}"
-                    else:
-                        reason = f"tag_changed overlap={overlap:.3f}"
-                    logger.info(
-                        "SEGMENT split turn=%d reason=%s",
-                        turn_offset + turn_idx, reason,
-                    )
-                    segments.append(self._build_segment(current_group, group_session))
-                    current_group = []
-                    # Derive session date from timestamp if no header present
-                    if temporal_gap and not parsed:
-                        ts = _earliest_timestamp(pair)
-                        if ts:
-                            running_session = ts.strftime("%Y-%m-%dT%H:%M:%S")
-                    group_session = running_session
-            if not current_group:
-                group_session = running_session
-            current_group.append((pair, result))
-
-        if current_group:
-            segments.append(self._build_segment(current_group, group_session))
+        logger.info(
+            "SEGMENT library: %d segments from %d turns (single-turn=%d/%d=%.0f%%), "
+            "threshold=%.2f, library_size=%d",
+            len(segments), len(tagged), single_turn, len(segments),
+            single_turn / len(segments) * 100 if segments else 0,
+            threshold, len(segment_library),
+        )
 
         # Reassign _stub segments to their chronologically nearest neighbor.
         # A stub between segments inherits tags from whichever neighbor is
