@@ -36,6 +36,11 @@ preserves all key decisions, action items, entities, and names.
 Keep the chronological progression. The summary should be comprehensive enough
 that someone could resume the conversation from it.
 
+Preserve the emotional and conversational tone across sessions — if the user was excited about
+a breakthrough, frustrated with a problem, or casually exploring, that texture should survive
+the rollup. A summary that reads like a dry changelog loses the human context that makes
+retrieval feel natural.
+
 IMPORTANT: When a segment mentions something personal the user disclosed about
 themselves (experiences, preferences, life events, possessions, relationships),
 ALWAYS preserve that disclosure in the summary even if it is tangential to the
@@ -87,15 +92,13 @@ Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 ho
 "about an hour"; "$45" must stay "$45", not "around $50").
 
 When the user states what they are doing, have done, or where they keep/store something,
-preserve that as a direct assertion, not as a plan or intention.
-For example, "I'm storing my sneakers in a shoe rack" should be summarized as
-"User stores/is storing sneakers in shoe rack", NOT "User plans to store sneakers in shoe rack."
+preserve that as a direct assertion, not as a plan or intention. Conversely, when the conversation
+is about a future activity the summary must clearly indicate this is planning/discussion, not a completed activity.
 
-Conversely, when the conversation is about planning, discussing, or researching a future
-activity (e.g. drafting an itinerary, comparing options, asking for recommendations),
-the summary must clearly indicate this is planning/discussion, not a completed activity.
-Use language like "User planned...", "User discussed planning...", "User drafted an itinerary for..."
-rather than "User provided..." or "User traveled to...".
+Capture the tone and texture of the conversation — was it casual/playful, urgent/stressed,
+analytical/technical, emotional/vulnerable, collaborative/brainstorming? Preserve the user's
+voice: if they were sarcastic, enthusiastic, frustrated, or reflective, that should come
+through in the summary, not be flattened into neutral reportage.
 
 Always preserve the user's role and relationship to the topic — phrases like
 "I led", "my project", "solo project", "I built", "I'm responsible for" are
