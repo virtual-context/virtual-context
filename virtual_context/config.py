@@ -307,14 +307,17 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         )
         for inst in instances_raw
     ]
+    _prx_defaults = ProxyConfig()
     proxy_config = ProxyConfig(
         request_log_dir=proxy_raw.get(
             "request_log_dir",
             os.path.join(storage_root, "request_log"),
         ),
-        request_log_max_files=proxy_raw.get("request_log_max_files", 50),
-        upstream_context_limit=proxy_raw.get("upstream_context_limit", 0),
-        passthrough_trim_ratio=proxy_raw.get("passthrough_trim_ratio", 0.40),
+        request_log_max_files=proxy_raw.get("request_log_max_files", _prx_defaults.request_log_max_files),
+        upstream_context_limit=proxy_raw.get("upstream_context_limit", _prx_defaults.upstream_context_limit),
+        passthrough_trim_ratio=proxy_raw.get("passthrough_trim_ratio", _prx_defaults.passthrough_trim_ratio),
+        llm_calls_log=proxy_raw.get("llm_calls_log", _prx_defaults.llm_calls_log),
+        history_widening_threshold=proxy_raw.get("history_widening_threshold", _prx_defaults.history_widening_threshold),
         instances=instances,
     )
 

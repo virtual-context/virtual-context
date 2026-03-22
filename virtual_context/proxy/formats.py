@@ -1319,10 +1319,15 @@ class OpenAIResponsesFormat(PayloadFormat):
 
     def get_messages(self, body: dict) -> list[dict]:
         items = body.get("input", [])
-        return items if isinstance(items, list) else []
+        if isinstance(items, list):
+            return items
+        if isinstance(items, str):
+            return [{"role": "user", "content": items}]
+        return []
 
     def has_messages(self, body: dict) -> bool:
-        return isinstance(body.get("input"), list)
+        inp = body.get("input")
+        return isinstance(inp, (list, str)) and bool(inp)
 
     # -- Context injection --
 
