@@ -471,44 +471,6 @@ def create_app(
                 turn = len(state.engine._turn_tag_index.entries)
                 _turn_id = uuid.uuid4().hex[:12]
 
-                # Record passthrough request event
-                metrics.record({
-                    "type": "request",
-                    "turn": turn,
-                    "turn_id": _turn_id,
-                    "message_preview": user_message[:60],
-                    "api_format": api_format,
-                    "streaming": is_streaming,
-                    "tags": [],
-                    "temporal": False,
-                    "context_tokens": 0,
-                    "budget": {},
-                    "history_len": len(state.conversation_history),
-                    "compacted_through": 0,
-                    "wait_ms": 0,
-                    "inbound_ms": 0,
-                    "overhead_ms": 0,
-                    "total_turns": turn,
-                    "filtered_turns": turn,
-                    "input_tokens": 0,
-                    "raw_input_tokens": 0,
-                    "system_tokens": 0,
-                    "turns_dropped": 0,
-                    "conversation_id": _conversation_id,
-                    "passthrough": True,
-                })
-
-                metrics.capture_request(
-                    turn, body, api_format,
-                    conversation_id=_conversation_id,
-                    passthrough=True,
-                    inbound_tokens=_inbound_tokens,
-                    outbound_tokens=_inbound_tokens,  # passthrough: same as inbound
-                    inbound_bytes=_inbound_bytes,
-                    outbound_bytes=_inbound_bytes,  # passthrough: same as inbound
-                    message_preview=user_message[:60],
-                )
-
                 # Tool output interception applies even in passthrough —
                 # truncating large tool_result blocks reduces upstream tokens
                 # regardless of whether VC context is being injected.
@@ -549,10 +511,54 @@ def create_app(
                             "pairs_trimmed": _pt_trimmed,
                         })
 
+                # Compute outbound tokens (after trim + tool interception)
+                _outbound_tokens = fmt._count(json.dumps(body, default=str))
+                _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
+
+                # Record passthrough request event with accurate post-trim values
+                metrics.record({
+                    "type": "request",
+                    "turn": turn,
+                    "turn_id": _turn_id,
+                    "message_preview": user_message[:60],
+                    "api_format": api_format,
+                    "streaming": is_streaming,
+                    "tags": [],
+                    "temporal": False,
+                    "context_tokens": 0,
+                    "budget": {},
+                    "history_len": len(state.conversation_history),
+                    "compacted_through": 0,
+                    "wait_ms": 0,
+                    "inbound_ms": 0,
+                    "overhead_ms": 0,
+                    "total_turns": turn,
+                    "filtered_turns": turn,
+                    "inbound_tokens": _inbound_tokens,
+                    "outbound_tokens": _outbound_tokens,
+                    "input_tokens": _outbound_tokens,
+                    "raw_input_tokens": _inbound_tokens,
+                    "system_tokens": 0,
+                    "turns_dropped": 0,
+                    "conversation_id": _conversation_id,
+                    "passthrough": True,
+                })
+
+                metrics.capture_request(
+                    turn, body, api_format,
+                    conversation_id=_conversation_id,
+                    passthrough=True,
+                    inbound_tokens=_inbound_tokens,
+                    outbound_tokens=_outbound_tokens,
+                    inbound_bytes=_inbound_bytes,
+                    outbound_bytes=_outbound_bytes,
+                    message_preview=user_message[:60],
+                )
+
                 logger.info(
-                    "T%d PASSTHROUGH %s stream=%s state=%s | %s",
+                    "T%d PASSTHROUGH %s stream=%s state=%s in=%dt out=%dt | %s",
                     turn, api_format, is_streaming, current_state.value,
-                    user_message[:60],
+                    _inbound_tokens, _outbound_tokens, user_message[:60],
                 )
 
                 if is_streaming:
