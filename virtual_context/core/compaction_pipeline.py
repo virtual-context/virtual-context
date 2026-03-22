@@ -203,13 +203,28 @@ class CompactionPipeline:
         """
         from ..types import CompactionReport
 
-        # Segment and compact in batches (results stored to DB incrementally)
+        # Phase 1: Segmenter (0-25%)
         turn_offset = self._engine_state.compacted_through // 2
+        if progress_callback:
+            try:
+                progress_callback(0, 1, None, phase="segmenter",
+                                  overall_percent=0, phase_name="segmenter")
+            except Exception:
+                pass
         segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
         logger.info(
             "Segmented %d messages into %d segments (watermark=%d)",
             len(compact_messages), len(segments), self._engine_state.compacted_through,
         )
+        if progress_callback:
+            try:
+                progress_callback(1, 1, None, phase="segmenter",
+                                  overall_percent=25, phase_name="segmenter",
+                                  segments=len(segments))
+            except Exception:
+                pass
+
+        # Phase 2+3: Compact + Store (25-75%)
         results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
 
         # Advance watermark past compacted messages
@@ -287,9 +302,12 @@ class CompactionPipeline:
                             logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
                         if progress_callback:
                             try:
+                                _pct = 75 + int(25 * (ts_i + 1) / max(len(new_tag_summaries), 1))
                                 progress_callback(
                                     ts_i + 1, len(new_tag_summaries), None,
                                     phase="tag_summary_built",
+                                    overall_percent=_pct,
+                                    phase_name="tag_summaries",
                                     tag=ts.tag,
                                 )
                             except Exception:
@@ -561,10 +579,16 @@ class CompactionPipeline:
 
             all_results.append(result)
 
-            # Facts + progress
+            # Facts + progress (phase 2+3: 25-75% of overall)
             if progress_callback:
                 try:
-                    progress_callback(len(all_results), len(segments), result, phase="segment_stored")
+                    _pct = 25 + int(50 * len(all_results) / max(len(results), 1))
+                    progress_callback(
+                        len(all_results), len(segments), result,
+                        phase="segment_stored",
+                        overall_percent=_pct,
+                        phase_name="compactor" if seg_idx < len(results) // 2 else "store",
+                    )
                 except Exception:
                     pass
 
