@@ -272,6 +272,12 @@ class CompositeStore:
     def load_tool_call(self, call_id: int) -> dict | None:
         return self._search.load_tool_call(call_id)
 
+    def save_request_context(self, context: dict) -> None:
+        return self._search.save_request_context(context)
+
+    def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        return self._search.load_request_contexts(conversation_id, limit=limit)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

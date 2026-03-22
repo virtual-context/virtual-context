@@ -909,6 +909,64 @@ def create_app(
             "conversation_id": _conversation_id,
         })
 
+        # Persist request context for dashboard recall page
+        if state and assembled:
+            try:
+                _retrieval_meta = getattr(assembled, 'retrieval_metadata', {}) or {}
+                _budget = assembled.budget_breakdown or {}
+                _retrieval_scores = getattr(assembled, 'retrieval_scores', {}) or {}
+                # Build segments_injected: [{ref, tag, tokens, score}]
+                _seg_injected = []
+                if hasattr(assembled, 'presented_segment_refs') and assembled.presented_segment_refs:
+                    # Map refs to tags from the retrieval result summaries
+                    _ref_to_summary = {}
+                    if hasattr(assembled, '_retrieval_summaries'):
+                        for s in assembled._retrieval_summaries:
+                            _ref_to_summary[s.ref] = s
+                    for ref in assembled.presented_segment_refs:
+                        _seg_injected.append({
+                            "ref": ref,
+                            "tag": _ref_to_summary.get(ref, type('', (), {"primary_tag": ""})()).primary_tag if ref in _ref_to_summary else "",
+                            "tokens": 0,
+                            "score": 0.0,
+                        })
+                # Simpler approach: use tag_sections which we know
+                if not _seg_injected and hasattr(assembled, 'tag_sections') and assembled.tag_sections:
+                    for tag in assembled.tag_sections:
+                        _seg_injected.append({
+                            "ref": "",
+                            "tag": tag,
+                            "tokens": len(assembled.tag_sections[tag]) // 4,
+                            "score": _retrieval_scores.get(tag, 0.0) if isinstance(_retrieval_scores, dict) else 0.0,
+                        })
+                # Build facts_injected: [fact_id, ...]
+                _facts_injected = []
+                if hasattr(assembled, 'facts_text') and assembled.facts_text:
+                    # Extract fact IDs from the facts — they're in the retrieval result
+                    pass  # fact IDs not directly available from assembled context
+                state.engine._store.save_request_context({
+                    "conversation_id": _conversation_id,
+                    "request_turn": turn,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "user_message": user_message[:500],
+                    "inbound_tags": assembled.matched_tags or [],
+                    "retrieval_method": _retrieval_meta.get("strategy", "rrf"),
+                    "candidates_found": _retrieval_meta.get("candidates_found", 0),
+                    "candidates_selected": _retrieval_meta.get("summaries_returned", 0),
+                    "segments_injected": _seg_injected,
+                    "facts_injected": _facts_injected,
+                    "facts_count": _budget.get("facts", 0),
+                    "facts_tags": _retrieval_meta.get("tags_queried", []),
+                    "pool_used": _budget.get("tags", 0) + _budget.get("facts", 0),
+                    "pool_budget": state.engine.config.assembler.context_injection_max_tokens,
+                    "total_context_tokens": context_tokens,
+                    "non_virtualizable_floor": state._last_non_virtualizable_floor,
+                    "tool_call_count": 0,
+                })
+            except Exception as e:
+                import logging as _log
+                _log.getLogger(__name__).debug("Failed to save request context: %s", e)
+
         # Log request to terminal for debugging
         _tags_str = ", ".join(assembled.matched_tags) if assembled else "none"
         _flag_str = ""
