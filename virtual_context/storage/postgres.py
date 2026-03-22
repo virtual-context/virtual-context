@@ -163,6 +163,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
     data_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id SERIAL PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    request_turn INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    group_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    tool_input TEXT NOT NULL,
+    tool_result TEXT NOT NULL,
+    result_length INTEGER NOT NULL,
+    duration_ms DOUBLE PRECISION NOT NULL,
+    found BOOLEAN,
+    timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conv ON tool_calls(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_group ON tool_calls(group_id);
+
 CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
     tag TEXT NOT NULL,
     conversation_id TEXT NOT NULL DEFAULT '',
@@ -1525,6 +1542,53 @@ class PostgresStore(ContextStore):
             )
             count += 1
         return count
+
+    # ------------------------------------------------------------------
+    # Tool calls
+    # ------------------------------------------------------------------
+
+    def save_tool_call(self, call: dict) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO tool_calls
+            (conversation_id, request_turn, round, group_id, tool_name,
+             tool_input, tool_result, result_length, duration_ms, found, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                call.get("conversation_id", ""),
+                call.get("request_turn", 0),
+                call.get("round", 1),
+                call.get("group_id", ""),
+                call.get("tool_name", ""),
+                json.dumps(call.get("tool_input", {})),
+                call.get("tool_result", ""),
+                call.get("result_length", 0),
+                call.get("duration_ms", 0),
+                call.get("found"),
+                call.get("timestamp", ""),
+            ),
+        )
+        conv_id = call.get("conversation_id", "")
+        conn.execute(
+            """DELETE FROM tool_calls WHERE id NOT IN (
+                SELECT id FROM tool_calls WHERE conversation_id = %s
+                ORDER BY id DESC LIMIT 50
+            ) AND conversation_id = %s""",
+            (conv_id, conv_id),
+        )
+
+    def load_tool_calls(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM tool_calls WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
+            (conversation_id, limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def load_tool_call(self, call_id: int) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM tool_calls WHERE id = %s", (call_id,)).fetchone()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # Lifecycle
