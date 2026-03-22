@@ -81,32 +81,44 @@ def _extract_system_prompt_hash(body: dict) -> str:
     if not body:
         return ""
 
+    system_text = ""
+    system_list: list | None = None
+
     system = body.get("system")
     if system is not None:
-        h = hashlib.sha256()
         if isinstance(system, str):
-            h.update(system.encode())
-            return h.hexdigest()
-        if isinstance(system, list):
-            for b in system:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    h.update(b.get("text", "").encode())
-            return h.hexdigest()
+            system_text = system
+        elif isinstance(system, list):
+            system_list = system
+            system_text = "".join(
+                b.get("text", "") for b in system
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
 
-    for msg in body.get("messages", []):
-        role = msg.get("role", "")
-        if role in ("system", "developer"):
-            c = msg.get("content", "")
-            h = hashlib.sha256()
-            if isinstance(c, str):
-                h.update(c.encode())
-            elif isinstance(c, list):
-                for b in c:
-                    if isinstance(b, dict) and b.get("type") == "text":
-                        h.update(b.get("text", "").encode())
-            return h.hexdigest()
+    if not system_text and not system_list:
+        # No top-level system field — check OpenAI-style system/developer message
+        for msg in body.get("messages", []):
+            role = msg.get("role", "")
+            if role in ("system", "developer"):
+                c = msg.get("content", "")
+                if isinstance(c, str):
+                    system_text = c
+                elif isinstance(c, list):
+                    system_list = c
+                    system_text = "".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                break
 
-    return ""
+    # Empty/falsy system prompts should not produce a hash — they would
+    # collapse all such requests into a single deterministic conversation ID.
+    if not system_text and not system_list:
+        return ""
+
+    h = hashlib.sha256()
+    h.update(system_text.encode())
+    return h.hexdigest()
 
 
 def resolve_conversation_id(
