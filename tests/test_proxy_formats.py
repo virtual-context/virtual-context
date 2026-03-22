@@ -819,8 +819,9 @@ class TestOpenAIResponsesFormat:
     # -- has_messages / get_messages --
 
     def test_has_messages(self):
-        assert self.fmt.has_messages({"input": []}) is True
-        assert self.fmt.has_messages({"input": "string"}) is False
+        assert self.fmt.has_messages({"input": [{"role": "user", "content": "hi"}]}) is True
+        assert self.fmt.has_messages({"input": "a user prompt"}) is True
+        assert self.fmt.has_messages({"input": []}) is False
         assert self.fmt.has_messages({"messages": []}) is False
         assert self.fmt.has_messages({}) is False
 
@@ -828,9 +829,12 @@ class TestOpenAIResponsesFormat:
         body = {"input": [{"role": "user", "content": "hi"}]}
         assert len(self.fmt.get_messages(body)) == 1
 
-    def test_get_messages_non_list(self):
-        body = {"input": "string"}
-        assert self.fmt.get_messages(body) == []
+    def test_get_messages_string_input(self):
+        body = {"input": "a user prompt"}
+        msgs = self.fmt.get_messages(body)
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+        assert msgs[0]["content"] == "a user prompt"
 
     # -- Context injection --
 

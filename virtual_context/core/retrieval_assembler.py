@@ -202,6 +202,22 @@ class RetrievalAssembler:
                 if retry_tags != ["_general"]:
                     message_tags = retry_tags
                     retrieval_result = retry_result
+                    # Re-assemble with the improved retrieval result so
+                    # prepend_text includes the newly matched summaries.
+                    if self._fact_curator and retrieval_result.facts:
+                        retrieval_result.facts = self._fact_curator.curate(
+                            retrieval_result.facts, question=message,
+                        )
+                    assembled = self._assembler.assemble(
+                        core_context=core_context,
+                        retrieval_result=retrieval_result,
+                        conversation_history=uncompacted,
+                        token_budget=self.config.context_window,
+                        context_hint=context_hint,
+                        working_set=ws_param,
+                        full_segments=full_segments_param,
+                        max_context_tokens=max_context_tokens,
+                    )
 
         # Final fallback: inherit from most recent meaningful turn in the index
         if message_tags == ["_general"]:

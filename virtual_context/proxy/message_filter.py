@@ -594,7 +594,14 @@ def trim_to_upstream_limit(
     Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
     """
     total = fmt.estimate_payload_tokens(body)
-    output_budget = body.get("max_tokens", 4096)
+    # Output budget key varies by provider
+    output_budget = body.get("max_tokens", 0)
+    if not output_budget:
+        gen_cfg = body.get("generationConfig", {})
+        if isinstance(gen_cfg, dict):
+            output_budget = gen_cfg.get("maxOutputTokens", 0)
+    if not output_budget:
+        output_budget = 4096
     input_limit = upstream_limit - output_budget
 
     if total <= input_limit:
@@ -621,8 +628,8 @@ def trim_to_upstream_limit(
         if msg.get("role") not in ("user", "human"):
             i += 1
             continue
-        # Verify next message is assistant — skip consecutive users
-        if original_messages[i + 1].get("role") not in ("assistant",):
+        # Verify next message is assistant/model — skip consecutive users
+        if original_messages[i + 1].get("role") not in ("assistant", "model"):
             i += 1
             continue
         # Start of a turn: user message + assistant response
