@@ -534,6 +534,8 @@ async def _handle_streaming(
 
                 for loop_i in range(_MAX_CONTINUATION_LOOPS):
                     # Execute VC tools
+                    import uuid as _uuid
+                    _group_id = _uuid.uuid4().hex[:12]
                     tool_results: list[dict] = []
                     for tool in vc_tools:
                         t_tool = time.monotonic()
@@ -562,7 +564,25 @@ async def _handle_streaming(
                                 "duration_ms": tool_ms,
                                 "continuation_count": loop_i + 1,
                                 "conversation_id": conversation_id,
+                                "group_id": _group_id,
                             })
+                        # Persist full tool call to store
+                        try:
+                            state.engine._store.save_tool_call({
+                                "conversation_id": conversation_id,
+                                "request_turn": turn,
+                                "round": loop_i + 1,
+                                "group_id": _group_id,
+                                "tool_name": tool["name"],
+                                "tool_input": tool["input"],
+                                "tool_result": result_str,
+                                "result_length": len(result_str),
+                                "duration_ms": tool_ms,
+                                "found": "not found" not in result_str.lower()[:100] if result_str else None,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            })
+                        except Exception:
+                            pass
                         if api_format == "openai_responses":
                             tool_results.append({
                                 "type": "function_call_output",
