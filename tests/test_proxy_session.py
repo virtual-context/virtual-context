@@ -640,6 +640,41 @@ class TestContentFingerprintRouting:
         assert is_new is False
         assert result is state
 
+    def test_cold_start_marker_restores_persisted_session(self, tmp_path):
+        """A marker referencing a persisted-but-not-loaded session should restore it, not create a new random one."""
+        from virtual_context.engine import VirtualContextEngine
+
+        # Create an engine, ingest some data, and persist state
+        config_path = tmp_path / "vc.yaml"
+        config_path.write_text("storage:\n  backend: sqlite\n  sqlite:\n    path: " + str(tmp_path / "store.db") + "\n")
+        engine1 = VirtualContextEngine(config_path=str(config_path))
+        saved_id = engine1.config.conversation_id
+        from virtual_context.types import Message, TurnTagEntry
+        engine1._turn_tag_index.append(TurnTagEntry(
+            turn_number=0, message_hash="abc123", tags=["test-topic"], primary_tag="test-topic",
+        ))
+        engine1._save_state([
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="hi"),
+        ])
+        engine1.close()
+
+        # Fresh registry — saved_id is NOT in memory
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=str(config_path),
+            upstream="http://fake:9999",
+            metrics=metrics,
+        )
+        assert saved_id not in registry._conversations
+
+        body = self._make_body(["new message"])
+        result, is_new = registry.get_or_create(saved_id, body=body)
+
+        # Should have restored the persisted session, not created a random new one
+        assert result.engine.config.conversation_id == saved_id
+        assert len(result.engine._turn_tag_index.entries) > 0
+
 
 # ---------------------------------------------------------------------------
 # Trailing fingerprint
