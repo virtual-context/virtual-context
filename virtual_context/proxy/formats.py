@@ -930,6 +930,39 @@ class GeminiFormat(PayloadFormat):
     def has_messages(self, body: dict) -> bool:
         return isinstance(body.get("contents"), list)
 
+    def estimate_payload_tokens(self, body: dict) -> int:
+        total = 0
+        for msg in self.get_messages(body):
+            parts = msg.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for p in parts:
+                if not isinstance(p, dict):
+                    continue
+                if "text" in p:
+                    total += self._count(p["text"])
+                elif "functionCall" in p:
+                    fc = p["functionCall"]
+                    total += self._count(fc.get("name", ""))
+                    args = fc.get("args")
+                    if args:
+                        total += self._count(
+                            json.dumps(args) if not isinstance(args, str) else args
+                        )
+                elif "functionResponse" in p:
+                    fr = p["functionResponse"]
+                    resp = fr.get("response", {})
+                    total += self._count(json.dumps(resp) if isinstance(resp, dict) else str(resp))
+        si = body.get("system_instruction", {})
+        if isinstance(si, dict):
+            for p in si.get("parts", []):
+                if isinstance(p, dict) and "text" in p:
+                    total += self._count(p["text"])
+        tools = body.get("tools", [])
+        if isinstance(tools, list):
+            total += self._count(json.dumps(tools))
+        return total
+
     # -- Context injection --
 
     def inject_context(self, body: dict, prepend_text: str) -> dict:
@@ -1647,6 +1680,12 @@ def detect_format(body: dict) -> PayloadFormat:
         return _FORMAT_REGISTRY["gemini"]
     if isinstance(body.get("input"), list) or "instructions" in body:
         return _FORMAT_REGISTRY["openai_responses"]
+    # String input without a messages key: Responses API single-turn shorthand.
+    # Exclude embedding/moderation models which also use "input" as a string.
+    if isinstance(body.get("input"), str) and "messages" not in body:
+        model = str(body.get("model", "")).lower()
+        if "embedding" not in model and "moderation" not in model:
+            return _FORMAT_REGISTRY["openai_responses"]
     if "system" in body:
         return _FORMAT_REGISTRY["anthropic"]
     model = body.get("model", "")
