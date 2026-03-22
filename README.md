@@ -26,7 +26,7 @@ The result: an agent that recalls details from turn 12 at turn 1000 with the sam
 
 ### Configurable Context Ceiling
 
-Most teams set `context_window` to whatever the model supports — 128K, 200K, 1M — and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200K tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
+Most teams set `context_window` to whatever the model supports (128K, 200K, 1M) and let it fill up. This is expensive and, counterintuitively, degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200K tokens of raw history are missed more often than the same facts concentrated in a managed 60K window.
 
 virtual-context lets you set an artificial ceiling well below the model's maximum:
 
@@ -54,7 +54,7 @@ These approaches are complementary, but optimize different failure modes.
 | **Specific fact lookup** | Depends on embedding/query phrasing alignment | Lossy after summarization | `vc_find_quote` + `vc_query_facts` + summary/segment drill-down |
 | **Broad overview ("what did we discuss?")** | Weak unless special orchestration | Can summarize, but often generic | `vc_recall_all` returns all topic summaries within budget |
 | **Time-scoped recall ("last week", "between June and July")** | Custom logic outside core RAG | Requires date fidelity in summaries | `vc_remember_when` with backend-resolved time ranges |
-| **Vocabulary mismatch tolerance** | Embedding-dependent | Low | Related-tag expansion + IDF-weighted ranking + quote search fallback |
+| **Vocabulary mismatch tolerance** | Embedding-dependent | Low | 3-signal RRF fusion (IDF + BM25 + embedding) + related-tag expansion + quote search fallback |
 | **Context budget control** | Append retrieved chunks | Compression with limited selective rehydration | Explicit paging: expand/collapse topics and bounded assembly |
 | **Cost at scale** | Grows with corpus size (more chunks retrieved) | Grows with conversation length (summaries accumulate) | Configurable ceiling: run a 200K model at 30K, ~85% fewer input tokens |
 | **Interpretability** | Medium (scores/chunks) | Low-medium (summary quality dependent) | High (tags, tool calls, budgets, sections, stored summaries) |
@@ -83,10 +83,10 @@ Two ways to integrate. Pick whichever fits:
 
 ### HTTP Proxy (zero code changes)
 
-Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently — inbound tagging, retrieval, history filtering, response tagging, compaction. Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats. Includes a [live dashboard](#live-dashboard).
+Point your existing LLM client at `localhost:5757` instead of the upstream API. The proxy handles everything transparently: inbound tagging, retrieval, history filtering, response tagging, compaction. Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats. Includes a [live dashboard](#live-dashboard).
 
 ```bash
-# Pick your upstream — format is auto-detected per request
+# Pick your upstream (format is auto-detected per request)
 virtual-context proxy --upstream https://api.anthropic.com
 virtual-context proxy --upstream https://api.openai.com
 virtual-context proxy --upstream https://generativelanguage.googleapis.com
@@ -111,7 +111,7 @@ cp virtual-context.yaml.example virtual-context.yaml
 virtual-context -c virtual-context.yaml proxy
 ```
 
-**Multi-instance mode** — multiple providers on different ports in one process:
+**Multi-instance mode:** multiple providers on different ports in one process:
 
 ```yaml
 proxy:
@@ -127,7 +127,7 @@ proxy:
       label: gemini
 ```
 
-**Daemon mode** — run as a background service:
+**Daemon mode:** run as a background service:
 
 ```bash
 virtual-context onboard --install-daemon --upstream https://api.anthropic.com
@@ -144,7 +144,7 @@ from virtual_context import VirtualContextEngine, Message
 
 engine = VirtualContextEngine(config_path="./virtual-context.yaml")
 
-# BEFORE sending to LLM — retrieve relevant stored context
+# BEFORE sending to LLM: retrieve relevant stored context
 assembled = engine.on_message_inbound(
     message="What was the Henninger filing deadline?",
     conversation_history=messages,
@@ -152,7 +152,7 @@ assembled = engine.on_message_inbound(
 # assembled.prepend_text → enriched system prompt with retrieved summaries
 # assembled.matched_tags → ["legal", "filing"]
 
-# AFTER LLM responds — tag, index, compact if needed
+# AFTER LLM responds: tag, index, compact if needed
 report = engine.on_turn_complete(messages)
 if report:
     print(f"Compacted {report.segments_compacted} segments, freed {report.tokens_freed:,} tokens")
@@ -173,7 +173,7 @@ Set these to allow OpenClaw to maintain large context windows from a client pers
   // global fallback
   "messages": { "groupChat": { "historyLimit": 99999 } }
 
-  // 2. Model context window — must be on the provider in the per-agent models.json, with
+  // 2. Model context window: must be on the provider in the per-agent models.json, with
   // explicit model entries:
   "anthropic": {
     "baseUrl": "https://anthropic.virtual-context.com?vckey=...",
@@ -189,11 +189,11 @@ Set these to allow OpenClaw to maintain large context windows from a client pers
 ```
 
   Just setting baseUrl alone isn't enough - without model entries, it falls back to pi-ai's
-  hardcoded 200K. And models.overrides in the global config is display only — it doesn't affect
+  hardcoded 200K. And models.overrides in the global config is display only; it doesn't affect
   actual windowing.
 
 ```
-  3. Context pruning — disable it so the proxy controls windowing:
+  3. Context pruning: disable it so the proxy controls windowing:
   "agents": {
     "defaults": {
       "contextPruning": { "mode": "off" },
@@ -260,7 +260,7 @@ Retrieve matching summaries from store
     │  ├─ Recall-all tool call? → load ALL tag summaries (bounded by token budget)
     │  ├─ Temporal query? → load segment summaries sorted earliest-first (Layer 1)
     │  ├─ Query expansion: primary tags + related tags widen the search
-    │  ├─ Overfetch 3x → IDF-weighted re-rank (rare tag matches score higher)
+    │  ├─ 3-signal RRF fusion: IDF tag overlap (0.50) + BM25 keyword (0.30) + embedding similarity (0.20)
     │  ├─ FTS fallback: if tag overlap finds nothing, full-text search on stored segments
     │  └─ Deep retrieval: full stored segment fetch for top matches
     │
@@ -380,7 +380,7 @@ Temporal reasoning requires knowing *when* each piece of information was recorde
     → assembled context: <virtual-context session="2023/05/25">
 ```
 
-The segmenter forces a new segment boundary whenever the session date changes, even if the primary tag is the same. This guarantees no segment spans multiple sessions. When the reader sees two conflicting facts — "sneakers under my bed" (session 2023/05/25) and "moved sneakers to shoe rack" (session 2023/05/29) — it can determine temporal ordering and answer correctly.
+The segmenter forces a new segment boundary whenever the session date changes, even if the primary tag is the same. This guarantees no segment spans multiple sessions. When the reader sees two conflicting facts ("sneakers under my bed" (session 2023/05/25) and "moved sneakers to shoe rack" (session 2023/05/29)), it can determine temporal ordering and answer correctly.
 
 For proxy/OpenClaw conversations, session dates come from envelope metadata timestamps (e.g., `"Tue 2026-03-17 00:35 EDT"` parsed from the `Conversation info` metadata block) or `Message.timestamp`. The compactor prepends a `[Session: March 17, 2026 12:35 AM]` header to each segment's conversation text, so the summarization LLM sees the actual conversation time and can reason temporally (e.g., "last night" vs "two days ago").
 
@@ -423,7 +423,7 @@ vc_query_facts(fact_type="preference")
 
 **Fact supersession.** When new information contradicts or updates a previously stored fact ("I moved from NYC to LA"), the supersession checker detects the conflict and marks the old fact as superseded. Detection uses object-keyword similarity to find cross-session candidates that share the same subject and semantic domain, then an LLM verifies whether the new fact genuinely replaces the old one. Superseded facts are retained in storage (for audit) but excluded from query results.
 
-**Fact graph.** Facts aren't isolated triples — they have relationships. "User led Project Alpha" and "Project Alpha uses Python" are connected by a `PART_OF` relationship. "User moved from NYC to LA" `SUPERSEDES` the older "User lives in NYC." virtual-context automatically detects these relationships during the same LLM pass that checks for supersession (zero additional API calls) and stores them as typed, directed links between facts. Six relationship types are supported: `SUPERSEDES`, `CAUSED_BY`, `PART_OF`, `CONTRADICTS`, `SAME_AS`, and `RELATED_TO`. When `vc_query_facts` returns results, linked facts are automatically included via 1-hop traversal — the reader gets richer context without needing to know the graph exists. In SQLite, links are stored in a `fact_links` table with BFS traversal; graph database backends (Neo4j, FalkorDB) represent them as native edges.
+**Fact graph.** Facts aren't isolated triples; they have relationships. "User led Project Alpha" and "Project Alpha uses Python" are connected by a `PART_OF` relationship. "User moved from NYC to LA" `SUPERSEDES` the older "User lives in NYC." virtual-context automatically detects these relationships during the same LLM pass that checks for supersession (zero additional API calls) and stores them as typed, directed links between facts. Six relationship types are supported: `SUPERSEDES`, `CAUSED_BY`, `PART_OF`, `CONTRADICTS`, `SAME_AS`, and `RELATED_TO`. When `vc_query_facts` returns results, linked facts are automatically included via 1-hop traversal, so the reader gets richer context without needing to know the graph exists. In SQLite, links are stored in a `fact_links` table with BFS traversal; graph database backends (Neo4j, FalkorDB) represent them as native edges.
 
 **Semantic verb expansion.** Queries like `verb="runs"` automatically expand to morphologically similar verbs in the database (e.g., "running", "run", "jogs") via sentence-transformer embedding similarity. This means the reader doesn't need to guess the exact verb form used during extraction.
 
@@ -446,7 +446,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Model-tiered delegation.** Not all LLMs are equally capable of managing their own context. Weaker models (Haiku, small open-source) get a simplified topic list and can request expansions, but virtual-context handles all eviction decisions silently. Stronger models (Opus, Sonnet, GPT-4) see a full budget dashboard with token costs per topic, available budget, and depth levels, making explicit trade-off decisions. In both modes, virtual-context enforces budget constraints and falls back to automatic management when the LLM doesn't manage. The LLM drives, virtual-context enforces, like `madvise()` hints with kernel enforcement.
 
-**Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query — FTS results are supplemented with semantic matches to fill the result set. Each call returns a fixed top 20 results. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
+**Full-text search with semantic enrichment.** When tag-based retrieval misses (content filed under an unexpected topic, detail too specific for summaries), `find_quote` searches stored conversation text directly using two complementary strategies. FTS5 handles exact and partial keyword matches. Semantic search (segment text chunked into overlapping windows, embedded with sentence-transformers, matched by cosine similarity) surfaces paraphrased references that share no lexical overlap with the original text. Both run on every query; FTS results are supplemented with semantic matches to fill the result set. Each call returns a fixed top 20 results. Results include the matching excerpt, session date, match type, and all tags on the segment, so the LLM can chain into `expand_topic` for broader context.
 
 **Working-set optimization.** Read-only tools (`find_quote`, `query_facts`, `recall_all`, `remember_when`) skip the expensive context reassembly step. Only `expand_topic` and `collapse_topic` (which change the working set) trigger a full context rebuild. This reduces per-round overhead in tool chains that make multiple read-only calls before expanding.
 
@@ -454,7 +454,7 @@ When the LLM needs more detail on a topic ("What was the exact sourdough timing?
 
 **Budget-aware reader prompting.** The context hint tells the reader exactly how many tool rounds it has, encouraging strategic tool use: "You have a maximum of N tool rounds. Plan your strategy upfront: use diverse queries, not repetitions. If a search already returned the answer, stop and respond." This prevents the reader from exhausting all rounds on redundant searches when the answer was found on the first call.
 
-**Multi-provider tool loop.** The tool loop supports Anthropic, OpenAI, and Gemini as reader models via a `ProviderAdapter` pattern. Each adapter handles provider-specific request/response formats, tool call parsing, and context injection. The reader model can be different from the upstream provider — e.g., use GPT-5 Codex as the reader with an Anthropic upstream, or Gemini as the reader with an OpenAI upstream.
+**Multi-provider tool loop.** The tool loop supports Anthropic, OpenAI, and Gemini as reader models via a `ProviderAdapter` pattern. Each adapter handles provider-specific request/response formats, tool call parsing, and context injection. The reader model can be different from the upstream provider, e.g., use GPT-5 Codex as the reader with an Anthropic upstream, or Gemini as the reader with an OpenAI upstream.
 
 **Resilient continuation.** When the tool loop exhausts all rounds and forces a final text-only continuation, transient HTTP errors (server 500s) are retried once with a brief delay before falling back to error state. This prevents a single upstream hiccup from discarding an otherwise complete answer.
 
@@ -509,7 +509,7 @@ This is the second emergent property of the system. Vocabulary convergence (the 
 - **Vocabulary entropy reduction**: Canonicalization + tag feedback lowers random tag drift and improves cross-turn consistency.
 - **Budget-shaped recall selection**: Budget-aware assembly consistently favors high-value context under tight token ceilings.
 - **Compaction survivorship effects**: Frequently reinforced facts stay highly retrievable, while low-signal details trend toward summary-level recall.
-- **Semantic verb bridging**: Verb expansion at query time lets the reader find facts regardless of morphological form — "runs" finds facts stored as "running", "jogging", "exercises".
+- **Semantic verb bridging**: Verb expansion at query time lets the reader find facts regardless of morphological form: "runs" finds facts stored as "running", "jogging", "exercises".
 
 Split tags are registered as aliases via TagCanonicalizer, so historical queries against the old tag still resolve. New sub-tags enter the vocabulary feedback loop immediately. The splitter never reuses existing tag names (which would cause cascading splits); it always creates new compound tags.
 
@@ -530,7 +530,7 @@ virtual-context solves this with two complementary mechanisms:
 
 **Related tag expansion.** Both the tagger (query-side) and compactor (write-side) generate `related_tags` (alternate terms someone might use to refer to the same concepts). A segment about "materialized views" gets stored with related tags like `caching`, `precomputed`, `feed-optimization`. A query about "caching trick" generates related tags that overlap with stored segments. The retriever expands its search to include both primary and related tags.
 
-**IDF-weighted scoring.** When multiple segments match, common tags like `database` (appearing on 20+ segments) shouldn't score the same as rare tags like `postgres` (appearing on 3). The retriever computes inverse document frequency weights from tag usage counts, overfetches 3x the needed results, then re-ranks by `sum(IDF[tag])`. Related tag matches score at 0.5x weight. The correct segment surfaces even when all overlapping tags are high-frequency.
+**3-signal RRF retrieval scoring.** When multiple segments match, the retriever fuses three independent ranking signals via Reciprocal Rank Fusion (k=60): IDF-weighted tag overlap (weight 0.50, where rare tags like `postgres` outweigh common ones like `database`), BM25 full-text search on tag and segment summaries (weight 0.30, catching content tagged under unrelated topics), and embedding cosine similarity against stored tag summary embeddings (weight 0.20, providing semantic rescue when neither tags nor keywords match). Three post-fusion filters refine results: gravity dampening halves embedding-only candidates lacking keyword support, hub dampening penalizes high-frequency tags that dominate without relevance, and resolution boost lifts tags containing actionable extracted facts.
 
 ### Budget-Aware Assembly
 
@@ -550,7 +550,7 @@ tag_rules:
 
 Higher-priority tags get assembled first. If the budget runs out, lower-priority summaries are dropped. The budget breakdown is fully transparent: core context, context hint, tag sections, and conversation history each have their own allocation.
 
-This budget enforcement is what makes the configurable context ceiling work in practice. A 30K ceiling doesn't mean losing information — it means the assembler is forced to prioritize, and the compression hierarchy ensures everything is still available at some depth level. The model reasons over a dense, curated context instead of a sprawling raw history.
+This budget enforcement is what makes the configurable context ceiling work in practice. A 30K ceiling doesn't mean losing information; it means the assembler is forced to prioritize, and the compression hierarchy ensures everything is still available at some depth level. The model reasons over a dense, curated context instead of a sprawling raw history.
 
 ## Configuration
 
@@ -629,9 +629,9 @@ virtual-context chat --replay vc-session.json
 
 **Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state from the store. Multiple concurrent conversations are routed independently via a session registry.
 
-**Conversation-scoped retrieval.** All store retrieval methods are scoped by `conversation_id`. Multiple conversations sharing the same SQLite database are fully isolated — a new conversation never gets context from another conversation's segments.
+**Conversation-scoped retrieval.** All store retrieval methods are scoped by `conversation_id`. Multiple conversations sharing the same SQLite database are fully isolated; a new conversation never gets context from another conversation's segments.
 
-**Session suppression.** When a session has no compacted data, the pipeline is suppressed — requests pass through as-is. Once the first compaction runs, the pipeline activates automatically.
+**Session suppression.** When a session has no compacted data, the pipeline is suppressed; requests pass through as-is. Once the first compaction runs, the pipeline activates automatically.
 
 **History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period.
 
@@ -680,7 +680,8 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **TagGenerator** | `core/tag_generator.py` | LLM and keyword semantic tagging with vocabulary feedback + per-turn fact signal extraction |
 | **EmbeddingTagGenerator** | `core/embedding_tag_generator.py` | Sentence-transformers cosine similarity against tag vocabulary |
 | **TagCanonicalizer** | `core/tag_canonicalizer.py` | Alias detection, plural folding, normalization |
-| **Retriever** | `core/retriever.py` | IDF-weighted tag retrieval, related tag expansion, FTS fallback |
+| **Retriever** | `core/retriever.py` | 3-signal RRF fusion retrieval (IDF + BM25 + embedding), related tag expansion, dampening filters |
+| **RetrievalScoring** | `core/retrieval_scoring.py` | RRF fusion, gravity/hub/resolution dampening |
 | **Assembler** | `core/assembler.py` | Budget-aware context assembly with priority ordering |
 | **Monitor** | `core/monitor.py` | Two-tier threshold detection (soft/hard) |
 | **Segmenter** | `core/segmenter.py` | Turn pairing + contiguous tag grouping via TurnTagIndex |
@@ -703,7 +704,7 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 
 ### Storage Backends
 
-The storage layer is decomposed into five focused protocols — `SegmentStore`, `FactStore`, `FactLinkStore`, `StateStore`, `SearchStore` — composed via a `CompositeStore`. Each backend implements the protocols it's suited for; the rest fall back to SQLite.
+The storage layer is decomposed into five focused protocols (`SegmentStore`, `FactStore`, `FactLinkStore`, `StateStore`, `SearchStore`) composed via a `CompositeStore`. Each backend implements the protocols it's suited for; the rest fall back to SQLite.
 
 ```yaml
 storage:
@@ -714,7 +715,7 @@ storage:
 
 **FilesystemStore**: Debug/inspection backend. Markdown files with YAML frontmatter, organized by tag directory. Human-readable, git-friendly. Thread-safe with atomic index writes and persisted tag aliases.
 
-**Postgres** (planned): Full protocol coverage — segments, facts, links, state, search — in a single relational database with pgvector for embeddings.
+**Postgres** (planned): Full protocol coverage (segments, facts, links, state, search) in a single relational database with pgvector for embeddings.
 
 **Neo4j / FalkorDB** (planned): Graph-native backends for `FactStore` + `FactLinkStore`. Facts become nodes, relationships become typed edges with native Cypher traversal. Segments, state, and search fall back to SQLite.
 
@@ -736,9 +737,9 @@ Both providers reuse a persistent `httpx.Client` across calls (connection poolin
 
 **Two-phase fact verification.** Per-turn fact signals are treated as hints, not ground truth. They are verified and consolidated at compaction time with the full multi-turn segment as context. This catches extraction errors that single-pass systems commit permanently.
 
-**Compression improves reasoning, not just cost.** A 200K model running at a 30K ceiling doesn't just save tokens — it concentrates the model's attention on curated, high-signal context. Research on long-context attention degradation ("lost in the middle") shows that facts buried deep in long sequences are missed more often than the same facts presented in a shorter, structured window. The configurable ceiling turns context compression from a cost optimization into a quality improvement.
+**Compression improves reasoning, not just cost.** A 200K model running at a 30K ceiling doesn't just save tokens; it concentrates the model's attention on curated, high-signal context. Research on long-context attention degradation ("lost in the middle") shows that facts buried deep in long sequences are missed more often than the same facts presented in a shorter, structured window. The configurable ceiling turns context compression from a cost optimization into a quality improvement.
 
-**Tag overlap with IDF scoring, not vector similarity.** Retrieval matches by IDF-weighted tag overlap, not cosine similarity. Related tag expansion handles vocabulary mismatch. Faster (no embedding computation at query time), fully interpretable, and composable with the tag hierarchy.
+**Multi-signal retrieval, not vector similarity alone.** Retrieval fuses three signals via Reciprocal Rank Fusion: IDF-weighted tag overlap (primary), BM25 keyword search on summaries, and embedding cosine similarity as a semantic rescue signal. Each signal independently ranks candidates; RRF combines them so that keyword and embedding evidence can surface content that the tag vocabulary alone would miss. Post-fusion dampening filters (gravity, hub, resolution) refine results. Fully interpretable and composable with the tag hierarchy.
 
 **Vocabulary feedback, not few-shot.** The LLM tagger gets a live vocabulary of tags already used in the session and store, and is instructed to reuse them when the topic matches. Convergence without manual curation.
 
@@ -764,13 +765,13 @@ Memory protection       ←→  Bleed gating (topic-shift isolation)
 madvise() hints         ←→  Model-tiered delegation (strong models manage, weak models get managed)
 ```
 
-Before virtual memory, programs were limited to physical RAM. Developers manually segmented code into overlays and loaded them from disk. Virtual memory removed the constraint transparently — programs addressed more memory than physically existed, and the OS handled paging. This enabled modern multitasking, process isolation, and every program running today.
+Before virtual memory, programs were limited to physical RAM. Developers manually segmented code into overlays and loaded them from disk. Virtual memory removed the constraint transparently: programs addressed more memory than physically existed, and the OS handled paging. This enabled modern multitasking, process isolation, and every program running today.
 
-LLMs have the same constraint: the context window is their RAM. The industry's current answers — bigger windows (just buy more RAM), RAG (manual overlay management), prompt caching (cheaper RAM) — mirror the pre-virtual-memory era. They work, but they're bounded. A 1M token window is still a ceiling. Manual retrieval requires the agent to know what it doesn't know.
+LLMs have the same constraint: the context window is their RAM. The industry's current answers (bigger windows (just buy more RAM), RAG (manual overlay management), prompt caching (cheaper RAM)) mirror the pre-virtual-memory era. They work, but they're bounded. A 1M token window is still a ceiling. Manual retrieval requires the agent to know what it doesn't know.
 
 virtual-context removes the constraint. The agent sees what appears to be infinite context. Paging, compression, eviction, and retrieval happen transparently. The agent just reasons, and relevant context surfaces when needed. This is the same architectural decision, applied to a different substrate.
 
-The implication: any agent that needs to run continuously — across hundreds of turns, across sessions, across days — needs a memory management layer between itself and the LLM, the same way any program that needs more than physical RAM needs a memory management layer between itself and the hardware. Bigger windows don't solve this. External knowledge bases don't solve this. Only active, transparent, in-conversation context management solves this.
+The implication: any agent that needs to run continuously (across hundreds of turns, across sessions, across days) needs a memory management layer between itself and the LLM, the same way any program that needs more than physical RAM needs a memory management layer between itself and the hardware. Bigger windows don't solve this. External knowledge bases don't solve this. Only active, transparent, in-conversation context management solves this.
 
 ## Stress-Tested
 
@@ -781,7 +782,7 @@ virtual-context has been validated across multiple dimensions: adversarial promp
 100-turn conversations with deliberately overlapping domains (Flask IoT API, music studio, ML pipeline, cross-domain integration), vocabulary mismatches, ambiguous callbacks, and cross-domain synthesis queries, using a 3,000-token context window with Claude Haiku:
 
 - **Cross-vocabulary recall**: "caching trick for the feed" correctly retrieves "materialized view" despite zero primary tag overlap. Related tag expansion bridges the vocabulary gap
-- **IDF-weighted precision**: "precomputed summary table" retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`
+- **RRF-scored precision**: "precomputed summary table" retrieves the correct segment over 20+ competing segments sharing common tags like `database` and `performance`, with hub dampening preventing high-frequency tags from dominating
 - **Ambiguous multi-match**: "what middleware pattern?" correctly identifies both auth and logging middleware across 4 overlapping domains; "plugins - Flask, audio, or ML?" correctly disambiguates
 - **Temporal recall**: "going back to the very beginning, what were the key decisions?" retrieves original Flask blueprint architecture from turn 1 via segment-level retrieval, even after 4 compaction events
 - **Overview query bounding**: `vc_recall_all` can load 22 bundled tag summaries while staying bounded at ~2,900 tokens post-compaction
@@ -800,7 +801,7 @@ The proxy has been validated in production with OpenClaw (Telegram bot) handling
 
 ### LongMemEval Benchmark
 
-A built-in benchmark harness (`benchmarks/longmemeval/`) evaluates virtual-context against the [LongMemEval dataset](https://arxiv.org/abs/2410.10813) (ICLR 2025) — 500 questions requiring recall across long conversation histories.
+A built-in benchmark harness (`benchmarks/longmemeval/`) evaluates virtual-context against the [LongMemEval dataset](https://arxiv.org/abs/2410.10813) (ICLR 2025), 500 questions requiring recall across long conversation histories.
 
 The harness runs each question through both a baseline (full-haystack) reader and a virtual-context reader, then judges correctness via LLM evaluation. Supports Anthropic, OpenAI, Google, and OpenAI Codex as reader backends. Budget tracking via ModelCatalog ensures cost visibility per run.
 
@@ -831,7 +832,7 @@ python -m pytest tests/ollama/ -v -m ollama          # integration (requires Oll
 | Avg Tokens/Question | 52,347 | 117,582 |
 | Avg Cost/Question | $0.16 | $0.36 |
 | Total Cost | $15.99 | $35.56 |
-| Token Reduction | 2.2x fewer | — |
+| Token Reduction | 2.2x fewer | -- |
 
 #### Accuracy by Question Type
 

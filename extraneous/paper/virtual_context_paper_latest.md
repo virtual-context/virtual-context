@@ -9,7 +9,7 @@ kidw.ai
 
 Large language models face a fundamental constraint: fixed context windows that cannot accommodate the accumulated context of long-running interactions (whether multi-session conversations, agentic tool-call chains, or workflows that generate substantial context through continuous operation). Existing approaches either silently drop old messages, retrieve via embedding similarity (RAG), or compress everything into summaries, each failing for distinct reasons. RAG misses vocabulary-mismatched content; compression loses specific details; full context suffers from attention degradation ("lost in the middle"). A subtler problem cuts across all retrieval-based approaches: they are *additive*: retrieving chunks that compete for the same context window the agent is working in right now, without managing the window itself. No existing system compresses, evicts, and pages context the way an operating system manages memory.
 
-We present Virtual Context (VC), a system that virtualizes LLM context the same way an OS virtualizes memory. A client application addresses a context space of 20 million tokens; the model's real window is 200K; VC sits between them and makes it work: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The model sees a dense 60K-token window where every token is signal. Interaction turns are tagged by topic, compressed into a three-layer hierarchy (raw turns, segment summaries, tag summaries), and paged in and out of the context window on demand. A two-pass fact extraction pipeline produces structured, queryable facts with temporal status tracking and knowledge-update detection via supersession chains. At query time, a reader LLM receives compressed summaries and a suite of five retrieval tools (`find_quote`, `query_facts`, `expand_topic`, `remember_when`, `recall_all`) to drill into details within a bounded token budget.
+We present Virtual Context (VC), a system that virtualizes LLM context the same way an OS virtualizes memory. A client application addresses a context space of 20 million tokens.  The model's real window is 200K.   VC sits between them and makes it work: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The model sees a dense 60K-token window where every token is signal. Interaction turns are tagged by topic, compressed into a three-layer hierarchy (raw turns, segment summaries, tag summaries), and paged in and out of the context window on demand. A two-pass fact extraction pipeline produces structured, queryable facts with temporal status tracking and knowledge-update detection via supersession chains. At query time, a reader LLM receives compressed summaries and a suite of five retrieval tools (`find_quote`, `query_facts`, `expand_topic`, `remember_when`, `recall_all`) to drill into details within a bounded token budget.
 
 On LongMemEval (100 random questions from the 500-question benchmark), VC achieves **95% accuracy** compared to **33%** for a full-context baseline using the same mid-tier reader model (Claude Sonnet 4.5), while consuming **55% fewer tokens** on average (52,347 vs. 117,582) at **55% lower cost** ($0.16 vs. $0.36/question) with only **1.5x latency overhead** (12.7s vs. 8.7s). VC achieves 100% accuracy on knowledge-update questions (vs. 29.4% baseline) where fact supersession chains are critical, and 92.9% on temporal-reasoning questions (vs. 32.1%). Analysis of tool call chains reveals 8 emergent retrieval patterns, with 82% of questions answered in 1--2 tool calls. These results demonstrate that structured context management is a higher-leverage investment than model capability: a mid-tier model with VC delivers accuracy that raw full context cannot match at any model tier, at an estimated 3.7x cost reduction versus flagship full-context deployment at standard scale, growing to 22x at realistic conversation lengths (~860K tokens) where baselines fail entirely.
 
@@ -58,7 +58,7 @@ We make five technical contributions:
 
 5. **A tool-augmented reader architecture with five retrieval tools.** Rather than passively consuming dumped context, the reader LLM actively queries the memory store using `find_quote` (full-text + semantic search), `query_facts` (structured fact lookup with semantic verb expansion), `expand_topic` (demand paging), `remember_when` (time-scoped recall), and `recall_all` (load all summaries). A synchronous tool loop runs up to 10 continuation rounds within a single user-visible request.
 
-MemGPT (Packer et al., 2023) proposed the analogy between OS memory hierarchies and LLM context management. In practice, the system used function calls to search and retrieve from external storage — the LLM itself decided what to save, search, and evict, operating as both kernel and application simultaneously.
+MemGPT (Packer et al., 2023) proposed the analogy between OS memory hierarchies and LLM context management. In practice, the system used function calls to search and retrieve from external storage; the LLM itself decided what to save, search, and evict, operating as both kernel and application simultaneously.
 
 VC starts from a different premise: the context window is a managed resource, not a search interface. An external kernel handles compaction, tagging, fact extraction, eviction, and working set tracking transparently. The LLM operates in userspace, issuing tool calls against a context window that has already been curated: it reasons about the user's task, not about its own memory. This architectural separation is what enables the full OS mechanism set: page tables (tag index + tag summaries), prefetch (embedding-matched facts and tag summaries pre-loaded before query), demand paging (expand_topic), LRU eviction (auto-collapse of coldest topics), working set management (depth-level tracking per tag), and soft/hard page replacement thresholds (compaction triggers at 70% and 85% utilization).
 
@@ -133,7 +133,7 @@ VC uses a two-tagger architecture that separates the write path (high quality, s
 
 **Write-path tagger (LLM-based).** During `on_turn_complete`, each user/assistant pair is tagged by an LLM. The tagger receives the current text, up to 5 pairs of recent conversation context (subject to bleed gating), and a curated list of existing tags (filtered by embedding similarity to top 30 + high-frequency fill). The tagger produces 5--10 tags per turn along with lightweight `FactSignal` objects.
 
-**Read-path tagger (embedding-based).** During `on_message_inbound`, the user's question is matched against cached tag embeddings using cosine similarity (threshold 0.3) with a sentence-transformer model (all-MiniLM-L6-v2). This produces sub-millisecond tag matching without an LLM call, enabling real-time retrieval.
+**Read-path tagger (embedding-based).** During `on_message_inbound`, the user's question is matched against cached tag embeddings using cosine similarity (threshold 0.3) with a sentence-transformer model (all-MiniLM-L6-v2). This produces sub-millisecond tag matching without an LLM call. The resulting tags and query embedding feed into the multi-signal retrieval scoring described in Section 3.3.1.
 
 **Context bleed gate.** To prevent stale context from causing mistagging on topic shifts, a cosine similarity gate (threshold 0.1) between the current text and the most recent context suppresses context injection entirely when the user switches topics abruptly. This prevents the tagger from being biased by irrelevant prior discussion.
 
@@ -143,7 +143,7 @@ VC uses a two-tagger architecture that separates the write path (high quality, s
 
 ### 3.3 Segmentation and Compression
 
-**Segmentation.** The `TopicSegmenter` groups contiguous same-tag turns into segments, with forced splits on session date changes (preventing cross-session segments). Segments are the atomic unit of storage and retrieval.
+**Segmentation.** The `TopicSegmenter` groups turns into segments using multi-signal relatedness scoring. For each pair of consecutive turns, three independent signals are computed: tag overlap (intersection over minimum set size), embedding similarity of the turn text (discounted to 0.9x), and keyword overlap via Jaccard similarity (discounted to 0.8x). The final score is the MAX of these three signals, so each signal can only lift, never dilute. This ensures that two turns sharing a tag are never split by a low embedding score, while embedding similarity can rescue turns that discuss the same topic under different tags. Turns with a relatedness score below 0.5 are split into separate segments. Same-tag turns within a single session are always merged regardless of score. Session date boundaries force a split (preventing cross-session segments). Hard caps of 20 turns per segment and 30-minute temporal gaps provide additional split triggers. Segments are the atomic unit of storage and retrieval.
 
 **Two-tier compaction thresholds.** Modeled on OS page replacement:
 - **Soft threshold (70%):** Emits a compaction signal that triggers background compaction of turns older than the protected window.
@@ -151,9 +151,31 @@ VC uses a two-tagger architecture that separates the write path (high quality, s
 
 Protected recent turns (default: 6 pairs) are never compacted, ensuring the most recent conversation context remains at full fidelity.
 
-**Compression algorithm.** Each segment is independently compressed by an LLM to a target of 15% of original token count (clamped to 200--2000 tokens). The compression prompt enforces critical constraints: exact numbers must be preserved (no rounding), present-tense declarations maintained, planning language preserved as planning (not assertions), and user role phrases kept intact.
+**Compression algorithm.** Compaction runs in two passes. First, a merge-preparation pass identifies segments that should be combined based on multi-signal relatedness scoring (Section 3.3), consolidating related content before LLM processing. Second, a batch LLM compression pass processes each segment (or merged group) to a target of 15% of original token count (clamped to 200--2000 tokens). The compression prompt enforces critical constraints: exact numbers must be preserved (no rounding), present-tense declarations maintained, planning language preserved as planning (not assertions), and user role phrases kept intact.
 
 **Greedy set cover for tag summaries.** After compaction, the system selects the minimum set of tags that covers all compacted turns using a standard greedy set cover algorithm (O(n log n) approximation). The algorithm iterates: at each step, select the tag covering the most uncovered turns, mark those turns as covered, repeat. A primary tag guarantee ensures each segment's most specific tag is always included in the cover, even if the greedy algorithm drops it.
+
+**Segment merge-back.** Across compaction cycles, the system coalesces same-topic segments that were initially separated. When a new segment is compacted, it is compared against existing stored segments using the same MAX-of-signals relatedness scoring. Candidates above the merge threshold (0.35) are merged, combining their summaries and facts. This prevents topic fragmentation over long conversations where the same subject is revisited across many sessions.
+
+#### 3.3.1 Retrieval Scoring: Multi-Signal Fusion
+
+At query time, VC selects which tag summaries to load into the reader's context using Reciprocal Rank Fusion (RRF) across three independent signals:
+
+1. **IDF-weighted tag overlap.** The primary signal. Query tags and related tags are matched against stored tag summaries, scored by inverse document frequency so that rare, specific tags (e.g., "postgres-materialized-views") outweigh common ones (e.g., "database"). Weight: 0.50.
+
+2. **BM25 full-text search.** Tag summary text and segment summaries are searched via FTS5 for keywords from the query. This catches content that was tagged under unrelated topics but contains relevant terms. Weight: 0.30.
+
+3. **Embedding similarity.** The query embedding (produced by the read-path tagger) is compared against stored tag summary embeddings via cosine similarity (minimum threshold 0.25). This provides semantic rescue when neither tags nor keywords match. Weight: 0.20.
+
+Each signal independently ranks all candidate tags. RRF fusion (k=60) combines the three rankings into a single score per tag: `score += weight * 1/(k + rank + 1)`. Tags missing from a signal receive a penalty rank of 2k, allowing weaker signals to contribute without overwhelming the primary signal.
+
+Three post-fusion dampening filters refine the results:
+
+- **Gravity dampening** (pre-fusion): Embedding candidates with no BM25 keyword support have their scores halved, reducing hallucination-prone semantic matches that lack any lexical evidence.
+- **Hub dampening** (post-fusion): Tags present in many segments (above the 90th percentile of segment counts) are penalized unless they appear in the query tags, preventing common "hub" topics from dominating results.
+- **Resolution boost** (post-fusion): Tags containing actionable extracted facts receive a 15% score boost, preferring topics with structured queryable content.
+
+This replaces the earlier single-signal IDF-weighted tag overlap scoring with a system where keyword and semantic signals can rescue relevant content that the tag vocabulary alone would miss.
 
 ### 3.4 Structured Fact Extraction
 
@@ -247,6 +269,7 @@ This has practical significance for production deployments where per-query cost 
 - **Context budget:** 64K tokens (deliberately below the model's maximum to test compression effectiveness)
 - **Max tool loops:** 10
 - **Token counter:** Character-based estimate (len/4)
+- **Retrieval scoring:** 3-signal RRF fusion (IDF 0.50, BM25 0.30, embedding 0.20, k=60) with gravity, hub, and resolution dampening
 - **Compaction:** Summary ratio 15%, min 200 tokens, max 2,000 tokens
 - **Ingestion:** Fully cached per question; each question's conversation is ingested once, then reader runs against the cached store
 
@@ -701,6 +724,7 @@ The virtual memory analogy is not merely metaphorical; it is a principled design
 | Memory pressure | Token budget management |
 | Working set size | `tag_context_max_tokens` (30K) |
 | Page replacement policy | LRU eviction by `last_accessed_turn` |
+| Multi-level page table lookup | 3-signal RRF retrieval scoring (IDF + BM25 + embedding) |
 
 The implementation literally tracks working sets (`PagingManager.working_set`), implements LRU eviction (`_auto_evict` sorted by access recency), enforces memory pressure thresholds (70%/85% utilization triggers), and manages page tables (tag-to-segment mappings with depth levels).
 
