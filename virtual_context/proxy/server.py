@@ -159,6 +159,14 @@ def create_app(
                     ):
                         engine.config.conversation_id = latest.conversation_id
                         engine._load_persisted_state()
+                        # Re-initialize retriever with the restored conversation_id —
+                        # the original was built during __init__ with the auto-generated ID.
+                        engine._init_retriever()
+                        if hasattr(engine, '_retrieval'):
+                            engine._retrieval._retriever = engine._retriever
+                        # Also update paging with the restored conversation_id
+                        if hasattr(engine, '_paging'):
+                            engine._paging._conversation_id = engine.config.conversation_id
                         logger.info(
                             "Lossless restart: restored conversation %s (%d turns, compacted=%d)",
                             latest.conversation_id[:12], len(latest.turn_tag_entries),
