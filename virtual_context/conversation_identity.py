@@ -111,9 +111,10 @@ def _extract_system_prompt_hash(body: dict) -> str:
                     )
                 break
 
-    # Empty/falsy system prompts should not produce a hash — they would
-    # collapse all such requests into a single deterministic conversation ID.
-    if not system_text and not system_list:
+    # No extractable text — don't hash. A deterministic hash-of-nothing
+    # would collapse unrelated requests (multimodal-only system, empty list)
+    # into the same conversation ID.
+    if not system_text:
         return ""
 
     h = hashlib.sha256()
