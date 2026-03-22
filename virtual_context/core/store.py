@@ -314,6 +314,18 @@ class ContextStore(ABC):
     ) -> list:
         return []
 
+    def save_tool_call(self, call: dict) -> None:
+        """Persist a tool call record."""
+        pass
+
+    def load_tool_calls(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        """Load recent tool call records for a conversation."""
+        return []
+
+    def load_tool_call(self, call_id: int) -> dict | None:
+        """Load a single tool call by ID."""
+        return None
+
     def save_request_capture(self, capture: dict) -> None:
         pass
 

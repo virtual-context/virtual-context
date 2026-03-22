@@ -263,6 +263,15 @@ class CompositeStore:
     def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list:
         return self._search.search_tool_outputs(query, limit=limit, conversation_id=conversation_id)
 
+    def save_tool_call(self, call: dict) -> None:
+        return self._search.save_tool_call(call)
+
+    def load_tool_calls(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        return self._search.load_tool_calls(conversation_id, limit=limit)
+
+    def load_tool_call(self, call_id: int) -> dict | None:
+        return self._search.load_tool_call(call_id)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

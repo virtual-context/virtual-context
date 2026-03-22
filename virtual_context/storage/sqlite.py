@@ -541,6 +541,25 @@ class SQLiteStore(ContextStore):
                 PRIMARY KEY (tag, conversation_id)
             );
         """)
+        # Tool call persistence for dashboard
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                request_turn INTEGER NOT NULL,
+                round INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                tool_result TEXT NOT NULL,
+                result_length INTEGER NOT NULL,
+                duration_ms REAL NOT NULL,
+                found BOOLEAN,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_conv ON tool_calls(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_group ON tool_calls(group_id);
+        """)
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -2113,6 +2132,55 @@ class SQLiteStore(ContextStore):
             return {row["tag"] for row in rows}
         except Exception:
             return set()
+
+    # ------------------------------------------------------------------
+    # Tool call persistence (dashboard)
+    # ------------------------------------------------------------------
+
+    def save_tool_call(self, call: dict) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO tool_calls
+            (conversation_id, request_turn, round, group_id, tool_name,
+             tool_input, tool_result, result_length, duration_ms, found, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                call.get("conversation_id", ""),
+                call.get("request_turn", 0),
+                call.get("round", 1),
+                call.get("group_id", ""),
+                call.get("tool_name", ""),
+                json.dumps(call.get("tool_input", {})),
+                call.get("tool_result", ""),
+                call.get("result_length", 0),
+                call.get("duration_ms", 0),
+                call.get("found"),
+                call.get("timestamp", ""),
+            ),
+        )
+        # Ring buffer: keep last 50 per conversation
+        conv_id = call.get("conversation_id", "")
+        conn.execute(
+            """DELETE FROM tool_calls WHERE id NOT IN (
+                SELECT id FROM tool_calls WHERE conversation_id = ?
+                ORDER BY id DESC LIMIT 50
+            ) AND conversation_id = ?""",
+            (conv_id, conv_id),
+        )
+        conn.commit()
+
+    def load_tool_calls(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM tool_calls WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+            (conversation_id, limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def load_tool_call(self, call_id: int) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM tool_calls WHERE id = ?", (call_id,)).fetchone()
+        return dict(row) if row else None
 
     def close(self) -> None:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
