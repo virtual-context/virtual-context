@@ -149,6 +149,14 @@ class SessionRegistry:
         3. Claim unclaimed session (first request after startup)
         4. Create new session
         """
+        # --- 0. Explicit conversation marker (highest priority) ---
+        if conversation_id:
+            for sid, st in self._conversations.items():
+                if st.engine.config.conversation_id == conversation_id:
+                    if body is not None:
+                        self.update_last_message_hash(body, sid)
+                    return st, False
+
         sys_hash = ""
         msg_hash = ""
         if body is not None:
