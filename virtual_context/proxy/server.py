@@ -529,19 +529,22 @@ def create_app(
                                     _post_stats - _pre_stats,
                                     _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
 
-                # Upstream context enforcement
-                if _inbound_tokens > _upstream_limit:
+                # Passthrough payload trimming — trim to upstream_limit * ratio
+                _pt_ratio = state.engine.config.proxy.passthrough_trim_ratio if state else 0.40
+                _pt_limit = int(_upstream_limit * _pt_ratio) if _pt_ratio > 0 else _upstream_limit
+                if _inbound_tokens > _pt_limit:
                     from .message_filter import trim_to_upstream_limit
-                    body, _pt_trimmed = trim_to_upstream_limit(body, _upstream_limit, fmt)
+                    body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
                     if _pt_trimmed:
                         logger.info(
-                            "PASSTHROUGH_TRIM: payload~%dt exceeds upstream=%dt, trimmed %d pairs",
-                            _inbound_tokens, _upstream_limit, _pt_trimmed,
+                            "PASSTHROUGH_TRIM: payload=%dt trimmed to %dt (ratio=%.0f%%, upstream=%dt)",
+                            _inbound_tokens, _pt_limit, _pt_ratio * 100, _upstream_limit,
                         )
                         metrics.record({
                             "type": "upstream_trim",
                             "path": "passthrough",
                             "original_tokens": _inbound_tokens,
+                            "passthrough_limit": _pt_limit,
                             "upstream_limit": _upstream_limit,
                             "pairs_trimmed": _pt_trimmed,
                         })

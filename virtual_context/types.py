@@ -855,6 +855,7 @@ class ProxyConfig:
     llm_calls_log: str = ""  # path for JSONL log of all LLM calls (tagger, compactor, etc.)
     upstream_context_limit: int = 0  # 0 = auto-detect from model name
     history_widening_threshold: float = 0.10  # 10% growth + prefix change triggers re-ingest
+    passthrough_trim_ratio: float = 0.40  # trim passthrough payloads to upstream_limit * ratio (0=no trim)
     instances: list[ProxyInstanceConfig] = field(default_factory=list)
 
 
