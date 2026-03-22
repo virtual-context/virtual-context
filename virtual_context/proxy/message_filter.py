@@ -610,15 +610,38 @@ def trim_to_upstream_limit(
     if original_messages and original_messages[0].get("role") in ("system",):
         system_prefix = 1
 
-    # Identify user/assistant pairs (indices relative to original_messages)
-    pairs: list[tuple[int, int]] = []
+    # Identify atomic units: regular pairs or tool chains.
+    # A tool chain is an assistant[tool_use] → user[tool_result] → ... sequence
+    # that must be dropped or kept together.
+    # Each "pair" is a tuple of ALL message indices in the atomic unit.
+    pairs: list[tuple[int, ...]] = []
     i = system_prefix
     while i < len(original_messages) - 1:
-        if original_messages[i].get("role") in ("user", "human"):
-            pairs.append((i, i + 1))
-            i += 2
-        else:
+        msg = original_messages[i]
+        if msg.get("role") not in ("user", "human"):
             i += 1
+            continue
+        # Start of a turn: user message
+        chain_indices = [i, i + 1]  # user + assistant
+        j = i + 2
+        # Extend chain through tool rounds: tool_result user → assistant → ...
+        while j < len(original_messages) - 1:
+            next_msg = original_messages[j]
+            if next_msg.get("role") not in ("user", "human"):
+                break
+            # Check if this user message is tool_result-only
+            content = next_msg.get("content", "")
+            is_tool_result = False
+            if isinstance(content, list):
+                ctypes = {b.get("type") for b in content if isinstance(b, dict)}
+                is_tool_result = bool(ctypes and ctypes <= {"tool_result"})
+            if not is_tool_result:
+                break  # real user message, not part of tool chain
+            # tool_result user + next assistant = part of chain
+            chain_indices.extend([j, j + 1])
+            j += 2
+        pairs.append(tuple(chain_indices))
+        i = chain_indices[-1] + 1
 
     if len(pairs) <= 2:
         return body, 0
@@ -640,9 +663,8 @@ def trim_to_upstream_limit(
         total_pairs_removed = trimmable_count
         drop_indices: set[int] = set()
         for pair_idx in range(total_pairs_removed):
-            u_idx, a_idx = pairs[pair_idx]
-            drop_indices.add(u_idx)
-            drop_indices.add(a_idx)
+            for idx in pairs[pair_idx]:
+                drop_indices.add(idx)
         new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
         trimmed_body = dict(body)
         trimmed_body[msg_key] = new_messages
@@ -667,9 +689,8 @@ def trim_to_upstream_limit(
 
         drop_indices: set[int] = set()
         for pair_idx in range(total_pairs_removed):
-            u_idx, a_idx = pairs[pair_idx]
-            drop_indices.add(u_idx)
-            drop_indices.add(a_idx)
+            for idx in pairs[pair_idx]:
+                drop_indices.add(idx)
 
         new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
         trimmed_body = dict(body)
