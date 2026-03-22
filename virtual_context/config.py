@@ -314,6 +314,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         ),
         request_log_max_files=proxy_raw.get("request_log_max_files", 50),
         upstream_context_limit=proxy_raw.get("upstream_context_limit", 0),
+        passthrough_trim_ratio=proxy_raw.get("passthrough_trim_ratio", 0.40),
         instances=instances,
     )
 
