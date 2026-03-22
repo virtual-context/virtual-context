@@ -609,7 +609,7 @@ def trim_to_upstream_limit(
 
     msg_key = _get_message_key(fmt)
     original_messages = body.get(msg_key, [])
-    if not original_messages:
+    if not original_messages or not isinstance(original_messages, list):
         return body, 0
 
     # Identify system prefix (not trimmable)
