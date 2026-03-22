@@ -283,7 +283,14 @@ class ProxyState:
 
         Compaction (if needed) fires automatically in a separate pool
         once tagging completes — the next request only waits for tagging.
+
+        Skipped entirely during ingestion — the live tagger would write to
+        turn numbers that conflict with historical turns being ingested.
+        Ingestion handles all tagging; post-ingestion compaction handles the rest.
         """
+        if self._state == SessionState.INGESTING:
+            logger.info("fire_turn_complete skipped (ingestion in progress)")
+            return
         self._pending_tag = self._pool.submit(
             self._run_tag_turn, history_snapshot, payload_tokens, turn_id,
         )
