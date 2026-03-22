@@ -318,6 +318,24 @@ class ProxyMetrics:
                 ),
                 "tool_intercepts": list(tool_intercepts),
                 "total_tool_intercepts": len(tool_intercepts),
+                "total_tool_calls": len(tool_intercepts),
+                "tool_calls_by_name": {
+                    name: sum(1 for tc in tool_intercepts if tc.get("tool_name", "unknown") == name)
+                    for name in {tc.get("tool_name", "unknown") for tc in tool_intercepts}
+                },
+                "recent_tool_calls": [
+                    {
+                        "tool_name": tc.get("tool_name"),
+                        "tool_input": tc.get("tool_input"),
+                        "result": (tc.get("tool_result", "") or "")[:200],
+                        "duration_ms": tc.get("duration_ms", 0),
+                        "turn": tc.get("turn"),
+                        "conversation_id": tc.get("conversation_id", ""),
+                        "group_id": tc.get("group_id", ""),
+                        "timestamp": tc.get("ts", ""),
+                    }
+                    for tc in tool_intercepts[-20:]
+                ],
                 "compaction_progress": list(compaction_progress),
                 "telemetry": telemetry,
                 "budget_promoted": next(
