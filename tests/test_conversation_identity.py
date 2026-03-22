@@ -172,3 +172,43 @@ class TestResolveConversationId:
         a = resolve_conversation_id(body)
         b = resolve_conversation_id(body)
         assert a == b
+
+    def test_empty_system_list_no_collision(self):
+        """system=[] should NOT produce a deterministic hash — each call gets a fresh UUID."""
+        a = resolve_conversation_id({"system": [], "messages": [{"role": "user", "content": "hi"}]})
+        b = resolve_conversation_id({"system": [], "messages": [{"role": "user", "content": "bye"}]})
+        # Both should be valid UUIDs but different (no shared system prompt)
+        uuid.UUID(a)
+        uuid.UUID(b)
+
+    def test_multimodal_system_no_text_no_collision(self):
+        """A system list with only image blocks (no text) should not hash to a fixed UUID."""
+        body_a = {
+            "system": [{"type": "image", "source": {"data": "abc"}}],
+            "messages": [{"role": "user", "content": "describe this"}],
+        }
+        body_b = {
+            "system": [{"type": "image", "source": {"data": "xyz"}}],
+            "messages": [{"role": "user", "content": "describe that"}],
+        }
+        a = resolve_conversation_id(body_a)
+        b = resolve_conversation_id(body_b)
+        uuid.UUID(a)
+        uuid.UUID(b)
+        # Without the fix, both would hash "" to the same UUID
+        # With the fix, no system hash is produced, so they fall through to random
+
+    def test_openai_developer_image_only_no_collision(self):
+        """An OpenAI developer message with only image_url content should not collide."""
+        body = {
+            "messages": [
+                {"role": "developer", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                ]},
+                {"role": "user", "content": "What is this?"},
+            ],
+        }
+        a = resolve_conversation_id(body)
+        b = resolve_conversation_id(body)
+        uuid.UUID(a)
+        uuid.UUID(b)
