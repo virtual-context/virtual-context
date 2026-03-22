@@ -211,6 +211,18 @@ class SessionRegistry:
             from . import server as _srv  # noqa: avoid circular at module level
             engine = _srv.VirtualContextEngine(config_path=self._config_path)
 
+            # If an explicit marker referenced a persisted conversation not yet
+            # in memory, bind the new engine to that ID so _load_persisted_state
+            # picks up the right stored data.
+            if conversation_id and engine.config.conversation_id != conversation_id:
+                engine.config.conversation_id = conversation_id
+                engine._load_persisted_state()
+                engine._apply_persisted_state_to_delegates()
+                logger.info(
+                    "Restored persisted session for marker: %s",
+                    conversation_id[:12],
+                )
+
             actual_id = engine.config.conversation_id
             state = ProxyState(
                 engine, metrics=self._metrics, upstream=self._upstream,
