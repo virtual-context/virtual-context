@@ -366,7 +366,6 @@ class AnthropicFormat(PayloadFormat):
 
                 if asst_text.strip():
                     # Normal pair: real user + assistant with text
-                    last_real_user = None
                     pairs.append(Message(
                         role="user", content=text,
                         metadata=meta or None, timestamp=ts,
@@ -375,6 +374,19 @@ class AnthropicFormat(PayloadFormat):
                         role="assistant", content=asst_text,
                         timestamp=ts,
                     ))
+                    # If assistant also has tool_use, hold the user for the
+                    # next tool_result→assistant text response. Otherwise clear.
+                    _asst_raw = chat_msgs[i + 1].get("content", "")
+                    _has_tool_use = False
+                    if isinstance(_asst_raw, list):
+                        _has_tool_use = any(
+                            isinstance(b, dict) and b.get("type") == "tool_use"
+                            for b in _asst_raw
+                        )
+                    if _has_tool_use:
+                        last_real_user = (text, meta or None, ts)
+                    else:
+                        last_real_user = None
                 else:
                     # Assistant is tool_use only — hold user for next text response
                     last_real_user = (text, meta or None, ts)
@@ -646,7 +658,6 @@ class OpenAIFormat(PayloadFormat):
 
                 if asst_text.strip():
                     # Normal pair: real user + assistant with text
-                    last_real_user = None
                     pairs.append(Message(
                         role="user", content=text,
                         metadata=meta or None, timestamp=ts,
@@ -655,6 +666,19 @@ class OpenAIFormat(PayloadFormat):
                         role="assistant", content=asst_text,
                         timestamp=ts,
                     ))
+                    # If assistant also has tool_use, hold the user for the
+                    # next tool_result→assistant text response.
+                    _asst_raw = chat_msgs[i + 1].get("content", "")
+                    _has_tool_use = False
+                    if isinstance(_asst_raw, list):
+                        _has_tool_use = any(
+                            isinstance(b, dict) and b.get("type") == "tool_use"
+                            for b in _asst_raw
+                        )
+                    if _has_tool_use:
+                        last_real_user = (text, meta or None, ts)
+                    else:
+                        last_real_user = None
                 else:
                     # Assistant is tool_use only — hold user for next text response
                     last_real_user = (text, meta or None, ts)
@@ -1263,7 +1287,6 @@ class OpenAIResponsesFormat(PayloadFormat):
 
                 if asst_text.strip():
                     # Normal pair: real user + assistant with text
-                    last_real_user = None
                     pairs.append(Message(
                         role="user", content=text,
                         metadata=meta or None, timestamp=ts,
@@ -1272,6 +1295,19 @@ class OpenAIResponsesFormat(PayloadFormat):
                         role="assistant", content=asst_text,
                         timestamp=ts,
                     ))
+                    # If assistant also has tool_use, hold the user for the
+                    # next tool_result→assistant text response.
+                    _asst_raw = chat_msgs[i + 1].get("content", "")
+                    _has_tool_use = False
+                    if isinstance(_asst_raw, list):
+                        _has_tool_use = any(
+                            isinstance(b, dict) and b.get("type") == "tool_use"
+                            for b in _asst_raw
+                        )
+                    if _has_tool_use:
+                        last_real_user = (text, meta or None, ts)
+                    else:
+                        last_real_user = None
                 else:
                     # Assistant is tool_use only — hold user for next text response
                     last_real_user = (text, meta or None, ts)
