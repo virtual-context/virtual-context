@@ -554,6 +554,14 @@ class ProxyState:
             logger.warning("Failed to delete conversation during widening reset: %s", e)
         self.engine._turn_tag_index = TurnTagIndex()
         self.engine._engine_state.compacted_through = 0
+        # Re-sync delegates that cached stale references to turn_tag_index
+        for attr in ('_tagging', '_compaction', '_retrieval', '_search'):
+            delegate = getattr(self.engine, attr, None)
+            if delegate is not None:
+                if hasattr(delegate, '_turn_tag_index'):
+                    delegate._turn_tag_index = self.engine._turn_tag_index
+                if hasattr(delegate, '_engine_state'):
+                    delegate._engine_state = self.engine._engine_state
         self._ingested_conversations.discard(conversation_id)
         self._ingested_first_hash.pop(conversation_id, None)
         self._ingested_turn_count.pop(conversation_id, None)
