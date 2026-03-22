@@ -217,7 +217,10 @@ class SessionRegistry:
             if conversation_id and engine.config.conversation_id != conversation_id:
                 engine.config.conversation_id = conversation_id
                 engine._load_persisted_state()
+                engine._init_retriever()
                 engine._apply_persisted_state_to_delegates()
+                if hasattr(engine, '_retrieval') and engine._retrieval is not None:
+                    engine._retrieval._retriever = engine._retriever
                 logger.info(
                     "Restored persisted session for marker: %s",
                     conversation_id[:12],
