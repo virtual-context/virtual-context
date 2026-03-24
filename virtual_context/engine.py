@@ -153,6 +153,27 @@ class VirtualContextEngine:
             except Exception as e:
                 logger.warning("Redis cache load failed: %s — falling back to store", e)
 
+        # Cross-check compacted_through against the store — the Redis snapshot
+        # may be stale if compaction advanced the watermark after the last
+        # Redis write (e.g. post-ingestion compaction wrote to store but the
+        # container restarted before the next Redis save).
+        if _redis_loaded:
+            try:
+                db_state = self._store.load_latest_engine_state()
+                if (
+                    db_state
+                    and db_state.conversation_id == self.config.conversation_id
+                    and db_state.compacted_through > self._engine_state.compacted_through
+                ):
+                    logger.info(
+                        "Watermark reconciliation: Redis=%d < store=%d — using store value",
+                        self._engine_state.compacted_through,
+                        db_state.compacted_through,
+                    )
+                    self._engine_state.compacted_through = db_state.compacted_through
+            except Exception:
+                pass  # store may not be initialized yet; non-critical
+
         if not _redis_loaded:
             self._load_persisted_state()
 
