@@ -150,16 +150,33 @@ class ProxyState:
             engine._restored_request_captures = []
         # Restore conversation history from persisted turn messages
         if engine._restored_conversation_history:
-            for _turn, _user, _asst in engine._restored_conversation_history:
-                self.conversation_history.append(
-                    Message(role="user", content=_user)
-                )
-                self.conversation_history.append(
-                    Message(role="assistant", content=_asst)
-                )
-            logger.info("Restored conversation_history: %d messages from %d turns",
-                        len(self.conversation_history),
-                        len(engine._restored_conversation_history))
+            for item in engine._restored_conversation_history:
+                if isinstance(item, dict):
+                    # Redis restore — full Message dicts with metadata, timestamps, raw_content
+                    from datetime import datetime, timezone
+                    ts = item.get("timestamp")
+                    if isinstance(ts, str) and ts:
+                        try:
+                            ts = datetime.fromisoformat(ts)
+                        except (ValueError, TypeError):
+                            ts = None
+                    else:
+                        ts = None
+                    self.conversation_history.append(Message(
+                        role=item.get("role", "user"),
+                        content=item.get("content", ""),
+                        timestamp=ts,
+                        metadata=item.get("metadata"),
+                        raw_content=item.get("raw_content"),
+                    ))
+                else:
+                    # Store restore — (turn, user, assistant) tuples
+                    _turn, _user, _asst = item
+                    self.conversation_history.append(Message(role="user", content=_user))
+                    self.conversation_history.append(Message(role="assistant", content=_asst))
+            _count = len(self.conversation_history)
+            _source = "Redis" if engine._restored_conversation_history and isinstance(engine._restored_conversation_history[0], dict) else "store"
+            logger.info("Restored conversation_history: %d messages from %s", _count, _source)
             engine._restored_conversation_history = []
 
     @property
