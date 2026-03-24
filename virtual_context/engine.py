@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from collections.abc import Callable
 from pathlib import Path
 
@@ -143,11 +143,14 @@ class VirtualContextEngine:
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
         self._restored_conversation_history: list = []  # (turn, user, asst) from store or dicts from Redis
+        self._restored_from_checkpoint = False
+        self._restored_checkpoint_source = ""
 
         # Restore persisted state BEFORE creating delegates so they get the
         # final turn_tag_index / engine_state — no re-sync needed.
         # Try Redis cache first (fast) — fall back to store if miss
         _redis_loaded = False
+        _store_loaded = False
         if self._session_cache and self._session_cache.is_available():
             try:
                 cached = self._session_cache.load_snapshot(self.config.conversation_id)
@@ -161,16 +164,24 @@ class VirtualContextEngine:
                         cached.get("version", "?"),
                     )
             except Exception as e:
-                logger.warning("Redis cache load failed: %s — falling back to store", e)
+                    logger.warning("Redis cache load failed: %s — falling back to store", e)
 
-        # Cross-check compacted_through against the store — the Redis snapshot
-        # may be stale if compaction advanced the watermark after the last
-        # Redis write (e.g. post-ingestion compaction wrote to store but the
-        # container restarted before the next Redis save).
+        # Reconcile Redis against the persisted checkpoint. Redis is faster,
+        # but the durable store wins if it has a newer saved_at or strictly
+        # more advanced state.
         if _redis_loaded:
             try:
                 db_state = self._store.load_engine_state(self.config.conversation_id)
-                if (
+                if db_state and self._store_checkpoint_is_newer(db_state, cached):
+                    logger.info(
+                        "Store checkpoint newer than Redis for conversation %s — preferring store",
+                        self.config.conversation_id[:12],
+                    )
+                    self._reset_restored_state()
+                    self._load_persisted_state()
+                    _redis_loaded = False
+                    _store_loaded = True
+                elif (
                     db_state
                     and db_state.compacted_through > self._engine_state.compacted_through
                 ):
@@ -183,7 +194,7 @@ class VirtualContextEngine:
             except Exception:
                 pass  # store may not be initialized yet; non-critical
 
-        if not _redis_loaded:
+        if not _redis_loaded and not _store_loaded:
             self._load_persisted_state()
 
         # Create delegates with the (possibly restored) turn_tag_index
@@ -483,10 +494,7 @@ class VirtualContextEngine:
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
-        # Reset compacted_through to 0 — the persisted value was an index into the
-        # previous session's conversation_history which no longer exists. The proxy
-        # advances this after ingestion completes to cover re-ingested messages.
-        self._engine_state.compacted_through = 0
+        self._engine_state.compacted_through = saved.compacted_through
         # Populate in-place so all existing references (retriever, etc.) see the restored entries
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
@@ -499,12 +507,15 @@ class VirtualContextEngine:
         self._restored_request_captures = saved.request_captures or []
         self._engine_state.provider = saved.provider or ""
         self._engine_state.tool_tag_counter = saved.tool_tag_counter or 0
+        self._restored_from_checkpoint = True
+        self._restored_checkpoint_source = "store"
         # Stash working set entries for _apply_persisted_state_to_delegates
         self._restored_working_set = saved.working_set or []
         # Load conversation history from turn messages for post-restart rebuild
         try:
             self._restored_conversation_history = self._store.load_recent_turn_messages(
-                saved.conversation_id, limit=200,
+                saved.conversation_id,
+                limit=max(200, min(saved.turn_count or 0, 1000)),
             )
         except Exception:
             self._restored_conversation_history = []
@@ -552,6 +563,8 @@ class VirtualContextEngine:
         self._engine_state.trailing_fingerprint = es.get("trailing_fingerprint", "")
         self._engine_state.provider = es.get("provider", "")
         self._engine_state.tool_tag_counter = es.get("tool_tag_counter", 0)
+        self._restored_from_checkpoint = True
+        self._restored_checkpoint_source = "redis"
 
         # TurnTagIndex — populate in-place
         for entry_dict in cached.get("turn_tag_entries", []):
@@ -658,7 +671,7 @@ class VirtualContextEngine:
                     captures = self._request_captures_provider()
                 except Exception:
                     pass
-            self._store.save_engine_state(EngineStateSnapshot(
+            snapshot = EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
                 compacted_through=self._engine_state.compacted_through,
                 turn_tag_entries=list(self._turn_tag_index.entries),
@@ -670,11 +683,15 @@ class VirtualContextEngine:
                 request_captures=captures,
                 provider=self._engine_state.provider,
                 tool_tag_counter=self._engine_state.tool_tag_counter,
-            ))
+            )
+            self._store.save_engine_state(snapshot)
             # Write-through to Redis cache
             if self._session_cache:
                 try:
-                    cache_snapshot = self._build_cache_snapshot(conversation_history)
+                    cache_snapshot = self._build_cache_snapshot(
+                        conversation_history,
+                        saved_at=snapshot.saved_at,
+                    )
                     self._session_cache.save_snapshot(
                         self.config.conversation_id, cache_snapshot,
                     )
@@ -685,10 +702,16 @@ class VirtualContextEngine:
 
     _cache_version = 0
 
-    def _build_cache_snapshot(self, conversation_history: list) -> dict:
+    def _build_cache_snapshot(
+        self,
+        conversation_history: list,
+        *,
+        saved_at: datetime | None = None,
+    ) -> dict:
         """Build atomic snapshot dict for Redis cache."""
         self._cache_version += 1
         ct = self._engine_state.compacted_through
+        saved_at = saved_at or datetime.now(timezone.utc)
 
         # History: uncompacted suffix only
         suffix = conversation_history[ct:] if ct < len(conversation_history) else conversation_history
@@ -734,11 +757,12 @@ class VirtualContextEngine:
 
         return {
             "version": self._cache_version,
+            "saved_at": saved_at.isoformat(),
             "conversation_id": self.config.conversation_id,
             "history": history,
             "turn_tag_entries": entries,
             "engine_state": {
-                "compacted_through": 0,  # history IS the uncompacted suffix
+                "compacted_through": self._engine_state.compacted_through,
                 "split_processed_tags": sorted(self._engine_state.split_processed_tags),
                 "working_set": [
                     {"tag": ws.tag, "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
@@ -752,6 +776,45 @@ class VirtualContextEngine:
                 "tool_tag_counter": self._engine_state.tool_tag_counter,
             },
         }
+
+    def _reset_restored_state(self) -> None:
+        self._turn_tag_index = TurnTagIndex()
+        self._engine_state = EngineState()
+        self._restored_working_set = []
+        self._restored_request_captures = []
+        self._restored_conversation_history = []
+        self._restored_from_checkpoint = False
+        self._restored_checkpoint_source = ""
+
+    @staticmethod
+    def _parse_checkpoint_saved_at(raw: object) -> datetime | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    def _store_checkpoint_is_newer(
+        self,
+        db_state: EngineStateSnapshot,
+        cached: dict,
+    ) -> bool:
+        cached_saved_at = self._parse_checkpoint_saved_at(cached.get("saved_at"))
+        if cached_saved_at and db_state.saved_at > cached_saved_at:
+            return True
+        if cached_saved_at and db_state.saved_at < cached_saved_at:
+            return False
+        cached_turns = len(cached.get("turn_tag_entries", []) or [])
+        cached_ct = (
+            cached.get("engine_state", {}).get("compacted_through", 0)
+            if isinstance(cached.get("engine_state"), dict) else 0
+        )
+        return (
+            db_state.turn_count > cached_turns
+            or db_state.compacted_through > cached_ct
+        )
 
     def _init_supersession_checker(self) -> None:
         sc = self.config.supersession

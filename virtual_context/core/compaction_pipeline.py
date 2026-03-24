@@ -229,6 +229,20 @@ class CompactionPipeline:
 
         # Advance watermark past compacted messages
         self._engine_state.compacted_through += len(compact_messages)
+        try:
+            keep_from_turn = self._engine_state.compacted_through // 2
+            removed = self._store.prune_turn_messages(
+                self._config.conversation_id,
+                keep_from_turn,
+            )
+            if removed:
+                logger.info(
+                    "Pruned %d compacted turn_messages before turn %d",
+                    removed,
+                    keep_from_turn,
+                )
+        except Exception as e:
+            logger.debug("turn_messages prune failed: %s", e, exc_info=True)
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})

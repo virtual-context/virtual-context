@@ -336,6 +336,58 @@ class SQLiteStore(ContextStore):
             conn.execute("ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT")
         except Exception:
             pass
+        try:
+            cur = conn.execute("PRAGMA table_info(request_captures)")
+            cols = cur.fetchall()
+            col_names = [row[1] for row in cols]
+            pk_names = [row[1] for row in sorted(cols, key=lambda row: row[5]) if row[5] > 0]
+            if col_names and (
+                "conversation_id" not in col_names
+                or pk_names != ["conversation_id", "turn"]
+            ):
+                legacy_rows = conn.execute(
+                    "SELECT turn, ts, recorded_at, data_json FROM request_captures"
+                ).fetchall()
+                migrated_rows: list[tuple[str, int, str, float, str]] = []
+                for row in legacy_rows:
+                    data_json = row["data_json"]
+                    conversation_id = ""
+                    turn = row["turn"]
+                    try:
+                        payload = json.loads(data_json)
+                        conversation_id = payload.get("conversation_id", "") or ""
+                        turn = int(payload.get("turn", turn))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                    migrated_rows.append((
+                        conversation_id,
+                        turn,
+                        row["ts"],
+                        row["recorded_at"],
+                        data_json,
+                    ))
+                conn.executescript("""
+                    DROP TABLE IF EXISTS request_captures_new;
+                    CREATE TABLE request_captures_new (
+                        conversation_id TEXT NOT NULL DEFAULT '',
+                        turn INTEGER NOT NULL,
+                        ts TEXT NOT NULL,
+                        recorded_at REAL NOT NULL,
+                        data_json TEXT NOT NULL,
+                        PRIMARY KEY (conversation_id, turn)
+                    );
+                    DROP TABLE request_captures;
+                    ALTER TABLE request_captures_new RENAME TO request_captures;
+                """)
+                if migrated_rows:
+                    conn.executemany(
+                        """INSERT OR REPLACE INTO request_captures
+                        (conversation_id, turn, ts, recorded_at, data_json)
+                        VALUES (?, ?, ?, ?, ?)""",
+                        migrated_rows,
+                    )
+        except sqlite3.OperationalError:
+            pass
         # D1: migrate role→verb — drop old schema if it has the 'role' column
         try:
             cur = conn.execute("PRAGMA table_info(facts)")
@@ -493,12 +545,14 @@ class SQLiteStore(ContextStore):
             """)
         # Request capture persistence for proxy dashboard
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS request_captures (
-                turn INTEGER PRIMARY KEY,
-                ts TEXT NOT NULL,
-                recorded_at REAL NOT NULL,
-                data_json TEXT NOT NULL
-            );
+CREATE TABLE IF NOT EXISTS request_captures (
+    conversation_id TEXT NOT NULL DEFAULT '',
+    turn INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    recorded_at REAL NOT NULL,
+    data_json TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, turn)
+);
         """)
         # Tag summary FTS for BM25 retrieval scoring
         try:
@@ -1475,6 +1529,16 @@ class SQLiteStore(ContextStore):
         # Return in ascending order (oldest first)
         return [(r["turn_number"], r["user_content"], r["assistant_content"]) for r in reversed(rows)]
 
+    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
+        conn = self._get_conn()
+        cur = conn.execute(
+            """DELETE FROM turn_messages
+            WHERE conversation_id = ? AND turn_number < ?""",
+            (conversation_id, keep_from_turn),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
     # ------------------------------------------------------------------
     # D1: Fact Extraction
     # ------------------------------------------------------------------
@@ -2042,26 +2106,51 @@ class SQLiteStore(ContextStore):
     def save_request_capture(self, capture: dict) -> None:
         conn = self._get_conn()
         import time as _time
+        conversation_id = capture.get("conversation_id", "") or ""
         conn.execute(
-            """INSERT OR REPLACE INTO request_captures (turn, ts, recorded_at, data_json)
-            VALUES (?, ?, ?, ?)""",
-            (capture["turn"], capture.get("ts", ""), _time.time(), json.dumps(capture)),
+            """INSERT OR REPLACE INTO request_captures
+            (conversation_id, turn, ts, recorded_at, data_json)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                conversation_id,
+                capture["turn"],
+                capture.get("ts", ""),
+                _time.time(),
+                json.dumps(capture),
+            ),
         )
-        # Prune: keep only the newest 50
         conn.execute(
-            """DELETE FROM request_captures WHERE turn NOT IN (
-                SELECT turn FROM request_captures ORDER BY recorded_at DESC LIMIT 50
-            )"""
+            """DELETE FROM request_captures
+            WHERE conversation_id = ?
+              AND (conversation_id, turn) NOT IN (
+                SELECT conversation_id, turn
+                FROM request_captures
+                WHERE conversation_id = ?
+                ORDER BY recorded_at DESC LIMIT 50
+            )""",
+            (conversation_id, conversation_id),
         )
         conn.commit()
 
-    def load_request_captures(self, limit: int = 50) -> list[dict]:
+    def load_request_captures(
+        self,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
         conn = self._get_conn()
         try:
-            rows = conn.execute(
-                "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if conversation_id is None:
+                rows = conn.execute(
+                    "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT data_json FROM request_captures
+                    WHERE conversation_id = ?
+                    ORDER BY recorded_at ASC LIMIT ?""",
+                    (conversation_id, limit),
+                ).fetchall()
         except Exception:
             return []
         result = []
