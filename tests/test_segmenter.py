@@ -54,6 +54,39 @@ def test_segment_empty(segmenter):
     assert segments == []
 
 
+def test_segment_progress_reports_monotonic_turns(segmenter):
+    messages = []
+    for i in range(6):
+        messages.append(Message(role="user", content=f"Question {i}"))
+        messages.append(Message(role="assistant", content=f"Answer {i}"))
+
+    events = []
+
+    def on_progress(done, total, result, **kwargs):
+        events.append({
+            "done": done,
+            "total": total,
+            "segments": kwargs.get("segments"),
+            "phase_name": kwargs.get("phase_name"),
+            "elapsed_ms": kwargs.get("elapsed_ms"),
+        })
+
+    segments = segmenter.segment(messages, progress_callback=on_progress)
+
+    assert len(segments) == 1
+    assert events
+    assert events[0]["done"] == 0
+    assert events[0]["total"] == 6
+    assert events[-1]["done"] == 6
+    assert events[-1]["total"] == 6
+    assert events[-1]["segments"] == len(segments)
+    assert all(evt["phase_name"] == "segmenter" for evt in events)
+    assert all(
+        later["done"] >= earlier["done"]
+        for earlier, later in zip(events, events[1:], strict=False)
+    )
+
+
 def test_turn_pairing(segmenter):
     messages = [
         Message(role="user", content="Hello"),

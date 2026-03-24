@@ -203,26 +203,56 @@ class CompactionPipeline:
         """
         from ..types import CompactionReport
 
-        # Phase 1: Segmenter (0-25%)
         turn_offset = self._engine_state.compacted_through // 2
-        if progress_callback:
-            try:
-                progress_callback(0, 1, None, phase="segmenter",
-                                  overall_percent=0, phase_name="segmenter")
-            except Exception:
-                pass
-        segments = self._segmenter.segment(compact_messages, turn_offset=turn_offset)
+
+        def _emit_weighted_progress(
+            done: int,
+            total: int,
+            result,
+            *,
+            phase: str,
+            phase_name: str,
+            base_percent: int,
+            span_percent: int,
+            **kwargs,
+        ) -> None:
+            if not progress_callback:
+                return
+            bounded_total = max(total, 1)
+            bounded_done = max(0, min(done, bounded_total))
+            overall_percent = base_percent + int(span_percent * bounded_done / bounded_total)
+            progress_callback(
+                done,
+                total,
+                result,
+                phase=phase,
+                overall_percent=overall_percent,
+                phase_name=phase_name,
+                **kwargs,
+            )
+
+        def _segmenter_progress(done: int, total: int, result, **kwargs) -> None:
+            _emit_weighted_progress(
+                done,
+                total,
+                result,
+                phase="segmenter",
+                phase_name=str(kwargs.pop("phase_name", "segmenter")),
+                base_percent=0,
+                span_percent=25,
+                **kwargs,
+            )
+
+        # Phase 1: Segmenter (0-25%)
+        segments = self._segmenter.segment(
+            compact_messages,
+            turn_offset=turn_offset,
+            progress_callback=_segmenter_progress,
+        )
         logger.info(
             "Segmented %d messages into %d segments (watermark=%d)",
             len(compact_messages), len(segments), self._engine_state.compacted_through,
         )
-        if progress_callback:
-            try:
-                progress_callback(1, 1, None, phase="segmenter",
-                                  overall_percent=25, phase_name="segmenter",
-                                  segments=len(segments))
-            except Exception:
-                pass
 
         # Phase 2+3: Compact + Store (25-75%)
         results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
@@ -302,7 +332,7 @@ class CompactionPipeline:
                             logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
                         if progress_callback:
                             try:
-                                _pct = 75 + int(25 * (ts_i + 1) / max(len(new_tag_summaries), 1))
+                                _pct = 95 + int(5 * (ts_i + 1) / max(len(new_tag_summaries), 1))
                                 progress_callback(
                                     ts_i + 1, len(new_tag_summaries), None,
                                     phase="tag_summary_built",
@@ -409,6 +439,32 @@ class CompactionPipeline:
 
         all_results: list[CompactionResult] = []
 
+        def _emit_progress(
+            done: int,
+            total: int,
+            result,
+            *,
+            phase: str,
+            phase_name: str,
+            base_percent: int,
+            span_percent: int,
+            **kwargs,
+        ) -> None:
+            if not progress_callback:
+                return
+            bounded_total = max(total, 1)
+            bounded_done = max(0, min(done, bounded_total))
+            overall_percent = base_percent + int(span_percent * bounded_done / bounded_total)
+            progress_callback(
+                done,
+                total,
+                result,
+                phase=phase,
+                overall_percent=overall_percent,
+                phase_name=phase_name,
+                **kwargs,
+            )
+
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
         turn_offset = self._engine_state.compacted_through // 2
         seg_cursor = turn_offset
@@ -483,11 +539,6 @@ class CompactionPipeline:
                 )
                 self._store.store_segment(stored)
                 all_results.append(result)
-                if progress_callback:
-                    try:
-                        progress_callback(len(all_results), len(segments), result, phase="segment_stored")
-                    except Exception:
-                        pass
                 continue
 
             # --- Merge check: find best existing segment to merge with ---
@@ -558,6 +609,16 @@ class CompactionPipeline:
             compactable.append(seg)
 
         if not compactable:
+            if all_results:
+                _emit_progress(
+                    len(all_results),
+                    len(all_results),
+                    all_results[-1],
+                    phase="segment_stored",
+                    phase_name="store",
+                    base_percent=80,
+                    span_percent=15,
+                )
             return all_results
 
         logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges)",
@@ -572,7 +633,23 @@ class CompactionPipeline:
             for seg in compactable if seg.id in segment_signals
         } or None
 
-        results = self._compactor.compact(compactable, fact_signals_by_segment=fact_signals_by_segment)
+        def _compactor_progress(done: int, total: int, result, **kwargs) -> None:
+            _emit_progress(
+                done,
+                total,
+                result,
+                phase="segment_compacting",
+                phase_name=str(kwargs.pop("phase_name", "compactor")),
+                base_percent=25,
+                span_percent=55,
+                **kwargs,
+            )
+
+        results = self._compactor.compact(
+            compactable,
+            fact_signals_by_segment=fact_signals_by_segment,
+            progress_callback=_compactor_progress,
+        )
 
         for seg_idx, result in enumerate(results):
             seg = compactable[seg_idx]
@@ -633,19 +710,17 @@ class CompactionPipeline:
                 )
 
             all_results.append(result)
+            stored_done = seg_idx + 1
 
-            # Facts + progress (phase 2+3: 25-75% of overall)
-            if progress_callback:
-                try:
-                    _pct = 25 + int(50 * len(all_results) / max(len(results), 1))
-                    progress_callback(
-                        len(all_results), len(segments), result,
-                        phase="segment_stored",
-                        overall_percent=_pct,
-                        phase_name="compactor" if seg_idx < len(results) // 2 else "store",
-                    )
-                except Exception:
-                    pass
+            _emit_progress(
+                stored_done,
+                len(results),
+                result,
+                phase="segment_stored",
+                phase_name="store",
+                base_percent=80,
+                span_percent=15,
+            )
 
             _seg_ref = stored.ref
             if result.facts:
@@ -668,16 +743,17 @@ class CompactionPipeline:
                             logger.info("  Linked %d facts for segment %s", _links_count, result.primary_tag)
                     except Exception as e:
                         logger.warning("Supersession/linking failed: %s", e)
-                if progress_callback:
-                    try:
-                        progress_callback(
-                            len(all_results), len(segments), result,
-                            phase="facts_extracted",
-                            fact_count=len(result.facts),
-                            superseded_count=_superseded_count,
-                            links_count=_links_count,
-                        )
-                    except Exception:
-                        pass
+                _emit_progress(
+                    stored_done,
+                    len(results),
+                    result,
+                    phase="facts_extracted",
+                    phase_name="store",
+                    base_percent=80,
+                    span_percent=15,
+                    fact_count=len(result.facts),
+                    superseded_count=_superseded_count,
+                    links_count=_links_count,
+                )
 
         return all_results

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -64,7 +65,10 @@ class TopicSegmenter:
         self._embed_fn = embed_fn
 
     def segment(
-        self, messages: list[Message], turn_offset: int = 0
+        self,
+        messages: list[Message],
+        turn_offset: int = 0,
+        progress_callback: Callable[..., None] | None = None,
     ) -> list[TaggedSegment]:
         """Segment a block of conversation into tag-based chunks.
 
@@ -82,6 +86,40 @@ class TopicSegmenter:
 
         # Pair messages into turns
         pairs = self._pair_turns(messages)
+        total_pairs = len(pairs)
+        processed_pairs = 0
+        progress_started = time.monotonic()
+        last_progress_emit = progress_started
+
+        def _emit_progress(*, force: bool = False, segments_built: int | None = None) -> None:
+            nonlocal last_progress_emit
+            if not progress_callback or total_pairs <= 0:
+                return
+            now = time.monotonic()
+            should_emit = force
+            if not should_emit:
+                should_emit = (
+                    processed_pairs <= 3
+                    or processed_pairs == total_pairs
+                    or processed_pairs % 5 == 0
+                    or (now - last_progress_emit) >= 0.5
+                )
+            if not should_emit:
+                return
+            elapsed_ms = int((now - progress_started) * 1000)
+            rate = (processed_pairs / (now - progress_started)) if now > progress_started else 0.0
+            eta_ms = int(((total_pairs - processed_pairs) / rate) * 1000) if rate > 0 else None
+            payload = {
+                "phase_name": "segmenter",
+                "elapsed_ms": elapsed_ms,
+                "eta_ms": eta_ms,
+            }
+            if segments_built is not None:
+                payload["segments"] = segments_built
+            progress_callback(processed_pairs, total_pairs, None, **payload)
+            last_progress_emit = now
+
+        _emit_progress(force=True)
 
         # Tag each turn pair
         tagged: list[tuple[TurnPair, TagResult]] = []
@@ -93,6 +131,8 @@ class TopicSegmenter:
                     "SEGMENT skip_empty turn=%d global=%d content_len=%d",
                     i, turn_offset + i, len(combined),
                 )
+                processed_pairs += 1
+                _emit_progress()
                 continue
 
             # Check index first — avoid redundant LLM call
@@ -117,6 +157,8 @@ class TopicSegmenter:
                 i, global_turn, tag_result.primary, sorted(tag_result.tags),
                 tag_result.source, preview,
             )
+            processed_pairs += 1
+            _emit_progress()
 
         # Group turns into topic segments using a segment library.
         # Each turn is scored against ALL existing segments (not just the previous turn).
@@ -259,6 +301,7 @@ class TopicSegmenter:
             len(segments), len(tagged), avg_turns,
             self.config.tag_overlap_threshold, self.config.max_segment_turns,
         )
+        _emit_progress(force=True, segments_built=len(segments))
         return segments
 
     @staticmethod
