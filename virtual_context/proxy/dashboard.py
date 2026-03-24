@@ -313,6 +313,9 @@ def register_dashboard_routes(
             # Reset in-memory watermark if deleting the current conversation
             if conversation_id == state.engine.config.conversation_id:
                 state.engine._engine_state.compacted_through = 0
+            # Invalidate Redis cache
+            if hasattr(state, 'engine') and hasattr(state.engine, '_session_cache') and state.engine._session_cache:
+                state.engine._session_cache.delete_conversation(conversation_id)
             logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
         except Exception as exc:

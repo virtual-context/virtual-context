@@ -567,6 +567,9 @@ class ProxyState:
         # Clear all conversation state
         try:
             self.engine._store.delete_conversation(conversation_id)
+            # Invalidate Redis cache
+            if hasattr(self.engine, '_session_cache') and self.engine._session_cache:
+                self.engine._session_cache.delete_conversation(conversation_id)
         except Exception as e:
             logger.warning("Failed to delete conversation during widening reset: %s", e)
         self.engine._turn_tag_index = TurnTagIndex()
