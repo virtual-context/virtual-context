@@ -25,6 +25,11 @@ _METADATA_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+_SYSTEM_JSON_BLOCK_RE = re.compile(
+    r"```json\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+
 _VC_PROMPT_MARKER = "[vc:prompt]"
 
 
@@ -73,6 +78,67 @@ def _extract_conversation_info(body: dict) -> dict:
             else:
                 break
         break
+
+    return {}
+
+
+def _extract_system_prompt_info(body: dict) -> dict:
+    """Extract identity fields from JSON code blocks in the system prompt.
+
+    Handles Anthropic (top-level ``system`` as str or list of text blocks)
+    and OpenAI (first message with ``role`` in ``("system", "developer")``).
+    Scans all ` ```json ` fenced blocks, parses each as JSON, and returns
+    the first dict containing ``chat_id``, ``conversation_label``, or
+    ``account_id``.
+    """
+    if not body:
+        return {}
+
+    system_text = ""
+
+    # Anthropic: top-level "system" key
+    system = body.get("system")
+    if system is not None:
+        if isinstance(system, str):
+            system_text = system
+        elif isinstance(system, list):
+            system_text = "\n".join(
+                b.get("text", "") for b in system
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+
+    # OpenAI: first message with role "system" or "developer"
+    if not system_text:
+        for msg in body.get("messages", []):
+            role = msg.get("role", "")
+            if role in ("system", "developer"):
+                c = msg.get("content", "")
+                if isinstance(c, str):
+                    system_text = c
+                elif isinstance(c, list):
+                    system_text = "\n".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                break
+
+    if not system_text:
+        return {}
+
+    result: dict = {}
+    identity_keys = {"chat_id", "conversation_label", "account_id"}
+    for m in _SYSTEM_JSON_BLOCK_RE.finditer(system_text):
+        try:
+            parsed = json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for key in identity_keys:
+            if key in parsed and isinstance(parsed[key], str) and parsed[key]:
+                result[key] = parsed[key]
+        if result:
+            return result
 
     return {}
 
@@ -154,6 +220,16 @@ def resolve_conversation_id(
         return _candidate_to_uuid("conversation_label", conv_info["conversation_label"])
     if conv_info.get("chat_id"):
         return _candidate_to_uuid("chat_id", conv_info["chat_id"])
+
+    # Also check system prompt for identity fields (e.g. OpenClaw embeds
+    # chat_id in a ```json block inside the system prompt).  This is checked
+    # BEFORE the system prompt hash so that a stable chat_id wins over an
+    # unstable hash caused by dynamic prompt sections.
+    sys_info = _extract_system_prompt_info(body)
+    if sys_info.get("conversation_label"):
+        return _candidate_to_uuid("conversation_label", sys_info["conversation_label"])
+    if sys_info.get("chat_id"):
+        return _candidate_to_uuid("chat_id", sys_info["chat_id"])
 
     sys_hash = _extract_system_prompt_hash(body)
     if sys_hash:

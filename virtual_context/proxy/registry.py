@@ -7,7 +7,9 @@ one per conversation, with fingerprint-based routing and persistence.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 import threading
 from typing import TYPE_CHECKING
 
@@ -46,6 +48,7 @@ class SessionRegistry:
         self._metrics = metrics
         self._conversations: dict[str, ProxyState] = {}
         self._sys_hashes: dict[str, str] = {}  # system_prompt_hash → conversation_id
+        self._chat_ids: dict[str, str] = {}  # chat_id_value → conversation_id
         # Last-message fingerprint: hash of the last user message from the
         # most recent request for each conversation.  The next request's
         # second-to-last user message should match this.
@@ -126,6 +129,52 @@ class SessionRegistry:
             return ""
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
+    _SYS_JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
+
+    @staticmethod
+    def _extract_chat_id(body: dict) -> str:
+        """Extract ``chat_id`` from JSON code blocks in the system prompt.
+
+        Returns the chat_id string, or empty string if not found.
+        """
+        text = ""
+
+        system = body.get("system")
+        if system is not None:
+            if isinstance(system, str):
+                text = system
+            elif isinstance(system, list):
+                text = "\n".join(
+                    b.get("text", "") for b in system
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+
+        if not text:
+            for msg in body.get("messages", []):
+                role = msg.get("role", "")
+                if role in ("system", "developer"):
+                    c = msg.get("content", "")
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        text = "\n".join(
+                            b.get("text", "") for b in c
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    break
+
+        if not text:
+            return ""
+
+        for m in SessionRegistry._SYS_JSON_BLOCK_RE.finditer(text):
+            try:
+                parsed = json.loads(m.group(1))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("chat_id"), str):
+                return parsed["chat_id"]
+        return ""
+
     def update_last_message_hash(self, body: dict, conversation_id: str) -> None:
         """Store the hash of the current last user message for this conversation.
 
@@ -161,18 +210,27 @@ class SessionRegistry:
 
         sys_hash = ""
         msg_hash = ""
+        chat_id = ""
         if body is not None:
+            chat_id = self._extract_chat_id(body)
             sys_hash = self._compute_system_hash(body)
             msg_hash = self._hash_user_message(body, position=1)
 
-        # --- 1. System prompt hash (primary) ---
+        # --- 1. chat_id from system prompt (stable per-chat) ---
+        if chat_id and chat_id in self._chat_ids:
+            target_sid = self._chat_ids[chat_id]
+            if target_sid in self._conversations:
+                self.update_last_message_hash(body, target_sid)
+                return self._conversations[target_sid], False
+
+        # --- 2. System prompt hash (primary) ---
         if sys_hash and sys_hash in self._sys_hashes:
             matched_sid = self._sys_hashes[sys_hash]
             if matched_sid in self._conversations:
                 self.update_last_message_hash(body, matched_sid)
                 return self._conversations[matched_sid], False
 
-        # --- 2. Last-message hash (secondary) ---
+        # --- 3. Last-message hash (secondary) ---
         if msg_hash and msg_hash in self._last_msg_hashes:
             matched_sid = self._last_msg_hashes[msg_hash]
             if matched_sid in self._conversations:
@@ -181,6 +239,12 @@ class SessionRegistry:
 
         with self._lock:
             # Double-check after acquiring lock
+            if chat_id and chat_id in self._chat_ids:
+                target_sid = self._chat_ids[chat_id]
+                if target_sid in self._conversations:
+                    self.update_last_message_hash(body, target_sid)
+                    return self._conversations[target_sid], False
+
             if sys_hash and sys_hash in self._sys_hashes:
                 matched_sid = self._sys_hashes[sys_hash]
                 if matched_sid in self._conversations:
@@ -193,10 +257,12 @@ class SessionRegistry:
                     self.update_last_message_hash(body, matched_sid)
                     return self._conversations[matched_sid], False
 
-            # --- 3. Claim unclaimed session ---
-            claimed_sids = set(self._sys_hashes.values()) | set(self._last_msg_hashes.values())
+            # --- 4. Claim unclaimed session ---
+            claimed_sids = set(self._sys_hashes.values()) | set(self._last_msg_hashes.values()) | set(self._chat_ids.values())
             for sid, st in self._conversations.items():
                 if sid not in claimed_sids:
+                    if chat_id:
+                        self._chat_ids[chat_id] = sid
                     if sys_hash:
                         self._sys_hashes[sys_hash] = sid
                     if body is not None:
@@ -209,7 +275,7 @@ class SessionRegistry:
                     )
                     return st, False
 
-            # --- 4. Create new session ---
+            # --- 5. Create new session ---
             from . import server as _srv
 
             if conversation_id:
@@ -232,6 +298,8 @@ class SessionRegistry:
             )
             self._conversations[actual_id] = state
 
+            if chat_id:
+                self._chat_ids[chat_id] = actual_id
             if sys_hash:
                 self._sys_hashes[sys_hash] = actual_id
             if body is not None:
