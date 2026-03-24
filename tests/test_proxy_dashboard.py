@@ -343,13 +343,21 @@ class TestMetricsIntegration:
         from virtual_context.types import Message
 
         engine = MagicMock()
-        engine.tag_turn.return_value = None  # no compaction
         engine._turn_tag_index = MagicMock()
+        engine._turn_tag_index.entries = []
 
         entry = MagicMock()
         entry.tags = ["auth", "jwt"]
         entry.primary_tag = "auth"
         engine._turn_tag_index.get_tags_for_turn.return_value = entry
+        engine._turn_tag_index.get_active_tags.return_value = {"auth", "jwt"}
+        engine._store.get_all_tags.return_value = []
+
+        def _tag_turn(*args, **kwargs):
+            engine._turn_tag_index.entries.append(entry)
+            return None
+
+        engine.tag_turn.side_effect = _tag_turn  # no compaction
 
         metrics = ProxyMetrics()
         state = ProxyState(engine, metrics=metrics)

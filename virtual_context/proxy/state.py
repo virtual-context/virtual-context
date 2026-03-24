@@ -14,7 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
-from ..types import Message, SplitResult
+from ..types import EngineState, Message, SplitResult
 
 from .helpers import (
     _strip_envelope,
@@ -598,29 +598,130 @@ class ProxyState:
                 self.engine._session_cache.delete_conversation(conversation_id)
         except Exception:
             pass
-        self.engine._turn_tag_index = TurnTagIndex()
-        self.engine._engine_state.compacted_through = 0
-        # Re-sync delegates that cached stale references to turn_tag_index
+        self._clear_runtime_state(conversation_id)
+
+        return True
+
+    def _rebind_engine_references(self) -> None:
+        """Refresh delegate references after replacing engine runtime state."""
         new_tti = self.engine._turn_tag_index
         new_es = self.engine._engine_state
-        for attr in ('_tagging', '_compaction', '_retrieval', '_search'):
+        for attr in ("_tagging", "_compaction", "_retrieval", "_search"):
             delegate = getattr(self.engine, attr, None)
-            if delegate is not None:
-                if hasattr(delegate, '_turn_tag_index'):
-                    delegate._turn_tag_index = new_tti
-                if hasattr(delegate, '_engine_state'):
-                    delegate._engine_state = new_es
-        # Also re-sync the nested retriever (holds its own _turn_tag_index)
-        if hasattr(self.engine, '_retriever'):
+            if delegate is None:
+                continue
+            if hasattr(delegate, "_turn_tag_index"):
+                delegate._turn_tag_index = new_tti
+            if hasattr(delegate, "_engine_state"):
+                delegate._engine_state = new_es
+        if hasattr(self.engine, "_retriever"):
             self.engine._retriever._turn_tag_index = new_tti
-        retrieval = getattr(self.engine, '_retrieval', None)
-        if retrieval and hasattr(retrieval, '_retriever'):
+        retrieval = getattr(self.engine, "_retrieval", None)
+        if retrieval and hasattr(retrieval, "_retriever"):
             retrieval._retriever._turn_tag_index = new_tti
+
+    def _clear_runtime_state(self, conversation_id: str) -> None:
+        """Clear in-memory state for a conversation without touching the store."""
+        self.engine._turn_tag_index = TurnTagIndex()
+        self.engine._engine_state = EngineState()
+        if self.provider:
+            self.engine._engine_state.provider = self.provider
+        self.engine._restored_working_set = []
+        self.engine._restored_request_captures = []
+        self.engine._restored_conversation_history = []
+        self.engine._restored_from_checkpoint = False
+        self.engine._restored_checkpoint_source = ""
+        self._rebind_engine_references()
+
+        retrieval = getattr(self.engine, "_retrieval", None)
+        if retrieval is not None:
+            retrieval._last_retrieval_result = None
+            retrieval._last_conversation_history = None
+            retrieval._presented_segment_refs.clear()
+        paging = getattr(self.engine, "_paging", None)
+        if paging is not None:
+            paging.working_set.clear()
+        telemetry = getattr(self.engine, "_telemetry", None)
+        if telemetry is not None:
+            try:
+                telemetry.reset()
+            except AttributeError:
+                pass
+
+        self.conversation_history.clear()
         self._ingested_conversations.discard(conversation_id)
         self._ingested_first_hash.pop(conversation_id, None)
         self._ingested_turn_count.pop(conversation_id, None)
+        self._latest_body = None
+        self._ingestion_progress = (0, 0)
+        self._manual_passthrough = False
+        self._state = SessionState.ACTIVE
+        self._pending_tag = None
+        self._pending_compact = None
+        self._last_compact_priority = ""
+        self._initial_turns = None
+        self._initial_tag_count = None
+        self._initial_payload_kb = None
+        self._last_payload_kb = 0.0
+        self._last_enriched_payload_kb = 0.0
+        self._initial_payload_tokens = None
+        self._last_payload_tokens = 0
+        self._last_enriched_payload_tokens = 0
+        self._last_non_virtualizable_floor = 0
+        self._total_requests = 0
+        self._last_model = ""
 
-        return True
+    def _drain_background_work(self) -> None:
+        """Wait for queued tag/compaction work without propagating old failures."""
+        for attr in ("_pending_tag", "_pending_compact"):
+            future = getattr(self, attr, None)
+            if future is None:
+                continue
+            try:
+                future.result()
+            except Exception:
+                logger.warning(
+                    "Background task failed while draining %s for conv=%s",
+                    attr,
+                    self.engine.config.conversation_id[:12],
+                    exc_info=True,
+                )
+            finally:
+                setattr(self, attr, None)
+
+    def _stop_ingestion_thread(
+        self,
+        *,
+        timeout_s: float = 5.0,
+        raise_on_timeout: bool = True,
+    ) -> None:
+        thread = self._ingestion_thread
+        if thread is None or not thread.is_alive():
+            self._ingestion_thread = None
+            self._ingestion_cancel.clear()
+            return
+
+        self._ingestion_cancel.set()
+        thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            msg = (
+                "Ingestion thread did not stop within "
+                f"{timeout_s:.1f}s for conv={self.engine.config.conversation_id[:12]}"
+            )
+            if raise_on_timeout:
+                raise RuntimeError(msg)
+            logger.warning(msg)
+            return
+
+        self._ingestion_thread = None
+        self._ingestion_cancel.clear()
+
+    def reset_for_conversation_deletion(self, conversation_id: str | None = None) -> None:
+        """Stop live work and clear runtime state before deleting a conversation."""
+        conv_id = conversation_id or self.engine.config.conversation_id
+        self._stop_ingestion_thread(timeout_s=5.0, raise_on_timeout=True)
+        self._drain_background_work()
+        self._clear_runtime_state(conv_id)
 
     def _advance_compaction_watermark(self) -> None:
         """Advance compacted_through to cover all already-processed messages.
@@ -1023,5 +1124,10 @@ class ProxyState:
             })
 
     def shutdown(self) -> None:
+        try:
+            self._stop_ingestion_thread(timeout_s=5.0, raise_on_timeout=False)
+        except Exception:
+            logger.warning("Failed to stop ingestion thread during shutdown", exc_info=True)
+        self._drain_background_work()
         self._pool.shutdown(wait=True)
         self._compact_pool.shutdown(wait=True)

@@ -854,7 +854,41 @@ class FilesystemStore(ContextStore):
 
     def delete_conversation(self, conversation_id: str) -> int:
         """Delete all segments for a conversation. Returns segment count deleted."""
-        return 0
+        deleted = 0
+        safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+
+        with self._lock:
+            refs = [
+                ref for ref, entry in self._index.items()
+                if entry.get("conversation_id", "") == conversation_id
+            ]
+
+        for ref in refs:
+            if self.delete_segment(ref):
+                deleted += 1
+
+        with self._lock:
+            state_path = self.root / "_engine_state" / f"{safe_id}.json"
+            if state_path.is_file():
+                state_path.unlink()
+
+            turn_messages_path = self._turn_messages_path(conversation_id)
+            if turn_messages_path.is_file():
+                turn_messages_path.unlink()
+
+            captures_path = self.root / "_request_captures.json"
+            if captures_path.is_file():
+                try:
+                    captures = json.loads(captures_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    captures = []
+                captures = [
+                    capture for capture in captures
+                    if (capture.get("conversation_id", "") or "") != conversation_id
+                ]
+                captures_path.write_text(json.dumps(captures, indent=2))
+
+        return deleted
 
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
         """Return snippet info for orphan tags.

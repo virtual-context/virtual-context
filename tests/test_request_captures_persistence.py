@@ -1,5 +1,6 @@
 """Tests for request capture persistence through ContextStore."""
-import time
+from datetime import datetime, timezone
+
 from virtual_context.storage.sqlite import SQLiteStore
 
 
@@ -374,3 +375,162 @@ class TestProxyMetricsStoreIntegration:
         assert cap_a["model"] == "a"
         assert cap_b["model"] == "b"
         assert cap_b["upstream_output_tokens"] == 9
+
+    def test_delete_conversation_artifacts_purges_scoped_metrics(self, tmp_path):
+        from virtual_context.proxy.metrics import ProxyMetrics
+
+        db_path = tmp_path / "metrics.db"
+        m = ProxyMetrics(db_path=str(db_path))
+        m.capture_request(
+            turn=1,
+            body={"model": "a", "messages": []},
+            api_format="anthropic",
+            conversation_id="conv-a",
+        )
+        m.capture_request(
+            turn=1,
+            body={"model": "b", "messages": []},
+            api_format="anthropic",
+            conversation_id="conv-b",
+        )
+        m.record({"type": "request", "conversation_id": "conv-a"})
+        m.record({"type": "request", "conversation_id": "conv-b"})
+
+        removed = m.delete_conversation_artifacts("conv-a")
+
+        assert removed["captures_removed"] == 1
+        assert removed["events_removed"] == 1
+        assert m.get_captured_requests_summary(conversation_id="conv-a") == []
+        assert len(m.get_captured_requests_summary(conversation_id="conv-b")) == 1
+        assert all(
+            (event.get("conversation_id", "") or "") != "conv-a"
+            for event in m.events_since(-1)
+        )
+
+        restored = ProxyMetrics(db_path=str(db_path))
+        assert all(
+            (event.get("conversation_id", "") or "") != "conv-a"
+            for event in restored.events_since(-1)
+        )
+        assert any(
+            (event.get("conversation_id", "") or "") == "conv-b"
+            for event in restored.events_since(-1)
+        )
+
+
+class TestDeleteConversationCleanup:
+    def test_sqlite_delete_conversation_removes_scoped_artifacts(self, tmp_path):
+        from virtual_context.types import SegmentMetadata, StoredSegment
+
+        store = SQLiteStore(tmp_path / "test.db")
+        now = datetime.now(timezone.utc)
+        base_segment = dict(
+            summary_tokens=5,
+            full_tokens=10,
+            full_text="full text",
+            metadata=SegmentMetadata(),
+            created_at=now,
+            start_timestamp=now,
+            end_timestamp=now,
+        )
+
+        for conversation_id, tag_embedding, tool_term in (
+            ("conv-a", [0.1, 0.2], "artifact-alpha"),
+            ("conv-b", [0.3, 0.4], "artifact-beta"),
+        ):
+            store.store_segment(StoredSegment(
+                ref=f"{conversation_id}-seg",
+                conversation_id=conversation_id,
+                primary_tag="topic",
+                tags=["topic"],
+                summary=f"{conversation_id} summary",
+                **base_segment,
+            ))
+            store.save_turn_message(conversation_id, 0, "user", "assistant")
+            store.save_request_capture({
+                "turn": 1,
+                "ts": "2026-03-20T10:00:00+00:00",
+                "api_format": "anthropic",
+                "model": conversation_id,
+                "stream": False,
+                "message_count": 1,
+                "conversation_id": conversation_id,
+                "inbound_tags": [],
+                "response_tags": [],
+                "passthrough": False,
+                "inbound_tokens": 0,
+                "outbound_tokens": 0,
+                "inbound_bytes": 0,
+                "outbound_bytes": 0,
+                "context_tokens": 0,
+                "overhead_ms": 0,
+                "turns_dropped": 0,
+                "turns_stubbed": 0,
+                "message_preview": "",
+                "upstream_input_tokens": 0,
+                "upstream_output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            })
+            store.store_tool_output(
+                ref=f"{conversation_id}-tool",
+                conversation_id=conversation_id,
+                tool_name="search",
+                command="lookup",
+                turn=1,
+                content=tool_term,
+                original_bytes=10,
+            )
+            store.save_tool_call({
+                "conversation_id": conversation_id,
+                "request_turn": 1,
+                "round": 1,
+                "group_id": f"group-{conversation_id}",
+                "tool_name": "search",
+                "tool_input": {"query": tool_term},
+                "tool_result": tool_term,
+                "result_length": len(tool_term),
+                "duration_ms": 1.0,
+                "found": True,
+                "timestamp": "2026-03-20T10:00:00+00:00",
+            })
+            store.save_request_context({
+                "conversation_id": conversation_id,
+                "request_turn": 1,
+                "timestamp": "2026-03-20T10:00:00+00:00",
+                "user_message": "hello",
+                "inbound_tags": ["topic"],
+                "retrieval_method": "default",
+                "candidates_found": 1,
+                "candidates_selected": 1,
+                "segments_injected": [f"{conversation_id}-seg"],
+                "facts_injected": [],
+                "facts_count": 0,
+                "facts_tags": [],
+                "pool_used": 1,
+                "pool_budget": 10,
+                "total_context_tokens": 5,
+                "non_virtualizable_floor": 0,
+                "tool_call_count": 1,
+            })
+            store.store_tag_summary_embedding("topic", conversation_id, tag_embedding)
+
+        deleted = store.delete_conversation("conv-a")
+
+        assert deleted == 1
+        assert store.get_segment("conv-a-seg", conversation_id="conv-a") is None
+        assert store.get_segment("conv-b-seg", conversation_id="conv-b") is not None
+        assert store.load_recent_turn_messages("conv-a", limit=5) == []
+        assert store.load_recent_turn_messages("conv-b", limit=5) == [
+            (0, "user", "assistant"),
+        ]
+        assert store.load_request_captures(conversation_id="conv-a") == []
+        assert len(store.load_request_captures(conversation_id="conv-b")) == 1
+        assert store.search_tool_outputs("artifact-alpha", conversation_id="conv-a") == []
+        assert len(store.search_tool_outputs("artifact-beta", conversation_id="conv-b")) == 1
+        assert store.load_tool_calls("conv-a") == []
+        assert len(store.load_tool_calls("conv-b")) == 1
+        assert store.load_request_contexts("conv-a") == []
+        assert len(store.load_request_contexts("conv-b")) == 1
+        assert store.load_tag_summary_embeddings("conv-a") == {}
+        assert store.load_tag_summary_embeddings("conv-b") == {"topic": [0.3, 0.4]}
