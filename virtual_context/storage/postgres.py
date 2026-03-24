@@ -743,25 +743,42 @@ class PostgresStore(ContextStore):
         cur = conn.execute("DELETE FROM segments WHERE created_at < %s", (cutoff,))
         return cur.rowcount
 
+    def _table_exists(self, conn, table: str) -> bool:
+        row = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+            (table,),
+        ).fetchone()
+        if not row:
+            return False
+        if isinstance(row, dict):
+            return bool(next(iter(row.values())))
+        return bool(row[0])
+
+    def _delete_conversation_rows(self, conn, table: str, conversation_id: str) -> int:
+        if not self._table_exists(conn, table):
+            return 0
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE conversation_id = %s",
+            (conversation_id,),
+        )
+        return int(cur.rowcount or 0)
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         with conn.transaction():
-            cur = conn.execute(
-                "DELETE FROM segments WHERE conversation_id = %s", (conversation_id,),
-            )
-            deleted = cur.rowcount
-            conn.execute(
-                "DELETE FROM engine_state WHERE conversation_id = %s", (conversation_id,),
-            )
-            conn.execute(
-                "DELETE FROM facts WHERE conversation_id = %s", (conversation_id,),
-            )
-            conn.execute(
-                "DELETE FROM turn_messages WHERE conversation_id = %s", (conversation_id,),
-            )
-            conn.execute(
-                "DELETE FROM tag_summaries WHERE conversation_id = %s", (conversation_id,),
-            )
+            deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
+            for table in (
+                "engine_state",
+                "facts",
+                "turn_messages",
+                "tag_summaries",
+                "request_captures",
+                "tool_outputs",
+                "tool_calls",
+                "request_context",
+                "tag_summary_embeddings",
+            ):
+                self._delete_conversation_rows(conn, table, conversation_id)
         return deleted
 
     def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:

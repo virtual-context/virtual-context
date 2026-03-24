@@ -1127,26 +1127,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return cursor.rowcount > 0
 
+    def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def _delete_conversation_rows(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        conversation_id: str,
+    ) -> int:
+        if not self._table_exists(conn, table):
+            return 0
+        cursor = conn.execute(
+            f"DELETE FROM {table} WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        return int(cursor.rowcount or 0)
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
-        cursor = conn.execute(
-            "DELETE FROM segments WHERE conversation_id = ?", (conversation_id,),
-        )
-        deleted = cursor.rowcount
-        # Also clear persisted engine state so lossless restart doesn't
-        # restore a stale _compacted_through watermark.
-        conn.execute(
-            "DELETE FROM engine_state WHERE conversation_id = ?", (conversation_id,),
-        )
-        conn.execute(
-            "DELETE FROM facts WHERE conversation_id = ?", (conversation_id,),
-        )
-        conn.execute(
-            "DELETE FROM turn_messages WHERE conversation_id = ?", (conversation_id,),
-        )
-        conn.execute(
-            "DELETE FROM tag_summaries WHERE conversation_id = ?", (conversation_id,),
-        )
+        deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
+        # Also clear persisted state and diagnostics so restarts do not
+        # resurrect a partially deleted conversation.
+        for table in (
+            "engine_state",
+            "facts",
+            "turn_messages",
+            "tag_summaries",
+            "request_captures",
+            "tool_outputs",
+            "tool_calls",
+            "request_context",
+            "tag_summary_embeddings",
+        ):
+            self._delete_conversation_rows(conn, table, conversation_id)
         conn.commit()
         return deleted
 

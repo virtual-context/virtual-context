@@ -133,7 +133,24 @@ class CompositeStore:
         return self._segments.get_orphan_tag_snippets(limit=limit)
 
     def delete_conversation(self, conversation_id: str) -> int:
-        return self._segments.delete_conversation(conversation_id)
+        deleted = 0
+        seen: set[int] = set()
+        for store in (
+            self._segments,
+            self._facts,
+            self._fact_links,
+            self._state,
+            self._search,
+        ):
+            marker = id(store)
+            if marker in seen or not hasattr(store, "delete_conversation"):
+                continue
+            seen.add(marker)
+            deleted = max(
+                deleted,
+                int(store.delete_conversation(conversation_id) or 0),
+            )
+        return deleted
 
     def save_turn_message(
         self, conversation_id: str, turn_number: int,

@@ -304,18 +304,31 @@ def register_dashboard_routes(
                 status_code=501,
             )
         try:
+            if conversation_id == state.engine.config.conversation_id:
+                await asyncio.to_thread(
+                    state.reset_for_conversation_deletion,
+                    conversation_id,
+                )
             deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
             # Also clean up tag aliases referencing this conversation
             if hasattr(store, "delete_tag_aliases_for_conversation"):
                 await asyncio.to_thread(
                     store.delete_tag_aliases_for_conversation, conversation_id,
                 )
-            # Reset in-memory watermark if deleting the current conversation
-            if conversation_id == state.engine.config.conversation_id:
-                state.engine._engine_state.compacted_through = 0
+            if state.metrics:
+                await asyncio.to_thread(
+                    state.metrics.delete_conversation_artifacts,
+                    conversation_id,
+                )
             # Invalidate Redis cache
             if hasattr(state, 'engine') and hasattr(state.engine, '_session_cache') and state.engine._session_cache:
                 state.engine._session_cache.delete_conversation(conversation_id)
+            if state.metrics:
+                state.metrics.record({
+                    "type": "conversation_deleted",
+                    "conversation_id": conversation_id,
+                    "segments_removed": deleted,
+                })
             logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
         except Exception as exc:

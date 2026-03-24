@@ -276,6 +276,59 @@ class ProxyMetrics:
                 )
             return removed
 
+    def delete_conversation_artifacts(self, conversation_id: str) -> dict[str, int]:
+        """Purge all in-memory and persisted metrics for a conversation."""
+        conv_id = self._capture_conversation_id(conversation_id)
+        if not conv_id:
+            return {"captures_removed": 0, "events_removed": 0}
+
+        with self._lock:
+            captures = [
+                req for req in self._request_bodies
+                if (req.get("conversation_id", "") or "") != conv_id
+            ]
+            captures_removed = len(self._request_bodies) - len(captures)
+            if captures_removed:
+                self._request_bodies = deque(
+                    captures,
+                    maxlen=self._request_bodies.maxlen,
+                )
+
+            events = [
+                event for event in self._events
+                if (event.get("conversation_id", "") or "") != conv_id
+            ]
+            events_removed = len(self._events) - len(events)
+            if events_removed:
+                self._events = events
+
+            if self._db:
+                try:
+                    self._db.execute(
+                        "DELETE FROM metrics_events WHERE conversation_id = ?",
+                        (conv_id,),
+                    )
+                    self._db.commit()
+                except Exception:
+                    logger.debug(
+                        "Failed to delete metrics artifacts for conv=%s",
+                        conv_id[:12],
+                        exc_info=True,
+                    )
+
+            if captures_removed or events_removed:
+                logger.info(
+                    "Deleted metrics artifacts for conv=%s captures=%d events=%d",
+                    conv_id[:12],
+                    captures_removed,
+                    events_removed,
+                )
+
+            return {
+                "captures_removed": captures_removed,
+                "events_removed": events_removed,
+            }
+
     def events_since(self, seq: int) -> list[dict]:
         with self._lock:
             self._evict_old()
