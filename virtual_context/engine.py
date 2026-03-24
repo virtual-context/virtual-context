@@ -109,6 +109,7 @@ class VirtualContextEngine:
         self,
         config_path: str | Path | None = None,
         config: VirtualContextConfig | None = None,
+        session_cache=None,  # RedisSessionCache or None
     ) -> None:
         self._config_path = str(config_path) if config_path else None
         self.config = config or load_config(config_path)
@@ -127,14 +128,33 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._engine_state = EngineState()  # mutable shared state for delegates
+        self._session_cache = session_cache
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
-        self._restored_conversation_history: list[tuple[int, str, str]] = []  # (turn, user, asst) from store
+        self._restored_conversation_history: list = []  # (turn, user, asst) from store or dicts from Redis
 
         # Restore persisted state BEFORE creating delegates so they get the
         # final turn_tag_index / engine_state — no re-sync needed.
-        self._load_persisted_state()
+        # Try Redis cache first (fast) — fall back to store if miss
+        _redis_loaded = False
+        if self._session_cache and self._session_cache.is_available():
+            try:
+                cached = self._session_cache.load_snapshot(self.config.conversation_id)
+                if cached and cached.get("conversation_id") == self.config.conversation_id:
+                    self._apply_cached_state(cached)
+                    _redis_loaded = True
+                    logger.info(
+                        "Session cache hit: %d messages, %d turns from Redis (version=%s)",
+                        len(cached.get("history", [])),
+                        len(cached.get("turn_tag_entries", [])),
+                        cached.get("version", "?"),
+                    )
+            except Exception as e:
+                logger.warning("Redis cache load failed: %s — falling back to store", e)
+
+        if not _redis_loaded:
+            self._load_persisted_state()
 
         # Create delegates with the (possibly restored) turn_tag_index
         self._semantic = SemanticSearchManager(store=self._store, config=self.config)
@@ -483,6 +503,75 @@ class VirtualContextEngine:
             except Exception:
                 pass  # Don't crash on validation failure
 
+    def _apply_cached_state(self, cached: dict) -> None:
+        """Restore engine state from a Redis snapshot."""
+        from .types import TurnTagEntry, FactSignal, WorkingSetEntry, DepthLevel
+        from datetime import datetime, timezone
+
+        self.config.conversation_id = cached["conversation_id"]
+
+        # Engine state — compacted_through is 0 in snapshot (history is uncompacted suffix)
+        es = cached.get("engine_state", {})
+        self._engine_state.compacted_through = es.get("compacted_through", 0)
+        self._engine_state.split_processed_tags = set(es.get("split_processed_tags", []))
+        self._engine_state.trailing_fingerprint = es.get("trailing_fingerprint", "")
+        self._engine_state.provider = es.get("provider", "")
+        self._engine_state.tool_tag_counter = es.get("tool_tag_counter", 0)
+
+        # TurnTagIndex — populate in-place
+        for entry_dict in cached.get("turn_tag_entries", []):
+            fs = []
+            for sig in entry_dict.get("fact_signals", []) or []:
+                fs.append(FactSignal(
+                    subject=sig.get("subject", ""),
+                    verb=sig.get("verb", ""),
+                    object=sig.get("object", ""),
+                    status=sig.get("status", ""),
+                    fact_type=sig.get("fact_type", "personal"),
+                    what=sig.get("what", ""),
+                ))
+            ts = entry_dict.get("timestamp")
+            if isinstance(ts, str) and ts:
+                try:
+                    ts = datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    ts = datetime.now(timezone.utc)
+            else:
+                ts = datetime.now(timezone.utc)
+            self._turn_tag_index.append(TurnTagEntry(
+                turn_number=entry_dict["turn_number"],
+                tags=entry_dict["tags"],
+                primary_tag=entry_dict.get("primary_tag", ""),
+                message_hash=entry_dict.get("message_hash", ""),
+                sender=entry_dict.get("sender", ""),
+                timestamp=ts,
+                fact_signals=fs or None,
+            ))
+
+        # Working set — stash for _apply_persisted_state_to_delegates
+        self._restored_working_set = []
+        for ws in es.get("working_set", []):
+            try:
+                self._restored_working_set.append(WorkingSetEntry(
+                    tag=ws["tag"],
+                    depth=DepthLevel(ws["depth"]) if isinstance(ws.get("depth"), str) else DepthLevel.SUMMARY,
+                    tokens=ws.get("tokens", 0),
+                    last_accessed_turn=ws.get("last_accessed_turn", 0),
+                ))
+            except (KeyError, ValueError):
+                pass
+
+        # Telemetry
+        if es.get("telemetry_rollup"):
+            self._telemetry.restore_from_rollup(es["telemetry_rollup"])
+
+        # Request captures
+        self._restored_request_captures = es.get("request_captures", [])
+
+        # History — stash as list of dicts for ProxyState to pick up
+        # (ProxyState handles the dict->Message conversion)
+        self._restored_conversation_history = cached.get("history", [])
+
     def _apply_persisted_state_to_delegates(self) -> None:
         """Wire restored state into delegates created after _load_persisted_state."""
         # Restore paging working set (old snapshots may have empty list)
@@ -547,8 +636,87 @@ class VirtualContextEngine:
                 provider=self._engine_state.provider,
                 tool_tag_counter=self._engine_state.tool_tag_counter,
             ))
+            # Write-through to Redis cache
+            if self._session_cache:
+                try:
+                    cache_snapshot = self._build_cache_snapshot(conversation_history)
+                    self._session_cache.save_snapshot(
+                        self.config.conversation_id, cache_snapshot,
+                    )
+                except Exception as _redis_err:
+                    logger.debug("Redis snapshot write failed: %s", _redis_err)
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
+
+    _cache_version = 0
+
+    def _build_cache_snapshot(self, conversation_history: list) -> dict:
+        """Build atomic snapshot dict for Redis cache."""
+        self._cache_version += 1
+        ct = self._engine_state.compacted_through
+
+        # History: uncompacted suffix only
+        suffix = conversation_history[ct:] if ct < len(conversation_history) else conversation_history
+        cap = getattr(self.config, 'proxy', None)
+        cap = getattr(cap, 'redis_history_cap', 600) if cap else 600
+        if len(suffix) > cap:
+            suffix = suffix[-cap:]
+
+        history = []
+        for msg in suffix:
+            history.append({
+                "role": msg.role,
+                "content": msg.content,
+                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+                "metadata": msg.metadata,
+                "raw_content": msg.raw_content,
+            })
+
+        entries = []
+        for e in self._turn_tag_index.entries:
+            entries.append({
+                "turn_number": e.turn_number,
+                "tags": e.tags,
+                "primary_tag": e.primary_tag,
+                "message_hash": e.message_hash,
+                "sender": e.sender,
+                "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                "fact_signals": [
+                    {"subject": fs.subject, "verb": fs.verb, "object": fs.object,
+                     "status": fs.status, "fact_type": fs.fact_type, "what": fs.what}
+                    for fs in (e.fact_signals or [])
+                ] if e.fact_signals else [],
+            })
+
+        telemetry_dict = self._telemetry.to_dict()
+        telemetry_dict.pop("events", None)
+        captures = []
+        if self._request_captures_provider:
+            try:
+                captures = self._request_captures_provider()
+            except Exception:
+                pass
+
+        return {
+            "version": self._cache_version,
+            "conversation_id": self.config.conversation_id,
+            "history": history,
+            "turn_tag_entries": entries,
+            "engine_state": {
+                "compacted_through": 0,  # history IS the uncompacted suffix
+                "split_processed_tags": sorted(self._engine_state.split_processed_tags),
+                "working_set": [
+                    {"tag": ws.tag, "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                     "tokens": ws.tokens, "last_accessed_turn": ws.last_accessed_turn}
+                    for ws in self._paging.working_set.values()
+                ],
+                "trailing_fingerprint": self._engine_state.trailing_fingerprint,
+                "telemetry_rollup": telemetry_dict,
+                "request_captures": captures,
+                "provider": self._engine_state.provider,
+                "tool_tag_counter": self._engine_state.tool_tag_counter,
+            },
+        }
 
     def _init_supersession_checker(self) -> None:
         sc = self.config.supersession
