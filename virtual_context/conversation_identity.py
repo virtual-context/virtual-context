@@ -39,11 +39,22 @@ def _candidate_to_uuid(layer: str, value: str) -> str:
     return str(_uuid.UUID(digest[:32]))
 
 
+def _get_messages(body: dict) -> list:
+    """Return the message list from any format (messages, input, or contents)."""
+    msgs = body.get("messages")
+    if isinstance(msgs, list) and msgs:
+        return msgs
+    inp = body.get("input")
+    if isinstance(inp, list) and inp:
+        return inp
+    return []
+
+
 def _extract_conversation_info(body: dict) -> dict:
     if not body:
         return {}
 
-    for msg in body.get("messages", []):
+    for msg in _get_messages(body):
         if msg.get("role") != "user":
             continue
 
@@ -107,9 +118,9 @@ def _extract_system_prompt_info(body: dict) -> dict:
                 if isinstance(b, dict) and b.get("type") == "text"
             )
 
-    # OpenAI: first message with role "system" or "developer"
+    # OpenAI Chat: first message with role "system" or "developer"
     if not system_text:
-        for msg in body.get("messages", []):
+        for msg in _get_messages(body):
             role = msg.get("role", "")
             if role in ("system", "developer"):
                 c = msg.get("content", "")
@@ -121,6 +132,12 @@ def _extract_system_prompt_info(body: dict) -> dict:
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
                 break
+
+    # OpenAI Responses: "instructions" key
+    if not system_text:
+        instructions = body.get("instructions", "")
+        if isinstance(instructions, str) and instructions:
+            system_text = instructions
 
     if not system_text:
         return {}
@@ -163,7 +180,7 @@ def _extract_system_prompt_hash(body: dict) -> str:
 
     if not system_text and not system_list:
         # No top-level system field — check OpenAI-style system/developer message
-        for msg in body.get("messages", []):
+        for msg in _get_messages(body):
             role = msg.get("role", "")
             if role in ("system", "developer"):
                 c = msg.get("content", "")
@@ -176,6 +193,12 @@ def _extract_system_prompt_hash(body: dict) -> str:
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
                 break
+
+    # OpenAI Responses: "instructions" key
+    if not system_text and not system_list:
+        instructions = body.get("instructions", "")
+        if isinstance(instructions, str) and instructions:
+            system_text = instructions
 
     # No extractable text — don't hash. A deterministic hash-of-nothing
     # would collapse unrelated requests (multimodal-only system, empty list)
