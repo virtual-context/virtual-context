@@ -356,7 +356,9 @@ class ProxyState:
         tag_summary_count = 0
         tag_summary_tokens = 0
         try:
-            summaries = engine._store.get_all_tag_summaries()
+            summaries = engine._store.get_all_tag_summaries(
+                conversation_id=engine.config.conversation_id,
+            )
             tag_summary_count = len(summaries)
             tag_summary_tokens = sum(ts.summary_tokens for ts in summaries)
         except Exception:
@@ -499,7 +501,11 @@ class ProxyState:
                     "complete_ms": tag_ms,
                     "tag_ms": tag_ms,
                     "active_tags": active_tags,
-                    "store_tag_count": len(self.engine._store.get_all_tags()),
+                    "store_tag_count": len(
+                        self.engine._store.get_all_tags(
+                            conversation_id=conversation_id,
+                        )
+                    ),
                     "turn_pair_tokens": turn_pair_tokens,
                     "conversation_id": conversation_id,
                 })
