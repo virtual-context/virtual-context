@@ -829,6 +829,12 @@ def create_app(
                     _redis_url = _pre_cfg.proxy.redis_url
                 except Exception:
                     pass
+            # Also check shared_engine's config when no config_path
+            if not _redis_url and shared_engine and hasattr(shared_engine.config, 'proxy'):
+                try:
+                    _redis_url = shared_engine.config.proxy.redis_url
+                except (AttributeError, TypeError):
+                    pass
             if _redis_url:
                 from .session_cache import RedisSessionCache
                 session_cache = RedisSessionCache(_redis_url)
@@ -837,7 +843,7 @@ def create_app(
 
         if shared_engine is not None:
             engine = shared_engine
-            if session_cache and not hasattr(engine, '_session_cache'):
+            if session_cache:
                 engine._session_cache = session_cache
         else:
             engine = VirtualContextEngine(config_path=config_path, session_cache=session_cache)
