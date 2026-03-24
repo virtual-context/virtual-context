@@ -209,6 +209,40 @@ class ProxyMetrics:
             if len(self._events) > self.MAX_EVENTS:
                 del self._events[:len(self._events) - self.MAX_EVENTS]
 
+    def clear_ingestion_events(self, conversation_id: str) -> int:
+        """Remove stale ingested_turn and history_ingestion events for a conversation.
+
+        Called when a new ingestion starts so old progress data from a
+        previous (possibly interrupted) run doesn't pollute the dashboard.
+        Returns the number of events removed.
+        """
+        with self._lock:
+            before = len(self._events)
+            self._events = [
+                e for e in self._events
+                if not (
+                    e.get("conversation_id") == conversation_id
+                    and e.get("type") in ("ingested_turn", "history_ingestion")
+                )
+            ]
+            removed = before - len(self._events)
+            # Also clear from SQLite
+            if self._db and removed:
+                try:
+                    self._db.execute(
+                        "DELETE FROM metrics_events WHERE conversation_id = ? AND type IN ('ingested_turn', 'history_ingestion')",
+                        (conversation_id,),
+                    )
+                    self._db.commit()
+                except Exception:
+                    pass
+            if removed:
+                logger.info(
+                    "Cleared %d stale ingestion events for conv=%s",
+                    removed, conversation_id[:12],
+                )
+            return removed
+
     def events_since(self, seq: int) -> list[dict]:
         with self._lock:
             self._evict_old()

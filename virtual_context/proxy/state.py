@@ -726,6 +726,11 @@ class ProxyState:
                 self._ingestion_thread is not None and self._ingestion_thread.is_alive(),
             )
 
+            # Clear stale ingestion events from any previous run so the
+            # dashboard shows fresh progress for this ingestion.
+            if self.metrics:
+                self.metrics.clear_ingestion_events(conversation_id)
+
             if not history_pairs:
                 self._ingested_conversations.add(conversation_id)
                 return
