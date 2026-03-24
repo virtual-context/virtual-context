@@ -145,18 +145,25 @@ def filter_body_messages(
     # Map: tool_use_id → msg_idx that contains the tool_use
     # Map: tool_use_id → msg_idx that contains the tool_result
     tooluse_to_msg: dict[str, int] = {}   # id → assistant msg index
-    toolresult_to_msg: dict[str, int] = {}  # tool_use_id → user msg index
+    toolresult_to_msg: dict[str, int] = {}  # tool_use_id → user/tool msg index
     for msg_idx, msg in enumerate(chat_msgs):
+        # Anthropic: content blocks with type=tool_use / type=tool_result
         content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use" and "id" in block:
-                tooluse_to_msg[block["id"]] = msg_idx
-            elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                toolresult_to_msg[block["tool_use_id"]] = msg_idx
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and "id" in block:
+                    tooluse_to_msg[block["id"]] = msg_idx
+                elif block.get("type") == "tool_result" and "tool_use_id" in block:
+                    toolresult_to_msg[block["tool_use_id"]] = msg_idx
+        # OpenAI: assistant message with tool_calls array
+        for tc in msg.get("tool_calls", []):
+            if isinstance(tc, dict) and "id" in tc:
+                tooluse_to_msg[tc["id"]] = msg_idx
+        # OpenAI: tool role message with tool_call_id
+        if msg.get("role") == "tool" and "tool_call_id" in msg:
+            toolresult_to_msg[msg["tool_call_id"]] = msg_idx
 
     # Build per-message keep set: unpaired messages always kept, pairs based on filter
     keep_msg: set[int] = set()
@@ -346,19 +353,28 @@ def filter_body_messages(
     # The tagging fix above should prevent orphans, but if any slip through
     # (e.g. a message layout we haven't seen yet), returning the unfiltered
     # body is always better than sending a guaranteed 400 to the API.
+    # Checks both Anthropic (tool_use/tool_result in content) and OpenAI
+    # (tool_calls on assistant / role="tool" with tool_call_id) formats.
     _final_tu: set[str] = set()
     _final_tr: set[str] = set()
     for msg in kept:
+        # Anthropic content blocks
         content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use" and "id" in block:
-                _final_tu.add(block["id"])
-            elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                _final_tr.add(block["tool_use_id"])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and "id" in block:
+                    _final_tu.add(block["id"])
+                elif block.get("type") == "tool_result" and "tool_use_id" in block:
+                    _final_tr.add(block["tool_use_id"])
+        # OpenAI tool_calls
+        for tc in msg.get("tool_calls", []):
+            if isinstance(tc, dict) and "id" in tc:
+                _final_tu.add(tc["id"])
+        # OpenAI tool role
+        if msg.get("role") == "tool" and "tool_call_id" in msg:
+            _final_tr.add(msg["tool_call_id"])
     _orphaned = _final_tr - _final_tu
     if _orphaned:
         logger.info(
@@ -635,12 +651,30 @@ def trim_to_upstream_limit(
         # Start of a turn: user message + assistant response
         chain_indices = [i, i + 1]  # user + assistant
         j = i + 2
-        # Extend chain through tool rounds: tool_result user → assistant → ...
+        # Extend chain through tool rounds.
+        # Anthropic: user[tool_result] → assistant → ...
+        # OpenAI: tool (role="tool") → assistant → ...  (assistant has "tool_calls")
         while j < len(original_messages) - 1:
             next_msg = original_messages[j]
-            if next_msg.get("role") not in ("user", "human"):
+            next_role = next_msg.get("role", "")
+            # OpenAI tool response (role="tool")
+            if next_role == "tool":
+                # Consume all consecutive tool messages + following assistant
+                tool_batch = [j]
+                k = j + 1
+                while k < len(original_messages) and original_messages[k].get("role") == "tool":
+                    tool_batch.append(k)
+                    k += 1
+                if k < len(original_messages) and original_messages[k].get("role") == "assistant":
+                    chain_indices.extend(tool_batch)
+                    chain_indices.append(k)
+                    j = k + 1
+                    continue
+                else:
+                    break  # tool messages without following assistant — stop
+            # Anthropic tool result (user message with tool_result content blocks)
+            if next_role not in ("user", "human"):
                 break
-            # Check if this user message is tool_result-only
             content = next_msg.get("content", "")
             is_tool_result = False
             if isinstance(content, list):
@@ -724,26 +758,34 @@ def trim_to_upstream_limit(
 
 
 def _cleanup_orphaned_tools(body: dict, msg_key: str) -> dict:
-    """Remove messages with orphaned tool_use or tool_result blocks."""
+    """Remove messages with orphaned tool_use/tool_result (Anthropic) or
+    tool_calls/tool (OpenAI) blocks."""
     messages = body.get(msg_key, [])
     if not messages:
         return body
 
     for _pass in range(3):  # max 3 passes (removing one orphan may expose another)
-        # Collect all tool_use IDs and tool_result IDs
-        tool_use_ids: set[str] = set()
-        tool_result_ids: set[str] = set()
+        # Collect all tool IDs from both Anthropic and OpenAI formats
+        tool_use_ids: set[str] = set()    # IDs offered (assistant side)
+        tool_result_ids: set[str] = set()  # IDs answered (user/tool side)
         for m in messages:
+            # Anthropic: content blocks with type=tool_use / type=tool_result
             content = m.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "tool_use" and "id" in b:
-                    tool_use_ids.add(b["id"])
-                elif b.get("type") == "tool_result" and "tool_use_id" in b:
-                    tool_result_ids.add(b["tool_use_id"])
+            if isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and "id" in b:
+                        tool_use_ids.add(b["id"])
+                    elif b.get("type") == "tool_result" and "tool_use_id" in b:
+                        tool_result_ids.add(b["tool_use_id"])
+            # OpenAI: assistant message with tool_calls array
+            for tc in m.get("tool_calls", []):
+                if isinstance(tc, dict) and "id" in tc:
+                    tool_use_ids.add(tc["id"])
+            # OpenAI: tool role message with tool_call_id
+            if m.get("role") == "tool" and "tool_call_id" in m:
+                tool_result_ids.add(m["tool_call_id"])
 
         orphan_use_ids = tool_use_ids - tool_result_ids
         orphan_result_ids = tool_result_ids - tool_use_ids
@@ -753,20 +795,28 @@ def _cleanup_orphaned_tools(body: dict, msg_key: str) -> dict:
         # Remove messages containing orphaned blocks
         cleaned: list[dict] = []
         for m in messages:
-            content = m.get("content", [])
-            if not isinstance(content, list):
-                cleaned.append(m)
-                continue
             has_orphan = False
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "tool_use" and b.get("id") in orphan_use_ids:
-                    has_orphan = True
-                    break
-                if b.get("type") == "tool_result" and b.get("tool_use_id") in orphan_result_ids:
-                    has_orphan = True
-                    break
+            # Check Anthropic content blocks
+            content = m.get("content", [])
+            if isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and b.get("id") in orphan_use_ids:
+                        has_orphan = True
+                        break
+                    if b.get("type") == "tool_result" and b.get("tool_use_id") in orphan_result_ids:
+                        has_orphan = True
+                        break
+            # Check OpenAI tool_calls
+            if not has_orphan:
+                for tc in m.get("tool_calls", []):
+                    if isinstance(tc, dict) and tc.get("id") in orphan_use_ids:
+                        has_orphan = True
+                        break
+            # Check OpenAI tool role
+            if not has_orphan and m.get("role") == "tool" and m.get("tool_call_id") in orphan_result_ids:
+                has_orphan = True
             if not has_orphan:
                 cleaned.append(m)
         messages = cleaned
