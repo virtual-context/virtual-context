@@ -925,6 +925,7 @@ def create_app(
             metrics=metrics,
             store=engine._store,
             session_cache=session_cache,
+            embedding_provider=engine._embedding_provider,
         )
         registry._conversations[engine.config.conversation_id] = default_state
 

@@ -110,10 +110,20 @@ class VirtualContextEngine:
         config_path: str | Path | None = None,
         config: VirtualContextConfig | None = None,
         session_cache=None,  # RedisSessionCache or None
+        embedding_provider=None,  # EmbeddingProvider or None
     ) -> None:
         self._config_path = str(config_path) if config_path else None
         self.config = config or load_config(config_path)
         self._token_counter = create_token_counter(self.config.token_counter)
+
+        # Shared embedding provider — single model load across all components
+        if embedding_provider is not None:
+            self._embedding_provider = embedding_provider
+        else:
+            from .core.embedding_provider import EmbeddingProvider
+            self._embedding_provider = EmbeddingProvider(
+                model_name=self.config.retriever.embedding_model,
+            )
 
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
@@ -177,7 +187,10 @@ class VirtualContextEngine:
             self._load_persisted_state()
 
         # Create delegates with the (possibly restored) turn_tag_index
-        self._semantic = SemanticSearchManager(store=self._store, config=self.config)
+        self._semantic = SemanticSearchManager(
+            store=self._store, config=self.config,
+            embedding_provider=self._embedding_provider,
+        )
         from .core.fact_query import FactQueryEngine
         self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
         from .core.search_engine import SearchEngine
@@ -287,7 +300,7 @@ class VirtualContextEngine:
         self._tag_generator: TagGenerator = build_tag_generator(
             self.config.tag_generator, llm_provider,
             canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
-            embed_fn_factory=lambda: self._semantic.get_embed_fn(),
+            embed_fn_factory=lambda: self._embedding_provider.get_embed_fn() if self._embedding_provider else None,
         )
 
     def _init_store(self) -> None:
@@ -360,7 +373,7 @@ class VirtualContextEngine:
         )
 
     def _init_segmenter(self) -> None:
-        embed_fn = self._semantic.get_embed_fn() if hasattr(self, '_semantic') else None
+        embed_fn = self._embedding_provider.get_embed_fn() if self._embedding_provider else None
         self._segmenter = TopicSegmenter(
             tag_generator=self._tag_generator,
             config=self.config.segmenter,
@@ -399,10 +412,12 @@ class VirtualContextEngine:
             self.config.retriever.embedding_model,
             self.config.retriever.embedding_threshold,
         )
+        embed_fn = self._embedding_provider.get_embed_fn() if self._embedding_provider else None
         return EmbeddingTagGenerator(
             config=self.config.tag_generator,
             model_name=self.config.retriever.embedding_model,
             similarity_threshold=self.config.retriever.embedding_threshold,
+            embed_fn=embed_fn,
         )
 
     def _init_compactor(self) -> None:
