@@ -318,6 +318,8 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         passthrough_trim_ratio=proxy_raw.get("passthrough_trim_ratio", _prx_defaults.passthrough_trim_ratio),
         llm_calls_log=proxy_raw.get("llm_calls_log", _prx_defaults.llm_calls_log),
         history_widening_threshold=proxy_raw.get("history_widening_threshold", _prx_defaults.history_widening_threshold),
+        redis_url=os.environ.get("REDIS_URL", proxy_raw.get("redis_url", "")),
+        redis_history_cap=proxy_raw.get("redis_history_cap", 600),
         instances=instances,
     )
 

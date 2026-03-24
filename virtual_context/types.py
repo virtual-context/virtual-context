@@ -856,6 +856,8 @@ class ProxyConfig:
     upstream_context_limit: int = 0  # 0 = auto-detect from model name
     history_widening_threshold: float = 0.10  # 10% growth + prefix change triggers re-ingest
     passthrough_trim_ratio: float = 0.40  # trim passthrough payloads to upstream_limit * ratio (0=no trim)
+    redis_url: str = ""           # empty = disabled, e.g. "redis://127.0.0.1:6379"
+    redis_history_cap: int = 600  # safety cap on uncompacted suffix size in snapshot
     instances: list[ProxyInstanceConfig] = field(default_factory=list)
 
 
