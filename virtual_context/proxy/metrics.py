@@ -69,7 +69,8 @@ class ProxyMetrics:
     MAX_AGE_S = 86_400  # 24 hours
 
     def __init__(self, context_window: int = 120_000, telemetry_ledger=None,
-                 db_path: str | None = None, store=None) -> None:
+                 db_path: str | None = None, store=None,
+                 restore_captures: bool = True) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
         self._events: list[dict] = []
@@ -101,7 +102,7 @@ class ProxyMetrics:
             self._load_from_db()
 
         self._store = store
-        if self._store:
+        if self._store and restore_captures:
             try:
                 persisted = self._store.load_request_captures(limit=50)
                 if persisted:
@@ -147,6 +148,32 @@ class ProxyMetrics:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _capture_conversation_id(value: str | None) -> str:
+        return value or ""
+
+    def _capture_matches(
+        self,
+        req: dict,
+        turn: int,
+        conversation_id: str | None = None,
+    ) -> bool:
+        if req.get("turn") != turn:
+            return False
+        if conversation_id is None:
+            return True
+        return (req.get("conversation_id", "") or "") == conversation_id
+
+    def _find_capture(
+        self,
+        turn: int,
+        conversation_id: str | None = None,
+    ) -> dict | None:
+        for req in reversed(self._request_bodies):
+            if self._capture_matches(req, turn, conversation_id):
+                return req
+        return None
 
     def record(self, event: dict) -> None:
         """Append an event (thread-safe). Adds ``_seq``, ``ts``, and ``_recorded_at``."""
@@ -409,7 +436,8 @@ class ProxyMetrics:
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
         with self._lock:
-            self._request_bodies.append({
+            conv_id = self._capture_conversation_id(conversation_id)
+            payload = {
                 "turn": turn,
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "api_format": api_format,
@@ -431,16 +459,34 @@ class ProxyMetrics:
                 "turns_dropped": turns_dropped,
                 "turns_stubbed": turns_stubbed,
                 "message_preview": message_preview,
-            })
-            self._persist_capture(turn)
+            }
+            existing = self._find_capture(turn, conv_id)
+            if existing is not None:
+                existing.clear()
+                existing.update(payload)
+            else:
+                self._request_bodies.append(payload)
+            if conv_id:
+                self._persist_capture(turn, conversation_id=conv_id)
+            else:
+                self._persist_capture(turn)
 
-    def capture_enriched(self, turn: int, body: dict) -> None:
+    def capture_enriched(
+        self,
+        turn: int,
+        body: dict,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
         with self._lock:
-            for req in self._request_bodies:
-                if req["turn"] == turn:
-                    req["enriched"] = body
+            conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+            req = self._find_capture(turn, conv_id)
+            if req is not None:
+                req["enriched"] = body
+                if conv_id:
+                    self._persist_capture(turn, conversation_id=conv_id)
+                else:
                     self._persist_capture(turn)
-                    return
 
     def capture_response(
         self, turn: int, body: dict, *,
@@ -448,62 +494,99 @@ class ProxyMetrics:
         upstream_output_tokens: int = 0,
         cache_creation_input_tokens: int = 0,
         cache_read_input_tokens: int = 0,
+        conversation_id: str | None = None,
     ) -> None:
         with self._lock:
-            for req in self._request_bodies:
-                if req["turn"] == turn:
-                    req["response"] = body
-                    if upstream_input_tokens:
-                        req["upstream_input_tokens"] = upstream_input_tokens
-                    if upstream_output_tokens:
-                        req["upstream_output_tokens"] = upstream_output_tokens
-                    if cache_creation_input_tokens:
-                        req["cache_creation_input_tokens"] = cache_creation_input_tokens
-                    if cache_read_input_tokens:
-                        req["cache_read_input_tokens"] = cache_read_input_tokens
+            conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+            req = self._find_capture(turn, conv_id)
+            if req is not None:
+                req["response"] = body
+                if upstream_input_tokens:
+                    req["upstream_input_tokens"] = upstream_input_tokens
+                if upstream_output_tokens:
+                    req["upstream_output_tokens"] = upstream_output_tokens
+                if cache_creation_input_tokens:
+                    req["cache_creation_input_tokens"] = cache_creation_input_tokens
+                if cache_read_input_tokens:
+                    req["cache_read_input_tokens"] = cache_read_input_tokens
+                if conv_id:
+                    self._persist_capture(turn, conversation_id=conv_id)
+                else:
                     self._persist_capture(turn)
-                    return
 
     def update_request_tags(
-        self, turn: int, *, response_tags: list[str] | None = None,
+        self,
+        turn: int,
+        *,
+        response_tags: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         with self._lock:
-            for req in self._request_bodies:
-                if req["turn"] == turn:
-                    if response_tags is not None:
-                        req["response_tags"] = response_tags
+            conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+            req = self._find_capture(turn, conv_id)
+            if req is not None:
+                if response_tags is not None:
+                    req["response_tags"] = response_tags
+                if conv_id:
+                    self._persist_capture(turn, conversation_id=conv_id)
+                else:
                     self._persist_capture(turn)
-                    return
 
-    def get_captured_request(self, turn: int) -> dict | None:
+    def get_captured_request(
+        self,
+        turn: int,
+        conversation_id: str | None = None,
+    ) -> dict | None:
         with self._lock:
-            for req in self._request_bodies:
-                if req["turn"] == turn:
-                    return dict(req)
-            return None
+            conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+            req = self._find_capture(turn, conv_id)
+            return dict(req) if req is not None else None
 
-    def get_captured_requests_summary(self) -> list[dict]:
+    def get_captured_requests_summary(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
         with self._lock:
-            return [_extract_summary(r) for r in self._request_bodies]
+            conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+            return [
+                _extract_summary(r)
+                for r in self._request_bodies
+                if conv_id is None
+                or (r.get("conversation_id", "") or "") == conv_id
+            ]
 
     def restore_request_captures(self, captures: list[dict]) -> None:
         with self._lock:
-            existing_turns = {r["turn"] for r in self._request_bodies}
+            existing_keys = {
+                ((r.get("conversation_id", "") or ""), r["turn"])
+                for r in self._request_bodies
+            }
             for cap in captures:
-                if cap.get("turn") not in existing_turns:
+                key = ((cap.get("conversation_id", "") or ""), cap.get("turn"))
+                if key not in existing_keys:
                     self._request_bodies.append(cap)
-                    existing_turns.add(cap["turn"])
+                    existing_keys.add(key)
 
-    def _persist_capture(self, turn: int) -> None:
+    def _persist_capture(
+        self,
+        turn: int,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
         if not self._store:
             logger.warning("CAPTURE_PERSIST store=None turn=%s", turn)
             return
-        for req in self._request_bodies:
-            if req["turn"] == turn:
-                try:
-                    summary = _extract_summary(req)
-                    self._store.save_request_capture(summary)
-                    logger.info("CAPTURE_PERSIST turn=%s ok", turn)
-                except Exception:
-                    logger.warning("CAPTURE_PERSIST turn=%s FAILED", turn, exc_info=True)
-                return
+        conv_id = self._capture_conversation_id(conversation_id) if conversation_id is not None else None
+        req = self._find_capture(turn, conv_id)
+        if req is None:
+            return
+        try:
+            summary = _extract_summary(req)
+            self._store.save_request_capture(summary)
+            logger.info(
+                "CAPTURE_PERSIST turn=%s conv=%s ok",
+                turn,
+                summary.get("conversation_id", "")[:12],
+            )
+        except Exception:
+            logger.warning("CAPTURE_PERSIST turn=%s FAILED", turn, exc_info=True)

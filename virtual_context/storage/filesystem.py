@@ -796,6 +796,58 @@ class FilesystemStore(ContextStore):
                 )
         return result
 
+    def load_recent_turn_messages(
+        self,
+        conversation_id: str,
+        limit: int = 100,
+    ) -> list[tuple[int, str, str]]:
+        path = self._turn_messages_path(conversation_id)
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        rows: list[tuple[int, str, str]] = []
+        for key, entry in data.items():
+            try:
+                turn_number = int(key)
+            except (TypeError, ValueError):
+                continue
+            rows.append((
+                turn_number,
+                entry.get("user_content", ""),
+                entry.get("assistant_content", ""),
+            ))
+        rows.sort(key=lambda item: item[0])
+        if limit > 0:
+            rows = rows[-limit:]
+        return rows
+
+    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
+        path = self._turn_messages_path(conversation_id)
+        if not path.is_file():
+            return 0
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return 0
+        removed = 0
+        kept: dict[str, dict] = {}
+        for key, entry in data.items():
+            try:
+                turn_number = int(key)
+            except (TypeError, ValueError):
+                kept[key] = entry
+                continue
+            if turn_number < keep_from_turn:
+                removed += 1
+                continue
+            kept[key] = entry
+        if removed:
+            path.write_text(json.dumps(kept, indent=2))
+        return removed
+
     # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------
@@ -880,16 +932,38 @@ class FilesystemStore(ContextStore):
                     existing = json.loads(captures_path.read_text())
                 except (json.JSONDecodeError, OSError):
                     existing = []
-            # Upsert by turn
-            existing = [c for c in existing if c.get("turn") != capture.get("turn")]
+            conv_id = capture.get("conversation_id", "") or ""
+            # Upsert by (conversation_id, turn)
+            existing = [
+                c for c in existing
+                if not (
+                    c.get("turn") == capture.get("turn")
+                    and (c.get("conversation_id", "") or "") == conv_id
+                )
+            ]
             existing.append(capture)
-            # Prune to newest 50 (by ts)
-            if len(existing) > 50:
-                existing.sort(key=lambda c: c.get("ts", ""))
-                existing = existing[-50:]
+            if conv_id:
+                scoped = [
+                    c for c in existing
+                    if (c.get("conversation_id", "") or "") == conv_id
+                ]
+                scoped.sort(key=lambda c: c.get("ts", ""))
+                keep = {
+                    ((c.get("conversation_id", "") or ""), c.get("turn"))
+                    for c in scoped[-50:]
+                }
+                existing = [
+                    c for c in existing
+                    if ((c.get("conversation_id", "") or ""), c.get("turn")) in keep
+                    or (c.get("conversation_id", "") or "") != conv_id
+                ]
             captures_path.write_text(json.dumps(existing, indent=2))
 
-    def load_request_captures(self, limit: int = 50) -> list[dict]:
+    def load_request_captures(
+        self,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
         captures_path = self.root / "_request_captures.json"
         with self._lock:
             if not captures_path.exists():
@@ -898,5 +972,10 @@ class FilesystemStore(ContextStore):
                 data = json.loads(captures_path.read_text())
             except (json.JSONDecodeError, OSError):
                 return []
+            if conversation_id is not None:
+                data = [
+                    c for c in data
+                    if (c.get("conversation_id", "") or "") == conversation_id
+                ]
             data.sort(key=lambda c: c.get("ts", ""))
             return data[-limit:]

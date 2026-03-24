@@ -157,10 +157,12 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
 );
 
 CREATE TABLE IF NOT EXISTS request_captures (
-    turn INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    turn INTEGER NOT NULL,
     ts TEXT NOT NULL,
     recorded_at DOUBLE PRECISION NOT NULL,
-    data_json TEXT NOT NULL
+    data_json TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, turn)
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -400,6 +402,51 @@ class PostgresStore(ContextStore):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                                    WHERE table_name='turn_messages' AND column_name='assistant_raw_content') THEN
                         ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT;
+                    END IF;
+                END $$;
+            """)
+        except Exception:
+            pass
+        try:
+            conn.execute("""
+                DO $$ DECLARE
+                    pk_cols text[];
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'request_captures'
+                    ) THEN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='request_captures' AND column_name='conversation_id'
+                        ) THEN
+                            ALTER TABLE request_captures
+                                ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
+                            UPDATE request_captures
+                            SET conversation_id = COALESCE(data_json::jsonb->>'conversation_id', '');
+                        END IF;
+
+                        SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+                        INTO pk_cols
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                         AND tc.table_name = kcu.table_name
+                        WHERE tc.table_name = 'request_captures'
+                          AND tc.constraint_type = 'PRIMARY KEY';
+
+                        IF pk_cols IS NULL OR pk_cols <> ARRAY['conversation_id', 'turn'] THEN
+                            IF EXISTS (
+                                SELECT 1 FROM information_schema.table_constraints
+                                WHERE table_name='request_captures'
+                                  AND constraint_type='PRIMARY KEY'
+                            ) THEN
+                                ALTER TABLE request_captures DROP CONSTRAINT request_captures_pkey;
+                            END IF;
+                            ALTER TABLE request_captures
+                                ADD PRIMARY KEY (conversation_id, turn);
+                        END IF;
                     END IF;
                 END $$;
             """)
@@ -935,25 +982,54 @@ class PostgresStore(ContextStore):
     def save_request_capture(self, capture: dict) -> None:
         conn = self._get_conn()
         import time as _time
+        conversation_id = capture.get("conversation_id", "") or ""
         conn.execute(
-            """INSERT INTO request_captures (turn, ts, recorded_at, data_json)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (turn) DO UPDATE SET ts=EXCLUDED.ts, recorded_at=EXCLUDED.recorded_at, data_json=EXCLUDED.data_json""",
-            (capture["turn"], capture.get("ts", ""), _time.time(), json.dumps(capture)),
+            """INSERT INTO request_captures
+            (conversation_id, turn, ts, recorded_at, data_json)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (conversation_id, turn) DO UPDATE SET
+                ts=EXCLUDED.ts,
+                recorded_at=EXCLUDED.recorded_at,
+                data_json=EXCLUDED.data_json""",
+            (
+                conversation_id,
+                capture["turn"],
+                capture.get("ts", ""),
+                _time.time(),
+                json.dumps(capture),
+            ),
         )
         conn.execute(
-            """DELETE FROM request_captures WHERE turn NOT IN (
-                SELECT turn FROM request_captures ORDER BY recorded_at DESC LIMIT 50
-            )"""
+            """DELETE FROM request_captures
+            WHERE conversation_id = %s
+              AND (conversation_id, turn) NOT IN (
+                SELECT conversation_id, turn
+                FROM request_captures
+                WHERE conversation_id = %s
+                ORDER BY recorded_at DESC LIMIT 50
+            )""",
+            (conversation_id, conversation_id),
         )
 
-    def load_request_captures(self, limit: int = 50) -> list[dict]:
+    def load_request_captures(
+        self,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
         conn = self._get_conn()
         try:
-            rows = conn.execute(
-                "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT %s",
-                (limit,),
-            ).fetchall()
+            if conversation_id is None:
+                rows = conn.execute(
+                    "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT data_json FROM request_captures
+                    WHERE conversation_id = %s
+                    ORDER BY recorded_at ASC LIMIT %s""",
+                    (conversation_id, limit),
+                ).fetchall()
         except Exception:
             return []
         result = []
@@ -1178,6 +1254,15 @@ class PostgresStore(ContextStore):
             (conversation_id, limit),
         ).fetchall()
         return [(r["turn_number"], r["user_content"], r["assistant_content"]) for r in reversed(rows)]
+
+    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
+        conn = self._get_conn()
+        cur = conn.execute(
+            """DELETE FROM turn_messages
+            WHERE conversation_id = %s AND turn_number < %s""",
+            (conversation_id, keep_from_turn),
+        )
+        return int(cur.rowcount or 0)
 
     def search_tag_summaries_fts(
         self, query: str, limit: int = 20, conversation_id: str | None = None,

@@ -157,6 +157,9 @@ class CompositeStore:
     ) -> list[tuple[int, str, str]]:
         return self._segments.load_recent_turn_messages(conversation_id, limit=limit)
 
+    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
+        return self._segments.prune_turn_messages(conversation_id, keep_from_turn)
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------
@@ -228,8 +231,15 @@ class CompositeStore:
     def save_request_capture(self, capture: dict) -> None:
         return self._state.save_request_capture(capture)
 
-    def load_request_captures(self, limit: int = 50) -> list[dict]:
-        return self._state.load_request_captures(limit=limit)
+    def load_request_captures(
+        self,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
+        return self._state.load_request_captures(
+            limit=limit,
+            conversation_id=conversation_id,
+        )
 
     # ------------------------------------------------------------------
     # SearchStore

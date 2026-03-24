@@ -171,6 +171,10 @@ class ContextStore(ABC):
         """
         return []
 
+    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
+        """Delete persisted turn messages older than ``keep_from_turn``."""
+        return 0
+
     # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
@@ -337,5 +341,9 @@ class ContextStore(ABC):
     def save_request_capture(self, capture: dict) -> None:
         pass
 
-    def load_request_captures(self, limit: int = 50) -> list[dict]:
+    def load_request_captures(
+        self,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
         return []

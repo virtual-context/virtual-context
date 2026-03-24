@@ -143,7 +143,12 @@ class ProxyState:
 
         # Wire up request captures persistence: engine pulls from metrics at save time
         if metrics:
-            engine._request_captures_provider = metrics.get_captured_requests_summary
+            conv_id = engine.config.conversation_id
+            engine._request_captures_provider = (
+                lambda conv_id=conv_id: metrics.get_captured_requests_summary(
+                    conversation_id=conv_id,
+                )
+            )
         # Restore persisted request captures into metrics
         if metrics and engine._restored_request_captures:
             metrics.restore_request_captures(engine._restored_request_captures)
@@ -361,6 +366,7 @@ class ProxyState:
                 response_tags = entry.tags if entry else []
                 self.metrics.update_request_tags(
                     turn, response_tags=response_tags,
+                    conversation_id=conversation_id,
                 )
                 self.metrics.record({
                     "type": "turn_complete",
@@ -532,6 +538,22 @@ class ProxyState:
     def _history_ingested(self) -> bool:
         return self.engine.config.conversation_id in self._ingested_conversations
 
+    def reconcile_history_bootstrap(self, history_pairs: list[Message]) -> bool:
+        """Finalize a restored session once the first post-restart history arrives."""
+        conversation_id = self.engine.config.conversation_id
+        if conversation_id in self._ingested_conversations:
+            return True
+        existing_turns = len(self.engine._turn_tag_index.entries)
+        needed_turns = len(history_pairs) // 2
+        if existing_turns <= 0:
+            return False
+        if history_pairs and existing_turns < needed_turns:
+            return False
+        self._ingested_conversations.add(conversation_id)
+        if history_pairs:
+            self._record_ingestion_watermark(history_pairs, conversation_id)
+        return True
+
     def _check_history_widening(self, history_pairs: list[Message], conversation_id: str) -> bool:
         """Detect if history prefix shifted (widening) and trigger full re-ingest.
 
@@ -612,6 +634,8 @@ class ProxyState:
         first-time compaction.
         """
         try:
+            if int(self.engine._engine_state.compacted_through) > 0:
+                return
             # Don't advance if there are no stored segments — everything needs first-time compaction
             existing_tags = self.engine._store.get_all_tags(
                 conversation_id=self.engine.config.conversation_id,

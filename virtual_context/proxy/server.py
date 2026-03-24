@@ -184,7 +184,9 @@ async def prepare_payload(
             history_pairs = _extract_history_pairs(body)
             needed = len(history_pairs) // 2
             existing = len(state.engine._turn_tag_index.entries)
-            if needed > 0 and existing < needed:
+            if state.reconcile_history_bootstrap(history_pairs):
+                current_state = SessionState.ACTIVE
+            elif needed > 0 and existing < needed:
                 current_state = SessionState.PASSTHROUGH
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
@@ -756,7 +758,11 @@ async def prepare_payload(
         message_preview=user_message[:60],
     )
     # Capture enriched body (what we actually send to the LLM)
-    metrics.capture_enriched(turn, enriched_body)
+    metrics.capture_enriched(
+        turn,
+        enriched_body,
+        conversation_id=_conversation_id,
+    )
 
     return PreparedPayload(
         body=body,
@@ -913,11 +919,6 @@ def create_app(
 
         if instance_upstream_limit:
             default_state._instance_upstream_limit = instance_upstream_limit
-
-        # If lossless restart recovered state, mark session as already ingested
-        # so the proxy doesn't re-ingest history on first request.
-        if engine._turn_tag_index.entries:
-            default_state._ingested_conversations.add(engine.config.conversation_id)
 
         # Build registry and pre-register the default session
         registry = SessionRegistry(

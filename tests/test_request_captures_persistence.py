@@ -130,6 +130,53 @@ class TestRequestCapturesPersistence:
         assert loaded[0]["conversation_id"] == "c1"
         store2.close()
 
+    def test_same_turns_are_isolated_by_conversation(self, tmp_path):
+        store = SQLiteStore(tmp_path / "test.db")
+        for conversation_id, model in (("c1", "model-a"), ("c2", "model-b")):
+            store.save_request_capture({
+                "turn": 7,
+                "ts": "2026-03-20T10:00:00+00:00",
+                "api_format": "anthropic",
+                "model": model,
+                "stream": False,
+                "message_count": 1,
+                "conversation_id": conversation_id,
+                "inbound_tags": [],
+                "response_tags": [],
+                "passthrough": False,
+                "inbound_tokens": 0,
+                "outbound_tokens": 0,
+                "inbound_bytes": 0,
+                "outbound_bytes": 0,
+                "context_tokens": 0,
+                "overhead_ms": 0,
+                "turns_dropped": 0,
+                "turns_stubbed": 0,
+                "message_preview": "",
+                "upstream_input_tokens": 0,
+                "upstream_output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            })
+
+        all_caps = store.load_request_captures(limit=10)
+        assert len(all_caps) == 2
+        assert [c["model"] for c in store.load_request_captures(conversation_id="c1")] == ["model-a"]
+        assert [c["model"] for c in store.load_request_captures(conversation_id="c2")] == ["model-b"]
+
+    def test_prune_turn_messages_keeps_suffix(self, tmp_path):
+        store = SQLiteStore(tmp_path / "test.db")
+        for turn in range(6):
+            store.save_turn_message("conv-1", turn, f"user-{turn}", f"assistant-{turn}")
+
+        removed = store.prune_turn_messages("conv-1", keep_from_turn=4)
+
+        assert removed == 4
+        assert store.load_recent_turn_messages("conv-1", limit=10) == [
+            (4, "user-4", "assistant-4"),
+            (5, "user-5", "assistant-5"),
+        ]
+
 
 class TestFilesystemRequestCaptures:
     def test_save_and_load(self, tmp_path):
@@ -294,3 +341,36 @@ class TestProxyMetricsStoreIntegration:
         }])
         # Should still be 1, not 2
         assert len(m2.get_captured_requests_summary()) == 1
+
+    def test_same_turns_do_not_collide_across_conversations(self, tmp_path):
+        from virtual_context.proxy.metrics import ProxyMetrics
+
+        store = self._make_store(tmp_path)
+        m = ProxyMetrics(store=store)
+        m.capture_request(
+            turn=3,
+            body={"model": "a", "messages": []},
+            api_format="anthropic",
+            conversation_id="conv-a",
+        )
+        m.capture_request(
+            turn=3,
+            body={"model": "b", "messages": []},
+            api_format="anthropic",
+            conversation_id="conv-b",
+        )
+        m.capture_response(
+            turn=3,
+            body={"content": "resp-b"},
+            conversation_id="conv-b",
+            upstream_output_tokens=9,
+        )
+
+        cap_a = m.get_captured_request(3, conversation_id="conv-a")
+        cap_b = m.get_captured_request(3, conversation_id="conv-b")
+
+        assert cap_a is not None
+        assert cap_b is not None
+        assert cap_a["model"] == "a"
+        assert cap_b["model"] == "b"
+        assert cap_b["upstream_output_tokens"] == 9
