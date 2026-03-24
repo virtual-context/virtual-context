@@ -304,11 +304,34 @@ def register_dashboard_routes(
                 status_code=501,
             )
         try:
+            begin_delete = getattr(store, "begin_conversation_deletion", None)
+            if callable(begin_delete):
+                await asyncio.to_thread(begin_delete, conversation_id)
             if conversation_id == state.engine.config.conversation_id:
-                await asyncio.to_thread(
-                    state.reset_for_conversation_deletion,
-                    conversation_id,
-                )
+                try:
+                    await asyncio.to_thread(
+                        state.reset_for_conversation_deletion,
+                        conversation_id,
+                        authoritative=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to reset deleted conversation %s before store cleanup",
+                        conversation_id,
+                        exc_info=True,
+                    )
+                try:
+                    await asyncio.to_thread(
+                        state.shutdown,
+                        wait=False,
+                        cancel_futures=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to shut down deleted conversation %s",
+                        conversation_id,
+                        exc_info=True,
+                    )
             deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
             # Also clean up tag aliases referencing this conversation
             if hasattr(store, "delete_tag_aliases_for_conversation"):

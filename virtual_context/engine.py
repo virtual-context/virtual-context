@@ -74,6 +74,7 @@ def _is_stub_content(text: str) -> bool:
 
 
 from .core.compaction_pipeline import CompactionPipeline
+from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
 from .core.paging_manager import PagingManager
 from .core.retrieval_assembler import RetrievalAssembler
 from .core.semantic_search import SemanticSearchManager
@@ -126,6 +127,7 @@ class VirtualContextEngine:
                 model_name=self.config.retriever.embedding_model,
             )
 
+        self._conversation_generation = 0
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
         self._init_store()
@@ -139,6 +141,7 @@ class VirtualContextEngine:
         self._init_compactor()
         self._init_tag_splitter()
         self._engine_state = EngineState()  # mutable shared state for delegates
+        self._engine_state.conversation_generation = self._conversation_generation
         self._session_cache = session_cache
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
@@ -171,7 +174,18 @@ class VirtualContextEngine:
                 _cached = None
 
         if _cached and _cached.get("conversation_id") == self.config.conversation_id:
-            if not _store_loaded:
+            cached_generation = int(_cached.get("conversation_generation", -1) or -1)
+            cache_generation_matches = (
+                cached_generation == self._conversation_generation
+                if cached_generation >= 0
+                else self._conversation_generation == 0
+            )
+            if not cache_generation_matches:
+                logger.info(
+                    "Ignoring Redis snapshot for conversation %s because its generation does not match the active lifecycle",
+                    self.config.conversation_id[:12],
+                )
+            elif not _store_loaded:
                 self._apply_cached_state(_cached)
                 logger.info(
                     "Session cache restore: %d messages, %d turns from Redis (version=%s)",
@@ -328,7 +342,7 @@ class VirtualContextEngine:
         if self.config.storage.backend == "sqlite":
             sqlite = SQLiteStore(db_path=self.config.storage.sqlite_path)
             fact_links = sqlite if self.config.facts.graph_links else NoopFactLinkStore()
-            self._store = CompositeStore(
+            store = CompositeStore(
                 segments=sqlite, facts=sqlite, fact_links=fact_links,
                 state=sqlite, search=sqlite,
             )
@@ -336,7 +350,7 @@ class VirtualContextEngine:
             from .storage.postgres import PostgresStore
             pg = PostgresStore(dsn=self.config.storage.postgres_dsn)
             fact_links = pg if self.config.facts.graph_links else NoopFactLinkStore()
-            self._store = CompositeStore(
+            store = CompositeStore(
                 segments=pg, facts=pg, fact_links=fact_links,
                 state=pg, search=pg,
             )
@@ -352,7 +366,7 @@ class VirtualContextEngine:
                 fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
             else:
                 fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
-            self._store = CompositeStore(
+            store = CompositeStore(
                 segments=fallback, facts=neo, fact_links=neo,
                 state=fallback, search=fallback,
             )
@@ -368,19 +382,27 @@ class VirtualContextEngine:
                 fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
             else:
                 fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
-            self._store = CompositeStore(
+            store = CompositeStore(
                 segments=fallback, facts=fdb, fact_links=fdb,
                 state=fallback, search=fallback,
             )
         elif self.config.storage.backend == "filesystem":
             fs = FilesystemStore(root=self.config.storage.root)
-            self._store = CompositeStore(
+            store = CompositeStore(
                 segments=fs, facts=fs, fact_links=NoopFactLinkStore(),
                 state=fs, search=fs,
             )
         else:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
+        self._conversation_generation = int(
+            getattr(store, "activate_conversation", lambda _cid: 0)(self.config.conversation_id) or 0
+        )
+        self._store = ConversationStoreView(
+            store,
+            self.config.conversation_id,
+            self._conversation_generation,
+        )
         # Propagate search config to the store for excerpt/snippet lengths
         self._store.search_config = self.config.search
 
@@ -510,6 +532,10 @@ class VirtualContextEngine:
         self._engine_state.last_completed_turn = saved.last_completed_turn
         self._engine_state.last_indexed_turn = saved.last_indexed_turn
         self._engine_state.checkpoint_version = saved.checkpoint_version
+        self._engine_state.conversation_generation = max(
+            saved.conversation_generation,
+            self._conversation_generation,
+        )
         # Populate in-place so all existing references (retriever, etc.) see the restored entries
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
@@ -598,6 +624,10 @@ class VirtualContextEngine:
             len(cached.get("turn_tag_entries", []) or []) - 1,
         )
         self._engine_state.checkpoint_version = es.get("checkpoint_version", cached.get("version", 0) or 0)
+        self._engine_state.conversation_generation = es.get(
+            "conversation_generation",
+            cached.get("conversation_generation", self._conversation_generation),
+        )
         self._engine_state.split_processed_tags = set(es.get("split_processed_tags", []))
         self._engine_state.trailing_fingerprint = es.get("trailing_fingerprint", "")
         self._engine_state.provider = es.get("provider", "")
@@ -731,6 +761,7 @@ class VirtualContextEngine:
                 last_completed_turn=self._engine_state.last_completed_turn,
                 last_indexed_turn=self._engine_state.last_indexed_turn,
                 checkpoint_version=self._engine_state.checkpoint_version,
+                conversation_generation=self._engine_state.conversation_generation,
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=max(
                     (len(conversation_history) // 2) if conversation_history else 0,
@@ -762,6 +793,13 @@ class VirtualContextEngine:
                 except Exception as _redis_err:
                     logger.debug("Redis snapshot write failed: %s", _redis_err)
             return True
+        except StaleConversationWriteError as e:
+            logger.info(
+                "Suppressed stale state save for conversation %s: %s",
+                self.config.conversation_id[:12],
+                e,
+            )
+            return False
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
             return False
@@ -822,6 +860,7 @@ class VirtualContextEngine:
             "version": self._engine_state.checkpoint_version,
             "saved_at": saved_at.isoformat(),
             "conversation_id": self.config.conversation_id,
+            "conversation_generation": self._engine_state.conversation_generation,
             "history": history,
             "turn_tag_entries": entries,
             "engine_state": {
@@ -830,6 +869,7 @@ class VirtualContextEngine:
                 "last_completed_turn": self._engine_state.last_completed_turn,
                 "last_indexed_turn": self._engine_state.last_indexed_turn,
                 "checkpoint_version": self._engine_state.checkpoint_version,
+                "conversation_generation": self._engine_state.conversation_generation,
                 "split_processed_tags": sorted(self._engine_state.split_processed_tags),
                 "working_set": [
                     {"tag": ws.tag, "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
@@ -860,6 +900,13 @@ class VirtualContextEngine:
                 user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
                 assistant_raw_content=json.dumps(assistant_msg.raw_content) if assistant_msg.raw_content else None,
             )
+        except StaleConversationWriteError as exc:
+            logger.info(
+                "Suppressed stale completed-turn persist for conversation %s: %s",
+                self.config.conversation_id[:12],
+                exc,
+            )
+            return
         except Exception:
             logger.warning(
                 "Failed to persist completed turn %d for conversation %s",
@@ -1009,6 +1056,17 @@ class VirtualContextEngine:
         cached: dict,
     ) -> bool:
         if db_state is None:
+            return False
+        db_generation = int(
+            getattr(db_state, "conversation_generation", self._conversation_generation) or 0
+        )
+        cached_generation = int(
+            cached.get("conversation_generation", -1) if isinstance(cached, dict) else -1
+        )
+        if cached_generation >= 0:
+            if cached_generation != db_generation:
+                return False
+        elif db_generation > 0:
             return False
         cached_state = cached.get("engine_state", {}) if isinstance(cached, dict) else {}
         cached_version = cached_state.get("checkpoint_version", cached.get("version", 0) if isinstance(cached, dict) else 0)

@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS engine_state (
     saved_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversation_lifecycle (
+    conversation_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS segment_chunks (
     segment_ref TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -1148,6 +1155,74 @@ CREATE TABLE IF NOT EXISTS request_captures (
         )
         return int(cursor.rowcount or 0)
 
+    def activate_conversation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        now = _dt_to_str(datetime.now(timezone.utc))
+        if row is None:
+            conn.execute(
+                """INSERT INTO conversation_lifecycle
+                (conversation_id, generation, deleted, updated_at)
+                VALUES (?, 0, 0, ?)""",
+                (conversation_id, now),
+            )
+            conn.commit()
+            return 0
+        generation = int(row[0])
+        conn.execute(
+            """UPDATE conversation_lifecycle
+            SET deleted = 0, updated_at = ?
+            WHERE conversation_id = ?""",
+            (now, conversation_id),
+        )
+        conn.commit()
+        return generation
+
+    def begin_conversation_deletion(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        generation = (int(row[0]) + 1) if row is not None else 1
+        conn.execute(
+            """INSERT INTO conversation_lifecycle
+            (conversation_id, generation, deleted, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                generation = excluded.generation,
+                deleted = 1,
+                updated_at = excluded.updated_at""",
+            (conversation_id, generation, _dt_to_str(datetime.now(timezone.utc))),
+        )
+        conn.commit()
+        return generation
+
+    def get_conversation_generation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def is_conversation_generation_current(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation, deleted FROM conversation_lifecycle WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return int(generation or 0) == 0
+        return int(row[0]) == int(generation or 0) and not bool(row[1])
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
@@ -1467,6 +1542,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             last_completed_turn=last_completed_turn,
             last_indexed_turn=last_indexed_turn,
             checkpoint_version=checkpoint_version,
+            conversation_generation=self.get_conversation_generation(row["conversation_id"]),
             saved_at=_str_to_dt(row["saved_at"]),
             split_processed_tags=split_processed_tags,
             working_set=working_set,

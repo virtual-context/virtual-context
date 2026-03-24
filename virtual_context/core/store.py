@@ -176,6 +176,30 @@ class ContextStore(ABC):
         return 0
 
     # ------------------------------------------------------------------
+    # Conversation lifecycle fencing
+    # ------------------------------------------------------------------
+
+    def activate_conversation(self, conversation_id: str) -> int:
+        """Mark a conversation as live and return its current generation."""
+        return 0
+
+    def begin_conversation_deletion(self, conversation_id: str) -> int:
+        """Fence future writes for a conversation by advancing its generation."""
+        return self.activate_conversation(conversation_id)
+
+    def get_conversation_generation(self, conversation_id: str) -> int:
+        """Return the current durable generation for a conversation."""
+        return 0
+
+    def is_conversation_generation_current(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        """Whether ``generation`` is the live write generation for ``conversation_id``."""
+        return generation == self.get_conversation_generation(conversation_id)
+
+    # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
 

@@ -692,6 +692,9 @@ class FilesystemStore(ContextStore):
             ),
             last_indexed_turn=data.get("last_indexed_turn", len(entries) - 1),
             checkpoint_version=data.get("checkpoint_version", 0),
+            conversation_generation=self.get_conversation_generation(
+                data.get("conversation_id", data.get("session_id", "")),
+            ),
             saved_at=_str_to_dt(data["saved_at"]) if "saved_at" in data else datetime.now(timezone.utc),
             split_processed_tags=data.get("split_processed_tags", []),
             working_set=working_set,
@@ -749,6 +752,62 @@ class FilesystemStore(ContextStore):
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
         return result
+
+    # ------------------------------------------------------------------
+    # Conversation lifecycle
+    # ------------------------------------------------------------------
+
+    def _conversation_lifecycle_path(self, conversation_id: str) -> Path:
+        safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+        return self.root / "_conversation_lifecycle" / f"{safe_id}.json"
+
+    def _load_conversation_lifecycle(self, conversation_id: str) -> dict | None:
+        path = self._conversation_lifecycle_path(conversation_id)
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def activate_conversation(self, conversation_id: str) -> int:
+        path = self._conversation_lifecycle_path(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self._load_conversation_lifecycle(conversation_id) or {"generation": 0}
+        data["deleted"] = False
+        data["updated_at"] = _dt_to_str(datetime.now(timezone.utc))
+        path.write_text(json.dumps(data, indent=2))
+        return int(data.get("generation", 0) or 0)
+
+    def begin_conversation_deletion(self, conversation_id: str) -> int:
+        path = self._conversation_lifecycle_path(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self._load_conversation_lifecycle(conversation_id) or {"generation": 0}
+        generation = int(data.get("generation", 0) or 0) + 1
+        data.update({
+            "generation": generation,
+            "deleted": True,
+            "updated_at": _dt_to_str(datetime.now(timezone.utc)),
+        })
+        path.write_text(json.dumps(data, indent=2))
+        return generation
+
+    def get_conversation_generation(self, conversation_id: str) -> int:
+        data = self._load_conversation_lifecycle(conversation_id) or {}
+        return int(data.get("generation", 0) or 0)
+
+    def is_conversation_generation_current(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        data = self._load_conversation_lifecycle(conversation_id)
+        if data is None:
+            return int(generation or 0) == 0
+        return (
+            int(data.get("generation", 0) or 0) == int(generation or 0)
+            and not bool(data.get("deleted", False))
+        )
 
     # ------------------------------------------------------------------
     # Turn messages

@@ -258,6 +258,34 @@ class CompositeStore:
             conversation_id=conversation_id,
         )
 
+    def activate_conversation(self, conversation_id: str) -> int:
+        lifecycle = getattr(self._state, "activate_conversation", None)
+        if callable(lifecycle):
+            return int(lifecycle(conversation_id) or 0)
+        return 0
+
+    def begin_conversation_deletion(self, conversation_id: str) -> int:
+        lifecycle = getattr(self._state, "begin_conversation_deletion", None)
+        if callable(lifecycle):
+            return int(lifecycle(conversation_id) or 0)
+        return 0
+
+    def get_conversation_generation(self, conversation_id: str) -> int:
+        lifecycle = getattr(self._state, "get_conversation_generation", None)
+        if callable(lifecycle):
+            return int(lifecycle(conversation_id) or 0)
+        return 0
+
+    def is_conversation_generation_current(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        lifecycle = getattr(self._state, "is_conversation_generation_current", None)
+        if callable(lifecycle):
+            return bool(lifecycle(conversation_id, generation))
+        return True
+
     # ------------------------------------------------------------------
     # SearchStore
     # ------------------------------------------------------------------
