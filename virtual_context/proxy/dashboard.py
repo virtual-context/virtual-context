@@ -194,7 +194,11 @@ def register_dashboard_routes(
                         snap["active_tags"] = list(
                             engine._turn_tag_index.get_active_tags(lookback=6)
                         )
-                        snap["store_tag_count"] = len(engine._store.get_all_tags())
+                        snap["store_tag_count"] = len(
+                            engine._store.get_all_tags(
+                                conversation_id=engine.config.conversation_id,
+                            )
+                        )
                         snap["compacted_through"] = engine._engine_state.compacted_through
                         snap["history_len"] = len(state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
@@ -415,12 +419,15 @@ def register_dashboard_routes(
                 snap["turn_tag_index"] = entries
 
                 # Store tags
+                cfg = engine.config
                 snap["store_tags"] = [
-                    ts.tag for ts in engine._store.get_all_tags()
+                    ts.tag
+                    for ts in engine._store.get_all_tags(
+                        conversation_id=cfg.conversation_id,
+                    )
                 ]
 
                 # Config summary
-                cfg = engine.config
                 snap["config"] = {
                     "conversation_id": cfg.conversation_id,
                     "context_window": cfg.monitor.context_window,

@@ -1057,6 +1057,9 @@ class TestDashboardExport:
         assert "store_tags" in data
         assert "config" in data
         assert data["config"]["conversation_id"] == "test-session"
+        engine._store.get_all_tags.assert_called_once_with(
+            conversation_id="test-session",
+        )
         # Should not have type=snapshot
         assert "type" not in data
 
