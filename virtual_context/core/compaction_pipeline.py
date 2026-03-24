@@ -187,6 +187,27 @@ class CompactionPipeline:
     # Internal pipeline
     # ------------------------------------------------------------------
 
+    def _propagate_tool_output_links(
+        self, segment_ref: str, turn_start: int, turn_end: int,
+    ) -> None:
+        """Copy turn-level tool output links to the segment join table.
+
+        Iterates turns in ``[turn_start, turn_end)`` and for each turn that
+        has ``turn_tool_outputs`` entries, writes a corresponding
+        ``segment_tool_outputs`` row.  Non-critical — failures are silenced.
+        """
+        try:
+            for t in range(turn_start, turn_end):
+                refs = self._store.get_tool_outputs_for_turn(
+                    self._config.conversation_id, t,
+                )
+                for ref in refs:
+                    self._store.link_segment_tool_output(
+                        self._config.conversation_id, segment_ref, ref,
+                    )
+        except Exception:
+            pass  # non-critical
+
     def _run_compaction(
         self,
         conversation_history: list[Message],
@@ -466,11 +487,14 @@ class CompactionPipeline:
             )
 
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
+        # Also record the contributing turn range per segment for tool-output linkage.
         turn_offset = self._engine_state.compacted_through // 2
         seg_cursor = turn_offset
         segment_signals: dict[str, list[FactSignal]] = {}
+        segment_turn_ranges: dict[str, tuple[int, int]] = {}  # seg.id -> (start, end_exclusive)
         for seg in segments:
             seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
+            segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
             signals: list[FactSignal] = []
             for t in range(seg_cursor, seg_cursor + seg_turn_count):
                 entry = self._turn_tag_index.get_tags_for_turn(t)
@@ -538,6 +562,10 @@ class CompactionPipeline:
                     end_timestamp=result.timestamp,
                 )
                 self._store.store_segment(stored)
+                # Propagate turn → segment tool output links
+                turn_range = segment_turn_ranges.get(seg.id)
+                if turn_range:
+                    self._propagate_tool_output_links(stored.ref, *turn_range)
                 all_results.append(result)
                 continue
 
@@ -708,6 +736,11 @@ class CompactionPipeline:
                     session_date or 'none',
                     result.original_tokens, result.summary_tokens, seg.turn_count,
                 )
+
+            # Propagate turn → segment tool output links
+            turn_range = segment_turn_ranges.get(seg.id)
+            if turn_range:
+                self._propagate_tool_output_links(stored.ref, *turn_range)
 
             all_results.append(result)
             stored_done = seg_idx + 1

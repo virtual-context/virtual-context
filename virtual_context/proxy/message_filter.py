@@ -87,19 +87,67 @@ def filter_body_messages(
         current_user = chat_msgs[-1]
         chat_msgs = chat_msgs[:-1]
 
-    # Group into user+assistant pairs, tracking which message indices are paired.
-    # Unpaired messages (tool_results between consecutive users, batched messages,
-    # etc.) are always kept — they're structural and may be required by the API.
-    pairs: list[tuple[int, int]] = []  # (msg_idx_user, msg_idx_assistant)
+    # Group into atomic turn chains, tracking which message indices are paired.
+    # A chain is: user + assistant + zero or more tool rounds.
+    # Tool round shapes:
+    #   - OpenAI Chat: one or more role="tool" messages → assistant
+    #   - Anthropic: user with tool_result-only content → assistant
+    #   - Responses API: bare function_call + function_call_output items
+    # Unpaired messages (those not captured by any chain) are always kept —
+    # they're structural and may be required by the API.
+    pairs: list[tuple[int, ...]] = []  # tuple of ALL msg indices in the chain
     paired_indices: set[int] = set()
     i = 0
     while i + 1 < len(chat_msgs):
         if (chat_msgs[i].get("role") == "user"
                 and chat_msgs[i + 1].get("role") == _asst_role):
-            pairs.append((i, i + 1))
-            paired_indices.add(i)
-            paired_indices.add(i + 1)
-            i += 2
+            chain_indices: list[int] = [i, i + 1]
+            j = i + 2
+            # Extend chain through tool rounds (same logic as trim_to_upstream_limit)
+            while j < len(chat_msgs) - 1:
+                next_msg = chat_msgs[j]
+                next_role = next_msg.get("role", "")
+                # OpenAI tool response (role="tool")
+                if next_role == "tool":
+                    tool_batch = [j]
+                    k = j + 1
+                    while k < len(chat_msgs) and chat_msgs[k].get("role") == "tool":
+                        tool_batch.append(k)
+                        k += 1
+                    if k < len(chat_msgs) and chat_msgs[k].get("role") == _asst_role:
+                        chain_indices.extend(tool_batch)
+                        chain_indices.append(k)
+                        j = k + 1
+                        continue
+                    else:
+                        break  # tool messages without following assistant — stop
+                # Anthropic tool result (user message with tool_result-only content)
+                if next_role not in ("user", "human"):
+                    break
+                content = next_msg.get("content", "")
+                is_tool_result = False
+                if isinstance(content, list):
+                    ctypes = {b.get("type") for b in content if isinstance(b, dict)}
+                    is_tool_result = bool(ctypes and ctypes <= {"tool_result"})
+                if not is_tool_result:
+                    break  # real user message, not part of tool chain
+                if j + 1 >= len(chat_msgs) or chat_msgs[j + 1].get("role") != _asst_role:
+                    break  # tool_result without following assistant — stop
+                chain_indices.extend([j, j + 1])
+                j += 2
+            # Also consume bare Responses API items (no role) that follow
+            while j < len(chat_msgs):
+                bare = chat_msgs[j]
+                btype = bare.get("type", "")
+                if btype in ("function_call", "function_call_output") and bare.get("role") is None:
+                    chain_indices.append(j)
+                    j += 1
+                else:
+                    break
+            pairs.append(tuple(chain_indices))
+            for ci in chain_indices:
+                paired_indices.add(ci)
+            i = chain_indices[-1] + 1
         else:
             i += 1
 
@@ -111,9 +159,9 @@ def filter_body_messages(
 
     tag_set = set(matched_tags)
 
-    # First pass: mark each pair as keep/drop based on tags
+    # First pass: mark each chain as keep/drop based on tags
     keep_pair = [False] * total_pairs
-    for pair_idx, (u_idx, a_idx) in enumerate(pairs):
+    for pair_idx, chain in enumerate(pairs):
         if pair_idx >= total_pairs - protected:
             keep_pair[pair_idx] = True
         elif compacted_turn > 0 and pair_idx < compacted_turn:
@@ -165,27 +213,31 @@ def filter_body_messages(
         if msg.get("role") == "tool" and "tool_call_id" in msg:
             toolresult_to_msg[msg["tool_call_id"]] = msg_idx
 
-    # Build per-message keep set: unpaired messages always kept, pairs based on filter
+    # Build per-message keep set: unpaired messages always kept, chains based on filter
     keep_msg: set[int] = set()
     for msg_idx in range(len(chat_msgs)):
         if msg_idx not in paired_indices:
             keep_msg.add(msg_idx)  # always keep unpaired messages
-    for pair_idx, (u_idx, a_idx) in enumerate(pairs):
+    for pair_idx, chain in enumerate(pairs):
         if keep_pair[pair_idx]:
-            keep_msg.add(u_idx)
-            keep_msg.add(a_idx)
+            for ci in chain:
+                keep_msg.add(ci)
 
-    # Build reverse map: msg_idx → its pair partner (if any)
-    msg_to_partner: dict[int, int] = {}
-    for u_idx, a_idx in pairs:
-        msg_to_partner[u_idx] = a_idx
-        msg_to_partner[a_idx] = u_idx
+    # Build reverse map: msg_idx → all OTHER indices in its chain.
+    # When any index in a chain is force-kept, all chain members must be kept
+    # to preserve tool-call referential integrity and role alternation.
+    msg_to_chain_peers: dict[int, set[int]] = {}
+    for chain in pairs:
+        chain_set = set(chain)
+        for ci in chain:
+            msg_to_chain_peers[ci] = chain_set - {ci}
 
     # Enforce tool_use_id referential integrity: if a message is kept,
     # the message containing the matching tool_use or tool_result must
-    # also be kept.  When a force-kept message belongs to a pair, its
-    # pair partner is also kept (otherwise we'd have a half-pair that
-    # breaks role alternation).  Iterate until stable (chains can be long).
+    # also be kept.  When a force-kept message belongs to a chain, all
+    # chain members are also kept (otherwise we'd have a partial chain
+    # that breaks role alternation or orphans tool results).
+    # Iterate until stable (chains can be long).
     changed = True
     while changed:
         changed = False
@@ -199,12 +251,14 @@ def filter_body_messages(
             if result_idx in keep_msg and use_idx not in keep_msg:
                 keep_msg.add(use_idx)
                 changed = True
-        # Keep pair partners of any force-added messages
+        # Keep all chain peers of any force-added messages
         for msg_idx in list(keep_msg):
-            partner = msg_to_partner.get(msg_idx)
-            if partner is not None and partner not in keep_msg:
-                keep_msg.add(partner)
-                changed = True
+            peers = msg_to_chain_peers.get(msg_idx)
+            if peers:
+                for peer in peers:
+                    if peer not in keep_msg:
+                        keep_msg.add(peer)
+                        changed = True
 
     # Ensure the first kept chat message is role=user.  When pair 0 is
     # dropped but an unpaired assistant at index 2 is force-kept (via
@@ -221,11 +275,13 @@ def filter_body_messages(
             if backfill not in keep_msg:
                 keep_msg.add(backfill)
                 changed = True
-        # Also keep pair partners of anything we just added
+        # Also keep chain peers of anything we just added
         for backfill in range(idx + 1):
-            partner = msg_to_partner.get(backfill)
-            if partner is not None and partner not in keep_msg:
-                keep_msg.add(partner)
+            peers = msg_to_chain_peers.get(backfill)
+            if peers:
+                for peer in peers:
+                    if peer not in keep_msg:
+                        keep_msg.add(peer)
     # Re-run referential integrity if we added messages
     if changed:
         changed = True
@@ -242,10 +298,12 @@ def filter_body_messages(
                     keep_msg.add(use_idx)
                     changed = True
             for msg_idx in list(keep_msg):
-                partner = msg_to_partner.get(msg_idx)
-                if partner is not None and partner not in keep_msg:
-                    keep_msg.add(partner)
-                    changed = True
+                peers = msg_to_chain_peers.get(msg_idx)
+                if peers:
+                    for peer in peers:
+                        if peer not in keep_msg:
+                            keep_msg.add(peer)
+                            changed = True
 
     # Adjacent gap fill: when we keep messages A and C but not B,
     # the dropped B may break role alternation or context flow.
@@ -557,17 +615,38 @@ def stub_compacted_messages(
         if stub:
             start, end, entry = stub
             tags_str = ", ".join(entry.tags[:5])
+            # Detect tool activity in the compacted range
+            has_tools = any(
+                messages[j].get("role") == "tool"
+                or messages[j].get("tool_calls")
+                or messages[j].get("type") in ("function_call", "function_call_output")
+                or (isinstance(messages[j].get("content"), list) and any(
+                    isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+                    for b in messages[j]["content"]
+                ))
+                for j in range(start, end)
+            )
             new_messages.append({
                 "role": "user",
                 "content": f"[Compacted turn {entry.turn_number}]",
             })
-            new_messages.append({
-                "role": _asst_role,
-                "content": [{"type": "text", "text":
+            if has_tools:
+                stub_text = (
+                    f"[Compacted turn {entry.turn_number}: "
+                    f"tool activity compacted. "
+                    f"Full tool output stored in virtual-context; "
+                    f"use vc_find_quote(...) to search it or "
+                    f"vc_expand_topic(...) for linked topic context.]"
+                )
+            else:
+                stub_text = (
                     f"[Compacted turn {entry.turn_number}: "
                     f"topics={tags_str}. "
                     f"Content stored in virtual-context.]"
-                }],
+                )
+            new_messages.append({
+                "role": _asst_role,
+                "content": [{"type": "text", "text": stub_text}],
             })
             i = end
         else:

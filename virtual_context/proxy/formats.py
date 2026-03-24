@@ -18,7 +18,8 @@ import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Shared helpers (provider-agnostic) — canonical definitions in _envelope.py
@@ -31,6 +32,34 @@ from ._envelope import (  # noqa: E402
     _strip_envelope,
     extract_timestamp_from_metadata,
 )
+
+
+# ---------------------------------------------------------------------------
+# Normalized tool-call / tool-output info
+# ---------------------------------------------------------------------------
+
+class ToolCallInfo(NamedTuple):
+    """Normalized descriptor for a tool call across all provider formats."""
+    call_id: str
+    name: str
+    arguments: object  # dict, str, or None depending on provider
+    msg_index: int
+
+
+class ToolOutputInfo(NamedTuple):
+    """Normalized descriptor for a tool output across all provider formats.
+
+    ``carrier`` is the mutable dict that owns the content in the request body.
+    ``carrier_type`` identifies the replacement strategy:
+      - ``"anthropic"``: carrier is a ``tool_result`` content block
+      - ``"openai_chat"``: carrier is a ``role: "tool"`` message dict
+      - ``"openai_responses"``: carrier is a bare ``function_call_output`` item
+    """
+    call_id: str
+    content: str
+    carrier: dict
+    carrier_type: str
+    msg_index: int
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +106,118 @@ class PayloadFormat(ABC):
     @abstractmethod
     def has_messages(self, body: dict) -> bool:
         ...
+
+    # -- Tool-call / tool-output traversal -----------------------------------
+
+    def iter_tool_calls(self, body: dict) -> Iterator[ToolCallInfo]:
+        """Yield normalized tool-call descriptors from all messages/items.
+
+        Handles Anthropic (``tool_use`` content blocks), OpenAI Chat
+        (``tool_calls`` on assistant messages), and OpenAI Responses
+        (bare ``function_call`` items).
+        """
+        messages = self.get_messages(body)
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+
+            # --- Anthropic: tool_use content blocks in assistant messages ---
+            if msg.get("role") == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            yield ToolCallInfo(
+                                call_id=block.get("id", ""),
+                                name=block.get("name", ""),
+                                arguments=block.get("input"),
+                                msg_index=i,
+                            )
+                # --- OpenAI Chat: tool_calls array on assistant messages ---
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        fn = tc.get("function", {})
+                        yield ToolCallInfo(
+                            call_id=tc.get("id", ""),
+                            name=fn.get("name", "") if isinstance(fn, dict) else "",
+                            arguments=fn.get("arguments") if isinstance(fn, dict) else None,
+                            msg_index=i,
+                        )
+
+            # --- OpenAI Responses: bare function_call items ---
+            if msg.get("type") == "function_call":
+                yield ToolCallInfo(
+                    call_id=msg.get("call_id", ""),
+                    name=msg.get("name", ""),
+                    arguments=msg.get("arguments"),
+                    msg_index=i,
+                )
+
+    def iter_tool_outputs(self, body: dict) -> Iterator[ToolOutputInfo]:
+        """Yield normalized tool-output descriptors from all messages/items.
+
+        Handles Anthropic (``tool_result`` content blocks in user messages),
+        OpenAI Chat (``role: "tool"`` messages), and OpenAI Responses
+        (bare ``function_call_output`` items).
+        """
+        messages = self.get_messages(body)
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+
+            # --- Anthropic: tool_result content blocks in user messages ---
+            if msg.get("role") == "user":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            text = self._extract_tool_result_text(block)
+                            yield ToolOutputInfo(
+                                call_id=block.get("tool_use_id", ""),
+                                content=text,
+                                carrier=block,
+                                carrier_type="anthropic",
+                                msg_index=i,
+                            )
+
+            # --- OpenAI Chat: role: "tool" messages ---
+            if msg.get("role") == "tool":
+                yield ToolOutputInfo(
+                    call_id=msg.get("tool_call_id", ""),
+                    content=msg.get("content", "") or "",
+                    carrier=msg,
+                    carrier_type="openai_chat",
+                    msg_index=i,
+                )
+
+            # --- OpenAI Responses: bare function_call_output items ---
+            if msg.get("type") == "function_call_output":
+                yield ToolOutputInfo(
+                    call_id=msg.get("call_id", ""),
+                    content=msg.get("output", "") or "",
+                    carrier=msg,
+                    carrier_type="openai_responses",
+                    msg_index=i,
+                )
+
+    @staticmethod
+    def _extract_tool_result_text(block: dict) -> str:
+        """Extract plain text from an Anthropic tool_result content block."""
+        content = block.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+        return ""
 
     # -- Context injection ---------------------------------------------------
 

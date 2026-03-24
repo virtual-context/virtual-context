@@ -621,6 +621,40 @@ def execute_vc_tool(
                 result["total_tokens_freed"] = sum(
                     cr.get("tokens_freed", 0) for cr in collapse_results
                 )
+
+            # Surface linked tool outputs as a recovery hint (Phase 8).
+            # Do NOT inline full raw content — just note their existence
+            # so the model knows to use vc_find_quote for details.
+            if "error" not in result:
+                _expand_tag = tool_input.get("tag", "")
+                _conv_id = engine.config.conversation_id
+                try:
+                    _segments = engine._store.get_segments_by_tags(
+                        tags=[_expand_tag], min_overlap=1, limit=500,
+                        conversation_id=_conv_id or None,
+                    )
+                    _linked_refs: list[str] = []
+                    for _seg in _segments:
+                        _refs = engine._store.get_tool_outputs_for_segment(
+                            _conv_id, _seg.ref,
+                        )
+                        for _r in _refs:
+                            if _r not in _linked_refs:
+                                _linked_refs.append(_r)
+                    if _linked_refs:
+                        result["linked_tool_outputs"] = len(_linked_refs)
+                        result["tool_output_hint"] = (
+                            f"This topic has {len(_linked_refs)} linked tool "
+                            f"output(s). Use vc_find_quote(query) to search "
+                            f"their content."
+                        )
+                except Exception:
+                    # Non-critical — don't break expand on linkage errors
+                    logger.debug(
+                        "Failed to query tool output links for tag %s",
+                        _expand_tag, exc_info=True,
+                    )
+
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
             _fq_max = engine.config.search.find_quote_max_results

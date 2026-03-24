@@ -234,6 +234,20 @@ CREATE INDEX IF NOT EXISTS idx_fact_tags_tag ON fact_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_fact_links_source ON fact_links(source_fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
+
+CREATE TABLE IF NOT EXISTS turn_tool_outputs (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    tool_output_ref TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, turn_number, tool_output_ref)
+);
+
+CREATE TABLE IF NOT EXISTS segment_tool_outputs (
+    conversation_id TEXT NOT NULL,
+    segment_ref TEXT NOT NULL,
+    tool_output_ref TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
+);
 """
 
 # Postgres FTS: tsvector columns + GIN indexes
@@ -837,6 +851,8 @@ class PostgresStore(ContextStore):
                 "tool_calls",
                 "request_context",
                 "tag_summary_embeddings",
+                "turn_tool_outputs",
+                "segment_tool_outputs",
             ):
                 self._delete_conversation_rows(conn, table, conversation_id)
         return deleted
@@ -1055,6 +1071,52 @@ class PostgresStore(ContextStore):
             QuoteResult(text=row["excerpt"], tag=row["tool_name"], segment_ref=row["ref"], session_date="", match_type="tool_output")
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Turn / Segment ↔ Tool Output linkage
+    # ------------------------------------------------------------------
+
+    def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING""",
+            (conversation_id, turn_number, tool_output_ref),
+        )
+
+    def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tool_output_ref FROM turn_tool_outputs WHERE conversation_id = %s AND turn_number = %s",
+            (conversation_id, turn_number),
+        ).fetchall()
+        return [row["tool_output_ref"] for row in rows]
+
+    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING""",
+            (conversation_id, segment_ref, tool_output_ref),
+        )
+
+    def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tool_output_ref FROM segment_tool_outputs WHERE conversation_id = %s AND segment_ref = %s",
+            (conversation_id, segment_ref),
+        ).fetchall()
+        return [row["tool_output_ref"] for row in rows]
+
+    def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT ref FROM tool_outputs WHERE conversation_id = %s AND turn = %s",
+            (conversation_id, turn),
+        ).fetchall()
+        return [row["ref"] for row in rows]
 
     def save_request_capture(self, capture: dict) -> None:
         conn = self._get_conn()
