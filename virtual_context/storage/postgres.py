@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS engine_state (
     saved_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversation_lifecycle (
+    conversation_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0,
+    deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS turn_messages (
     conversation_id TEXT NOT NULL,
     turn_number INTEGER NOT NULL,
@@ -763,6 +770,59 @@ class PostgresStore(ContextStore):
         )
         return int(cur.rowcount or 0)
 
+    def activate_conversation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+            VALUES (%s, 0, FALSE, %s)
+            ON CONFLICT (conversation_id) DO UPDATE SET
+                deleted = FALSE,
+                updated_at = EXCLUDED.updated_at
+            RETURNING generation""",
+            (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
+        ).fetchone()
+        return int(row["generation"] if isinstance(row, dict) else row[0])
+
+    def begin_conversation_deletion(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+            VALUES (%s, 1, TRUE, %s)
+            ON CONFLICT (conversation_id) DO UPDATE SET
+                generation = conversation_lifecycle.generation + 1,
+                deleted = TRUE,
+                updated_at = EXCLUDED.updated_at
+            RETURNING generation""",
+            (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
+        ).fetchone()
+        return int(row["generation"] if isinstance(row, dict) else row[0])
+
+    def get_conversation_generation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return 0
+        return int(row["generation"] if isinstance(row, dict) else row[0])
+
+    def is_conversation_generation_current(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT generation, deleted FROM conversation_lifecycle WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return int(generation or 0) == 0
+        current = int(row["generation"] if isinstance(row, dict) else row[0])
+        deleted = bool(row["deleted"] if isinstance(row, dict) else row[1])
+        return current == int(generation or 0) and not deleted
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         with conn.transaction():
@@ -1195,6 +1255,7 @@ class PostgresStore(ContextStore):
             last_completed_turn=last_completed_turn,
             last_indexed_turn=last_indexed_turn,
             checkpoint_version=checkpoint_version,
+            conversation_generation=self.get_conversation_generation(row["conversation_id"]),
             split_processed_tags=split_tags,
             working_set=working_set,
             trailing_fingerprint=fingerprint,

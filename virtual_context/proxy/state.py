@@ -13,6 +13,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
+from ..core.conversation_store import StaleConversationWriteError
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import EngineState, Message, SplitResult
@@ -814,6 +815,24 @@ class ProxyState:
             finally:
                 setattr(self, attr, None)
 
+    def _cancel_background_work(self) -> None:
+        """Cancel queued tag/compaction futures without blocking on completion."""
+        for attr in ("_pending_tag", "_pending_compact"):
+            future = getattr(self, attr, None)
+            if future is None:
+                continue
+            try:
+                future.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel %s for conv=%s",
+                    attr,
+                    self.engine.config.conversation_id[:12],
+                    exc_info=True,
+                )
+            finally:
+                setattr(self, attr, None)
+
     def _stop_ingestion_thread(
         self,
         *,
@@ -841,11 +860,22 @@ class ProxyState:
         self._ingestion_thread = None
         self._ingestion_cancel.clear()
 
-    def reset_for_conversation_deletion(self, conversation_id: str | None = None) -> None:
+    def reset_for_conversation_deletion(
+        self,
+        conversation_id: str | None = None,
+        *,
+        authoritative: bool = False,
+    ) -> None:
         """Stop live work and clear runtime state before deleting a conversation."""
         conv_id = conversation_id or self.engine.config.conversation_id
-        self._stop_ingestion_thread(timeout_s=5.0, raise_on_timeout=True)
-        self._drain_background_work()
+        self._stop_ingestion_thread(
+            timeout_s=0.1 if authoritative else 5.0,
+            raise_on_timeout=not authoritative,
+        )
+        if authoritative:
+            self._cancel_background_work()
+        else:
+            self._drain_background_work()
         self._clear_runtime_state(conv_id)
 
     def _advance_compaction_watermark(self) -> None:
@@ -1158,6 +1188,13 @@ class ProxyState:
             # so we use a flag to skip the finalization actions.
             cancelled = True
             logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
+        except StaleConversationWriteError as e:
+            cancelled = True
+            logger.info(
+                "Ingestion abandoned for deleted/stale conversation %s: %s",
+                conversation_id[:12],
+                e,
+            )
         except Exception as e:
             logger.error("Ingestion error: %s", e, exc_info=True)
         finally:
@@ -1248,11 +1285,17 @@ class ProxyState:
                 "baseline_history_tokens": baseline_history_tokens,
             })
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
         try:
-            self._stop_ingestion_thread(timeout_s=5.0, raise_on_timeout=False)
+            self._stop_ingestion_thread(
+                timeout_s=5.0 if wait else 0.1,
+                raise_on_timeout=False,
+            )
         except Exception:
             logger.warning("Failed to stop ingestion thread during shutdown", exc_info=True)
-        self._drain_background_work()
-        self._pool.shutdown(wait=True)
-        self._compact_pool.shutdown(wait=True)
+        if wait:
+            self._drain_background_work()
+        else:
+            self._cancel_background_work()
+        self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+        self._compact_pool.shutdown(wait=wait, cancel_futures=cancel_futures)

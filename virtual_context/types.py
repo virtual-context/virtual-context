@@ -305,6 +305,7 @@ class EngineState:
     last_completed_turn: int = -1
     last_indexed_turn: int = -1
     checkpoint_version: int = 0
+    conversation_generation: int = 0
     tool_tag_counter: int = 0
     split_processed_tags: set[str] = field(default_factory=set)
     trailing_fingerprint: str = ""
@@ -337,6 +338,7 @@ class EngineStateSnapshot:
     last_completed_turn: int = -1
     last_indexed_turn: int = -1
     checkpoint_version: int = 0
+    conversation_generation: int = 0
     saved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
     working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
