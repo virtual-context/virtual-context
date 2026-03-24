@@ -327,6 +327,21 @@ class CompositeStore:
     def load_tool_call(self, call_id: int) -> dict | None:
         return self._search.load_tool_call(call_id)
 
+    def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
+        return self._search.link_turn_tool_output(conversation_id, turn_number, tool_output_ref)
+
+    def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
+        return self._search.get_tool_outputs_for_turn(conversation_id, turn_number)
+
+    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+        return self._search.link_segment_tool_output(conversation_id, segment_ref, tool_output_ref)
+
+    def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        return self._search.get_tool_outputs_for_segment(conversation_id, segment_ref)
+
+    def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
+        return self._search.get_tool_output_refs_for_turn(conversation_id, turn)
+
     def save_request_context(self, context: dict) -> None:
         return self._search.save_request_context(context)
 

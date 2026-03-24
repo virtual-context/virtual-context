@@ -127,6 +127,24 @@ class TaggingPipeline:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _link_turn_tool_outputs(self, turn_number: int) -> None:
+        """Link any previously intercepted tool outputs to a canonical turn.
+
+        Queries the ``tool_outputs`` table by (conversation_id, turn) to find
+        refs stored by the interceptor, then writes explicit entries into the
+        ``turn_tool_outputs`` join table.  Non-critical — failures are silenced.
+        """
+        try:
+            refs = self._store.get_tool_output_refs_for_turn(
+                self.config.conversation_id, turn_number,
+            )
+            for ref in refs:
+                self._store.link_turn_tool_output(
+                    self.config.conversation_id, turn_number, ref,
+                )
+        except Exception:
+            pass  # non-critical
+
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
         """Extract the most recent user+assistant pair."""
         if len(history) < 2:
@@ -327,6 +345,7 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass  # never block tagging for message persistence
+                self._link_turn_tool_outputs(turn_num)
             self._save_state_callback(
                 conversation_history,
                 last_indexed_turn=len(self._turn_tag_index.entries) - 1,
@@ -476,6 +495,7 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass
+                self._link_turn_tool_outputs(entry.turn_number)
                 ingested += 1
                 continue
 
@@ -513,6 +533,7 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass
+                self._link_turn_tool_outputs(entry.turn_number)
                 ingested += 1
                 logger.info(
                     "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
@@ -646,6 +667,7 @@ class TaggingPipeline:
                 )
             except Exception:
                 pass
+            self._link_turn_tool_outputs(entry.turn_number)
             ingested += 1
 
             # Stderr progress for visibility

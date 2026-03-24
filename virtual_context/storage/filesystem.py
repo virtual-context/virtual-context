@@ -1023,6 +1023,21 @@ class FilesystemStore(ContextStore):
     ) -> list:
         return []
 
+    def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
+        pass
+
+    def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
+        return []
+
+    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+        pass
+
+    def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        return []
+
+    def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
+        return []
+
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return {}
 

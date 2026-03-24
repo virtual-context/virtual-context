@@ -645,6 +645,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
             );
             CREATE INDEX IF NOT EXISTS idx_request_context_conv ON request_context(conversation_id);
         """)
+        # Turn / Segment ↔ Tool Output linkage (join tables)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS turn_tool_outputs (
+                conversation_id TEXT NOT NULL,
+                turn_number INTEGER NOT NULL,
+                tool_output_ref TEXT NOT NULL,
+                PRIMARY KEY (conversation_id, turn_number, tool_output_ref)
+            );
+
+            CREATE TABLE IF NOT EXISTS segment_tool_outputs (
+                conversation_id TEXT NOT NULL,
+                segment_ref TEXT NOT NULL,
+                tool_output_ref TEXT NOT NULL,
+                PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
+            );
+        """)
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -1238,6 +1254,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "tool_calls",
             "request_context",
             "tag_summary_embeddings",
+            "turn_tool_outputs",
+            "segment_tool_outputs",
         ):
             self._delete_conversation_rows(conn, table, conversation_id)
         conn.commit()
@@ -2221,6 +2239,52 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Turn / Segment ↔ Tool Output linkage
+    # ------------------------------------------------------------------
+
+    def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR IGNORE INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref)
+            VALUES (?, ?, ?)""",
+            (conversation_id, turn_number, tool_output_ref),
+        )
+        conn.commit()
+
+    def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tool_output_ref FROM turn_tool_outputs WHERE conversation_id = ? AND turn_number = ?",
+            (conversation_id, turn_number),
+        ).fetchall()
+        return [row["tool_output_ref"] for row in rows]
+
+    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
+            VALUES (?, ?, ?)""",
+            (conversation_id, segment_ref, tool_output_ref),
+        )
+        conn.commit()
+
+    def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tool_output_ref FROM segment_tool_outputs WHERE conversation_id = ? AND segment_ref = ?",
+            (conversation_id, segment_ref),
+        ).fetchall()
+        return [row["tool_output_ref"] for row in rows]
+
+    def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT ref FROM tool_outputs WHERE conversation_id = ? AND turn = ?",
+            (conversation_id, turn),
+        ).fetchall()
+        return [row["ref"] for row in rows]
 
     # ------------------------------------------------------------------
     # Request capture persistence

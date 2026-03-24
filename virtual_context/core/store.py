@@ -316,6 +316,36 @@ class ContextStore(ABC):
         return []
 
     # ------------------------------------------------------------------
+    # Turn / Segment ↔ Tool Output linkage (join tables)
+    # ------------------------------------------------------------------
+
+    def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
+        """Link a tool output ref to a specific turn."""
+        pass  # default no-op for backwards compatibility
+
+    def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
+        """Return tool_output refs linked to a turn."""
+        return []
+
+    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+        """Link a tool output ref to a segment."""
+        pass
+
+    def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        """Return tool_output refs linked to a segment."""
+        return []
+
+    def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
+        """Return refs from the tool_outputs table for a given conversation + turn.
+
+        Unlike ``get_tool_outputs_for_turn`` (which reads the join table),
+        this queries the ``tool_outputs`` table directly by its ``turn`` column.
+        Used during ingestion to discover intercepted tool outputs that should
+        be linked to a canonical turn.
+        """
+        return []
+
+    # ------------------------------------------------------------------
     # Tool Output Storage
     # ------------------------------------------------------------------
 
