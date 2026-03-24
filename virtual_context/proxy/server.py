@@ -183,9 +183,12 @@ async def prepare_payload(
         ):
             history_pairs = _extract_history_pairs(body)
             needed = len(history_pairs) // 2
-            existing = len(state.engine._turn_tag_index.entries)
+            existing = state._indexed_turn_count()
             if state.reconcile_history_bootstrap(history_pairs):
                 current_state = SessionState.ACTIVE
+            elif state.has_pending_indexing():
+                state.resume_pending_ingestion_if_needed()
+                current_state = state.session_state
             elif needed > 0 and existing < needed:
                 current_state = SessionState.PASSTHROUGH
 

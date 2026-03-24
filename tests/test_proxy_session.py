@@ -19,7 +19,7 @@ from virtual_context.proxy.server import (
 from virtual_context.config import load_config
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.core.turn_tag_index import TurnTagIndex
-from virtual_context.types import AssembledContext, Message, TurnTagEntry
+from virtual_context.types import AssembledContext, EngineState, Message, TurnTagEntry
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +853,7 @@ class TestSessionStateMachine:
         engine = MagicMock()
         engine.config.conversation_id = conversation_id
         engine._turn_tag_index = TurnTagIndex()
+        engine._engine_state = EngineState()
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
         engine.config.tag_generator.context_lookback_pairs = 3
@@ -931,6 +932,8 @@ class TestSessionStateMachine:
                 turn_number=i, message_hash=f"h{i}",
                 tags=["tag"], primary_tag="tag",
             ))
+        state.engine._engine_state.last_indexed_turn = 2
+        state.engine._engine_state.last_completed_turn = 2
         pairs = [
             Message(role="user", content=f"Q{i}")
             if i % 2 == 0
@@ -942,6 +945,47 @@ class TestSessionStateMachine:
         assert state.session_state == SessionState.ACTIVE
         assert state._history_ingested() is True
         state.engine.ingest_history.assert_not_called()
+
+    def test_resume_pending_ingestion_from_store_gap(self):
+        import time
+
+        state = self._make_state()
+        state.engine._turn_tag_index.append(TurnTagEntry(
+            turn_number=0,
+            message_hash="h0",
+            tags=["tag-0"],
+            primary_tag="tag-0",
+        ))
+        state.engine._engine_state.last_indexed_turn = 0
+        state.engine._engine_state.last_completed_turn = 2
+        state.engine._store.get_turn_messages.return_value = {
+            1: ("Q1", "A1", None, None),
+            2: ("Q2", "A2", None, None),
+        }
+
+        def ingest_gap(pairs, progress_callback=None, turn_offset=0):
+            for i in range(0, len(pairs), 2):
+                turn_number = turn_offset + (i // 2)
+                entry = TurnTagEntry(
+                    turn_number=turn_number,
+                    message_hash=f"h{turn_number}",
+                    tags=[f"tag-{turn_number}"],
+                    primary_tag=f"tag-{turn_number}",
+                )
+                state.engine._turn_tag_index.append(entry)
+                if progress_callback:
+                    progress_callback((i // 2) + 1, len(pairs) // 2, entry)
+            state.engine._engine_state.last_indexed_turn = 2
+            return len(pairs) // 2
+
+        state.engine.ingest_history.side_effect = ingest_gap
+
+        assert state.resume_pending_ingestion_if_needed() is True
+        time.sleep(0.5)
+
+        assert state.session_state == SessionState.ACTIVE
+        assert len(state.engine._turn_tag_index.entries) == 3
+        assert state._history_ingested() is True
 
     def test_ingestion_error_transitions_to_active(self):
         state = self._make_state()
@@ -1125,4 +1169,3 @@ class TestSessionStateMachine:
         metrics.capture_request(0, {"messages": []}, "anthropic")
         req = metrics.get_captured_request(0)
         assert req["passthrough"] is False
-

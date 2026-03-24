@@ -7,6 +7,7 @@ state machine for non-blocking ingestion and turn-complete processing.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import threading
 import time
@@ -194,9 +195,7 @@ class ProxyState:
         continues from the previous session.
         """
         try:
-            entries = self.engine._turn_tag_index.entries
-            if entries and len(entries) > 0:
-                return max(e.turn_number for e in entries) + 1
+            return self._indexed_turn_count()
         except (TypeError, AttributeError):
             pass
         return 0
@@ -210,6 +209,127 @@ class ProxyState:
 
     def set_manual_passthrough(self, enabled: bool) -> None:
         self._manual_passthrough = enabled
+
+    def _indexed_turn_count(self) -> int:
+        raw = getattr(getattr(self.engine, "_engine_state", None), "last_indexed_turn", -1)
+        marker = raw if isinstance(raw, int) else -1
+        try:
+            entries_len = len(self.engine._turn_tag_index.entries)
+        except (TypeError, AttributeError):
+            entries_len = 0
+        return max(entries_len, marker + 1)
+
+    def _completed_turn_count(self) -> int:
+        raw = getattr(getattr(self.engine, "_engine_state", None), "last_completed_turn", -1)
+        marker = raw if isinstance(raw, int) else -1
+        history_turns = len(self.conversation_history) // 2 if self.conversation_history else 0
+        return max(history_turns, marker + 1)
+
+    def has_pending_indexing(self) -> bool:
+        return self._completed_turn_count() > self._indexed_turn_count()
+
+    def persist_completed_turn(self) -> None:
+        if len(self.conversation_history) < 2 or len(self.conversation_history) % 2 != 0:
+            return
+        persist = getattr(self.engine, "persist_completed_turn", None)
+        if callable(persist):
+            persist(list(self.conversation_history))
+            return
+        turn_number = (len(self.conversation_history) // 2) - 1
+        try:
+            self.engine._store.save_turn_message(
+                self.engine.config.conversation_id,
+                turn_number,
+                self.conversation_history[-2].content,
+                self.conversation_history[-1].content,
+                user_raw_content=json.dumps(self.conversation_history[-2].raw_content)
+                if self.conversation_history[-2].raw_content else None,
+                assistant_raw_content=json.dumps(self.conversation_history[-1].raw_content)
+                if self.conversation_history[-1].raw_content else None,
+            )
+            self.engine._engine_state.last_completed_turn = max(
+                getattr(self.engine._engine_state, "last_completed_turn", -1),
+                turn_number,
+            )
+        except Exception:
+            logger.warning("Failed to persist completed turn", exc_info=True)
+
+    def resume_pending_ingestion_if_needed(self) -> bool:
+        """Resume indexing from durable turn_messages when completed turns outpace indexed turns."""
+        conversation_id = self.engine.config.conversation_id
+        if not self.has_pending_indexing():
+            return False
+        with self._ingestion_lock:
+            if self._ingestion_thread is not None and self._ingestion_thread.is_alive():
+                return True
+
+            baseline = self._indexed_turn_count()
+            total = self._completed_turn_count()
+            pending_rows = list(getattr(self.engine, "_restored_pending_turns", []) or [])
+            if not pending_rows:
+                turn_numbers = list(range(baseline, total))
+                try:
+                    rows = self.engine._store.get_turn_messages(conversation_id, turn_numbers)
+                except Exception:
+                    logger.warning(
+                        "Failed to load pending turn_messages for durable resume (conv=%s)",
+                        conversation_id[:12],
+                        exc_info=True,
+                    )
+                    return False
+                for turn_number in turn_numbers:
+                    row = rows.get(turn_number)
+                    if row is None:
+                        continue
+                    user_content, assistant_content, user_raw, assistant_raw = row
+                    pending_rows.append(
+                        (turn_number, user_content, assistant_content, user_raw, assistant_raw)
+                    )
+
+            if not pending_rows:
+                return False
+
+            pairs: list[Message] = []
+            expected_turn = baseline
+            for row in sorted(pending_rows, key=lambda item: item[0]):
+                turn_number, user_content, assistant_content, *_rest = row
+                if turn_number < baseline:
+                    continue
+                if turn_number != expected_turn:
+                    logger.warning(
+                        "Durable resume gap at turn %d for conversation %s; pending resume will stop at turn %d",
+                        expected_turn,
+                        conversation_id[:12],
+                        turn_number - 1,
+                    )
+                    break
+                pairs.append(Message(role="user", content=user_content))
+                pairs.append(Message(role="assistant", content=assistant_content))
+                expected_turn += 1
+
+            if not pairs:
+                return False
+
+            if self.metrics:
+                self.metrics.clear_ingestion_events(conversation_id)
+
+            self.engine._restored_pending_turns = []
+            self._ingestion_progress = (baseline, max(total, baseline + (len(pairs) // 2)))
+            self._transition_to(SessionState.INGESTING)
+            self._ingestion_thread = threading.Thread(
+                target=self._run_ingestion_with_catchup,
+                args=(pairs, baseline, total),
+                daemon=True,
+                name="vc-ingest-resume",
+            )
+            self._ingestion_thread.start()
+            logger.info(
+                "Resuming durable ingestion for conversation %s from turn %d to %d",
+                conversation_id[:12],
+                baseline,
+                total - 1,
+            )
+            return True
 
     def _transition_to(self, new_state: SessionState) -> None:
         old = self._state
@@ -536,14 +656,19 @@ class ProxyState:
             logger.error("Post-ingestion compaction error: %s", e, exc_info=True)
 
     def _history_ingested(self) -> bool:
-        return self.engine.config.conversation_id in self._ingested_conversations
+        return (
+            self.engine.config.conversation_id in self._ingested_conversations
+            and not self.has_pending_indexing()
+        )
 
     def reconcile_history_bootstrap(self, history_pairs: list[Message]) -> bool:
         """Finalize a restored session once the first post-restart history arrives."""
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations:
             return True
-        existing_turns = len(self.engine._turn_tag_index.entries)
+        if self.has_pending_indexing():
+            return False
+        existing_turns = self._indexed_turn_count()
         needed_turns = len(history_pairs) // 2
         if existing_turns <= 0:
             return False
@@ -770,7 +895,7 @@ class ProxyState:
         Double-checked locking: fast path skips the lock entirely.
         """
         conversation_id = self.engine.config.conversation_id
-        if conversation_id in self._ingested_conversations:
+        if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
             self._check_history_widening(history_pairs, conversation_id)
             if conversation_id in self._ingested_conversations:
@@ -835,7 +960,7 @@ class ProxyState:
         last tagged turn (PROXY-013).
         """
         conversation_id = self.engine.config.conversation_id
-        if conversation_id in self._ingested_conversations:
+        if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
             self._check_history_widening(history_pairs, conversation_id)
             if conversation_id in self._ingested_conversations:
@@ -847,7 +972,7 @@ class ProxyState:
             logger.info(
                 "INGEST_ENTRY conversation=%s pairs=%d index_size=%d thread_alive=%s",
                 conversation_id[:12], len(history_pairs) // 2,
-                len(self.engine._turn_tag_index.entries),
+                self._indexed_turn_count(),
                 self._ingestion_thread is not None and self._ingestion_thread.is_alive(),
             )
 
@@ -861,7 +986,7 @@ class ProxyState:
                 return
 
             # Skip if persisted TurnTagIndex already covers history
-            existing_turns = len(self.engine._turn_tag_index.entries)
+            existing_turns = self._indexed_turn_count()
             needed_turns = len(history_pairs) // 2
             if existing_turns >= needed_turns:
                 self._ingested_conversations.add(conversation_id)
@@ -911,7 +1036,7 @@ class ProxyState:
                 # Re-read existing_turns AFTER old thread stopped —
                 # the thread may have appended one more entry between
                 # the last callback and the cancel taking effect.
-                existing_turns = len(self.engine._turn_tag_index.entries)
+                existing_turns = self._indexed_turn_count()
 
                 logger.info(
                     "INGEST Cancel at T%d/%d, resuming from T%d (conversation=%s)",

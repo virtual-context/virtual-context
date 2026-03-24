@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -143,59 +144,65 @@ class VirtualContextEngine:
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
         self._restored_conversation_history: list = []  # (turn, user, asst) from store or dicts from Redis
+        self._restored_pending_turns: list[tuple[int, str, str, str | None, str | None]] = []
         self._restored_from_checkpoint = False
         self._restored_checkpoint_source = ""
 
         # Restore persisted state BEFORE creating delegates so they get the
         # final turn_tag_index / engine_state — no re-sync needed.
-        # Try Redis cache first (fast) — fall back to store if miss
-        _redis_loaded = False
+        # The durable store is authoritative; Redis may only supply a richer
+        # history snapshot when it matches the committed checkpoint.
         _store_loaded = False
+        _cached = None
+        try:
+            _saved = self._store.load_engine_state(self.config.conversation_id)
+        except Exception:
+            logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
+            _saved = None
+        if _saved:
+            self._load_persisted_state(saved=_saved)
+            _store_loaded = True
+
         if self._session_cache and self._session_cache.is_available():
             try:
-                cached = self._session_cache.load_snapshot(self.config.conversation_id)
-                if cached and cached.get("conversation_id") == self.config.conversation_id:
-                    self._apply_cached_state(cached)
-                    _redis_loaded = True
-                    logger.info(
-                        "Session cache hit: %d messages, %d turns from Redis (version=%s)",
-                        len(cached.get("history", [])),
-                        len(cached.get("turn_tag_entries", [])),
-                        cached.get("version", "?"),
-                    )
+                _cached = self._session_cache.load_snapshot(self.config.conversation_id)
             except Exception as e:
-                    logger.warning("Redis cache load failed: %s — falling back to store", e)
+                logger.warning("Redis cache load failed: %s — continuing without cache", e)
+                _cached = None
 
-        # Reconcile Redis against the persisted checkpoint. Redis is faster,
-        # but the durable store wins if it has a newer saved_at or strictly
-        # more advanced state.
-        if _redis_loaded:
-            try:
-                db_state = self._store.load_engine_state(self.config.conversation_id)
-                if db_state and self._store_checkpoint_is_newer(db_state, cached):
+        if _cached and _cached.get("conversation_id") == self.config.conversation_id:
+            if not _store_loaded:
+                self._apply_cached_state(_cached)
+                logger.info(
+                    "Session cache restore: %d messages, %d turns from Redis (version=%s)",
+                    len(_cached.get("history", [])),
+                    len(_cached.get("turn_tag_entries", [])),
+                    _cached.get("version", "?"),
+                )
+            elif self._cache_checkpoint_matches_store(_saved, _cached):
+                self._restored_conversation_history = _cached.get("history", [])
+                if self._restored_conversation_history:
+                    self._restored_checkpoint_source = "store+redis"
                     logger.info(
-                        "Store checkpoint newer than Redis for conversation %s — preferring store",
+                        "Session cache history accepted for committed checkpoint %s (messages=%d, version=%s)",
                         self.config.conversation_id[:12],
+                        len(self._restored_conversation_history),
+                        _cached.get("version", "?"),
                     )
-                    self._reset_restored_state()
-                    self._load_persisted_state()
-                    _redis_loaded = False
-                    _store_loaded = True
-                elif (
-                    db_state
-                    and db_state.compacted_through > self._engine_state.compacted_through
-                ):
-                    logger.info(
-                        "Watermark reconciliation: Redis=%d < store=%d — using store value",
-                        self._engine_state.compacted_through,
-                        db_state.compacted_through,
-                    )
-                    self._engine_state.compacted_through = db_state.compacted_through
+            else:
+                logger.info(
+                    "Ignoring Redis snapshot for conversation %s because it does not match the committed store checkpoint",
+                    self.config.conversation_id[:12],
+                )
+        if _store_loaded:
+            try:
+                self.prune_committed_turn_messages()
             except Exception:
-                pass  # store may not be initialized yet; non-critical
-
-        if not _redis_loaded and not _store_loaded:
-            self._load_persisted_state()
+                logger.warning(
+                    "Startup turn_messages prune failed for conversation %s",
+                    self.config.conversation_id[:12],
+                    exc_info=True,
+                )
 
         # Create delegates with the (possibly restored) turn_tag_index
         self._semantic = SemanticSearchManager(
@@ -478,7 +485,10 @@ class VirtualContextEngine:
             self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
 
-    def _load_persisted_state(self) -> None:
+    def _load_persisted_state(
+        self,
+        saved: EngineStateSnapshot | None = None,
+    ) -> None:
         """Restore TurnTagIndex and compaction watermark from store if available.
 
         Only sets state on ``self`` (turn_tag_index, engine_state, config).
@@ -486,18 +496,24 @@ class VirtualContextEngine:
         ``_apply_persisted_state_to_delegates`` which runs after delegate
         creation.
         """
-        try:
-            saved = self._store.load_engine_state(self.config.conversation_id)
-        except Exception:
-            logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
-            return
+        if saved is None:
+            try:
+                saved = self._store.load_engine_state(self.config.conversation_id)
+            except Exception:
+                logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
+                return
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
         self._engine_state.compacted_through = saved.compacted_through
+        self._engine_state.last_compacted_turn = saved.last_compacted_turn
+        self._engine_state.last_completed_turn = saved.last_completed_turn
+        self._engine_state.last_indexed_turn = saved.last_indexed_turn
+        self._engine_state.checkpoint_version = saved.checkpoint_version
         # Populate in-place so all existing references (retriever, etc.) see the restored entries
         for entry in saved.turn_tag_entries:
             self._turn_tag_index.append(entry)
+        self._update_checkpoint_markers()
         self._engine_state.split_processed_tags = set(saved.split_processed_tags)
         self._engine_state.trailing_fingerprint = saved.trailing_fingerprint
         # Restore telemetry counters from persisted rollup
@@ -513,18 +529,28 @@ class VirtualContextEngine:
         self._restored_working_set = saved.working_set or []
         # Load conversation history from turn messages for post-restart rebuild
         try:
-            self._restored_conversation_history = self._store.load_recent_turn_messages(
+            restored_turns = self._store.load_recent_turn_messages(
                 saved.conversation_id,
                 limit=max(200, min(saved.turn_count or 0, 1000)),
             )
+            if saved.last_compacted_turn >= 0:
+                restored_turns = [
+                    row for row in restored_turns
+                    if row[0] > saved.last_compacted_turn
+                ]
+            self._restored_conversation_history = restored_turns
         except Exception:
             self._restored_conversation_history = []
+        self._restore_pending_turns(saved)
         logger.info(
-            "Restored engine state: conversation=%s, compacted_through=%d, turns=%d, "
-            "split_processed=%d, working_set=%d, history_messages=%d",
+            "Restored engine state: conversation=%s, compacted_through=%d, indexed=%d, completed=%d, "
+            "turns=%d, split_processed=%d, working_set=%d, history_messages=%d pending_turns=%d",
             saved.conversation_id[:12], saved.compacted_through,
+            self._engine_state.last_indexed_turn,
+            self._engine_state.last_completed_turn,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
             len(self._restored_working_set), len(self._restored_conversation_history),
+            len(self._restored_pending_turns),
         )
 
         # Validate watermark against actual stored segments.
@@ -559,6 +585,19 @@ class VirtualContextEngine:
         # Engine state — compacted_through is 0 in snapshot (history is uncompacted suffix)
         es = cached.get("engine_state", {})
         self._engine_state.compacted_through = es.get("compacted_through", 0)
+        self._engine_state.last_compacted_turn = es.get(
+            "last_compacted_turn",
+            (self._engine_state.compacted_through // 2) - 1 if self._engine_state.compacted_through > 0 else -1,
+        )
+        self._engine_state.last_completed_turn = es.get(
+            "last_completed_turn",
+            len(cached.get("turn_tag_entries", []) or []) - 1,
+        )
+        self._engine_state.last_indexed_turn = es.get(
+            "last_indexed_turn",
+            len(cached.get("turn_tag_entries", []) or []) - 1,
+        )
+        self._engine_state.checkpoint_version = es.get("checkpoint_version", cached.get("version", 0) or 0)
         self._engine_state.split_processed_tags = set(es.get("split_processed_tags", []))
         self._engine_state.trailing_fingerprint = es.get("trailing_fingerprint", "")
         self._engine_state.provider = es.get("provider", "")
@@ -595,6 +634,7 @@ class VirtualContextEngine:
                 timestamp=ts,
                 fact_signals=fs or None,
             ))
+        self._update_checkpoint_markers()
 
         # Working set — stash for _apply_persisted_state_to_delegates
         self._restored_working_set = []
@@ -659,8 +699,21 @@ class VirtualContextEngine:
                 len(tag_counts),
             )
 
-    def _save_state(self, conversation_history: list[Message]) -> None:
+    def _save_state(
+        self,
+        conversation_history: list[Message] | None,
+        *,
+        last_completed_turn: int | None = None,
+        last_indexed_turn: int | None = None,
+    ) -> bool:
         try:
+            self._update_checkpoint_markers(
+                conversation_history,
+                last_completed_turn=last_completed_turn,
+                last_indexed_turn=last_indexed_turn,
+            )
+            self._engine_state.checkpoint_version += 1
+            saved_at = datetime.now(timezone.utc)
             # Persist telemetry rollup (totals + by_model) without raw events
             telemetry_dict = self._telemetry.to_dict()
             telemetry_dict.pop("events", None)  # too large for state blob
@@ -674,8 +727,17 @@ class VirtualContextEngine:
             snapshot = EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
                 compacted_through=self._engine_state.compacted_through,
+                last_compacted_turn=self._engine_state.last_compacted_turn,
+                last_completed_turn=self._engine_state.last_completed_turn,
+                last_indexed_turn=self._engine_state.last_indexed_turn,
+                checkpoint_version=self._engine_state.checkpoint_version,
                 turn_tag_entries=list(self._turn_tag_index.entries),
-                turn_count=len(conversation_history) // 2,
+                turn_count=max(
+                    (len(conversation_history) // 2) if conversation_history else 0,
+                    self._engine_state.last_completed_turn + 1,
+                    self._engine_state.last_indexed_turn + 1,
+                ),
+                saved_at=saved_at,
                 split_processed_tags=sorted(self._engine_state.split_processed_tags),
                 working_set=list(self._paging.working_set.values()),
                 trailing_fingerprint=self._engine_state.trailing_fingerprint,
@@ -688,19 +750,21 @@ class VirtualContextEngine:
             # Write-through to Redis cache
             if self._session_cache:
                 try:
-                    cache_snapshot = self._build_cache_snapshot(
-                        conversation_history,
-                        saved_at=snapshot.saved_at,
-                    )
-                    self._session_cache.save_snapshot(
-                        self.config.conversation_id, cache_snapshot,
-                    )
+                    history_turns = (len(conversation_history) // 2) if conversation_history else 0
+                    if conversation_history and history_turns >= self._engine_state.last_completed_turn + 1:
+                        cache_snapshot = self._build_cache_snapshot(
+                            conversation_history,
+                            saved_at=snapshot.saved_at,
+                        )
+                        self._session_cache.save_snapshot(
+                            self.config.conversation_id, cache_snapshot,
+                        )
                 except Exception as _redis_err:
                     logger.debug("Redis snapshot write failed: %s", _redis_err)
+            return True
         except Exception as e:
             logger.error("Failed to save engine state: %s", e)
-
-    _cache_version = 0
+            return False
 
     def _build_cache_snapshot(
         self,
@@ -709,7 +773,6 @@ class VirtualContextEngine:
         saved_at: datetime | None = None,
     ) -> dict:
         """Build atomic snapshot dict for Redis cache."""
-        self._cache_version += 1
         ct = self._engine_state.compacted_through
         saved_at = saved_at or datetime.now(timezone.utc)
 
@@ -756,13 +819,17 @@ class VirtualContextEngine:
                 pass
 
         return {
-            "version": self._cache_version,
+            "version": self._engine_state.checkpoint_version,
             "saved_at": saved_at.isoformat(),
             "conversation_id": self.config.conversation_id,
             "history": history,
             "turn_tag_entries": entries,
             "engine_state": {
                 "compacted_through": self._engine_state.compacted_through,
+                "last_compacted_turn": self._engine_state.last_compacted_turn,
+                "last_completed_turn": self._engine_state.last_completed_turn,
+                "last_indexed_turn": self._engine_state.last_indexed_turn,
+                "checkpoint_version": self._engine_state.checkpoint_version,
                 "split_processed_tags": sorted(self._engine_state.split_processed_tags),
                 "working_set": [
                     {"tag": ws.tag, "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
@@ -777,14 +844,185 @@ class VirtualContextEngine:
             },
         }
 
+    def persist_completed_turn(self, conversation_history: list[Message]) -> None:
+        """Durably record the latest completed user/assistant pair before indexing catches up."""
+        if len(conversation_history) < 2 or len(conversation_history) % 2 != 0:
+            return
+        turn_number = (len(conversation_history) // 2) - 1
+        user_msg = conversation_history[-2]
+        assistant_msg = conversation_history[-1]
+        try:
+            self._store.save_turn_message(
+                self.config.conversation_id,
+                turn_number,
+                user_msg.content,
+                assistant_msg.content,
+                user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                assistant_raw_content=json.dumps(assistant_msg.raw_content) if assistant_msg.raw_content else None,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist completed turn %d for conversation %s",
+                turn_number,
+                self.config.conversation_id[:12],
+                exc_info=True,
+            )
+            return
+        self._save_state(
+            conversation_history,
+            last_completed_turn=turn_number,
+        )
+
+    def prune_committed_turn_messages(
+        self,
+        *,
+        minimum_last_compacted_turn: int | None = None,
+    ) -> int:
+        """Prune raw turn_messages only from the durably committed compacted prefix."""
+        try:
+            saved = self._store.load_engine_state(self.config.conversation_id)
+        except Exception:
+            logger.warning(
+                "Failed to load committed checkpoint before pruning turn_messages for conversation %s",
+                self.config.conversation_id[:12],
+                exc_info=True,
+            )
+            return 0
+        if not saved:
+            return 0
+        committed_turn = int(getattr(saved, "last_compacted_turn", -1) or -1)
+        if committed_turn < 0:
+            return 0
+        if (
+            minimum_last_compacted_turn is not None
+            and committed_turn < minimum_last_compacted_turn
+        ):
+            logger.info(
+                "Skipping turn_messages prune for conversation %s: committed turn %d below expected %d",
+                self.config.conversation_id[:12],
+                committed_turn,
+                minimum_last_compacted_turn,
+            )
+            return 0
+        keep_from_turn = committed_turn + 1
+        try:
+            removed = self._store.prune_turn_messages(
+                self.config.conversation_id,
+                keep_from_turn,
+            )
+        except Exception:
+            logger.warning(
+                "Committed turn_messages prune failed for conversation %s at keep_from_turn=%d",
+                self.config.conversation_id[:12],
+                keep_from_turn,
+                exc_info=True,
+            )
+            return 0
+        if removed:
+            logger.info(
+                "Pruned %d committed turn_messages before turn %d for conversation %s",
+                removed,
+                keep_from_turn,
+                self.config.conversation_id[:12],
+            )
+        return removed
+
     def _reset_restored_state(self) -> None:
         self._turn_tag_index = TurnTagIndex()
         self._engine_state = EngineState()
         self._restored_working_set = []
         self._restored_request_captures = []
         self._restored_conversation_history = []
+        self._restored_pending_turns = []
         self._restored_from_checkpoint = False
         self._restored_checkpoint_source = ""
+
+    def _highest_indexed_turn(self) -> int:
+        try:
+            return max((entry.turn_number for entry in self._turn_tag_index.entries), default=-1)
+        except Exception:
+            return -1
+
+    def _update_checkpoint_markers(
+        self,
+        conversation_history: list[Message] | None = None,
+        *,
+        last_completed_turn: int | None = None,
+        last_indexed_turn: int | None = None,
+    ) -> None:
+        indexed = self._highest_indexed_turn()
+        if last_indexed_turn is not None:
+            indexed = max(indexed, last_indexed_turn)
+        self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, indexed)
+
+        completed = -1
+        if conversation_history and len(conversation_history) >= 2 and len(conversation_history) % 2 == 0:
+            completed = (len(conversation_history) // 2) - 1
+        if last_completed_turn is not None:
+            completed = max(completed, last_completed_turn)
+        completed = max(completed, self._engine_state.last_indexed_turn)
+        self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, completed)
+
+        compacted_turn = (self._engine_state.compacted_through // 2) - 1
+        if self._engine_state.compacted_through <= 0:
+            compacted_turn = -1
+        self._engine_state.last_compacted_turn = max(self._engine_state.last_compacted_turn, compacted_turn)
+
+    def _restore_pending_turns(self, saved: EngineStateSnapshot) -> None:
+        self._restored_pending_turns = []
+        start_turn = saved.last_indexed_turn + 1
+        end_turn = saved.last_completed_turn
+        if end_turn < start_turn:
+            return
+        turn_numbers = list(range(start_turn, end_turn + 1))
+        try:
+            stored = self._store.get_turn_messages(saved.conversation_id, turn_numbers)
+        except Exception:
+            logger.warning(
+                "Failed to load pending turn_messages for conversation %s",
+                saved.conversation_id[:12],
+                exc_info=True,
+            )
+            return
+
+        missing: list[int] = []
+        for turn_number in turn_numbers:
+            row = stored.get(turn_number)
+            if row is None:
+                missing.append(turn_number)
+                continue
+            user_content, assistant_content, user_raw, assistant_raw = row
+            self._restored_pending_turns.append(
+                (turn_number, user_content, assistant_content, user_raw, assistant_raw)
+            )
+        if missing:
+            logger.warning(
+                "Pending checkpoint gap for conversation %s is missing %d stored turn_messages starting at turn %d",
+                saved.conversation_id[:12],
+                len(missing),
+                missing[0],
+            )
+
+    def _cache_checkpoint_matches_store(
+        self,
+        db_state: EngineStateSnapshot | None,
+        cached: dict,
+    ) -> bool:
+        if db_state is None:
+            return False
+        cached_state = cached.get("engine_state", {}) if isinstance(cached, dict) else {}
+        cached_version = cached_state.get("checkpoint_version", cached.get("version", 0) if isinstance(cached, dict) else 0)
+        if db_state.checkpoint_version > 0 and cached_version > 0:
+            return int(cached_version) == int(db_state.checkpoint_version)
+        cached_saved_at = self._parse_checkpoint_saved_at(cached.get("saved_at") if isinstance(cached, dict) else None)
+        if cached_saved_at is not None and db_state.saved_at != cached_saved_at:
+            return False
+        cached_turns = len(cached.get("turn_tag_entries", []) or []) if isinstance(cached, dict) else 0
+        cached_ct = cached_state.get("compacted_through", 0) if isinstance(cached_state, dict) else 0
+        return (
+            cached_turns == len(db_state.turn_tag_entries)
+            and cached_ct == db_state.compacted_through
+        )
 
     @staticmethod
     def _parse_checkpoint_saved_at(raw: object) -> datetime | None:

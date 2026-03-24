@@ -620,6 +620,10 @@ class FilesystemStore(ContextStore):
         data = {
             "conversation_id": state.conversation_id,
             "compacted_through": state.compacted_through,
+            "last_compacted_turn": state.last_compacted_turn,
+            "last_completed_turn": state.last_completed_turn,
+            "last_indexed_turn": state.last_indexed_turn,
+            "checkpoint_version": state.checkpoint_version,
             "turn_count": state.turn_count,
             "saved_at": _dt_to_str(state.saved_at),
             "turn_tag_entries": [
@@ -647,6 +651,7 @@ class FilesystemStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint,
             "request_captures": state.request_captures,
             "provider": state.provider,
+            "tool_tag_counter": state.tool_tag_counter,
         }
         path.write_text(json.dumps(data, indent=2))
 
@@ -677,12 +682,23 @@ class FilesystemStore(ContextStore):
             compacted_through=data.get("compacted_through", 0),
             turn_tag_entries=entries,
             turn_count=data.get("turn_count", 0),
+            last_compacted_turn=data.get(
+                "last_compacted_turn",
+                (data.get("compacted_through", 0) // 2) - 1 if data.get("compacted_through", 0) > 0 else -1,
+            ),
+            last_completed_turn=data.get(
+                "last_completed_turn",
+                max(data.get("turn_count", 0) - 1, len(entries) - 1),
+            ),
+            last_indexed_turn=data.get("last_indexed_turn", len(entries) - 1),
+            checkpoint_version=data.get("checkpoint_version", 0),
             saved_at=_str_to_dt(data["saved_at"]) if "saved_at" in data else datetime.now(timezone.utc),
             split_processed_tags=data.get("split_processed_tags", []),
             working_set=working_set,
             trailing_fingerprint=data.get("trailing_fingerprint", ""),
             request_captures=data.get("request_captures", []),
             provider=data.get("provider", ""),
+            tool_tag_counter=data.get("tool_tag_counter", 0),
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
