@@ -286,6 +286,7 @@ class ContextAssembler:
             },
             prepend_text=prepend_text,
             presented_segment_refs=presented_refs,
+            selected_facts=selected_facts,
         )
 
     def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:

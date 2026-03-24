@@ -36,7 +36,7 @@ from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
 )
-from ..types import Message, PreparedPayload, SplitResult  # noqa: F401 — re-exported
+from ..types import Fact, Message, PreparedPayload, SplitResult, StoredSummary  # noqa: F401 — re-exported
 
 from .dashboard import register_dashboard_routes
 from .formats import (
@@ -107,6 +107,136 @@ def _compute_effective_budget(
     if overhead >= context_window:
         return overhead + 10_000, True
     return context_window, False
+
+
+def _iso_or_none(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _selection_mode(retrieval_meta: dict) -> str:
+    if retrieval_meta.get("summary_floor"):
+        return "summary_floor"
+    if retrieval_meta.get("fts_fallback"):
+        return "fts_fallback"
+    if retrieval_meta.get("general_fallback") == "previous_turn":
+        return "previous_turn_fallback"
+    if retrieval_meta.get("fallback") == "working_set":
+        return "working_set_fallback"
+    return retrieval_meta.get("strategy", "default")
+
+
+def _segment_selection_reasons(
+    summary: "StoredSummary",
+    query_tags: set[str],
+    related_tags: set[str],
+    retrieval_meta: dict,
+) -> tuple[list[str], list[str], list[str]]:
+    matched_query_tags = sorted(t for t in summary.tags if t in query_tags)
+    related_match_tags = sorted(t for t in summary.tags if t in related_tags and t not in query_tags)
+    reasons: list[str] = []
+    if matched_query_tags:
+        reasons.append("Matched query tags: " + ", ".join(matched_query_tags))
+    if related_match_tags:
+        reasons.append("Included via related tags: " + ", ".join(related_match_tags))
+    if retrieval_meta.get("fts_fallback"):
+        reasons.append("Added by text-search fallback when tag overlap was insufficient.")
+    if retrieval_meta.get("summary_floor"):
+        reasons.append("Included by summary floor because the conversation was already compacted.")
+    if retrieval_meta.get("general_fallback") == "previous_turn":
+        reasons.append("Used previous-turn tags because the inbound request was too general.")
+    if retrieval_meta.get("fallback") == "working_set":
+        reasons.append("Used working-set tags because inbound tagging fell back.")
+    if not reasons and summary.primary_tag:
+        reasons.append(f"Selected from stored context under {summary.primary_tag}.")
+    return reasons, matched_query_tags, related_match_tags
+
+
+def _serialize_recall_segment(
+    summary: "StoredSummary",
+    *,
+    rank: int,
+    retrieval_meta: dict,
+    retrieval_scores: dict[str, float],
+) -> dict:
+    query_tags = set(retrieval_meta.get("tags_queried", []) or [])
+    related_tags = set(retrieval_meta.get("related_tags_used", []) or [])
+    reasons, matched_query_tags, related_match_tags = _segment_selection_reasons(
+        summary,
+        query_tags,
+        related_tags,
+        retrieval_meta,
+    )
+    best_score = max((retrieval_scores.get(tag, 0.0) for tag in summary.tags), default=0.0)
+    meta = summary.metadata
+    return {
+        "ref": summary.ref,
+        "primary_tag": summary.primary_tag,
+        "tags": list(summary.tags),
+        "rank": rank,
+        "score": round(best_score, 4),
+        "selection_mode": _selection_mode(retrieval_meta),
+        "selected_because": reasons,
+        "matched_query_tags": matched_query_tags,
+        "related_match_tags": related_match_tags,
+        "summary": summary.summary,
+        "summary_tokens": summary.summary_tokens,
+        "full_tokens": summary.full_tokens,
+        "turn_count": meta.turn_count if meta else 0,
+        "session_date": meta.session_date if meta else "",
+        "entities": list(meta.entities) if meta else [],
+        "key_decisions": list(meta.key_decisions) if meta else [],
+        "action_items": list(meta.action_items) if meta else [],
+        "date_references": list(meta.date_references) if meta else [],
+        "created_at": _iso_or_none(summary.created_at),
+        "start_timestamp": _iso_or_none(summary.start_timestamp),
+        "end_timestamp": _iso_or_none(summary.end_timestamp),
+    }
+
+
+def _serialize_recall_fact(
+    fact: "Fact",
+    *,
+    retrieval_meta: dict,
+) -> dict:
+    query_tags = set(retrieval_meta.get("tags_queried", []) or [])
+    related_tags = set(retrieval_meta.get("related_tags_used", []) or [])
+    matched_query_tags = sorted(t for t in fact.tags if t in query_tags)
+    related_match_tags = sorted(t for t in fact.tags if t in related_tags and t not in query_tags)
+    reasons: list[str] = []
+    if matched_query_tags:
+        reasons.append("Matched query tags: " + ", ".join(matched_query_tags))
+    if related_match_tags:
+        reasons.append("Included via related tags: " + ", ".join(related_match_tags))
+    if retrieval_meta.get("summary_floor"):
+        reasons.append("Included by summary floor because the conversation was already compacted.")
+    if retrieval_meta.get("fallback") == "working_set":
+        reasons.append("Selected from working-set fallback.")
+    return {
+        "id": fact.id,
+        "subject": fact.subject,
+        "verb": fact.verb,
+        "object": fact.object,
+        "status": fact.status,
+        "fact_type": fact.fact_type,
+        "what": fact.what,
+        "who": fact.who,
+        "when_date": fact.when_date,
+        "where": fact.where,
+        "why": fact.why,
+        "tags": list(fact.tags),
+        "segment_ref": fact.segment_ref,
+        "turn_numbers": list(fact.turn_numbers),
+        "session_date": fact.session_date,
+        "mentioned_at": _iso_or_none(fact.mentioned_at),
+        "selection_mode": _selection_mode(retrieval_meta),
+        "selected_because": reasons,
+        "matched_query_tags": matched_query_tags,
+        "related_match_tags": related_match_tags,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -675,38 +805,58 @@ async def prepare_payload(
     # Persist request context for dashboard recall page
     if state and assembled:
         try:
-            _retrieval_meta = getattr(assembled, 'retrieval_metadata', {}) or {}
+            _retrieval_meta = assembled.retrieval_metadata or {}
             _budget = assembled.budget_breakdown or {}
-            _retrieval_scores = getattr(assembled, 'retrieval_scores', {}) or {}
-            # Build segments_injected: [{ref, tag, tokens, score}]
-            _seg_injected = []
-            if hasattr(assembled, 'presented_segment_refs') and assembled.presented_segment_refs:
-                # Map refs to tags from the retrieval result summaries
-                _ref_to_summary = {}
-                if hasattr(assembled, '_retrieval_summaries'):
-                    for s in assembled._retrieval_summaries:
-                        _ref_to_summary[s.ref] = s
-                for ref in assembled.presented_segment_refs:
-                    _seg_injected.append({
-                        "ref": ref,
-                        "tag": _ref_to_summary.get(ref, type('', (), {"primary_tag": ""})()).primary_tag if ref in _ref_to_summary else "",
-                        "tokens": 0,
-                        "score": 0.0,
-                    })
-            # Simpler approach: use tag_sections which we know
-            if not _seg_injected and hasattr(assembled, 'tag_sections') and assembled.tag_sections:
-                for tag in assembled.tag_sections:
+            _retrieval_scores = assembled.retrieval_scores or {}
+            _selected_refs = set(assembled.presented_segment_refs or set())
+            _seg_injected: list[dict] = []
+
+            if _selected_refs and assembled.retrieval_summaries:
+                _rank = 0
+                for summary in assembled.retrieval_summaries:
+                    if summary.ref not in _selected_refs:
+                        continue
+                    _rank += 1
+                    _seg_injected.append(
+                        _serialize_recall_segment(
+                            summary,
+                            rank=_rank,
+                            retrieval_meta=_retrieval_meta,
+                            retrieval_scores=_retrieval_scores,
+                        ),
+                    )
+
+            if not _seg_injected and assembled.tag_sections:
+                _fallback_selection_mode = _selection_mode(_retrieval_meta)
+                for rank, tag in enumerate(assembled.tag_sections, start=1):
                     _seg_injected.append({
                         "ref": "",
-                        "tag": tag,
-                        "tokens": len(assembled.tag_sections[tag]) // 4,
-                        "score": _retrieval_scores.get(tag, 0.0) if isinstance(_retrieval_scores, dict) else 0.0,
+                        "primary_tag": tag,
+                        "tags": [tag],
+                        "rank": rank,
+                        "score": round(float(_retrieval_scores.get(tag, 0.0)), 4),
+                        "selection_mode": _fallback_selection_mode,
+                        "selected_because": [f"Selected from assembled tag context for {tag}."],
+                        "matched_query_tags": [tag] if tag in (_retrieval_meta.get("tags_queried", []) or []) else [],
+                        "related_match_tags": [tag] if tag in (_retrieval_meta.get("related_tags_used", []) or []) else [],
+                        "summary": assembled.tag_sections[tag],
+                        "summary_tokens": len(assembled.tag_sections[tag]) // 4,
+                        "full_tokens": 0,
+                        "turn_count": 0,
+                        "session_date": "",
+                        "entities": [],
+                        "key_decisions": [],
+                        "action_items": [],
+                        "date_references": [],
+                        "created_at": None,
+                        "start_timestamp": None,
+                        "end_timestamp": None,
                     })
-            # Build facts_injected: [fact_id, ...]
-            _facts_injected = []
-            if hasattr(assembled, 'facts_text') and assembled.facts_text:
-                # Extract fact IDs from the facts — they're in the retrieval result
-                pass  # fact IDs not directly available from assembled context
+
+            _facts_injected = [
+                _serialize_recall_fact(fact, retrieval_meta=_retrieval_meta)
+                for fact in (assembled.selected_facts or [])
+            ]
             state.engine._store.save_request_context({
                 "conversation_id": _conversation_id,
                 "request_turn": turn,
@@ -714,12 +864,12 @@ async def prepare_payload(
                 "user_message": user_message[:500],
                 "inbound_tags": assembled.matched_tags or [],
                 "retrieval_method": _retrieval_meta.get("strategy", "rrf"),
-                "candidates_found": _retrieval_meta.get("candidates_found", 0),
-                "candidates_selected": _retrieval_meta.get("summaries_returned", 0),
+                "candidates_found": _retrieval_meta.get("candidates_found", len(assembled.retrieval_summaries or [])),
+                "candidates_selected": _retrieval_meta.get("summaries_returned", len(_seg_injected)),
                 "segments_injected": _seg_injected,
                 "facts_injected": _facts_injected,
-                "facts_count": _budget.get("facts", 0),
-                "facts_tags": _retrieval_meta.get("tags_queried", []),
+                "facts_count": len(_facts_injected),
+                "facts_tags": (_retrieval_meta.get("tags_queried", []) or []) + (_retrieval_meta.get("related_tags_used", []) or []),
                 "pool_used": _budget.get("tags", 0) + _budget.get("facts", 0),
                 "pool_budget": state.engine.config.assembler.context_injection_max_tokens,
                 "total_context_tokens": context_tokens,
