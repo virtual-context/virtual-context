@@ -212,3 +212,56 @@ class TestResolveConversationId:
         b = resolve_conversation_id(body)
         uuid.UUID(a)
         uuid.UUID(b)
+
+
+class TestSystemPromptChatId:
+    def test_chat_id_from_system_prompt_metadata(self):
+        body = {
+            "system": 'You are a bot.\n\n```json\n{"schema": "openclaw.inbound_meta.v1", "chat_id": "telegram:123"}\n```\n## Reactions\nEnabled.',
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = resolve_conversation_id(body)
+        expected = _candidate_to_uuid("chat_id", "telegram:123")
+        assert result == expected
+
+    def test_chat_id_from_anthropic_list_system_prompt(self):
+        body = {
+            "system": [
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": 'You are a personal assistant.\n\n```json\n{"schema": "openclaw.inbound_meta.v1", "chat_id": "telegram:8049932331"}\n```\n## Reactions\nEnabled.'},
+            ],
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = resolve_conversation_id(body)
+        expected = _candidate_to_uuid("chat_id", "telegram:8049932331")
+        assert result == expected
+
+    def test_system_prompt_chat_id_stable_despite_dynamic_sections(self):
+        body_a = {
+            "system": 'Bot.\n\n```json\n{"chat_id": "telegram:123"}\n```\n## Reactions\nEnabled.',
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        body_b = {
+            "system": 'Bot.\n\n```json\n{"chat_id": "telegram:123"}\n```\n## Runtime Events\nSome event.',
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        assert resolve_conversation_id(body_a) == resolve_conversation_id(body_b)
+
+    def test_user_message_chat_id_wins_over_system_prompt_chat_id(self):
+        body = {
+            "system": '```json\n{"chat_id": "telegram:999"}\n```',
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Conversation info (untrusted metadata):\n"
+                        "```json\n"
+                        '{"chat_id": "telegram:123"}\n'
+                        "```\n\nHello"
+                    ),
+                }
+            ],
+        }
+        result = resolve_conversation_id(body)
+        expected = _candidate_to_uuid("chat_id", "telegram:123")
+        assert result == expected
