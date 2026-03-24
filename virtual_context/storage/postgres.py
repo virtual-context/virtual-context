@@ -976,6 +976,7 @@ class PostgresStore(ContextStore):
                     "turn_number": e.turn_number,
                     "tags": e.tags,
                     "primary_tag": e.primary_tag,
+                    "message_hash": e.message_hash,
                     "sender": e.sender,
                     "fact_signals": [
                         {"subject": fs.subject, "verb": fs.verb, "object": fs.object,
@@ -1066,6 +1067,7 @@ class PostgresStore(ContextStore):
             entries.append(TurnTagEntry(
                 turn_number=e["turn_number"], tags=e["tags"],
                 primary_tag=e.get("primary_tag", e["tags"][0] if e["tags"] else "_general"),
+                message_hash=e.get("message_hash", ""),
                 fact_signals=signals if signals else None,
                 sender=e.get("sender", ""),
             ))

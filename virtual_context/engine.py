@@ -159,10 +159,9 @@ class VirtualContextEngine:
         # container restarted before the next Redis save).
         if _redis_loaded:
             try:
-                db_state = self._store.load_latest_engine_state()
+                db_state = self._store.load_engine_state(self.config.conversation_id)
                 if (
                     db_state
-                    and db_state.conversation_id == self.config.conversation_id
                     and db_state.compacted_through > self._engine_state.compacted_through
                 ):
                     logger.info(
