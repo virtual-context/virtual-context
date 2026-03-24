@@ -650,6 +650,11 @@ class AssembledContext:
     context_hint: str = ""  # Topic list injected post-compaction
     temporal: bool = False  # True when query references a time position
     presented_segment_refs: set[str] = field(default_factory=set)  # segment refs already shown to reader
+    retrieval_metadata: dict = field(default_factory=dict)
+    retrieval_scores: dict[str, float] = field(default_factory=dict)
+    retrieval_summaries: list[StoredSummary] = field(default_factory=list)
+    retrieval_full_segments: list[StoredSegment] = field(default_factory=list)
+    selected_facts: list[Fact] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

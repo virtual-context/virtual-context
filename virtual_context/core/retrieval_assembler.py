@@ -227,6 +227,10 @@ class RetrievalAssembler:
 
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
+        assembled.retrieval_metadata = dict(retrieval_result.retrieval_metadata or {})
+        assembled.retrieval_scores = dict(retrieval_result.retrieval_scores or {})
+        assembled.retrieval_summaries = list(retrieval_result.summaries or [])
+        assembled.retrieval_full_segments = list(retrieval_result.full_detail or [])
 
         # Cache for reassemble_context() -- used after paging tool execution
         self._last_retrieval_result = retrieval_result

@@ -377,6 +377,7 @@ class ContextRetriever:
             "tags_from_message": tag_result.tags,
             "tags_queried": query_tags,
             "tags_skipped_active": skipped_tags,
+            "candidates_found": len(all_summaries),
             "summaries_returned": len(selected),
             "strategy": "default",
             "budget_fraction": round(budget_fraction, 3),
