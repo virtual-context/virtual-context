@@ -144,7 +144,7 @@ class CompactionPipeline:
         report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
 
         self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
-        self._save_state_callback(conversation_history)
+        self._commit_compaction_state(conversation_history)
         return report
 
     def compact_manual(
@@ -180,7 +180,7 @@ class CompactionPipeline:
 
         report = self._run_compaction(conversation_history, compact_messages)
 
-        self._save_state_callback(conversation_history)
+        self._commit_compaction_state(conversation_history)
         return report
 
     # ------------------------------------------------------------------
@@ -229,20 +229,6 @@ class CompactionPipeline:
 
         # Advance watermark past compacted messages
         self._engine_state.compacted_through += len(compact_messages)
-        try:
-            keep_from_turn = self._engine_state.compacted_through // 2
-            removed = self._store.prune_turn_messages(
-                self._config.conversation_id,
-                keep_from_turn,
-            )
-            if removed:
-                logger.info(
-                    "Pruned %d compacted turn_messages before turn %d",
-                    removed,
-                    keep_from_turn,
-                )
-        except Exception as e:
-            logger.debug("turn_messages prune failed: %s", e, exc_info=True)
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
@@ -347,6 +333,61 @@ class CompactionPipeline:
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
 
         return report
+
+    def _commit_compaction_state(self, conversation_history: list[Message]) -> None:
+        """Persist the committed compaction checkpoint, then prune raw turns from that prefix."""
+        expected_last_compacted_turn = int(self._engine_state.last_compacted_turn)
+        saved = self._save_state_callback(conversation_history)
+        if not saved:
+            logger.warning(
+                "Compaction checkpoint save failed for conversation %s; skipping turn_messages prune",
+                self._config.conversation_id[:12],
+            )
+            return
+        prune = getattr(self._store, "prune_turn_messages", None)
+        if prune is None:
+            return
+        try:
+            committed = self._store.load_engine_state(self._config.conversation_id)
+        except Exception:
+            logger.warning(
+                "Failed to reload committed compaction checkpoint for conversation %s before pruning turn_messages",
+                self._config.conversation_id[:12],
+                exc_info=True,
+            )
+            return
+        if not committed:
+            return
+        committed_turn = int(getattr(committed, "last_compacted_turn", -1) or -1)
+        if committed_turn < expected_last_compacted_turn:
+            logger.warning(
+                "Committed compaction checkpoint regressed for conversation %s (%d < %d); skipping turn_messages prune",
+                self._config.conversation_id[:12],
+                committed_turn,
+                expected_last_compacted_turn,
+            )
+            return
+        keep_from_turn = committed_turn + 1
+        try:
+            removed = self._store.prune_turn_messages(
+                self._config.conversation_id,
+                keep_from_turn,
+            )
+        except Exception:
+            logger.warning(
+                "Committed compaction prune failed for conversation %s at keep_from_turn=%d",
+                self._config.conversation_id[:12],
+                keep_from_turn,
+                exc_info=True,
+            )
+            return
+        if removed:
+            logger.info(
+                "Pruned %d committed turn_messages before turn %d for conversation %s",
+                removed,
+                keep_from_turn,
+                self._config.conversation_id[:12],
+            )
 
     def _compact_and_store(
         self, segments: list, compact_messages_len: int,

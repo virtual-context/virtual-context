@@ -327,7 +327,10 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass  # never block tagging for message persistence
-            self._save_state_callback(conversation_history)
+            self._save_state_callback(
+                conversation_history,
+                last_indexed_turn=len(self._turn_tag_index.entries) - 1,
+            )
 
         return signal
 
@@ -666,10 +669,20 @@ class TaggingPipeline:
 
             # Periodic state save so session_date + tags are queryable during ingestion
             if ingested % 20 == 0:
-                self._save_state_callback(history_pairs)
+                checkpoint_turn = turn_offset + ingested - 1
+                self._save_state_callback(
+                    history_pairs,
+                    last_completed_turn=checkpoint_turn,
+                    last_indexed_turn=checkpoint_turn,
+                )
 
         # Final save after all turns ingested
-        self._save_state_callback(history_pairs)
+        final_turn = turn_offset + ingested - 1
+        self._save_state_callback(
+            history_pairs,
+            last_completed_turn=final_turn,
+            last_indexed_turn=final_turn,
+        )
         _sys.stderr.write("\n")
         _sys.stderr.flush()
         logger.info("Ingested %d historical turns into TurnTagIndex", ingested)

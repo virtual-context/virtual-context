@@ -1092,6 +1092,11 @@ class PostgresStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint or "",
             "request_captures": state.request_captures,
             "provider": state.provider,
+            "tool_tag_counter": state.tool_tag_counter,
+            "last_compacted_turn": state.last_compacted_turn,
+            "last_completed_turn": state.last_completed_turn,
+            "last_indexed_turn": state.last_indexed_turn,
+            "checkpoint_version": state.checkpoint_version,
         }
         conn.execute(
             """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
@@ -1100,7 +1105,7 @@ class PostgresStore(ContextStore):
                 compacted_through=EXCLUDED.compacted_through, turn_count=EXCLUDED.turn_count,
                 turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at""",
             (state.conversation_id, state.compacted_through, state.turn_count,
-             json.dumps(entries_data), _dt_to_str(datetime.now(timezone.utc))),
+             json.dumps(entries_data), _dt_to_str(state.saved_at)),
         )
 
     def _parse_engine_state_row(self, row: dict) -> EngineStateSnapshot:
@@ -1140,6 +1145,17 @@ class PostgresStore(ContextStore):
             fingerprint = raw.get("trailing_fingerprint", "")
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
+            tool_tag_counter = raw.get("tool_tag_counter", 0)
+            last_compacted_turn = raw.get(
+                "last_compacted_turn",
+                (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1,
+            )
+            last_completed_turn = raw.get(
+                "last_completed_turn",
+                max(row["turn_count"] - 1, len(entries_list) - 1),
+            )
+            last_indexed_turn = raw.get("last_indexed_turn", len(entries_list) - 1)
+            checkpoint_version = raw.get("checkpoint_version", 0)
         else:
             entries_list = []
             split_tags = set()
@@ -1147,6 +1163,11 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
+            tool_tag_counter = 0
+            last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
+            last_completed_turn = row["turn_count"] - 1
+            last_indexed_turn = -1
+            checkpoint_version = 0
 
         entries = []
         for e in entries_list:
@@ -1170,11 +1191,16 @@ class PostgresStore(ContextStore):
             compacted_through=row["compacted_through"],
             turn_count=row["turn_count"],
             turn_tag_entries=entries,
+            last_compacted_turn=last_compacted_turn,
+            last_completed_turn=last_completed_turn,
+            last_indexed_turn=last_indexed_turn,
+            checkpoint_version=checkpoint_version,
             split_processed_tags=split_tags,
             working_set=working_set,
             trailing_fingerprint=fingerprint,
             request_captures=request_captures,
             provider=provider,
+            tool_tag_counter=tool_tag_counter,
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:

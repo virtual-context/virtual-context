@@ -36,6 +36,10 @@ def _make_snapshot(
         compacted_through=compacted_through,
         turn_tag_entries=entries,
         turn_count=turn_count,
+        last_compacted_turn=(compacted_through // 2) - 1 if compacted_through > 0 else -1,
+        last_completed_turn=turn_count - 1,
+        last_indexed_turn=turn_count - 1,
+        checkpoint_version=7,
     )
 
 
@@ -58,6 +62,10 @@ class TestEngineStateSQLite:
         assert loaded.conversation_id == snap.conversation_id
         assert loaded.compacted_through == snap.compacted_through
         assert loaded.turn_count == snap.turn_count
+        assert loaded.last_compacted_turn == snap.last_compacted_turn
+        assert loaded.last_completed_turn == snap.last_completed_turn
+        assert loaded.last_indexed_turn == snap.last_indexed_turn
+        assert loaded.checkpoint_version == snap.checkpoint_version
         assert len(loaded.turn_tag_entries) == len(snap.turn_tag_entries)
 
         # Verify individual entries
@@ -112,6 +120,10 @@ class TestEngineStateFilesystem:
         assert loaded.conversation_id == snap.conversation_id
         assert loaded.compacted_through == snap.compacted_through
         assert loaded.turn_count == snap.turn_count
+        assert loaded.last_compacted_turn == snap.last_compacted_turn
+        assert loaded.last_completed_turn == snap.last_completed_turn
+        assert loaded.last_indexed_turn == snap.last_indexed_turn
+        assert loaded.checkpoint_version == snap.checkpoint_version
         assert len(loaded.turn_tag_entries) == len(snap.turn_tag_entries)
 
         for orig, restored in zip(snap.turn_tag_entries, loaded.turn_tag_entries):
@@ -154,6 +166,9 @@ class TestEngineStateFilesystem:
         data = json.loads(path.read_text())
         assert data["conversation_id"] == snap.conversation_id
         assert data["compacted_through"] == snap.compacted_through
+        assert data["last_completed_turn"] == snap.last_completed_turn
+        assert data["last_indexed_turn"] == snap.last_indexed_turn
+        assert data["checkpoint_version"] == snap.checkpoint_version
         assert len(data["turn_tag_entries"]) == 3
 
 
@@ -222,6 +237,98 @@ class TestEngineStateIntegration:
         assert len(engine2._turn_tag_index.entries) == 5
         assert engine2._turn_tag_index.entries[0].tags == ["tag-0"]
         assert engine2._turn_tag_index.entries[4].tags == ["tag-4"]
+
+    def test_completed_turn_checkpoint_restores_pending_gap(self, tmp_path):
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+        from virtual_context.types import Message
+
+        db_path = str(tmp_path / "store.db")
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine1 = VirtualContextEngine(config=config)
+        conversation_id = engine1.config.conversation_id
+
+        history = [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="hi"),
+        ]
+        engine1.persist_completed_turn(history)
+        engine1.close()
+
+        config2 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        config2.conversation_id = conversation_id
+        engine2 = VirtualContextEngine(config=config2)
+
+        assert engine2._engine_state.last_completed_turn == 0
+        assert engine2._engine_state.last_indexed_turn == -1
+        assert len(engine2._restored_pending_turns) == 1
+        assert engine2._restored_pending_turns[0][0] == 0
+
+    def test_startup_retries_committed_turn_prune(self, tmp_path):
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+        from virtual_context.types import Message, StoredSegment, SegmentMetadata
+
+        db_path = str(tmp_path / "store.db")
+        config1 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine1 = VirtualContextEngine(config=config1)
+        conversation_id = engine1.config.conversation_id
+
+        engine1._store.store_segment(StoredSegment(
+            ref="seg-0",
+            conversation_id=conversation_id,
+            primary_tag="topic",
+            tags=["topic"],
+            summary="Compacted summary",
+            summary_tokens=5,
+            full_text="full text",
+            full_tokens=10,
+            metadata=SegmentMetadata(turn_count=2),
+        ))
+        for turn in range(3):
+            engine1._store.save_turn_message(
+                conversation_id,
+                turn,
+                f"user-{turn}",
+                f"assistant-{turn}",
+            )
+        engine1._store.save_engine_state(EngineStateSnapshot(
+            conversation_id=conversation_id,
+            compacted_through=4,
+            turn_tag_entries=[],
+            turn_count=3,
+            last_compacted_turn=1,
+            last_completed_turn=2,
+            last_indexed_turn=2,
+            checkpoint_version=3,
+        ))
+        engine1.close()
+
+        config2 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        config2.conversation_id = conversation_id
+        engine2 = VirtualContextEngine(config=config2)
+
+        remaining = engine2._store.get_turn_messages(conversation_id, [0, 1, 2])
+        assert 0 not in remaining
+        assert 1 not in remaining
+        assert 2 in remaining
+        assert engine2._restored_conversation_history == [(2, "user-2", "assistant-2")]
 
 
 # ---------------------------------------------------------------------------

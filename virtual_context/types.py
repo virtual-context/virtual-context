@@ -301,6 +301,10 @@ class TurnTagEntry:
 class EngineState:
     """Mutable shared state passed to engine delegates."""
     compacted_through: int = 0
+    last_compacted_turn: int = -1
+    last_completed_turn: int = -1
+    last_indexed_turn: int = -1
+    checkpoint_version: int = 0
     tool_tag_counter: int = 0
     split_processed_tags: set[str] = field(default_factory=set)
     trailing_fingerprint: str = ""
@@ -329,6 +333,10 @@ class EngineStateSnapshot:
     compacted_through: int
     turn_tag_entries: list[TurnTagEntry]
     turn_count: int  # len(conversation_history) // 2
+    last_compacted_turn: int = -1
+    last_completed_turn: int = -1
+    last_indexed_turn: int = -1
+    checkpoint_version: int = 0
     saved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     split_processed_tags: list[str] = field(default_factory=list)  # tags already split/summarized
     working_set: list[WorkingSetEntry] = field(default_factory=list)  # paging depth state
