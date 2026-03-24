@@ -1170,11 +1170,7 @@ def create_app(
         # Per-request upstream override (e.g. subdomain routing in cloud)
         _req_upstream = getattr(request.state, "upstream", None)
         if _req_upstream:
-            if _req_upstream != upstream:
-                logger.warning("Rejected upstream override: %s (allowed: %s)", _req_upstream, upstream)
-                _req_upstream = None
-            else:
-                url = f"{_req_upstream}/{path}{_suffix}"
+            url = f"{_req_upstream}/{path}{_suffix}"
         raw_headers = dict(request.headers)
         fwd_headers = _forward_headers(raw_headers)
 
