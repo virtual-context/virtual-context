@@ -1277,6 +1277,38 @@ class TestFilterBodyMessagesResponses:
         bare_items = [m for m in result["input"] if m.get("type") in ("function_call", "function_call_output")]
         assert len(bare_items) == 2
 
+    def test_filter_responses_drops_full_tool_round_atomically(self):
+        """Responses tool rounds should drop the closing assistant with the chain."""
+        from virtual_context.proxy.message_filter import filter_body_messages
+        from virtual_context.core.turn_tag_index import TurnTagIndex
+        from virtual_context.types import TurnTagEntry
+
+        tti = TurnTagIndex()
+        tti.append(TurnTagEntry(turn_number=0, message_hash="h0", tags=["music"], primary_tag="music"))
+        tti.append(TurnTagEntry(turn_number=1, message_hash="h1", tags=["cooking"], primary_tag="cooking"))
+
+        body = {"input": [
+            {"role": "user", "content": "q0"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a0 intro"}]},
+            {"type": "function_call", "call_id": "fc0", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "fc0", "output": "result 0"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a0 final"}]},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a1"}]},
+            {"role": "user", "content": "current"},
+        ]}
+
+        result, dropped = filter_body_messages(
+            body, tti, ["cooking"], recent_turns=1, fmt=OpenAIResponsesFormat(),
+        )
+
+        assert dropped == 1
+        rendered = json.dumps(result["input"])
+        assert "fc0" not in rendered
+        assert "a0 intro" not in rendered
+        assert "a0 final" not in rendered
+        assert "q1" in rendered
+
 
 # ---------------------------------------------------------------------------
 # Filter body messages with Gemini format
@@ -2476,4 +2508,3 @@ class TestExtractHistoryPairs:
         assert pairs[0].content == "Q1"
         assert pairs[2].content == "Batch 3"
         assert pairs[4].content == "Q3"
-

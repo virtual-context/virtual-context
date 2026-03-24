@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from virtual_context.proxy.tool_output_interceptor import ToolOutputInterceptor
+from virtual_context.proxy.tool_output_interceptor import (
+    ToolOutputInterceptor,
+    build_turn_tool_output_refs,
+)
 from virtual_context.proxy.formats import detect_format
 from virtual_context.types import ToolOutputConfig, ToolOutputRule, ToolOutputStats
 
@@ -61,6 +64,10 @@ def _tool_result_block_structured(tool_id: str, text: str) -> dict:
         "tool_use_id": tool_id,
         "content": [{"type": "text", "text": text}],
     }
+
+
+def _responses_body(items: list[dict]) -> dict:
+    return {"model": "gpt-5", "input": items}
 
 
 class FakeStore:
@@ -301,6 +308,36 @@ class TestHistoryPreservation:
         assert new_user["content"] != new_big_text, "new tool_result should be truncated"
         assert "find_quote" in str(new_user["content"])
         assert len(store.stored) == 2  # both outputs indexed
+
+    def test_build_turn_tool_output_refs_responses(self):
+        config = ToolOutputConfig(enabled=True, default_truncate_threshold=100)
+        store = FakeStore()
+        interceptor = ToolOutputInterceptor(config, store, "sess1")
+
+        big_0 = "result zero " * 40
+        big_1 = "result one " * 40
+        body = _responses_body([
+            {"role": "user", "content": "q0"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a0"}]},
+            {"type": "function_call", "call_id": "fc0", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "fc0", "output": big_0},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a0 final"}]},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a1"}]},
+            {"type": "function_call", "call_id": "fc1", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "fc1", "output": big_1},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a1 final"}]},
+            {"role": "user", "content": "current"},
+        ])
+        fmt = detect_format(body)
+        result = interceptor.process(body, fmt)
+
+        turn_refs = build_turn_tool_output_refs(result, fmt, interceptor.intercepted_refs)
+
+        assert sorted(turn_refs) == [0, 1]
+        assert len(turn_refs[0]) == 1
+        assert len(turn_refs[1]) == 1
+        assert turn_refs[0][0] != turn_refs[1][0]
 
 
 # ---------------------------------------------------------------------------

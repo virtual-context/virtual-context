@@ -323,33 +323,16 @@ async def prepare_payload(
                 current_state = SessionState.PASSTHROUGH
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
-            # Store latest body for catch-up loop
-            state._latest_body = body
-
-            # On first request: kick off non-blocking ingestion
-            if not state._history_ingested():
-                history_pairs = _extract_history_pairs(body)
-                if history_pairs:
-                    state.conversation_history = list(history_pairs)
-                await asyncio.to_thread(
-                    state.start_ingestion_if_needed, history_pairs,
-                )
-
-            state.conversation_history.append(
-                Message(role="user", content=user_message,
-                        timestamp=datetime.now(timezone.utc),
-                        raw_content=fmt.extract_user_raw_content(body))
-            )
-
-            _conversation_id = state.engine.config.conversation_id
-            turn = len(state.engine._turn_tag_index.entries)
-            _turn_id = uuid.uuid4().hex[:12]
+            tool_output_refs_by_turn: dict[int, list[str]] | None = None
 
             # Tool output interception applies even in passthrough —
             # truncating large tool_result blocks reduces upstream tokens
             # regardless of whether VC context is being injected.
             if state.engine.config.tool_output.enabled:
-                from .tool_output_interceptor import ToolOutputInterceptor
+                from .tool_output_interceptor import (
+                    ToolOutputInterceptor,
+                    build_turn_tool_output_refs,
+                )
 
                 _pt_interceptor = ToolOutputInterceptor(
                     config=state.engine.config.tool_output,
@@ -364,6 +347,33 @@ async def prepare_payload(
                     logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
                                 _post_stats - _pre_stats,
                                 _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
+                tool_output_refs_by_turn = build_turn_tool_output_refs(
+                    body,
+                    fmt,
+                    _pt_interceptor.intercepted_refs,
+                )
+
+            # Store latest body for catch-up loop
+            state._latest_body = body
+
+            # On first request: kick off non-blocking ingestion
+            if not state._history_ingested():
+                history_pairs = _extract_history_pairs(body)
+                if history_pairs:
+                    state.conversation_history = list(history_pairs)
+                await asyncio.to_thread(
+                    state.start_ingestion_if_needed, history_pairs, tool_output_refs_by_turn,
+                )
+
+            state.conversation_history.append(
+                Message(role="user", content=user_message,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_content=fmt.extract_user_raw_content(body))
+            )
+
+            _conversation_id = state.engine.config.conversation_id
+            turn = len(state.engine._turn_tag_index.entries)
+            _turn_id = uuid.uuid4().hex[:12]
 
             # Passthrough payload trimming — trim to upstream_limit * ratio
             _pt_ratio = state.engine.config.proxy.passthrough_trim_ratio if state else 0.40

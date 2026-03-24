@@ -127,17 +127,24 @@ class TaggingPipeline:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _link_turn_tool_outputs(self, turn_number: int) -> None:
-        """Link any previously intercepted tool outputs to a canonical turn.
+    def _link_turn_tool_outputs(
+        self,
+        turn_number: int,
+        refs: list[str] | None = None,
+    ) -> None:
+        """Link intercepted tool outputs to a canonical turn.
 
-        Queries the ``tool_outputs`` table by (conversation_id, turn) to find
-        refs stored by the interceptor, then writes explicit entries into the
-        ``turn_tool_outputs`` join table.  Non-critical — failures are silenced.
+        ``refs`` is the preferred path: ingestion computes canonical turn
+        ownership from parsed payload history and passes the matching tool
+        output refs directly. When ``refs`` is omitted, fall back to the legacy
+        request-time ``tool_outputs.turn`` lookup for compatibility with older
+        single-turn flows.
         """
         try:
-            refs = self._store.get_tool_output_refs_for_turn(
-                self.config.conversation_id, turn_number,
-            )
+            if refs is None:
+                refs = self._store.get_tool_output_refs_for_turn(
+                    self.config.conversation_id, turn_number,
+                )
             for ref in refs:
                 self._store.link_turn_tool_output(
                     self.config.conversation_id, turn_number, ref,
@@ -431,6 +438,7 @@ class TaggingPipeline:
         history_pairs: list[Message],
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
@@ -444,6 +452,8 @@ class TaggingPipeline:
             turn_offset: Global turn number of the first pair. Used by catch-up
                 ingestion to prevent TurnTagIndex overwrites when multiple
                 batches are ingested sequentially.
+            tool_output_refs_by_turn: Mapping of batch-local turn index to
+                intercepted tool-output refs discovered from the raw payload.
 
         Returns:
             Number of turns ingested.
@@ -466,6 +476,10 @@ class TaggingPipeline:
         for i in range(0, len(history_pairs) - 1, 2):
             user_msg = history_pairs[i]
             asst_msg = history_pairs[i + 1]
+            batch_turn = i // 2
+            turn_tool_refs = None
+            if tool_output_refs_by_turn is not None:
+                turn_tool_refs = tool_output_refs_by_turn.get(batch_turn, [])
 
             sender = get_sender_name(user_msg.metadata) if user_msg.metadata else ""
 
@@ -495,7 +509,7 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass
-                self._link_turn_tool_outputs(entry.turn_number)
+                self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
                 continue
 
@@ -533,7 +547,7 @@ class TaggingPipeline:
                     )
                 except Exception:
                     pass
-                self._link_turn_tool_outputs(entry.turn_number)
+                self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
                 logger.info(
                     "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
@@ -667,7 +681,7 @@ class TaggingPipeline:
                 )
             except Exception:
                 pass
-            self._link_turn_tool_outputs(entry.turn_number)
+            self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
             ingested += 1
 
             # Stderr progress for visibility
