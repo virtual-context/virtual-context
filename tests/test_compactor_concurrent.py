@@ -97,6 +97,36 @@ class TestConcurrentCompaction:
         # Can't directly verify max 2 threads, but results should be correct
         assert all(r.summary for r in results)
 
+    def test_progress_callback_reports_completed_segments(self):
+        llm = ThreadTrackingLLM()
+        compactor = DomainCompactor(
+            llm_provider=llm,
+            config=CompactorConfig(max_concurrent_summaries=2),
+        )
+        segments = [_make_segment(f"tag-{i}") for i in range(4)]
+        events = []
+
+        def on_progress(done, total, result, **kwargs):
+            events.append({
+                "done": done,
+                "total": total,
+                "primary_tag": getattr(result, "primary_tag", None),
+                "phase_name": kwargs.get("phase_name"),
+                "elapsed_ms": kwargs.get("elapsed_ms"),
+            })
+
+        results = compactor.compact(segments, progress_callback=on_progress)
+
+        assert len(results) == 4
+        assert events
+        assert events[0]["done"] == 0
+        assert events[0]["total"] == 4
+        assert events[-1]["done"] == 4
+        assert events[-1]["total"] == 4
+        assert events[-1]["primary_tag"] in {"tag-0", "tag-1", "tag-2", "tag-3"}
+        assert all(evt["phase_name"] == "compactor" for evt in events)
+        assert any(evt["done"] >= 1 for evt in events[1:])
+
     def test_error_handling(self):
         """Errors in one segment should not crash others."""
         call_count = 0

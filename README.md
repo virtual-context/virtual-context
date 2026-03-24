@@ -200,6 +200,15 @@ Set these to allow OpenClaw to maintain large context windows from a client pers
       "contextTokens": 2000000 // Note this is 2M
     }
   }
+
+  4. Session idle timeout: prevent OpenClaw from resetting sessions too early.
+  Without this, sessions reset after 12 hours by default, wiping the client-side
+  history before VC can manage it:
+  "session": {
+    "resetByType": {
+      "group": { "idleMinutes": 2880 }   // 48 hours (default is 720 / 12h)
+    }
+  }
 ```
 
 ### MCP Server (Model Context Protocol)

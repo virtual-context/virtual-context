@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from ..core.conversation_store import StaleConversationWriteError
@@ -551,6 +552,8 @@ class ProxyState:
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request."""
         conversation_id = self.engine.config.conversation_id
+        operation_id = uuid.uuid4().hex[:12]
+        compaction_started = time.monotonic()
 
         def _compact_progress(done, total, result, *, phase="", **kwargs):
             if self.metrics:
@@ -561,12 +564,14 @@ class ProxyState:
                     "total": total,
                     "phase": phase,
                     "conversation_id": conversation_id,
+                    "operation_id": operation_id,
                 }
                 if result is not None:
                     evt["primary_tag"] = result.primary_tag
                     evt["tags"] = result.tags
                     evt["original_tokens"] = result.original_tokens
                     evt["summary_tokens"] = result.summary_tokens
+                evt["elapsed_ms"] = round((time.monotonic() - compaction_started) * 1000, 1)
                 for k, v in kwargs.items():
                     evt[k] = v
                 self.metrics.record(evt)
@@ -615,6 +620,7 @@ class ProxyState:
                             "tag_summaries_built": report.tag_summaries_built,
                             "compacted_through": self.engine._engine_state.compacted_through,
                             "conversation_id": conversation_id,
+                            "operation_id": operation_id,
                         })
                 else:
                     logger.info("T%d compaction skipped (no messages to compact)", turn)

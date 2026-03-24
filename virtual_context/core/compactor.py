@@ -204,6 +204,7 @@ class DomainCompactor:
         self,
         segments: list[TaggedSegment],
         fact_signals_by_segment: dict[str, list[FactSignal]] | None = None,
+        progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
         """Summarize each segment independently.
 
@@ -217,6 +218,7 @@ class DomainCompactor:
         signals = fact_signals_by_segment or {}
         import sys as _sys
         import time as _time
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         logger.info(
             "Compacting %d segments (%d workers)...",
@@ -243,28 +245,81 @@ class DomainCompactor:
                 total_chars += len(part)
             prev_contexts.append("\n---\n".join(parts))
 
+        progress_started = _time.time()
+
+        def _emit_progress(
+            done_count: int,
+            result: CompactionResult | None = None,
+            *,
+            heartbeat: bool = False,
+            in_flight: int = 0,
+        ) -> None:
+            if not progress_callback or not segments:
+                return
+            elapsed = _time.time() - progress_started
+            rate = done_count / elapsed if elapsed > 0 else 0.0
+            eta_ms = int(((len(segments) - done_count) / rate) * 1000) if rate > 0 else None
+            progress_callback(
+                done_count,
+                len(segments),
+                result,
+                phase="segment_compacting",
+                phase_name="compactor",
+                heartbeat=heartbeat,
+                in_flight=in_flight,
+                elapsed_ms=int(elapsed * 1000),
+                eta_ms=eta_ms,
+            )
+
         if len(segments) <= 1:
             # Sequential for single segment — no threading overhead
-            return [self._compact_one(s, signals.get(s.id, []), prev_context=prev_contexts[0]) for s in segments]
+            _emit_progress(0, None, in_flight=len(segments))
+            results: list[CompactionResult] = []
+            for idx, segment in enumerate(segments, start=1):
+                result = self._compact_one(segment, signals.get(segment.id, []), prev_context=prev_contexts[idx - 1])
+                results.append(result)
+                _emit_progress(idx, result, in_flight=max(len(segments) - idx, 0))
+            return results
 
         max_workers = min(self.config.max_concurrent_summaries, len(segments))
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results: list[CompactionResult] = [None] * len(segments)  # type: ignore[list-item]
         done_count = 0
         _compact_start = _time.time()
+        heartbeat_interval_s = 2.0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
+            pending = {
                 executor.submit(self._compact_one, segment, signals.get(segment.id, []),
                                 prev_context=prev_contexts[i]): i
                 for i, segment in enumerate(segments)
             }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                done_count += 1
-                try:
-                    results[idx] = future.result()
+            _emit_progress(0, None, in_flight=len(pending))
+            while pending:
+                done, _ = wait(tuple(pending.keys()), timeout=heartbeat_interval_s, return_when=FIRST_COMPLETED)
+                if not done:
+                    _emit_progress(done_count, None, heartbeat=True, in_flight=len(pending))
+                    continue
+                for future in done:
+                    idx = pending.pop(future)
+                    done_count += 1
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        logger.error(f"Concurrent compaction failed for segment {idx}: {e}")
+                        # Create a fallback result
+                        segment = segments[idx]
+                        conversation_text = self._format_conversation(segment.messages)
+                        results[idx] = CompactionResult(
+                            segment_id=segment.id,
+                            primary_tag=segment.primary_tag,
+                            tags=segment.tags,
+                            summary=conversation_text[:2000],
+                            summary_tokens=self.token_counter(conversation_text[:2000]),
+                            original_tokens=self.token_counter(conversation_text),
+                            compression_ratio=0.0,
+                            full_text=conversation_text,
+                            timestamp=segment.start_timestamp,
+                        )
                     logger.info(
                         "  Segment %d/%d done (%s, %dt → %dt)",
                         done_count, len(segments),
@@ -280,22 +335,7 @@ class DomainCompactor:
                         f"{_rate:.1f} seg/s | ETA {_eta}s   "
                     )
                     _sys.stderr.flush()
-                except Exception as e:
-                    logger.error(f"Concurrent compaction failed for segment {idx}: {e}")
-                    # Create a fallback result
-                    segment = segments[idx]
-                    conversation_text = self._format_conversation(segment.messages)
-                    results[idx] = CompactionResult(
-                        segment_id=segment.id,
-                        primary_tag=segment.primary_tag,
-                        tags=segment.tags,
-                        summary=conversation_text[:2000],
-                        summary_tokens=self.token_counter(conversation_text[:2000]),
-                        original_tokens=self.token_counter(conversation_text),
-                        compression_ratio=0.0,
-                        full_text=conversation_text,
-                        timestamp=segment.start_timestamp,
-                    )
+                    _emit_progress(done_count, results[idx], in_flight=len(pending))
 
         _sys.stderr.write("\n")
         _sys.stderr.flush()
