@@ -39,6 +39,7 @@ class SessionRegistry:
         metrics: ProxyMetrics,
         *,
         store: "Store | None" = None,
+        session_cache=None,
     ) -> None:
         self._config_path = config_path
         self._upstream = upstream
@@ -51,6 +52,7 @@ class SessionRegistry:
         self._last_msg_hashes: dict[str, str] = {}  # hash → conversation_id
         self._lock = threading.Lock()
         self._store = store  # for loading persisted fingerprints on restart
+        self._session_cache = session_cache
 
     @staticmethod
     def _compute_system_hash(body: dict) -> str:
@@ -208,22 +210,20 @@ class SessionRegistry:
                     return st, False
 
             # --- 4. Create new session ---
-            from . import server as _srv  # noqa: avoid circular at module level
-            engine = _srv.VirtualContextEngine(config_path=self._config_path)
+            from . import server as _srv
 
-            # If an explicit marker referenced a persisted conversation not yet
-            # in memory, bind the new engine to that ID so _load_persisted_state
-            # picks up the right stored data.
-            if conversation_id and engine.config.conversation_id != conversation_id:
-                engine.config.conversation_id = conversation_id
-                engine._load_persisted_state()
-                engine._init_retriever()
-                engine._apply_persisted_state_to_delegates()
-                if hasattr(engine, '_retrieval') and engine._retrieval is not None:
-                    engine._retrieval._retriever = engine._retriever
-                logger.info(
-                    "Restored persisted session for marker: %s",
-                    conversation_id[:12],
+            if conversation_id:
+                # Marker path: set conv_id BEFORE construction so Redis loads the right key
+                from ..config import load_config
+                _cfg = load_config(self._config_path)
+                _cfg.conversation_id = conversation_id
+                engine = _srv.VirtualContextEngine(
+                    config=_cfg, session_cache=self._session_cache,
+                )
+                # No need for post-construction rebind — engine has the right ID from start
+            else:
+                engine = _srv.VirtualContextEngine(
+                    config_path=self._config_path, session_cache=self._session_cache,
                 )
 
             actual_id = engine.config.conversation_id
