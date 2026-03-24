@@ -42,6 +42,7 @@ class SessionRegistry:
         *,
         store: "Store | None" = None,
         session_cache=None,
+        embedding_provider=None,
     ) -> None:
         self._config_path = config_path
         self._upstream = upstream
@@ -56,6 +57,7 @@ class SessionRegistry:
         self._lock = threading.Lock()
         self._store = store  # for loading persisted fingerprints on restart
         self._session_cache = session_cache
+        self._embedding_provider = embedding_provider
 
     @staticmethod
     def _compute_system_hash(body: dict) -> str:
@@ -285,11 +287,13 @@ class SessionRegistry:
                 _cfg.conversation_id = conversation_id
                 engine = _srv.VirtualContextEngine(
                     config=_cfg, session_cache=self._session_cache,
+                    embedding_provider=self._embedding_provider,
                 )
                 # No need for post-construction rebind — engine has the right ID from start
             else:
                 engine = _srv.VirtualContextEngine(
                     config_path=self._config_path, session_cache=self._session_cache,
+                    embedding_provider=self._embedding_provider,
                 )
 
             actual_id = engine.config.conversation_id

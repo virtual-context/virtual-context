@@ -76,9 +76,11 @@ class SemanticSearchManager:
         self,
         store: ContextStore,
         config: VirtualContextConfig,
+        embedding_provider=None,
     ) -> None:
         self._store = store
         self._config = config
+        self._embedding_provider = embedding_provider
         self._embed_fn = _EMBED_NOT_LOADED
 
     def get_embed_fn(self) -> Callable[[list[str]], list[list[float]]] | None:
@@ -88,43 +90,47 @@ class SemanticSearchManager:
         float vectors, or ``None`` if sentence-transformers is not installed.
         """
         if self._embed_fn is _EMBED_NOT_LOADED:
-            try:
-                import os
-                import sys
-
-                from sentence_transformers import SentenceTransformer
-
-                model_name = self._config.retriever.embedding_model
-
-                # Suppress progress bar output during model loading.
-                old_stderr = sys.stderr
+            if self._embedding_provider is not None:
+                self._embed_fn = self._embedding_provider.get_embed_fn()
+            else:
+                # Original lazy-load path for backward compat
                 try:
-                    sys.stderr = open(os.devnull, "w")
-                    model = SentenceTransformer(model_name)
-                finally:
+                    import os
+                    import sys
+
+                    from sentence_transformers import SentenceTransformer
+
+                    model_name = self._config.retriever.embedding_model
+
+                    # Suppress progress bar output during model loading.
+                    old_stderr = sys.stderr
                     try:
-                        sys.stderr.close()
-                    except Exception:
-                        pass
-                    sys.stderr = old_stderr
+                        sys.stderr = open(os.devnull, "w")
+                        model = SentenceTransformer(model_name)
+                    finally:
+                        try:
+                            sys.stderr.close()
+                        except Exception:
+                            pass
+                        sys.stderr = old_stderr
 
-                def embed(texts: list[str]) -> list[list[float]]:
-                    return model.encode(
-                        texts, convert_to_numpy=True, show_progress_bar=False,
-                    ).tolist()
+                    def embed(texts: list[str]) -> list[list[float]]:
+                        return model.encode(
+                            texts, convert_to_numpy=True, show_progress_bar=False,
+                        ).tolist()
 
-                self._embed_fn = embed
-            except ImportError:
-                logger.debug(
-                    "sentence-transformers not installed, context bleed gate disabled"
-                )
-                self._embed_fn = None
-            except Exception:
-                logger.debug(
-                    "Failed to load embedding model, semantic search disabled",
-                    exc_info=True,
-                )
-                self._embed_fn = None
+                    self._embed_fn = embed
+                except ImportError:
+                    logger.debug(
+                        "sentence-transformers not installed, context bleed gate disabled"
+                    )
+                    self._embed_fn = None
+                except Exception:
+                    logger.debug(
+                        "Failed to load embedding model, semantic search disabled",
+                        exc_info=True,
+                    )
+                    self._embed_fn = None
         return self._embed_fn
 
     def embed_and_store_chunks(self, stored: StoredSegment) -> None:

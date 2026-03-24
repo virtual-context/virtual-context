@@ -553,7 +553,9 @@ def build_tag_generator(
 
     if config.type == "embedding":
         from .embedding_tag_generator import EmbeddingTagGenerator
-        return EmbeddingTagGenerator(config=config)
+        # Use embed_fn from factory if available (shared EmbeddingProvider)
+        _embed_fn = embed_fn_factory() if embed_fn_factory else None
+        return EmbeddingTagGenerator(config=config, embed_fn=_embed_fn)
 
     if config.keyword_fallback:
         return KeywordTagGenerator(config=config.keyword_fallback)
