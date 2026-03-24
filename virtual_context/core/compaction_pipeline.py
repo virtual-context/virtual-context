@@ -662,6 +662,7 @@ class CompactionPipeline:
         } or None
 
         def _compactor_progress(done: int, total: int, result, **kwargs) -> None:
+            kwargs.pop("phase", None)  # avoid double-passing phase
             _emit_progress(
                 done,
                 total,
