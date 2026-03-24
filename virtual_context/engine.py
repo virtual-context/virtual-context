@@ -1283,8 +1283,14 @@ class VirtualContextEngine:
         history_pairs: list[Message],
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> int:
-        return self._tagging.ingest_history(history_pairs, progress_callback, turn_offset)
+        return self._tagging.ingest_history(
+            history_pairs,
+            progress_callback,
+            turn_offset,
+            tool_output_refs_by_turn=tool_output_refs_by_turn,
+        )
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
         return self._retrieval.retrieve(message, active_tags)

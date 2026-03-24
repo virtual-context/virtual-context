@@ -16,6 +16,43 @@ from .formats import PayloadFormat, detect_format
 logger = logging.getLogger(__name__)
 
 
+def _is_tool_result_only_user(msg: dict) -> bool:
+    """Whether a user message is tool-result scaffolding, not a real turn start."""
+    if msg.get("role") not in ("user", "human"):
+        return False
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    ctypes = {block.get("type") for block in content if isinstance(block, dict)}
+    return bool(ctypes and ctypes <= {"tool_result"})
+
+
+def _consume_responses_tool_round(
+    messages: list[dict],
+    start: int,
+    assistant_role: str,
+) -> tuple[list[int], int] | None:
+    """Consume a bare Responses tool round plus its closing assistant."""
+    bare_indices: list[int] = []
+    idx = start
+    while idx < len(messages):
+        item = messages[idx]
+        if (
+            not isinstance(item, dict)
+            or item.get("role") is not None
+            or item.get("type") not in ("function_call", "function_call_output")
+        ):
+            break
+        bare_indices.append(idx)
+        idx += 1
+    if not bare_indices:
+        return None
+    if idx < len(messages) and messages[idx].get("role") == assistant_role:
+        bare_indices.append(idx)
+        return bare_indices, idx + 1
+    return None
+
+
 def filter_body_messages(
     body: dict,
     turn_tag_index: TurnTagIndex,
@@ -121,29 +158,22 @@ def filter_body_messages(
                         continue
                     else:
                         break  # tool messages without following assistant — stop
+                # OpenAI Responses bare function_call/function_call_output round
+                responses_round = _consume_responses_tool_round(chat_msgs, j, _asst_role)
+                if responses_round:
+                    round_indices, next_index = responses_round
+                    chain_indices.extend(round_indices)
+                    j = next_index
+                    continue
                 # Anthropic tool result (user message with tool_result-only content)
                 if next_role not in ("user", "human"):
                     break
-                content = next_msg.get("content", "")
-                is_tool_result = False
-                if isinstance(content, list):
-                    ctypes = {b.get("type") for b in content if isinstance(b, dict)}
-                    is_tool_result = bool(ctypes and ctypes <= {"tool_result"})
-                if not is_tool_result:
+                if not _is_tool_result_only_user(next_msg):
                     break  # real user message, not part of tool chain
                 if j + 1 >= len(chat_msgs) or chat_msgs[j + 1].get("role") != _asst_role:
                     break  # tool_result without following assistant — stop
                 chain_indices.extend([j, j + 1])
                 j += 2
-            # Also consume bare Responses API items (no role) that follow
-            while j < len(chat_msgs):
-                bare = chat_msgs[j]
-                btype = bare.get("type", "")
-                if btype in ("function_call", "function_call_output") and bare.get("role") is None:
-                    chain_indices.append(j)
-                    j += 1
-                else:
-                    break
             pairs.append(tuple(chain_indices))
             for ci in chain_indices:
                 paired_indices.add(ci)
@@ -751,15 +781,17 @@ def trim_to_upstream_limit(
                     continue
                 else:
                     break  # tool messages without following assistant — stop
+            # OpenAI Responses bare function_call/function_call_output round
+            responses_round = _consume_responses_tool_round(original_messages, j, "assistant")
+            if responses_round:
+                round_indices, next_index = responses_round
+                chain_indices.extend(round_indices)
+                j = next_index
+                continue
             # Anthropic tool result (user message with tool_result content blocks)
             if next_role not in ("user", "human"):
                 break
-            content = next_msg.get("content", "")
-            is_tool_result = False
-            if isinstance(content, list):
-                ctypes = {b.get("type") for b in content if isinstance(b, dict)}
-                is_tool_result = bool(ctypes and ctypes <= {"tool_result"})
-            if not is_tool_result:
+            if not _is_tool_result_only_user(next_msg):
                 break  # real user message, not part of tool chain
             # Verify next message is assistant before extending
             if j + 1 >= len(original_messages) or original_messages[j + 1].get("role") != "assistant":

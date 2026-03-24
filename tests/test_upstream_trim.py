@@ -1,6 +1,8 @@
 """Tests for upstream context window enforcement trimming."""
+import copy
+
 from virtual_context.proxy.message_filter import trim_to_upstream_limit
-from virtual_context.proxy.formats import get_format
+from virtual_context.proxy.formats import OpenAIResponsesFormat, get_format
 
 
 def _make_body(n_pairs, system="System prompt.", tools=None):
@@ -92,3 +94,31 @@ class TestTrimToUpstreamLimit:
         trimmed, removed = trim_to_upstream_limit(body, 10, fmt)
         assert removed == 0
         assert trimmed is body
+
+    def test_responses_tool_round_trim_is_atomic(self):
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "User message 0. " * 60},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Assistant intro 0. " * 60}]},
+                {"type": "function_call", "call_id": "fc0", "name": "search", "arguments": '{"q":"zero"}'},
+                {"type": "function_call_output", "call_id": "fc0", "output": "Tool output 0. " * 60},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Assistant final 0. " * 60}]},
+                {"role": "user", "content": "User message 1. " * 60},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Assistant 1. " * 60}]},
+                {"role": "user", "content": "User message 2. " * 60},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Assistant 2. " * 60}]},
+                {"role": "user", "content": "User message 3. " * 60},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Assistant 3. " * 60}]},
+            ],
+            "max_tokens": 512,
+        }
+        fmt = copy.copy(OpenAIResponsesFormat())
+        fmt.set_token_counter(lambda text: len(text) // 4)
+
+        trimmed, removed = trim_to_upstream_limit(body, 2500, fmt)
+
+        assert removed > 0
+        rendered = str(trimmed["input"])
+        assert "fc0" not in rendered
+        assert "Assistant final 0." not in rendered

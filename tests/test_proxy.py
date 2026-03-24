@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -457,6 +457,37 @@ class TestEngineIngestHistory:
 
         # get_all_tags called: once at start + once after turn 10
         assert engine._store.get_all_tags.call_count == 2
+
+    def test_ingest_links_tool_outputs_from_explicit_turn_mapping(self):
+        engine = self._make_mock_engine()
+        mock_tagger = MagicMock()
+        mock_tagger.generate_tags.side_effect = [
+            TagResult(tags=["alpha"], primary="alpha", source="keyword"),
+            TagResult(tags=["beta"], primary="beta", source="keyword"),
+        ]
+        engine._tagging._tag_generator = mock_tagger
+
+        from virtual_context.engine import VirtualContextEngine
+        pairs = [
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+        ]
+
+        result = VirtualContextEngine.ingest_history(
+            engine,
+            pairs,
+            tool_output_refs_by_turn={0: ["tool_ref_0"], 1: ["tool_ref_1", "tool_ref_2"]},
+        )
+
+        assert result == 2
+        assert engine._store.link_turn_tool_output.call_args_list == [
+            call(engine.config.conversation_id, 0, "tool_ref_0"),
+            call(engine.config.conversation_id, 1, "tool_ref_1"),
+            call(engine.config.conversation_id, 1, "tool_ref_2"),
+        ]
+        engine._store.get_tool_output_refs_for_turn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1073,4 +1104,3 @@ class TestEstimateToolsTokens:
         assert tokens > 0
         # Empty tools → 0
         assert fmt.estimate_tools_tokens({"messages": []}) == 0
-

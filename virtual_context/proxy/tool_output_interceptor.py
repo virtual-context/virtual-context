@@ -17,6 +17,7 @@ prevent feedback loops.
 
 from __future__ import annotations
 
+import json
 import fnmatch
 from uuid import uuid4
 
@@ -103,7 +104,14 @@ class ToolOutputInterceptor:
             head_text, tail_text = self._truncate(
                 content_text, threshold, rule.head_ratio, rule.tail_ratio,
             )
-            ref = self._index(content_text, tool_name, rule)
+            ref = self._index(
+                content_text,
+                tool_name,
+                rule,
+                call_id=call_id,
+                msg_index=output.msg_index,
+                carrier_type=output.carrier_type,
+            )
 
             truncated_bytes = (
                 len(head_text.encode("utf-8")) + len(tail_text.encode("utf-8"))
@@ -204,6 +212,10 @@ class ToolOutputInterceptor:
         content: str,
         tool_name: str,
         rule: ToolOutputRule,
+        *,
+        call_id: str = "",
+        msg_index: int = -1,
+        carrier_type: str = "",
     ) -> str:
         ref = f"tool_{uuid4().hex[:12]}"
         cap = (
@@ -211,11 +223,16 @@ class ToolOutputInterceptor:
             if rule.max_index_bytes is not None
             else self.config.max_index_bytes
         )
+        provenance = json.dumps({
+            "call_id": call_id or "",
+            "msg_index": int(msg_index),
+            "carrier_type": carrier_type or "",
+        }, sort_keys=True)
         self.store.store_tool_output(
             ref=ref,
             conversation_id=self.conversation_id,
             tool_name=tool_name,
-            command="",
+            command=provenance,
             turn=self._turn_counter,
             content=content[:cap],
             original_bytes=len(content.encode("utf-8")),
@@ -263,3 +280,76 @@ class ToolOutputInterceptor:
             tool_stats["count"] += 1
             tool_stats["original_bytes"] += original_bytes
             tool_stats["returned_bytes"] += returned_bytes
+
+
+def _is_tool_result_only_user(msg: dict) -> bool:
+    """Whether a user message is Anthropic tool_result scaffolding only."""
+    if msg.get("role") not in ("user", "human"):
+        return False
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    ctypes = {block.get("type") for block in content if isinstance(block, dict)}
+    return bool(ctypes and ctypes <= {"tool_result"})
+
+
+def build_turn_tool_output_refs(
+    body: dict,
+    fmt: PayloadFormat,
+    intercepted_refs: list[dict],
+) -> dict[int, list[str]]:
+    """Map intercepted tool outputs to completed payload turn indices."""
+    if not intercepted_refs:
+        return {}
+
+    messages = fmt.get_messages(body)
+    if not isinstance(messages, list) or not messages:
+        return {}
+
+    assistant_roles = {"assistant"}
+    if fmt.name == "gemini":
+        assistant_roles.add("model")
+
+    turn_starts: list[int] = []
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") not in ("user", "human"):
+            continue
+        if _is_tool_result_only_user(msg):
+            continue
+        turn_starts.append(idx)
+
+    if not turn_starts:
+        return {}
+
+    refs_by_msg_index: dict[int, list[dict]] = {}
+    for ref in intercepted_refs:
+        try:
+            msg_index = int(ref.get("msg_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if msg_index < 0:
+            continue
+        refs_by_msg_index.setdefault(msg_index, []).append(ref)
+
+    if not refs_by_msg_index:
+        return {}
+
+    turn_tool_refs: dict[int, list[str]] = {}
+    for turn_idx, start in enumerate(turn_starts):
+        end = turn_starts[turn_idx + 1] if turn_idx + 1 < len(turn_starts) else len(messages)
+        has_assistant = any(
+            isinstance(messages[pos], dict) and messages[pos].get("role") in assistant_roles
+            for pos in range(start + 1, end)
+        )
+        if not has_assistant:
+            continue
+        for pos in range(start, end):
+            for ref in refs_by_msg_index.get(pos, []):
+                tool_ref = ref.get("ref", "")
+                if not tool_ref:
+                    continue
+                turn_tool_refs.setdefault(turn_idx, []).append(tool_ref)
+
+    return turn_tool_refs

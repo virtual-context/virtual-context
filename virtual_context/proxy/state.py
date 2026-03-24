@@ -925,7 +925,11 @@ class ProxyState:
             )
         self._ingested_turn_count[conversation_id] = len(history_pairs) // 2
 
-    def ingest_if_needed(self, history_pairs: list[Message]) -> None:
+    def ingest_if_needed(
+        self,
+        history_pairs: list[Message],
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
+    ) -> None:
         """Bootstrap TurnTagIndex from pre-existing history (once per session).
 
         Double-checked locking: fast path skips the lock entirely.
@@ -940,7 +944,13 @@ class ProxyState:
             if conversation_id in self._ingested_conversations:
                 return
             t0 = time.monotonic()
-            turns = self.engine.ingest_history(history_pairs)
+            if tool_output_refs_by_turn is None:
+                turns = self.engine.ingest_history(history_pairs)
+            else:
+                turns = self.engine.ingest_history(
+                    history_pairs,
+                    tool_output_refs_by_turn=tool_output_refs_by_turn,
+                )
             elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
             self._ingested_conversations.add(conversation_id)
             self._advance_compaction_watermark()
@@ -987,7 +997,11 @@ class ProxyState:
     # Non-blocking ingestion (background thread)
     # ------------------------------------------------------------------
 
-    def start_ingestion_if_needed(self, history_pairs: list[Message]) -> None:
+    def start_ingestion_if_needed(
+        self,
+        history_pairs: list[Message],
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
+    ) -> None:
         """Start non-blocking history ingestion in a background thread.
 
         Returns immediately — the session stays in INGESTING while the
@@ -1046,6 +1060,12 @@ class ProxyState:
                     existing_turns, needed_turns,
                 )
                 history_pairs = list(history_pairs[existing_turns * 2:])
+                if tool_output_refs_by_turn is not None:
+                    tool_output_refs_by_turn = {
+                        turn_idx - existing_turns: refs
+                        for turn_idx, refs in tool_output_refs_by_turn.items()
+                        if turn_idx >= existing_turns
+                    }
                 if not history_pairs:
                     self._ingested_conversations.add(conversation_id)
                     self._advance_compaction_watermark()
@@ -1084,6 +1104,12 @@ class ProxyState:
 
                 # Slice to remaining pairs only
                 history_pairs = list(history_pairs[existing_turns * 2:])
+                if tool_output_refs_by_turn is not None:
+                    tool_output_refs_by_turn = {
+                        turn_idx - existing_turns: refs
+                        for turn_idx, refs in tool_output_refs_by_turn.items()
+                        if turn_idx >= existing_turns
+                    }
                 if not history_pairs:
                     self._ingested_conversations.add(conversation_id)
                     self._advance_compaction_watermark()
@@ -1105,7 +1131,7 @@ class ProxyState:
             # can use the pool once we transition to ACTIVE.
             self._ingestion_thread = threading.Thread(
                 target=self._run_ingestion_with_catchup,
-                args=(list(history_pairs), existing_turns, total),
+                args=(list(history_pairs), existing_turns, total, tool_output_refs_by_turn),
                 daemon=True,
                 name="vc-ingest",
             )
@@ -1153,7 +1179,11 @@ class ProxyState:
             )
 
     def _run_ingestion_with_catchup(
-        self, initial_pairs: list[Message], baseline: int = 0, cumulative_total: int = 0,
+        self,
+        initial_pairs: list[Message],
+        baseline: int = 0,
+        cumulative_total: int = 0,
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
         """Background thread: ingest initial pairs, then catch up any gap."""
         conversation_id = self.engine.config.conversation_id
@@ -1161,7 +1191,10 @@ class ProxyState:
         try:
             # Tag all initial history
             self._ingest_pairs_with_progress(
-                initial_pairs, baseline=baseline, cumulative_total=cumulative_total or None,
+                initial_pairs,
+                baseline=baseline,
+                cumulative_total=cumulative_total or None,
+                tool_output_refs_by_turn=tool_output_refs_by_turn,
             )
 
             # Catch-up loop — tag any turns that arrived during ingestion
@@ -1219,7 +1252,11 @@ class ProxyState:
                 self._transition_to(SessionState.ACTIVE)
 
     def _ingest_pairs_with_progress(
-        self, pairs: list[Message], baseline: int = 0, cumulative_total: int | None = None,
+        self,
+        pairs: list[Message],
+        baseline: int = 0,
+        cumulative_total: int | None = None,
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
         """Call engine.ingest_history with a progress callback that emits events.
 
@@ -1273,7 +1310,13 @@ class ProxyState:
                     "total": _total,
                 })
 
-        turns = self.engine.ingest_history(pairs, progress_callback=on_progress, turn_offset=baseline)
+        ingest_kwargs = {
+            "progress_callback": on_progress,
+            "turn_offset": baseline,
+        }
+        if tool_output_refs_by_turn is not None:
+            ingest_kwargs["tool_output_refs_by_turn"] = tool_output_refs_by_turn
+        turns = self.engine.ingest_history(pairs, **ingest_kwargs)
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
         logger.info(
