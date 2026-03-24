@@ -817,10 +817,30 @@ def create_app(
     registry: SessionRegistry | None = None
     default_state: ProxyState | None = None
     try:
+        # Redis session cache (optional) — must exist before engine __init__
+        session_cache = None
+        try:
+            import os as _os
+            _redis_url = _os.environ.get("REDIS_URL", "")
+            if not _redis_url and config_path:
+                from ..config import load_config as _load_cfg
+                try:
+                    _pre_cfg = _load_cfg(config_path)
+                    _redis_url = _pre_cfg.proxy.redis_url
+                except Exception:
+                    pass
+            if _redis_url:
+                from .session_cache import RedisSessionCache
+                session_cache = RedisSessionCache(_redis_url)
+        except Exception:
+            pass
+
         if shared_engine is not None:
             engine = shared_engine
+            if session_cache and not hasattr(engine, '_session_cache'):
+                engine._session_cache = session_cache
         else:
-            engine = VirtualContextEngine(config_path=config_path)
+            engine = VirtualContextEngine(config_path=config_path, session_cache=session_cache)
 
             # Lossless restart: if engine has no persisted state for its
             # auto-generated conversation_id, try loading the most recent conversation.
@@ -837,21 +857,40 @@ def create_app(
                         and isinstance(getattr(latest, 'turn_tag_entries', None), list)
                         and latest.turn_tag_entries
                     ):
-                        engine.config.conversation_id = latest.conversation_id
-                        engine._load_persisted_state()
-                        # Re-initialize retriever with the restored conversation_id —
-                        # the original was built during __init__ with the auto-generated ID.
-                        engine._init_retriever()
-                        if hasattr(engine, '_retrieval'):
-                            engine._retrieval._retriever = engine._retriever
-                        # Also update paging with the restored conversation_id
-                        if hasattr(engine, '_paging'):
-                            engine._paging._conversation_id = engine.config.conversation_id
-                        logger.info(
-                            "Lossless restart: restored conversation %s (%d turns, compacted=%d)",
-                            latest.conversation_id[:12], len(latest.turn_tag_entries),
-                            latest.compacted_through,
-                        )
+                        # Try Redis first for the restored conversation ID
+                        _redis_hit = False
+                        if session_cache and session_cache.is_available():
+                            _cached = session_cache.load_snapshot(latest.conversation_id)
+                            if _cached and _cached.get("conversation_id") == latest.conversation_id:
+                                engine.config.conversation_id = latest.conversation_id
+                                engine._apply_cached_state(_cached)
+                                engine._apply_persisted_state_to_delegates()
+                                engine._bootstrap_vocabulary()
+                                engine._init_retriever()
+                                if hasattr(engine, '_retrieval'):
+                                    engine._retrieval._retriever = engine._retriever
+                                if hasattr(engine, '_paging'):
+                                    engine._paging._conversation_id = engine.config.conversation_id
+                                _redis_hit = True
+                                logger.info(
+                                    "Lossless restart: restored from Redis (conv=%s, version=%s)",
+                                    latest.conversation_id[:12], _cached.get("version", "?"),
+                                )
+
+                        if not _redis_hit:
+                            engine.config.conversation_id = latest.conversation_id
+                            engine._load_persisted_state()
+                            engine._apply_persisted_state_to_delegates()
+                            engine._bootstrap_vocabulary()
+                            engine._init_retriever()
+                            if hasattr(engine, '_retrieval'):
+                                engine._retrieval._retriever = engine._retriever
+                            if hasattr(engine, '_paging'):
+                                engine._paging._conversation_id = engine.config.conversation_id
+                            logger.info(
+                                "Lossless restart: restored from store (conv=%s, %d turns)",
+                                latest.conversation_id[:12], len(latest.turn_tag_entries),
+                            )
                 except Exception as _e:
                     logger.info("Lossless restart failed: %s", _e)
 
@@ -879,6 +918,7 @@ def create_app(
             upstream=upstream,
             metrics=metrics,
             store=engine._store,
+            session_cache=session_cache,
         )
         registry._conversations[engine.config.conversation_id] = default_state
 
