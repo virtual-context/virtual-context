@@ -801,6 +801,7 @@ def create_app(
     shared_metrics: ProxyMetrics | None = None,
     instance_label: str = "",
     instance_upstream_limit: int = 0,
+    embedding_provider=None,
 ) -> FastAPI:
     """Create the FastAPI proxy application.
 
@@ -846,7 +847,7 @@ def create_app(
             if session_cache:
                 engine._session_cache = session_cache
         else:
-            engine = VirtualContextEngine(config_path=config_path, session_cache=session_cache)
+            engine = VirtualContextEngine(config_path=config_path, session_cache=session_cache, embedding_provider=embedding_provider)
 
             # Lossless restart: if engine has no persisted state for its
             # auto-generated conversation_id, try loading the most recent conversation.
