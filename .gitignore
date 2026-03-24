@@ -29,6 +29,13 @@ virtual-context-*.yaml
 # Internal docs
 CHANGELOG.md
 docs/superpowers/
+docs/competitive-analysis.md
+diagnostics/
+uv.lock
+extraneous/paper/virtual_context_paper_latest.md
+extraneous/paper/data/
+extraneous/paper/*.zip
+extraneous/paper/*.png
 
 # Worktrees
 .worktrees/
