@@ -39,9 +39,9 @@ from virtual_context.core.tool_loop import (
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_five_tools(self):
+    def test_returns_six_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 5
+        assert len(defs) == 6
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
@@ -52,6 +52,7 @@ class TestVCToolDefinitions:
             "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",
+            "vc_restore_tool",
         }
 
     def test_tools_have_input_schema(self):
@@ -1226,6 +1227,7 @@ class TestVCToolNames:
             "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",
+            "vc_restore_tool",
         }
 
 

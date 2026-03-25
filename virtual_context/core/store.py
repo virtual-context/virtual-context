@@ -372,6 +372,13 @@ class ContextStore(ABC):
     ) -> list:
         return []
 
+    def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
+        """Look up a stored tool output by conversation_id and ref.
+
+        Returns the full stored content string, or None if not found.
+        """
+        return None
+
     def save_tool_call(self, call: dict) -> None:
         """Persist a tool call record."""
         pass

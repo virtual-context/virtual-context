@@ -46,6 +46,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_query_facts",
     "vc_recall_all",
     "vc_remember_when",
+    "vc_restore_tool",
 })
 
 
@@ -220,6 +221,27 @@ def vc_tool_definitions() -> list[dict]:
                     },
                 },
                 "required": ["query", "time_range"],
+            },
+        },
+        {
+            "name": "vc_restore_tool",
+            "description": (
+                "Restore a previously stubbed tool output in place. Use when "
+                "you see a stub like [tool output ref=... | call "
+                "vc_restore_tool(ref=...)]."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": (
+                            "The tool output ref from the stub "
+                            "(e.g. tool_abc123def)"
+                        ),
+                    },
+                },
+                "required": ["ref"],
             },
         },
     ]
@@ -750,6 +772,11 @@ def execute_vc_tool(
                 time_range=tool_input.get("time_range", {}),
                 max_results=tool_input.get("max_results", engine.config.search.remember_when_max_results),
             )
+        elif name == "vc_restore_tool":
+            # vc_restore_tool is proxy-handled — it mutates the in-flight
+            # payload, which only the proxy can do. If it reaches here,
+            # the caller is not the proxy continuation loop.
+            result = {"error": "vc_restore_tool is handled by the proxy, not the engine tool executor"}
         else:
             result = {"error": f"unknown VC tool: {name}"}
         return json.dumps(result)

@@ -1278,7 +1278,11 @@ class TestFilterBodyMessagesResponses:
         assert len(bare_items) == 2
 
     def test_filter_responses_drops_full_tool_round_atomically(self):
-        """Responses tool rounds should drop the closing assistant with the chain."""
+        """Tool-bearing chains are drop-exempt — kept regardless of tag match.
+
+        Position-based tool output stubbing handles older tool outputs
+        separately.  The filtering layer preserves the full chain.
+        """
         from virtual_context.proxy.message_filter import filter_body_messages
         from virtual_context.core.turn_tag_index import TurnTagIndex
         from virtual_context.types import TurnTagEntry
@@ -1302,11 +1306,13 @@ class TestFilterBodyMessagesResponses:
             body, tti, ["cooking"], recent_turns=1, fmt=OpenAIResponsesFormat(),
         )
 
-        assert dropped == 1
+        # Tool-bearing chains are drop-exempt, so nothing gets dropped
+        assert dropped == 0
         rendered = json.dumps(result["input"])
-        assert "fc0" not in rendered
-        assert "a0 intro" not in rendered
-        assert "a0 final" not in rendered
+        # The tool chain is preserved (not dropped)
+        assert "fc0" in rendered
+        assert "a0 intro" in rendered
+        assert "a0 final" in rendered
         assert "q1" in rendered
 
 

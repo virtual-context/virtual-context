@@ -2286,6 +2286,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [row["ref"] for row in rows]
 
+    def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT content FROM tool_outputs WHERE conversation_id = ? AND ref = ?",
+            (conversation_id, ref),
+        ).fetchone()
+        return row["content"] if row else None
+
     # ------------------------------------------------------------------
     # Request capture persistence
     # ------------------------------------------------------------------

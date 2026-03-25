@@ -1038,6 +1038,9 @@ class FilesystemStore(ContextStore):
     def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
         return []
 
+    def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
+        return None
+
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return {}
 
