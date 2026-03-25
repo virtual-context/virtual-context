@@ -399,6 +399,13 @@ async def prepare_payload(
             _outbound_tokens = fmt._count(json.dumps(body, default=str))
             _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
 
+            # Non-virtualizable floor: system prompt + tools + anything VC can't touch
+            _pt_system_tokens = fmt._estimate_system_tokens(body)
+            _pt_tools_tokens = fmt.estimate_tools_tokens(body)
+            _pt_floor = _pt_system_tokens + _pt_tools_tokens
+            if state:
+                state._last_non_virtualizable_floor = _pt_floor
+
             # Record passthrough request event with accurate post-trim values
             metrics.record({
                 "type": "request",
@@ -422,8 +429,9 @@ async def prepare_payload(
                 "outbound_tokens": _outbound_tokens,
                 "input_tokens": _outbound_tokens,
                 "raw_input_tokens": _inbound_tokens,
-                "system_tokens": 0,
+                "system_tokens": _pt_system_tokens,
                 "turns_dropped": 0,
+                "non_virtualizable_floor": _pt_floor,
                 "conversation_id": _conversation_id,
                 "passthrough": True,
             })
@@ -809,6 +817,7 @@ async def prepare_payload(
         "system_tokens": system_tokens,      # component estimate
         "turns_dropped": turns_dropped,
         "turns_stubbed": turns_stubbed,
+        "non_virtualizable_floor": _non_virtualizable_floor,
         "conversation_id": _conversation_id,
     })
 
