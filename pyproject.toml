@@ -8,7 +8,14 @@ version = "0.2.1"
 description = "OS-style virtual memory for LLM session context management"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
+authors = [{name = "Y. Ahmed Kidwai"}]
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "pyyaml>=6.0",
     "httpx>=0.27",
@@ -29,6 +36,11 @@ dependencies = [
 postgres = ["psycopg[binary]>=3.1"]
 neo4j = ["neo4j>=5.0"]
 falkordb = ["falkordb>=1.0"]
+redis = ["redis>=5.0"]
+all = [
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.3",
@@ -36,11 +48,32 @@ dev = [
     "ruff>=0.8",
 ]
 
+[project.urls]
+Homepage = "https://virtual-context.com"
+Repository = "https://github.com/virtual-context/virtual-context"
+Documentation = "https://virtual-context.com/docs"
+
 [project.scripts]
 virtual-context = "virtual_context.cli.main:main"
 
+[tool.hatch.build]
+exclude = [
+    "diagnostics/",
+    "benchmarks/",
+    "extraneous/",
+    "scripts/",
+    "docs/",
+    ".virtualcontext/",
+    "*.db",
+    "*.log",
+]
+artifacts = [
+    "virtual_context/proxy/static/*",
+    "virtual_context/data/anthropic-tokenizer/tokenizer.json",
+]
+
 [tool.hatch.build.targets.wheel]
-artifacts = ["virtual_context/proxy/static/*"]
+packages = ["virtual_context"]
 
 [tool.ruff]
 target-version = "py311"
