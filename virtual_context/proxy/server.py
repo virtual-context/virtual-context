@@ -825,6 +825,9 @@ async def prepare_payload(
         "turns_stubbed": turns_stubbed,
         "non_virtualizable_floor": _non_virtualizable_floor,
         "upstream_context_limit": _upstream_limit,
+        "passthrough_trim_limit": int(
+            _upstream_limit * (state.engine.config.proxy.passthrough_trim_ratio if state else 0.40)
+        ),
         "conversation_id": _conversation_id,
     })
 
@@ -937,6 +940,9 @@ async def prepare_payload(
         message_preview=user_message[:60],
         non_virtualizable_floor=_non_virtualizable_floor,
         upstream_context_limit=_upstream_limit,
+        passthrough_trim_limit=int(
+            _upstream_limit * (state.engine.config.proxy.passthrough_trim_ratio if state else 0.40)
+        ),
         system_tokens=system_tokens,
     )
     # Capture enriched body (what we actually send to the LLM)
