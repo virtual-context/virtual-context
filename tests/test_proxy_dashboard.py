@@ -170,6 +170,21 @@ class TestProxyMetricsSnapshot:
         assert len(snap["turn_completes"]) == 1
         assert snap["turn_completes"][0]["turn"] == 0
 
+    def test_snapshot_with_cursor_is_atomic(self):
+        m = ProxyMetrics()
+        m.record({"type": "request", "turn": 0})
+        m.record({"type": "response", "turn": 0})
+
+        snap, cursor = m.snapshot_with_cursor()
+
+        assert cursor == 1
+        seqs = []
+        for key in ("recent_requests", "responses", "compactions", "turn_completes", "ingested_turns"):
+            for evt in snap.get(key, []):
+                seqs.append(evt["_seq"])
+        assert seqs
+        assert max(seqs) == cursor
+
 
 class TestProxyMetricsThreadSafety:
     def test_concurrent_records(self):

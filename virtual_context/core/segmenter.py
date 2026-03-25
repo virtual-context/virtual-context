@@ -91,35 +91,52 @@ class TopicSegmenter:
         progress_started = time.monotonic()
         last_progress_emit = progress_started
 
-        def _emit_progress(*, force: bool = False, segments_built: int | None = None) -> None:
+        def _emit_progress(
+            done: int,
+            total: int,
+            *,
+            phase_name: str,
+            force: bool = False,
+            segments_built: int | None = None,
+            phase_unit: str = "turns",
+            phase_detail: str = "",
+            progress_fraction: float = 0.0,
+            heartbeat: bool = False,
+        ) -> None:
             nonlocal last_progress_emit
-            if not progress_callback or total_pairs <= 0:
+            if not progress_callback or total <= 0:
                 return
             now = time.monotonic()
             should_emit = force
             if not should_emit:
                 should_emit = (
-                    processed_pairs <= 3
-                    or processed_pairs == total_pairs
-                    or processed_pairs % 5 == 0
+                    done <= 3
+                    or done == total
+                    or done % 5 == 0
                     or (now - last_progress_emit) >= 0.5
                 )
             if not should_emit:
                 return
             elapsed_ms = int((now - progress_started) * 1000)
-            rate = (processed_pairs / (now - progress_started)) if now > progress_started else 0.0
-            eta_ms = int(((total_pairs - processed_pairs) / rate) * 1000) if rate > 0 else None
+            rate = (done / (now - progress_started)) if now > progress_started else 0.0
+            eta_ms = int(((total - done) / rate) * 1000) if rate > 0 else None
             payload = {
-                "phase_name": "segmenter",
+                "phase_name": phase_name,
+                "phase_unit": phase_unit,
                 "elapsed_ms": elapsed_ms,
                 "eta_ms": eta_ms,
+                "heartbeat": heartbeat,
             }
             if segments_built is not None:
                 payload["segments"] = segments_built
-            progress_callback(processed_pairs, total_pairs, None, **payload)
+            if phase_detail:
+                payload["phase_detail"] = phase_detail
+            if progress_fraction > 0:
+                payload["progress_fraction"] = progress_fraction
+            progress_callback(done, total, None, **payload)
             last_progress_emit = now
 
-        _emit_progress(force=True)
+        _emit_progress(0, total_pairs, phase_name="segment_tagging", force=True)
 
         # Tag each turn pair
         tagged: list[tuple[TurnPair, TagResult]] = []
@@ -132,7 +149,7 @@ class TopicSegmenter:
                     i, turn_offset + i, len(combined),
                 )
                 processed_pairs += 1
-                _emit_progress()
+                _emit_progress(processed_pairs, total_pairs, phase_name="segment_tagging")
                 continue
 
             # Check index first — avoid redundant LLM call
@@ -158,7 +175,7 @@ class TopicSegmenter:
                 tag_result.source, preview,
             )
             processed_pairs += 1
-            _emit_progress()
+            _emit_progress(processed_pairs, total_pairs, phase_name="segment_tagging")
 
         # Group turns into topic segments using a segment library.
         # Each turn is scored against ALL existing segments (not just the previous turn).
@@ -172,6 +189,17 @@ class TopicSegmenter:
         max_seg_tokens = self.config.max_segment_turns * 200 if self.config.max_segment_turns > 0 else 999_999
         # Use the configured max_segment_tokens from compactor if available, else estimate
         threshold = self.config.tag_overlap_threshold
+        total_group_turns = len(tagged)
+        grouped_turns = 0
+
+        if total_group_turns > 0:
+            _emit_progress(
+                0,
+                total_group_turns,
+                phase_name="segment_grouping",
+                force=True,
+                segments_built=0,
+            )
 
         for turn_idx, (pair, result) in enumerate(tagged):
             parsed = _parse_session_date(pair)
@@ -187,8 +215,21 @@ class TopicSegmenter:
             best_seg_idx = -1
             best_score = 0.0
             best_reason = ""
+            candidate_total = max(len(segment_library), 1)
 
             for seg_idx, (group, group_session, group_tags, group_tokens) in enumerate(segment_library):
+                _emit_progress(
+                    grouped_turns,
+                    total_group_turns,
+                    phase_name="segment_grouping",
+                    segments_built=len(segment_library),
+                    progress_fraction=min(0.999, seg_idx / candidate_total),
+                    phase_detail=(
+                        f"turn {turn_idx + 1}/{total_group_turns}"
+                        f" • candidate {seg_idx + 1}/{candidate_total}"
+                    ),
+                    heartbeat=True,
+                )
                 # Skip if adding this turn would exceed token cap
                 if group_tokens + turn_tokens > max_seg_tokens:
                     continue
@@ -261,10 +302,33 @@ class TopicSegmenter:
                     turn_offset + turn_idx, len(segment_library) - 1,
                     result.primary, sorted(meaningful_curr), turn_tokens,
                 )
+            grouped_turns += 1
+            _emit_progress(
+                grouped_turns,
+                total_group_turns,
+                phase_name="segment_grouping",
+                segments_built=len(segment_library),
+                phase_detail=(
+                    f"turn {grouped_turns}/{total_group_turns}"
+                    f" • {len(segment_library)} segments"
+                ),
+            )
 
         # Build final segments from the library
         segments: list[TaggedSegment] = []
         single_turn = 0
+        postprocess_steps = 2 + (1 if self.config.tool_result_segment_threshold > 0 else 0)
+        postprocess_done = 0
+
+        _emit_progress(
+            0,
+            postprocess_steps,
+            phase_name="segment_postprocess",
+            phase_unit="steps",
+            phase_detail="building segments",
+            force=True,
+            segments_built=len(segment_library),
+        )
         for group, group_session, group_tags, group_tokens in segment_library:
             if group:
                 seg = self._build_segment(group, group_session)
@@ -276,6 +340,16 @@ class TopicSegmenter:
                         "SEGMENT built: '%s' %d turns %dt tags=%s",
                         seg.primary_tag, len(group), group_tokens, sorted(group_tags),
                     )
+        postprocess_done += 1
+        _emit_progress(
+            postprocess_done,
+            postprocess_steps,
+            phase_name="segment_postprocess",
+            phase_unit="steps",
+            phase_detail="reassigning stubs",
+            segments_built=len(segments),
+            force=True,
+        )
 
         logger.info(
             "SEGMENT library: %d segments from %d turns (single-turn=%d/%d=%.0f%%), "
@@ -290,9 +364,20 @@ class TopicSegmenter:
         # temporally closer — handles both "end of session image" (attach backward)
         # and "morning image to start new conversation" (attach forward).
         segments = self._reassign_stub_segments(segments)
+        postprocess_done += 1
 
         if self.config.tool_result_segment_threshold > 0:
+            _emit_progress(
+                postprocess_done,
+                postprocess_steps,
+                phase_name="segment_postprocess",
+                phase_unit="steps",
+                phase_detail="splitting tool results",
+                segments_built=len(segments),
+                force=True,
+            )
             segments = self._split_large_tool_results(segments)
+            postprocess_done += 1
 
         avg_turns = len(tagged) / len(segments) if segments else 0
         logger.info(
@@ -301,7 +386,15 @@ class TopicSegmenter:
             len(segments), len(tagged), avg_turns,
             self.config.tag_overlap_threshold, self.config.max_segment_turns,
         )
-        _emit_progress(force=True, segments_built=len(segments))
+        _emit_progress(
+            postprocess_done,
+            postprocess_steps,
+            phase_name="segment_postprocess",
+            phase_unit="steps",
+            phase_detail="segmenter complete",
+            segments_built=len(segments),
+            force=True,
+        )
         return segments
 
     @staticmethod
