@@ -753,12 +753,18 @@ async def prepare_payload(
     _non_virtualizable_floor = 0
     if state:
         state._last_enriched_payload_tokens = outbound_tokens
-        # Non-virtualizable floor: everything in the outbound payload except VC context
-        _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
-        state._last_non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
-        _non_virtualizable_floor = state._last_non_virtualizable_floor
+        # Non-virtualizable floor: system + tools (what VC can't touch)
+        if _bloat_fallback:
+            # After bloat fallback, compute floor from the original body's
+            # system prompt + tools — not the entire passthrough payload
+            _vc_tokens = 0
+            _non_virtualizable_floor = fmt._estimate_system_tokens(_pre_filter_body) + fmt.estimate_tools_tokens(_pre_filter_body)
+        else:
+            _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
+            _non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
+        state._last_non_virtualizable_floor = _non_virtualizable_floor
         logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
-                    state._last_non_virtualizable_floor, _vc_tokens, outbound_tokens)
+                    _non_virtualizable_floor, _vc_tokens, outbound_tokens)
         # Warn if context_window is at or below the floor
         try:
             _cw = int(state.engine.config.monitor.context_window)
