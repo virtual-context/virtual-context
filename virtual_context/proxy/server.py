@@ -732,7 +732,7 @@ async def prepare_payload(
         return PreparedPayload(
             body=_pre_filter_body,
             enriched_body=_pre_filter_body,
-            conversation_id=_conversation_id,
+            conversation_id=state.engine.config.conversation_id if state else "",
             is_passthrough=True,
             turn=len(state.engine._turn_tag_index.entries) if state else 0,
             turn_id=uuid.uuid4().hex[:12],
