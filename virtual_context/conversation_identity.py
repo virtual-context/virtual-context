@@ -206,8 +206,85 @@ def _extract_system_prompt_hash(body: dict) -> str:
     if not system_text:
         return ""
 
+    # Claude Code special path: the billing header (block 0) contains a
+    # per-request `cch=` value that changes every turn. Strip it and mix
+    # in the first few user messages to get a stable per-session hash.
+    if _is_claude_code_system(system, system_list):
+        return _claude_code_hash(system, system_list, body)
+
     h = hashlib.sha256()
     h.update(system_text.encode())
+    return h.hexdigest()
+
+
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
+def _is_claude_code_system(
+    system: object,
+    system_list: list | None,
+) -> bool:
+    """Detect Claude Code by the billing header in the first system block."""
+    if isinstance(system, list) and system:
+        first = system[0]
+        if isinstance(first, dict) and first.get("type") == "text":
+            text = first.get("text", "")
+            if text.startswith(_BILLING_HEADER_PREFIX):
+                return True
+    if isinstance(system, str) and system.startswith(_BILLING_HEADER_PREFIX):
+        return True
+    return False
+
+
+def _claude_code_hash(
+    system: object,
+    system_list: list | None,
+    body: dict,
+) -> str:
+    """Hash stable system blocks + first user messages for Claude Code sessions.
+
+    Skips the billing header block (contains per-request ``cch=`` value)
+    and mixes in the first 3 user message texts to disambiguate sessions
+    in the same project.
+    """
+    h = hashlib.sha256()
+
+    # Hash system blocks, skipping any that start with the billing header
+    if isinstance(system, list):
+        for block in system:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = block.get("text", "")
+            if text.startswith(_BILLING_HEADER_PREFIX):
+                continue
+            h.update(text.encode())
+    elif isinstance(system, str):
+        # Strip the billing header line from a plain string system prompt
+        lines = system.split("\n")
+        for line in lines:
+            if line.startswith(_BILLING_HEADER_PREFIX):
+                continue
+            h.update(line.encode())
+
+    # Mix in the first 3 user messages for per-session uniqueness
+    user_count = 0
+    for msg in _get_messages(body):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("text", "input_text"):
+                    content = block.get("text", "")
+                    break
+            else:
+                continue
+        if isinstance(content, str) and content.strip():
+            h.update(content[:500].encode())  # cap per-message to avoid huge hashes
+            user_count += 1
+            if user_count >= 3:
+                break
+
     return h.hexdigest()
 
 
