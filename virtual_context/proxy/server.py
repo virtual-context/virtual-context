@@ -721,6 +721,20 @@ async def prepare_payload(
     # Ground truth: inbound tokens (what the client sent us, measured above)
     inbound_tokens = _inbound_tokens
 
+    # VC must never send more than the client sent. If enrichment bloated
+    # the payload beyond inbound, fall back to the filtered body without
+    # VC context injection — passthrough with tool interception applied.
+    if outbound_tokens > inbound_tokens:
+        logger.warning(
+            "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — falling back to filtered body (delta +%dt)",
+            outbound_tokens, inbound_tokens, outbound_tokens - inbound_tokens,
+        )
+        enriched_body = body  # filtered body without context injection
+        _outbound_json = json.dumps(enriched_body, default=str)
+        _outbound_bytes = len(_outbound_json.encode("utf-8"))
+        outbound_tokens = fmt._count(_outbound_json)
+        prepend_text = ""  # no VC context was used
+
     # Legacy aliases for downstream consumers
     input_tokens = outbound_tokens
     raw_input_tokens = inbound_tokens
