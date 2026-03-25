@@ -67,6 +67,44 @@ class TestProxyState:
         assert call_args[0] == (history, signal)
         assert "progress_callback" in call_args[1]
 
+    def test_compaction_progress_phase_name_does_not_crash(self):
+        engine = MagicMock()
+        signal = MagicMock()
+        engine.tag_turn.return_value = signal
+        metrics = ProxyMetrics()
+
+        def _compact_if_needed(history, compaction_signal, progress_callback=None):
+            assert progress_callback is not None
+            progress_callback(
+                1,
+                2,
+                None,
+                phase="segment_compacting",
+                phase_name="compactor",
+                overall_percent=55,
+                phase_detail="working",
+            )
+            return None
+
+        engine.compact_if_needed.side_effect = _compact_if_needed
+
+        state = ProxyState(engine, metrics=metrics)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+
+        state.fire_turn_complete(history)
+        state.wait_for_complete()
+
+        events = metrics.events_since(-1)
+        assert any(
+            event["type"] == "compaction_progress"
+            and event["phase_name"] == "compactor"
+            for event in events
+        )
+        assert not any(event["type"] == "compaction_error" for event in events)
+        snap = state.compaction_snapshot()
+        assert snap is not None
+        assert snap["status"] == "skipped"
+
     def test_error_in_tag_turn_is_caught(self):
         engine = MagicMock()
         engine.tag_turn.side_effect = RuntimeError("boom")

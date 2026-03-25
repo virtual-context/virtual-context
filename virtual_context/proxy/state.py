@@ -689,6 +689,7 @@ class ProxyState:
                         "type", "turn", "done", "total", "phase", "conversation_id",
                         "operation_id", "status", "primary_tag", "tag",
                         "overall_percent", "elapsed_ms", "eta_ms", "heartbeat",
+                        "phase_name",
                     }
                 },
             )
