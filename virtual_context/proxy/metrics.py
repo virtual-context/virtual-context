@@ -39,6 +39,10 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "upstream_output_tokens": 0,
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
+    "non_virtualizable_floor": 0,
+    "upstream_context_limit": 0,
+    "passthrough_trim_limit": 0,
+    "system_tokens": 0,
 }
 
 
