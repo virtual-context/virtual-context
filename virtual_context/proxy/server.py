@@ -447,6 +447,10 @@ async def prepare_payload(
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
                 message_preview=user_message[:60],
+                non_virtualizable_floor=_pt_floor,
+                upstream_context_limit=_upstream_limit,
+                passthrough_trim_limit=_pt_limit,
+                system_tokens=_pt_system_tokens,
             )
 
             logger.info(
@@ -931,6 +935,9 @@ async def prepare_payload(
         turns_dropped=turns_dropped,
         turns_stubbed=turns_stubbed,
         message_preview=user_message[:60],
+        non_virtualizable_floor=_non_virtualizable_floor,
+        upstream_context_limit=_upstream_limit,
+        system_tokens=system_tokens,
     )
     # Capture enriched body (what we actually send to the LLM)
     metrics.capture_enriched(
