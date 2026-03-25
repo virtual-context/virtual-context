@@ -722,18 +722,42 @@ async def prepare_payload(
     inbound_tokens = _inbound_tokens
 
     # VC must never send more than the client sent. If enrichment bloated
-    # the payload beyond inbound, fall back to the filtered body without
-    # VC context injection — passthrough with tool interception applied.
+    # the payload beyond inbound, abandon all VC processing and send the
+    # original client payload as a pure passthrough.
     if outbound_tokens > inbound_tokens:
         logger.warning(
-            "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — falling back to filtered body (delta +%dt)",
+            "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — reverting to passthrough (delta +%dt)",
             outbound_tokens, inbound_tokens, outbound_tokens - inbound_tokens,
         )
-        enriched_body = body  # filtered body without context injection
-        _outbound_json = json.dumps(enriched_body, default=str)
-        _outbound_bytes = len(_outbound_json.encode("utf-8"))
-        outbound_tokens = fmt._count(_outbound_json)
-        prepend_text = ""  # no VC context was used
+        return PreparedPayload(
+            body=_pre_filter_body,
+            enriched_body=_pre_filter_body,
+            conversation_id=_conversation_id,
+            is_passthrough=True,
+            turn=len(state.engine._turn_tag_index.entries) if state else 0,
+            turn_id=uuid.uuid4().hex[:12],
+            api_format=api_format,
+            user_message=user_message,
+            is_streaming=is_streaming,
+            inbound_tokens=inbound_tokens,
+            outbound_tokens=inbound_tokens,
+            context_tokens=0,
+            non_virtualizable_floor=0,
+            upstream_limit=_upstream_limit,
+            tags_matched=[],
+            budget_breakdown={},
+            turns_dropped=0,
+            turns_stubbed=0,
+            wait_ms=wait_ms,
+            inbound_ms=inbound_ms,
+            overhead_ms=0,
+            assembled=None,
+            pre_filter_body=_pre_filter_body,
+            paging_enabled=False,
+            tool_output_find_quote=False,
+            inbound_bytes=_inbound_bytes,
+            outbound_bytes=_inbound_bytes,
+        )
 
     # Legacy aliases for downstream consumers
     input_tokens = outbound_tokens
