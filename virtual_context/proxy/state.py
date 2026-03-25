@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
 from ..engine import VirtualContextEngine
@@ -116,6 +117,8 @@ class ProxyState:
         self._ingested_turn_count: dict[str, int] = {}   # conversation_id → turn count at ingestion
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
+        self._compaction_state_lock = threading.Lock()
+        self._compaction_state: dict[str, object] = {}
         # State machine for non-blocking ingestion
         self._state = SessionState.ACTIVE
         self._latest_body: dict | None = None
@@ -348,6 +351,80 @@ class ProxyState:
             self.engine.config.conversation_id[:12], old.value, new_state.value,
         )
 
+    def _update_compaction_state(
+        self,
+        *,
+        operation_id: str,
+        status: str,
+        phase: str | None = None,
+        phase_name: str | None = None,
+        done: int | None = None,
+        total: int | None = None,
+        overall_percent: int | float | None = None,
+        elapsed_ms: float | None = None,
+        eta_ms: int | None = None,
+        heartbeat: bool = False,
+        primary_tag: str = "",
+        tag: str = "",
+        error: str = "",
+        **extra,
+    ) -> None:
+        now_epoch = time.time()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._compaction_state_lock:
+            prev = (
+                self._compaction_state
+                if self._compaction_state.get("operation_id") == operation_id
+                else {}
+            )
+            started_at = prev.get("started_at", now_iso)
+            started_epoch = prev.get("_started_at_epoch", now_epoch)
+            phase_value = phase if phase is not None else str(prev.get("phase", ""))
+            phase_name_value = phase_name if phase_name is not None else str(prev.get("phase_name", phase_value))
+            done_value = done if done is not None else int(prev.get("done", 0) or 0)
+            total_value = total if total is not None else int(prev.get("total", 0) or 0)
+            percent_value = overall_percent if overall_percent is not None else prev.get("overall_percent", 0)
+            if elapsed_ms is None:
+                elapsed_ms = round((now_epoch - float(started_epoch)) * 1000, 1)
+
+            state = {
+                "conversation_id": self.engine.config.conversation_id,
+                "operation_id": operation_id,
+                "status": status,
+                "phase": phase_value,
+                "phase_name": phase_name_value,
+                "done": done_value,
+                "total": total_value,
+                "overall_percent": percent_value,
+                "started_at": started_at,
+                "updated_at": now_iso,
+                "elapsed_ms": elapsed_ms,
+                "eta_ms": eta_ms,
+                "heartbeat": bool(heartbeat),
+                "primary_tag": primary_tag or str(prev.get("primary_tag", "")),
+                "tag": tag or str(prev.get("tag", "")),
+                "error": error,
+            }
+            for key, value in extra.items():
+                state[key] = value
+            state["_started_at_epoch"] = started_epoch
+            state["_updated_at_epoch"] = now_epoch
+            self._compaction_state = state
+
+    def compaction_snapshot(self) -> dict | None:
+        with self._compaction_state_lock:
+            if not self._compaction_state:
+                return None
+            snap = {
+                key: value
+                for key, value in self._compaction_state.items()
+                if not key.startswith("_")
+            }
+            updated_epoch = self._compaction_state.get("_updated_at_epoch")
+            if isinstance(updated_epoch, (int, float)):
+                snap["heartbeat_age_ms"] = int(max(0.0, time.time() - updated_epoch) * 1000)
+            return snap
+
     def live_snapshot(self) -> dict:
         engine = self.engine
         idx = engine._turn_tag_index
@@ -377,6 +454,7 @@ class ProxyState:
         for entry in idx.entries:
             all_tags.update(entry.tags)
         all_tags.discard("_general")
+        compaction = self.compaction_snapshot()
 
         snap = {
             "conversation_id": engine.config.conversation_id,
@@ -403,6 +481,8 @@ class ProxyState:
             "last_payload_tokens": self._last_payload_tokens,
             "last_enriched_payload_tokens": self._last_enriched_payload_tokens,
             "non_virtualizable_floor": self._last_non_virtualizable_floor,
+            "compacting": bool(compaction and compaction.get("status") in {"queued", "running"}),
+            "compaction": compaction,
         }
         return snap
 
@@ -560,30 +640,74 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         operation_id = uuid.uuid4().hex[:12]
         compaction_started = time.monotonic()
+        self._update_compaction_state(
+            operation_id=operation_id,
+            status="queued",
+            phase="queued",
+            phase_name="queued",
+            overall_percent=0,
+            done=0,
+            total=0,
+            phase_detail="waiting for compaction slot",
+        )
 
         def _compact_progress(done, total, result, *, phase="", **kwargs):
+            evt = {
+                "type": "compaction_progress",
+                "turn": turn,
+                "done": done,
+                "total": total,
+                "phase": phase,
+                "conversation_id": conversation_id,
+                "operation_id": operation_id,
+                "status": "running",
+            }
+            if result is not None:
+                evt["primary_tag"] = result.primary_tag
+                evt["tags"] = result.tags
+                evt["original_tokens"] = result.original_tokens
+                evt["summary_tokens"] = result.summary_tokens
+            evt["elapsed_ms"] = round((time.monotonic() - compaction_started) * 1000, 1)
+            for k, v in kwargs.items():
+                evt[k] = v
+            self._update_compaction_state(
+                operation_id=operation_id,
+                status="running",
+                phase=phase,
+                phase_name=str(evt.get("phase_name", phase)),
+                done=done,
+                total=total,
+                overall_percent=evt.get("overall_percent"),
+                elapsed_ms=evt.get("elapsed_ms"),
+                eta_ms=evt.get("eta_ms"),
+                heartbeat=bool(evt.get("heartbeat", False)),
+                primary_tag=str(evt.get("primary_tag", "")),
+                tag=str(evt.get("tag", "")),
+                **{
+                    k: v for k, v in evt.items()
+                    if k not in {
+                        "type", "turn", "done", "total", "phase", "conversation_id",
+                        "operation_id", "status", "primary_tag", "tag",
+                        "overall_percent", "elapsed_ms", "eta_ms", "heartbeat",
+                    }
+                },
+            )
             if self.metrics:
-                evt = {
-                    "type": "compaction_progress",
-                    "turn": turn,
-                    "done": done,
-                    "total": total,
-                    "phase": phase,
-                    "conversation_id": conversation_id,
-                    "operation_id": operation_id,
-                }
-                if result is not None:
-                    evt["primary_tag"] = result.primary_tag
-                    evt["tags"] = result.tags
-                    evt["original_tokens"] = result.original_tokens
-                    evt["summary_tokens"] = result.summary_tokens
-                evt["elapsed_ms"] = round((time.monotonic() - compaction_started) * 1000, 1)
-                for k, v in kwargs.items():
-                    evt[k] = v
                 self.metrics.record(evt)
 
         with self._compaction_lock:
             t0 = time.monotonic()
+            self._update_compaction_state(
+                operation_id=operation_id,
+                status="running",
+                phase="starting",
+                phase_name="starting",
+                overall_percent=0,
+                done=0,
+                total=0,
+                elapsed_ms=0.0,
+                phase_detail="starting compaction",
+            )
             try:
                 report = self.engine.compact_if_needed(
                     history, signal, progress_callback=_compact_progress,
@@ -628,10 +752,57 @@ class ProxyState:
                             "conversation_id": conversation_id,
                             "operation_id": operation_id,
                         })
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="completed",
+                        phase="completed",
+                        phase_name="completed",
+                        done=report.segments_compacted,
+                        total=report.segments_compacted,
+                        overall_percent=100,
+                        elapsed_ms=compact_ms,
+                        primary_tag="",
+                        tag="",
+                        phase_detail=f"{report.segments_compacted} segments compacted",
+                        segments=report.segments_compacted,
+                        tokens_freed=report.tokens_freed,
+                        tag_summaries_built=report.tag_summaries_built,
+                    )
                 else:
                     logger.info("T%d compaction skipped (no messages to compact)", turn)
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="skipped",
+                        phase="skipped",
+                        phase_name="skipped",
+                        done=0,
+                        total=0,
+                        overall_percent=100,
+                        elapsed_ms=compact_ms,
+                        phase_detail="no messages to compact",
+                    )
 
             except Exception as e:
+                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                self._update_compaction_state(
+                    operation_id=operation_id,
+                    status="failed",
+                    phase="failed",
+                    phase_name="failed",
+                    overall_percent=None,
+                    elapsed_ms=elapsed_ms,
+                    error=str(e),
+                    phase_detail="compaction crashed",
+                )
+                if self.metrics:
+                    self.metrics.record({
+                        "type": "compaction_error",
+                        "turn": turn,
+                        "conversation_id": conversation_id,
+                        "operation_id": operation_id,
+                        "error": str(e),
+                        "elapsed_ms": elapsed_ms,
+                    })
                 logger.error("compact_if_needed error: %s", e, exc_info=True)
 
     def _compact_after_ingestion(self, history: list[Message]) -> None:

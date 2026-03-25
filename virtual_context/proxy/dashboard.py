@@ -186,7 +186,7 @@ def register_dashboard_routes(
         async def event_stream():
             try:
                 # Send snapshot immediately
-                snap = metrics.snapshot()
+                snap, cursor = metrics.snapshot_with_cursor()
                 # Augment with live engine state
                 if state:
                     try:
@@ -203,6 +203,7 @@ def register_dashboard_routes(
                         snap["history_len"] = len(state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
                         snap["current_conversation_id"] = engine.config.conversation_id
+                        snap["compaction_state"] = state.compaction_snapshot()
                     except Exception:
                         logger.debug("SSE engine snapshot failed", exc_info=True)
 
@@ -220,20 +221,6 @@ def register_dashboard_routes(
                     snap["instance_label"] = instance_label
 
                 yield f"data: {json.dumps(snap)}\n\n"
-
-                cursor = snap.get("_seq", -1)
-                # Use the highest _seq from snapshot events as cursor
-                for evt_list in (
-                    snap.get("recent_requests", []),
-                    snap.get("responses", []),
-                    snap.get("compactions", []),
-                    snap.get("turn_completes", []),
-                    snap.get("ingested_turns", []),
-                ):
-                    for evt in evt_list:
-                        s = evt.get("_seq", -1)
-                        if s > cursor:
-                            cursor = s
 
                 while True:
                     if await request.is_disconnected():

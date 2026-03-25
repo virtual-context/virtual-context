@@ -218,6 +218,8 @@ class ProxyMetrics:
                 extras = f" segments={event.get('segments')} freed={event.get('tokens_freed')} summaries={event.get('tag_summaries_built')}"
             elif etype == "compaction_progress":
                 extras = f" phase={event.get('phase')} done={event.get('done')}/{event.get('total')} tag={event.get('primary_tag','')}"
+            elif etype == "compaction_error":
+                extras = f" error={event.get('error','')[:120]}"
             elif etype == "ingested_turn":
                 extras = f" turn={event.get('turn')} done={event.get('done')}/{event.get('total')} tags={event.get('tags',[])} preview=\"{event.get('message_preview','')[:40]}\""
             elif etype == "history_ingestion":
@@ -334,139 +336,147 @@ class ProxyMetrics:
             self._evict_old()
             return [e for e in self._events if e["_seq"] > seq]
 
+    def _snapshot_locked(self) -> dict:
+        self._evict_old()
+        requests = [e for e in self._events if e.get("type") == "request"]
+        compactions = [e for e in self._events if e.get("type") == "compaction"]
+        turn_completes = [e for e in self._events if e.get("type") == "turn_complete"]
+        ingestions = [e for e in self._events if e.get("type") == "history_ingestion"]
+        responses = [e for e in self._events if e.get("type") == "response"]
+        ingested_turns = [e for e in self._events if e.get("type") == "ingested_turn"]
+        tool_intercepts = [e for e in self._events if e.get("type") == "tool_intercept"]
+        compaction_progress = [e for e in self._events if e.get("type") == "compaction_progress"]
+
+        wait_values = [r["wait_ms"] for r in requests if "wait_ms" in r]
+        inbound_values = [r["inbound_ms"] for r in requests if "inbound_ms" in r]
+        context_values = [r["context_tokens"] for r in requests if "context_tokens" in r]
+
+        total_original = sum(c.get("original_tokens", 0) for c in compactions)
+        total_summary = sum(c.get("summary_tokens", 0) for c in compactions)
+        total_freed = sum(c.get("tokens_freed", 0) for c in compactions)
+        compression_ratio = (
+            round(total_summary / total_original, 3)
+            if total_original > 0 else 0
+        )
+        total_context_injected = sum(
+            r.get("context_tokens", 0) for r in requests
+        )
+
+        # Session efficiency: actual vs baseline input tokens
+        total_actual_input = sum(
+            r.get("input_tokens", 0) for r in requests
+        )
+
+        # Raw baseline: sum of raw_input_tokens from request events.
+        # This is the true cost a naive system would incur by forwarding
+        # the full unfiltered payload each turn.
+        total_raw_baseline = sum(
+            r.get("raw_input_tokens", 0) for r in requests
+        )
+
+        # Fallback: accumulated turn-pair baseline (for headless mode
+        # where raw_input_tokens is not available on request events)
+        system_tokens_per_turn = 0
+        if requests:
+            system_tokens_per_turn = requests[-1].get("system_tokens", 0)
+        baseline_history_tokens = 0
+        for ing in ingestions:
+            baseline_history_tokens += ing.get("baseline_history_tokens", 0)
+        cumulative_baseline = 0
+        for tc in turn_completes:
+            tpt = tc.get("turn_pair_tokens", 0)
+            baseline_history_tokens += tpt
+            if baseline_history_tokens > self.context_window:
+                protected = tpt * 4
+                compactable = max(0, baseline_history_tokens - protected)
+                baseline_history_tokens = (
+                    round(compactable * self.BASELINE_RATIO) + protected
+                )
+            cumulative_baseline += system_tokens_per_turn + baseline_history_tokens
+
+        # Prefer raw baseline (accurate for proxy mode) over accumulated
+        total_baseline_input = (
+            total_raw_baseline if total_raw_baseline > 0
+            else cumulative_baseline
+        )
+
+        # Telemetry
+        telemetry = {}
+        if self._telemetry_ledger:
+            try:
+                telem_dict = self._telemetry_ledger.to_dict()
+                if isinstance(telem_dict, dict):
+                    # Remove raw events for snapshot (too large for SSE)
+                    telem_dict.pop("events", None)
+                    telemetry = telem_dict
+            except Exception:
+                logger.debug("telemetry snapshot failed", exc_info=True)
+
+        return {
+            "type": "snapshot",
+            "uptime_s": round(time.time() - self.start_time, 1),
+            "total_requests": len(requests),
+            "total_compactions": len(compactions),
+            "total_tokens_freed": total_freed,
+            "total_original_tokens": total_original,
+            "total_summary_tokens": total_summary,
+            "compression_ratio": compression_ratio,
+            "total_context_injected": total_context_injected,
+            "total_actual_input": total_actual_input,
+            "total_baseline_input": total_baseline_input,
+            "baseline_ratio": self.BASELINE_RATIO,
+            "avg_wait_ms": round(statistics.mean(wait_values), 1) if wait_values else 0,
+            "avg_inbound_ms": round(statistics.mean(inbound_values), 1) if inbound_values else 0,
+            "avg_context_tokens": round(statistics.mean(context_values), 1) if context_values else 0,
+            "recent_requests": list(requests[-50:]),
+            "compactions": list(compactions),
+            "turn_completes": list(turn_completes[-50:]),
+            "responses": list(responses[-50:]),
+            "history_ingestions": list(ingestions),
+            "ingested_turns": list(ingested_turns),
+            "total_turns_ingested": sum(
+                e.get("turns_ingested", 0) for e in ingestions
+            ),
+            "tool_intercepts": list(tool_intercepts),
+            "total_tool_intercepts": len(tool_intercepts),
+            "total_tool_calls": len(tool_intercepts),
+            "tool_calls_by_name": {
+                name: sum(1 for tc in tool_intercepts if tc.get("tool_name", "unknown") == name)
+                for name in {tc.get("tool_name", "unknown") for tc in tool_intercepts}
+            },
+            "recent_tool_calls": [
+                {
+                    "tool_name": tc.get("tool_name"),
+                    "tool_input": tc.get("tool_input"),
+                    "result": (tc.get("tool_result", "") or "")[:200],
+                    "duration_ms": tc.get("duration_ms", 0),
+                    "turn": tc.get("turn"),
+                    "conversation_id": tc.get("conversation_id", ""),
+                    "group_id": tc.get("group_id", ""),
+                    "timestamp": tc.get("ts", ""),
+                }
+                for tc in tool_intercepts[-20:]
+            ],
+            "compaction_progress": list(compaction_progress),
+            "telemetry": telemetry,
+            "budget_promoted": next(
+                (e for e in reversed(self._events)
+                 if e.get("type") == "budget_auto_promoted"), None,
+            ),
+            "budget_exceeded": next(
+                (e for e in reversed(self._events)
+                 if e.get("type") == "budget_exceeded"), None,
+            ),
+        }
+
     def snapshot(self) -> dict:
         with self._lock:
-            self._evict_old()
-            requests = [e for e in self._events if e.get("type") == "request"]
-            compactions = [e for e in self._events if e.get("type") == "compaction"]
-            turn_completes = [e for e in self._events if e.get("type") == "turn_complete"]
-            ingestions = [e for e in self._events if e.get("type") == "history_ingestion"]
-            responses = [e for e in self._events if e.get("type") == "response"]
-            ingested_turns = [e for e in self._events if e.get("type") == "ingested_turn"]
-            tool_intercepts = [e for e in self._events if e.get("type") == "tool_intercept"]
-            compaction_progress = [e for e in self._events if e.get("type") == "compaction_progress"]
+            return self._snapshot_locked()
 
-            wait_values = [r["wait_ms"] for r in requests if "wait_ms" in r]
-            inbound_values = [r["inbound_ms"] for r in requests if "inbound_ms" in r]
-            context_values = [r["context_tokens"] for r in requests if "context_tokens" in r]
-
-            total_original = sum(c.get("original_tokens", 0) for c in compactions)
-            total_summary = sum(c.get("summary_tokens", 0) for c in compactions)
-            total_freed = sum(c.get("tokens_freed", 0) for c in compactions)
-            compression_ratio = (
-                round(total_summary / total_original, 3)
-                if total_original > 0 else 0
-            )
-            total_context_injected = sum(
-                r.get("context_tokens", 0) for r in requests
-            )
-
-            # Session efficiency: actual vs baseline input tokens
-            total_actual_input = sum(
-                r.get("input_tokens", 0) for r in requests
-            )
-
-            # Raw baseline: sum of raw_input_tokens from request events.
-            # This is the true cost a naive system would incur by forwarding
-            # the full unfiltered payload each turn.
-            total_raw_baseline = sum(
-                r.get("raw_input_tokens", 0) for r in requests
-            )
-
-            # Fallback: accumulated turn-pair baseline (for headless mode
-            # where raw_input_tokens is not available on request events)
-            system_tokens_per_turn = 0
-            if requests:
-                system_tokens_per_turn = requests[-1].get("system_tokens", 0)
-            baseline_history_tokens = 0
-            for ing in ingestions:
-                baseline_history_tokens += ing.get("baseline_history_tokens", 0)
-            cumulative_baseline = 0
-            for tc in turn_completes:
-                tpt = tc.get("turn_pair_tokens", 0)
-                baseline_history_tokens += tpt
-                if baseline_history_tokens > self.context_window:
-                    protected = tpt * 4
-                    compactable = max(0, baseline_history_tokens - protected)
-                    baseline_history_tokens = (
-                        round(compactable * self.BASELINE_RATIO) + protected
-                    )
-                cumulative_baseline += system_tokens_per_turn + baseline_history_tokens
-
-            # Prefer raw baseline (accurate for proxy mode) over accumulated
-            total_baseline_input = (
-                total_raw_baseline if total_raw_baseline > 0
-                else cumulative_baseline
-            )
-
-            # Telemetry
-            telemetry = {}
-            if self._telemetry_ledger:
-                try:
-                    telem_dict = self._telemetry_ledger.to_dict()
-                    if isinstance(telem_dict, dict):
-                        # Remove raw events for snapshot (too large for SSE)
-                        telem_dict.pop("events", None)
-                        telemetry = telem_dict
-                except Exception:
-                    logger.debug("telemetry snapshot failed", exc_info=True)
-
-            return {
-                "type": "snapshot",
-                "uptime_s": round(time.time() - self.start_time, 1),
-                "total_requests": len(requests),
-                "total_compactions": len(compactions),
-                "total_tokens_freed": total_freed,
-                "total_original_tokens": total_original,
-                "total_summary_tokens": total_summary,
-                "compression_ratio": compression_ratio,
-                "total_context_injected": total_context_injected,
-                "total_actual_input": total_actual_input,
-                "total_baseline_input": total_baseline_input,
-                "baseline_ratio": self.BASELINE_RATIO,
-                "avg_wait_ms": round(statistics.mean(wait_values), 1) if wait_values else 0,
-                "avg_inbound_ms": round(statistics.mean(inbound_values), 1) if inbound_values else 0,
-                "avg_context_tokens": round(statistics.mean(context_values), 1) if context_values else 0,
-                "recent_requests": list(requests[-50:]),
-                "compactions": list(compactions),
-                "turn_completes": list(turn_completes[-50:]),
-                "responses": list(responses[-50:]),
-                "history_ingestions": list(ingestions),
-                "ingested_turns": list(ingested_turns),
-                "total_turns_ingested": sum(
-                    e.get("turns_ingested", 0) for e in ingestions
-                ),
-                "tool_intercepts": list(tool_intercepts),
-                "total_tool_intercepts": len(tool_intercepts),
-                "total_tool_calls": len(tool_intercepts),
-                "tool_calls_by_name": {
-                    name: sum(1 for tc in tool_intercepts if tc.get("tool_name", "unknown") == name)
-                    for name in {tc.get("tool_name", "unknown") for tc in tool_intercepts}
-                },
-                "recent_tool_calls": [
-                    {
-                        "tool_name": tc.get("tool_name"),
-                        "tool_input": tc.get("tool_input"),
-                        "result": (tc.get("tool_result", "") or "")[:200],
-                        "duration_ms": tc.get("duration_ms", 0),
-                        "turn": tc.get("turn"),
-                        "conversation_id": tc.get("conversation_id", ""),
-                        "group_id": tc.get("group_id", ""),
-                        "timestamp": tc.get("ts", ""),
-                    }
-                    for tc in tool_intercepts[-20:]
-                ],
-                "compaction_progress": list(compaction_progress),
-                "telemetry": telemetry,
-                "budget_promoted": next(
-                    (e for e in reversed(self._events)
-                     if e.get("type") == "budget_auto_promoted"), None,
-                ),
-                "budget_exceeded": next(
-                    (e for e in reversed(self._events)
-                     if e.get("type") == "budget_exceeded"), None,
-                ),
-            }
+    def snapshot_with_cursor(self) -> tuple[dict, int]:
+        with self._lock:
+            snap = self._snapshot_locked()
+            return snap, self._seq - 1
 
     def capture_request(
         self,

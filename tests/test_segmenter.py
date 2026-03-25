@@ -77,14 +77,22 @@ def test_segment_progress_reports_monotonic_turns(segmenter):
     assert events
     assert events[0]["done"] == 0
     assert events[0]["total"] == 6
-    assert events[-1]["done"] == 6
-    assert events[-1]["total"] == 6
+    assert events[0]["phase_name"] == "segment_tagging"
+    assert events[-1]["phase_name"] == "segment_postprocess"
+    assert events[-1]["done"] == events[-1]["total"]
     assert events[-1]["segments"] == len(segments)
-    assert all(evt["phase_name"] == "segmenter" for evt in events)
-    assert all(
-        later["done"] >= earlier["done"]
-        for earlier, later in zip(events, events[1:], strict=False)
+    assert {"segment_tagging", "segment_grouping", "segment_postprocess"}.issubset(
+        {evt["phase_name"] for evt in events},
     )
+
+    events_by_phase: dict[str, list[dict]] = {}
+    for evt in events:
+        events_by_phase.setdefault(str(evt["phase_name"]), []).append(evt)
+    for phase_events in events_by_phase.values():
+        assert all(
+            later["done"] >= earlier["done"]
+            for earlier, later in zip(phase_events, phase_events[1:], strict=False)
+        )
 
 
 def test_turn_pairing(segmenter):

@@ -239,8 +239,14 @@ class CompactionPipeline:
         ) -> None:
             if not progress_callback:
                 return
+            progress_fraction = kwargs.pop("progress_fraction", 0.0)
             bounded_total = max(total, 1)
             bounded_done = max(0, min(done, bounded_total))
+            if progress_fraction:
+                bounded_done = min(
+                    float(bounded_total),
+                    float(bounded_done) + max(0.0, min(float(progress_fraction), 0.999)),
+                )
             overall_percent = base_percent + int(span_percent * bounded_done / bounded_total)
             progress_callback(
                 done,
@@ -252,15 +258,25 @@ class CompactionPipeline:
                 **kwargs,
             )
 
+        _segmenter_phase_ranges = {
+            "segment_tagging": (0, 12),
+            "segment_grouping": (12, 10),
+            "segment_postprocess": (22, 3),
+        }
+
         def _segmenter_progress(done: int, total: int, result, **kwargs) -> None:
+            phase_name = str(kwargs.pop("phase_name", "segment_tagging"))
+            base_percent, span_percent = _segmenter_phase_ranges.get(
+                phase_name, (0, 25),
+            )
             _emit_weighted_progress(
                 done,
                 total,
                 result,
-                phase="segmenter",
-                phase_name=str(kwargs.pop("phase_name", "segmenter")),
-                base_percent=0,
-                span_percent=25,
+                phase=phase_name,
+                phase_name=phase_name,
+                base_percent=base_percent,
+                span_percent=span_percent,
                 **kwargs,
             )
 
