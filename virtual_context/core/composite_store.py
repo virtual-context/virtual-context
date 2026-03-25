@@ -342,6 +342,9 @@ class CompositeStore:
     def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
         return self._search.get_tool_output_refs_for_turn(conversation_id, turn)
 
+    def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
+        return self._search.get_tool_output_by_ref(conversation_id, ref)
+
     def save_request_context(self, context: dict) -> None:
         return self._search.save_request_context(context)
 

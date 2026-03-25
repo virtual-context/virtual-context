@@ -66,6 +66,62 @@ def _extract_usage(msg_usage: dict, target: dict) -> None:
         target["cache_read_input_tokens"] = cache_read
 
 
+def _restore_tool_stub_in_place(body: dict, fmt, ref: str, full_content: str) -> bool:
+    """Replace a tool output stub containing *ref* with *full_content* in place.
+
+    Walks all messages/items in *body* looking for tool output carriers whose
+    content contains the ref string.  When found, replaces the stub content
+    with the full stored tool output at the original position.
+
+    Supports Anthropic (tool_result blocks), OpenAI Chat (role="tool" messages),
+    and OpenAI Responses (function_call_output items).
+
+    Returns True if a matching stub was found and replaced, False otherwise.
+    """
+    messages = fmt.get_messages(body)
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        # --- Anthropic: tool_result content blocks in user messages ---
+        if msg.get("role") == "user":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    # Check if this block's content contains the ref
+                    block_content = block.get("content", "")
+                    if isinstance(block_content, str) and ref in block_content:
+                        block["content"] = full_content
+                        return True
+                    elif isinstance(block_content, list):
+                        for sub in block_content:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                if ref in sub.get("text", ""):
+                                    # Replace entire block content, not just the text sub-block
+                                    block["content"] = full_content
+                                    return True
+
+        # --- OpenAI Chat: role="tool" messages ---
+        if msg.get("role") == "tool":
+            msg_content = msg.get("content", "")
+            if isinstance(msg_content, str) and ref in msg_content:
+                msg["content"] = full_content
+                return True
+
+        # --- OpenAI Responses: function_call_output items ---
+        if msg.get("type") == "function_call_output":
+            output = msg.get("output", "")
+            if isinstance(output, str) and ref in output:
+                msg["output"] = full_content
+                return True
+
+    return False
+
+
 async def _passthrough(
     client: httpx.AsyncClient,
     request: Request,
@@ -540,27 +596,52 @@ async def _handle_streaming(
                     tool_results: list[dict] = []
                     for tool in vc_tools:
                         t_tool = time.monotonic()
-                        result_str = execute_vc_tool(
-                            state.engine,
-                            tool["name"],
-                            tool["input"],
-                        )
+                        tool_name = tool["name"]
+                        tool_input = tool["input"]
+
+                        if tool_name == "vc_restore_tool":
+                            # In-place restore: find the stub in the
+                            # current payload and replace with full content
+                            ref = tool_input.get("ref", "")
+                            full_content = state.engine._store.get_tool_output_by_ref(
+                                conversation_id, ref,
+                            )
+                            if full_content is None:
+                                result_str = json.dumps({"error": f"tool output ref {ref} not found"})
+                            else:
+                                # Determine target body to mutate: cont_body
+                                # for rounds > 1, original body for round 1
+                                _target = cont_body if cont_body is not None else body
+                                _fmt = get_format(api_format)
+                                _restored = _restore_tool_stub_in_place(
+                                    _target, _fmt, ref, full_content,
+                                )
+                                if _restored:
+                                    result_str = json.dumps({"restored": True, "ref": ref})
+                                else:
+                                    result_str = json.dumps({"error": f"stub for ref {ref} not found in current payload"})
+                        else:
+                            result_str = execute_vc_tool(
+                                state.engine,
+                                tool_name,
+                                tool_input,
+                            )
                         tool_ms = round(
                             (time.monotonic() - t_tool) * 1000, 1,
                         )
-                        _input_preview = json.dumps(tool["input"])[:120]
+                        _input_preview = json.dumps(tool_input)[:120]
                         _result_preview = result_str[:200].replace("\n", " ")
                         logger.info(
                             "TOOL_CALL %s %dms input=%s result_len=%d preview=%s",
-                            tool["name"], tool_ms, _input_preview,
+                            tool_name, tool_ms, _input_preview,
                             len(result_str), _result_preview,
                         )
                         if metrics:
                             metrics.record({
                                 "type": "tool_intercept",
                                 "turn": turn,
-                                "tool_name": tool["name"],
-                                "tool_input": tool["input"],
+                                "tool_name": tool_name,
+                                "tool_input": tool_input,
                                 "result": result_str[:200],
                                 "duration_ms": tool_ms,
                                 "continuation_count": loop_i + 1,
@@ -574,8 +655,8 @@ async def _handle_streaming(
                                 "request_turn": turn,
                                 "round": loop_i + 1,
                                 "group_id": _group_id,
-                                "tool_name": tool["name"],
-                                "tool_input": tool["input"],
+                                "tool_name": tool_name,
+                                "tool_input": tool_input,
                                 "tool_result": result_str,
                                 "result_length": len(result_str),
                                 "duration_ms": tool_ms,

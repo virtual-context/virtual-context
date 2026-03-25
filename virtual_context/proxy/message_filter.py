@@ -6,12 +6,18 @@ Pure functions — no ProxyState dependency. Extracted from proxy/server.py.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
+from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from ..core.turn_tag_index import TurnTagIndex
 from ._envelope import _strip_envelope
 from .formats import PayloadFormat, detect_format
+
+if TYPE_CHECKING:
+    from ..core.store import ContextStore
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,29 @@ def _consume_responses_tool_round(
         bare_indices.append(idx)
         return bare_indices, idx + 1
     return None
+
+
+def _chain_has_tool_activity(messages: list[dict], indices: tuple[int, ...] | range) -> bool:
+    """Return True if any message in *indices* contains tool-call or tool-output signals.
+
+    Checks all supported provider formats:
+    - OpenAI Chat: ``role: "tool"`` or ``tool_calls`` array on assistant
+    - OpenAI Responses: bare items with ``type`` of ``function_call`` / ``function_call_output``
+    - Anthropic: content blocks with ``type`` of ``tool_use`` / ``tool_result``
+    """
+    for ci in indices:
+        msg = messages[ci]
+        if msg.get("role") == "tool" or msg.get("tool_calls"):
+            return True
+        if msg.get("type") in ("function_call", "function_call_output"):
+            return True
+        content = msg.get("content", [])
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+            for b in content
+        ):
+            return True
+    return False
 
 
 def filter_body_messages(
@@ -189,11 +218,23 @@ def filter_body_messages(
 
     tag_set = set(matched_tags)
 
+    # Detect which chains contain tool activity — these are drop-exempt.
+    chain_has_tools = [False] * total_pairs
+    for pair_idx, chain in enumerate(pairs):
+        if _chain_has_tool_activity(chat_msgs, chain):
+            chain_has_tools[pair_idx] = True
+
     # First pass: mark each chain as keep/drop based on tags
     keep_pair = [False] * total_pairs
     for pair_idx, chain in enumerate(pairs):
         if pair_idx >= total_pairs - protected:
             keep_pair[pair_idx] = True
+        elif chain_has_tools[pair_idx]:
+            # Tool-bearing chains are drop-exempt — always kept regardless
+            # of tag match. Tool history is handled by position-based
+            # stubbing, not semantic filtering.
+            keep_pair[pair_idx] = True
+            logger.debug("T%d KEEP (tool activity: drop-exempt)", pair_idx)
         elif compacted_turn > 0 and pair_idx < compacted_turn:
             # PROXY-023: paging active — compacted turns are dropped
             # unconditionally. Their content is in VC summaries and
@@ -629,6 +670,10 @@ def stub_compacted_messages(
 
         entry = turn_tag_index.get_entry_by_hash(h)
         if entry is not None and entry.turn_number < watermark_turn:
+            # Skip tool-bearing turn groups — position-based stubbing
+            # handles their tool outputs separately.
+            if _chain_has_tool_activity(messages, range(start, end)):
+                continue
             stubs.append((start, end, entry))
 
     if not stubs:
@@ -645,35 +690,17 @@ def stub_compacted_messages(
         if stub:
             start, end, entry = stub
             tags_str = ", ".join(entry.tags[:5])
-            # Detect tool activity in the compacted range
-            has_tools = any(
-                messages[j].get("role") == "tool"
-                or messages[j].get("tool_calls")
-                or messages[j].get("type") in ("function_call", "function_call_output")
-                or (isinstance(messages[j].get("content"), list) and any(
-                    isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
-                    for b in messages[j]["content"]
-                ))
-                for j in range(start, end)
-            )
+            # Tool-bearing turns are skipped above (position-based
+            # stubbing handles them), so only non-tool turns reach here.
             new_messages.append({
                 "role": "user",
                 "content": f"[Compacted turn {entry.turn_number}]",
             })
-            if has_tools:
-                stub_text = (
-                    f"[Compacted turn {entry.turn_number}: "
-                    f"tool activity compacted. "
-                    f"Full tool output stored in virtual-context; "
-                    f"use vc_find_quote(...) to search it or "
-                    f"vc_expand_topic(...) for linked topic context.]"
-                )
-            else:
-                stub_text = (
-                    f"[Compacted turn {entry.turn_number}: "
-                    f"topics={tags_str}. "
-                    f"Content stored in virtual-context.]"
-                )
+            stub_text = (
+                f"[Compacted turn {entry.turn_number}: "
+                f"topics={tags_str}. "
+                f"Content stored in virtual-context.]"
+            )
             new_messages.append({
                 "role": _asst_role,
                 "content": [{"type": "text", "text": stub_text}],
@@ -935,3 +962,279 @@ def _cleanup_orphaned_tools(body: dict, msg_key: str) -> dict:
     body = dict(body)
     body[msg_key] = messages
     return body
+
+
+# ---------------------------------------------------------------------------
+# Position-based tool output stubbing
+# ---------------------------------------------------------------------------
+
+
+def _summarise_arguments(args: object, max_len: int = 200) -> str:
+    """Produce a compact single-line summary of tool call arguments."""
+    if args is None:
+        return ""
+    if isinstance(args, str):
+        text = args
+    elif isinstance(args, dict):
+        # For dict args, format as key=value pairs
+        parts: list[str] = []
+        for k, v in args.items():
+            v_str = str(v) if not isinstance(v, str) else v
+            parts.append(f"{k}={v_str}")
+        text = " ".join(parts)
+    else:
+        text = str(args)
+    # Collapse whitespace and cap length
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        text = text[:max_len] + "..."
+    return text
+
+
+def _replace_anthropic_content(block: dict, new_text: str) -> None:
+    """Replace entire content of an Anthropic tool_result block.
+
+    Replaces ALL content (including non-text blocks like images) with a
+    single text block. When stubbing, the stub is the only thing that
+    should remain. When restoring, the full text replaces everything.
+    """
+    block["content"] = new_text
+
+
+def stub_tool_outputs_by_position(
+    body: dict,
+    fmt: PayloadFormat,
+    protected_recent_turns: int,
+    turn_tag_index: TurnTagIndex,
+    store: ContextStore,
+    conversation_id: str,
+) -> tuple[dict, int, list[str]]:
+    """Replace tool outputs outside the protected window with lightweight stubs.
+
+    Scans all tool outputs in the payload.  Outputs in the last
+    *protected_recent_turns* turn chains pass through unmodified.  Older
+    outputs are stored with a unique ref and replaced in-place with a stub
+    containing the ref, tool name, argument summary, and restore call.
+
+    Returns ``(body, stub_count, list_of_refs)``.
+    """
+    if fmt.name == "gemini":
+        _msg_key = "contents"
+        _asst_role = "model"
+    elif fmt.name == "openai_responses":
+        _msg_key = "input"
+        _asst_role = "assistant"
+    else:
+        _msg_key = "messages"
+        _asst_role = "assistant"
+
+    messages = body.get(_msg_key, [])
+    if not messages:
+        return body, 0, []
+
+    # ------------------------------------------------------------------
+    # 1. Parse turn chains (same pattern as filter_body_messages)
+    # ------------------------------------------------------------------
+    prefix_count = 0
+    chat_msgs: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system" and not chat_msgs:
+            prefix_count += 1
+        else:
+            chat_msgs.append(msg)
+
+    if not chat_msgs:
+        return body, 0, []
+
+    # Separate trailing user message (current turn)
+    has_trailing_user = bool(chat_msgs and chat_msgs[-1].get("role") == "user")
+    history_msgs = chat_msgs[:-1] if has_trailing_user else chat_msgs
+
+    pairs: list[tuple[int, ...]] = []  # tuples of GLOBAL message indices
+    paired_indices: set[int] = set()
+    i = 0
+    while i + 1 < len(history_msgs):
+        gi = i + prefix_count  # global index into messages list
+        if (history_msgs[i].get("role") == "user"
+                and history_msgs[i + 1].get("role") == _asst_role):
+            chain_indices: list[int] = [gi, gi + 1]
+            j = i + 2
+            while j < len(history_msgs) - 1:
+                next_msg = history_msgs[j]
+                next_role = next_msg.get("role", "")
+                gj = j + prefix_count
+                # OpenAI tool response (role="tool")
+                if next_role == "tool":
+                    tool_batch = [gj]
+                    k = j + 1
+                    while k < len(history_msgs) and history_msgs[k].get("role") == "tool":
+                        tool_batch.append(k + prefix_count)
+                        k += 1
+                    if k < len(history_msgs) and history_msgs[k].get("role") == _asst_role:
+                        chain_indices.extend(tool_batch)
+                        chain_indices.append(k + prefix_count)
+                        j = k + 1
+                        continue
+                    else:
+                        break
+                # OpenAI Responses bare function_call/function_call_output round
+                responses_round = _consume_responses_tool_round(history_msgs, j, _asst_role)
+                if responses_round:
+                    round_indices, next_index = responses_round
+                    chain_indices.extend([ri + prefix_count for ri in round_indices])
+                    j = next_index
+                    continue
+                # Anthropic tool result (user message with tool_result-only content)
+                if next_role not in ("user", "human"):
+                    break
+                if not _is_tool_result_only_user(next_msg):
+                    break
+                if j + 1 >= len(history_msgs) or history_msgs[j + 1].get("role") != _asst_role:
+                    break
+                chain_indices.extend([gj, gj + 1])
+                j += 2
+            pairs.append(tuple(chain_indices))
+            for ci in chain_indices:
+                paired_indices.add(ci)
+            i = chain_indices[-1] - prefix_count + 1
+        else:
+            i += 1
+
+    if not pairs:
+        return body, 0, []
+
+    # ------------------------------------------------------------------
+    # 2. Identify protected window (last N chains)
+    # ------------------------------------------------------------------
+    total_chains = len(pairs)
+    protected = min(protected_recent_turns, total_chains)
+    protected_start = total_chains - protected  # chains >= this index are protected
+
+    # Build global-index → chain-index map
+    msg_to_chain: dict[int, int] = {}
+    for chain_idx, chain in enumerate(pairs):
+        for gi in chain:
+            msg_to_chain[gi] = chain_idx
+
+    # ------------------------------------------------------------------
+    # 3. Build tool call map: call_id → {name, arguments}
+    # ------------------------------------------------------------------
+    tool_call_map: dict[str, dict] = {}
+    for tc in fmt.iter_tool_calls(body):
+        if tc.call_id:
+            tool_call_map[tc.call_id] = {
+                "name": tc.name,
+                "arguments": tc.arguments,
+            }
+
+    # ------------------------------------------------------------------
+    # 4. Resolve canonical turn numbers per chain via hash lookup
+    # ------------------------------------------------------------------
+    chain_canonical_turn: dict[int, int] = {}
+    for chain_idx, chain in enumerate(pairs):
+        # Find user-text message and first assistant message in chain
+        user_text = ""
+        asst_text = ""
+        for gi in chain:
+            msg = messages[gi]
+            if msg.get("role") == "user" and not _is_tool_result_only_user(msg):
+                user_text = _extract_text_for_stub_hash(msg)
+            elif msg.get("role") == _asst_role and not asst_text:
+                asst_text = _extract_text_for_stub_hash(msg)
+        if user_text:
+            combined = f"{user_text} {asst_text}"
+            h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+            entry = turn_tag_index.get_entry_by_hash(h)
+            if entry is not None:
+                chain_canonical_turn[chain_idx] = entry.turn_number
+                continue
+        # No canonical turn resolved — mark as unknown.
+        # Do NOT use body-local chain index: after filtering drops turns,
+        # chain_idx no longer corresponds to the real turn number.
+        chain_canonical_turn[chain_idx] = -1
+
+    # ------------------------------------------------------------------
+    # 5. Stub tool outputs outside protected window
+    # ------------------------------------------------------------------
+    # Import VC_TOOL_NAMES to skip VC tool results
+    from ..core.tool_loop import VC_TOOL_NAMES
+
+    stub_count = 0
+    stub_refs: list[str] = []
+
+    for output in fmt.iter_tool_outputs(body):
+        # Determine which chain this output belongs to
+        chain_idx = msg_to_chain.get(output.msg_index)
+        if chain_idx is None:
+            # Output not in any chain (e.g. unpaired) — skip
+            continue
+        if chain_idx >= protected_start:
+            # Inside protected window — leave unmodified
+            continue
+
+        # Skip VC tool outputs to prevent feedback loops
+        call_info = tool_call_map.get(output.call_id, {})
+        tool_name = call_info.get("name", "")
+        if tool_name in VC_TOOL_NAMES:
+            continue
+
+        content_text = output.content
+        if not content_text:
+            continue
+
+        # Generate unique ref
+        ref = f"tool_{uuid4().hex[:12]}"
+
+        # Resolve canonical turn
+        canonical_turn = chain_canonical_turn.get(chain_idx, chain_idx)
+
+        # Summarise arguments for the stub
+        args_summary = _summarise_arguments(call_info.get("arguments"))
+
+        # Store the full content
+        try:
+            store.store_tool_output(
+                ref=ref,
+                conversation_id=conversation_id,
+                tool_name=tool_name,
+                command=args_summary,
+                turn=canonical_turn,
+                content=content_text,
+                original_bytes=len(content_text.encode("utf-8")),
+            )
+        except Exception:
+            logger.warning("TOOL-STUB: failed to store ref=%s", ref, exc_info=True)
+            continue
+
+        # Write turn link (only if canonical turn was resolved)
+        if canonical_turn < 0:
+            logger.debug("TOOL-STUB: skipping turn link for ref=%s (no canonical turn)", ref)
+        else:
+            try:
+                store.link_turn_tool_output(conversation_id, canonical_turn, ref)
+            except Exception:
+                pass  # non-critical
+
+        # Build stub text
+        stub_text = (
+            f"[tool output ref={ref}"
+            f" | tool={tool_name or 'unknown'}"
+            f' args="{args_summary}"'
+            f' | call vc_restore_tool(ref="{ref}")]'
+        )
+
+        # Replace content in-place
+        carrier = output.carrier
+        carrier_type = output.carrier_type
+        if carrier_type == "anthropic":
+            _replace_anthropic_content(carrier, stub_text)
+        elif carrier_type == "openai_chat":
+            carrier["content"] = stub_text
+        elif carrier_type == "openai_responses":
+            carrier["output"] = stub_text
+
+        stub_count += 1
+        stub_refs.append(ref)
+
+    return body, stub_count, stub_refs

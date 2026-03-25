@@ -323,36 +323,6 @@ async def prepare_payload(
                 current_state = SessionState.PASSTHROUGH
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
-            tool_output_refs_by_turn: dict[int, list[str]] | None = None
-
-            # Tool output interception applies even in passthrough —
-            # truncating large tool_result blocks reduces upstream tokens
-            # regardless of whether VC context is being injected.
-            if state.engine.config.tool_output.enabled:
-                from .tool_output_interceptor import (
-                    ToolOutputInterceptor,
-                    build_turn_tool_output_refs,
-                )
-
-                _pt_interceptor = ToolOutputInterceptor(
-                    config=state.engine.config.tool_output,
-                    store=state.engine._store,
-                    conversation_id=state.engine.config.conversation_id,
-                )
-                _pt_interceptor._turn_counter = state._total_requests
-                _pre_stats = _pt_interceptor.stats.total_intercepted
-                body = _pt_interceptor.process(body, fmt)
-                _post_stats = _pt_interceptor.stats.total_intercepted
-                if _post_stats > _pre_stats:
-                    logger.info("TOOL-INTERCEPT Passthrough: truncated %d tool_result(s), saved %dB",
-                                _post_stats - _pre_stats,
-                                _pt_interceptor.stats.total_bytes_original - _pt_interceptor.stats.total_bytes_returned)
-                tool_output_refs_by_turn = build_turn_tool_output_refs(
-                    body,
-                    fmt,
-                    _pt_interceptor.intercepted_refs,
-                )
-
             # Store latest body for catch-up loop
             state._latest_body = body
 
@@ -362,7 +332,7 @@ async def prepare_payload(
                 if history_pairs:
                     state.conversation_history = list(history_pairs)
                 await asyncio.to_thread(
-                    state.start_ingestion_if_needed, history_pairs, tool_output_refs_by_turn,
+                    state.start_ingestion_if_needed, history_pairs,
                 )
 
             state.conversation_history.append(
@@ -627,23 +597,20 @@ async def prepare_payload(
         elif _pre_compaction and _pcf_mode == "off":
             logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
 
-    # Tool output interception: truncate large tool_result blocks.
+    # Position-based tool output stubbing — active path only
+    _tool_stubs_present = False
     if state and state.engine.config.tool_output.enabled:
-        from .tool_output_interceptor import ToolOutputInterceptor
-
-        interceptor = ToolOutputInterceptor(
-            config=state.engine.config.tool_output,
+        from .message_filter import stub_tool_outputs_by_position
+        body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
+            body, fmt,
+            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+            turn_tag_index=state.engine._turn_tag_index,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
         )
-        interceptor._turn_counter = state._total_requests
-        _pre = interceptor.stats.total_intercepted
-        body = interceptor.process(body, fmt)
-        _post = interceptor.stats.total_intercepted
-        if _post > _pre:
-            logger.info("TOOL-INTERCEPT Active: truncated %d tool_result(s), saved %dB",
-                        _post - _pre,
-                        interceptor.stats.total_bytes_original - interceptor.stats.total_bytes_returned)
+        if _stub_count:
+            _tool_stubs_present = True
+            logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
 
     enriched_body = _inject_context(body, prepend_text, api_format)
 
@@ -696,6 +663,16 @@ async def prepare_payload(
             tool_output_find_quote = True
             logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
 
+    # Inject vc_restore_tool when stubs are present but paging didn't already inject it
+    if _tool_stubs_present and not paging_enabled and fmt.supports_tool_interception:
+        existing_names = {t.get("name") for t in enriched_body.get("tools", []) if isinstance(t, dict)}
+        if "vc_restore_tool" not in existing_names:
+            from ..core.tool_loop import vc_tool_definitions
+            _restore_def = [d for d in vc_tool_definitions() if d["name"] == "vc_restore_tool"]
+            if _restore_def:
+                enriched_body = fmt.inject_tools(enriched_body, _restore_def)
+                logger.info("TOOL-STUB Injected vc_restore_tool for stub restoration")
+
     # Track enriched payload size
     if state:
         state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
@@ -743,6 +720,7 @@ async def prepare_payload(
         turns_stubbed = 0
         paging_enabled = False
         tool_output_find_quote = False
+        _tool_stubs_present = False
         assembled = None
 
     # Legacy aliases for downstream consumers
