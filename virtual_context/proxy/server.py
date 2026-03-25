@@ -432,6 +432,8 @@ async def prepare_payload(
                 "system_tokens": _pt_system_tokens,
                 "turns_dropped": 0,
                 "non_virtualizable_floor": _pt_floor,
+                "upstream_context_limit": _upstream_limit,
+                "passthrough_trim_limit": _pt_limit,
                 "conversation_id": _conversation_id,
                 "passthrough": True,
             })
@@ -818,6 +820,7 @@ async def prepare_payload(
         "turns_dropped": turns_dropped,
         "turns_stubbed": turns_stubbed,
         "non_virtualizable_floor": _non_virtualizable_floor,
+        "upstream_context_limit": _upstream_limit,
         "conversation_id": _conversation_id,
     })
 
