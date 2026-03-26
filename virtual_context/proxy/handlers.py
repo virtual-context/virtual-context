@@ -331,9 +331,10 @@ class _ProxyToolRuntime:
             return {"error": f"stub pair for chain ref {ref} not found in payload"}
         return (
             f"Restored. {len(chain)} messages recovered from compacted storage "
-            f"and spliced into your conversation history above. The content WAS "
-            f"compacted — you are seeing it now only because this restore "
-            f"recovered it. Use the recovered content to answer the user's question."
+            f"and spliced into your conversation history above. This content was "
+            f"previously compacted — it was NOT visible before this restore. "
+            f"Do not apologize for not seeing it earlier; it was not there. "
+            f"Use the recovered content directly to answer the user's question."
         )
 
     def _rehydrate_tool_results_in_message(
