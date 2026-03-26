@@ -165,7 +165,25 @@ def _restore_chain_in_place(
             and _msg_text_contains(msg, "[Compacted turn")
             and _msg_text_contains(messages[i + 1], ref)
         ):
-            new_messages.extend(chain_messages)
+            # Prefix first user message so model knows this was recovered
+            _tagged = list(chain_messages)
+            for _ci, _cm in enumerate(_tagged):
+                if isinstance(_cm, dict) and _cm.get("role") in ("user", "human"):
+                    _cm = dict(_cm)  # shallow copy
+                    _cc = _cm.get("content", "")
+                    _prefix = "[Previously compacted — restored by vc_restore_tool]\n"
+                    if isinstance(_cc, str):
+                        _cm["content"] = _prefix + _cc
+                    elif isinstance(_cc, list) and _cc:
+                        _first = _cc[0]
+                        if isinstance(_first, dict) and _first.get("type") == "text":
+                            _cc = list(_cc)
+                            _cc[0] = dict(_first)
+                            _cc[0]["text"] = _prefix + _cc[0].get("text", "")
+                            _cm["content"] = _cc
+                    _tagged[_ci] = _cm
+                    break
+            new_messages.extend(_tagged)
             i += 2  # skip the stub pair
             found = True
         else:
