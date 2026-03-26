@@ -882,7 +882,18 @@ def trim_to_upstream_limit(
         pairs.append(tuple(chain_indices))
         i = chain_indices[-1] + 1
 
-    if len(pairs) <= 2:
+    # Collect trailing messages not in any pair (e.g. the user's current
+    # message with no assistant response yet). These are always kept.
+    paired_indices: set[int] = set()
+    for pair in pairs:
+        for idx in pair:
+            paired_indices.add(idx)
+    trailing = tuple(
+        idx for idx in range(system_prefix, len(original_messages))
+        if idx not in paired_indices
+    )
+
+    if len(pairs) <= 2 and not trailing:
         return body, 0
 
     fixed = fmt._estimate_system_tokens(body) + fmt.estimate_tools_tokens(body)
@@ -907,10 +918,13 @@ def trim_to_upstream_limit(
         trimmed_body[msg_key] = new_messages
         return trimmed_body, len(pairs) - 2
 
-    # Build from newest to oldest. Start with the last 2 pairs (protected),
-    # then add older pairs one at a time until the budget is full.
+    # Build from newest to oldest. Start with trailing messages + last 2 pairs
+    # (protected), then add older pairs one at a time until the budget is full.
     keep_pairs: list[tuple[int, ...]] = list(pairs[-2:])  # always keep last 2
     budget_used = 0
+    # Always count trailing messages (user's current message)
+    for idx in trailing:
+        budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
     for pair in keep_pairs:
         for idx in pair:
             budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
@@ -933,9 +947,14 @@ def trim_to_upstream_limit(
         return body, 0
 
     keep_indices: set[int] = set()
+    # Always keep system prefix message if present
+    for idx in range(system_prefix):
+        keep_indices.add(idx)
     for pair in keep_pairs:
         for idx in pair:
             keep_indices.add(idx)
+    for idx in trailing:
+        keep_indices.add(idx)
 
     new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
     trimmed_body = dict(body)
