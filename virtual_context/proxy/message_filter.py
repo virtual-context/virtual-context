@@ -1085,6 +1085,7 @@ def stub_tool_outputs_by_position(
     turn_tag_index: TurnTagIndex,
     store: ContextStore,
     conversation_id: str,
+    **kwargs,
 ) -> tuple[dict, int, list[str]]:
     """Replace tool outputs outside the protected window with lightweight stubs.
 
@@ -1188,6 +1189,34 @@ def stub_tool_outputs_by_position(
     protected = min(protected_recent_turns, total_chains)
     protected_start = total_chains - protected  # chains >= this index are protected
 
+    # Conditional intrusion: if protected zone exceeds a percentage of the
+    # context budget, allow stubbing into the protected zone except for
+    # the last 2 chains (the current exchange).
+    _intrusion_threshold = kwargs.get("protected_intrusion_threshold", 0.0)
+    _context_budget = kwargs.get("context_budget", 0)
+    _stub_protected_start = total_chains  # default: no intrusion
+
+    if _intrusion_threshold > 0 and _context_budget > 0 and protected > 2:
+        # Estimate protected zone token size
+        _prot_bytes = 0
+        for chain_idx in range(protected_start, total_chains):
+            for gi in pairs[chain_idx]:
+                _prot_bytes += len(json.dumps(messages[gi], default=str))
+        _prot_tokens = _prot_bytes // 4
+        _prot_ratio = _prot_tokens / _context_budget if _context_budget else 0
+
+        if _prot_ratio > _intrusion_threshold:
+            # Allow stubbing inside protected zone except last 2 chains
+            _stub_protected_start = total_chains - 2
+            logger.info(
+                "PROTECTED_INTRUSION: protected zone %dt is %.0f%% of budget %dt "
+                "(threshold %.0f%%) — stubbing turns 3+ in protected window",
+                _prot_tokens, _prot_ratio * 100, _context_budget,
+                _intrusion_threshold * 100,
+            )
+        else:
+            _stub_protected_start = total_chains  # no intrusion needed
+
     # Build global-index → chain-index map
     msg_to_chain: dict[int, int] = {}
     for chain_idx, chain in enumerate(pairs):
@@ -1246,8 +1275,11 @@ def stub_tool_outputs_by_position(
         if chain_idx is None:
             # Output not in any chain (e.g. unpaired) — skip
             continue
-        if chain_idx >= protected_start:
-            # Inside protected window — leave unmodified
+        if chain_idx >= _stub_protected_start:
+            # Inside hard-protected window (last 2 chains) — leave unmodified
+            continue
+        if chain_idx >= protected_start and _stub_protected_start >= total_chains:
+            # Inside protected window and no intrusion active — leave unmodified
             continue
 
         # Skip VC tool outputs to prevent feedback loops

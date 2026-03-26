@@ -652,6 +652,8 @@ async def prepare_payload(
                 turn_tag_index=state.engine._turn_tag_index,
                 store=state.engine._store,
                 conversation_id=state.engine.config.conversation_id,
+                protected_intrusion_threshold=0.6,
+                context_budget=state.engine.config.monitor.context_window,
             )
             if _stub_count:
                 _tool_stubs_present = True
