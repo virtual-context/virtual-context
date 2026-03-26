@@ -10,7 +10,6 @@ import json
 import logging
 import math
 from typing import TYPE_CHECKING
-from uuid import uuid4
 
 from ..core.turn_tag_index import TurnTagIndex
 from ._envelope import _strip_envelope
@@ -1183,8 +1182,9 @@ def stub_tool_outputs_by_position(
         if not content_text:
             continue
 
-        # Generate unique ref
-        ref = f"tool_{uuid4().hex[:12]}"
+        # Content-addressed ref: same content always produces the same ref.
+        # Prevents duplicate storage when the client resends the full history.
+        ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
 
         # Resolve canonical turn
         canonical_turn = chain_canonical_turn.get(chain_idx, chain_idx)

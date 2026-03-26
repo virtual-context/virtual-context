@@ -1311,9 +1311,12 @@ def create_app(
         _sid = state.engine.config.conversation_id[:12] if state else "none"
         logger.info("%s POST /%s msgs=%d stream=%s conversation=%s payload=%sKB", _now, path, _msg_count, is_streaming, _sid, _payload_kb)
 
-        if not user_message:
-            # Tool-result or non-text turn — skip VC enrichment but
-            # preserve streaming so the client SDK doesn't break.
+        if not user_message and _msg_count < 10:
+            # Trivial tool-result or non-text turn with very few messages —
+            # a one-off tool call, not a real conversation. Skip enrichment.
+            # Conversations with 10+ messages still go through prepare_payload
+            # so tool output stubbing runs even when the last message is a
+            # tool result.
             _skip_sid = state.engine.config.conversation_id if state else ""
             _skip_turn = len(state.engine._turn_tag_index.entries) if state else 0
             _skip_turn_id = uuid.uuid4().hex[:12]
