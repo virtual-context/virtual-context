@@ -806,11 +806,9 @@ def trim_to_upstream_limit(
 
     Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
     """
-    total = fmt.estimate_payload_tokens(body)
-    # upstream_limit is already the input budget — do not subtract max_tokens.
-    # The caller (passthrough trim or active path) sets the limit based on
-    # how much input we want to send, not the combined input+output window.
-    output_budget = 0
+    # Use _count on the full JSON for consistency with the caller's token estimate.
+    # estimate_payload_tokens only counts text content and underestimates.
+    total = fmt._count(json.dumps(body, default=str))
     input_limit = upstream_limit
 
     if total <= input_limit:
@@ -895,8 +893,8 @@ def trim_to_upstream_limit(
 
     logger.info(
         "TRIM_BUDGET: total=%d fixed(system+tools)=%d msg_tokens=%d "
-        "input_limit=%d available_for_msgs=%d output_budget=%d pairs=%d",
-        total, fixed, msg_tokens, input_limit, available, output_budget, len(pairs),
+        "input_limit=%d available_for_msgs=%d pairs=%d",
+        total, fixed, msg_tokens, input_limit, available, len(pairs),
     )
 
     if msg_tokens <= 0:
@@ -945,7 +943,7 @@ def trim_to_upstream_limit(
         trimmed_body = dict(body)
         trimmed_body[msg_key] = new_messages
 
-        total = fmt.estimate_payload_tokens(trimmed_body)
+        total = fmt._count(json.dumps(trimmed_body, default=str))
         msg_tokens = total - fixed
 
     if total_pairs_removed == 0:
