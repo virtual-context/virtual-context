@@ -719,7 +719,10 @@ class ProxyState:
                 _offset = self.engine._engine_state.history_offset(
                     len(history), total_turns_indexed=_tti,
                 )
-                _snapshot = self.engine._monitor.build_snapshot(history[_offset:])
+                _snapshot = self.engine._monitor.build_snapshot(
+                    history[_offset:],
+                    payload_tokens=self._last_enriched_payload_tokens or None,
+                )
                 _recheck = self.engine._monitor.check(_snapshot)
                 if _recheck is None:
                     logger.info(
