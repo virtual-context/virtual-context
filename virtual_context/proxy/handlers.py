@@ -326,6 +326,54 @@ class _ProxyToolRuntime:
                             # All content was tool_use — drop the message entirely
                             chain = chain[:-1]
 
+        # Strip leading orphaned tool_result blocks from the first message.
+        # When the previous chain's trailing tool_use was stripped above,
+        # this chain's first user message may reference those gone IDs.
+        # Collect tool_use IDs present in this chain to know which are valid.
+        if chain:
+            _chain_tool_use_ids: set[str] = set()
+            for _cm in chain:
+                if not isinstance(_cm, dict):
+                    continue
+                _cc = _cm.get("content", [])
+                if isinstance(_cc, list):
+                    for _cb in _cc:
+                        if (
+                            isinstance(_cb, dict)
+                            and _cb.get("type") == "tool_use"
+                        ):
+                            _tid = _cb.get("id")
+                            if _tid:
+                                _chain_tool_use_ids.add(_tid)
+
+            first = chain[0]
+            if isinstance(first, dict) and first.get("role") in ("user", "human"):
+                fc = first.get("content", [])
+                if isinstance(fc, list):
+                    orphaned = [
+                        b for b in fc
+                        if (
+                            isinstance(b, dict)
+                            and b.get("type") == "tool_result"
+                            and b.get("tool_use_id") not in _chain_tool_use_ids
+                        )
+                    ]
+                    if orphaned:
+                        cleaned_first = [
+                            b for b in fc
+                            if not (
+                                isinstance(b, dict)
+                                and b.get("type") == "tool_result"
+                                and b.get("tool_use_id") not in _chain_tool_use_ids
+                            )
+                        ]
+                        if cleaned_first:
+                            first = dict(first)
+                            first["content"] = cleaned_first
+                            chain[0] = first
+                        else:
+                            chain = chain[1:]
+
         target = self._get_target_body()
         if not isinstance(target, dict):
             return {"error": "no mutable payload available for chain restore"}
