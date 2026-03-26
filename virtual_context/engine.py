@@ -1370,6 +1370,7 @@ class VirtualContextEngine:
         max_loops: int | None = None,
         provider: str = "anthropic",
         extended_thinking: bool = False,
+        tool_runtime=None,
     ) -> "ToolLoopResult":
         """Send a query to an LLM with VC tool support.
 
@@ -1429,6 +1430,7 @@ class VirtualContextEngine:
             max_loops=max_loops,
             provider=provider,
             extended_thinking=extended_thinking,
+            tool_runtime=tool_runtime,
         )
 
     def get_telemetry(self) -> TelemetryLedger:

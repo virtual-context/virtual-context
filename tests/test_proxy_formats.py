@@ -1435,6 +1435,7 @@ class TestPagingToolSupport:
         assert "vc_expand_topic" in names
         assert "vc_collapse_topic" not in names
         assert "vc_find_quote" in names
+        assert "vc_restore_tool" not in names
 
     def test_server_inject_vc_tools_anthropic(self):
         from virtual_context.proxy.server import _inject_vc_tools
@@ -1448,6 +1449,7 @@ class TestPagingToolSupport:
         tool_names = [t["name"] for t in result["tools"]]
         assert "vc_expand_topic" in tool_names
         assert "vc_collapse_topic" not in tool_names
+        assert "vc_restore_tool" not in tool_names
 
     def test_server_build_continuation_gemini(self):
         from virtual_context.proxy.server import _build_continuation_request
@@ -1516,6 +1518,7 @@ class TestPagingToolSupport:
         assert "vc_expand_topic" in names
         assert "vc_collapse_topic" not in names
         assert "vc_find_quote" in names
+        assert "vc_restore_tool" not in names
         # Verify Responses API format (type: "function")
         assert all(t["type"] == "function" for t in result["tools"])
 

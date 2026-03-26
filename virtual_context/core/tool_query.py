@@ -44,6 +44,7 @@ class ToolQueryRunner:
         max_loops: int | None = None,
         provider: str = "anthropic",
         extended_thinking: bool = False,
+        tool_runtime=None,
     ) -> ToolLoopResult:
         """Send a query to an LLM with VC tool support.
 
@@ -95,7 +96,7 @@ class ToolQueryRunner:
             _parse_provider_http_response,
             get_adapter,
             run_tool_loop,
-            vc_tool_definitions,
+            vc_tool_definitions_for_runtime,
         )
         from ..types import ToolLoopResult as _ToolLoopResult
 
@@ -111,7 +112,7 @@ class ToolQueryRunner:
         )
         all_tools: list[dict] = []
         if inject_vc:
-            all_tools.extend(vc_tool_definitions())
+            all_tools.extend(vc_tool_definitions_for_runtime(tool_runtime))
         if tools:
             all_tools.extend(tools)
 
@@ -208,6 +209,7 @@ class ToolQueryRunner:
                 self._engine, data, body, adapter,
                 url=url, max_loops=effective_loops,
                 extra_headers=_extra_hdrs or None,
+                tool_runtime=tool_runtime,
             )
             # Prepend the initial request to raw_requests
             loop_result.raw_requests.insert(0, body)

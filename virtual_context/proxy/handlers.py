@@ -122,6 +122,44 @@ def _restore_tool_stub_in_place(body: dict, fmt, ref: str, full_content: str) ->
     return False
 
 
+class _ProxyToolRuntime:
+    """Shared VC tool runtime backed by the proxy's mutable request body."""
+
+    def __init__(
+        self,
+        engine,
+        api_format: str,
+        conversation_id: str,
+        get_target_body,
+    ) -> None:
+        self._engine = engine
+        self._api_format = api_format
+        self._conversation_id = conversation_id
+        self._get_target_body = get_target_body
+
+    def has_restorable_stubs(self) -> bool:
+        return True
+
+    def restore_tool_output(self, ref: str) -> dict:
+        full_content = self._engine._store.get_tool_output_by_ref(
+            self._conversation_id, ref,
+        )
+        if full_content is None:
+            return {"error": f"tool output ref {ref} not found"}
+
+        target = self._get_target_body()
+        if not isinstance(target, dict):
+            return {"error": "no mutable payload available for vc_restore_tool"}
+
+        fmt = get_format(self._api_format)
+        restored = _restore_tool_stub_in_place(
+            target, fmt, ref, full_content,
+        )
+        if not restored:
+            return {"error": f"stub for ref {ref} not found in current payload"}
+        return {"restored": True, "ref": ref}
+
+
 async def _passthrough(
     client: httpx.AsyncClient,
     request: Request,
@@ -588,6 +626,12 @@ async def _handle_streaming(
                 cont_body: dict | None = None
                 cont_data: dict | None = None
                 loop_content_blocks: list[dict] = []
+                tool_runtime = _ProxyToolRuntime(
+                    engine=state.engine,
+                    api_format=api_format,
+                    conversation_id=conversation_id,
+                    get_target_body=lambda: cont_body if cont_body is not None else body,
+                )
 
                 for loop_i in range(_MAX_CONTINUATION_LOOPS):
                     # Execute VC tools
@@ -598,34 +642,12 @@ async def _handle_streaming(
                         t_tool = time.monotonic()
                         tool_name = tool["name"]
                         tool_input = tool["input"]
-
-                        if tool_name == "vc_restore_tool":
-                            # In-place restore: find the stub in the
-                            # current payload and replace with full content
-                            ref = tool_input.get("ref", "")
-                            full_content = state.engine._store.get_tool_output_by_ref(
-                                conversation_id, ref,
-                            )
-                            if full_content is None:
-                                result_str = json.dumps({"error": f"tool output ref {ref} not found"})
-                            else:
-                                # Determine target body to mutate: cont_body
-                                # for rounds > 1, original body for round 1
-                                _target = cont_body if cont_body is not None else body
-                                _fmt = get_format(api_format)
-                                _restored = _restore_tool_stub_in_place(
-                                    _target, _fmt, ref, full_content,
-                                )
-                                if _restored:
-                                    result_str = json.dumps({"restored": True, "ref": ref})
-                                else:
-                                    result_str = json.dumps({"error": f"stub for ref {ref} not found in current payload"})
-                        else:
-                            result_str = execute_vc_tool(
-                                state.engine,
-                                tool_name,
-                                tool_input,
-                            )
+                        result_str = execute_vc_tool(
+                            state.engine,
+                            tool_name,
+                            tool_input,
+                            tool_runtime=tool_runtime,
+                        )
                         tool_ms = round(
                             (time.monotonic() - t_tool) * 1000, 1,
                         )

@@ -13,7 +13,7 @@ import copy
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import httpx
 
@@ -34,6 +34,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 VC_FIND_QUOTE_MAX_RESULTS = 20
+
+
+@runtime_checkable
+class VCToolRuntime(Protocol):
+    """Mutable request-body runtime for VC tools that need in-place effects."""
+
+    def has_restorable_stubs(self) -> bool:
+        """Whether the current in-flight payload contains restoreable stubs."""
+
+    def restore_tool_output(self, ref: str) -> dict:
+        """Restore a stubbed tool output in the active payload and return a result."""
 
 # ---------------------------------------------------------------------------
 # Tool catalogue
@@ -245,6 +256,31 @@ def vc_tool_definitions() -> list[dict]:
             },
         },
     ]
+
+
+def _runtime_supports_restore(tool_runtime: VCToolRuntime | None) -> bool:
+    """Whether *tool_runtime* can currently advertise vc_restore_tool."""
+    if tool_runtime is None:
+        return False
+    try:
+        return bool(tool_runtime.has_restorable_stubs())
+    except Exception:
+        logger.debug("VC tool runtime restore capability check failed", exc_info=True)
+        return False
+
+
+def vc_tool_definitions_for_runtime(
+    tool_runtime: VCToolRuntime | None = None,
+    *,
+    restore_available: bool | None = None,
+) -> list[dict]:
+    """Return the VC tool catalogue filtered for the active runtime."""
+    defs = vc_tool_definitions()
+    if restore_available is None:
+        restore_available = _runtime_supports_restore(tool_runtime)
+    if restore_available:
+        return defs
+    return [d for d in defs if d.get("name") != "vc_restore_tool"]
 
 
 _SUPPRESSION_MARKER = "[Older session ("
@@ -557,6 +593,7 @@ def execute_vc_tool(
     intent_context: str = "",
     presented_segment_refs: set[str] | None = None,
     presented_fact_ids: set[str] | None = None,
+    tool_runtime: VCToolRuntime | None = None,
 ) -> str:
     """Execute a VC paging tool and return a JSON result string.
 
@@ -773,10 +810,11 @@ def execute_vc_tool(
                 max_results=tool_input.get("max_results", engine.config.search.remember_when_max_results),
             )
         elif name == "vc_restore_tool":
-            # vc_restore_tool is proxy-handled — it mutates the in-flight
-            # payload, which only the proxy can do. If it reaches here,
-            # the caller is not the proxy continuation loop.
-            result = {"error": "vc_restore_tool is handled by the proxy, not the engine tool executor"}
+            ref = tool_input.get("ref", "")
+            if not _runtime_supports_restore(tool_runtime):
+                result = {"error": "vc_restore_tool unavailable: no restorable payload runtime"}
+            else:
+                result = tool_runtime.restore_tool_output(ref)
         else:
             result = {"error": f"unknown VC tool: {name}"}
         return json.dumps(result)
@@ -905,6 +943,7 @@ def _execute_pending_tools(
     intent_context: str,
     presented_refs: set[str],
     presented_facts: set[str],
+    tool_runtime: VCToolRuntime | None = None,
 ) -> list[dict]:
     """Execute pending VC tool calls, record them, return provider-formatted results."""
     tool_results: list[dict] = []
@@ -915,6 +954,7 @@ def _execute_pending_tools(
             intent_context=intent_context,
             presented_segment_refs=presented_refs,
             presented_fact_ids=presented_facts,
+            tool_runtime=tool_runtime,
         )
         dur = round((time.monotonic() - t0) * 1000, 1)
         result.tool_calls.append(ToolCallRecord(
@@ -1013,6 +1053,7 @@ def run_tool_loop(
     url: str = "",
     max_loops: int = _DEFAULT_MAX_LOOPS,
     extra_headers: dict | None = None,
+    tool_runtime: VCToolRuntime | None = None,
 ) -> ToolLoopResult:
     """Run a synchronous non-streaming tool loop.
 
@@ -1117,6 +1158,7 @@ def run_tool_loop(
                     intent_context=intent_context,
                     presented_segment_refs=presented_refs,
                     presented_fact_ids=presented_facts,
+                    tool_runtime=tool_runtime,
                 )
                 duration_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -1245,6 +1287,7 @@ def run_tool_loop(
                         forced_results = _execute_pending_tools(
                             engine, vc_tools, adapter, result,
                             intent_context, presented_refs, presented_facts,
+                            tool_runtime=tool_runtime,
                         )
                         _force_text_response(
                             client, url, headers, cont_body,
@@ -1271,6 +1314,7 @@ def run_tool_loop(
                 forced_results = _execute_pending_tools(
                     engine, vc_tools, adapter, result,
                     intent_context, presented_refs, presented_facts,
+                    tool_runtime=tool_runtime,
                 )
                 _force_text_response(
                     client, url, headers, cont_body,

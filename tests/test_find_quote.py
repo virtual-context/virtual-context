@@ -344,7 +344,7 @@ class TestProxyFindQuoteTool:
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
         assert "vc_remember_when" in names
-        assert len(tools) == 5  # expand, find_quote, query_facts, recall_all, remember_when
+        assert len(tools) == 6  # shared VC catalogue also includes vc_restore_tool
 
     def test_find_quote_tool_schema(self):
         from virtual_context.core.tool_loop import vc_tool_definitions

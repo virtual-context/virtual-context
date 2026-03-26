@@ -635,6 +635,7 @@ async def prepare_payload(
                 enriched_body,
                 state.engine,
                 require_tool_use=require_tools,
+                restore_available=_tool_stubs_present,
             )
             paging_enabled = True
             _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
