@@ -237,9 +237,14 @@ def vc_tool_definitions() -> list[dict]:
         {
             "name": "vc_restore_tool",
             "description": (
-                "Restore a previously stubbed tool output in place. Use when "
-                "you see a stub like [tool output ref=... | call "
-                "vc_restore_tool(ref=...)]."
+                "Restore compacted conversation history in place. Compacted turns "
+                "marked with [Compacted turn N | ... | vc_restore_tool(ref=...)] "
+                "contain the FULL original conversation including thinking blocks, "
+                "tool calls, tool outputs, and all details that the summary omits. "
+                "Call this when you need the exact original content — raw command "
+                "output, file contents, detailed reasoning, per-test results, etc. "
+                "The ref is in the stub text. Supports both chain_ refs (full turn "
+                "chain restore) and tool_ refs (single tool output restore)."
             ),
             "input_schema": {
                 "type": "object",
@@ -247,8 +252,8 @@ def vc_tool_definitions() -> list[dict]:
                     "ref": {
                         "type": "string",
                         "description": (
-                            "The tool output ref from the stub "
-                            "(e.g. tool_abc123def)"
+                            "The ref from the compacted stub "
+                            "(e.g. chain_5_abc123 or tool_abc123def)"
                         ),
                     },
                 },
