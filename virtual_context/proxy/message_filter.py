@@ -1698,11 +1698,26 @@ def collapse_turn_chains(
     # 7. Build new message list with collapsed chains
     # ------------------------------------------------------------------
     # Collect all global indices that belong to collapsed chains
+    # and all tool_use IDs within those chains (for orphan cleanup).
     collapsed_indices: set[int] = set()
+    collapsed_tool_use_ids: set[str] = set()
     for chain_idx, (ref, stub_user, stub_asst) in collapse_map.items():
         chain = pairs[chain_idx]
         for gi in chain:
             collapsed_indices.add(gi)
+            msg = messages[gi]
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                    ):
+                        _tid = block.get("id")
+                        if _tid:
+                            collapsed_tool_use_ids.add(_tid)
 
     # Build index → insertion stubs map
     insert_at: dict[int, tuple[dict, dict]] = {}
@@ -1718,7 +1733,23 @@ def collapse_turn_chains(
                 new_messages.append(stub_asst)
             # else: skip (interior of a collapsed chain)
         else:
-            new_messages.append(messages[mi])
+            msg = messages[mi]
+            # Strip orphaned tool_result blocks whose tool_use was collapsed
+            if collapsed_tool_use_ids and isinstance(msg, dict):
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    cleaned = [
+                        block for block in content
+                        if not (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                            and block.get("tool_use_id") in collapsed_tool_use_ids
+                        )
+                    ]
+                    if len(cleaned) != len(content):
+                        msg = dict(msg)
+                        msg["content"] = cleaned if cleaned else [{"type": "text", "text": "[tool results removed — parent tool call was compacted]"}]
+            new_messages.append(msg)
 
     body = dict(body)
     body[_msg_key] = new_messages
