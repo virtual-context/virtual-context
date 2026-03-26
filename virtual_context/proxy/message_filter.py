@@ -1678,7 +1678,8 @@ def collapse_turn_chains(
         # Build explicit restore instruction
         stub_text = (
             f"[{desc_line}.\n"
-            f'To restore full output: {{"type": "tool_use", "name": "vc_restore_tool", '
+            f'To restore and uncompact full tool call results in place: '
+            f'{{"type": "tool_use", "name": "vc_restore_tool", '
             f'"input": {{"ref": "{ref}"}}}}]'
         )
         stub_asst = {

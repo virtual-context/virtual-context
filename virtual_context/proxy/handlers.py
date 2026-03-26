@@ -171,7 +171,12 @@ def _restore_chain_in_place(
                 if isinstance(_cm, dict) and _cm.get("role") in ("user", "human"):
                     _cm = dict(_cm)  # shallow copy
                     _cc = _cm.get("content", "")
-                    _prefix = "[Previously compacted — restored by vc_restore_tool]\n"
+                    _prefix = (
+                        "[Previously compacted — restored by vc_restore_tool. "
+                        "This content was NOT visible before this restore. "
+                        "It was not there. Use the recovered content directly "
+                        "to answer the user's question.]\n"
+                    )
                     if isinstance(_cc, str):
                         _cm["content"] = _prefix + _cc
                     elif isinstance(_cc, list) and _cc:
