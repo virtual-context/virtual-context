@@ -38,10 +38,14 @@ class ContextAssembler:
         config: AssemblerConfig,
         token_counter: Callable[[str], int] | None = None,
         tag_rules: list[TagPromptRule] | None = None,
+        store: object | None = None,
+        conversation_id: str = "",
     ) -> None:
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self.tag_rules = tag_rules or []
+        self._store = store
+        self._conversation_id = conversation_id
 
     def assemble(
         self,
@@ -331,6 +335,8 @@ class ContextAssembler:
             tool_tags = [t for t in s.tags if t.startswith("tool_")]
             if tool_tags:
                 text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
+            # Tool-enriched segment summary: append tool hint at assembly time
+            text = self._maybe_append_tool_hint(text, s.ref)
             summary_texts.append(text)
 
         body = "\n\n---\n\n".join(summary_texts)
@@ -353,10 +359,11 @@ class ContextAssembler:
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
             session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
+            summary_text = self._maybe_append_tool_hint(seg.summary, seg.ref)
             parts.append(
                 f'<virtual-context tags="{tags_attr}" depth="segments" '
                 f'ref="{seg.ref}"{session_attr} created="{seg.created_at.isoformat()}">\n'
-                f"{seg.summary}\n"
+                f"{summary_text}\n"
                 f"</virtual-context>"
             )
         return "\n\n".join(parts)
@@ -381,6 +388,31 @@ class ContextAssembler:
                 f"</virtual-context>"
             )
         return "\n\n".join(parts)
+
+    def _maybe_append_tool_hint(self, text: str, segment_ref: str) -> str:
+        """Append a tool hint to summary text if the segment has linked tool outputs.
+
+        Queries the store at assembly time to discover tool names linked via
+        segment_tool_outputs, then appends a hint like:
+        [Tools: Bash, Read, Glob -- 48 outputs restorable via vc_restore_tool]
+        """
+        if not self._store or not self._conversation_id or not segment_ref:
+            return text
+        store = self._store
+        get_refs = getattr(store, "get_tool_outputs_for_segment", None)
+        get_names = getattr(store, "get_tool_names_for_segment", None)
+        if not callable(get_refs) or not callable(get_names):
+            return text
+        try:
+            refs = get_refs(self._conversation_id, segment_ref)
+            if not refs:
+                return text
+            names = get_names(self._conversation_id, segment_ref)
+            names_str = ", ".join(names) if names else "tools"
+            text += f"\n[Tools: {names_str} \u2014 {len(refs)} outputs restorable via vc_restore_tool]"
+        except Exception:
+            logger.debug("Failed to enrich segment %s with tool hint", segment_ref, exc_info=True)
+        return text
 
     def _trim_conversation(self, history: list[Message], budget: int) -> list[Message]:
         if budget <= 0:

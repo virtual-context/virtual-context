@@ -248,6 +248,16 @@ CREATE TABLE IF NOT EXISTS segment_tool_outputs (
     tool_output_ref TEXT NOT NULL,
     PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
 );
+
+CREATE TABLE IF NOT EXISTS chain_snapshots (
+    ref TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    chain_json TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    tool_output_refs TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
 """
 
 # Postgres FTS: tsvector columns + GIN indexes
@@ -853,6 +863,7 @@ class PostgresStore(ContextStore):
                 "tag_summary_embeddings",
                 "turn_tool_outputs",
                 "segment_tool_outputs",
+                "chain_snapshots",
             ):
                 self._delete_conversation_rows(conn, table, conversation_id)
         return deleted
@@ -1125,6 +1136,61 @@ class PostgresStore(ContextStore):
             (conversation_id, ref),
         ).fetchone()
         return row["content"] if row else None
+
+    # ------------------------------------------------------------------
+    # Chain Snapshots (turn chain collapse)
+    # ------------------------------------------------------------------
+
+    def store_chain_snapshot(
+        self,
+        ref: str,
+        conversation_id: str,
+        turn_number: int,
+        chain_json: str,
+        message_count: int,
+        tool_output_refs: str = "",
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO chain_snapshots
+            (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ref) DO UPDATE SET
+                chain_json=EXCLUDED.chain_json, message_count=EXCLUDED.message_count,
+                tool_output_refs=EXCLUDED.tool_output_refs""",
+            (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs,
+             _dt_to_str(datetime.now(timezone.utc))),
+        )
+
+    def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs
+            FROM chain_snapshots WHERE conversation_id = %s AND ref = %s""",
+            (conversation_id, ref),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "ref": row["ref"],
+            "conversation_id": row["conversation_id"],
+            "turn_number": row["turn_number"],
+            "chain_json": row["chain_json"],
+            "message_count": row["message_count"],
+            "tool_output_refs": row["tool_output_refs"],
+        }
+
+    def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT DISTINCT t.tool_name
+            FROM segment_tool_outputs s
+            JOIN tool_outputs t ON t.ref = s.tool_output_ref AND t.conversation_id = s.conversation_id
+            WHERE s.conversation_id = %s AND s.segment_ref = %s
+            ORDER BY t.tool_name""",
+            (conversation_id, segment_ref),
+        ).fetchall()
+        return [row["tool_name"] for row in rows]
 
     def save_request_capture(self, capture: dict) -> None:
         conn = self._get_conn()

@@ -345,6 +345,25 @@ class CompositeStore:
     def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
         return self._search.get_tool_output_by_ref(conversation_id, ref)
 
+    def store_chain_snapshot(
+        self,
+        ref: str,
+        conversation_id: str,
+        turn_number: int,
+        chain_json: str,
+        message_count: int,
+        tool_output_refs: str = "",
+    ) -> None:
+        return self._search.store_chain_snapshot(
+            ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs,
+        )
+
+    def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
+        return self._search.get_chain_snapshot(conversation_id, ref)
+
+    def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        return self._search.get_tool_names_for_segment(conversation_id, segment_ref)
+
     def save_request_context(self, context: dict) -> None:
         return self._search.save_request_context(context)
 

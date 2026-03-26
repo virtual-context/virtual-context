@@ -597,20 +597,39 @@ async def prepare_payload(
         elif _pre_compaction and _pcf_mode == "off":
             logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
 
-    # Position-based tool output stubbing — active path only
+    # Tool output handling — active path only
+    # Stage gate: post-compaction uses full chain collapse (stage 2),
+    # pre-compaction uses position-based tool result stubbing (stage 1).
     _tool_stubs_present = False
     if state and state.engine.config.tool_output.enabled:
-        from .message_filter import stub_tool_outputs_by_position
-        body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
-            body, fmt,
-            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-            turn_tag_index=state.engine._turn_tag_index,
-            store=state.engine._store,
-            conversation_id=state.engine.config.conversation_id,
-        )
-        if _stub_count:
-            _tool_stubs_present = True
-            logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
+        _ct = int(state.engine._engine_state.compacted_through)
+        if _ct > 0:
+            # Stage 2: full chain collapse (post-compaction)
+            from .message_filter import collapse_turn_chains
+            body, _collapse_count, _chain_refs = collapse_turn_chains(
+                body, fmt,
+                pre_filter_body=_pre_filter_body,
+                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                turn_tag_index=state.engine._turn_tag_index,
+                store=state.engine._store,
+                conversation_id=state.engine.config.conversation_id,
+            )
+            if _collapse_count:
+                _tool_stubs_present = True
+                logger.info("CHAIN-COLLAPSE: collapsed %d turn chains (%d chain refs)", _collapse_count, len(_chain_refs))
+        else:
+            # Stage 1: tool result stubbing only (pre-compaction)
+            from .message_filter import stub_tool_outputs_by_position
+            body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
+                body, fmt,
+                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                turn_tag_index=state.engine._turn_tag_index,
+                store=state.engine._store,
+                conversation_id=state.engine.config.conversation_id,
+            )
+            if _stub_count:
+                _tool_stubs_present = True
+                logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
 
     enriched_body = _inject_context(body, prepend_text, api_format)
 

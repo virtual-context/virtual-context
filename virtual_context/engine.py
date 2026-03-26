@@ -427,6 +427,8 @@ class VirtualContextEngine:
             config=self.config.assembler,
             token_counter=self._token_counter,
             tag_rules=self.config.tag_rules,
+            store=self._store,
+            conversation_id=self.config.conversation_id,
         )
 
     def _init_retriever(self) -> None:
