@@ -348,6 +348,24 @@ class Neo4jFactStore:
             record = result.single()
             return record["cnt"] if record else 0
 
+    def delete_conversation(self, conversation_id: str) -> int:
+        with self._driver.session() as session:
+            result = session.run(
+                "MATCH (f:Fact {conversation_id: $conversation_id}) RETURN count(f) AS cnt",
+                conversation_id=conversation_id,
+            )
+            record = result.single()
+            deleted = int(record["cnt"]) if record else 0
+            if deleted:
+                session.run(
+                    "MATCH (f:Fact {conversation_id: $conversation_id}) DETACH DELETE f",
+                    conversation_id=conversation_id,
+                )
+                session.run(
+                    "MATCH (t:Tag) WHERE NOT (t)<-[:HAS_TAG]-(:Fact) DELETE t",
+                )
+            return deleted
+
     def migrate_supersession_to_links(self) -> int:
         """Migrate superseded_by properties to SUPERSEDES FACT_LINK edges."""
         with self._driver.session() as session:

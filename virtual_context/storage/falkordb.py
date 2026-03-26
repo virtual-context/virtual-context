@@ -323,6 +323,22 @@ class FalkorDBFactStore:
         )
         return rows[0][0] if rows else 0
 
+    def delete_conversation(self, conversation_id: str) -> int:
+        rows = self._query(
+            "MATCH (f:Fact {conversation_id: $conversation_id}) RETURN count(f) AS cnt",
+            {"conversation_id": conversation_id},
+        )
+        deleted = int(rows[0][0]) if rows else 0
+        if deleted:
+            self._query(
+                "MATCH (f:Fact {conversation_id: $conversation_id}) DETACH DELETE f",
+                {"conversation_id": conversation_id},
+            )
+            self._query(
+                "MATCH (t:Tag) WHERE NOT (t)<-[:HAS_TAG]-(:Fact) DELETE t",
+            )
+        return deleted
+
     def migrate_supersession_to_links(self) -> int:
         rows = self._query(
             "MATCH (old:Fact) WHERE old.superseded_by IS NOT NULL AND old.superseded_by <> '' "

@@ -87,6 +87,32 @@ class ConsolidationResult:
 
 # ── core logic ──────────────────────────────────────────────────────────
 
+def _store_conversation_id(store: ContextStore) -> str:
+    conversation_id = getattr(store, "conversation_id", "")
+    return conversation_id if isinstance(conversation_id, str) else ""
+
+
+def _get_store_aliases(store: ContextStore) -> dict[str, str]:
+    getter = getattr(store, "get_tag_aliases", None)
+    if not callable(getter):
+        return {}
+    conversation_id = _store_conversation_id(store)
+    try:
+        return getter(conversation_id=conversation_id or None)
+    except TypeError:
+        return getter()
+
+
+def _set_store_alias(store: ContextStore, alias: str, canonical: str) -> None:
+    setter = getattr(store, "set_tag_alias", None)
+    if not callable(setter):
+        return
+    conversation_id = _store_conversation_id(store)
+    try:
+        setter(alias, canonical, conversation_id=conversation_id)
+    except TypeError:
+        setter(alias, canonical)
+
 def consolidate_tags(
     store: ContextStore,
     llm: LLMProvider,
@@ -171,11 +197,11 @@ def consolidate_tags(
         return result
 
     # Write aliases
-    existing_aliases = store.get_tag_aliases()
+    existing_aliases = _get_store_aliases(store)
     for group in all_groups:
         for alias in group.aliases:
             if alias not in existing_aliases:
-                store.set_tag_alias(alias, group.canonical)
+                _set_store_alias(store, alias, group.canonical)
                 result.aliases_written += 1
 
     logger.info("Wrote %d new aliases.", result.aliases_written)

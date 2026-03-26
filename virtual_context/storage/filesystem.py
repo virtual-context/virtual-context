@@ -177,6 +177,7 @@ class FilesystemStore(ContextStore):
         self._aliases_path = self.root / "_aliases.json"
         self._index: dict[str, dict] = {}
         self._aliases: dict[str, str] = {}
+        self._conversation_aliases: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
         self.search_config = None  # set by engine after construction
         self._ensure_root()
@@ -206,15 +207,47 @@ class FilesystemStore(ContextStore):
     def _load_aliases(self) -> None:
         if self._aliases_path.is_file():
             try:
-                self._aliases = json.loads(self._aliases_path.read_text())
+                raw = json.loads(self._aliases_path.read_text())
+                if (
+                    isinstance(raw, dict)
+                    and isinstance(raw.get("global"), dict)
+                    and isinstance(raw.get("by_conversation"), dict)
+                ):
+                    self._aliases = {
+                        str(alias): str(canonical)
+                        for alias, canonical in raw.get("global", {}).items()
+                    }
+                    self._conversation_aliases = {
+                        str(conv_id): {
+                            str(alias): str(canonical)
+                            for alias, canonical in aliases.items()
+                        }
+                        for conv_id, aliases in raw.get("by_conversation", {}).items()
+                        if isinstance(aliases, dict)
+                    }
+                elif isinstance(raw, dict):
+                    self._aliases = {
+                        str(alias): str(canonical)
+                        for alias, canonical in raw.items()
+                    }
+                    self._conversation_aliases = {}
+                else:
+                    self._aliases = {}
+                    self._conversation_aliases = {}
             except (json.JSONDecodeError, OSError):
                 self._aliases = {}
+                self._conversation_aliases = {}
         else:
             self._aliases = {}
+            self._conversation_aliases = {}
 
     def _save_aliases(self) -> None:
         tmp_path = self._aliases_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(self._aliases, indent=2))
+        payload = {
+            "global": self._aliases,
+            "by_conversation": self._conversation_aliases,
+        }
+        tmp_path.write_text(json.dumps(payload, indent=2))
         os.replace(str(tmp_path), str(self._aliases_path))
 
     def _segment_path(self, primary_tag: str, ref: str) -> Path:
@@ -446,13 +479,32 @@ class FilesystemStore(ContextStore):
             reverse=True,
         )
 
-    def get_tag_aliases(self) -> dict[str, str]:
-        return dict(self._aliases)
+    def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
+        aliases = dict(self._aliases)
+        if conversation_id:
+            aliases.update(self._conversation_aliases.get(conversation_id, {}))
+        return aliases
 
-    def set_tag_alias(self, alias: str, canonical: str) -> None:
+    def set_tag_alias(
+        self,
+        alias: str,
+        canonical: str,
+        conversation_id: str = "",
+    ) -> None:
         with self._lock:
-            self._aliases[alias] = canonical
+            if conversation_id:
+                self._conversation_aliases.setdefault(conversation_id, {})[alias] = canonical
+            else:
+                self._aliases[alias] = canonical
             self._save_aliases()
+
+    def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
+        with self._lock:
+            removed = len(self._conversation_aliases.get(conversation_id, {}))
+            if removed:
+                self._conversation_aliases.pop(conversation_id, None)
+                self._save_aliases()
+            return removed
 
     def delete_segment(self, ref: str) -> bool:
         with self._lock:
@@ -962,6 +1014,10 @@ class FilesystemStore(ContextStore):
                     if (capture.get("conversation_id", "") or "") != conversation_id
                 ]
                 captures_path.write_text(json.dumps(captures, indent=2))
+
+            if conversation_id in self._conversation_aliases:
+                self._conversation_aliases.pop(conversation_id, None)
+                self._save_aliases()
 
         return deleted
 

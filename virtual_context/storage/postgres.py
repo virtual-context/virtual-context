@@ -60,8 +60,10 @@ CREATE TABLE IF NOT EXISTS segment_tags (
 );
 
 CREATE TABLE IF NOT EXISTS tag_aliases (
-    alias TEXT PRIMARY KEY,
-    canonical TEXT NOT NULL
+    alias TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (alias, conversation_id)
 );
 
 CREATE TABLE IF NOT EXISTS tag_summaries (
@@ -483,6 +485,49 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             pass
+        try:
+            conn.execute("""
+                DO $$ DECLARE
+                    pk_cols text[];
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'tag_aliases'
+                    ) THEN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='tag_aliases' AND column_name='conversation_id'
+                        ) THEN
+                            ALTER TABLE tag_aliases
+                                ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
+                        END IF;
+
+                        SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+                        INTO pk_cols
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                         AND tc.table_name = kcu.table_name
+                        WHERE tc.table_name = 'tag_aliases'
+                          AND tc.constraint_type = 'PRIMARY KEY';
+
+                        IF pk_cols IS NULL OR pk_cols <> ARRAY['alias', 'conversation_id'] THEN
+                            IF EXISTS (
+                                SELECT 1 FROM information_schema.table_constraints
+                                WHERE table_name='tag_aliases'
+                                  AND constraint_type='PRIMARY KEY'
+                            ) THEN
+                                ALTER TABLE tag_aliases DROP CONSTRAINT tag_aliases_pkey;
+                            END IF;
+                            ALTER TABLE tag_aliases
+                                ADD PRIMARY KEY (alias, conversation_id);
+                        END IF;
+                    END IF;
+                END $$;
+            """)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Helpers
@@ -745,17 +790,44 @@ class PostgresStore(ContextStore):
             ))
         return results
 
-    def get_tag_aliases(self) -> dict[str, str]:
+    def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
         conn = self._get_conn()
-        rows = conn.execute("SELECT alias, canonical FROM tag_aliases").fetchall()
-        return {row["alias"]: row["canonical"] for row in rows}
+        params: list[object] = []
+        query = "SELECT alias, canonical, conversation_id FROM tag_aliases"
+        if conversation_id:
+            query += " WHERE conversation_id IN ('', %s)"
+            params.append(conversation_id)
+        else:
+            query += " WHERE conversation_id = ''"
+        query += " ORDER BY CASE WHEN conversation_id = '' THEN 0 ELSE 1 END, alias"
+        rows = conn.execute(query, params).fetchall()
+        aliases: dict[str, str] = {}
+        for row in rows:
+            aliases[row["alias"]] = row["canonical"]
+        return aliases
 
-    def set_tag_alias(self, alias: str, canonical: str) -> None:
+    def set_tag_alias(
+        self,
+        alias: str,
+        canonical: str,
+        conversation_id: str = "",
+    ) -> None:
         conn = self._get_conn()
         conn.execute(
-            "INSERT INTO tag_aliases (alias, canonical) VALUES (%s, %s) ON CONFLICT (alias) DO UPDATE SET canonical = EXCLUDED.canonical",
-            (alias, canonical),
+            """INSERT INTO tag_aliases (alias, conversation_id, canonical)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (alias, conversation_id)
+            DO UPDATE SET canonical = EXCLUDED.canonical""",
+            (alias, conversation_id or "", canonical),
         )
+
+    def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM tag_aliases WHERE conversation_id = %s",
+            (conversation_id,),
+        )
+        return int(cur.rowcount or 0)
 
     def delete_segment(self, ref: str) -> bool:
         conn = self._get_conn()
@@ -856,6 +928,7 @@ class PostgresStore(ContextStore):
                 "facts",
                 "turn_messages",
                 "tag_summaries",
+                "tag_aliases",
                 "request_captures",
                 "tool_outputs",
                 "tool_calls",

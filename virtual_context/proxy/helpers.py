@@ -469,7 +469,9 @@ def _dump_session_state(
         # Tag aliases
         aliases: dict[str, str] = {}
         try:
-            aliases = engine._store.get_tag_aliases()
+            aliases = engine._store.get_tag_aliases(
+                conversation_id=engine.config.conversation_id,
+            )
         except Exception:
             logger.debug("tag aliases collection failed", exc_info=True)
 

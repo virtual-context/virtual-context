@@ -89,11 +89,20 @@ class CompositeStore:
     def get_conversation_stats(self) -> list[ConversationStats]:
         return self._segments.get_conversation_stats()
 
-    def get_tag_aliases(self) -> dict[str, str]:
-        return self._segments.get_tag_aliases()
+    def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
+        return self._segments.get_tag_aliases(conversation_id=conversation_id)
 
-    def set_tag_alias(self, alias: str, canonical: str) -> None:
-        return self._segments.set_tag_alias(alias, canonical)
+    def set_tag_alias(
+        self,
+        alias: str,
+        canonical: str,
+        conversation_id: str = "",
+    ) -> None:
+        return self._segments.set_tag_alias(
+            alias,
+            canonical,
+            conversation_id=conversation_id,
+        )
 
     def delete_segment(self, ref: str) -> bool:
         return self._segments.delete_segment(ref)
@@ -151,6 +160,12 @@ class CompositeStore:
                 int(store.delete_conversation(conversation_id) or 0),
             )
         return deleted
+
+    def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
+        delete_aliases = getattr(self._segments, "delete_tag_aliases_for_conversation", None)
+        if callable(delete_aliases):
+            return int(delete_aliases(conversation_id) or 0)
+        return 0
 
     def save_turn_message(
         self, conversation_id: str, turn_number: int,

@@ -297,6 +297,8 @@ async def prepare_payload(
         if state._initial_payload_kb is None:
             state._initial_payload_kb = _payload_kb
             state._initial_payload_tokens = _inbound_tokens
+        if state.is_conversation_deleted():
+            state = None
 
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
@@ -329,17 +331,18 @@ async def prepare_payload(
             # On first request: kick off non-blocking ingestion
             if not state._history_ingested():
                 history_pairs = _extract_history_pairs(body)
-                if history_pairs:
+                if history_pairs and not state.is_conversation_deleted():
                     state.conversation_history = list(history_pairs)
                 await asyncio.to_thread(
                     state.start_ingestion_if_needed, history_pairs,
                 )
 
-            state.conversation_history.append(
-                Message(role="user", content=user_message,
-                        timestamp=datetime.now(timezone.utc),
-                        raw_content=fmt.extract_user_raw_content(body))
-            )
+            if not state.is_conversation_deleted():
+                state.conversation_history.append(
+                    Message(role="user", content=user_message,
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=fmt.extract_user_raw_content(body))
+                )
 
             _conversation_id = state.engine.config.conversation_id
             turn = len(state.engine._turn_tag_index.entries)
@@ -513,22 +516,23 @@ async def prepare_payload(
                 await asyncio.to_thread(state.wait_for_complete)
             wait_ms = round((time.monotonic() - t0) * 1000, 1)
 
-            state.conversation_history.append(
-                Message(role="user", content=user_message,
-                        timestamp=datetime.now(timezone.utc),
-                        raw_content=fmt.extract_user_raw_content(body))
-            )
+            if not state.is_conversation_deleted():
+                state.conversation_history.append(
+                    Message(role="user", content=user_message,
+                            timestamp=datetime.now(timezone.utc),
+                            raw_content=fmt.extract_user_raw_content(body))
+                )
 
-            t1 = time.monotonic()
-            assembled = await asyncio.to_thread(
-                state.engine.on_message_inbound,
-                user_message,
-                state.conversation_history,
-                body.get("model", ""),
-            )
-            inbound_ms = round((time.monotonic() - t1) * 1000, 1)
+                t1 = time.monotonic()
+                assembled = await asyncio.to_thread(
+                    state.engine.on_message_inbound,
+                    user_message,
+                    state.conversation_history,
+                    body.get("model", ""),
+                )
+                inbound_ms = round((time.monotonic() - t1) * 1000, 1)
 
-            prepend_text = assembled.prepend_text
+                prepend_text = assembled.prepend_text
         except Exception as e:
             logger.error("Engine error (forwarding unmodified): %s", e)
 

@@ -315,7 +315,10 @@ class VirtualContextEngine:
         self._temporal.reference_date = value
 
     def _init_canonicalizer(self) -> None:
-        self._canonicalizer = TagCanonicalizer(store=self._store)
+        self._canonicalizer = TagCanonicalizer(
+            store=self._store,
+            conversation_id=self.config.conversation_id,
+        )
         self._canonicalizer.load()
 
     def _init_tag_generator(self) -> None:

@@ -41,8 +41,10 @@ CREATE TABLE IF NOT EXISTS segment_tags (
 );
 
 CREATE TABLE IF NOT EXISTS tag_aliases (
-    alias TEXT PRIMARY KEY,
-    canonical TEXT NOT NULL
+    alias TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (alias, conversation_id)
 );
 
 CREATE TABLE IF NOT EXISTS cost_log (
@@ -342,6 +344,42 @@ class SQLiteStore(ContextStore):
         try:
             conn.execute("ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT")
         except Exception:
+            pass
+        try:
+            cur = conn.execute("PRAGMA table_info(tag_aliases)")
+            cols = cur.fetchall()
+            col_names = [row[1] for row in cols]
+            pk_names = [row[1] for row in sorted(cols, key=lambda row: row[5]) if row[5] > 0]
+            if col_names and (
+                "conversation_id" not in col_names
+                or pk_names != ["alias", "conversation_id"]
+            ):
+                legacy_rows = conn.execute(
+                    "SELECT alias, canonical FROM tag_aliases"
+                ).fetchall()
+                migrated_rows = [
+                    (row["alias"], "", row["canonical"])
+                    for row in legacy_rows
+                ]
+                conn.executescript("""
+                    DROP TABLE IF EXISTS tag_aliases_new;
+                    CREATE TABLE tag_aliases_new (
+                        alias TEXT NOT NULL,
+                        conversation_id TEXT NOT NULL DEFAULT '',
+                        canonical TEXT NOT NULL,
+                        PRIMARY KEY (alias, conversation_id)
+                    );
+                    DROP TABLE tag_aliases;
+                    ALTER TABLE tag_aliases_new RENAME TO tag_aliases;
+                """)
+                if migrated_rows:
+                    conn.executemany(
+                        """INSERT OR REPLACE INTO tag_aliases
+                        (alias, conversation_id, canonical)
+                        VALUES (?, ?, ?)""",
+                        migrated_rows,
+                    )
+        except sqlite3.OperationalError:
             pass
         try:
             cur = conn.execute("PRAGMA table_info(request_captures)")
@@ -1143,18 +1181,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
         return results
 
-    def get_tag_aliases(self) -> dict[str, str]:
+    def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
         conn = self._get_conn()
-        rows = conn.execute("SELECT alias, canonical FROM tag_aliases").fetchall()
-        return {row["alias"]: row["canonical"] for row in rows}
+        params: list[str] = []
+        query = "SELECT alias, canonical, conversation_id FROM tag_aliases"
+        if conversation_id:
+            query += " WHERE conversation_id IN ('', ?)"
+            params.append(conversation_id)
+        else:
+            query += " WHERE conversation_id = ''"
+        query += " ORDER BY CASE WHEN conversation_id = '' THEN 0 ELSE 1 END, alias"
+        rows = conn.execute(query, params).fetchall()
+        aliases: dict[str, str] = {}
+        for row in rows:
+            aliases[row["alias"]] = row["canonical"]
+        return aliases
 
-    def set_tag_alias(self, alias: str, canonical: str) -> None:
+    def set_tag_alias(
+        self,
+        alias: str,
+        canonical: str,
+        conversation_id: str = "",
+    ) -> None:
         conn = self._get_conn()
         conn.execute(
-            "INSERT OR REPLACE INTO tag_aliases (alias, canonical) VALUES (?, ?)",
-            (alias, canonical),
+            """INSERT OR REPLACE INTO tag_aliases
+            (alias, conversation_id, canonical) VALUES (?, ?, ?)""",
+            (alias, conversation_id or "", canonical),
         )
         conn.commit()
+
+    def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM tag_aliases WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
 
     def delete_segment(self, ref: str) -> bool:
         conn = self._get_conn()
@@ -1261,6 +1325,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "facts",
             "turn_messages",
             "tag_summaries",
+            "tag_aliases",
             "request_captures",
             "tool_outputs",
             "tool_calls",

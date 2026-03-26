@@ -321,7 +321,37 @@ class SessionRegistry:
     def conversation_count(self) -> int:
         return len(self._conversations)
 
+    def get_state(self, conversation_id: str) -> ProxyState | None:
+        with self._lock:
+            return self._conversations.get(conversation_id)
+
+    def first_state(self) -> ProxyState | None:
+        with self._lock:
+            return next(iter(self._conversations.values()), None)
+
+    def remove_conversation(self, conversation_id: str) -> ProxyState | None:
+        with self._lock:
+            state = self._conversations.pop(conversation_id, None)
+            self._sys_hashes = {
+                key: value for key, value in self._sys_hashes.items()
+                if value != conversation_id
+            }
+            self._chat_ids = {
+                key: value for key, value in self._chat_ids.items()
+                if value != conversation_id
+            }
+            self._last_msg_hashes = {
+                key: value for key, value in self._last_msg_hashes.items()
+                if value != conversation_id
+            }
+            return state
+
     def shutdown_all(self) -> None:
-        for state in self._conversations.values():
+        with self._lock:
+            states = list(self._conversations.values())
+            self._conversations.clear()
+            self._sys_hashes.clear()
+            self._chat_ids.clear()
+            self._last_msg_hashes.clear()
+        for state in states:
             state.shutdown()
-        self._conversations.clear()
