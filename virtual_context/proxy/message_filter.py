@@ -886,66 +886,65 @@ def trim_to_upstream_limit(
         return body, 0
 
     fixed = fmt._estimate_system_tokens(body) + fmt.estimate_tools_tokens(body)
-    msg_tokens = total - fixed
     available = input_limit - fixed
 
     logger.info(
-        "TRIM_BUDGET: total=%d fixed(system+tools)=%d msg_tokens=%d "
+        "TRIM_BUDGET: total=%d fixed(system+tools)=%d "
         "input_limit=%d available_for_msgs=%d pairs=%d",
-        total, fixed, msg_tokens, input_limit, available, len(pairs),
+        total, fixed, input_limit, available, len(pairs),
     )
 
-    if msg_tokens <= 0:
-        return body, 0
-
-    total_pairs_removed = 0
-    trimmable_count = len(pairs) - 2
-    tokens_before = total
-
-    # When available <= 0, system+tools+max_tokens already exceed the limit.
-    # Best effort: drop all trimmable pairs.
     if available <= 0:
-        total_pairs_removed = trimmable_count
-        drop_indices: set[int] = set()
-        for pair_idx in range(total_pairs_removed):
-            for idx in pairs[pair_idx]:
-                drop_indices.add(idx)
-        new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
+        # System+tools alone exceed the limit — drop all trimmable pairs
+        keep_indices: set[int] = set()
+        for idx in pairs[-2]:
+            keep_indices.add(idx)
+        if len(pairs) > 2:
+            for idx in pairs[-1]:
+                keep_indices.add(idx)
+        new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
         trimmed_body = dict(body)
         trimmed_body[msg_key] = new_messages
-        return trimmed_body, total_pairs_removed
+        return trimmed_body, len(pairs) - 2
 
-    for _iteration in range(3):
-        if msg_tokens <= available:
-            break
+    # Build from newest to oldest. Start with the last 2 pairs (protected),
+    # then add older pairs one at a time until the budget is full.
+    keep_pairs: list[tuple[int, ...]] = list(pairs[-2:])  # always keep last 2
+    budget_used = 0
+    for pair in keep_pairs:
+        for idx in pair:
+            budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
 
-        if total_pairs_removed > 0:
-            tokens_per_pair = (tokens_before - total) / total_pairs_removed
-            pairs_needed = math.ceil((msg_tokens - available) / max(tokens_per_pair, 1))
-        else:
-            excess_ratio = (msg_tokens - available) / msg_tokens
-            pairs_needed = math.ceil(excess_ratio * trimmable_count)
+    # Walk backwards from the third-to-last pair
+    added = 0
+    for pair_idx in range(len(pairs) - 3, -1, -1):
+        pair = pairs[pair_idx]
+        pair_tokens = 0
+        for idx in pair:
+            pair_tokens += fmt._count(json.dumps(original_messages[idx], default=str))
+        if budget_used + pair_tokens <= available:
+            keep_pairs.insert(0, pair)
+            budget_used += pair_tokens
+            added += 1
+        # else: skip this pair, too big — but keep trying older smaller ones
 
-        pairs_needed = max(1, min(pairs_needed, trimmable_count - total_pairs_removed))
-        if pairs_needed <= 0:
-            break
-
-        total_pairs_removed += pairs_needed
-
-        drop_indices: set[int] = set()
-        for pair_idx in range(total_pairs_removed):
-            for idx in pairs[pair_idx]:
-                drop_indices.add(idx)
-
-        new_messages = [m for idx, m in enumerate(original_messages) if idx not in drop_indices]
-        trimmed_body = dict(body)
-        trimmed_body[msg_key] = new_messages
-
-        total = fmt.estimate_payload_tokens(trimmed_body)
-        msg_tokens = total - fixed
-
+    total_pairs_removed = len(pairs) - 2 - added
     if total_pairs_removed == 0:
         return body, 0
+
+    keep_indices: set[int] = set()
+    for pair in keep_pairs:
+        for idx in pair:
+            keep_indices.add(idx)
+
+    new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
+    trimmed_body = dict(body)
+    trimmed_body[msg_key] = new_messages
+
+    logger.info(
+        "TRIM_RESULT: kept=%d/%d pairs (%d msgs), budget_used=%d/%d",
+        len(keep_pairs), len(pairs), len(new_messages), budget_used, available,
+    )
 
     # Post-trim cleanup: remove any orphaned tool_use/tool_result pairs
     # that survived trimming without their counterpart.
