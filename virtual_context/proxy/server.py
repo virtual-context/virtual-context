@@ -350,17 +350,30 @@ async def prepare_payload(
             _pt_limit = int(_upstream_limit * _pt_ratio) if _pt_ratio > 0 else _upstream_limit
             if _inbound_tokens > _pt_limit:
                 from .message_filter import trim_to_upstream_limit
+                _pre_trim_msgs = len(body.get(fmt.get_message_key(body) if hasattr(fmt, 'get_message_key') else 'messages', []))
                 body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
+                _post_trim_tokens = fmt._count(json.dumps(body, default=str))
+                _post_trim_msgs = len(body.get('messages', body.get('input', body.get('contents', []))))
                 if _pt_trimmed:
                     logger.info(
-                        "PASSTHROUGH_TRIM: payload=%dt trimmed to %dt (ratio=%.0f%%, upstream=%dt)",
-                        _inbound_tokens, _pt_limit, _pt_ratio * 100, _upstream_limit,
+                        "PASSTHROUGH_TRIM: inbound=%dt target=%dt actual=%dt "
+                        "msgs=%d->%d pairs_dropped=%d (ratio=%.0f%%, upstream=%dt)",
+                        _inbound_tokens, _pt_limit, _post_trim_tokens,
+                        _pre_trim_msgs, _post_trim_msgs, _pt_trimmed,
+                        _pt_ratio * 100, _upstream_limit,
                     )
+                    if _post_trim_tokens < _pt_limit * 0.5:
+                        logger.warning(
+                            "PASSTHROUGH_TRIM_UNDERSHOOT: actual=%dt is %.0f%% of target=%dt — "
+                            "large atomic tool chains likely caused over-trimming",
+                            _post_trim_tokens, (_post_trim_tokens / _pt_limit) * 100, _pt_limit,
+                        )
                     metrics.record({
                         "type": "upstream_trim",
                         "path": "passthrough",
                         "original_tokens": _inbound_tokens,
                         "passthrough_limit": _pt_limit,
+                        "actual_tokens": _post_trim_tokens,
                         "upstream_limit": _upstream_limit,
                         "pairs_trimmed": _pt_trimmed,
                     })

@@ -897,6 +897,12 @@ def trim_to_upstream_limit(
     msg_tokens = total - fixed
     available = input_limit - fixed
 
+    logger.info(
+        "TRIM_BUDGET: total=%d fixed(system+tools)=%d msg_tokens=%d "
+        "input_limit=%d available_for_msgs=%d output_budget=%d pairs=%d",
+        total, fixed, msg_tokens, input_limit, available, output_budget, len(pairs),
+    )
+
     if msg_tokens <= 0:
         return body, 0
 
