@@ -670,7 +670,9 @@ async def _handle_streaming(
                                         "text": "".join(current_text_parts),
                                     })
                                     current_text_parts = []
-                                    forwarded_block_count += 1
+                                # Count ALL forwarded blocks (text, thinking, etc.)
+                                # so continuation emits use correct indices.
+                                forwarded_block_count += 1
 
                         # -- message_delta: extract output_tokens --
                         elif dtype == "message_delta":
@@ -1148,7 +1150,19 @@ async def _handle_streaming(
 
                         for tb in text_blocks:
                             t = tb.get("text", "")
-                            if t:
+                            if not t:
+                                continue
+                            # Non-streaming continuations may embed
+                            # <thinking>...</thinking> as literal text.
+                            # Split into proper thinking + text blocks.
+                            import re as _re
+                            _think_match = _re.match(
+                                r"<thinking>([\s\S]*?)</thinking>\s*",
+                                t,
+                            )
+                            if _think_match:
+                                t = t[_think_match.end():]
+                            if t.strip():
                                 text_chunks.append(t)
                                 for sse_evt in _emit_text_as_sse(
                                     t, forwarded_block_count,
@@ -1222,6 +1236,11 @@ async def _handle_streaming(
                         )
                         if raw_stop == "tool_use" and non_vc_forwarded:
                             cont_stop = "tool_use"
+                    # Emit conversation marker BEFORE message_stop
+                    if state:
+                        _marker_sid = state.engine.config.conversation_id
+                        _fmt = get_format(api_format)
+                        yield _fmt.emit_conversation_marker_sse(_marker_sid)
                     for sse_evt in _emit_message_end_sse(
                         cont_stop, usage=cont_usage,
                     ):
@@ -1242,9 +1261,6 @@ async def _handle_streaming(
                         payload_tokens=state._last_enriched_payload_tokens or None,
                         turn_id=turn_id,
                     )
-                _marker_sid = state.engine.config.conversation_id
-                _fmt = get_format(api_format)
-                yield _fmt.emit_conversation_marker_sse(_marker_sid)
 
             if session_log_path and state:
                 _dump_session_state(state, session_log_path)
