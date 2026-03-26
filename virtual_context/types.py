@@ -904,6 +904,7 @@ class PreparedPayload:
     pre_filter_body: dict | None  # body before filtering (for metrics capture)
     paging_enabled: bool
     tool_output_find_quote: bool
+    restore_tool_injected: bool
     inbound_bytes: int
     outbound_bytes: int
     metadata: dict = field(default_factory=dict)  # catch-all for anything else

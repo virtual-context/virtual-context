@@ -455,6 +455,7 @@ async def prepare_payload(
                 pre_filter_body=None,
                 paging_enabled=False,
                 tool_output_find_quote=False,
+                restore_tool_injected=False,
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
             )
@@ -684,6 +685,7 @@ async def prepare_payload(
             logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
 
     # Inject vc_restore_tool when stubs are present but paging didn't already inject it
+    _restore_tool_injected = False
     if _tool_stubs_present and not paging_enabled and fmt.supports_tool_interception:
         existing_names = {t.get("name") for t in enriched_body.get("tools", []) if isinstance(t, dict)}
         if "vc_restore_tool" not in existing_names:
@@ -691,7 +693,14 @@ async def prepare_payload(
             _restore_def = [d for d in vc_tool_definitions() if d["name"] == "vc_restore_tool"]
             if _restore_def:
                 enriched_body = fmt.inject_tools(enriched_body, _restore_def)
+                _restore_tool_injected = True
                 logger.info("TOOL-STUB Injected vc_restore_tool for stub restoration")
+
+    # Sanitize stale vc_restore_tool errors from history so the model isn't
+    # poisoned by previous client-side "No such tool" rejections.
+    if _restore_tool_injected or paging_enabled:
+        from .message_filter import sanitize_vc_tool_errors
+        enriched_body = sanitize_vc_tool_errors(enriched_body, fmt)
 
     # Track enriched payload size
     if state:
@@ -1006,6 +1015,7 @@ async def prepare_payload(
         pre_filter_body=_pre_filter_body,
         paging_enabled=paging_enabled,
         tool_output_find_quote=tool_output_find_quote,
+        restore_tool_injected=_restore_tool_injected,
         inbound_bytes=_inbound_bytes,
         outbound_bytes=_outbound_bytes,
     )
@@ -1387,7 +1397,7 @@ def create_app(
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                 )
         else:
-            _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote
+            _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote or result.restore_tool_injected
 
             if result.is_streaming:
                 return await _handle_streaming(
