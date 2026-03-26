@@ -589,7 +589,9 @@ class AnthropicFormat(PayloadFormat):
             content = msg.get("content", "")
             if isinstance(content, str):
                 cleaned = _VC_CONVERSATION_RE.sub("", content).rstrip()
-                if cleaned != content:
+                # Don't strip if it would leave the content empty —
+                # the marker is harmless, an empty string is not.
+                if cleaned != content and cleaned:
                     msg = dict(msg)
                     msg["content"] = cleaned
                     modified = True
@@ -599,7 +601,8 @@ class AnthropicFormat(PayloadFormat):
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
                         cleaned = _VC_CONVERSATION_RE.sub("", text).rstrip()
-                        if cleaned != text:
+                        # Don't strip if it would leave the text empty.
+                        if cleaned != text and cleaned:
                             block = dict(block)
                             block["text"] = cleaned
                             modified = True
@@ -886,7 +889,9 @@ class OpenAIFormat(PayloadFormat):
             content = msg.get("content", "")
             if isinstance(content, str):
                 cleaned = _VC_CONVERSATION_RE.sub("", content).rstrip()
-                if cleaned != content:
+                # Don't strip if it would leave the content empty —
+                # the marker is harmless, an empty string is not.
+                if cleaned != content and cleaned:
                     msg = dict(msg)
                     msg["content"] = cleaned
                     modified = True
@@ -896,7 +901,8 @@ class OpenAIFormat(PayloadFormat):
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
                         cleaned = _VC_CONVERSATION_RE.sub("", text).rstrip()
-                        if cleaned != text:
+                        # Don't strip if it would leave the text empty.
+                        if cleaned != text and cleaned:
                             block = dict(block)
                             block["text"] = cleaned
                             modified = True
