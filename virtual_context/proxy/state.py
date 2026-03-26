@@ -117,6 +117,7 @@ class ProxyState:
         self._ingested_turn_count: dict[str, int] = {}   # conversation_id → turn count at ingestion
         self._ingestion_lock = threading.Lock()
         self._compaction_lock = threading.Lock()
+        self._compaction_cancelled = threading.Event()
         self._compaction_state_lock = threading.Lock()
         self._compaction_state: dict[str, object] = {}
         # State machine for non-blocking ingestion
@@ -652,6 +653,8 @@ class ProxyState:
         )
 
         def _compact_progress(done, total, result, *, phase="", **kwargs):
+            if self._compaction_cancelled.is_set():
+                raise InterruptedError("Compaction cancelled (conversation deleted)")
             evt = {
                 "type": "compaction_progress",
                 "turn": turn,
@@ -981,6 +984,7 @@ class ProxyState:
         self._latest_body = None
         self._ingestion_progress = (0, 0)
         self._manual_passthrough = False
+        self._compaction_cancelled.clear()
         self._state = SessionState.ACTIVE
         self._pending_tag = None
         self._pending_compact = None
@@ -1017,6 +1021,7 @@ class ProxyState:
 
     def _cancel_background_work(self) -> None:
         """Cancel queued tag/compaction futures without blocking on completion."""
+        self._compaction_cancelled.set()
         for attr in ("_pending_tag", "_pending_compact"):
             future = getattr(self, attr, None)
             if future is None:
