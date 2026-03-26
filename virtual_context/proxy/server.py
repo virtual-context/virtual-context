@@ -423,6 +423,14 @@ async def prepare_payload(
                 system_tokens=_pt_system_tokens,
             )
 
+            # 2-to-llm: log passthrough body sent to the LLM (after trim)
+            if log_dir and log_prefix:
+                try:
+                    _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
+                    _to_llm_log.write_text(json.dumps(body, default=str))
+                except Exception:
+                    logger.debug("passthrough to-llm log write failed", exc_info=True)
+
             logger.info(
                 "T%d PASSTHROUGH %s stream=%s state=%s in=%dt out=%dt | %s",
                 turn, api_format, is_streaming, current_state.value,
