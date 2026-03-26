@@ -806,9 +806,7 @@ def trim_to_upstream_limit(
 
     Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
     """
-    # Use _count on the full JSON for consistency with the caller's token estimate.
-    # estimate_payload_tokens only counts text content and underestimates.
-    total = fmt._count(json.dumps(body, default=str))
+    total = fmt.estimate_payload_tokens(body)
     input_limit = upstream_limit
 
     if total <= input_limit:
@@ -943,7 +941,7 @@ def trim_to_upstream_limit(
         trimmed_body = dict(body)
         trimmed_body[msg_key] = new_messages
 
-        total = fmt._count(json.dumps(trimmed_body, default=str))
+        total = fmt.estimate_payload_tokens(trimmed_body)
         msg_tokens = total - fixed
 
     if total_pairs_removed == 0:

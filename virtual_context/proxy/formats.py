@@ -274,48 +274,12 @@ class PayloadFormat(ABC):
     # -- Payload token estimation --------------------------------------------
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        """Estimate total input tokens from a request body (fallback only).
+        """Estimate total input tokens from a request body.
 
-        Counts all token-consuming content: message text, tool_use inputs,
-        tool_result outputs, system prompt, and tool definitions.
-
-        NOTE: This is a structural estimate. When the actual serialized payload
-        is available, use ``fmt._count(json.dumps(body))`` for ground truth.
-        This method remains useful for pre-parse estimation in paths where
-        the final body hasn't been constructed yet.
+        Uses _count on the full JSON serialization for consistency with
+        all other token estimation paths in the proxy.
         """
-        total = 0
-        for m in self.get_messages(body):
-            c = m.get("content", "")
-            if isinstance(c, str):
-                total += self._count(c)
-            elif isinstance(c, list):
-                for b in c:
-                    if not isinstance(b, dict):
-                        continue
-                    btype = b.get("type", "")
-                    if btype == "text":
-                        total += self._count(b.get("text", ""))
-                    elif btype == "tool_use":
-                        total += self._count(b.get("name", ""))
-                        inp = b.get("input")
-                        if inp:
-                            total += self._count(
-                                json.dumps(inp) if not isinstance(inp, str) else inp
-                            )
-                    elif btype == "tool_result":
-                        rc = b.get("content", "")
-                        if isinstance(rc, str):
-                            total += self._count(rc)
-                        elif isinstance(rc, list):
-                            for rb in rc:
-                                if isinstance(rb, dict):
-                                    total += self._count(rb.get("text", ""))
-                    else:
-                        total += self._count(json.dumps(b))
-        total += self._estimate_system_tokens(body)
-        total += self.estimate_tools_tokens(body)
-        return total
+        return self._count(json.dumps(body, default=str))
 
     def _estimate_system_tokens(self, body: dict) -> int:
         return 0
@@ -1078,37 +1042,7 @@ class GeminiFormat(PayloadFormat):
         return isinstance(body.get("contents"), list)
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        total = 0
-        for msg in self.get_messages(body):
-            parts = msg.get("parts", [])
-            if not isinstance(parts, list):
-                continue
-            for p in parts:
-                if not isinstance(p, dict):
-                    continue
-                if "text" in p:
-                    total += self._count(p["text"])
-                elif "functionCall" in p:
-                    fc = p["functionCall"]
-                    total += self._count(fc.get("name", ""))
-                    args = fc.get("args")
-                    if args:
-                        total += self._count(
-                            json.dumps(args) if not isinstance(args, str) else args
-                        )
-                elif "functionResponse" in p:
-                    fr = p["functionResponse"]
-                    resp = fr.get("response", {})
-                    total += self._count(json.dumps(resp) if isinstance(resp, dict) else str(resp))
-        si = body.get("system_instruction", {})
-        if isinstance(si, dict):
-            for p in si.get("parts", []):
-                if isinstance(p, dict) and "text" in p:
-                    total += self._count(p["text"])
-        tools = body.get("tools", [])
-        if isinstance(tools, list):
-            total += self._count(json.dumps(tools))
-        return total
+        return self._count(json.dumps(body, default=str))
 
     # -- Context injection --
 
@@ -1650,46 +1584,7 @@ class OpenAIResponsesFormat(PayloadFormat):
         return 0
 
     def estimate_payload_tokens(self, body: dict) -> int:
-        """Override to handle bare function_call/function_call_output items."""
-        total = 0
-        for item in self.get_messages(body):
-            if not isinstance(item, dict):
-                continue
-            if self._is_bare_item(item):
-                name = item.get("name", "") or item.get("call_id", "")
-                args = item.get("arguments", "") or item.get("output", "")
-                total += self._count(str(name) + str(args))
-                continue
-            content = item.get("content", "")
-            if isinstance(content, str):
-                total += self._count(content)
-            elif isinstance(content, list):
-                for b in content:
-                    if not isinstance(b, dict):
-                        continue
-                    btype = b.get("type", "")
-                    if btype in ("text", "output_text", "input_text"):
-                        total += self._count(b.get("text", ""))
-                    elif btype == "tool_use":
-                        total += self._count(b.get("name", ""))
-                        inp = b.get("input")
-                        if inp:
-                            total += self._count(
-                                json.dumps(inp) if not isinstance(inp, str) else inp
-                            )
-                    elif btype == "tool_result":
-                        rc = b.get("content", "")
-                        if isinstance(rc, str):
-                            total += self._count(rc)
-                        elif isinstance(rc, list):
-                            for rb in rc:
-                                if isinstance(rb, dict):
-                                    total += self._count(rb.get("text", ""))
-                    else:
-                        total += self._count(json.dumps(b))
-        total += self._estimate_system_tokens(body)
-        total += self.estimate_tools_tokens(body)
-        return total
+        return self._count(json.dumps(body, default=str))
 
     # -- Fingerprinting --
 
