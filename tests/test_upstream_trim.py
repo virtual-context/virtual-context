@@ -61,14 +61,16 @@ class TestTrimToUpstreamLimit:
         assert "tools" in trimmed
         assert len(trimmed["tools"]) == 1
 
-    def test_accounts_for_max_tokens(self):
+    def test_max_tokens_not_subtracted_from_budget(self):
+        """max_tokens is NOT subtracted — upstream_limit is the input budget."""
         body = _make_body(50, system="Sys.")
         body["max_tokens"] = 50_000
         fmt = self._fmt()
         total_before = fmt.estimate_payload_tokens(body)
         trimmed, removed = trim_to_upstream_limit(body, 60_000, fmt)
-        if total_before > 10_000:
-            assert removed > 0
+        # With 60k budget and no max_tokens subtraction, small body fits
+        if total_before <= 60_000:
+            assert removed == 0
 
     def test_anthropic_format(self):
         body = {
@@ -116,7 +118,7 @@ class TestTrimToUpstreamLimit:
         fmt = copy.copy(OpenAIResponsesFormat())
         fmt.set_token_counter(lambda text: len(text) // 4)
 
-        trimmed, removed = trim_to_upstream_limit(body, 2500, fmt)
+        trimmed, removed = trim_to_upstream_limit(body, 1500, fmt)
 
         assert removed > 0
         rendered = str(trimmed["input"])
