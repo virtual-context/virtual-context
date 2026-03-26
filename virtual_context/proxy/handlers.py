@@ -1314,7 +1314,7 @@ async def _handle_streaming(
 
             # Post-stream processing
             assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_stream_usage)
-            if state and assistant_text:
+            if state and assistant_text and not state.is_conversation_deleted():
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
                             timestamp=datetime.now(timezone.utc),
@@ -1413,7 +1413,7 @@ async def _handle_streaming(
         finally:
             await upstream.aclose()
             assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
-            if state and assistant_text:
+            if state and assistant_text and not state.is_conversation_deleted():
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
                             timestamp=datetime.now(timezone.utc),
@@ -1516,7 +1516,7 @@ async def _handle_non_streaming(
 
     # Extract and record assistant text
     assistant_text = _extract_assistant_text(response_body, api_format)
-    if state and assistant_text:
+    if state and assistant_text and not state.is_conversation_deleted():
         state.conversation_history.append(
             Message(role="assistant", content=assistant_text,
                     timestamp=datetime.now(timezone.utc),

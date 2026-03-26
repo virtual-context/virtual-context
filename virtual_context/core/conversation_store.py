@@ -14,6 +14,9 @@ class ConversationStoreView:
 
     _GUARDED_METHODS = {
         "delete_segment",
+        "delete_fact_links",
+        "link_segment_tool_output",
+        "link_turn_tool_output",
         "save_engine_state",
         "save_request_capture",
         "save_tag_summary",
@@ -25,6 +28,7 @@ class ConversationStoreView:
         "store_chunk_embeddings",
         "store_fact_links",
         "store_facts",
+        "store_chain_snapshot",
         "store_segment",
         "store_tag_summary_embedding",
         "store_tool_output",

@@ -126,6 +126,75 @@ def register_dashboard_routes(
             "Set VC_DASHBOARD_TOKEN or pass dashboard_token to secure them."
         )
 
+    def _registry_states() -> dict[str, ProxyState]:
+        conversations = getattr(registry, "_conversations", None)
+        return conversations if isinstance(conversations, dict) else {}
+
+    def _dashboard_state(
+        preferred_conversation_id: str | None = None,
+    ) -> ProxyState | None:
+        nonlocal state
+
+        if preferred_conversation_id and registry and hasattr(registry, "get_state"):
+            preferred = registry.get_state(preferred_conversation_id)
+            if preferred is not None:
+                return preferred
+
+        conversations = _registry_states()
+        if conversations:
+            if state is not None:
+                current_id = getattr(
+                    getattr(getattr(state, "engine", None), "config", None),
+                    "conversation_id",
+                    "",
+                )
+                if current_id and conversations.get(current_id) is state:
+                    return state
+            resolved = next(iter(conversations.values()), None)
+            state = resolved
+            return resolved
+
+        if preferred_conversation_id:
+            if (
+                state is not None
+                and getattr(state.engine.config, "conversation_id", "") == preferred_conversation_id
+            ):
+                return state
+            return None
+
+        return state if registry is None else None
+
+    def _dashboard_store():
+        active_state = _dashboard_state()
+        if active_state is not None:
+            return active_state.engine._store
+        return None
+
+    async def _stop_replay_for_conversation(conversation_id: str) -> None:
+        if _replay_state.get("conversation_id") != conversation_id:
+            return
+        cancel = _replay_state.get("cancel")
+        if cancel:
+            cancel.set()
+        task = _replay_state.get("task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Replay task did not stop within 5.0s for conversation %s",
+                    conversation_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Replay task shutdown failed for conversation %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+
     # ------------------------------------------------------------------
     # CORS middleware for virtual-context.com
     # ------------------------------------------------------------------
@@ -188,9 +257,10 @@ def register_dashboard_routes(
                 # Send snapshot immediately
                 snap, cursor = metrics.snapshot_with_cursor()
                 # Augment with live engine state
-                if state:
+                active_state = _dashboard_state()
+                if active_state:
                     try:
-                        engine = state.engine
+                        engine = active_state.engine
                         snap["active_tags"] = list(
                             engine._turn_tag_index.get_active_tags(lookback=6)
                         )
@@ -200,10 +270,10 @@ def register_dashboard_routes(
                             )
                         )
                         snap["compacted_through"] = engine._engine_state.compacted_through
-                        snap["history_len"] = len(state.conversation_history)
+                        snap["history_len"] = len(active_state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
                         snap["current_conversation_id"] = engine.config.conversation_id
-                        snap["compaction_state"] = state.compaction_snapshot()
+                        snap["compaction_state"] = active_state.compaction_snapshot()
                     except Exception:
                         logger.debug("SSE engine snapshot failed", exc_info=True)
 
@@ -248,13 +318,17 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/conversations")
     async def dashboard_conversations():
-        if not state:
+        active_state = _dashboard_state()
+        store = _dashboard_store()
+        if not store:
             return JSONResponse({"conversations": [], "current_conversation_id": ""})
 
         conversations_raw = await asyncio.to_thread(
-            state.engine._store.get_conversation_stats
+            store.get_conversation_stats
         )
-        current_id = state.engine.config.conversation_id
+        current_id = (
+            active_state.engine.config.conversation_id if active_state else ""
+        )
 
         conversations = []
         for s in conversations_raw:
@@ -282,13 +356,15 @@ def register_dashboard_routes(
 
     @app.delete("/dashboard/conversations/{conversation_id}")
     async def dashboard_delete_conversation(conversation_id: str, request: Request):
+        nonlocal state
         if err := _check_dashboard_auth(request, _token):
             return err
-        if not state:
+        active_state = _dashboard_state(conversation_id)
+        store = active_state.engine._store if active_state else _dashboard_store()
+        if not store:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
-        store = state.engine._store
         if not hasattr(store, "delete_conversation"):
             return JSONResponse(
                 {"error": "Store does not support conversation deletion"},
@@ -298,10 +374,20 @@ def register_dashboard_routes(
             begin_delete = getattr(store, "begin_conversation_deletion", None)
             if callable(begin_delete):
                 await asyncio.to_thread(begin_delete, conversation_id)
-            if conversation_id == state.engine.config.conversation_id:
+            await _stop_replay_for_conversation(conversation_id)
+            target_state = None
+            if registry and hasattr(registry, "remove_conversation"):
+                target_state = registry.remove_conversation(conversation_id)
+            elif (
+                active_state is not None
+                and conversation_id == active_state.engine.config.conversation_id
+            ):
+                target_state = active_state
+
+            if target_state is not None:
                 try:
                     await asyncio.to_thread(
-                        state.reset_for_conversation_deletion,
+                        target_state.reset_for_conversation_deletion,
                         conversation_id,
                         authoritative=True,
                     )
@@ -313,8 +399,8 @@ def register_dashboard_routes(
                     )
                 try:
                     await asyncio.to_thread(
-                        state.shutdown,
-                        wait=False,
+                        target_state.shutdown,
+                        wait=True,
                         cancel_futures=True,
                     )
                 except Exception:
@@ -324,25 +410,28 @@ def register_dashboard_routes(
                         exc_info=True,
                     )
             deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
-            # Also clean up tag aliases referencing this conversation
-            if hasattr(store, "delete_tag_aliases_for_conversation"):
+            if metrics:
                 await asyncio.to_thread(
-                    store.delete_tag_aliases_for_conversation, conversation_id,
-                )
-            if state.metrics:
-                await asyncio.to_thread(
-                    state.metrics.delete_conversation_artifacts,
+                    metrics.delete_conversation_artifacts,
                     conversation_id,
                 )
             # Invalidate Redis cache
-            if hasattr(state, 'engine') and hasattr(state.engine, '_session_cache') and state.engine._session_cache:
-                state.engine._session_cache.delete_conversation(conversation_id)
-            if state.metrics:
-                state.metrics.record({
+            cache_state = target_state or active_state or _dashboard_state()
+            if (
+                cache_state is not None
+                and hasattr(cache_state, "engine")
+                and hasattr(cache_state.engine, "_session_cache")
+                and cache_state.engine._session_cache
+            ):
+                cache_state.engine._session_cache.delete_conversation(conversation_id)
+            if metrics:
+                metrics.record({
                     "type": "conversation_deleted",
                     "conversation_id": conversation_id,
                     "segments_removed": deleted,
                 })
+            if target_state is not None and state is target_state:
+                state = _dashboard_state()
             logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
         except Exception as exc:
@@ -392,9 +481,10 @@ def register_dashboard_routes(
         snap.pop("type", None)
         snap["version"] = __version__
 
-        if state:
+        active_state = _dashboard_state()
+        if active_state:
             try:
-                engine = state.engine
+                engine = active_state.engine
                 # TurnTagIndex — full per-turn tag data
                 entries = []
                 for entry in engine._turn_tag_index.entries:
@@ -427,7 +517,7 @@ def register_dashboard_routes(
                 }
 
                 snap["conversation_turns"] = len(
-                    state.conversation_history
+                    active_state.conversation_history
                 ) // 2
                 snap["compacted_through"] = engine._engine_state.compacted_through
             except Exception as e:
@@ -471,7 +561,8 @@ def register_dashboard_routes(
     async def replay_start(request: Request):
         if err := _check_dashboard_auth(request, _token):
             return err
-        if not state:
+        active_state = _dashboard_state()
+        if not active_state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
@@ -483,7 +574,7 @@ def register_dashboard_routes(
                     {"error": "Replay already running"}, status_code=409,
                 )
 
-            if not getattr(state.engine, "_llm_provider", None):
+            if not getattr(active_state.engine, "_llm_provider", None):
                 return JSONResponse(
                     {"error": "No LLM provider configured in engine"},
                     status_code=503,
@@ -534,7 +625,7 @@ def register_dashboard_routes(
 
             cancel = asyncio.Event()
             task = asyncio.create_task(
-                _replay_worker(prompts, state, metrics, cancel)
+                _replay_worker(prompts, active_state, metrics, cancel)
             )
 
             def _on_replay_done(t: asyncio.Task) -> None:
@@ -557,6 +648,7 @@ def register_dashboard_routes(
                 "cancel": cancel,
                 "turn": 0,
                 "total": len(prompts),
+                "conversation_id": active_state.engine.config.conversation_id,
             })
 
         return JSONResponse({
@@ -602,13 +694,14 @@ def register_dashboard_routes(
     async def dashboard_compact(request: Request):
         if err := _check_dashboard_auth(request, _token):
             return err
-        if not state:
+        active_state = _dashboard_state()
+        if not active_state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
 
         # Reject if compaction is already running
-        if not state._compaction_lock.acquire(blocking=False):
+        if not active_state._compaction_lock.acquire(blocking=False):
             return JSONResponse(
                 {"status": "busy", "message": "Compaction already in progress"},
                 status_code=409,
@@ -616,11 +709,11 @@ def register_dashboard_routes(
 
         try:
             # Wait for any pending on_turn_complete to finish
-            await asyncio.to_thread(state.wait_for_complete)
+            await asyncio.to_thread(active_state.wait_for_complete)
 
             # Run compaction in a thread (accesses engine internals)
             report = await asyncio.to_thread(
-                state.engine.compact_manual, state.conversation_history
+                active_state.engine.compact_manual, active_state.conversation_history
             )
 
             if report is None:
@@ -631,7 +724,7 @@ def register_dashboard_routes(
 
             # Emit compaction event so the dashboard updates live
             if metrics:
-                turn = len(state.conversation_history) // 2 - 1
+                turn = len(active_state.conversation_history) // 2 - 1
                 original_tokens = sum(r.original_tokens for r in report.results)
                 summary_tokens = sum(r.summary_tokens for r in report.results)
                 metrics.record({
@@ -643,7 +736,7 @@ def register_dashboard_routes(
                     "summary_tokens": summary_tokens,
                     "tags": report.tags,
                     "tag_summaries_built": report.tag_summaries_built,
-                    "compacted_through": state.engine._engine_state.compacted_through,
+                    "compacted_through": active_state.engine._engine_state.compacted_through,
                 })
 
             return JSONResponse({
@@ -654,7 +747,7 @@ def register_dashboard_routes(
                 "tag_summaries_built": report.tag_summaries_built,
             })
         finally:
-            state._compaction_lock.release()
+            active_state._compaction_lock.release()
 
     # -------------------------------------------------------------------
     # Settings endpoints
@@ -662,21 +755,22 @@ def register_dashboard_routes(
 
     @app.get("/dashboard/settings")
     async def dashboard_settings_get():
-        if not state:
+        active_state = _dashboard_state()
+        if not active_state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
-        resp = _build_settings_response(state.engine.config)
+        resp = _build_settings_response(active_state.engine.config)
         if instance_label:
             resp["instance_label"] = instance_label
-        resp["non_virtualizable_floor"] = getattr(state, "_last_non_virtualizable_floor", 0)
+        resp["non_virtualizable_floor"] = getattr(active_state, "_last_non_virtualizable_floor", 0)
 
         # Upstream context limit (resolved from last request's model)
         from ..model_limits import resolve_upstream_limit
         try:
-            _inst_lim = getattr(state, '_instance_upstream_limit', 0)
-            _global_lim = state.engine.config.proxy.upstream_context_limit
-            _model = getattr(state, '_last_model', '')
+            _inst_lim = getattr(active_state, '_instance_upstream_limit', 0)
+            _global_lim = active_state.engine.config.proxy.upstream_context_limit
+            _model = getattr(active_state, '_last_model', '')
             resp["upstream_context_limit"] = resolve_upstream_limit(_model, _inst_lim, _global_lim)
         except Exception:
             resp["upstream_context_limit"] = 200_000
@@ -687,12 +781,13 @@ def register_dashboard_routes(
     async def dashboard_settings_put(request: Request):
         if err := _check_dashboard_auth(request, _token):
             return err
-        if not state:
+        active_state = _dashboard_state()
+        if not active_state:
             return JSONResponse(
                 {"error": "Engine not initialized"}, status_code=503,
             )
         body = await request.json()
-        cfg = state.engine.config
+        cfg = active_state.engine.config
         strategy = cfg.retriever.strategy_configs.get("default")
         if strategy is None:
             strategy = StrategyConfig()
@@ -918,6 +1013,8 @@ async def _replay_worker(
             for i, prompt in enumerate(prompts):
                 if cancel.is_set():
                     break
+                if state.is_conversation_deleted():
+                    break
 
                 t_start = time.monotonic()
 
@@ -927,12 +1024,16 @@ async def _replay_worker(
                 wait_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 # Append user message to history
+                if state.is_conversation_deleted():
+                    break
                 state.conversation_history.append(
                     Message(role="user", content=prompt)
                 )
 
                 # Engine: tag + retrieve + assemble
                 t1 = time.monotonic()
+                if state.is_conversation_deleted():
+                    break
                 assembled = await asyncio.to_thread(
                     state.engine.on_message_inbound,
                     prompt,
@@ -968,6 +1069,8 @@ async def _replay_worker(
                     assistant_text = f"[replay error: {e}]"
 
                 # Append assistant response
+                if state.is_conversation_deleted():
+                    break
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text)
                 )

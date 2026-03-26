@@ -429,7 +429,10 @@ def _alias_ride_along(
     in X's alias group and retrieve segments that match those aliases but
     weren't already selected. These ride free — no max_results cap.
     """
-    aliases = store.get_tag_aliases()
+    try:
+        aliases = store.get_tag_aliases(conversation_id=conversation_id)
+    except TypeError:
+        aliases = store.get_tag_aliases()
     if not aliases:
         return []
 

@@ -59,10 +59,15 @@ class ContextStore(ABC):
         """Return aggregate statistics grouped by conversation_id, newest first."""
 
     @abstractmethod
-    def get_tag_aliases(self) -> dict[str, str]: ...
+    def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]: ...
 
     @abstractmethod
-    def set_tag_alias(self, alias: str, canonical: str) -> None: ...
+    def set_tag_alias(
+        self,
+        alias: str,
+        canonical: str,
+        conversation_id: str = "",
+    ) -> None: ...
 
     @abstractmethod
     def delete_segment(self, ref: str) -> bool: ...
@@ -367,6 +372,13 @@ class ContextStore(ABC):
     # ------------------------------------------------------------------
 
     def delete_conversation(self, conversation_id: str) -> int:
+        return 0
+
+    def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
+        """Delete aliases owned by ``conversation_id``.
+
+        Backends may keep legacy/global aliases under the empty conversation id.
+        """
         return 0
 
     def store_tool_output(

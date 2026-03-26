@@ -127,6 +127,7 @@ class ProxyState:
         self._manual_passthrough = False
         self._ingestion_thread: threading.Thread | None = None
         self._ingestion_cancel = threading.Event()
+        self._deletion_requested = threading.Event()
         # Initial snapshot: captured at first ingestion start for growth tracking
         self._initial_turns: int | None = None
         self._initial_tag_count: int | None = None
@@ -216,6 +217,12 @@ class ProxyState:
     def set_manual_passthrough(self, enabled: bool) -> None:
         self._manual_passthrough = enabled
 
+    def mark_conversation_deleted(self) -> None:
+        self._deletion_requested.set()
+
+    def is_conversation_deleted(self) -> bool:
+        return self._deletion_requested.is_set()
+
     def _indexed_turn_count(self) -> int:
         raw = getattr(getattr(self.engine, "_engine_state", None), "last_indexed_turn", -1)
         marker = raw if isinstance(raw, int) else -1
@@ -235,6 +242,8 @@ class ProxyState:
         return self._completed_turn_count() > self._indexed_turn_count()
 
     def persist_completed_turn(self) -> None:
+        if self.is_conversation_deleted():
+            return
         if len(self.conversation_history) < 2 or len(self.conversation_history) % 2 != 0:
             return
         persist = getattr(self.engine, "persist_completed_turn", None)
@@ -518,9 +527,21 @@ class ProxyState:
         if self._state == SessionState.INGESTING:
             logger.info("fire_turn_complete skipped (ingestion in progress)")
             return
-        self._pending_tag = self._pool.submit(
-            self._run_tag_turn, history_snapshot, payload_tokens, turn_id,
-        )
+        if self.is_conversation_deleted():
+            logger.info(
+                "fire_turn_complete skipped for deleted session %s",
+                self.engine.config.conversation_id[:12],
+            )
+            return
+        try:
+            self._pending_tag = self._pool.submit(
+                self._run_tag_turn, history_snapshot, payload_tokens, turn_id,
+            )
+        except RuntimeError:
+            logger.info(
+                "fire_turn_complete suppressed for shut down session %s",
+                self.engine.config.conversation_id[:12],
+            )
 
     def _run_tag_turn(
         self,
@@ -624,9 +645,15 @@ class ProxyState:
                 if self._state == SessionState.INGESTING:
                     logger.info("T%d compaction deferred (ingestion in progress)", turn)
                 else:
-                    self._pending_compact = self._compact_pool.submit(
-                        self._run_compact, history, signal, turn,
-                    )
+                    try:
+                        self._pending_compact = self._compact_pool.submit(
+                            self._run_compact, history, signal, turn,
+                        )
+                    except RuntimeError:
+                        logger.info(
+                            "T%d compaction suppressed for shut down session %s",
+                            turn, conversation_id[:12],
+                        )
 
         except Exception as e:
             logger.error("tag_turn error: %s", e, exc_info=True)
@@ -958,6 +985,7 @@ class ProxyState:
         self.engine._restored_working_set = []
         self.engine._restored_request_captures = []
         self.engine._restored_conversation_history = []
+        self.engine._restored_pending_turns = []
         self.engine._restored_from_checkpoint = False
         self.engine._restored_checkpoint_source = ""
         self._rebind_engine_references()
@@ -985,6 +1013,8 @@ class ProxyState:
         self._ingestion_progress = (0, 0)
         self._manual_passthrough = False
         self._compaction_cancelled.clear()
+        with self._compaction_state_lock:
+            self._compaction_state = {}
         self._state = SessionState.ACTIVE
         self._pending_tag = None
         self._pending_compact = None
@@ -1018,6 +1048,23 @@ class ProxyState:
                 )
             finally:
                 setattr(self, attr, None)
+
+    def _request_background_stop(self) -> None:
+        """Signal queued/running background work to stop without dropping handles."""
+        self._compaction_cancelled.set()
+        for attr in ("_pending_tag", "_pending_compact"):
+            future = getattr(self, attr, None)
+            if future is None:
+                continue
+            try:
+                future.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to request cancellation for %s on conv=%s",
+                    attr,
+                    self.engine.config.conversation_id[:12],
+                    exc_info=True,
+                )
 
     def _cancel_background_work(self) -> None:
         """Cancel queued tag/compaction futures without blocking on completion."""
@@ -1073,15 +1120,32 @@ class ProxyState:
     ) -> None:
         """Stop live work and clear runtime state before deleting a conversation."""
         conv_id = conversation_id or self.engine.config.conversation_id
-        self._stop_ingestion_thread(
-            timeout_s=0.1 if authoritative else 5.0,
-            raise_on_timeout=not authoritative,
-        )
         if authoritative:
-            self._cancel_background_work()
-        else:
-            self._drain_background_work()
-        self._clear_runtime_state(conv_id)
+            self.mark_conversation_deleted()
+            # Keep the old runtime intact until workers actually stop so a
+            # stale compaction/tagger cannot repopulate freshly-cleared state.
+            self._request_background_stop()
+        self._stop_ingestion_thread(
+            timeout_s=5.0,
+            raise_on_timeout=authoritative,
+        )
+        self._drain_background_work()
+        acquired_compaction_lock = self._compaction_lock.acquire(
+            timeout=5.0,
+        )
+        if not acquired_compaction_lock:
+            msg = (
+                "Compaction lock did not quiesce within 5.0s for "
+                f"conv={self.engine.config.conversation_id[:12]}"
+            )
+            if authoritative:
+                raise RuntimeError(msg)
+            logger.warning(msg)
+        try:
+            self._clear_runtime_state(conv_id)
+        finally:
+            if acquired_compaction_lock:
+                self._compaction_lock.release()
 
     def _advance_compaction_watermark(self) -> None:
         """Advance compacted_through to cover all already-processed messages.

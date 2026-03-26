@@ -15,14 +15,37 @@ class TagCanonicalizer:
     Normalization (lowercase, hyphenate) is always applied even without aliases.
     """
 
-    def __init__(self, store=None) -> None:
+    def __init__(self, store=None, conversation_id: str = "") -> None:
         self._alias_cache: dict[str, str] = {}
         self._store = store
         self._known_tags: set[str] = set()
+        self._conversation_id = conversation_id
+
+    def _load_store_aliases(self) -> dict[str, str]:
+        if not self._store:
+            return {}
+        getter = getattr(self._store, "get_tag_aliases", None)
+        if not callable(getter):
+            return {}
+        try:
+            return getter(conversation_id=self._conversation_id)
+        except TypeError:
+            return getter()
+
+    def _store_alias(self, alias: str, canonical: str) -> None:
+        if not self._store:
+            return
+        setter = getattr(self._store, "set_tag_alias", None)
+        if not callable(setter):
+            return
+        try:
+            setter(alias, canonical, conversation_id=self._conversation_id)
+        except TypeError:
+            setter(alias, canonical)
 
     def load(self) -> None:
         if self._store:
-            self._alias_cache = self._store.get_tag_aliases()
+            self._alias_cache = self._load_store_aliases()
             # Seed known tags from canonical values
             self._known_tags.update(self._alias_cache.values())
 
@@ -65,8 +88,7 @@ class TagCanonicalizer:
     def register_alias(self, alias: str, canonical: str) -> None:
         normalized = alias.lower().strip().replace(" ", "-").replace("_", "-")
         self._alias_cache[normalized] = canonical
-        if self._store:
-            self._store.set_tag_alias(normalized, canonical)
+        self._store_alias(normalized, canonical)
 
     def get_aliases(self) -> dict[str, str]:
         return dict(self._alias_cache)

@@ -177,6 +177,20 @@ class TestSQLiteStore:
         aliases = store.get_tag_aliases()
         assert aliases["db"] == "database"
 
+    def test_delete_conversation_removes_only_conversation_scoped_aliases(self, store):
+        store.set_tag_alias("global-db", "database")
+        store.set_tag_alias("db", "database", conversation_id="session-1")
+        store.set_tag_alias("sql", "database", conversation_id="session-2")
+
+        store.delete_conversation("session-1")
+
+        aliases_session_1 = store.get_tag_aliases("session-1")
+        aliases_session_2 = store.get_tag_aliases("session-2")
+        assert aliases_session_1["global-db"] == "database"
+        assert "db" not in aliases_session_1
+        assert aliases_session_2["global-db"] == "database"
+        assert aliases_session_2["sql"] == "database"
+
     def test_metadata_preserved(self, store):
         seg = _make_segment()
         seg.metadata = SegmentMetadata(
