@@ -1604,18 +1604,24 @@ def collapse_turn_chains(
             "role": "user",
             "content": f"[Compacted turn {turn_label}]",
         }
-        stub_parts = [f"Compacted turn {turn_label}"]
-        # Include topic tags as fallback context (segment summaries are in the context block)
+        # Build descriptive line
+        desc_parts = [f"Compacted turn {turn_label}"]
         if canonical_turn >= 0:
             entry = turn_tag_index.get_tags_for_turn(canonical_turn)
             if entry and entry.tags:
-                stub_parts.append(f"topics={', '.join(entry.tags[:5])}")
+                desc_parts.append(f"topics={', '.join(entry.tags[:5])}")
         if tool_str:
-            stub_parts.append(tool_str)
-        stub_parts.append(f'vc_restore_tool(ref="{ref}")')
+            desc_parts.append(tool_str)
+        desc_line = " | ".join(desc_parts)
+        # Build explicit restore instruction
+        stub_text = (
+            f"[{desc_line}.\n"
+            f'To restore full output: {{"type": "tool_use", "name": "vc_restore_tool", '
+            f'"input": {{"ref": "{ref}"}}}}]'
+        )
         stub_asst = {
             "role": _asst_role,
-            "content": [{"type": "text", "text": f"[{' | '.join(stub_parts)}]"}],
+            "content": [{"type": "text", "text": stub_text}],
         }
 
         collapse_map[chain_idx] = (ref, stub_user, stub_asst)
