@@ -1236,11 +1236,6 @@ async def _handle_streaming(
                         )
                         if raw_stop == "tool_use" and non_vc_forwarded:
                             cont_stop = "tool_use"
-                    # Emit conversation marker BEFORE message_stop
-                    if state:
-                        _marker_sid = state.engine.config.conversation_id
-                        _fmt = get_format(api_format)
-                        yield _fmt.emit_conversation_marker_sse(_marker_sid)
                     for sse_evt in _emit_message_end_sse(
                         cont_stop, usage=cont_usage,
                     ):
