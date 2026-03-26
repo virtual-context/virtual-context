@@ -889,7 +889,7 @@ async def prepare_payload(
             _non_virtualizable_floor = fmt._estimate_system_tokens(_pre_filter_body) + fmt.estimate_tools_tokens(_pre_filter_body)
         else:
             _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
-            _non_virtualizable_floor = max(0, outbound_tokens - _vc_tokens)
+            _non_virtualizable_floor = fmt._estimate_system_tokens(enriched_body) + fmt.estimate_tools_tokens(enriched_body)
         state._last_non_virtualizable_floor = _non_virtualizable_floor
         logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
                     _non_virtualizable_floor, _vc_tokens, outbound_tokens)
