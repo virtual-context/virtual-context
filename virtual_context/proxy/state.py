@@ -711,39 +711,6 @@ class ProxyState:
             return
 
         try:
-            # Fix 3: Re-evaluate whether compaction is still needed.
-            # The signal was computed before the lock was acquired — a previous
-            # compaction may have freed enough tokens in the meantime.
-            try:
-                _tti = len(self.engine._turn_tag_index.entries) if self.engine._turn_tag_index else None
-                _offset = self.engine._engine_state.history_offset(
-                    len(history), total_turns_indexed=_tti,
-                )
-                _snapshot = self.engine._monitor.build_snapshot(
-                    history[_offset:],
-                    payload_tokens=self._last_enriched_payload_tokens or None,
-                )
-                _recheck = self.engine._monitor.check(_snapshot)
-                if _recheck is None:
-                    logger.info(
-                        "Compaction no longer needed after re-evaluation "
-                        "(tokens=%d, budget=%d) — skipping",
-                        _snapshot.total_tokens, _snapshot.budget_tokens,
-                    )
-                    self._update_compaction_state(
-                        operation_id=operation_id,
-                        status="skipped",
-                        phase="skipped",
-                        phase_name="skipped",
-                        done=0,
-                        total=0,
-                        overall_percent=100,
-                        phase_detail="no longer needed after re-evaluation",
-                    )
-                    return
-            except Exception as e:
-                logger.debug("Re-evaluation check failed, proceeding: %s", e)
-
             t0 = time.monotonic()
             self._update_compaction_state(
                 operation_id=operation_id,
