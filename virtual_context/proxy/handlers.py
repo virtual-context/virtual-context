@@ -998,9 +998,15 @@ async def _handle_streaming(
                     )
 
                     if cont_resp.status_code >= 300:
+                        _err_body = ""
+                        try:
+                            _err_body = (await cont_resp.aread()).decode("utf-8", errors="replace")[:500]
+                        except Exception:
+                            pass
                         logger.error(
-                            "Continuation failed: %d",
+                            "Continuation failed: %d body=%s",
                             cont_resp.status_code,
+                            _err_body,
                         )
                         if _cont_is_streaming:
                             try:
