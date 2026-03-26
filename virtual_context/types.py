@@ -314,17 +314,47 @@ class EngineState:
     last_compact_ms: float = 0.0
     last_split_result: SplitResult | None = None
 
-    def history_offset(self, history_len: int) -> int:
+    def history_offset(self, history_len: int, *, total_turns_indexed: int | None = None) -> int:
         """Effective index into conversation_history for slicing past compacted messages.
 
-        After a session restart, compacted_through may exceed the current
-        history length (the history only contains messages from the current
-        session, not the prior one whose messages were already compacted).
-        In that case, return 0 — everything in the current history is new.
+        When *total_turns_indexed* is provided (the total number of entries in
+        the turn-tag index), the method can distinguish between two cases where
+        ``compacted_through >= history_len``:
+
+        1. **Session restart** — history was rebuilt from scratch; everything
+           in the current history is genuinely new.  Return 0.
+        2. **Sliding window** — the proxy trimmed old messages from the
+           in-memory history, but the session is continuous.  We must skip
+           messages whose turns have already been compacted to avoid
+           re-processing.
+
+        Without *total_turns_indexed* the legacy behaviour is preserved:
+        return 0 whenever ``compacted_through >= history_len``.
         """
-        if self.compacted_through >= history_len:
+        if self.compacted_through < history_len:
+            return self.compacted_through
+
+        # compacted_through >= history_len
+        if total_turns_indexed is None:
+            # Legacy path — no additional info, assume restart / fresh history.
             return 0
-        return self.compacted_through
+
+        # Sliding-window detection: if the turn-tag index has grown beyond
+        # what the trimmed history can represent, we are in a sliding window.
+        # Compute the first turn present in the current history and derive
+        # how many messages from the front should be skipped.
+        history_turns = history_len // 2
+        first_turn_in_history = total_turns_indexed - history_turns
+        compacted_turn = (self.compacted_through // 2)  # exclusive: turns < this are compacted
+
+        if compacted_turn <= first_turn_in_history:
+            # Watermark is behind the start of the history window —
+            # every message in history is un-compacted.
+            return 0
+
+        # Some messages at the front of history have already been compacted.
+        offset = (compacted_turn - first_turn_in_history) * 2
+        return min(offset, history_len)  # safety cap
 
 
 @dataclass

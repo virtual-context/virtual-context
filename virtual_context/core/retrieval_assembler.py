@@ -115,7 +115,10 @@ class RetrievalAssembler:
             active_tags = self._get_active_tags(conversation_history)
 
         # Compute current utilization (only count un-compacted history)
-        _offset = self._engine_state.history_offset(len(conversation_history))
+        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        _offset = self._engine_state.history_offset(
+            len(conversation_history), total_turns_indexed=_total_turns,
+        )
         snapshot = self._monitor.build_snapshot(
             conversation_history[_offset:]
         )
@@ -267,7 +270,8 @@ class RetrievalAssembler:
         ws_param, full_segments_param = self._load_working_set_segments()
 
         _hist = history or []
-        uncompacted = _hist[self._engine_state.history_offset(len(_hist)):]
+        _tti = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        uncompacted = _hist[self._engine_state.history_offset(len(_hist), total_turns_indexed=_tti):]
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
@@ -351,7 +355,8 @@ class RetrievalAssembler:
             return list(conversation_history)
 
         # Skip compacted messages -- their content is in stored summaries
-        offset = self._engine_state.history_offset(total)
+        _tti2 = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        offset = self._engine_state.history_offset(total, total_turns_indexed=_tti2)
         older = conversation_history[offset:-protected_count]
         recent = conversation_history[-protected_count:]
 
