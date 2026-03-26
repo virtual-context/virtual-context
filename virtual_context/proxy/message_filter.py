@@ -32,6 +32,68 @@ def _is_tool_result_only_user(msg: dict) -> bool:
     return bool(ctypes and ctypes <= {"tool_result"})
 
 
+def sanitize_vc_tool_errors(body: dict, fmt: PayloadFormat) -> dict:
+    """Replace stale vc_restore_tool error results with benign acknowledgements.
+
+    When the client SDK (e.g. Claude Code) didn't recognise vc_restore_tool,
+    it returned ``<tool_use_error>`` XML.  These errors poison the conversation
+    history — the model sees them and refuses to call the tool again.  Replace
+    them with a neutral message so future calls aren't inhibited.
+    """
+    # Determine message key by format name
+    _fname = fmt.name
+    if _fname == "gemini":
+        msg_key = "contents"
+    elif _fname == "openai_responses":
+        msg_key = "input"
+    else:
+        msg_key = "messages"
+    messages = body.get(msg_key) if msg_key else None
+    if not messages or not isinstance(messages, list):
+        return body
+
+    _ERROR_NEEDLE = "No such tool available: vc_restore_tool"
+    _REPLACEMENT = (
+        "The restore was handled internally. The original content is "
+        "available in your conversation history above."
+    )
+    changed = False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and _ERROR_NEEDLE in content:
+            msg["content"] = _REPLACEMENT
+            if "is_error" in msg:
+                del msg["is_error"]
+            changed = True
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            # Anthropic tool_result blocks
+            if block.get("type") == "tool_result":
+                bc = block.get("content", "")
+                if isinstance(bc, str) and _ERROR_NEEDLE in bc:
+                    block["content"] = _REPLACEMENT
+                    if "is_error" in block:
+                        del block["is_error"]
+                    changed = True
+            # OpenAI function_call_output
+            if block.get("type") == "function_call_output":
+                out = block.get("output", "")
+                if isinstance(out, str) and _ERROR_NEEDLE in out:
+                    block["output"] = _REPLACEMENT
+                    changed = True
+
+    if changed:
+        logger.info("SANITIZE: replaced stale vc_restore_tool error(s) in history")
+    return body
+
+
 def _consume_responses_tool_round(
     messages: list[dict],
     start: int,
