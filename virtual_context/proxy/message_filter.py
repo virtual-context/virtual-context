@@ -807,15 +807,11 @@ def trim_to_upstream_limit(
     Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
     """
     total = fmt.estimate_payload_tokens(body)
-    # Output budget key varies by provider
-    output_budget = body.get("max_tokens", 0)
-    if not output_budget:
-        gen_cfg = body.get("generationConfig", {})
-        if isinstance(gen_cfg, dict):
-            output_budget = gen_cfg.get("maxOutputTokens", 0)
-    if not output_budget:
-        output_budget = 4096
-    input_limit = upstream_limit - output_budget
+    # upstream_limit is already the input budget — do not subtract max_tokens.
+    # The caller (passthrough trim or active path) sets the limit based on
+    # how much input we want to send, not the combined input+output window.
+    output_budget = 0
+    input_limit = upstream_limit
 
     if total <= input_limit:
         return body, 0
