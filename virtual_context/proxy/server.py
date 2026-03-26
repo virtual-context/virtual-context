@@ -768,6 +768,86 @@ async def prepare_payload(
     # Ground truth: inbound tokens (what the client sent us, measured above)
     inbound_tokens = _inbound_tokens
 
+    # ------------------------------------------------------------------
+    # PAYLOAD SANITY CHECK — fire alarms for anything abnormal
+    # ------------------------------------------------------------------
+    if state and outbound_tokens > 0:
+        _budget = state.engine.config.monitor.context_window
+        _sanity_msgs = enriched_body.get("messages", enriched_body.get("input", enriched_body.get("contents", [])))
+        if isinstance(_sanity_msgs, list):
+            _sys_t = fmt._estimate_system_tokens(enriched_body)
+            _tools_t = fmt.estimate_tools_tokens(enriched_body)
+            _nv_floor = _sys_t + _tools_t
+            _nv_pct = (_nv_floor / _budget * 100) if _budget else 0
+
+            # 1. Total payload exceeds budget
+            if outbound_tokens > _budget:
+                logger.warning(
+                    "SANITY_OVER_BUDGET: outbound=%dt exceeds budget=%dt (%.0f%%)",
+                    outbound_tokens, _budget, outbound_tokens / _budget * 100,
+                )
+
+            # 2. Non-virtualizable floor too high
+            if _nv_pct > 40:
+                logger.warning(
+                    "SANITY_HIGH_FLOOR: system=%dt + tools=%dt = %dt (%.0f%% of budget %dt)",
+                    _sys_t, _tools_t, _nv_floor, _nv_pct, _budget,
+                )
+
+            # 3. Protected zone size
+            _prot_msgs = min(12, len(_sanity_msgs))
+            _prot_bytes = sum(
+                len(m.get("content", "")) if isinstance(m.get("content", ""), str)
+                else len(json.dumps(m.get("content", [])))
+                for m in _sanity_msgs[-_prot_msgs:]
+            )
+            _prot_t = _prot_bytes // 4
+            _prot_pct = (_prot_t / _budget * 100) if _budget else 0
+            if _prot_pct > 50:
+                logger.warning(
+                    "SANITY_BLOATED_PROTECTED: last %d msgs = %dt (%.0f%% of budget %dt)",
+                    _prot_msgs, _prot_t, _prot_pct, _budget,
+                )
+
+            # 4. Individual large messages + unstubbed tool_results
+            _large_threshold = _budget // 20  # 5% of budget
+            for _si, _sm in enumerate(_sanity_msgs):
+                _sc = _sm.get("content", "")
+                _s_bytes = len(_sc) if isinstance(_sc, str) else len(json.dumps(_sc))
+                _s_tokens = _s_bytes // 4
+                if _s_tokens > _large_threshold:
+                    _s_role = _sm.get("role", "?")
+                    logger.warning(
+                        "SANITY_LARGE_MSG: msg %d (%s) = %dt (%.0f%% of budget) — threshold %dt",
+                        _si, _s_role, _s_tokens, _s_tokens / _budget * 100, _large_threshold,
+                    )
+                # Check for unstubbed tool_results
+                if isinstance(_sc, list):
+                    for _sb in _sc:
+                        if isinstance(_sb, dict) and _sb.get("type") == "tool_result":
+                            _tr_content = _sb.get("content", "")
+                            _tr_bytes = len(_tr_content) if isinstance(_tr_content, str) else len(json.dumps(_tr_content))
+                            if _tr_bytes > 4096:
+                                logger.warning(
+                                    "SANITY_UNSTUBBED_TOOL: msg %d tool_result %d bytes — should be stubbed",
+                                    _si, _tr_bytes,
+                                )
+
+            # 5. Thinking signature bloat
+            _think_bytes = 0
+            for _sm in _sanity_msgs:
+                _sc = _sm.get("content", [])
+                if isinstance(_sc, list):
+                    for _sb in _sc:
+                        if isinstance(_sb, dict) and _sb.get("type") == "thinking":
+                            _think_bytes += len(_sb.get("signature", ""))
+            _think_t = _think_bytes // 4
+            if _think_t > _budget // 10:
+                logger.warning(
+                    "SANITY_THINKING_BLOAT: %dt in thinking signatures (%.0f%% of budget %dt)",
+                    _think_t, _think_t / _budget * 100, _budget,
+                )
+
     # VC must never send more than the client sent. If enrichment bloated
     # the payload beyond inbound, revert to the original client body and
     # treat as passthrough — all downstream metrics/capture will record
