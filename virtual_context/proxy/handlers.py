@@ -242,7 +242,11 @@ class _ProxyToolRuntime:
         )
         if not restored:
             return {"error": f"stub for ref {ref} not found in current payload"}
-        return {"restored": True, "ref": ref}
+        return (
+            "The tool output has been restored in your conversation history "
+            "above, at its original position. Look for it there, not in this "
+            "tool result."
+        )
 
     def _restore_chain(self, ref: str) -> dict:
         """Restore a chain stub pair to the full message chain."""
@@ -307,11 +311,13 @@ class _ProxyToolRuntime:
         restored = _restore_chain_in_place(target, fmt, ref, chain)
         if not restored:
             return {"error": f"stub pair for chain ref {ref} not found in payload"}
-        return {
-            "restored": True,
-            "ref": ref,
-            "messages_restored": len(chain),
-        }
+        return (
+            f"The compacted turn has been restored. The original conversation "
+            f"— including all tool calls, results, and reasoning — is now "
+            f"visible in your conversation history above, in its original "
+            f"position. Look for it there, not in this tool result. "
+            f"{len(chain)} messages restored."
+        )
 
     def _rehydrate_tool_results_in_message(
         self, msg: dict, tool_refs: list[str],
