@@ -1269,27 +1269,20 @@ def stub_tool_outputs_by_position(
     stub_count = 0
     stub_refs: list[str] = []
 
-    # Hard-protected message indices: last 4 messages (last 2 turns) are never stubbed
+    # Turn-based protection for stubbing: last 2 turns (4 messages) are hard-protected.
+    # Turns 3-6 in the protected window: tool results get stubbed (turn stays intact).
+    # Everything outside the protected window: tool results always stubbed.
     _hard_protected_msg_start = max(0, len(messages) - 4)
+    _soft_protected_msg_start = max(0, len(messages) - protected_recent_turns * 2)
 
     for output in fmt.iter_tool_outputs(body):
-        # Hard-protect last 2 turns by message index
+        # Last 2 turns — never stub
         if output.msg_index >= _hard_protected_msg_start:
             continue
 
-        # If in a recognized chain, use chain-level protection
-        chain_idx = msg_to_chain.get(output.msg_index)
-        if chain_idx is not None:
-            if chain_idx >= _stub_protected_start:
-                continue
-            if chain_idx >= protected_start and _stub_protected_start >= total_chains:
-                continue
-        else:
-            # Not in any chain — use message-index-based protection
-            # Only protect if within the last protected_recent_turns * 2 messages
-            _soft_protected_msg_start = max(0, len(messages) - protected_recent_turns * 2)
-            if output.msg_index >= _soft_protected_msg_start and _stub_protected_start >= total_chains:
-                continue
+        # Turns 3-6 in protected window — only stub if intrusion is active
+        if output.msg_index >= _soft_protected_msg_start and _stub_protected_start >= total_chains:
+            continue
 
         # Skip VC tool outputs to prevent feedback loops
         call_info = tool_call_map.get(output.call_id, {})
