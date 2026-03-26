@@ -643,6 +643,20 @@ async def prepare_payload(
             if _collapse_count:
                 _tool_stubs_present = True
                 logger.info("CHAIN-COLLAPSE: collapsed %d turn chains (%d chain refs)", _collapse_count, len(_chain_refs))
+            # After collapse, stub tool outputs in the protected zone if it's bloated
+            from .message_filter import stub_tool_outputs_by_position
+            body, _prot_stub_count, _prot_stub_refs = stub_tool_outputs_by_position(
+                body, fmt,
+                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                turn_tag_index=state.engine._turn_tag_index,
+                store=state.engine._store,
+                conversation_id=state.engine.config.conversation_id,
+                protected_intrusion_threshold=0.6,
+                context_budget=state.engine.config.monitor.context_window,
+            )
+            if _prot_stub_count:
+                _tool_stubs_present = True
+                logger.info("PROTECTED-STUB: stubbed %d tool outputs in protected zone", _prot_stub_count)
         else:
             # Stage 1: tool result stubbing only (pre-compaction)
             from .message_filter import stub_tool_outputs_by_position
