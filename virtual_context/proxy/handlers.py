@@ -273,6 +273,32 @@ class _ProxyToolRuntime:
                     continue
                 self._rehydrate_tool_results_in_message(msg, tool_refs)
 
+        # Strip trailing tool_use blocks from the last assistant message.
+        # The chain may end with assistant[thinking, text, tool_use] where the
+        # corresponding tool_result is in the NEXT turn chain (not stored in
+        # this snapshot). Leaving the orphaned tool_use causes Anthropic 400.
+        if chain:
+            last = chain[-1]
+            if isinstance(last, dict) and last.get("role") in ("assistant", "model"):
+                content = last.get("content", [])
+                if isinstance(content, list):
+                    has_tool_use = any(
+                        isinstance(b, dict) and b.get("type") == "tool_use"
+                        for b in content
+                    )
+                    if has_tool_use:
+                        cleaned = [
+                            b for b in content
+                            if not (isinstance(b, dict) and b.get("type") == "tool_use")
+                        ]
+                        if cleaned:
+                            last = dict(last)
+                            last["content"] = cleaned
+                            chain[-1] = last
+                        else:
+                            # All content was tool_use — drop the message entirely
+                            chain = chain[:-1]
+
         target = self._get_target_body()
         if not isinstance(target, dict):
             return {"error": "no mutable payload available for chain restore"}
