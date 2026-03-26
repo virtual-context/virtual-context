@@ -1678,9 +1678,7 @@ def collapse_turn_chains(
         # Build explicit restore instruction
         stub_text = (
             f"[{desc_line}.\n"
-            f"Exact values (file paths, outputs, code, errors) are NOT in summaries — "
-            f"restore before citing specifics.\n"
-            f'Restore: {{"type": "tool_use", "name": "vc_restore_tool", '
+            f'To restore full output: {{"type": "tool_use", "name": "vc_restore_tool", '
             f'"input": {{"ref": "{ref}"}}}}]'
         )
         stub_asst = {
