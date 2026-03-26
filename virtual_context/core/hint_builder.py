@@ -57,6 +57,9 @@ def build_autonomous_hint(
     _RULES = (
         "RULE: These are compressed summaries — Summaries DO omit details.\n"
         "To find detailed information you have the following tools:\n"
+        "- vc_restore_tool(ref): ALL compacted tool turns can be restored to "
+        "full fidelity — thinking, tool calls, and raw output. Use the ref "
+        "from the compacted stub. This is the fastest way to get exact data.\n"
         "- vc_find_quote(query): search raw text across ALL topics.\n"
         "- vc_query_facts(subject?, verb?, status?, object_contains?): "
         "structured fact lookup.\n"
