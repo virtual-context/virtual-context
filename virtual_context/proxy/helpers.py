@@ -114,11 +114,19 @@ def _inject_vc_tools(
     body: dict,
     engine: "VirtualContextEngine",
     require_tool_use: bool | None = None,
+    *,
+    tool_runtime=None,
+    restore_available: bool | None = None,
 ) -> dict:
-    from ..core.tool_loop import vc_tool_definitions
+    from ..core.tool_loop import vc_tool_definitions_for_runtime
     fmt = detect_format(body)
     return fmt.inject_tools(
-        body, vc_tool_definitions(), require_tool_use=require_tool_use,
+        body,
+        vc_tool_definitions_for_runtime(
+            tool_runtime,
+            restore_available=restore_available,
+        ),
+        require_tool_use=require_tool_use,
     )
 
 

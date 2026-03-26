@@ -914,6 +914,7 @@ class TestInjectVCTools:
         assert "tools" in result
         names = {t["name"] for t in result["tools"]}
         assert "vc_expand_topic" in names
+        assert "vc_restore_tool" not in names
         assert "vc_collapse_topic" not in names
 
     def test_preserves_existing_tools(self):
@@ -953,6 +954,13 @@ class TestInjectVCTools:
         result = _inject_vc_tools(body, engine)
         assert result is not body
         assert "tools" not in body  # original untouched
+
+    def test_injects_restore_when_restore_available(self):
+        engine = MagicMock()
+        body = {"model": "claude-3", "messages": []}
+        result = _inject_vc_tools(body, engine, restore_available=True)
+        names = {t["name"] for t in result["tools"]}
+        assert "vc_restore_tool" in names
 
 class TestBuildContinuationRequest:
     """Tests for _build_continuation_request()."""

@@ -24,6 +24,7 @@ from virtual_context.core.tool_loop import (
     GeminiAdapter,
     OpenAIAdapter,
     OpenAICodexAdapter,
+    vc_tool_definitions_for_runtime,
     execute_vc_tool,
     get_adapter,
     is_vc_tool,
@@ -80,6 +81,23 @@ class TestVCToolDefinitions:
         props = expand["input_schema"]["properties"]
         assert "collapse_tags" in props
         assert props["collapse_tags"]["type"] == "array"
+
+    def test_runtime_filtered_definitions_hide_restore_by_default(self):
+        defs = vc_tool_definitions_for_runtime()
+        names = {d["name"] for d in defs}
+        assert "vc_restore_tool" not in names
+
+    def test_runtime_filtered_definitions_include_restore_when_available(self):
+        class FakeRuntime:
+            def has_restorable_stubs(self):
+                return True
+
+            def restore_tool_output(self, ref):
+                return {"restored": True, "ref": ref}
+
+        defs = vc_tool_definitions_for_runtime(FakeRuntime())
+        names = {d["name"] for d in defs}
+        assert "vc_restore_tool" in names
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +296,31 @@ class TestExecuteVCTool:
         engine.expand_topic.return_value = {}
         execute_vc_tool(engine, "vc_expand_topic", {"tag": "t"})
         engine.expand_topic.assert_called_once_with(tag="t", depth="full")
+
+    def test_restore_uses_runtime(self):
+        engine = MagicMock()
+
+        class FakeRuntime:
+            def has_restorable_stubs(self):
+                return True
+
+            def restore_tool_output(self, ref):
+                return {"restored": True, "ref": ref}
+
+        result = execute_vc_tool(
+            engine,
+            "vc_restore_tool",
+            {"ref": "tool_abc123"},
+            tool_runtime=FakeRuntime(),
+        )
+        parsed = json.loads(result)
+        assert parsed == {"restored": True, "ref": "tool_abc123"}
+
+    def test_restore_without_runtime_returns_error(self):
+        engine = MagicMock()
+        result = execute_vc_tool(engine, "vc_restore_tool", {"ref": "tool_abc123"})
+        parsed = json.loads(result)
+        assert "error" in parsed
 
     def test_collapse_tags_called_before_expand(self):
         """Collapse must happen before expand so freed budget is available."""
