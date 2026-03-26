@@ -133,6 +133,23 @@ class ContextStore(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Compaction dedup: turn numbers already covered by stored segments
+    # ------------------------------------------------------------------
+
+    def get_compacted_turn_numbers(self, conversation_id: str) -> set[int]:
+        """Return the set of turn numbers already covered by stored tag summaries.
+
+        Used by the compaction pipeline to skip segments whose turns have
+        already been compacted, preventing redundant LLM calls when the
+        compaction watermark drifts ahead of the in-memory history window.
+        """
+        tag_summaries = self.get_all_tag_summaries(conversation_id=conversation_id)
+        covered: set[int] = set()
+        for ts in tag_summaries:
+            covered.update(ts.source_turn_numbers)
+        return covered
+
+    # ------------------------------------------------------------------
     # Turn messages (lightweight per-turn text for post-restart recall)
     # ------------------------------------------------------------------
 

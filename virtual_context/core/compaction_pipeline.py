@@ -124,7 +124,10 @@ class CompactionPipeline:
         # Messages to compact: everything between watermark and protected zone.
         # Compact all available messages (not just the minimum) so compaction
         # fires infrequently — one big batch instead of many small ones.
-        offset = self._engine_state.history_offset(len(conversation_history))
+        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        offset = self._engine_state.history_offset(
+            len(conversation_history), total_turns_indexed=_total_turns,
+        )
         compact_messages = conversation_history[offset:-protected_count]
 
         if not compact_messages:
@@ -137,9 +140,9 @@ class CompactionPipeline:
             return None
 
         logger.info(
-            "Compacting %d messages (offset=%d, watermark=%d, history=%d, protected=%d turns)",
+            "Compacting %d messages (offset=%d, watermark=%d, history=%d, protected=%d turns, indexed=%s)",
             len(compact_messages), offset, self._engine_state.compacted_through,
-            len(conversation_history), protected_turns,
+            len(conversation_history), protected_turns, _total_turns,
         )
         report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
 
@@ -172,7 +175,10 @@ class CompactionPipeline:
             logger.info("Not enough messages outside protected zone to compact")
             return None
 
-        offset = self._engine_state.history_offset(len(conversation_history))
+        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        offset = self._engine_state.history_offset(
+            len(conversation_history), total_turns_indexed=_total_turns,
+        )
         compact_messages = conversation_history[offset:-protected_count]
 
         if not compact_messages:
@@ -524,6 +530,20 @@ class CompactionPipeline:
         max_seg_tokens = self._config.compactor.max_segment_tokens
         merge_threshold = self._config.compactor.merge_overlap_threshold
 
+        # ------------------------------------------------------------------
+        # Store-based skip: collect turn numbers already covered by stored
+        # tag summaries so we can skip segments that would re-compact the
+        # same turns (happens when compacted_through > history_len and
+        # history_offset() returns 0).
+        # ------------------------------------------------------------------
+        try:
+            _already_compacted_turns = self._store.get_compacted_turn_numbers(
+                self._config.conversation_id,
+            )
+        except Exception:
+            _already_compacted_turns = set()
+        _skipped_segments = 0
+
         # ==================================================================
         # Pass 1: Sequential pre-pass — stubs + merge check (no LLM calls)
         # ==================================================================
@@ -537,6 +557,19 @@ class CompactionPipeline:
         embed_fn = self._semantic.get_embed_fn() if self._semantic else None
 
         for seg in segments:
+            # --- Store-based skip: already-compacted turn range ---
+            if _already_compacted_turns:
+                seg_range = segment_turn_ranges.get(seg.id)
+                if seg_range:
+                    seg_turns = set(range(seg_range[0], seg_range[1]))
+                    if seg_turns and seg_turns <= _already_compacted_turns:
+                        _skipped_segments += 1
+                        logger.info(
+                            "SEGMENT SKIP (already compacted) ref=%s turns=%d-%d primary=%s",
+                            seg.id[:8], seg_range[0], seg_range[1] - 1, seg.primary_tag,
+                        )
+                        continue
+
             # --- Stub passthrough (no LLM) ---
             text = " ".join(m.content for m in seg.messages)
             if _is_stub_content_fn(text):
@@ -665,9 +698,11 @@ class CompactionPipeline:
                 )
             return all_results
 
-        logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges)",
+        if _skipped_segments:
+            logger.info("Store-based skip: %d segments skipped (turns already compacted)", _skipped_segments)
+        logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges, %d skipped)",
                     len(all_results), len(compactable),
-                    sum(1 for s in compactable if s.merge_ref))
+                    sum(1 for s in compactable if s.merge_ref), _skipped_segments)
 
         # ==================================================================
         # Pass 2: Batch LLM compaction + store

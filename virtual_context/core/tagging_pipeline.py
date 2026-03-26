@@ -327,7 +327,10 @@ class TaggingPipeline:
             self._check_and_split_broad_tags(conversation_history)
 
         # Build snapshot (only count un-compacted messages)
-        _offset = self._engine_state.history_offset(len(conversation_history))
+        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        _offset = self._engine_state.history_offset(
+            len(conversation_history), total_turns_indexed=_total_turns,
+        )
         snapshot = self._monitor.build_snapshot(
             conversation_history[_offset:],
             payload_tokens=payload_tokens,
