@@ -1041,6 +1041,15 @@ class FilesystemStore(ContextStore):
     def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
         return None
 
+    def store_chain_snapshot(self, ref: str, conversation_id: str, turn_number: int, chain_json: str, message_count: int, tool_output_refs: str = "") -> None:
+        pass
+
+    def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
+        return None
+
+    def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        return []
+
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return {}
 

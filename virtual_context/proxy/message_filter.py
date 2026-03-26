@@ -1238,3 +1238,419 @@ def stub_tool_outputs_by_position(
         stub_refs.append(ref)
 
     return body, stub_count, stub_refs
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Full turn chain collapse (post-compaction)
+# ---------------------------------------------------------------------------
+
+
+def _extract_tool_metadata_from_chain(
+    messages: list[dict],
+    chain_global_indices: tuple[int, ...],
+    tool_call_map: dict[str, dict],
+) -> list[str]:
+    """Extract compact tool call descriptions from a turn chain.
+
+    Returns a list of strings like ``"Read(file.py)"``, ``"Exec(cmd)"``.
+    """
+    from ..core.tool_loop import VC_TOOL_NAMES
+
+    seen: list[str] = []
+    seen_ids: set[str] = set()
+    for gi in chain_global_indices:
+        msg = messages[gi]
+        # Anthropic tool_use blocks
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and "id" in block:
+                    call_id = block["id"]
+                    if call_id in seen_ids:
+                        continue
+                    seen_ids.add(call_id)
+                    name = block.get("name", "")
+                    if name in VC_TOOL_NAMES:
+                        continue
+                    args = _summarise_arguments(block.get("input"), max_len=60)
+                    seen.append(f"{name}({args})" if args else name)
+        # OpenAI tool_calls
+        for tc in msg.get("tool_calls", []):
+            if isinstance(tc, dict) and "id" in tc:
+                call_id = tc["id"]
+                if call_id in seen_ids:
+                    continue
+                seen_ids.add(call_id)
+                name = tc.get("function", {}).get("name", "")
+                if name in VC_TOOL_NAMES:
+                    continue
+                args = _summarise_arguments(tc.get("function", {}).get("arguments"), max_len=60)
+                seen.append(f"{name}({args})" if args else name)
+    return seen
+
+
+def _find_pre_filter_chain(
+    pre_filter_messages: list[dict],
+    user_text_needle: str,
+    _asst_role: str,
+    used_indices: set[int] | None = None,
+) -> list[int] | None:
+    """Find the turn chain in pre_filter_messages that starts with a user
+    message whose extracted text matches *user_text_needle*.
+
+    *used_indices* tracks starting positions already claimed by previous
+    calls, preventing duplicate user text (e.g. "continue", "yes") from
+    always matching the same first occurrence.
+
+    Returns list of global indices into pre_filter_messages, or None.
+    """
+    if used_indices is None:
+        used_indices = set()
+    for i, msg in enumerate(pre_filter_messages):
+        if i in used_indices:
+            continue
+        if msg.get("role") != "user":
+            continue
+        text = _extract_text_for_stub_hash(msg)
+        if text != user_text_needle:
+            continue
+        # Found the matching user message — build the chain
+        chain: list[int] = [i]
+        if i + 1 >= len(pre_filter_messages):
+            continue
+        if pre_filter_messages[i + 1].get("role") != _asst_role:
+            continue
+        chain.append(i + 1)
+        j = i + 2
+        while j < len(pre_filter_messages):
+            next_msg = pre_filter_messages[j]
+            next_role = next_msg.get("role", "")
+            # OpenAI tool response
+            if next_role == "tool":
+                tool_batch = [j]
+                k = j + 1
+                while k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == "tool":
+                    tool_batch.append(k)
+                    k += 1
+                if k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == _asst_role:
+                    chain.extend(tool_batch)
+                    chain.append(k)
+                    j = k + 1
+                    continue
+                else:
+                    break
+            # OpenAI Responses bare round
+            responses_round = _consume_responses_tool_round(pre_filter_messages, j, _asst_role)
+            if responses_round:
+                round_indices, next_index = responses_round
+                chain.extend(round_indices)
+                j = next_index
+                continue
+            # Anthropic tool result
+            if next_role not in ("user", "human"):
+                break
+            if not _is_tool_result_only_user(next_msg):
+                break
+            if j + 1 >= len(pre_filter_messages) or pre_filter_messages[j + 1].get("role") != _asst_role:
+                break
+            chain.extend([j, j + 1])
+            j += 2
+        return chain
+    return None
+
+
+def collapse_turn_chains(
+    body: dict,
+    fmt: PayloadFormat,
+    pre_filter_body: dict,
+    protected_recent_turns: int,
+    turn_tag_index: TurnTagIndex,
+    store: ContextStore,
+    conversation_id: str,
+) -> tuple[dict, int, list[str]]:
+    """Collapse turn chains outside protected window to stub pairs (stage 2).
+
+    Each turn chain outside the protected window is replaced with a compact
+    stub pair (user + assistant) that includes tool names and a restore ref.
+    The original messages (including thinking blocks) are captured from
+    *pre_filter_body* and stored as a chain snapshot for later restore.
+    Individual tool outputs are also stored for FTS search.
+
+    Returns ``(modified_body, collapse_count, list_of_chain_refs)``.
+    """
+    if fmt.name == "gemini":
+        _msg_key = "contents"
+        _asst_role = "model"
+    elif fmt.name == "openai_responses":
+        _msg_key = "input"
+        _asst_role = "assistant"
+    else:
+        _msg_key = "messages"
+        _asst_role = "assistant"
+
+    messages = body.get(_msg_key, [])
+    if not messages:
+        return body, 0, []
+
+    # ------------------------------------------------------------------
+    # 1. Parse turn chains (same pattern as stub_tool_outputs_by_position)
+    # ------------------------------------------------------------------
+    prefix_count = 0
+    chat_msgs: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system" and not chat_msgs:
+            prefix_count += 1
+        else:
+            chat_msgs.append(msg)
+
+    if not chat_msgs:
+        return body, 0, []
+
+    has_trailing_user = bool(chat_msgs and chat_msgs[-1].get("role") == "user")
+    history_msgs = chat_msgs[:-1] if has_trailing_user else chat_msgs
+
+    pairs: list[tuple[int, ...]] = []  # tuples of GLOBAL message indices
+    i = 0
+    while i + 1 < len(history_msgs):
+        gi = i + prefix_count
+        if (history_msgs[i].get("role") == "user"
+                and history_msgs[i + 1].get("role") == _asst_role):
+            chain_indices: list[int] = [gi, gi + 1]
+            j = i + 2
+            while j < len(history_msgs) - 1:
+                next_msg = history_msgs[j]
+                next_role = next_msg.get("role", "")
+                gj = j + prefix_count
+                if next_role == "tool":
+                    tool_batch = [gj]
+                    k = j + 1
+                    while k < len(history_msgs) and history_msgs[k].get("role") == "tool":
+                        tool_batch.append(k + prefix_count)
+                        k += 1
+                    if k < len(history_msgs) and history_msgs[k].get("role") == _asst_role:
+                        chain_indices.extend(tool_batch)
+                        chain_indices.append(k + prefix_count)
+                        j = k + 1
+                        continue
+                    else:
+                        break
+                responses_round = _consume_responses_tool_round(history_msgs, j, _asst_role)
+                if responses_round:
+                    round_indices, next_index = responses_round
+                    chain_indices.extend([ri + prefix_count for ri in round_indices])
+                    j = next_index
+                    continue
+                if next_role not in ("user", "human"):
+                    break
+                if not _is_tool_result_only_user(next_msg):
+                    break
+                if j + 1 >= len(history_msgs) or history_msgs[j + 1].get("role") != _asst_role:
+                    break
+                chain_indices.extend([gj, gj + 1])
+                j += 2
+            pairs.append(tuple(chain_indices))
+            i = chain_indices[-1] - prefix_count + 1
+        else:
+            i += 1
+
+    if not pairs:
+        return body, 0, []
+
+    # ------------------------------------------------------------------
+    # 2. Identify protected window (last N chains)
+    # ------------------------------------------------------------------
+    total_chains = len(pairs)
+    protected = min(protected_recent_turns, total_chains)
+    protected_start = total_chains - protected
+
+    # ------------------------------------------------------------------
+    # 3. Build tool call map
+    # ------------------------------------------------------------------
+    tool_call_map: dict[str, dict] = {}
+    for tc in fmt.iter_tool_calls(body):
+        if tc.call_id:
+            tool_call_map[tc.call_id] = {
+                "name": tc.name,
+                "arguments": tc.arguments,
+            }
+
+    # ------------------------------------------------------------------
+    # 4. Resolve canonical turn numbers via hash lookup
+    # ------------------------------------------------------------------
+    chain_canonical_turn: dict[int, int] = {}
+    chain_user_text: dict[int, str] = {}  # for pre_filter matching
+    for chain_idx, chain in enumerate(pairs):
+        user_text = ""
+        asst_text = ""
+        for gi in chain:
+            msg = messages[gi]
+            if msg.get("role") == "user" and not _is_tool_result_only_user(msg):
+                user_text = _extract_text_for_stub_hash(msg)
+            elif msg.get("role") == _asst_role and not asst_text:
+                asst_text = _extract_text_for_stub_hash(msg)
+        chain_user_text[chain_idx] = user_text
+        if user_text:
+            combined = f"{user_text} {asst_text}"
+            h = hashlib.sha256(combined.encode()).hexdigest()[:16]
+            entry = turn_tag_index.get_entry_by_hash(h)
+            if entry is not None:
+                chain_canonical_turn[chain_idx] = entry.turn_number
+                continue
+        chain_canonical_turn[chain_idx] = -1
+
+    # ------------------------------------------------------------------
+    # 5. Prepare pre_filter messages for snapshot extraction
+    # ------------------------------------------------------------------
+    pre_filter_messages = pre_filter_body.get(_msg_key, [])
+
+    # ------------------------------------------------------------------
+    # 6. Collapse chains outside the protected window
+    # ------------------------------------------------------------------
+    from ..core.tool_loop import VC_TOOL_NAMES
+
+    collapse_count = 0
+    _pf_used: set[int] = set()  # track claimed pre-filter indices
+    chain_refs: list[str] = []
+    # Map: chain_idx → (ref, stub_user, stub_asst) for chains to collapse
+    collapse_map: dict[int, tuple[str, dict, dict]] = {}
+
+    for chain_idx in range(protected_start):
+        chain = pairs[chain_idx]
+        canonical_turn = chain_canonical_turn.get(chain_idx, -1)
+
+        # Skip chains without tool activity — they're handled by
+        # stub_compacted_messages
+        if not _chain_has_tool_activity(messages, chain):
+            continue
+
+        user_text = chain_user_text.get(chain_idx, "")
+        if not user_text:
+            continue
+
+        # a. Find corresponding messages in pre_filter_body
+        pf_chain = _find_pre_filter_chain(pre_filter_messages, user_text, _asst_role, used_indices=_pf_used)
+        if pf_chain is None:
+            logger.debug("CHAIN-COLLAPSE: no pre-filter match for chain %d (turn %d)", chain_idx, canonical_turn)
+            continue
+
+        # Claim these pre-filter indices so duplicate user text doesn't re-match
+        _pf_used.update(pf_chain)
+
+        # b. Serialize chain snapshot from pre-filter body
+        pf_msgs = [pre_filter_messages[pi] for pi in pf_chain]
+        chain_json = json.dumps(pf_msgs, default=str)
+
+        # c. Generate composite ref
+        ref = f"chain_{canonical_turn}_{hashlib.sha256(chain_json.encode()).hexdigest()[:12]}"
+
+        # d. Store individual tool outputs
+        tool_output_refs_for_chain: list[str] = []
+        for output in fmt.iter_tool_outputs(body):
+            if output.msg_index not in chain:
+                continue
+            call_info = tool_call_map.get(output.call_id, {})
+            tool_name = call_info.get("name", "")
+            if tool_name in VC_TOOL_NAMES:
+                continue
+            content_text = output.content
+            if not content_text:
+                continue
+            tool_ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
+            args_summary = _summarise_arguments(call_info.get("arguments"))
+            try:
+                store.store_tool_output(
+                    ref=tool_ref,
+                    conversation_id=conversation_id,
+                    tool_name=tool_name,
+                    command=args_summary,
+                    turn=canonical_turn,
+                    content=content_text,
+                    original_bytes=len(content_text.encode("utf-8")),
+                )
+            except Exception:
+                logger.warning("CHAIN-COLLAPSE: failed to store tool output ref=%s", tool_ref, exc_info=True)
+                continue
+            if canonical_turn >= 0:
+                try:
+                    store.link_turn_tool_output(conversation_id, canonical_turn, tool_ref)
+                except Exception:
+                    pass
+            tool_output_refs_for_chain.append(tool_ref)
+
+        # e. Store chain snapshot
+        try:
+            store.store_chain_snapshot(
+                ref=ref,
+                conversation_id=conversation_id,
+                turn_number=canonical_turn,
+                chain_json=chain_json,
+                message_count=len(pf_msgs),
+                tool_output_refs=",".join(tool_output_refs_for_chain),
+            )
+        except Exception:
+            logger.warning("CHAIN-COLLAPSE: failed to store chain snapshot ref=%s", ref, exc_info=True)
+            continue
+
+        # f. Build tool metadata for stub
+        tool_descs = _extract_tool_metadata_from_chain(messages, chain, tool_call_map)
+        tool_str = ", ".join(tool_descs) if tool_descs else ""
+
+        # g. Build stub pair
+        turn_label = canonical_turn if canonical_turn >= 0 else chain_idx
+        stub_user = {
+            "role": "user",
+            "content": f"[Compacted turn {turn_label}]",
+        }
+        stub_parts = [f"Compacted turn {turn_label}"]
+        # Include topic tags as fallback context (segment summaries are in the context block)
+        if canonical_turn >= 0:
+            entry = turn_tag_index.get_tags_for_turn(canonical_turn)
+            if entry and entry.tags:
+                stub_parts.append(f"topics={', '.join(entry.tags[:5])}")
+        if tool_str:
+            stub_parts.append(tool_str)
+        stub_parts.append(f'vc_restore_tool(ref="{ref}")')
+        stub_asst = {
+            "role": _asst_role,
+            "content": [{"type": "text", "text": f"[{' | '.join(stub_parts)}]"}],
+        }
+
+        collapse_map[chain_idx] = (ref, stub_user, stub_asst)
+        chain_refs.append(ref)
+        collapse_count += 1
+
+    if not collapse_map:
+        return body, 0, []
+
+    # ------------------------------------------------------------------
+    # 7. Build new message list with collapsed chains
+    # ------------------------------------------------------------------
+    # Collect all global indices that belong to collapsed chains
+    collapsed_indices: set[int] = set()
+    for chain_idx, (ref, stub_user, stub_asst) in collapse_map.items():
+        chain = pairs[chain_idx]
+        for gi in chain:
+            collapsed_indices.add(gi)
+
+    # Build index → insertion stubs map
+    insert_at: dict[int, tuple[dict, dict]] = {}
+    for chain_idx, (ref, stub_user, stub_asst) in collapse_map.items():
+        insert_at[pairs[chain_idx][0]] = (stub_user, stub_asst)
+
+    new_messages: list[dict] = []
+    for mi in range(len(messages)):
+        if mi in collapsed_indices:
+            if mi in insert_at:
+                stub_user, stub_asst = insert_at[mi]
+                new_messages.append(stub_user)
+                new_messages.append(stub_asst)
+            # else: skip (interior of a collapsed chain)
+        else:
+            new_messages.append(messages[mi])
+
+    body = dict(body)
+    body[_msg_key] = new_messages
+    return body, collapse_count, chain_refs

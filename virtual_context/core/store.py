@@ -379,6 +379,38 @@ class ContextStore(ABC):
         """
         return None
 
+    # ------------------------------------------------------------------
+    # Chain Snapshots (turn chain collapse)
+    # ------------------------------------------------------------------
+
+    def store_chain_snapshot(
+        self,
+        ref: str,
+        conversation_id: str,
+        turn_number: int,
+        chain_json: str,
+        message_count: int,
+        tool_output_refs: str = "",
+    ) -> None:
+        """Upsert a chain snapshot by ref."""
+        pass
+
+    def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
+        """Retrieve a chain snapshot by conversation_id and ref.
+
+        Returns {ref, conversation_id, turn_number, chain_json,
+        message_count, tool_output_refs} or None.
+        """
+        return None
+
+    def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
+        """Return distinct tool names linked to a segment via segment_tool_outputs.
+
+        Performs a JOIN between segment_tool_outputs and tool_outputs to get
+        distinct tool_name values.
+        """
+        return []
+
     def save_tool_call(self, call: dict) -> None:
         """Persist a tool call record."""
         pass

@@ -122,6 +122,88 @@ def _restore_tool_stub_in_place(body: dict, fmt, ref: str, full_content: str) ->
     return False
 
 
+def _msg_key_for_format(fmt) -> str:
+    """Return the body key that holds the message list for a given format."""
+    name = fmt.name
+    if name == "gemini":
+        return "contents"
+    if name == "openai_responses":
+        return "input"
+    # anthropic, openai (chat)
+    return "messages"
+
+
+def _restore_chain_in_place(
+    body: dict,
+    fmt,
+    ref: str,
+    chain_messages: list[dict],
+) -> bool:
+    """Replace a chain stub pair with the full chain messages in place.
+
+    A chain stub pair is:
+      1. A user message whose content contains ``[Compacted turn``
+      2. Immediately followed by an assistant message whose content contains *ref*
+
+    Both messages are removed and replaced with *chain_messages* (N messages).
+    Returns True if the stub pair was found and replaced, False otherwise.
+    """
+    messages = fmt.get_messages(body)
+    msg_key = _msg_key_for_format(fmt)
+
+    new_messages: list[dict] = []
+    i = 0
+    found = False
+    while i < len(messages):
+        msg = messages[i]
+        # Check if this is the stub user message and the next is the stub
+        # assistant with our chain ref.
+        if (
+            not found
+            and i + 1 < len(messages)
+            and isinstance(msg, dict)
+            and _msg_text_contains(msg, "[Compacted turn")
+            and _msg_text_contains(messages[i + 1], ref)
+        ):
+            new_messages.extend(chain_messages)
+            i += 2  # skip the stub pair
+            found = True
+        else:
+            new_messages.append(msg)
+            i += 1
+
+    if found:
+        body[msg_key] = new_messages
+    return found
+
+
+def _msg_text_contains(msg: dict, needle: str) -> bool:
+    """Check whether any text content of *msg* contains *needle*.
+
+    Handles string content, list-of-blocks content (Anthropic), and
+    OpenAI Responses ``output`` fields.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return needle in content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                if needle in block.get("text", ""):
+                    return True
+                # tool_result blocks can have nested content
+                sub = block.get("content", "")
+                if isinstance(sub, str) and needle in sub:
+                    return True
+            elif isinstance(block, str) and needle in block:
+                return True
+    # OpenAI Responses: output field
+    output = msg.get("output", "")
+    if isinstance(output, str) and needle in output:
+        return True
+    return False
+
+
 class _ProxyToolRuntime:
     """Shared VC tool runtime backed by the proxy's mutable request body."""
 
@@ -141,6 +223,9 @@ class _ProxyToolRuntime:
         return True
 
     def restore_tool_output(self, ref: str) -> dict:
+        if ref.startswith("chain_"):
+            return self._restore_chain(ref)
+
         full_content = self._engine._store.get_tool_output_by_ref(
             self._conversation_id, ref,
         )
@@ -158,6 +243,104 @@ class _ProxyToolRuntime:
         if not restored:
             return {"error": f"stub for ref {ref} not found in current payload"}
         return {"restored": True, "ref": ref}
+
+    def _restore_chain(self, ref: str) -> dict:
+        """Restore a chain stub pair to the full message chain."""
+        snapshot = self._engine._store.get_chain_snapshot(
+            self._conversation_id, ref,
+        )
+        if snapshot is None:
+            return {"error": f"chain snapshot ref {ref} not found"}
+
+        try:
+            chain = json.loads(snapshot["chain_json"])
+        except (json.JSONDecodeError, TypeError):
+            return {"error": f"invalid chain_json for ref {ref}"}
+
+        # Rehydrate any stubbed tool results within the chain.
+        # The chain snapshot stores messages from pre_filter_body, so tool
+        # results normally have their full content.  However, if stage 1
+        # (tool result stubbing) ran before stage 2 (chain collapse) in
+        # the same request, some tool_result blocks may contain stub text
+        # with vc_restore_tool refs.  Rehydrate those from tool_outputs.
+        tool_output_refs_str = snapshot.get("tool_output_refs", "")
+        if tool_output_refs_str:
+            tool_refs = [
+                r.strip() for r in tool_output_refs_str.split(",") if r.strip()
+            ]
+            for msg in chain:
+                if not isinstance(msg, dict):
+                    continue
+                self._rehydrate_tool_results_in_message(msg, tool_refs)
+
+        target = self._get_target_body()
+        if not isinstance(target, dict):
+            return {"error": "no mutable payload available for chain restore"}
+
+        fmt = get_format(self._api_format)
+        restored = _restore_chain_in_place(target, fmt, ref, chain)
+        if not restored:
+            return {"error": f"stub pair for chain ref {ref} not found in payload"}
+        return {
+            "restored": True,
+            "ref": ref,
+            "messages_restored": len(chain),
+        }
+
+    def _rehydrate_tool_results_in_message(
+        self, msg: dict, tool_refs: list[str],
+    ) -> None:
+        """Replace any stubbed tool_result content in *msg* with full content.
+
+        Checks if text in tool_result blocks contains ``vc_restore_tool``
+        and any of the known *tool_refs*.  If so, looks up the full content
+        from the store and replaces in place.
+        """
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            # String content — check for stub text
+            if isinstance(content, str) and "vc_restore_tool" in content:
+                for ref in tool_refs:
+                    if ref in content:
+                        full = self._engine._store.get_tool_output_by_ref(
+                            self._conversation_id, ref,
+                        )
+                        if full is not None:
+                            msg["content"] = full
+                        return
+            return
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            block_content = block.get("content", "")
+            if isinstance(block_content, str) and "vc_restore_tool" in block_content:
+                for ref in tool_refs:
+                    if ref in block_content:
+                        full = self._engine._store.get_tool_output_by_ref(
+                            self._conversation_id, ref,
+                        )
+                        if full is not None:
+                            block["content"] = full
+                        break
+            elif isinstance(block_content, list):
+                for sub in block_content:
+                    if (
+                        isinstance(sub, dict)
+                        and sub.get("type") == "text"
+                        and "vc_restore_tool" in sub.get("text", "")
+                    ):
+                        for ref in tool_refs:
+                            if ref in sub.get("text", ""):
+                                full = self._engine._store.get_tool_output_by_ref(
+                                    self._conversation_id, ref,
+                                )
+                                if full is not None:
+                                    block["content"] = full
+                                break
+                        break
 
 
 async def _passthrough(
