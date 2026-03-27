@@ -1,6 +1,7 @@
+import copy
 import json
 import pytest
-from virtual_context.proxy.message_filter import scan_reducible_items, apply_reduction, ReducibleItem
+from virtual_context.proxy.message_filter import scan_reducible_items, apply_reduction, ReducibleItem, enforce_payload_budget
 from virtual_context.proxy.formats import detect_format
 
 
@@ -256,3 +257,97 @@ class TestApplyReduction:
         new_img = Image.open(BytesIO(new_data))
         assert new_img.width <= 1024
         assert new_img.height <= 1024
+
+
+class TestEnforcePayloadBudget:
+    def _fmt(self):
+        fmt = detect_format({"model": "claude-sonnet-4-6", "messages": []})
+        fmt_copy = copy.copy(fmt)
+        fmt_copy.set_token_counter(lambda text: len(text) // 4)
+        return fmt_copy
+
+    def test_no_reduction_when_under_budget(self):
+        body = _make_payload([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ])
+        fmt = self._fmt()
+        result, reductions, freed = enforce_payload_budget(body, fmt, 100000)
+        assert reductions == 0
+        assert freed == 0
+
+    def test_reduces_until_under_budget(self):
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "A" * 8000},
+                {"type": "text", "text": "response"},
+            ]},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "B" * 8000},
+                {"type": "text", "text": "more response"},
+            ]},
+            {"role": "user", "content": "bye"},
+        ]
+        body = _make_payload(msgs)
+        fmt = self._fmt()
+        total_before = fmt._count(json.dumps(body))
+        budget = total_before - 2000
+        result, reductions, freed = enforce_payload_budget(body, fmt, budget)
+        total_after = fmt._count(json.dumps(result))
+        assert total_after <= budget
+        assert reductions > 0
+        assert freed > 0
+
+    def test_targets_largest_first(self):
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "A" * 2000},
+                {"type": "text", "text": "response"},
+            ]},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "B" * 8000},
+                {"type": "text", "text": "more"},
+            ]},
+            {"role": "user", "content": "bye"},
+        ]
+        body = _make_payload(msgs)
+        fmt = self._fmt()
+        total = fmt._count(json.dumps(body))
+        budget = total - 1000
+        result, reductions, freed = enforce_payload_budget(body, fmt, budget)
+        content_3 = result["messages"][3]["content"]
+        has_thinking_3 = any(b.get("type") == "thinking" for b in content_3)
+        assert not has_thinking_3
+
+    def test_respects_max_iterations(self):
+        msgs = []
+        for i in range(300):
+            msgs.append({"role": "user", "content": "x" * 500})
+            msgs.append({"role": "assistant", "content": "y" * 500})
+        body = _make_payload(msgs)
+        fmt = self._fmt()
+        result, reductions, freed = enforce_payload_budget(body, fmt, 1)
+        assert reductions <= 200
+
+    def test_returns_unchanged_when_nothing_reducible(self):
+        body = _make_payload([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "bye"},
+        ])
+        fmt = self._fmt()
+        result, reductions, freed = enforce_payload_budget(body, fmt, 1)
+        assert reductions == 0
+
+    def test_terminates_when_largest_not_reducible(self):
+        msgs = [
+            {"role": "user", "content": "x" * 200},
+            {"role": "assistant", "content": "y" * 200},
+        ]
+        body = _make_payload(msgs)
+        fmt = self._fmt()
+        result, reductions, freed = enforce_payload_budget(body, fmt, 1)
+        assert reductions <= 2

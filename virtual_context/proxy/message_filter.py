@@ -2130,3 +2130,78 @@ def _reduce_image(body: dict, item: ReducibleItem) -> int:
     except Exception as e:
         logger.warning("BUDGET_ENFORCE: image compression failed: %s", e)
         return 0
+
+
+def enforce_payload_budget(
+    body: dict,
+    fmt: PayloadFormat,
+    context_window: int,
+    store: "ContextStore | None" = None,
+    conversation_id: str = "",
+) -> tuple[dict, int, int]:
+    """Enforce the VC context window budget on the assembled payload.
+
+    Iteratively reduces the largest reducible item until the payload fits.
+    Only meaningful when outbound_tokens > context_window.
+
+    Returns (modified_body, reductions_applied, total_bytes_freed).
+    """
+    _MAX_ITERATIONS = 200
+
+    outbound_tokens = fmt._count(json.dumps(body, default=str))
+    if outbound_tokens <= context_window:
+        return body, 0, 0
+
+    logger.info(
+        "BUDGET_ENFORCE: payload %dt exceeds budget %dt — starting reduction loop",
+        outbound_tokens, context_window,
+    )
+
+    total_freed = 0
+    reductions = 0
+
+    for iteration in range(_MAX_ITERATIONS):
+        if outbound_tokens <= context_window:
+            break
+
+        items = scan_reducible_items(body, fmt)
+        if not items:
+            logger.warning(
+                "BUDGET_ENFORCE: no reducible items left, still over budget (%dt > %dt)",
+                outbound_tokens, context_window,
+            )
+            break
+
+        largest = max(items, key=lambda x: x.size_bytes)
+        freed = apply_reduction(body, largest, fmt, store=store, conversation_id=conversation_id)
+
+        if freed <= 0:
+            logger.info(
+                "BUDGET_ENFORCE: largest item (%s, %d bytes at msg %d) could not be reduced — stopping",
+                largest.category, largest.size_bytes, largest.msg_index,
+            )
+            break
+
+        reductions += 1
+        total_freed += freed
+        outbound_tokens = fmt._count(json.dumps(body, default=str))
+
+        logger.info(
+            "BUDGET_ENFORCE: [%d] cut %s at msg %d (%d bytes freed) — now %dt/%dt",
+            iteration + 1, largest.category, largest.msg_index, freed,
+            outbound_tokens, context_window,
+        )
+
+    if outbound_tokens > context_window:
+        logger.warning(
+            "BUDGET_ENFORCE: exhausted after %d reductions (%d bytes freed) — "
+            "still %dt > %dt, deferring to bloat fallback",
+            reductions, total_freed, outbound_tokens, context_window,
+        )
+    else:
+        logger.info(
+            "BUDGET_ENFORCE: done — %d reductions, %d bytes freed, final %dt/%dt",
+            reductions, total_freed, outbound_tokens, context_window,
+        )
+
+    return body, reductions, total_freed
