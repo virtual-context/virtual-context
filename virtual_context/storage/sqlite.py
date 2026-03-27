@@ -711,6 +711,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
+        # Media output metadata for compressed images
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS media_outputs (
+                ref TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                original_bytes INTEGER NOT NULL,
+                compressed_bytes INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, ref)
+            );
+        """)
         conn.commit()
         self._repair_fts_if_needed(conn)
 
@@ -1334,9 +1349,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "turn_tool_outputs",
             "segment_tool_outputs",
             "chain_snapshots",
+            "media_outputs",
         ):
             self._delete_conversation_rows(conn, table, conversation_id)
         conn.commit()
+
+        # Disk cleanup: remove media files for this conversation
+        import os
+        import shutil
+        _data_dir = str(self.db_path.parent) if hasattr(self, "db_path") else ""
+        media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
+        if media_dir and os.path.isdir(media_dir):
+            shutil.rmtree(media_dir, ignore_errors=True)
+
         return deleted
 
     def cleanup(
@@ -2371,6 +2396,49 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (conversation_id, ref),
         ).fetchone()
         return row["content"] if row else None
+
+    # ------------------------------------------------------------------
+    # Media Output Storage
+    # ------------------------------------------------------------------
+
+    def store_media_output(
+        self,
+        ref: str,
+        conversation_id: str,
+        media_type: str,
+        width: int,
+        height: int,
+        original_bytes: int,
+        compressed_bytes: int,
+        file_path: str,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO media_outputs
+            (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path),
+        )
+        conn.commit()
+
+    def get_media_output(self, conversation_id: str, ref: str) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path FROM media_outputs WHERE conversation_id = ? AND ref = ?",
+            (conversation_id, ref),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "ref": row["ref"],
+            "conversation_id": row["conversation_id"],
+            "media_type": row["media_type"],
+            "width": row["width"],
+            "height": row["height"],
+            "original_bytes": row["original_bytes"],
+            "compressed_bytes": row["compressed_bytes"],
+            "file_path": row["file_path"],
+        }
 
     # ------------------------------------------------------------------
     # Chain Snapshots (turn chain collapse)
