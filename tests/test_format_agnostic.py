@@ -187,6 +187,54 @@ class TestMergeConsecutiveConversational:
         merged = body["messages"][1]["content"]
         assert len(merged) == 2  # two text blocks combined
 
+    def test_responses_merge_user_produces_plain_text(self):
+        """P1-4: Merging consecutive user messages in Responses must produce plain text, not output_text."""
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "first message"},
+            {"role": "user", "content": "second message"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "response"}]},
+        ]}
+        fmt = detect_format(body)
+        fmt.merge_consecutive_conversational(body)
+        assert len(body["input"]) == 2
+        merged_content = body["input"][0]["content"]
+        # User content must be a plain string, not output_text blocks
+        assert isinstance(merged_content, str)
+        assert "first message" in merged_content
+        assert "second message" in merged_content
+
+    def test_responses_merge_user_list_content_produces_plain_text(self):
+        """P1-4: Merging user messages with list content (input_text) produces plain text."""
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "response"}]},
+        ]}
+        fmt = detect_format(body)
+        fmt.merge_consecutive_conversational(body)
+        assert len(body["input"]) == 2
+        merged_content = body["input"][0]["content"]
+        assert isinstance(merged_content, str)
+        assert "first" in merged_content
+        assert "second" in merged_content
+
+    def test_responses_merge_assistant_keeps_output_text_blocks(self):
+        """P1-4: Merging assistant messages in Responses must keep output_text block arrays."""
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "part1"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "part2"}]},
+            {"role": "user", "content": "bye"},
+        ]}
+        fmt = detect_format(body)
+        fmt.merge_consecutive_conversational(body)
+        assert len(body["input"]) == 3
+        merged_content = body["input"][1]["content"]
+        assert isinstance(merged_content, list)
+        assert len(merged_content) == 2
+        assert merged_content[0]["type"] == "output_text"
+        assert merged_content[1]["type"] == "output_text"
+
 
 class TestStubToolOutputsCrossFormat:
     def test_stubs_anthropic_tool_results(self):
@@ -487,9 +535,9 @@ class TestStubMediaCrossFormat:
         fmt = detect_format(body)
         result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
         assert count == 1
-        # Replacement should use output_text type for OpenAI Responses
+        # Replacement should use input_text type for user messages in OpenAI Responses
         stub_block = result["input"][0]["content"][0]
-        assert stub_block["type"] == "output_text"
+        assert stub_block["type"] == "input_text"
         assert "media_" in stub_block["text"]
         assert "vc_restore_tool" in stub_block["text"]
 

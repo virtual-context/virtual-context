@@ -1769,7 +1769,8 @@ def scan_reducible_items(
     if len(turns) >= 3:
         _last2_start = turns[-2].indices[0]
     else:
-        _last2_start = len(messages)  # nothing is "last2"
+        # With 1-2 turns everything is recent — protect all of it.
+        _last2_start = 0
 
     # Track which msg_index+block_index pairs are already registered to
     # avoid duplicate entries (e.g. a tool_result also matching text scan).
@@ -1819,20 +1820,33 @@ def scan_reducible_items(
 
     # -- Media blocks (via format method) -------------------------------
     for media_info in fmt.iter_media_blocks(body):
-        # Estimate data size from the source/URL
+        # Estimate data size from the source/URL — check all known shapes.
         msg = messages[media_info.msg_index]
-        content = msg.get("content", [])
+        # Gemini stores blocks in "parts"; others use "content".
+        content = msg.get("parts") or msg.get("content", [])
         data_size = 0
         if isinstance(content, list) and media_info.block_index < len(content):
             block = content[media_info.block_index]
             if isinstance(block, dict):
+                # Anthropic: {"source": {"type": "base64", "data": "..."}}
                 source = block.get("source", {})
                 if isinstance(source, dict) and source.get("type") == "base64":
                     data_size = len(source.get("data", ""))
+                # OpenAI Chat: {"type": "image_url", "image_url": {"url": "data:..."}}
                 elif block.get("type") == "image_url":
                     url = block.get("image_url", {}).get("url", "")
                     if url.startswith("data:") and ";base64," in url:
                         data_size = len(url.split(";base64,", 1)[1]) if ";base64," in url else 0
+                # OpenAI Responses: {"type": "input_image", "image_url": "data:..."}
+                elif block.get("type") == "input_image":
+                    url = block.get("image_url", "")
+                    if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                        data_size = len(url.split(";base64,", 1)[1])
+                # Gemini: {"inline_data": {"mime_type": "...", "data": "..."}}
+                elif "inline_data" in block:
+                    inline = block.get("inline_data", {})
+                    if isinstance(inline, dict):
+                        data_size = len(inline.get("data", ""))
         if data_size > 10000:
             key = (media_info.msg_index, media_info.block_index)
             if key not in _seen:

@@ -34,7 +34,10 @@ class TestScanReducibleItems:
         assert thinking_items[0].size_bytes > 0
 
     def test_finds_tool_results(self):
+        # Need 3+ turn groups so the tool result falls outside the last-2 window.
         msgs = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
             {"role": "user", "content": "do something"},
             {"role": "assistant", "content": [
                 {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
@@ -44,13 +47,15 @@ class TestScanReducibleItems:
             ]},
             {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
             {"role": "user", "content": "thanks"},
+            {"role": "assistant", "content": "welcome"},
+            {"role": "user", "content": "current"},
         ]
         body = _make_payload(msgs)
         fmt = detect_format(body)
         items = scan_reducible_items(body, fmt)
         tr_items = [i for i in items if i.category == "tool_result"]
         assert len(tr_items) == 1
-        assert tr_items[0].msg_index == 2
+        assert tr_items[0].msg_index == 4
 
     def test_last_2_turns_tool_results_categorized_separately(self):
         msgs = [
@@ -408,3 +413,148 @@ class TestEnforcePayloadBudget:
         fmt_copy.set_token_counter(lambda text: len(text) // 4)
         result, reductions, freed = enforce_payload_budget(body, fmt_copy, 5000)
         assert reductions > 0
+
+
+class TestSmallPayloadProtection:
+    """P1-1: With 1-2 turn groups, ALL tool results must be in the last2 protected window."""
+
+    def test_single_tool_turn_all_protected(self):
+        """A payload with one tool chain turn — tool result must be tool_result_last2."""
+        msgs = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        ]
+        body = _make_payload(msgs)
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        tr_items = [i for i in items if i.category.startswith("tool_result")]
+        assert len(tr_items) == 1
+        # With only 1 turn group, the tool result must be in the protected window.
+        assert tr_items[0].category == "tool_result_last2"
+
+    def test_two_turns_all_protected(self):
+        """A payload with 2 turn groups — tool results in both must be last2."""
+        msgs = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            {"role": "user", "content": "thanks"},
+            {"role": "assistant", "content": "welcome"},
+        ]
+        body = _make_payload(msgs)
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        tr_items = [i for i in items if i.category.startswith("tool_result")]
+        assert len(tr_items) == 1
+        assert tr_items[0].category == "tool_result_last2"
+
+    def test_no_unprotected_tool_results_with_small_payload(self):
+        """With <=2 turns, no tool_result items should exist in the unprotected category."""
+        msgs = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            {"role": "user", "content": "current"},
+        ]
+        body = _make_payload(msgs)
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        unprotected = [i for i in items if i.category == "tool_result"]
+        assert len(unprotected) == 0
+
+
+class TestGeminiMediaScan:
+    """P1-3: Gemini inline_data images must be detected by scan_reducible_items."""
+
+    def test_finds_gemini_inline_data_image(self):
+        body = {"contents": [
+            {"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": "A" * 50000}},
+                {"text": "what is this?"},
+            ]},
+            {"role": "model", "parts": [{"text": "It is an image."}]},
+            {"role": "user", "parts": [{"text": "q2"}]},
+            {"role": "model", "parts": [{"text": "a2"}]},
+            {"role": "user", "parts": [{"text": "current"}]},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        image_items = [i for i in items if i.category == "image"]
+        assert len(image_items) == 1
+        assert image_items[0].size_bytes == 50000
+
+    def test_skips_small_gemini_image(self):
+        body = {"contents": [
+            {"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": "A" * 100}},
+            ]},
+            {"role": "model", "parts": [{"text": "tiny."}]},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        assert not any(i.category == "image" for i in items)
+
+
+class TestResponsesInputImageScan:
+    """P1-2: OpenAI Responses input_image blocks must be yielded by iter_media_blocks."""
+
+    def test_iter_media_blocks_finds_input_image(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": [
+                {"type": "input_image", "image_url": f"data:image/png;base64,{'A' * 50000}"},
+                {"type": "input_text", "text": "describe this"},
+            ]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a photo"}]},
+        ]}
+        fmt = detect_format(body)
+        media_blocks = list(fmt.iter_media_blocks(body))
+        assert len(media_blocks) == 1
+        assert media_blocks[0].msg_index == 0
+        assert media_blocks[0].block_index == 0
+
+    def test_input_image_replace_uses_input_text_for_user(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": [
+                {"type": "input_image", "image_url": f"data:image/png;base64,{'A' * 50000}"},
+            ]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+        ]}
+        fmt = detect_format(body)
+        for media_info in fmt.iter_media_blocks(body):
+            media_info.replace_with_text("[image removed]")
+            break
+        replaced = body["input"][0]["content"][0]
+        assert replaced["type"] == "input_text"
+        assert replaced["text"] == "[image removed]"
+
+    def test_scan_finds_input_image_as_image_category(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": [
+                {"type": "input_image", "image_url": f"data:image/png;base64,{'A' * 50000}"},
+            ]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a photo"}]},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a2"}]},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        image_items = [i for i in items if i.category == "image"]
+        assert len(image_items) == 1
+        assert image_items[0].size_bytes == 50000
