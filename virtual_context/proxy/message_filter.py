@@ -2172,13 +2172,23 @@ def enforce_payload_budget(
             )
             break
 
-        largest = max(items, key=lambda x: x.size_bytes)
-        freed = apply_reduction(body, largest, fmt, store=store, conversation_id=conversation_id)
+        # Try items from largest to smallest — skip any that can't be reduced
+        items.sort(key=lambda x: x.size_bytes, reverse=True)
+        freed = 0
+        largest = None
+        for candidate in items:
+            freed = apply_reduction(body, candidate, fmt, store=store, conversation_id=conversation_id)
+            if freed > 0:
+                largest = candidate
+                break
+            logger.debug(
+                "BUDGET_ENFORCE: skipping %s (%d bytes at msg %d) — not reducible",
+                candidate.category, candidate.size_bytes, candidate.msg_index,
+            )
 
-        if freed <= 0:
+        if freed <= 0 or largest is None:
             logger.info(
-                "BUDGET_ENFORCE: largest item (%s, %d bytes at msg %d) could not be reduced — stopping",
-                largest.category, largest.size_bytes, largest.msg_index,
+                "BUDGET_ENFORCE: no items could be reduced — stopping",
             )
             break
 
