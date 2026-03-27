@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..core.turn_tag_index import TurnTagIndex
@@ -1804,3 +1805,132 @@ def collapse_turn_chains(
     body = dict(body)
     body[_msg_key] = new_messages
     return body, collapse_count, chain_refs
+
+
+@dataclass
+class ReducibleItem:
+    """An item in the payload that can be reduced to save tokens."""
+    msg_index: int          # index into the messages list
+    block_index: int        # index into message content blocks (-1 for string content)
+    category: str           # thinking_sig, tool_result, tool_result_last2, vc_context, conversation_text, image
+    size_bytes: int         # current size in bytes
+    location: str           # "messages" or "system" — where the item lives
+
+
+def scan_reducible_items(
+    body: dict,
+    fmt: PayloadFormat,
+) -> list[ReducibleItem]:
+    """Scan the payload and return all items eligible for reduction."""
+    items: list[ReducibleItem] = []
+
+    if fmt.name == "gemini":
+        msg_key = "contents"
+    elif fmt.name == "openai_responses":
+        msg_key = "input"
+    else:
+        msg_key = "messages"
+
+    messages = body.get(msg_key, [])
+    if not messages:
+        return items
+
+    # Find the start of the "last 2 real turns" — only count user messages
+    # that are NOT pure tool-result scaffolding.
+    _real_user_indices: list[int] = []
+    for _i, _m in enumerate(messages):
+        if _m.get("role") not in ("user", "human"):
+            continue
+        _c = _m.get("content", "")
+        if isinstance(_c, list) and all(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in _c
+        ):
+            continue
+        _real_user_indices.append(_i)
+    if len(_real_user_indices) >= 3:
+        _last2_start = _real_user_indices[-2]
+    else:
+        _last2_start = len(messages)  # nothing is "last2"
+
+    system = body.get("system", [])
+    if isinstance(system, list):
+        for si, block in enumerate(system):
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text", "")
+            if "<context-topics" in text or ("system-reminder" in text and "context-topics" in text):
+                items.append(ReducibleItem(
+                    msg_index=-1, block_index=si, category="vc_context",
+                    size_bytes=len(text), location="system",
+                ))
+
+    for mi, msg in enumerate(messages):
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            if "[Compacted turn" in content:
+                continue
+            if len(content) > 100:
+                items.append(ReducibleItem(
+                    msg_index=mi, block_index=-1, category="conversation_text",
+                    size_bytes=len(content), location="messages",
+                ))
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        all_text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if "[Compacted turn" in all_text and "vc_restore_tool" in all_text:
+            continue
+
+        for bi, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+
+            if btype == "image":
+                source = block.get("source", {})
+                if isinstance(source, dict) and source.get("type") == "base64":
+                    data = source.get("data", "")
+                    if len(data) > 10000:
+                        items.append(ReducibleItem(
+                            msg_index=mi, block_index=bi, category="image",
+                            size_bytes=len(data), location="messages",
+                        ))
+                continue
+
+            if btype == "thinking":
+                sig = block.get("signature", "")
+                if sig:
+                    items.append(ReducibleItem(
+                        msg_index=mi, block_index=bi, category="thinking_sig",
+                        size_bytes=len(sig), location="messages",
+                    ))
+
+            elif btype == "tool_result":
+                tc = block.get("content", "")
+                tc_bytes = len(tc) if isinstance(tc, str) else len(json.dumps(tc))
+                if tc_bytes < 100:
+                    continue
+                tc_str = tc if isinstance(tc, str) else json.dumps(tc)
+                if "vc_restore_tool" in tc_str:
+                    continue
+                category = "tool_result_last2" if mi >= _last2_start else "tool_result"
+                items.append(ReducibleItem(
+                    msg_index=mi, block_index=bi, category=category,
+                    size_bytes=tc_bytes, location="messages",
+                ))
+
+            elif btype == "text":
+                text = block.get("text", "")
+                if "[Compacted turn" in text:
+                    continue
+                if len(text) > 100:
+                    items.append(ReducibleItem(
+                        msg_index=mi, block_index=bi, category="conversation_text",
+                        size_bytes=len(text), location="messages",
+                    ))
+
+    return items
