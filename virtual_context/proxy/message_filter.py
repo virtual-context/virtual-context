@@ -1934,3 +1934,199 @@ def scan_reducible_items(
                     ))
 
     return items
+
+
+def apply_reduction(
+    body: dict,
+    item: ReducibleItem,
+    fmt: PayloadFormat,
+    store: "ContextStore | None" = None,
+    conversation_id: str = "",
+) -> int:
+    """Apply a category-appropriate reduction to one item. Returns bytes freed."""
+    if item.category == "thinking_sig":
+        return _reduce_thinking_sig(body, item)
+    elif item.category == "tool_result":
+        return _reduce_tool_result(body, item, fmt, store, conversation_id)
+    elif item.category == "tool_result_last2":
+        return _reduce_tool_result_last2(body, item)
+    elif item.category == "vc_context":
+        return _reduce_vc_context(body, item)
+    elif item.category == "conversation_text":
+        return _reduce_conversation_text(body, item)
+    elif item.category == "image":
+        return _reduce_image(body, item)
+    return 0
+
+
+def _reduce_thinking_sig(body: dict, item: ReducibleItem) -> int:
+    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+    msg = msgs[item.msg_index]
+    content = msg.get("content", [])
+    if not isinstance(content, list) or item.block_index >= len(content):
+        return 0
+    removed = content.pop(item.block_index)
+    return len(removed.get("signature", "")) + len(removed.get("thinking", ""))
+
+
+def _reduce_tool_result(
+    body: dict, item: ReducibleItem, fmt: PayloadFormat,
+    store, conversation_id: str,
+) -> int:
+    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+    msg = msgs[item.msg_index]
+    content = msg.get("content", [])
+    if not isinstance(content, list) or item.block_index >= len(content):
+        return 0
+    block = content[item.block_index]
+    tc = block.get("content", "")
+    tc_str = tc if isinstance(tc, str) else json.dumps(tc)
+
+    ref = f"tool_{hashlib.sha256(tc_str.encode()).hexdigest()[:12]}"
+
+    if store is not None:
+        try:
+            tool_name = ""
+            call_id = block.get("tool_use_id", "")
+            for m in msgs:
+                mc = m.get("content", [])
+                if isinstance(mc, list):
+                    for b in mc:
+                        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") == call_id:
+                            tool_name = b.get("name", "")
+                            break
+            store.store_tool_output(
+                ref=ref, conversation_id=conversation_id,
+                tool_name=tool_name, command="", turn=-1,
+                content=tc_str, original_bytes=len(tc_str.encode("utf-8")),
+            )
+        except Exception:
+            logger.warning("BUDGET_ENFORCE: failed to store ref=%s", ref, exc_info=True)
+
+    stub_text = f'[budget-reduced tool output ref={ref} | call vc_restore_tool(ref="{ref}")]'
+    block["content"] = stub_text
+    return item.size_bytes - len(stub_text)
+
+
+def _reduce_tool_result_last2(body: dict, item: ReducibleItem) -> int:
+    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+    msg = msgs[item.msg_index]
+    content = msg.get("content", [])
+    if not isinstance(content, list) or item.block_index >= len(content):
+        return 0
+    block = content[item.block_index]
+    tc = block.get("content", "")
+    tc_str = tc if isinstance(tc, str) else json.dumps(tc)
+    if len(tc_str) <= 500:
+        return 0
+    head = tc_str[:200]
+    tail = tc_str[-200:]
+    truncated = f"{head}\n\n[... {len(tc_str) - 400} chars truncated ...]\n\n{tail}"
+    block["content"] = truncated
+    return len(tc_str) - len(truncated)
+
+
+def _reduce_vc_context(body: dict, item: ReducibleItem) -> int:
+    system = body.get("system", [])
+    if not isinstance(system, list) or item.block_index >= len(system):
+        return 0
+    block = system[item.block_index]
+    text = block.get("text", "")
+    if len(text) <= 500:
+        return 0
+    cut_point = len(text) // 2
+    truncated = text[:cut_point] + "\n[... VC context truncated to fit budget ...]"
+    block["text"] = truncated
+    return len(text) - len(truncated)
+
+
+def _reduce_conversation_text(body: dict, item: ReducibleItem) -> int:
+    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+    msg = msgs[item.msg_index]
+
+    if item.block_index == -1:
+        text = msg.get("content", "")
+        if not isinstance(text, str) or len(text) <= 500:
+            return 0
+        head = text[:200]
+        tail = text[-200:]
+        truncated = f"{head}\n\n[... {len(text) - 400} chars truncated ...]\n\n{tail}"
+        msg["content"] = truncated
+        return len(text) - len(truncated)
+    else:
+        content = msg.get("content", [])
+        if not isinstance(content, list) or item.block_index >= len(content):
+            return 0
+        block = content[item.block_index]
+        text = block.get("text", "")
+        if len(text) <= 500:
+            return 0
+        head = text[:200]
+        tail = text[-200:]
+        truncated = f"{head}\n\n[... {len(text) - 400} chars truncated ...]\n\n{tail}"
+        block["text"] = truncated
+        return len(text) - len(truncated)
+
+
+def _reduce_image(body: dict, item: ReducibleItem) -> int:
+    import base64
+    from io import BytesIO
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("BUDGET_ENFORCE: Pillow not installed, cannot compress image")
+        return 0
+
+    MAX_WIDTH = 1024
+    MAX_HEIGHT = 1024
+    JPEG_QUALITY = 75
+
+    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+    msg = msgs[item.msg_index]
+    content = msg.get("content", [])
+    if not isinstance(content, list) or item.block_index >= len(content):
+        return 0
+    block = content[item.block_index]
+    source = block.get("source", {})
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return 0
+
+    original_data = source.get("data", "")
+    original_bytes = len(original_data)
+
+    try:
+        img_bytes = base64.b64decode(original_data)
+        img = Image.open(BytesIO(img_bytes))
+        if img.width > MAX_WIDTH or img.height > MAX_HEIGHT:
+            img.thumbnail((MAX_WIDTH, MAX_HEIGHT), Image.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        # Try JPEG at decreasing quality until smaller than original
+        best_b64 = None
+        for quality in (JPEG_QUALITY, 50, 30):
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            candidate = base64.b64encode(buf.getvalue()).decode("ascii")
+            if len(candidate) < original_bytes:
+                best_b64 = candidate
+                break
+
+        # Fall back to resized PNG if JPEG doesn't help
+        if best_b64 is None:
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            candidate = base64.b64encode(buf.getvalue()).decode("ascii")
+            if len(candidate) < original_bytes:
+                best_b64 = candidate
+                source["data"] = best_b64
+                source["media_type"] = "image/png"
+                return original_bytes - len(best_b64)
+            return 0
+
+        source["data"] = best_b64
+        source["media_type"] = "image/jpeg"
+        return original_bytes - len(best_b64)
+    except Exception as e:
+        logger.warning("BUDGET_ENFORCE: image compression failed: %s", e)
+        return 0
