@@ -3,7 +3,7 @@ import json
 import copy
 import pytest
 from virtual_context.proxy.formats import detect_format
-from virtual_context.proxy.message_filter import drop_topic_only_stubs, stub_tool_outputs_by_position
+from virtual_context.proxy.message_filter import collapse_turn_chains, drop_topic_only_stubs, stub_tool_outputs_by_position
 from virtual_context.core.turn_tag_index import TurnTagIndex
 
 
@@ -355,3 +355,93 @@ class TestDropTopicOnlyStubs:
         result, dropped = drop_topic_only_stubs(body, fmt)
         assert dropped == 2
         assert len(body["messages"]) == 2
+
+
+class TestCollapseChainsCrossFormat:
+    def test_collapses_anthropic_chains(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            # Old turn with tool activity -- should be collapsed
+            {"role": "user", "content": "read file"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/tmp/x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "file contents shown"}]},
+            # Recent turns (protected)
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        original_count = len(body["messages"])
+        result, collapsed, refs = collapse_turn_chains(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        # The old tool turn (4 messages) should be collapsed into a stub pair (2 messages)
+        assert len(result["messages"]) < original_count
+        # The last message should still be the current user question
+        assert result["messages"][-1]["content"] == "current"
+        assert collapsed >= 1
+
+    def test_collapses_openai_responses_chains(self):
+        body = {"model": "gpt-5", "input": [
+            # Old turn with tool activity -- should be collapsed
+            {"role": "user", "content": "read file"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "calling read"}]},
+            {"type": "function_call", "call_id": "fc1", "name": "read", "arguments": '{"path": "/tmp/x"}'},
+            {"type": "function_call_output", "call_id": "fc1", "output": "x" * 10000},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "file contents shown"}]},
+            # Recent turns (protected)
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a1"}]},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a2"}]},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a3"}]},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        original_count = len(body["input"])
+        result, collapsed, refs = collapse_turn_chains(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        # The old tool turn (5 items) should be collapsed into a stub pair (2 items)
+        assert len(result["input"]) < original_count
+        # The last item should still be the current user question
+        assert result["input"][-1]["content"] == "current"
+        assert collapsed >= 1
+
+    def test_protects_recent_turns(self):
+        """Turns inside the protected window should NOT be collapsed."""
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            # Only two turns -- both within protected_recent_turns=3
+            {"role": "user", "content": "read file"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/tmp/x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        original_count = len(body["messages"])
+        result, collapsed, refs = collapse_turn_chains(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        # Everything is within the protected window -- nothing should be collapsed
+        assert len(result["messages"]) == original_count
+        assert collapsed == 0
