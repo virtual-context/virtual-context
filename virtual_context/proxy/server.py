@@ -706,6 +706,15 @@ async def prepare_payload(
             _tool_stubs_present = True
             logger.info("MEDIA-STUB: stubbed %d images outside protected window", _media_stubbed)
 
+    # Drop topic-only stubs — stubs without restore refs are dead weight
+    from .message_filter import drop_topic_only_stubs
+    body, _stubs_dropped = drop_topic_only_stubs(body, fmt)
+    if _stubs_dropped:
+        logger.info("STUB-DROP: removed %d topic-only stubs", _stubs_dropped)
+
+    # Merge consecutive conversational messages — fixes alternation violations
+    fmt.merge_consecutive_conversational(body)
+
     enriched_body = _inject_context(body, prepend_text, api_format)
 
     # Inject VC paging tools for autonomous mode (formats that support it)

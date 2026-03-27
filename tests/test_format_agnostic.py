@@ -3,7 +3,7 @@ import json
 import copy
 import pytest
 from virtual_context.proxy.formats import detect_format
-from virtual_context.proxy.message_filter import stub_tool_outputs_by_position
+from virtual_context.proxy.message_filter import drop_topic_only_stubs, stub_tool_outputs_by_position
 from virtual_context.core.turn_tag_index import TurnTagIndex
 
 
@@ -266,3 +266,92 @@ class TestStubToolOutputsCrossFormat:
             store=None, conversation_id="test",
         )
         assert count >= 1
+
+
+class TestDropTopicOnlyStubs:
+    def test_drops_stubs_without_restore_ref(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": "stub user", "_vc_stub": True},
+            {"role": "assistant", "content": "stub asst with no ref", "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 2
+        assert len(body["messages"]) == 2
+
+    def test_keeps_stubs_with_restore_ref(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": "[Compacted turn 0]", "_vc_stub": True},
+            {"role": "assistant", "content": 'To restore: vc_restore_tool(ref="chain_0_abc")', "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 0
+        assert len(body["messages"]) == 4
+
+    def test_keeps_non_stub_messages(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": "real message"},
+            {"role": "assistant", "content": "real response"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 0
+
+    def test_drops_openai_stubs_without_restore_ref(self):
+        body = {"model": "gpt-4", "messages": [
+            {"role": "user", "content": "stub user", "_vc_stub": True},
+            {"role": "assistant", "content": "stub asst", "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 2
+        assert len(body["messages"]) == 2
+
+    def test_drops_openai_responses_stubs_without_restore_ref(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "stub user", "_vc_stub": True},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "stub asst"}], "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "real answer"}]},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 2
+        assert len(body["input"]) == 2
+
+    def test_mixed_stubs_drops_only_topic_only(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": "topic stub user", "_vc_stub": True},
+            {"role": "assistant", "content": "topic stub asst", "_vc_stub": True},
+            {"role": "user", "content": "[Compacted turn 1]", "_vc_stub": True},
+            {"role": "assistant", "content": 'Use vc_restore_tool(ref="chain_1_xyz") to expand', "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 2
+        assert len(body["messages"]) == 4
+        # The restore-ref stubs and real messages remain
+        assert body["messages"][0]["content"] == "[Compacted turn 1]"
+        assert body["messages"][2]["content"] == "real question"
+
+    def test_anthropic_list_content_stubs(self):
+        """Stubs with list content (block-style) should also be inspected."""
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "stub user"}], "_vc_stub": True},
+            {"role": "assistant", "content": [{"type": "text", "text": "stub asst no ref"}], "_vc_stub": True},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]}
+        fmt = detect_format(body)
+        result, dropped = drop_topic_only_stubs(body, fmt)
+        assert dropped == 2
+        assert len(body["messages"]) == 2
