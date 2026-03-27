@@ -360,6 +360,12 @@ class CompositeStore:
     def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
         return self._search.get_tool_output_by_ref(conversation_id, ref)
 
+    def store_media_output(self, ref: str, conversation_id: str, media_type: str, width: int, height: int, original_bytes: int, compressed_bytes: int, file_path: str) -> None:
+        return self._search.store_media_output(ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path)
+
+    def get_media_output(self, conversation_id: str, ref: str) -> dict | None:
+        return self._search.get_media_output(conversation_id, ref)
+
     def store_chain_snapshot(
         self,
         ref: str,
