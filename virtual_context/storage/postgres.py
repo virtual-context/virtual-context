@@ -260,6 +260,19 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
     tool_output_refs TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS media_outputs (
+    ref TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    original_bytes INTEGER NOT NULL,
+    compressed_bytes INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (conversation_id, ref)
+);
 """
 
 # Postgres FTS: tsvector columns + GIN indexes
@@ -937,8 +950,18 @@ class PostgresStore(ContextStore):
                 "turn_tool_outputs",
                 "segment_tool_outputs",
                 "chain_snapshots",
+                "media_outputs",
             ):
                 self._delete_conversation_rows(conn, table, conversation_id)
+
+        # Disk cleanup: remove media files for this conversation
+        import os
+        import shutil
+        _data_dir = os.environ.get("VC_DATA_DIR", "/data/tenants")
+        media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
+        if media_dir and os.path.isdir(media_dir):
+            shutil.rmtree(media_dir, ignore_errors=True)
+
         return deleted
 
     def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
@@ -1209,6 +1232,51 @@ class PostgresStore(ContextStore):
             (conversation_id, ref),
         ).fetchone()
         return row["content"] if row else None
+
+    # ------------------------------------------------------------------
+    # Media Output Storage
+    # ------------------------------------------------------------------
+
+    def store_media_output(
+        self,
+        ref: str,
+        conversation_id: str,
+        media_type: str,
+        width: int,
+        height: int,
+        original_bytes: int,
+        compressed_bytes: int,
+        file_path: str,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO media_outputs (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (conversation_id, ref) DO UPDATE SET
+                media_type=EXCLUDED.media_type, width=EXCLUDED.width, height=EXCLUDED.height,
+                original_bytes=EXCLUDED.original_bytes, compressed_bytes=EXCLUDED.compressed_bytes,
+                file_path=EXCLUDED.file_path""",
+            (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, _dt_to_str(datetime.now(timezone.utc))),
+        )
+
+    def get_media_output(self, conversation_id: str, ref: str) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path FROM media_outputs WHERE conversation_id = %s AND ref = %s",
+            (conversation_id, ref),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "ref": row["ref"],
+            "conversation_id": row["conversation_id"],
+            "media_type": row["media_type"],
+            "width": row["width"],
+            "height": row["height"],
+            "original_bytes": row["original_bytes"],
+            "compressed_bytes": row["compressed_bytes"],
+            "file_path": row["file_path"],
+        }
 
     # ------------------------------------------------------------------
     # Chain Snapshots (turn chain collapse)

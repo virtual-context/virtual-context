@@ -368,6 +368,33 @@ class ContextStore(ABC):
         return []
 
     # ------------------------------------------------------------------
+    # Media Output Storage
+    # ------------------------------------------------------------------
+
+    def store_media_output(
+        self,
+        ref: str,
+        conversation_id: str,
+        media_type: str,
+        width: int,
+        height: int,
+        original_bytes: int,
+        compressed_bytes: int,
+        file_path: str,
+    ) -> None:
+        """Store metadata for a compressed media output. Default no-op."""
+        pass
+
+    def get_media_output(self, conversation_id: str, ref: str) -> dict | None:
+        """Look up media output metadata by conversation_id and ref.
+
+        Returns dict with keys {ref, conversation_id, media_type, width, height,
+        original_bytes, compressed_bytes, file_path} or None if not found.
+        Default returns None.
+        """
+        return None
+
+    # ------------------------------------------------------------------
     # Tool Output Storage
     # ------------------------------------------------------------------
 
