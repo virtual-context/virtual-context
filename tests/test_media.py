@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from virtual_context.proxy.formats import detect_format
-from virtual_context.proxy.media import compress_media_in_payload
+from virtual_context.proxy.media import compress_media_in_payload, stub_media_by_position
 from virtual_context.storage.sqlite import SQLiteStore
 
 
@@ -223,3 +223,124 @@ class TestCompressMediaInPayload:
         fmt = self._fmt()
         result, count = compress_media_in_payload(body, fmt, store=None, conversation_id="c1", media_dir=self.media_dir)
         assert count == 0
+
+
+class TestStubMediaByPosition:
+    def test_stubs_image_outside_protected_window(self):
+        b64 = "A" * 50000  # fake compressed data
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": "old image"},
+            ]},
+            {"role": "assistant", "content": "I see it."},
+            {"role": "user", "content": "msg2"},
+            {"role": "assistant", "content": "resp2"},
+            {"role": "user", "content": "msg3"},
+            {"role": "assistant", "content": "resp3"},
+            {"role": "user", "content": "msg4"},
+            {"role": "assistant", "content": "resp4"},
+            {"role": "user", "content": "msg5"},
+            {"role": "assistant", "content": "resp5"},
+            {"role": "user", "content": "msg6"},
+            {"role": "assistant", "content": "resp6"},
+            {"role": "user", "content": "latest"},
+        ]
+        body = {"model": "claude-sonnet-4-6", "messages": msgs}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 1
+        # First message should now be a text stub
+        first_content = result["messages"][0]["content"]
+        assert isinstance(first_content, list)
+        stub_block = first_content[0]
+        assert stub_block["type"] == "text"
+        assert "media_" in stub_block["text"]
+        assert "vc_restore_tool" in stub_block["text"]
+
+    def test_keeps_image_in_protected_window(self):
+        b64 = "A" * 50000
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            ]},
+            {"role": "assistant", "content": "I see it."},
+            {"role": "user", "content": "latest"},
+        ]
+        body = {"model": "claude-sonnet-4-6", "messages": msgs}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 0
+        assert result["messages"][0]["content"][0]["type"] == "image"
+
+    def test_keeps_last_2_turns_always(self):
+        b64 = "A" * 50000
+        msgs = []
+        # 8 turns of filler
+        for i in range(8):
+            msgs.append({"role": "user", "content": f"msg{i}"})
+            msgs.append({"role": "assistant", "content": f"resp{i}"})
+        # Image in second-to-last turn
+        msgs.append({"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+        ]})
+        msgs.append({"role": "assistant", "content": "I see it."})
+        msgs.append({"role": "user", "content": "latest"})
+        body = {"model": "claude-sonnet-4-6", "messages": msgs}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 0  # image is in last 2 turns
+
+    def test_gemini_stub_uses_text_part_format(self):
+        """Gemini stubs should use {"text": "..."} not {"type": "text", "text": "..."}."""
+        b64 = "A" * 50000
+        msgs = [
+            {"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                {"text": "old image"},
+            ]},
+            {"role": "model", "parts": [{"text": "I see it."}]},
+        ]
+        # Add enough filler to push the image outside the protected window
+        for i in range(8):
+            msgs.append({"role": "user", "parts": [{"text": f"msg{i}"}]})
+            msgs.append({"role": "model", "parts": [{"text": f"resp{i}"}]})
+        msgs.append({"role": "user", "parts": [{"text": "latest"}]})
+        body = {"contents": msgs}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 1
+        stub_block = result["contents"][0]["parts"][0]
+        # Gemini format: {"text": "..."} (no "type" key)
+        assert "text" in stub_block
+        assert "type" not in stub_block
+        assert "media_" in stub_block["text"]
+        assert "vc_restore_tool" in stub_block["text"]
+
+    def test_intrusion_allows_stubbing_protected_zone(self):
+        """When protected zone is bloated, allow stubbing turns 3-6."""
+        # Build a large payload where the protected zone is huge
+        big_b64 = "A" * 100000
+        msgs = []
+        # 10 turns total, protected_recent_turns=6 means turns 5-10 are protected
+        for i in range(10):
+            if i < 4:
+                msgs.append({"role": "user", "content": f"msg{i}"})
+            else:
+                # Protected zone turns have images
+                msgs.append({"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": big_b64}},
+                ]})
+            msgs.append({"role": "assistant", "content": f"resp{i}"})
+        msgs.append({"role": "user", "content": "latest"})
+        body = {"model": "claude-sonnet-4-6", "messages": msgs}
+        fmt = detect_format(body)
+        # With intrusion threshold, the bloated protected zone triggers stubbing into it
+        result, count = stub_media_by_position(
+            body, fmt,
+            protected_recent_turns=6,
+            protected_intrusion_threshold=0.1,  # very low threshold to trigger
+            context_budget=10000,
+        )
+        # Should stub some images in the protected zone (but not last 2 turns)
+        assert count > 0
