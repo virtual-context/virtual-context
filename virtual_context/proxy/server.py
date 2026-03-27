@@ -1507,12 +1507,9 @@ def create_app(
 
         # In multi-tenant mode, use the tenant's metrics so captures
         # (request, enriched, response) land on the correct instance.
-        # Initialize from enclosing scope first to avoid UnboundLocalError
-        # when state is None (e.g. sub-agent skip, tier block).
-        _local_metrics = metrics
+        nonlocal metrics
         if state and state.metrics:
-            _local_metrics = state.metrics
-        metrics = _local_metrics
+            metrics = state.metrics
 
         # Use format-specific token counter (anthropic tokenizer for Anthropic,
         # tiktoken for others, with fallback chain)
