@@ -1079,6 +1079,58 @@ def _replace_anthropic_content(block: dict, new_text: str) -> None:
     block["content"] = new_text
 
 
+def drop_topic_only_stubs(
+    body: dict,
+    fmt: PayloadFormat,
+) -> tuple[dict, int]:
+    """Remove VC stub messages that have no restore ref.
+
+    Stubs are identified by the _vc_stub marker (via fmt.is_vc_stub).
+    A stub is topic-only if its text does not contain 'vc_restore_tool'.
+    These are dead weight — summaries already cover their content.
+
+    Stubs are grouped into user+assistant pairs. If either message in a
+    pair contains a restore ref, the entire pair is kept.
+
+    Uses fmt.extract_text_from_item for format-aware text extraction.
+
+    Returns (body, stubs_dropped).
+    """
+    messages = fmt.get_messages(body)
+
+    # Group consecutive stubs into pairs (user + assistant).
+    # Walk through stubs in the contiguous run and pair them up.
+    stub_pairs: list[list[int]] = []
+    current_pair: list[int] = []
+    for i in range(len(messages)):
+        if not fmt.is_vc_stub(body, i):
+            if current_pair:
+                stub_pairs.append(current_pair)
+                current_pair = []
+            continue
+        current_pair.append(i)
+        if len(current_pair) == 2:
+            stub_pairs.append(current_pair)
+            current_pair = []
+    if current_pair:
+        stub_pairs.append(current_pair)
+
+    # For each pair, check if ANY message in the pair has a restore ref
+    drop_indices = []
+    for pair in stub_pairs:
+        has_restore = any(
+            "vc_restore_tool" in fmt.extract_text_from_item(body, i)
+            for i in pair
+        )
+        if not has_restore:
+            drop_indices.extend(pair)
+
+    if drop_indices:
+        fmt.remove_items(body, drop_indices)
+
+    return body, len(drop_indices)
+
+
 def stub_tool_outputs_by_position(
     body: dict,
     fmt: PayloadFormat,
