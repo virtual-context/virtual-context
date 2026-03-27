@@ -1543,6 +1543,7 @@ def create_app(
         # ---------------------------------------------------------------
         # Enrichment: passthrough or active path via prepare_payload()
         # ---------------------------------------------------------------
+        _t_prepare = time.monotonic()
         result = await prepare_payload(
             body, state, fmt, metrics,
             body_bytes=body_bytes,
@@ -1550,6 +1551,8 @@ def create_app(
             log_dir=_effective_log_dir,
             log_prefix=_log_prefix,
         )
+        # Override overhead_ms with total wall-clock time for the full VC pipeline
+        result.overhead_ms = round((time.monotonic() - _t_prepare) * 1000, 1)
 
         if result.is_passthrough:
             if result.is_streaming:
