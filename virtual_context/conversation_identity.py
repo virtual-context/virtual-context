@@ -291,6 +291,7 @@ def _claude_code_hash(
 def resolve_conversation_id(
     body: dict | None,
     explicit_id: str | None = None,
+    format_name: str = "",
 ) -> str:
     """Resolve a deterministic conversation ID from request body signals.
 
@@ -300,12 +301,21 @@ def resolve_conversation_id(
     3. chat_id (from envelope metadata)
     4. system_prompt hash (Anthropic or OpenAI format)
 
+    When *format_name* is provided, it is included in the hash so that the
+    same conversation on different provider formats (e.g. Anthropic vs OpenAI
+    Responses) produces different IDs.  This prevents format-specific engine
+    state (turn hashes, compaction watermark) from being applied to a
+    different format's payload.
+
     The body dict is read by reference — no copies made.
-    Special case: if explicit_id is already a valid UUID, returned as-is.
+    Special case: if explicit_id is already a valid UUID AND no format_name,
+    returned as-is.  With format_name, it is re-hashed to include the format.
     Returns a random UUID if no signals are found.
     """
     if explicit_id and explicit_id.strip():
         explicit_id = explicit_id.strip()
+        if format_name:
+            return _candidate_to_uuid("explicit_id", f"{format_name}:{explicit_id}")
         try:
             _uuid.UUID(explicit_id)
             return explicit_id
@@ -315,11 +325,13 @@ def resolve_conversation_id(
     if not body:
         return str(_uuid.uuid4())
 
+    _fmt_suffix = f":{format_name}" if format_name else ""
+
     conv_info = _extract_conversation_info(body)
     if conv_info.get("conversation_label"):
-        return _candidate_to_uuid("conversation_label", conv_info["conversation_label"])
+        return _candidate_to_uuid("conversation_label", conv_info["conversation_label"] + _fmt_suffix)
     if conv_info.get("chat_id"):
-        return _candidate_to_uuid("chat_id", conv_info["chat_id"])
+        return _candidate_to_uuid("chat_id", conv_info["chat_id"] + _fmt_suffix)
 
     # Also check system prompt for identity fields (e.g. OpenClaw embeds
     # chat_id in a ```json block inside the system prompt).  This is checked
@@ -327,12 +339,12 @@ def resolve_conversation_id(
     # unstable hash caused by dynamic prompt sections.
     sys_info = _extract_system_prompt_info(body)
     if sys_info.get("conversation_label"):
-        return _candidate_to_uuid("conversation_label", sys_info["conversation_label"])
+        return _candidate_to_uuid("conversation_label", sys_info["conversation_label"] + _fmt_suffix)
     if sys_info.get("chat_id"):
-        return _candidate_to_uuid("chat_id", sys_info["chat_id"])
+        return _candidate_to_uuid("chat_id", sys_info["chat_id"] + _fmt_suffix)
 
     sys_hash = _extract_system_prompt_hash(body)
     if sys_hash:
-        return _candidate_to_uuid("system_prompt", sys_hash)
+        return _candidate_to_uuid("system_prompt", sys_hash + _fmt_suffix)
 
     return str(_uuid.uuid4())
