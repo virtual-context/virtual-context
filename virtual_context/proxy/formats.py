@@ -62,6 +62,13 @@ class ToolOutputInfo(NamedTuple):
     msg_index: int
 
 
+class TurnGroup(NamedTuple):
+    """A logical turn — user message + assistant response + any tool rounds."""
+    indices: list[int]       # raw message/item indices in this turn
+    role: str                # "user" — the initiating role
+    has_tool_activity: bool  # whether this turn includes tool calls/results
+
+
 # ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------
@@ -105,6 +112,21 @@ class PayloadFormat(ABC):
 
     @abstractmethod
     def has_messages(self, body: dict) -> bool:
+        ...
+
+    # -- Turn grouping -------------------------------------------------------
+
+    @abstractmethod
+    def group_into_turns(self, body: dict) -> list[TurnGroup]:
+        """Group messages/items into logical turns.
+
+        Each turn starts with a user message, includes the assistant response,
+        and absorbs any tool call/result rounds that follow. Trailing user
+        messages (no assistant response) form their own group.
+
+        This is the SOLE source of truth for turn boundaries. All protected-window
+        consumers must use this method.
+        """
         ...
 
     # -- Tool-call / tool-output traversal -----------------------------------
@@ -507,6 +529,63 @@ class AnthropicFormat(PayloadFormat):
     def has_messages(self, body: dict) -> bool:
         return isinstance(body.get("messages"), list)
 
+    def group_into_turns(self, body: dict) -> list[TurnGroup]:
+        messages = body.get("messages", [])
+        turns: list[TurnGroup] = []
+        current_indices: list[int] = []
+        has_tool = False
+
+        def _is_real_user(msg: dict) -> bool:
+            """True if user message has real content (not just tool_result blocks)."""
+            if msg.get("role") != "user":
+                return False
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return True
+            if isinstance(content, list):
+                types = {b.get("type") for b in content if isinstance(b, dict)}
+                return not (types and types <= {"tool_result"})
+            return True
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            if role == "user" and _is_real_user(msg):
+                # Start of a new turn — flush the previous one
+                if current_indices:
+                    turns.append(TurnGroup(
+                        indices=current_indices,
+                        role="user",
+                        has_tool_activity=has_tool,
+                    ))
+                current_indices = [i]
+                has_tool = False
+            else:
+                if not current_indices:
+                    # Orphaned message before any user message; start a group
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+                # Detect tool activity
+                if role == "assistant":
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") in ("tool_use",):
+                                has_tool = True
+                elif role == "user":
+                    # tool_result-only user message
+                    has_tool = True
+
+        # Flush the last group
+        if current_indices:
+            turns.append(TurnGroup(
+                indices=current_indices,
+                role="user",
+                has_tool_activity=has_tool,
+            ))
+
+        return turns
+
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         if not prepend_text:
             return body
@@ -802,6 +881,51 @@ class OpenAIFormat(PayloadFormat):
     def has_messages(self, body: dict) -> bool:
         return isinstance(body.get("messages"), list)
 
+    def group_into_turns(self, body: dict) -> list[TurnGroup]:
+        messages = body.get("messages", [])
+        turns: list[TurnGroup] = []
+        current_indices: list[int] = []
+        has_tool = False
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            if role == "user":
+                # Start of a new turn — flush the previous one
+                if current_indices:
+                    turns.append(TurnGroup(
+                        indices=current_indices,
+                        role="user",
+                        has_tool_activity=has_tool,
+                    ))
+                current_indices = [i]
+                has_tool = False
+            elif role == "tool":
+                # Tool result — belongs to the current turn
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+                has_tool = True
+            else:
+                # assistant, system, or other
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+                # Detect tool calls on assistant messages
+                if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                    has_tool = True
+
+        # Flush the last group
+        if current_indices:
+            turns.append(TurnGroup(
+                indices=current_indices,
+                role="user",
+                has_tool_activity=has_tool,
+            ))
+
+        return turns
+
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         if not prepend_text:
             return body
@@ -1040,6 +1164,69 @@ class GeminiFormat(PayloadFormat):
 
     def has_messages(self, body: dict) -> bool:
         return isinstance(body.get("contents"), list)
+
+    def group_into_turns(self, body: dict) -> list[TurnGroup]:
+        contents = body.get("contents", [])
+        turns: list[TurnGroup] = []
+        current_indices: list[int] = []
+        has_tool = False
+
+        def _is_real_user(msg: dict) -> bool:
+            """True if user message has real content (not just functionResponse parts)."""
+            if msg.get("role") != "user":
+                return False
+            parts = msg.get("parts", [])
+            if not parts:
+                return True
+            types = set()
+            for p in parts:
+                if isinstance(p, dict):
+                    if "functionResponse" in p:
+                        types.add("functionResponse")
+                    elif "text" in p:
+                        types.add("text")
+                    else:
+                        types.add("other")
+            return not (types and types <= {"functionResponse"})
+
+        def _has_function_parts(msg: dict) -> bool:
+            """True if message has functionCall or functionResponse parts."""
+            parts = msg.get("parts", [])
+            for p in parts:
+                if isinstance(p, dict):
+                    if "functionCall" in p or "functionResponse" in p:
+                        return True
+            return False
+
+        for i, msg in enumerate(contents):
+            role = msg.get("role", "")
+            if role == "user" and _is_real_user(msg):
+                # Start of a new turn — flush the previous one
+                if current_indices:
+                    turns.append(TurnGroup(
+                        indices=current_indices,
+                        role="user",
+                        has_tool_activity=has_tool,
+                    ))
+                current_indices = [i]
+                has_tool = False
+            else:
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+                if _has_function_parts(msg):
+                    has_tool = True
+
+        # Flush the last group
+        if current_indices:
+            turns.append(TurnGroup(
+                indices=current_indices,
+                role="user",
+                has_tool_activity=has_tool,
+            ))
+
+        return turns
 
     def estimate_payload_tokens(self, body: dict) -> int:
         return self._count(json.dumps(body, default=str))
@@ -1442,6 +1629,60 @@ class OpenAIResponsesFormat(PayloadFormat):
     def has_messages(self, body: dict) -> bool:
         inp = body.get("input")
         return isinstance(inp, (list, str)) and bool(inp)
+
+    def group_into_turns(self, body: dict) -> list[TurnGroup]:
+        items = body.get("input", [])
+        if not isinstance(items, list):
+            return []
+        turns: list[TurnGroup] = []
+        current_indices: list[int] = []
+        has_tool = False
+
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role", "")
+            item_type = item.get("type", "")
+
+            if role == "user":
+                # Start of a new turn — flush the previous one
+                if current_indices:
+                    turns.append(TurnGroup(
+                        indices=current_indices,
+                        role="user",
+                        has_tool_activity=has_tool,
+                    ))
+                current_indices = [i]
+                has_tool = False
+            elif item_type in ("function_call", "function_call_output"):
+                # Bare tool items belong to the current turn
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+                has_tool = True
+            elif item_type == "reasoning":
+                # Reasoning items belong to the current turn
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+            else:
+                # assistant or other role-based items
+                if not current_indices:
+                    current_indices = [i]
+                else:
+                    current_indices.append(i)
+
+        # Flush the last group
+        if current_indices:
+            turns.append(TurnGroup(
+                indices=current_indices,
+                role="user",
+                has_tool_activity=has_tool,
+            ))
+
+        return turns
 
     # -- Context injection --
 
