@@ -187,8 +187,8 @@ class TestMergeConsecutiveConversational:
         merged = body["messages"][1]["content"]
         assert len(merged) == 2  # two text blocks combined
 
-    def test_responses_merge_user_produces_plain_text(self):
-        """P1-4: Merging consecutive user messages in Responses must produce plain text, not output_text."""
+    def test_responses_merge_user_preserves_content(self):
+        """Merging consecutive user messages in Responses preserves all content."""
         body = {"model": "gpt-5", "input": [
             {"role": "user", "content": "first message"},
             {"role": "user", "content": "second message"},
@@ -198,13 +198,14 @@ class TestMergeConsecutiveConversational:
         fmt.merge_consecutive_conversational(body)
         assert len(body["input"]) == 2
         merged_content = body["input"][0]["content"]
-        # User content must be a plain string, not output_text blocks
-        assert isinstance(merged_content, str)
-        assert "first message" in merged_content
-        assert "second message" in merged_content
+        # Content is a list preserving all blocks
+        assert isinstance(merged_content, list)
+        texts = [b.get("text", "") for b in merged_content]
+        assert "first message" in texts
+        assert "second message" in texts
 
-    def test_responses_merge_user_list_content_produces_plain_text(self):
-        """P1-4: Merging user messages with list content (input_text) produces plain text."""
+    def test_responses_merge_user_list_content_preserves_blocks(self):
+        """Merging user messages with list content preserves all block types."""
         body = {"model": "gpt-5", "input": [
             {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
             {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
@@ -214,9 +215,29 @@ class TestMergeConsecutiveConversational:
         fmt.merge_consecutive_conversational(body)
         assert len(body["input"]) == 2
         merged_content = body["input"][0]["content"]
-        assert isinstance(merged_content, str)
-        assert "first" in merged_content
-        assert "second" in merged_content
+        assert isinstance(merged_content, list)
+        assert len(merged_content) == 2
+        assert merged_content[0]["type"] == "input_text"
+
+    def test_responses_merge_user_preserves_multimodal(self):
+        """Merging user messages with images preserves the image blocks."""
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": [
+                {"type": "input_image", "source": {"type": "base64", "data": "AAAA", "media_type": "image/png"}},
+                {"type": "input_text", "text": "what is this?"},
+            ]},
+            {"role": "user", "content": [{"type": "input_text", "text": "also check the colors"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "response"}]},
+        ]}
+        fmt = detect_format(body)
+        fmt.merge_consecutive_conversational(body)
+        assert len(body["input"]) == 2
+        merged_content = body["input"][0]["content"]
+        assert isinstance(merged_content, list)
+        assert len(merged_content) == 3
+        types = [b.get("type") for b in merged_content]
+        assert "input_image" in types
+        assert "input_text" in types
 
     def test_responses_merge_assistant_keeps_output_text_blocks(self):
         """P1-4: Merging assistant messages in Responses must keep output_text block arrays."""
