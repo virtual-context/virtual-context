@@ -848,6 +848,26 @@ async def prepare_payload(
                     _think_t, _think_t / _budget * 100, _budget,
                 )
 
+    # ------------------------------------------------------------------
+    # PAYLOAD BUDGET ENFORCEMENT — hard cap on VC context window
+    # ------------------------------------------------------------------
+    if state and outbound_tokens > state.engine.config.monitor.context_window:
+        from .message_filter import enforce_payload_budget
+        _budget_window = state.engine.config.monitor.context_window
+        enriched_body, _budget_reductions, _budget_freed = enforce_payload_budget(
+            enriched_body, fmt, _budget_window,
+            store=state.engine._store,
+            conversation_id=state.engine.config.conversation_id,
+        )
+        if _budget_reductions > 0:
+            _outbound_json = json.dumps(enriched_body, default=str)
+            _outbound_bytes = len(_outbound_json.encode("utf-8"))
+            outbound_tokens = fmt._count(_outbound_json)
+            logger.info(
+                "BUDGET_ENFORCE: %d reductions, %d bytes freed, now %dt/%dt",
+                _budget_reductions, _budget_freed, outbound_tokens, _budget_window,
+            )
+
     # VC must never send more than the client sent. If enrichment bloated
     # the payload beyond inbound, revert to the original client body and
     # treat as passthrough — all downstream metrics/capture will record
