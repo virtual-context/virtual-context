@@ -234,6 +234,29 @@ def stub_media_by_position(
     return body, count
 
 
+def build_media_restore_result(
+    b64_data: str,
+    media_type: str,
+    width: int,
+    height: int,
+) -> list[dict]:
+    """Build the content blocks for a media restore tool result."""
+    return [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64_data,
+            },
+        },
+        {
+            "type": "text",
+            "text": f"Restored image ({width}x{height} {media_type}).",
+        },
+    ]
+
+
 def _extract_media_data(block: dict, format_name: str):
     """Extract base64 data from a media block. Returns (b64_data, media_type, setter_fn) or (None, None, None).
 
