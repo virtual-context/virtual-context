@@ -1984,14 +1984,33 @@ class OpenAIResponsesFormat(PayloadFormat):
     # -- OpenAI Responses-specific overrides ---------------------------------
 
     def _merge_message_content(self, target: dict, source: dict) -> None:
-        """OpenAI Responses: combine content arrays (output_text items)."""
+        """OpenAI Responses: combine content appropriately by role.
+
+        User messages use plain text strings (or ``input_text`` blocks).
+        Assistant messages use ``output_text`` block arrays.
+        """
+        role = target.get("role", "")
         tc = target.get("content", [])
         sc = source.get("content", [])
-        if isinstance(tc, str):
-            tc = [{"type": "output_text", "text": tc}] if tc else []
-        if isinstance(sc, str):
-            sc = [{"type": "output_text", "text": sc}] if sc else []
-        target["content"] = list(tc) + list(sc)
+        if role == "user":
+            # User messages: combine as plain text strings.
+            if isinstance(tc, list):
+                tc = " ".join(
+                    b.get("text", "") for b in tc if isinstance(b, dict)
+                ) if tc else ""
+            if isinstance(sc, list):
+                sc = " ".join(
+                    b.get("text", "") for b in sc if isinstance(b, dict)
+                ) if sc else ""
+            parts = [p for p in (tc, sc) if p]
+            target["content"] = "\n".join(parts)
+        else:
+            # Assistant messages: combine output_text block arrays.
+            if isinstance(tc, str):
+                tc = [{"type": "output_text", "text": tc}] if tc else []
+            if isinstance(sc, str):
+                sc = [{"type": "output_text", "text": sc}] if sc else []
+            target["content"] = list(tc) + list(sc)
 
     def extract_text_from_item(self, body: dict, index: int) -> str:
         item = self.get_messages(body)[index]
@@ -2014,21 +2033,50 @@ class OpenAIResponsesFormat(PayloadFormat):
             content = msg.get("content", "")
             if not isinstance(content, list):
                 continue
+            role = msg.get("role", "")
             for bi, block in enumerate(content):
                 if not isinstance(block, dict):
                     continue
+                # Check for OpenAI Responses input_image blocks first
+                if block.get("type") == "input_image":
+                    image_url = block.get("image_url", "")
+                    media_type = "image"
+                    if isinstance(image_url, str) and image_url.startswith("data:") and ";base64," in image_url:
+                        header = image_url.split(";base64,", 1)[0]
+                        media_type = header.replace("data:", "")
+                    def _make_input_image_setter(_block):
+                        def _setter(blk, b64, mt):
+                            blk["image_url"] = f"data:{mt};base64,{b64}"
+                        return _setter
+                    def _make_input_image_replacer(_content, _bi, _role):
+                        def _replace(text: str) -> None:
+                            # Use input_text for user messages, output_text for assistant
+                            block_type = "input_text" if _role == "user" else "output_text"
+                            _content[_bi] = {"type": block_type, "text": text}
+                        return _replace
+                    yield MediaBlockInfo(
+                        msg_index=mi,
+                        block_index=bi,
+                        media_type=media_type,
+                        setter=_make_input_image_setter(block),
+                        replace_with_text=_make_input_image_replacer(content, bi, role),
+                        carrier=msg,
+                    )
+                    continue
+                # Fall back to base class detection (Anthropic/OpenAI Chat shapes)
                 media_type, setter = self._detect_media_block(block)
                 if media_type is not None:
-                    def _make_replacer(_content, _bi):
+                    def _make_replacer(_content, _bi, _role):
                         def _replace(text: str) -> None:
-                            _content[_bi] = {"type": "output_text", "text": text}
+                            block_type = "input_text" if _role == "user" else "output_text"
+                            _content[_bi] = {"type": block_type, "text": text}
                         return _replace
                     yield MediaBlockInfo(
                         msg_index=mi,
                         block_index=bi,
                         media_type=media_type,
                         setter=setter,
-                        replace_with_text=_make_replacer(content, bi),
+                        replace_with_text=_make_replacer(content, bi, role),
                         carrier=msg,
                     )
 
