@@ -802,6 +802,9 @@ async def prepare_payload(
     # Component-level estimate (diagnostic breakdown, not source of truth)
     system_tokens = fmt._estimate_system_tokens(body)
 
+    # Strip VC internal markers before token counting and upstream send
+    fmt.strip_vc_markers(enriched_body)
+
     # Ground truth: actual byte-measured outbound token count
     _outbound_json = json.dumps(enriched_body, default=str)
     _outbound_bytes = len(_outbound_json.encode("utf-8"))
