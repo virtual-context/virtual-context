@@ -567,6 +567,26 @@ async def prepare_payload(
     # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
     _pre_filter_body = body
 
+    # Media compression — compress images on first sight, store on disk
+    if state and state.engine.config.tool_output.enabled:
+        from .media import compress_media_in_payload
+        _data_dir = getattr(state.engine._store, '_data_dir', '')
+        if not _data_dir:
+            _db_path = getattr(state.engine._store, 'db_path', None)
+            if _db_path:
+                _data_dir = str(getattr(_db_path, 'parent', ''))
+            if not _data_dir:
+                _data_dir = os.environ.get('VC_DATA_DIR', '/data/tenants')
+        _media_dir = os.path.join(_data_dir, 'media')
+        body, _media_compressed = compress_media_in_payload(
+            body, fmt,
+            store=state.engine._store,
+            conversation_id=state.engine.config.conversation_id,
+            media_dir=_media_dir,
+        )
+        if _media_compressed:
+            logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
+
     # PROXY-025: Stub compacted messages via hash matching
     turns_stubbed = 0
     try:
@@ -672,6 +692,19 @@ async def prepare_payload(
             if _stub_count:
                 _tool_stubs_present = True
                 logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
+
+    # Media stubbing — stub images outside protected window
+    if state and state.engine.config.tool_output.enabled:
+        from .media import stub_media_by_position
+        body, _media_stubbed = stub_media_by_position(
+            body, fmt,
+            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+            protected_intrusion_threshold=0.6,
+            context_budget=state.engine.config.monitor.context_window,
+        )
+        if _media_stubbed:
+            _tool_stubs_present = True
+            logger.info("MEDIA-STUB: stubbed %d images outside protected window", _media_stubbed)
 
     enriched_body = _inject_context(body, prepend_text, api_format)
 

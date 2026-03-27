@@ -2069,6 +2069,17 @@ def _reduce_conversation_text(body: dict, item: ReducibleItem) -> int:
 
 
 def _reduce_image(body: dict, item: ReducibleItem) -> int:
+    # Skip if likely already compressed by the media pipeline.
+    # Check: small size AND already JPEG media_type.
+    if item.size_bytes < 200000:
+        msgs = body.get("messages", body.get("input", body.get("contents", [])))
+        if item.msg_index < len(msgs):
+            content = msgs[item.msg_index].get("content", [])
+            if isinstance(content, list) and item.block_index < len(content):
+                block = content[item.block_index]
+                source = block.get("source", {})
+                if isinstance(source, dict) and "jpeg" in source.get("media_type", "").lower():
+                    return 0
     import base64
     from io import BytesIO
     try:
