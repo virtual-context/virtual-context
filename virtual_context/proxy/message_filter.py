@@ -797,15 +797,14 @@ def trim_to_upstream_limit(
     upstream_limit: int,
     fmt,
 ) -> tuple[dict, int]:
-    """Trim oldest message pairs so payload fits within upstream context window.
+    """Trim oldest turn groups so payload fits within upstream context window.
 
-    Uses adaptive batch removal: estimate excess fraction, drop proportional
-    batch of oldest pairs, re-estimate with empirical tokens-per-pair.
+    Uses ``fmt.group_into_turns(body)`` for atomic turn grouping across all
+    provider formats.  Builds from newest turn groups to oldest, filling the
+    budget greedily.  Always protects the last 2 turn groups (current +
+    previous turn).  System prompt and tools are never trimmed.
 
-    Always protects the last 2 user/assistant pairs (current + previous turn).
-    System prompt and tools are never trimmed.
-
-    Returns (trimmed_body, pairs_removed). Returns (body, 0) if no trim needed.
+    Returns (trimmed_body, turns_removed). Returns (body, 0) if no trim needed.
     """
     total = fmt.estimate_payload_tokens(body)
     input_limit = upstream_limit
@@ -818,83 +817,38 @@ def trim_to_upstream_limit(
     if not original_messages or not isinstance(original_messages, list):
         return body, 0
 
-    # Identify system prefix (not trimmable)
-    system_prefix = 0
-    if original_messages and original_messages[0].get("role") in ("system",):
-        system_prefix = 1
+    # Use format abstraction for atomic turn grouping
+    all_groups = fmt.group_into_turns(body)
 
-    # Identify atomic units: regular pairs or tool chains.
-    # A tool chain is an assistant[tool_use] → user[tool_result] → ... sequence
-    # that must be dropped or kept together.
-    # Each "pair" is a tuple of ALL message indices in the atomic unit.
-    pairs: list[tuple[int, ...]] = []
-    i = system_prefix
-    while i < len(original_messages) - 1:
-        msg = original_messages[i]
-        if msg.get("role") not in ("user", "human"):
-            i += 1
-            continue
-        # Verify next message is assistant/model — skip consecutive users
-        if original_messages[i + 1].get("role") not in ("assistant", "model"):
-            i += 1
-            continue
-        # Start of a turn: user message + assistant response
-        chain_indices = [i, i + 1]  # user + assistant
-        j = i + 2
-        # Extend chain through tool rounds.
-        # Anthropic: user[tool_result] → assistant → ...
-        # OpenAI: tool (role="tool") → assistant → ...  (assistant has "tool_calls")
-        while j < len(original_messages) - 1:
-            next_msg = original_messages[j]
-            next_role = next_msg.get("role", "")
-            # OpenAI tool response (role="tool")
-            if next_role == "tool":
-                # Consume all consecutive tool messages + following assistant
-                tool_batch = [j]
-                k = j + 1
-                while k < len(original_messages) and original_messages[k].get("role") == "tool":
-                    tool_batch.append(k)
-                    k += 1
-                if k < len(original_messages) and original_messages[k].get("role") == "assistant":
-                    chain_indices.extend(tool_batch)
-                    chain_indices.append(k)
-                    j = k + 1
-                    continue
-                else:
-                    break  # tool messages without following assistant — stop
-            # OpenAI Responses bare function_call/function_call_output round
-            responses_round = _consume_responses_tool_round(original_messages, j, "assistant")
-            if responses_round:
-                round_indices, next_index = responses_round
-                chain_indices.extend(round_indices)
-                j = next_index
+    # Separate system-prefix groups (always kept, not counted against budget)
+    # from real turn groups.  A "system prefix" group is one at the start of
+    # the array whose items all have role="system".
+    system_groups: list = []
+    turn_groups: list = []
+    for g in all_groups:
+        if not turn_groups:
+            # Still scanning for system-only prefix groups
+            all_system = all(
+                original_messages[idx].get("role") == "system"
+                for idx in g.indices
+            )
+            if all_system:
+                system_groups.append(g)
                 continue
-            # Anthropic tool result (user message with tool_result content blocks)
-            if next_role not in ("user", "human"):
-                break
-            if not _is_tool_result_only_user(next_msg):
-                break  # real user message, not part of tool chain
-            # Verify next message is assistant before extending
-            if j + 1 >= len(original_messages) or original_messages[j + 1].get("role") != "assistant":
-                break  # tool_result without following assistant — malformed, stop
-            # tool_result user + next assistant = part of chain
-            chain_indices.extend([j, j + 1])
-            j += 2
-        pairs.append(tuple(chain_indices))
-        i = chain_indices[-1] + 1
+        turn_groups.append(g)
 
-    # Collect trailing messages not in any pair (e.g. the user's current
-    # message with no assistant response yet). These are always kept.
-    paired_indices: set[int] = set()
-    for pair in pairs:
-        for idx in pair:
-            paired_indices.add(idx)
+    # Collect trailing items: indices not covered by any turn group.
+    # group_into_turns covers all items, so this is normally empty, but
+    # handle the edge case defensively.
+    grouped_indices: set[int] = set()
+    for g in all_groups:
+        grouped_indices.update(g.indices)
     trailing = tuple(
-        idx for idx in range(system_prefix, len(original_messages))
-        if idx not in paired_indices
+        idx for idx in range(len(original_messages))
+        if idx not in grouped_indices
     )
 
-    if len(pairs) <= 2 and not trailing:
+    if len(turn_groups) <= 2 and not trailing:
         return body, 0
 
     fixed = fmt._estimate_system_tokens(body) + fmt.estimate_tools_tokens(body)
@@ -902,58 +856,67 @@ def trim_to_upstream_limit(
 
     logger.info(
         "TRIM_BUDGET: total=%d fixed(system+tools)=%d "
-        "input_limit=%d available_for_msgs=%d pairs=%d",
-        total, fixed, input_limit, available, len(pairs),
+        "input_limit=%d available_for_msgs=%d turns=%d",
+        total, fixed, input_limit, available, len(turn_groups),
     )
 
+    # Protect the last 2 turn groups (or all if fewer than 2)
+    protected_count = min(2, len(turn_groups))
+
     if available <= 0:
-        # System+tools alone exceed the limit — drop all trimmable pairs
+        # System+tools alone exceed the limit — keep only protected turns
         keep_indices: set[int] = set()
-        for idx in pairs[-2]:
+        for g in system_groups:
+            keep_indices.update(g.indices)
+        for g in turn_groups[-protected_count:]:
+            keep_indices.update(g.indices)
+        for idx in trailing:
             keep_indices.add(idx)
-        if len(pairs) > 2:
-            for idx in pairs[-1]:
-                keep_indices.add(idx)
         new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
         trimmed_body = dict(body)
         trimmed_body[msg_key] = new_messages
-        return trimmed_body, len(pairs) - 2
+        return trimmed_body, len(turn_groups) - protected_count
 
-    # Build from newest to oldest. Start with trailing messages + last 2 pairs
-    # (protected), then add older pairs one at a time until the budget is full.
-    keep_pairs: list[tuple[int, ...]] = list(pairs[-2:])  # always keep last 2
+    # Build from newest to oldest.  Start with protected turn groups +
+    # trailing items, then add older groups until the budget is full.
+    keep_groups = list(turn_groups[-protected_count:])
     budget_used = 0
-    # Always count trailing messages (user's current message)
+
+    # Always count trailing items
     for idx in trailing:
         budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
-    for pair in keep_pairs:
-        for idx in pair:
+    # Count system-prefix groups (always kept)
+    for g in system_groups:
+        for idx in g.indices:
+            budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
+    # Count protected turn groups
+    for g in keep_groups:
+        for idx in g.indices:
             budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
 
-    # Walk backwards from the third-to-last pair
+    # Walk backwards from the oldest unprotected turn group
     added = 0
-    for pair_idx in range(len(pairs) - 3, -1, -1):
-        pair = pairs[pair_idx]
-        pair_tokens = 0
-        for idx in pair:
-            pair_tokens += fmt._count(json.dumps(original_messages[idx], default=str))
-        if budget_used + pair_tokens <= available:
-            keep_pairs.insert(0, pair)
-            budget_used += pair_tokens
+    trimmable = turn_groups[:-protected_count] if protected_count else turn_groups
+    for g_idx in range(len(trimmable) - 1, -1, -1):
+        g = trimmable[g_idx]
+        g_tokens = 0
+        for idx in g.indices:
+            g_tokens += fmt._count(json.dumps(original_messages[idx], default=str))
+        if budget_used + g_tokens <= available:
+            keep_groups.insert(0, g)
+            budget_used += g_tokens
             added += 1
-        # else: skip this pair, too big — but keep trying older smaller ones
+        # else: skip — too big, but keep trying older smaller ones
 
-    total_pairs_removed = len(pairs) - 2 - added
-    if total_pairs_removed == 0:
+    total_removed = len(trimmable) - added
+    if total_removed == 0:
         return body, 0
 
     keep_indices: set[int] = set()
-    # Always keep system prefix message if present
-    for idx in range(system_prefix):
-        keep_indices.add(idx)
-    for pair in keep_pairs:
-        for idx in pair:
-            keep_indices.add(idx)
+    for g in system_groups:
+        keep_indices.update(g.indices)
+    for g in keep_groups:
+        keep_indices.update(g.indices)
     for idx in trailing:
         keep_indices.add(idx)
 
@@ -962,15 +925,15 @@ def trim_to_upstream_limit(
     trimmed_body[msg_key] = new_messages
 
     logger.info(
-        "TRIM_RESULT: kept=%d/%d pairs (%d msgs), budget_used=%d/%d",
-        len(keep_pairs), len(pairs), len(new_messages), budget_used, available,
+        "TRIM_RESULT: kept=%d/%d turns (%d msgs), budget_used=%d/%d",
+        len(keep_groups), len(turn_groups), len(new_messages), budget_used, available,
     )
 
     # Post-trim cleanup: remove any orphaned tool_use/tool_result pairs
     # that survived trimming without their counterpart.
     trimmed_body = _cleanup_orphaned_tools(trimmed_body, msg_key)
 
-    return trimmed_body, total_pairs_removed
+    return trimmed_body, total_removed
 
 
 def _cleanup_orphaned_tools(body: dict, msg_key: str) -> dict:
