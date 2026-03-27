@@ -1749,38 +1749,33 @@ def scan_reducible_items(
     body: dict,
     fmt: PayloadFormat,
 ) -> list[ReducibleItem]:
-    """Scan the payload and return all items eligible for reduction."""
+    """Scan the payload and return all items eligible for reduction.
+
+    Uses format methods for cross-format compatibility:
+    - ``fmt.group_into_turns()`` for the protection window
+    - ``fmt.iter_tool_outputs()`` for tool results
+    - ``fmt.iter_media_blocks()`` for images
+    - ``fmt.extract_text_from_item()`` for conversational text
+    - Anthropic-specific thinking block detection
+    """
     items: list[ReducibleItem] = []
 
-    if fmt.name == "gemini":
-        msg_key = "contents"
-    elif fmt.name == "openai_responses":
-        msg_key = "input"
-    else:
-        msg_key = "messages"
-
-    messages = body.get(msg_key, [])
+    messages = fmt.get_messages(body)
     if not messages:
         return items
 
-    # Find the start of the "last 2 real turns" — only count user messages
-    # that are NOT pure tool-result scaffolding.
-    _real_user_indices: list[int] = []
-    for _i, _m in enumerate(messages):
-        if _m.get("role") not in ("user", "human"):
-            continue
-        _c = _m.get("content", "")
-        if isinstance(_c, list) and all(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in _c
-        ):
-            continue
-        _real_user_indices.append(_i)
-    if len(_real_user_indices) >= 3:
-        _last2_start = _real_user_indices[-2]
+    # Use turn groups to find the protection window (last 2 real turns).
+    turns = fmt.group_into_turns(body)
+    if len(turns) >= 3:
+        _last2_start = turns[-2].indices[0]
     else:
         _last2_start = len(messages)  # nothing is "last2"
 
+    # Track which msg_index+block_index pairs are already registered to
+    # avoid duplicate entries (e.g. a tool_result also matching text scan).
+    _seen: set[tuple[int, int]] = set()
+
+    # -- VC context blocks in system prompt (Anthropic-specific) --------
     system = body.get("system", [])
     if isinstance(system, list):
         for si, block in enumerate(system):
@@ -1793,73 +1788,135 @@ def scan_reducible_items(
                     size_bytes=len(text), location="system",
                 ))
 
-    for mi, msg in enumerate(messages):
-        content = msg.get("content", "")
+    # -- Tool outputs (via format method) -------------------------------
+    for tool_out in fmt.iter_tool_outputs(body):
+        content_str = tool_out.content
+        tc_bytes = len(content_str)
+        if tc_bytes < 100:
+            continue
+        if "vc_restore_tool" in content_str:
+            continue
+        # For Anthropic, block_index is the position within content list.
+        # For OpenAI Chat/Responses, block_index is -1 (whole message).
+        if tool_out.carrier_type == "anthropic":
+            # Find the block_index within the content list
+            msg = messages[tool_out.msg_index]
+            content_list = msg.get("content", [])
+            bi = -1
+            if isinstance(content_list, list):
+                for _bi, _blk in enumerate(content_list):
+                    if _blk is tool_out.carrier:
+                        bi = _bi
+                        break
+        else:
+            bi = -1
+        category = "tool_result_last2" if tool_out.msg_index >= _last2_start else "tool_result"
+        items.append(ReducibleItem(
+            msg_index=tool_out.msg_index, block_index=bi, category=category,
+            size_bytes=tc_bytes, location="messages",
+        ))
+        _seen.add((tool_out.msg_index, bi))
 
-        if isinstance(content, str):
-            if "[Compacted turn" in content:
+    # -- Media blocks (via format method) -------------------------------
+    for media_info in fmt.iter_media_blocks(body):
+        # Estimate data size from the source/URL
+        msg = messages[media_info.msg_index]
+        content = msg.get("content", [])
+        data_size = 0
+        if isinstance(content, list) and media_info.block_index < len(content):
+            block = content[media_info.block_index]
+            if isinstance(block, dict):
+                source = block.get("source", {})
+                if isinstance(source, dict) and source.get("type") == "base64":
+                    data_size = len(source.get("data", ""))
+                elif block.get("type") == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    if url.startswith("data:") and ";base64," in url:
+                        data_size = len(url.split(";base64,", 1)[1]) if ";base64," in url else 0
+        if data_size > 10000:
+            key = (media_info.msg_index, media_info.block_index)
+            if key not in _seen:
+                items.append(ReducibleItem(
+                    msg_index=media_info.msg_index, block_index=media_info.block_index,
+                    category="image", size_bytes=data_size, location="messages",
+                ))
+                _seen.add(key)
+
+    # -- Thinking blocks (Anthropic only) -------------------------------
+    if fmt.name == "anthropic":
+        for mi, msg in enumerate(messages):
+            content = msg.get("content", [])
+            if not isinstance(content, list):
                 continue
-            if len(content) > 100:
+            for bi, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    sig = block.get("signature", "")
+                    if sig:
+                        key = (mi, bi)
+                        if key not in _seen:
+                            items.append(ReducibleItem(
+                                msg_index=mi, block_index=bi, category="thinking_sig",
+                                size_bytes=len(sig), location="messages",
+                            ))
+                            _seen.add(key)
+
+    # -- Conversational text (via format method) ------------------------
+    for mi in range(len(messages)):
+        text = fmt.extract_text_from_item(body, mi)
+        if not text or len(text) <= 100:
+            continue
+        if "[Compacted turn" in text:
+            # Skip compacted stubs — check for vc_restore_tool presence too
+            if "vc_restore_tool" in text:
+                continue
+            # Plain "[Compacted turn" string content → also skip
+            content = messages[mi].get("content", "")
+            if isinstance(content, str) and "[Compacted turn" in content:
+                continue
+
+        # Determine block_index: -1 for string content, specific index for
+        # list content with text blocks.
+        content = messages[mi].get("content", "")
+        if isinstance(content, str):
+            key = (mi, -1)
+            if key not in _seen:
                 items.append(ReducibleItem(
                     msg_index=mi, block_index=-1, category="conversation_text",
                     size_bytes=len(content), location="messages",
                 ))
-            continue
-
-        if not isinstance(content, list):
-            continue
-
-        all_text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-        if "[Compacted turn" in all_text and "vc_restore_tool" in all_text:
-            continue
-
-        for bi, block in enumerate(content):
-            if not isinstance(block, dict):
+                _seen.add(key)
+        elif isinstance(content, list):
+            # Check for compacted stub (list content)
+            all_text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            if "[Compacted turn" in all_text and "vc_restore_tool" in all_text:
                 continue
-            btype = block.get("type", "")
-
-            if btype == "image":
-                source = block.get("source", {})
-                if isinstance(source, dict) and source.get("type") == "base64":
-                    data = source.get("data", "")
-                    if len(data) > 10000:
-                        items.append(ReducibleItem(
-                            msg_index=mi, block_index=bi, category="image",
-                            size_bytes=len(data), location="messages",
-                        ))
-                continue
-
-            if btype == "thinking":
-                sig = block.get("signature", "")
-                if sig:
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type", "")
+                if btype in ("text", "output_text"):
+                    btext = block.get("text", "")
+                    if "[Compacted turn" in btext:
+                        continue
+                    if len(btext) > 100:
+                        key = (mi, bi)
+                        if key not in _seen:
+                            items.append(ReducibleItem(
+                                msg_index=mi, block_index=bi, category="conversation_text",
+                                size_bytes=len(btext), location="messages",
+                            ))
+                            _seen.add(key)
+        else:
+            # OpenAI Responses bare items with output field
+            output = messages[mi].get("output", "")
+            if isinstance(output, str) and len(output) > 100:
+                key = (mi, -1)
+                if key not in _seen:
                     items.append(ReducibleItem(
-                        msg_index=mi, block_index=bi, category="thinking_sig",
-                        size_bytes=len(sig), location="messages",
+                        msg_index=mi, block_index=-1, category="conversation_text",
+                        size_bytes=len(output), location="messages",
                     ))
-
-            elif btype == "tool_result":
-                tc = block.get("content", "")
-                tc_bytes = len(tc) if isinstance(tc, str) else len(json.dumps(tc))
-                if tc_bytes < 100:
-                    continue
-                tc_str = tc if isinstance(tc, str) else json.dumps(tc)
-                if "vc_restore_tool" in tc_str:
-                    continue
-                category = "tool_result_last2" if mi >= _last2_start else "tool_result"
-                items.append(ReducibleItem(
-                    msg_index=mi, block_index=bi, category=category,
-                    size_bytes=tc_bytes, location="messages",
-                ))
-
-            elif btype == "text":
-                text = block.get("text", "")
-                if "[Compacted turn" in text:
-                    continue
-                if len(text) > 100:
-                    items.append(ReducibleItem(
-                        msg_index=mi, block_index=bi, category="conversation_text",
-                        size_bytes=len(text), location="messages",
-                    ))
+                    _seen.add(key)
 
     return items
 
@@ -1871,58 +1928,82 @@ def apply_reduction(
     store: "ContextStore | None" = None,
     conversation_id: str = "",
 ) -> int:
-    """Apply a category-appropriate reduction to one item. Returns bytes freed."""
+    """Apply a category-appropriate reduction to one item. Returns bytes freed.
+
+    Uses format methods for cross-format compatibility:
+    - ``fmt.remove_thinking_block()`` for thinking signatures
+    - ``fmt.replace_tool_output_content()`` via ``fmt.iter_tool_outputs()``
+    - ``fmt.get_messages()`` for message list access
+    """
     if item.category == "thinking_sig":
-        return _reduce_thinking_sig(body, item)
+        return _reduce_thinking_sig(body, item, fmt)
     elif item.category == "tool_result":
         return _reduce_tool_result(body, item, fmt, store, conversation_id)
     elif item.category == "tool_result_last2":
-        return _reduce_tool_result_last2(body, item)
+        return _reduce_tool_result_last2(body, item, fmt)
     elif item.category == "vc_context":
         return _reduce_vc_context(body, item)
     elif item.category == "conversation_text":
-        return _reduce_conversation_text(body, item)
+        return _reduce_conversation_text(body, item, fmt)
     elif item.category == "image":
-        return _reduce_image(body, item)
+        return _reduce_image(body, item, fmt)
     return 0
 
 
-def _reduce_thinking_sig(body: dict, item: ReducibleItem) -> int:
-    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+def _reduce_thinking_sig(body: dict, item: ReducibleItem, fmt: PayloadFormat) -> int:
+    """Remove a thinking block using fmt.remove_thinking_block()."""
+    msgs = fmt.get_messages(body)
+    if item.msg_index >= len(msgs):
+        return 0
     msg = msgs[item.msg_index]
     content = msg.get("content", [])
     if not isinstance(content, list) or item.block_index >= len(content):
         return 0
-    removed = content.pop(item.block_index)
-    return len(removed.get("signature", "")) + len(removed.get("thinking", ""))
+    block = content[item.block_index]
+    freed = len(block.get("signature", "")) + len(block.get("thinking", ""))
+    fmt.remove_thinking_block(body, msg_index=item.msg_index, block_index=item.block_index)
+    return freed
+
+
+def _find_tool_output_info(body, item, fmt):
+    """Find the ToolOutputInfo matching a ReducibleItem's msg_index."""
+    for tool_out in fmt.iter_tool_outputs(body):
+        if tool_out.msg_index != item.msg_index:
+            continue
+        # For Anthropic, match by block_index (carrier identity)
+        if item.block_index >= 0 and tool_out.carrier_type == "anthropic":
+            msgs = fmt.get_messages(body)
+            msg = msgs[item.msg_index]
+            content_list = msg.get("content", [])
+            if isinstance(content_list, list) and item.block_index < len(content_list):
+                if content_list[item.block_index] is tool_out.carrier:
+                    return tool_out
+        elif item.block_index == -1:
+            # OpenAI Chat / Responses: whole-message carriers
+            return tool_out
+    return None
 
 
 def _reduce_tool_result(
     body: dict, item: ReducibleItem, fmt: PayloadFormat,
     store, conversation_id: str,
 ) -> int:
-    msgs = body.get("messages", body.get("input", body.get("contents", [])))
-    msg = msgs[item.msg_index]
-    content = msg.get("content", [])
-    if not isinstance(content, list) or item.block_index >= len(content):
+    """Stub a tool result using fmt.replace_tool_output_content()."""
+    tool_out = _find_tool_output_info(body, item, fmt)
+    if tool_out is None:
         return 0
-    block = content[item.block_index]
-    tc = block.get("content", "")
-    tc_str = tc if isinstance(tc, str) else json.dumps(tc)
 
+    tc_str = tool_out.content
     ref = f"tool_{hashlib.sha256(tc_str.encode()).hexdigest()[:12]}"
 
     if store is not None:
         try:
             tool_name = ""
-            call_id = block.get("tool_use_id", "")
-            for m in msgs:
-                mc = m.get("content", [])
-                if isinstance(mc, list):
-                    for b in mc:
-                        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") == call_id:
-                            tool_name = b.get("name", "")
-                            break
+            # Find tool name via fmt.iter_tool_calls()
+            for tc_info in fmt.iter_tool_calls(body):
+                if tc_info.call_id == tool_out.call_id:
+                    tool_name = tc_info.name
+                    break
             store.store_tool_output(
                 ref=ref, conversation_id=conversation_id,
                 tool_name=tool_name, command="", turn=-1,
@@ -1932,25 +2013,23 @@ def _reduce_tool_result(
             logger.warning("BUDGET_ENFORCE: failed to store ref=%s", ref, exc_info=True)
 
     stub_text = f'[budget-reduced tool output ref={ref} | call vc_restore_tool(ref="{ref}")]'
-    block["content"] = stub_text
+    fmt.replace_tool_output_content(body, tool_out, stub_text)
     return item.size_bytes - len(stub_text)
 
 
-def _reduce_tool_result_last2(body: dict, item: ReducibleItem) -> int:
-    msgs = body.get("messages", body.get("input", body.get("contents", [])))
-    msg = msgs[item.msg_index]
-    content = msg.get("content", [])
-    if not isinstance(content, list) or item.block_index >= len(content):
+def _reduce_tool_result_last2(body: dict, item: ReducibleItem, fmt: PayloadFormat) -> int:
+    """Truncate a recent tool result (head+tail) using fmt.replace_tool_output_content()."""
+    tool_out = _find_tool_output_info(body, item, fmt)
+    if tool_out is None:
         return 0
-    block = content[item.block_index]
-    tc = block.get("content", "")
-    tc_str = tc if isinstance(tc, str) else json.dumps(tc)
+
+    tc_str = tool_out.content
     if len(tc_str) <= 500:
         return 0
     head = tc_str[:200]
     tail = tc_str[-200:]
     truncated = f"{head}\n\n[... {len(tc_str) - 400} chars truncated ...]\n\n{tail}"
-    block["content"] = truncated
+    fmt.replace_tool_output_content(body, tool_out, truncated)
     return len(tc_str) - len(truncated)
 
 
@@ -1968,8 +2047,8 @@ def _reduce_vc_context(body: dict, item: ReducibleItem) -> int:
     return len(text) - len(truncated)
 
 
-def _reduce_conversation_text(body: dict, item: ReducibleItem) -> int:
-    msgs = body.get("messages", body.get("input", body.get("contents", [])))
+def _reduce_conversation_text(body: dict, item: ReducibleItem, fmt: PayloadFormat) -> int:
+    msgs = fmt.get_messages(body)
     msg = msgs[item.msg_index]
 
     if item.block_index == -1:
@@ -1996,11 +2075,11 @@ def _reduce_conversation_text(body: dict, item: ReducibleItem) -> int:
         return len(text) - len(truncated)
 
 
-def _reduce_image(body: dict, item: ReducibleItem) -> int:
+def _reduce_image(body: dict, item: ReducibleItem, fmt: PayloadFormat) -> int:
+    msgs = fmt.get_messages(body)
     # Skip if likely already compressed by the media pipeline.
     # Check: small size AND already JPEG media_type.
     if item.size_bytes < 200000:
-        msgs = body.get("messages", body.get("input", body.get("contents", [])))
         if item.msg_index < len(msgs):
             content = msgs[item.msg_index].get("content", [])
             if isinstance(content, list) and item.block_index < len(content):
@@ -2020,7 +2099,6 @@ def _reduce_image(body: dict, item: ReducibleItem) -> int:
     MAX_HEIGHT = 1024
     JPEG_QUALITY = 75
 
-    msgs = body.get("messages", body.get("input", body.get("contents", [])))
     msg = msgs[item.msg_index]
     content = msg.get("content", [])
     if not isinstance(content, list) or item.block_index >= len(content):

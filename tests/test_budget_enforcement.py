@@ -151,6 +151,50 @@ class TestScanReducibleItems:
         items = scan_reducible_items(body, fmt)
         assert not any(i.category == "image" for i in items)
 
+    def test_finds_openai_responses_tool_outputs(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "calling"}]},
+            {"type": "function_call", "call_id": "fc1", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "fc1", "output": "x" * 10000},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            {"role": "user", "content": "thanks"},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        tr_items = [i for i in items if i.category in ("tool_result", "tool_result_last2")]
+        assert len(tr_items) == 1
+        assert tr_items[0].msg_index == 3
+
+    def test_finds_openai_chat_tool_outputs(self):
+        body = {"model": "gpt-4", "messages": [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": "x" * 10000},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "thanks"},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        tr_items = [i for i in items if i.category in ("tool_result", "tool_result_last2")]
+        assert len(tr_items) == 1
+        assert tr_items[0].msg_index == 2
+
+    def test_finds_openai_responses_conversation_text(self):
+        """Verify we find text in output_text blocks, not just string content."""
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "msg " + "x" * 2000},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "resp " + "y" * 2000}]},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        items = scan_reducible_items(body, fmt)
+        text_items = [i for i in items if i.category == "conversation_text"]
+        # Should find both the user string content AND the assistant output_text block
+        assert len(text_items) >= 2
+
 
 class TestApplyReduction:
     def test_remove_thinking_signature(self):
@@ -351,3 +395,16 @@ class TestEnforcePayloadBudget:
         fmt = self._fmt()
         result, reductions, freed = enforce_payload_budget(body, fmt, 1)
         assert reductions <= 2
+
+    def test_reduces_openai_responses_payload(self):
+        items = []
+        for i in range(20):
+            items.append({"role": "user", "content": "msg " + "x" * 2000})
+            items.append({"role": "assistant", "content": [{"type": "output_text", "text": "resp " + "y" * 2000}]})
+        items.append({"role": "user", "content": "current"})
+        body = {"model": "gpt-5", "input": items}
+        fmt = detect_format(body)
+        fmt_copy = copy.copy(fmt)
+        fmt_copy.set_token_counter(lambda text: len(text) // 4)
+        result, reductions, freed = enforce_payload_budget(body, fmt_copy, 5000)
+        assert reductions > 0
