@@ -69,6 +69,16 @@ class TurnGroup(NamedTuple):
     has_tool_activity: bool  # whether this turn includes tool calls/results
 
 
+class MediaBlockInfo(NamedTuple):
+    """Descriptor for a media block (image, audio, etc.) in the payload."""
+    msg_index: int
+    block_index: int
+    media_type: str                    # "image", "audio", etc.
+    setter: Callable                   # existing setter for raw data replacement
+    replace_with_text: Callable[[str], None]  # replaces block with text placeholder
+    carrier: dict                      # the parent message/item
+
+
 # ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------
@@ -349,6 +359,192 @@ class PayloadFormat(ABC):
             )
         return ""
 
+    # -- Mutation methods ----------------------------------------------------
+
+    def remove_items(self, body: dict, indices: list[int]) -> None:
+        """Remove messages/items at the given indices. Handles index shifting."""
+        messages = self.get_messages(body)
+        for idx in sorted(indices, reverse=True):
+            if 0 <= idx < len(messages):
+                messages.pop(idx)
+
+    def insert_items(self, body: dict, position: int, items: list[dict]) -> None:
+        """Insert new messages/items at the given position."""
+        messages = self.get_messages(body)
+        for i, item in enumerate(items):
+            messages.insert(position + i, item)
+
+    def remove_thinking_block(self, body: dict, msg_index: int, block_index: int) -> None:
+        """Remove a thinking block from a message. Format-overridable.
+
+        Anthropic: pops the block from the content list.
+        All other formats: no-op (they don't have thinking blocks).
+        """
+        # Default: no-op. Anthropic overrides this.
+        pass
+
+    def replace_tool_output_content(self, body: dict, output_info: "ToolOutputInfo", new_content: str) -> None:
+        """Replace a tool output's content using the carrier from iter_tool_outputs."""
+        carrier = output_info.carrier
+        ct = output_info.carrier_type
+        if ct == "anthropic":
+            carrier["content"] = new_content
+        elif ct == "openai_chat":
+            carrier["content"] = new_content
+        elif ct == "openai_responses":
+            carrier["output"] = new_content
+
+    def iter_media_blocks(self, body: dict) -> Iterator["MediaBlockInfo"]:
+        """Yield MediaBlockInfo for each media block in the payload.
+
+        Each format overrides to detect its specific media block structure.
+        Default implementation handles Anthropic and OpenAI Chat formats.
+        """
+        messages = self.get_messages(body)
+        for mi, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                media_type, setter = self._detect_media_block(block)
+                if media_type is not None:
+                    def _make_replacer(_content, _bi):
+                        def _replace(text: str) -> None:
+                            _content[_bi] = {"type": "text", "text": text}
+                        return _replace
+                    yield MediaBlockInfo(
+                        msg_index=mi,
+                        block_index=bi,
+                        media_type=media_type,
+                        setter=setter,
+                        replace_with_text=_make_replacer(content, bi),
+                        carrier=msg,
+                    )
+
+    def _detect_media_block(self, block: dict) -> tuple[str | None, Callable | None]:
+        """Detect if a content block is a media block. Returns (media_type, setter) or (None, None)."""
+        # Anthropic: {"type": "image", "source": {"type": "base64", ...}}
+        if block.get("type") == "image":
+            source = block.get("source", {})
+            if isinstance(source, dict) and source.get("type") == "base64":
+                def _setter(blk, b64, mt):
+                    blk["source"]["data"] = b64
+                    blk["source"]["media_type"] = mt
+                return source.get("media_type", "image"), _setter
+        # OpenAI Chat: {"type": "image_url", "image_url": {"url": "data:..."}}
+        if block.get("type") == "image_url":
+            url = block.get("image_url", {}).get("url", "")
+            if url.startswith("data:") and ";base64," in url:
+                header = url.split(";base64,", 1)[0]
+                media_type = header.replace("data:", "")
+                def _setter(blk, b64, mt):
+                    blk["image_url"]["url"] = f"data:{mt};base64,{b64}"
+                return media_type, _setter
+        return None, None
+
+    # -- Stub markers --------------------------------------------------------
+
+    def mark_as_vc_stub(self, item: dict) -> None:
+        """Add the VC stub marker to a message/item."""
+        item["_vc_stub"] = True
+
+    def is_vc_stub(self, body: dict, index: int) -> bool:
+        """Check if a message/item at index has the VC stub marker."""
+        messages = self.get_messages(body)
+        if 0 <= index < len(messages):
+            return bool(messages[index].get("_vc_stub"))
+        return False
+
+    def strip_vc_markers(self, body: dict) -> None:
+        """Remove all _vc_stub markers from the payload."""
+        messages = self.get_messages(body)
+        for msg in messages:
+            msg.pop("_vc_stub", None)
+
+    # -- Conversational message detection and merging ------------------------
+
+    def _is_conversational_message(self, msg: dict) -> bool:
+        """Check if a message is purely conversational (no tool semantics).
+
+        Conversational = user or assistant message with only text/image content.
+        NOT conversational: tool messages, function_call items, tool_result carriers.
+        """
+        role = msg.get("role", "")
+        if role not in ("user", "assistant", "human", "model"):
+            return False
+        # Check for tool semantics in content
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "")
+                    if btype in ("tool_use", "tool_result"):
+                        return False
+        # OpenAI Chat: assistant with tool_calls
+        if msg.get("tool_calls"):
+            return False
+        # OpenAI Responses: bare items
+        if msg.get("type") in ("function_call", "function_call_output", "reasoning"):
+            return False
+        # Gemini: function parts
+        if isinstance(msg.get("parts"), list):
+            for part in msg["parts"]:
+                if isinstance(part, dict) and ("functionCall" in part or "functionResponse" in part):
+                    return False
+        return True
+
+    def merge_consecutive_conversational(self, body: dict) -> None:
+        """Merge adjacent same-role conversational messages.
+
+        Only merges user/assistant messages that do NOT encode tool semantics.
+        Tool messages, function items, reasoning items are never merged.
+        """
+        messages = self.get_messages(body)
+        if len(messages) < 2:
+            return
+
+        merged = [messages[0]]
+        for msg in messages[1:]:
+            prev = merged[-1]
+            prev_role = prev.get("role", prev.get("type", ""))
+            curr_role = msg.get("role", msg.get("type", ""))
+
+            if (prev_role == curr_role
+                    and self._is_conversational_message(prev)
+                    and self._is_conversational_message(msg)):
+                # Merge content
+                self._merge_message_content(prev, msg)
+            else:
+                merged.append(msg)
+
+        # Replace messages in body
+        msg_key = self._get_message_key(body)
+        body[msg_key] = merged
+
+    def _get_message_key(self, body: dict) -> str:
+        """Return the key used for the message list in this format."""
+        if "contents" in body:
+            return "contents"
+        if "input" in body and isinstance(body.get("input"), list):
+            return "input"
+        return "messages"
+
+    @abstractmethod
+    def _merge_message_content(self, target: dict, source: dict) -> None:
+        """Merge source message content into target. Each format overrides."""
+        ...
+
+    @abstractmethod
+    def extract_text_from_item(self, body: dict, index: int) -> str:
+        """Extract all text content from the message/item at the given index.
+
+        Returns a single string with all text content joined. Format-specific:
+        each format knows its own content structure.
+        """
+        ...
+
     # -- Paging tool support -------------------------------------------------
 
     @property
@@ -585,6 +781,37 @@ class AnthropicFormat(PayloadFormat):
             ))
 
         return turns
+
+    # -- Anthropic-specific overrides ----------------------------------------
+
+    def remove_thinking_block(self, body: dict, msg_index: int, block_index: int) -> None:
+        """Anthropic: pop the thinking block from the content list."""
+        messages = self.get_messages(body)
+        msg = messages[msg_index]
+        content = msg.get("content", [])
+        if isinstance(content, list) and 0 <= block_index < len(content):
+            content.pop(block_index)
+
+    def _merge_message_content(self, target: dict, source: dict) -> None:
+        """Anthropic: combine content block arrays."""
+        tc = target.get("content", "")
+        sc = source.get("content", "")
+        if isinstance(tc, str):
+            tc = [{"type": "text", "text": tc}] if tc else []
+        if isinstance(sc, str):
+            sc = [{"type": "text", "text": sc}] if sc else []
+        target["content"] = list(tc) + list(sc)
+
+    def extract_text_from_item(self, body: dict, index: int) -> str:
+        msg = self.get_messages(body)[index]
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+        return ""
 
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         if not prepend_text:
@@ -926,6 +1153,33 @@ class OpenAIFormat(PayloadFormat):
 
         return turns
 
+    # -- OpenAI Chat-specific overrides --------------------------------------
+
+    def _merge_message_content(self, target: dict, source: dict) -> None:
+        """OpenAI Chat: concatenate content strings."""
+        tc = target.get("content", "") or ""
+        sc = source.get("content", "") or ""
+        if isinstance(tc, str) and isinstance(sc, str):
+            target["content"] = tc + "\n" + sc
+            return
+        # Fall back to list concatenation for array content
+        if isinstance(tc, str):
+            tc = [{"type": "text", "text": tc}] if tc else []
+        if isinstance(sc, str):
+            sc = [{"type": "text", "text": sc}] if sc else []
+        target["content"] = list(tc) + list(sc)
+
+    def extract_text_from_item(self, body: dict, index: int) -> str:
+        msg = self.get_messages(body)[index]
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+        return ""
+
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         if not prepend_text:
             return body
@@ -1227,6 +1481,49 @@ class GeminiFormat(PayloadFormat):
             ))
 
         return turns
+
+    # -- Gemini-specific overrides -------------------------------------------
+
+    def _merge_message_content(self, target: dict, source: dict) -> None:
+        """Gemini: combine parts arrays."""
+        target["parts"] = target.get("parts", []) + source.get("parts", [])
+
+    def extract_text_from_item(self, body: dict, index: int) -> str:
+        msg = self.get_messages(body)[index]
+        parts = msg.get("parts", [])
+        return " ".join(
+            p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p
+        )
+
+    def iter_media_blocks(self, body: dict) -> Iterator["MediaBlockInfo"]:
+        """Gemini: media blocks are inline_data entries in parts."""
+        messages = self.get_messages(body)
+        for mi, msg in enumerate(messages):
+            parts = msg.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for bi, part in enumerate(parts):
+                if not isinstance(part, dict):
+                    continue
+                if "inline_data" in part:
+                    inline = part["inline_data"]
+                    if isinstance(inline, dict):
+                        media_type = inline.get("mime_type", "image")
+                        def _setter(blk, b64, mt):
+                            blk["inline_data"]["data"] = b64
+                            blk["inline_data"]["mime_type"] = mt
+                        def _make_replacer(_parts, _bi):
+                            def _replace(text: str) -> None:
+                                _parts[_bi] = {"text": text}
+                            return _replace
+                        yield MediaBlockInfo(
+                            msg_index=mi,
+                            block_index=bi,
+                            media_type=media_type,
+                            setter=_setter,
+                            replace_with_text=_make_replacer(parts, bi),
+                            carrier=msg,
+                        )
 
     def estimate_payload_tokens(self, body: dict) -> int:
         return self._count(json.dumps(body, default=str))
@@ -1683,6 +1980,57 @@ class OpenAIResponsesFormat(PayloadFormat):
             ))
 
         return turns
+
+    # -- OpenAI Responses-specific overrides ---------------------------------
+
+    def _merge_message_content(self, target: dict, source: dict) -> None:
+        """OpenAI Responses: combine content arrays (output_text items)."""
+        tc = target.get("content", [])
+        sc = source.get("content", [])
+        if isinstance(tc, str):
+            tc = [{"type": "output_text", "text": tc}] if tc else []
+        if isinstance(sc, str):
+            sc = [{"type": "output_text", "text": sc}] if sc else []
+        target["content"] = list(tc) + list(sc)
+
+    def extract_text_from_item(self, body: dict, index: int) -> str:
+        item = self.get_messages(body)[index]
+        # Bare items (function_call, function_call_output, reasoning)
+        if "output" in item:
+            return str(item["output"])
+        content = item.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+        return ""
+
+    def iter_media_blocks(self, body: dict) -> Iterator["MediaBlockInfo"]:
+        """OpenAI Responses: media in content arrays with input_image type."""
+        messages = self.get_messages(body)
+        for mi, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                media_type, setter = self._detect_media_block(block)
+                if media_type is not None:
+                    def _make_replacer(_content, _bi):
+                        def _replace(text: str) -> None:
+                            _content[_bi] = {"type": "output_text", "text": text}
+                        return _replace
+                    yield MediaBlockInfo(
+                        msg_index=mi,
+                        block_index=bi,
+                        media_type=media_type,
+                        setter=setter,
+                        replace_with_text=_make_replacer(content, bi),
+                        carrier=msg,
+                    )
 
     # -- Context injection --
 
