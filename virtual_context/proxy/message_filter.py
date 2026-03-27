@@ -1095,134 +1095,66 @@ def stub_tool_outputs_by_position(
     outputs are stored with a unique ref and replaced in-place with a stub
     containing the ref, tool name, argument summary, and restore call.
 
+    Uses ``fmt.group_into_turns(body)`` for turn detection and protection
+    window calculation, ``fmt.iter_tool_outputs(body)`` for finding outputs,
+    and ``fmt.replace_tool_output_content()`` for replacement.
+
     Returns ``(body, stub_count, list_of_refs)``.
     """
     if fmt.name == "gemini":
-        _msg_key = "contents"
         _asst_role = "model"
-    elif fmt.name == "openai_responses":
-        _msg_key = "input"
-        _asst_role = "assistant"
     else:
-        _msg_key = "messages"
         _asst_role = "assistant"
 
-    messages = body.get(_msg_key, [])
+    messages = fmt.get_messages(body)
     if not messages:
         return body, 0, []
 
     # ------------------------------------------------------------------
-    # 1. Parse turn chains (same pattern as filter_body_messages)
+    # 1. Group into turns using format-aware turn detection
     # ------------------------------------------------------------------
-    prefix_count = 0
-    chat_msgs: list[dict] = []
-    for msg in messages:
-        role = msg.get("role")
-        if role == "system" and not chat_msgs:
-            prefix_count += 1
-        else:
-            chat_msgs.append(msg)
-
-    if not chat_msgs:
+    turns = fmt.group_into_turns(body)
+    if not turns:
         return body, 0, []
 
-    # Separate trailing user message (current turn)
-    has_trailing_user = bool(chat_msgs and chat_msgs[-1].get("role") == "user")
-    history_msgs = chat_msgs[:-1] if has_trailing_user else chat_msgs
-
-    pairs: list[tuple[int, ...]] = []  # tuples of GLOBAL message indices
-    paired_indices: set[int] = set()
-    i = 0
-    while i + 1 < len(history_msgs):
-        gi = i + prefix_count  # global index into messages list
-        if (history_msgs[i].get("role") == "user"
-                and history_msgs[i + 1].get("role") == _asst_role):
-            chain_indices: list[int] = [gi, gi + 1]
-            j = i + 2
-            while j < len(history_msgs) - 1:
-                next_msg = history_msgs[j]
-                next_role = next_msg.get("role", "")
-                gj = j + prefix_count
-                # OpenAI tool response (role="tool")
-                if next_role == "tool":
-                    tool_batch = [gj]
-                    k = j + 1
-                    while k < len(history_msgs) and history_msgs[k].get("role") == "tool":
-                        tool_batch.append(k + prefix_count)
-                        k += 1
-                    if k < len(history_msgs) and history_msgs[k].get("role") == _asst_role:
-                        chain_indices.extend(tool_batch)
-                        chain_indices.append(k + prefix_count)
-                        j = k + 1
-                        continue
-                    else:
-                        break
-                # OpenAI Responses bare function_call/function_call_output round
-                responses_round = _consume_responses_tool_round(history_msgs, j, _asst_role)
-                if responses_round:
-                    round_indices, next_index = responses_round
-                    chain_indices.extend([ri + prefix_count for ri in round_indices])
-                    j = next_index
-                    continue
-                # Anthropic tool result (user message with tool_result-only content)
-                if next_role not in ("user", "human"):
-                    break
-                if not _is_tool_result_only_user(next_msg):
-                    break
-                if j + 1 >= len(history_msgs) or history_msgs[j + 1].get("role") != _asst_role:
-                    break
-                chain_indices.extend([gj, gj + 1])
-                j += 2
-            pairs.append(tuple(chain_indices))
-            for ci in chain_indices:
-                paired_indices.add(ci)
-            i = chain_indices[-1] - prefix_count + 1
-        else:
-            i += 1
-
-    if not pairs:
-        return body, 0, []
+    total_turns = len(turns)
 
     # ------------------------------------------------------------------
-    # 2. Identify protected window (last N chains)
+    # 2. Identify protected window (last N turns)
     # ------------------------------------------------------------------
-    total_chains = len(pairs)
-    protected = min(protected_recent_turns, total_chains)
-    protected_start = total_chains - protected  # chains >= this index are protected
+    protected_start = max(0, total_turns - protected_recent_turns)
+    hard_protected_start = max(0, total_turns - 2)
 
     # Conditional intrusion: if protected zone exceeds a percentage of the
     # context budget, allow stubbing into the protected zone except for
-    # the last 2 chains (the current exchange).
+    # the last 2 turns (the current exchange).
     _intrusion_threshold = kwargs.get("protected_intrusion_threshold", 0.0)
     _context_budget = kwargs.get("context_budget", 0)
-    _stub_protected_start = total_chains  # default: no intrusion
+    intrusion_active = False
 
-    if _intrusion_threshold > 0 and _context_budget > 0 and protected > 2:
+    if _intrusion_threshold > 0 and _context_budget > 0 and (total_turns - protected_start) > 2:
         # Estimate protected zone token size
         _prot_bytes = 0
-        for chain_idx in range(protected_start, total_chains):
-            for gi in pairs[chain_idx]:
-                _prot_bytes += len(json.dumps(messages[gi], default=str))
+        for ti in range(protected_start, total_turns):
+            for idx in turns[ti].indices:
+                _prot_bytes += len(json.dumps(messages[idx], default=str))
         _prot_tokens = _prot_bytes // 4
         _prot_ratio = _prot_tokens / _context_budget if _context_budget else 0
 
         if _prot_ratio > _intrusion_threshold:
-            # Allow stubbing inside protected zone except last 2 chains
-            _stub_protected_start = total_chains - 2
+            intrusion_active = True
             logger.info(
                 "PROTECTED_INTRUSION: protected zone %dt is %.0f%% of budget %dt "
                 "(threshold %.0f%%) — stubbing turns 3+ in protected window",
                 _prot_tokens, _prot_ratio * 100, _context_budget,
                 _intrusion_threshold * 100,
             )
-        else:
-            _stub_protected_start = total_chains  # no intrusion needed
 
-    # Build global-index → chain-index map
-    msg_to_chain: dict[int, int] = {}
-    for chain_idx, chain in enumerate(pairs):
-        for gi in chain:
-            msg_to_chain[gi] = chain_idx
+    # Build message-index → turn-index map
+    idx_to_turn: dict[int, int] = {}
+    for ti, turn in enumerate(turns):
+        for idx in turn.indices:
+            idx_to_turn[idx] = ti
 
     # ------------------------------------------------------------------
     # 3. Build tool call map: call_id → {name, arguments}
@@ -1236,16 +1168,15 @@ def stub_tool_outputs_by_position(
             }
 
     # ------------------------------------------------------------------
-    # 4. Resolve canonical turn numbers per chain via hash lookup
+    # 4. Resolve canonical turn numbers per turn via hash lookup
     # ------------------------------------------------------------------
-    chain_canonical_turn: dict[int, int] = {}
-    for chain_idx, chain in enumerate(pairs):
-        # Find user-text message and first assistant message in chain
+    turn_canonical: dict[int, int] = {}
+    for ti, turn in enumerate(turns):
         user_text = ""
         asst_text = ""
-        for gi in chain:
-            msg = messages[gi]
-            if msg.get("role") == "user" and not _is_tool_result_only_user(msg):
+        for idx in turn.indices:
+            msg = messages[idx]
+            if msg.get("role") in ("user", "human") and not _is_tool_result_only_user(msg):
                 user_text = _extract_text_for_stub_hash(msg)
             elif msg.get("role") == _asst_role and not asst_text:
                 asst_text = _extract_text_for_stub_hash(msg)
@@ -1254,35 +1185,31 @@ def stub_tool_outputs_by_position(
             h = hashlib.sha256(combined.encode()).hexdigest()[:16]
             entry = turn_tag_index.get_entry_by_hash(h)
             if entry is not None:
-                chain_canonical_turn[chain_idx] = entry.turn_number
+                turn_canonical[ti] = entry.turn_number
                 continue
-        # No canonical turn resolved — mark as unknown.
-        # Do NOT use body-local chain index: after filtering drops turns,
-        # chain_idx no longer corresponds to the real turn number.
-        chain_canonical_turn[chain_idx] = -1
+        turn_canonical[ti] = -1
 
     # ------------------------------------------------------------------
     # 5. Stub tool outputs outside protected window
     # ------------------------------------------------------------------
-    # Import VC_TOOL_NAMES to skip VC tool results
     from ..core.tool_loop import VC_TOOL_NAMES
 
     stub_count = 0
     stub_refs: list[str] = []
 
-    # Turn-based protection for stubbing: last 2 turns (4 messages) are hard-protected.
-    # Turns 3-6 in the protected window: tool results get stubbed (turn stays intact).
-    # Everything outside the protected window: tool results always stubbed.
-    _hard_protected_msg_start = max(0, len(messages) - 4)
-    _soft_protected_msg_start = max(0, len(messages) - protected_recent_turns * 2)
-
     for output in fmt.iter_tool_outputs(body):
-        # Last 2 turns — never stub
-        if output.msg_index >= _hard_protected_msg_start:
+        turn_idx = idx_to_turn.get(output.msg_index)
+
+        # Messages not in any turn group are structural — skip
+        if turn_idx is None:
             continue
 
-        # Turns 3-6 in protected window — only stub if intrusion is active
-        if output.msg_index >= _soft_protected_msg_start and _stub_protected_start >= total_chains:
+        # Last 2 turns — never stub (hard-protected)
+        if turn_idx >= hard_protected_start:
+            continue
+
+        # Turns in protected window — only stub if intrusion is active
+        if turn_idx >= protected_start and not intrusion_active:
             continue
 
         # Skip VC tool outputs to prevent feedback loops
@@ -1300,34 +1227,33 @@ def stub_tool_outputs_by_position(
         ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
 
         # Resolve canonical turn
-        canonical_turn = chain_canonical_turn.get(chain_idx, chain_idx)
+        canonical_turn = turn_canonical.get(turn_idx, -1)
 
         # Summarise arguments for the stub
         args_summary = _summarise_arguments(call_info.get("arguments"))
 
-        # Store the full content
-        try:
-            store.store_tool_output(
-                ref=ref,
-                conversation_id=conversation_id,
-                tool_name=tool_name,
-                command=args_summary,
-                turn=canonical_turn,
-                content=content_text,
-                original_bytes=len(content_text.encode("utf-8")),
-            )
-        except Exception:
-            logger.warning("TOOL-STUB: failed to store ref=%s", ref, exc_info=True)
-            continue
-
-        # Write turn link (only if canonical turn was resolved)
-        if canonical_turn < 0:
-            logger.debug("TOOL-STUB: skipping turn link for ref=%s (no canonical turn)", ref)
-        else:
+        # Store the full content (skip if store is None — e.g. in tests)
+        if store is not None:
             try:
-                store.link_turn_tool_output(conversation_id, canonical_turn, ref)
+                store.store_tool_output(
+                    ref=ref,
+                    conversation_id=conversation_id,
+                    tool_name=tool_name,
+                    command=args_summary,
+                    turn=canonical_turn,
+                    content=content_text,
+                    original_bytes=len(content_text.encode("utf-8")),
+                )
             except Exception:
-                pass  # non-critical
+                logger.warning("TOOL-STUB: failed to store ref=%s", ref, exc_info=True)
+                continue
+
+            # Write turn link (only if canonical turn was resolved)
+            if canonical_turn >= 0:
+                try:
+                    store.link_turn_tool_output(conversation_id, canonical_turn, ref)
+                except Exception:
+                    pass  # non-critical
 
         # Build stub text
         stub_text = (
@@ -1337,15 +1263,8 @@ def stub_tool_outputs_by_position(
             f' | call vc_restore_tool(ref="{ref}")]'
         )
 
-        # Replace content in-place
-        carrier = output.carrier
-        carrier_type = output.carrier_type
-        if carrier_type == "anthropic":
-            _replace_anthropic_content(carrier, stub_text)
-        elif carrier_type == "openai_chat":
-            carrier["content"] = stub_text
-        elif carrier_type == "openai_responses":
-            carrier["output"] = stub_text
+        # Replace content in-place using format method
+        fmt.replace_tool_output_content(body, output, stub_text)
 
         stub_count += 1
         stub_refs.append(ref)

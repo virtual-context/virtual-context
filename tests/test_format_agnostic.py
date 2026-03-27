@@ -3,6 +3,8 @@ import json
 import copy
 import pytest
 from virtual_context.proxy.formats import detect_format
+from virtual_context.proxy.message_filter import stub_tool_outputs_by_position
+from virtual_context.core.turn_tag_index import TurnTagIndex
 
 
 class TestMutationMethods:
@@ -184,3 +186,83 @@ class TestMergeConsecutiveConversational:
         # Assistant messages merged
         merged = body["messages"][1]["content"]
         assert len(merged) == 2  # two text blocks combined
+
+
+class TestStubToolOutputsCrossFormat:
+    def test_stubs_anthropic_tool_results(self):
+        body = {"model": "claude-sonnet-4-6", "messages": [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            # Recent turns (protected)
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        result, count, refs = stub_tool_outputs_by_position(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        assert count >= 1
+
+    def test_stubs_openai_responses_function_outputs(self):
+        body = {"model": "gpt-5", "input": [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "calling"}]},
+            {"type": "function_call", "call_id": "fc1", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "fc1", "output": "x" * 10000},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            # Recent turns (protected)
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a1"}]},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a2"}]},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "a3"}]},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        result, count, refs = stub_tool_outputs_by_position(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        assert count >= 1
+        # The function_call_output should be stubbed
+        item = body["input"][3]
+        assert len(item.get("output", "")) < 10000
+
+    def test_stubs_openai_chat_tool_messages(self):
+        body = {"model": "gpt-4", "messages": [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": "x" * 10000},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "user", "content": "current"},
+        ]}
+        fmt = detect_format(body)
+        tti = TurnTagIndex()
+        result, count, refs = stub_tool_outputs_by_position(
+            body, fmt, protected_recent_turns=3, turn_tag_index=tti,
+            store=None, conversation_id="test",
+        )
+        assert count >= 1
