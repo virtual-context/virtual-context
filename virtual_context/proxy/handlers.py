@@ -246,6 +246,9 @@ class _ProxyToolRuntime:
         return True
 
     def restore_tool_output(self, ref: str) -> dict:
+        if ref.startswith("media_"):
+            return self._restore_media(ref)
+
         if ref.startswith("chain_"):
             return self._restore_chain(ref)
 
@@ -269,6 +272,29 @@ class _ProxyToolRuntime:
             "Restored. The tool output was compacted and has been recovered "
             "into your conversation history above. Use the recovered content "
             "to answer the user's question."
+        )
+
+    def _restore_media(self, ref: str) -> dict | list:
+        """Restore a media stub by returning the image in the tool result."""
+        import base64
+        from .media import build_media_restore_result
+
+        metadata = self._engine._store.get_media_output(self._conversation_id, ref)
+        if metadata is None:
+            return {"error": f"media ref {ref} not found"}
+
+        file_path = metadata["file_path"]
+        try:
+            with open(file_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("ascii")
+        except FileNotFoundError:
+            return {"error": f"media file not found: {file_path}"}
+
+        return build_media_restore_result(
+            b64_data=b64_data,
+            media_type=metadata["media_type"],
+            width=metadata["width"],
+            height=metadata["height"],
         )
 
     def _restore_chain(self, ref: str) -> dict:

@@ -344,3 +344,20 @@ class TestStubMediaByPosition:
         )
         # Should stub some images in the protected zone (but not last 2 turns)
         assert count > 0
+
+
+class TestMediaRestore:
+    def test_restore_returns_image_in_tool_result(self):
+        """Test that restoring a media ref returns an image block in tool result format."""
+        from virtual_context.proxy.media import build_media_restore_result
+        result = build_media_restore_result(
+            b64_data="AAAA",
+            media_type="image/jpeg",
+            width=1024,
+            height=768,
+        )
+        assert isinstance(result, list)
+        assert result[0]["type"] == "image"
+        assert result[0]["source"]["data"] == "AAAA"
+        assert result[1]["type"] == "text"
+        assert "1024x768" in result[1]["text"]
