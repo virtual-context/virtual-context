@@ -3,7 +3,7 @@ import json
 import copy
 import pytest
 from virtual_context.proxy.formats import detect_format
-from virtual_context.proxy.message_filter import collapse_turn_chains, drop_topic_only_stubs, stub_tool_outputs_by_position
+from virtual_context.proxy.message_filter import collapse_turn_chains, drop_topic_only_stubs, stub_tool_outputs_by_position, trim_to_upstream_limit
 from virtual_context.core.turn_tag_index import TurnTagIndex
 
 
@@ -445,3 +445,20 @@ class TestCollapseChainsCrossFormat:
         # Everything is within the protected window -- nothing should be collapsed
         assert len(result["messages"]) == original_count
         assert collapsed == 0
+
+
+class TestTrimCrossFormat:
+    def test_trims_openai_responses(self):
+        items = []
+        for i in range(50):
+            items.append({"role": "user", "content": "msg " + "x" * 500})
+            items.append({"role": "assistant", "content": [{"type": "output_text", "text": "resp " + "y" * 500}]})
+        items.append({"role": "user", "content": "current"})
+        body = {"model": "gpt-5", "input": items}
+        fmt = detect_format(body)
+        fmt_copy = copy.copy(fmt)
+        fmt_copy.set_token_counter(lambda text: len(text) // 4)
+        trimmed, removed = trim_to_upstream_limit(body, 5000, fmt_copy)
+        assert removed > 0
+        # Last item should still be the current user message
+        assert body["input"][-1]["content"] == "current"
