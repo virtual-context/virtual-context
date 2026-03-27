@@ -1993,17 +1993,12 @@ class OpenAIResponsesFormat(PayloadFormat):
         tc = target.get("content", [])
         sc = source.get("content", [])
         if role == "user":
-            # User messages: combine as plain text strings.
-            if isinstance(tc, list):
-                tc = " ".join(
-                    b.get("text", "") for b in tc if isinstance(b, dict)
-                ) if tc else ""
-            if isinstance(sc, list):
-                sc = " ".join(
-                    b.get("text", "") for b in sc if isinstance(b, dict)
-                ) if sc else ""
-            parts = [p for p in (tc, sc) if p]
-            target["content"] = "\n".join(parts)
+            # User messages: preserve all content types (text, images, etc.)
+            if isinstance(tc, str):
+                tc = [{"type": "input_text", "text": tc}] if tc else []
+            if isinstance(sc, str):
+                sc = [{"type": "input_text", "text": sc}] if sc else []
+            target["content"] = list(tc) + list(sc)
         else:
             # Assistant messages: combine output_text block arrays.
             if isinstance(tc, str):
