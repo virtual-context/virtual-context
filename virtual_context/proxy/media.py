@@ -42,6 +42,12 @@ def compress_media_in_payload(
     Writes compressed files to disk, records metadata in store.
 
     Returns (modified_body, images_compressed).
+
+    NOTE: This function is already format-aware — it uses ``_extract_media_data``
+    with format-specific setter callbacks for in-place replacement. No rewrite
+    to use ``fmt.iter_media_blocks()`` is needed here because compression
+    operates on the raw block dict directly and the setter pattern already
+    handles all provider formats correctly.
     """
     messages = fmt.get_messages(body)
     if not messages:
@@ -129,6 +135,10 @@ def stub_media_by_position(
 ) -> tuple[dict, int]:
     """Replace media blocks outside the protected window with text stubs.
 
+    Uses ``fmt.group_into_turns()`` for protection window logic and
+    ``fmt.iter_media_blocks()`` / ``media_info.replace_with_text()`` for
+    format-agnostic iteration and replacement.
+
     Supports conditional intrusion into the protected zone via kwargs:
     - protected_intrusion_threshold (float): ratio of protected zone to context budget
       that triggers intrusion. 0.0 disables (default).
@@ -140,29 +150,37 @@ def stub_media_by_position(
     if not messages:
         return body, 0
 
-    # Hard-protect last 4 messages (last 2 turns)
-    _hard_protected = max(0, len(messages) - 4)
-    # Soft-protect last N*2 messages (protected window)
-    _soft_protected = max(0, len(messages) - protected_recent_turns * 2)
+    # --- Build protection sets from turn groups ---
+    turns = fmt.group_into_turns(body)
+    if not turns:
+        return body, 0
 
-    # Conditional intrusion: if protected zone exceeds a percentage of the
-    # context budget, allow stubbing into the protected zone except for
-    # the last 2 turns (last 4 messages).
+    # Hard-protect: last 2 turns (always protected, never stubbed)
+    hard_protected_indices: set[int] = set()
+    for turn in turns[-2:]:
+        hard_protected_indices.update(turn.indices)
+
+    # Soft-protect: last N turns (protected window)
+    soft_protected_indices: set[int] = set()
+    for turn in turns[-protected_recent_turns:]:
+        soft_protected_indices.update(turn.indices)
+
+    # --- Conditional intrusion ---
     _intrusion_threshold = kwargs.get("protected_intrusion_threshold", 0.0)
     _context_budget = kwargs.get("context_budget", 0)
-    _intrusion_start = len(messages)  # default: no intrusion
+    intrusion_active = False
 
     if _intrusion_threshold > 0 and _context_budget > 0 and protected_recent_turns > 2:
         # Estimate protected zone size
-        _prot_bytes = 0
-        for mi in range(_soft_protected, len(messages)):
-            _prot_bytes += len(json.dumps(messages[mi], default=str))
+        _prot_bytes = sum(
+            len(json.dumps(messages[mi], default=str))
+            for mi in soft_protected_indices
+        )
         _prot_tokens = _prot_bytes // 4
         _prot_ratio = _prot_tokens / _context_budget if _context_budget else 0
 
         if _prot_ratio > _intrusion_threshold:
-            # Allow stubbing inside protected zone except last 2 turns
-            _intrusion_start = _hard_protected
+            intrusion_active = True
             logger.info(
                 "MEDIA_INTRUSION: protected zone %dt is %.0f%% of budget %dt "
                 "(threshold %.0f%%) -- stubbing turns 3+ in protected window",
@@ -170,66 +188,62 @@ def stub_media_by_position(
                 _intrusion_threshold * 100,
             )
 
+    # --- Determine which message indices are stubbable ---
+    stubbable_indices: set[int] = set()
+    for mi in range(len(messages)):
+        # Never stub hard-protected (last 2 turns)
+        if mi in hard_protected_indices:
+            continue
+        # Outside soft-protected window: always stubbable
+        if mi not in soft_protected_indices:
+            stubbable_indices.add(mi)
+        # Inside soft-protected but intrusion active: stubbable
+        elif intrusion_active:
+            stubbable_indices.add(mi)
+
+    # --- Iterate media blocks and stub those in stubbable indices ---
     count = 0
-    for mi, msg in enumerate(messages):
-        # Never stub last 2 turns
-        if mi >= _hard_protected:
-            continue
-        # Respect protected window unless intrusion applies
-        if mi >= _soft_protected and mi >= _intrusion_start:
-            # Inside protected zone but intrusion not active for this message
-            continue
-        if mi >= _soft_protected and mi < _intrusion_start:
-            # Intrusion active: allow stubbing
-            pass
-        elif mi < _soft_protected:
-            # Outside protected window: always stub
-            pass
-        else:
+    for media_info in fmt.iter_media_blocks(body):
+        if media_info.msg_index not in stubbable_indices:
             continue
 
-        content = msg.get("content", "")
-        if not isinstance(content, list):
-            content = msg.get("parts", [])
-            if not isinstance(content, list):
-                continue
+        # Extract b64 data for hashing and dimensions
+        carrier = media_info.carrier
+        content_list = carrier.get("content", carrier.get("parts", []))
+        if not isinstance(content_list, list):
+            continue
+        block = content_list[media_info.block_index]
+        if not isinstance(block, dict):
+            continue
 
-        for bi, block in enumerate(content):
-            if not isinstance(block, dict):
-                continue
+        b64_data, media_type, _ = _extract_media_data(block, fmt.name)
+        if b64_data is None or len(b64_data) < MIN_COMPRESS_BYTES:
+            continue
 
-            b64_data, media_type, _ = _extract_media_data(block, fmt.name)
-            if b64_data is None or len(b64_data) < MIN_COMPRESS_BYTES:
-                continue
+        ref = f"media_{hashlib.sha256(b64_data.encode()).hexdigest()[:12]}"
 
-            ref = f"media_{hashlib.sha256(b64_data.encode()).hexdigest()[:12]}"
+        # Get dimensions from the compressed image
+        try:
+            img_bytes = base64.b64decode(b64_data)
+            img = Image.open(BytesIO(img_bytes))
+            w, h = img.width, img.height
+            orig_kb = len(b64_data) // 1024
+        except Exception:
+            w, h = 0, 0
+            orig_kb = len(b64_data) // 1024
 
-            # Get dimensions from the compressed image
-            try:
-                img_bytes = base64.b64decode(b64_data)
-                img = Image.open(BytesIO(img_bytes))
-                w, h = img.width, img.height
-                orig_kb = len(b64_data) // 1024
-            except Exception:
-                w, h = 0, 0
-                orig_kb = len(b64_data) // 1024
+        stub_text = (
+            f"[Image ({w}x{h} {media_type or 'jpeg'}, originally {orig_kb}KB) "
+            f"compressed and stored by virtual context.\n"
+            f'To restore and uncompact full image in place: '
+            f'{{"type": "tool_use", "name": "vc_restore_tool", '
+            f'"input": {{"ref": "{ref}"}}}}]'
+        )
 
-            stub_text = (
-                f"[Image ({w}x{h} {media_type or 'jpeg'}, originally {orig_kb}KB) "
-                f"compressed and stored by virtual context.\n"
-                f'To restore and uncompact full image in place: '
-                f'{{"type": "tool_use", "name": "vc_restore_tool", '
-                f'"input": {{"ref": "{ref}"}}}}]'
-            )
-
-            # Format-aware stub block construction
-            if fmt.name == "gemini":
-                # Gemini uses {"text": "..."} not {"type": "text", "text": "..."}
-                content[bi] = {"text": stub_text}
-            else:
-                content[bi] = {"type": "text", "text": stub_text}
-            logger.info("MEDIA-STUB: ref=%s msg=%d", ref, mi)
-            count += 1
+        # Format-agnostic replacement via MediaBlockInfo callback
+        media_info.replace_with_text(stub_text)
+        logger.info("MEDIA-STUB: ref=%s msg=%d", ref, media_info.msg_index)
+        count += 1
 
     return body, count
 
