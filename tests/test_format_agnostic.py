@@ -462,3 +462,84 @@ class TestTrimCrossFormat:
         assert removed > 0
         # Last item should still be the current user message
         assert body["input"][-1]["content"] == "current"
+
+
+class TestStubMediaCrossFormat:
+    """Cross-format tests for stub_media_by_position using format methods."""
+
+    def test_stubs_openai_responses_media(self):
+        """OpenAI Responses format: media outside protected window is stubbed."""
+        from virtual_context.proxy.media import stub_media_by_position
+        b64 = "A" * 50000  # fake compressed data
+        items = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": "old image"},
+            ]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "I see it."}]},
+        ]
+        # Add enough filler to push the image outside protected window
+        for i in range(6):
+            items.append({"role": "user", "content": f"msg{i}"})
+            items.append({"role": "assistant", "content": [{"type": "output_text", "text": f"resp{i}"}]})
+        items.append({"role": "user", "content": "latest"})
+        body = {"model": "gpt-5", "input": items}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 1
+        # Replacement should use output_text type for OpenAI Responses
+        stub_block = result["input"][0]["content"][0]
+        assert stub_block["type"] == "output_text"
+        assert "media_" in stub_block["text"]
+        assert "vc_restore_tool" in stub_block["text"]
+
+    def test_stubs_openai_chat_media(self):
+        """OpenAI Chat format: media outside protected window is stubbed."""
+        from virtual_context.proxy.media import stub_media_by_position
+        b64 = "A" * 50000
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": "old image"},
+            ]},
+            {"role": "assistant", "content": "I see it."},
+        ]
+        for i in range(6):
+            msgs.append({"role": "user", "content": f"msg{i}"})
+            msgs.append({"role": "assistant", "content": f"resp{i}"})
+        msgs.append({"role": "user", "content": "latest"})
+        body = {"model": "gpt-4", "messages": msgs}
+        fmt = detect_format(body)
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=6)
+        assert count == 1
+        stub_block = result["messages"][0]["content"][0]
+        assert stub_block["type"] == "text"
+        assert "media_" in stub_block["text"]
+
+    def test_protected_window_uses_turn_groups(self):
+        """Verify turn-group-based protection protects tool chains correctly."""
+        from virtual_context.proxy.media import stub_media_by_position
+        b64 = "A" * 50000
+        # Image in a turn that's inside the protected window (turn with tool activity)
+        msgs = [
+            {"role": "user", "content": "old msg"},
+            {"role": "assistant", "content": "old resp"},
+            # This is a turn with tool activity, should be protected as turn 2 of 3
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            # Recent turn
+            {"role": "user", "content": "current"},
+        ]
+        body = {"model": "claude-sonnet-4-6", "messages": msgs}
+        fmt = detect_format(body)
+        # 3 turns total, protected_recent_turns=3 => all protected
+        result, count = stub_media_by_position(body, fmt, protected_recent_turns=3)
+        assert count == 0  # image is in protected window
