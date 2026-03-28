@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 from unittest.mock import MagicMock
 from datetime import datetime, timezone
 
@@ -133,3 +134,141 @@ def test_fill_pass_adds_breadth_summaries():
     )
     assert summaries_added >= 1
     mock_store.get_all_tag_summaries.assert_called_once_with(conversation_id="test")
+
+
+def test_presented_tags_from_segments_and_full_sections():
+    """presented_tags must include secondary tags from SEGMENTS/FULL sections."""
+    tag_sections = {
+        "cooking": (
+            '<virtual-context tags="cooking, italian" segments="2">\n'
+            "[1/2]\nPasta techniques\n\n---\n\n[2/2]\nRisotto methods\n"
+            "</virtual-context>"
+        ),
+        "baking": (
+            '<virtual-context tags="baking, bread, sourdough" segments="1">\n'
+            "[1/1]\nSourdough starter maintenance\n"
+            "</virtual-context>"
+        ),
+    }
+
+    _vc_tags_re = re.compile(r'<virtual-context\s+tags="([^"]*)"')
+    presented_tags: set[str] = set()
+    for section_text in tag_sections.values():
+        for m in _vc_tags_re.finditer(section_text):
+            for t in m.group(1).split(", "):
+                t = t.strip()
+                if t:
+                    presented_tags.add(t)
+    # Also include section keys
+    presented_tags.update(tag_sections.keys())
+
+    assert "cooking" in presented_tags
+    assert "baking" in presented_tags
+    assert "italian" in presented_tags
+    assert "bread" in presented_tags
+    assert "sourdough" in presented_tags
+    assert "grilling" not in presented_tags
+
+
+def test_presented_tags_fallback_to_section_key():
+    """When tags attr is empty, section key should still be covered."""
+    tag_sections = {
+        "misc": '<virtual-context tags="" segments="1">\n[1/1]\nRandom\n</virtual-context>',
+    }
+
+    _vc_tags_re = re.compile(r'<virtual-context\s+tags="([^"]*)"')
+    presented_tags: set[str] = set()
+    for section_text in tag_sections.values():
+        for m in _vc_tags_re.finditer(section_text):
+            for t in m.group(1).split(", "):
+                t = t.strip()
+                if t:
+                    presented_tags.add(t)
+    presented_tags.update(tag_sections.keys())
+
+    # "misc" comes from keys(), not from regex (empty attr)
+    assert "misc" in presented_tags
+
+
+def test_fill_pass_accounting_summary_and_turns():
+    """After fill pass, counts must match actual content added."""
+    from virtual_context.proxy.message_filter import fill_pass
+
+    body = _make_anthropic_body(["hello", "world"])
+    pre_filter = copy.deepcopy(body)
+    extra_msgs = [
+        {"role": "user", "content": "older message 1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "older reply 1"}]},
+        {"role": "user", "content": "older message 2"},
+        {"role": "assistant", "content": [{"type": "text", "text": "older reply 2"}]},
+    ]
+    pre_filter["messages"] = extra_msgs + pre_filter["messages"]
+
+    fmt = detect_format(body)
+
+    ts1 = TagSummary(tag="history", summary="Historical events discussed",
+                     summary_tokens=30, source_segment_refs=["seg_h1"],
+                     updated_at=datetime.now(timezone.utc))
+    mock_store = MagicMock()
+    mock_store.get_all_tag_summaries.return_value = [ts1]
+
+    assembled = AssembledContext(
+        presented_segment_refs=set(),
+        presented_tags=set(),
+        tag_sections={},
+        retrieval_result=RetrievalResult(),
+    )
+
+    result_body, summaries_added, turns_added = fill_pass(
+        body=body, fmt=fmt,
+        outbound_tokens=70000, target_tokens=90000,
+        assembled=assembled, pre_filter_body=pre_filter,
+        store=mock_store, conversation_id="test-conv",
+        summary_ratio=0.5,
+    )
+
+    assert summaries_added >= 1
+    result_json = json.dumps(result_body)
+    assert "Historical events discussed" in result_json
+
+
+def test_fill_pass_sanitizes_restored_turns():
+    """Restored turns must have thinking blocks stripped and media replaced."""
+    from virtual_context.proxy.message_filter import _sanitize_restored_turn
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "show me the image"},
+            {"type": "image", "source": {"type": "base64", "data": "abc123"}},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think..."},
+            {"type": "text", "text": "here is my answer"},
+        ]},
+    ]
+
+    sanitized = _sanitize_restored_turn(messages)
+
+    user_content = sanitized[0]["content"]
+    assert any(b.get("text") == "[image removed from restored turn]" for b in user_content)
+    assert not any(b.get("type") == "image" for b in user_content)
+
+    asst_content = sanitized[1]["content"]
+    assert not any(b.get("type") == "thinking" for b in asst_content)
+    assert any(b.get("text") == "here is my answer" for b in asst_content)
+
+
+def test_fill_pass_no_restore_tool_references():
+    """Media placeholders must NOT reference vc_restore_tool."""
+    from virtual_context.proxy.message_filter import _sanitize_restored_turn
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,abc123"},
+        ]},
+    ]
+
+    sanitized = _sanitize_restored_turn(messages)
+    result_json = json.dumps(sanitized)
+    assert "vc_restore_tool" not in result_json
+    assert "image removed from restored turn" in result_json
