@@ -683,128 +683,73 @@ def drop_compacted_turns(
     compacted_through: int,
     *,
     fmt: PayloadFormat | None = None,
+    protected_recent_turns: int = 6,
 ) -> tuple[dict, int]:
-    """Drop compacted non-tool turns from the payload entirely.
+    """Drop non-tool turns outside the protected window.
 
+    Uses ``fmt.group_into_turns()`` to identify turn boundaries and drops
+    all non-tool turns outside the last *protected_recent_turns* groups.
     These turns are already represented by compacted segments in the VC
-    context injection.  Keeping per-turn stubs is redundant and wastes
-    tokens.  Tool-bearing turns are left for chain collapse to handle.
+    context injection.  Tool-bearing turns are left for chain collapse.
+
+    No hash matching — all non-tool history turns are dropped regardless
+    of whether they match the turn tag index.
 
     Returns (modified_body, drop_count).
     """
     if compacted_through <= 0:
         return body, 0
-    if not turn_tag_index.entries:
-        return body, 0
 
     if fmt is None:
         fmt = detect_format(body)
 
-    if fmt.name == "gemini":
-        _msg_key = "contents"
-        _asst_role = "model"
-    elif fmt.name == "openai_responses":
-        _msg_key = "input"
-        _asst_role = "assistant"
+    turn_groups = fmt.group_into_turns(body)
+    if not turn_groups:
+        return body, 0
+
+    # Separate trailing user-only group (current question) from history.
+    messages = fmt.get_messages(body)
+    last_group = turn_groups[-1]
+    last_idx = last_group.indices[-1] if last_group.indices else -1
+    last_msg = messages[last_idx] if 0 <= last_idx < len(messages) else {}
+    if last_msg.get("role") in ("user", "human"):
+        all_user = all(
+            messages[i].get("role") in ("user", "human")
+            for i in last_group.indices
+            if 0 <= i < len(messages)
+        )
+        if all_user:
+            history_turns = turn_groups[:-1]
+        else:
+            history_turns = turn_groups
     else:
-        _msg_key = "messages"
-        _asst_role = "assistant"
+        history_turns = turn_groups
 
-    watermark_turn = compacted_through // 2
-
-    messages = body.get(_msg_key, [])
-    if not messages:
+    if not history_turns:
         return body, 0
 
-    # Identify user-text message indices (messages with extractable text
-    # that are NOT tool_result-only).
-    user_text_indices: list[int] = []
-    for i, msg in enumerate(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            _text_block_types = {"text", "input_text", "output_text"}
-            has_text = any(
-                isinstance(b, dict) and b.get("type") in _text_block_types
-                for b in content
-            )
-            has_tool_result = any(
-                isinstance(b, dict) and b.get("type") == "tool_result"
-                for b in content
-            )
-            if has_tool_result and not has_text:
-                continue
-        # Gemini: check parts
-        parts = msg.get("parts", [])
-        if isinstance(parts, list) and parts:
-            has_func_response = any(
-                isinstance(p, dict) and "functionResponse" in p for p in parts
-            )
-            has_text_part = any(
-                isinstance(p, dict) and "text" in p and "functionResponse" not in p
-                for p in parts
-            )
-            if has_func_response and not has_text_part:
-                continue
-        text = _extract_text_for_stub_hash(msg)
-        if text:
-            user_text_indices.append(i)
+    total = len(history_turns)
+    protected = min(protected_recent_turns, total)
+    protected_start = total - protected
 
-    if not user_text_indices:
+    # Collect indices of non-tool turns outside the protected window
+    drop_indices: set[int] = set()
+    drop_count = 0
+    for tidx in range(protected_start):
+        turn = history_turns[tidx]
+        if turn.has_tool_activity:
+            continue  # chain collapse handles these
+        for gi in turn.indices:
+            drop_indices.add(gi)
+        drop_count += 1
+
+    if not drop_indices:
         return body, 0
 
-    # Group messages into turns.
-    turn_groups: list[tuple[int, int]] = []  # (start_idx, end_idx_exclusive)
-    for g, uti in enumerate(user_text_indices):
-        if g + 1 < len(user_text_indices):
-            end = user_text_indices[g + 1]
-        else:
-            end = len(messages)
-        turn_groups.append((uti, end))
+    # Remove dropped indices
+    fmt.remove_items(body, sorted(drop_indices))
 
-    # Hash each turn group and identify compacted non-tool turns to drop.
-    drop_ranges: list[tuple[int, int]] = []
-    for start, end in turn_groups:
-        msg = messages[start]
-        user_text = _extract_text_for_stub_hash(msg)
-        if not user_text:
-            continue
-
-        asst_text = ""
-        for j in range(start + 1, end):
-            if messages[j].get("role") == _asst_role:
-                asst_text = _extract_text_for_stub_hash(messages[j])
-                break
-
-        combined = f"{user_text} {asst_text}"
-        h = hashlib.sha256(combined.encode()).hexdigest()[:16]
-
-        entry = turn_tag_index.get_entry_by_hash(h)
-        if entry is not None and entry.turn_number < watermark_turn:
-            # Skip tool-bearing turns — chain collapse handles those
-            if _chain_has_tool_activity(messages, range(start, end)):
-                continue
-            drop_ranges.append((start, end))
-
-    if not drop_ranges:
-        return body, 0
-
-    # Build new message list, skipping dropped ranges entirely
-    drop_starts: dict[int, int] = {s: e for s, e in drop_ranges}
-    new_messages: list[dict] = []
-    i = 0
-    while i < len(messages):
-        end = drop_starts.get(i)
-        if end is not None:
-            i = end  # skip entire turn
-        else:
-            new_messages.append(messages[i])
-            i += 1
-
-    body = dict(body)
-    body[_msg_key] = new_messages
-    return body, len(drop_ranges)
+    return body, drop_count
 
 
 # ---------------------------------------------------------------------------

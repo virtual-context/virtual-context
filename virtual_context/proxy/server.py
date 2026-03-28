@@ -597,6 +597,7 @@ async def prepare_payload(
                 state.engine._turn_tag_index,
                 state.engine._engine_state.compacted_through,
                 fmt=fmt,
+                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
             )
             if turns_stubbed:
                 logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", turns_stubbed)
