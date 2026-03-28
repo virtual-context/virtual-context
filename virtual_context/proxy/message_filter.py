@@ -23,14 +23,32 @@ logger = logging.getLogger(__name__)
 
 
 def _is_tool_result_only_user(msg: dict) -> bool:
-    """Whether a user message is tool-result scaffolding, not a real turn start."""
+    """Whether a user message is tool-result scaffolding, not a real turn start.
+
+    Handles Anthropic (tool_result content blocks) and Gemini (functionResponse
+    parts).
+    """
     if msg.get("role") not in ("user", "human"):
         return False
+    # Anthropic: content blocks with type="tool_result"
     content = msg.get("content", "")
-    if not isinstance(content, list):
-        return False
-    ctypes = {block.get("type") for block in content if isinstance(block, dict)}
-    return bool(ctypes and ctypes <= {"tool_result"})
+    if isinstance(content, list):
+        ctypes = {block.get("type") for block in content if isinstance(block, dict)}
+        if ctypes and ctypes <= {"tool_result"}:
+            return True
+    # Gemini: parts with functionResponse
+    parts = msg.get("parts", [])
+    if isinstance(parts, list) and parts:
+        has_func_response = any(
+            isinstance(p, dict) and "functionResponse" in p for p in parts
+        )
+        has_text = any(
+            isinstance(p, dict) and "text" in p and "functionResponse" not in p
+            for p in parts
+        )
+        if has_func_response and not has_text:
+            return True
+    return False
 
 
 def sanitize_vc_tool_errors(body: dict, fmt: PayloadFormat) -> dict:
@@ -128,6 +146,7 @@ def _chain_has_tool_activity(messages: list[dict], indices: tuple[int, ...] | ra
     - OpenAI Chat: ``role: "tool"`` or ``tool_calls`` array on assistant
     - OpenAI Responses: bare items with ``type`` of ``function_call`` / ``function_call_output``
     - Anthropic: content blocks with ``type`` of ``tool_use`` / ``tool_result``
+    - Gemini: parts with ``functionCall`` or ``functionResponse``
     """
     for ci in indices:
         msg = messages[ci]
@@ -139,6 +158,13 @@ def _chain_has_tool_activity(messages: list[dict], indices: tuple[int, ...] | ra
         if isinstance(content, list) and any(
             isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
             for b in content
+        ):
+            return True
+        # Gemini: functionCall/functionResponse in parts
+        parts = msg.get("parts", [])
+        if isinstance(parts, list) and any(
+            isinstance(p, dict) and ("functionCall" in p or "functionResponse" in p)
+            for p in parts
         ):
             return True
     return False
@@ -617,8 +643,11 @@ def _strip_thinking_blocks(messages: list[dict]) -> list[dict]:
 def _extract_text_for_stub_hash(msg: dict) -> str:
     """Extract the last user-visible text from a message for hashing.
 
-    Handles both plain-string content and content-block arrays.
-    Skips tool_use / tool_result blocks.  Strips OpenClaw envelope.
+    Handles all four provider formats:
+    - Anthropic: content blocks with type="text"
+    - OpenAI Chat: string content or content blocks with type="text"
+    - OpenAI Responses: content blocks with type="input_text" or "output_text"
+    - Gemini: parts array with {"text": "..."} dicts (no type field)
 
     Uses reversed iteration over content blocks so that multi-text-block
     messages (common in Anthropic tool_use responses) return the **last**
@@ -628,12 +657,22 @@ def _extract_text_for_stub_hash(msg: dict) -> str:
     if isinstance(content, str):
         return _strip_envelope(content).strip()
     if isinstance(content, list):
-        # Accept "text" (Anthropic), "input_text" (OpenAI Responses user),
-        # and "output_text" (OpenAI Responses assistant).
+        # Accept "text" (Anthropic/OpenAI Chat), "input_text" (Responses user),
+        # and "output_text" (Responses assistant).
         _text_types = {"text", "input_text", "output_text"}
         for block in reversed(content):
             if isinstance(block, dict) and block.get("type") in _text_types:
                 text = block.get("text", "")
+                return _strip_envelope(text).strip()
+    # Gemini: messages use "parts" instead of "content"
+    parts = msg.get("parts", [])
+    if isinstance(parts, list):
+        for part in reversed(parts):
+            if isinstance(part, dict) and "text" in part:
+                # Skip functionCall/functionResponse parts
+                if "functionCall" in part or "functionResponse" in part:
+                    continue
+                text = part.get("text", "")
                 return _strip_envelope(text).strip()
     return ""
 
@@ -762,19 +801,29 @@ def stub_compacted_messages(
             tags_str = ", ".join(entry.tags[:5])
             # Tool-bearing turns are skipped above (position-based
             # stubbing handles them), so only non-tool turns reach here.
-            new_messages.append({
-                "role": "user",
-                "content": f"[Compacted turn {entry.turn_number}]",
-            })
             stub_text = (
                 f"[Compacted turn {entry.turn_number}: "
                 f"topics={tags_str}. "
                 f"Content stored in virtual-context.]"
             )
-            new_messages.append({
-                "role": _asst_role,
-                "content": [{"type": _asst_block_type, "text": stub_text}],
-            })
+            if _fname == "gemini":
+                new_messages.append({
+                    "role": "user",
+                    "parts": [{"text": f"[Compacted turn {entry.turn_number}]"}],
+                })
+                new_messages.append({
+                    "role": "model",
+                    "parts": [{"text": stub_text}],
+                })
+            else:
+                new_messages.append({
+                    "role": "user",
+                    "content": f"[Compacted turn {entry.turn_number}]",
+                })
+                new_messages.append({
+                    "role": _asst_role,
+                    "content": [{"type": _asst_block_type, "text": stub_text}],
+                })
             i = end
         else:
             new_messages.append(messages[i])
@@ -1352,6 +1401,17 @@ def _extract_tool_metadata_from_chain(
                 if name not in VC_TOOL_NAMES:
                     args = _summarise_arguments(msg.get("arguments"), max_len=60)
                     seen.append(f"{name}({args})" if args else name)
+        # Gemini functionCall parts
+        parts = msg.get("parts", [])
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict) and "functionCall" in part:
+                    fc = part["functionCall"]
+                    name = fc.get("name", "")
+                    if name in VC_TOOL_NAMES:
+                        continue
+                    args = _summarise_arguments(fc.get("args"), max_len=60)
+                    seen.append(f"{name}({args})" if args else name)
     return seen
 
 
@@ -1670,23 +1730,10 @@ def collapse_turn_chains(
         tool_descs = _extract_tool_metadata_from_chain(messages, turn.indices, tool_call_map)
         tool_str = ", ".join(tool_descs) if tool_descs else ""
 
-        # g. Build stub pair (format-aware content block types)
+        # g. Build stub pair (format-aware content structure)
         turn_label = canonical_turn if canonical_turn >= 0 else tidx
         _fname = fmt.name
-        if _fname == "openai_responses":
-            _user_block_type = "input_text"
-            _asst_block_type = "output_text"
-        elif _fname == "gemini":
-            _user_block_type = "text"  # Gemini uses parts with "text" key, not type
-            _asst_block_type = "text"
-        else:
-            _user_block_type = "text"
-            _asst_block_type = "text"
 
-        stub_user = {
-            "role": "user",
-            "content": f"[Compacted turn {turn_label}]",
-        }
         desc_parts = [f"Compacted turn {turn_label}"]
         if canonical_turn >= 0:
             entry = turn_tag_index.get_tags_for_turn(canonical_turn)
@@ -1701,10 +1748,35 @@ def collapse_turn_chains(
             f'{{"type": "tool_use", "name": "vc_restore_tool", '
             f'"input": {{"ref": "{ref}"}}}}]'
         )
-        stub_asst = {
-            "role": _asst_role,
-            "content": [{"type": _asst_block_type, "text": stub_text}],
-        }
+
+        if _fname == "gemini":
+            stub_user = {
+                "role": "user",
+                "parts": [{"text": f"[Compacted turn {turn_label}]"}],
+            }
+            stub_asst = {
+                "role": "model",
+                "parts": [{"text": stub_text}],
+            }
+        elif _fname == "openai_responses":
+            stub_user = {
+                "role": "user",
+                "content": f"[Compacted turn {turn_label}]",
+            }
+            stub_asst = {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": stub_text}],
+            }
+        else:
+            # Anthropic / OpenAI Chat
+            stub_user = {
+                "role": "user",
+                "content": f"[Compacted turn {turn_label}]",
+            }
+            stub_asst = {
+                "role": _asst_role,
+                "content": [{"type": "text", "text": stub_text}],
+            }
 
         fmt.mark_as_vc_stub(stub_user)
         fmt.mark_as_vc_stub(stub_asst)
