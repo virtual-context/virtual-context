@@ -609,6 +609,7 @@ class RetrievalResult:
     facts: list[Fact] = field(default_factory=list)  # D1: matching facts
     retrieval_scores: dict[str, float] = field(default_factory=dict)  # primary_tag → RRF fused score
     query_embedding: list[float] | None = None
+    overflow_summaries: list[StoredSummary] = field(default_factory=list)  # relevant but budget-excluded
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +686,8 @@ class AssembledContext:
     retrieval_summaries: list[StoredSummary] = field(default_factory=list)
     retrieval_full_segments: list[StoredSegment] = field(default_factory=list)
     selected_facts: list[Fact] = field(default_factory=list)
+    retrieval_result: RetrievalResult | None = None  # for fill pass overflow access
+    presented_tags: set[str] = field(default_factory=set)  # ALL tags visible in rendered output
 
 
 # ---------------------------------------------------------------------------
