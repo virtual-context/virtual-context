@@ -18,6 +18,7 @@ from .formats import PayloadFormat, detect_format
 
 if TYPE_CHECKING:
     from ..core.store import ContextStore
+    from ..types import AssembledContext
 
 logger = logging.getLogger(__name__)
 
@@ -2356,3 +2357,175 @@ def enforce_payload_budget(
         )
 
     return body, reductions, total_freed
+
+
+def fill_pass(
+    body: dict,
+    fmt: PayloadFormat,
+    outbound_tokens: int,
+    target_tokens: int,
+    assembled: "AssembledContext | None",
+    pre_filter_body: dict,
+    store: "ContextStore | None",
+    conversation_id: str,
+    summary_ratio: float = 0.60,
+) -> tuple[dict, int, int]:
+    """Fill payload from VC floor up to target threshold.
+
+    The caller clamps *target_tokens* before calling:
+        target = min(soft_threshold_tokens, inbound_tokens, upstream_limit - max_tokens)
+
+    If *assembled* is None or has no retrieval_result, phase 1a (overflow)
+    is skipped. Phase 1b (breadth) and phase 2 (turns) still run.
+
+    Returns (modified_body, summaries_added, turns_added).
+    """
+    headroom = target_tokens - outbound_tokens
+    if headroom <= 0:
+        return body, 0, 0
+
+    presented_refs: set[str] = set(assembled.presented_segment_refs) if assembled else set()
+    covered_tags: set[str] = set(assembled.presented_tags) if assembled else set()
+    tokens_used = 0
+    summaries_added = 0
+
+    # Phase 1: Tag summaries (up to summary_ratio of headroom)
+    summary_budget = int(headroom * summary_ratio)
+
+    # 1a. Overflow candidates (relevant but budget-excluded, new tags only)
+    if (
+        assembled
+        and getattr(assembled, "retrieval_result", None)
+        and getattr(assembled.retrieval_result, "overflow_summaries", None)
+    ):
+        from ..core.assembler import format_tag_section
+
+        for summary in assembled.retrieval_result.overflow_summaries:
+            if summary.primary_tag in covered_tags:
+                continue
+            if summary.ref in presented_refs:
+                continue
+            text = format_tag_section(summary.primary_tag, [summary], store=store, conversation_id=conversation_id)
+            tokens = len(text) // 4  # rough estimate
+            if tokens_used + tokens > summary_budget:
+                continue
+            body = _append_to_context(body, fmt, text)
+            tokens_used += tokens
+            summaries_added += 1
+            presented_refs.add(summary.ref)
+            covered_tags.add(summary.primary_tag)
+            covered_tags.update(summary.tags)
+
+    # 1b. Breadth summaries (remaining conversation tag summaries, recency-sorted)
+    if store is not None and tokens_used < summary_budget:
+        all_tag_summaries = store.get_all_tag_summaries(conversation_id=conversation_id)
+        for ts in sorted(all_tag_summaries, key=lambda s: s.updated_at, reverse=True):
+            if ts.tag in covered_tags:
+                continue
+            source_refs = set(ts.source_segment_refs)
+            if source_refs and source_refs <= presented_refs:
+                continue
+            text = _format_breadth_section(ts)
+            tokens = len(text) // 4
+            if tokens_used + tokens > summary_budget:
+                continue
+            body = _append_to_context(body, fmt, text)
+            tokens_used += tokens
+            summaries_added += 1
+            presented_refs.update(source_refs)
+            covered_tags.add(ts.tag)
+
+    # Phase 2: Recent turns (remaining headroom)
+    turn_budget = headroom - tokens_used
+    turns_added = 0
+
+    if turn_budget > 200 and pre_filter_body is not None:
+        pre_turns = fmt.group_into_turns(pre_filter_body)
+        cur_turn_count = len(fmt.group_into_turns(body))
+        pre_messages = fmt.get_messages(pre_filter_body)
+
+        if len(pre_turns) > cur_turn_count:
+            dropped_end = len(pre_turns) - cur_turn_count
+            for tidx in range(dropped_end - 1, -1, -1):
+                turn = pre_turns[tidx]
+                if turn.has_tool_activity:
+                    continue
+                turn_msgs = [pre_messages[i] for i in turn.indices if 0 <= i < len(pre_messages)]
+                turn_msgs = _sanitize_restored_turn(turn_msgs)
+                turn_text = json.dumps(turn_msgs, default=str)
+                turn_tokens = len(turn_text) // 4
+                if turn_tokens > turn_budget:
+                    continue
+                cur_msgs = fmt.get_messages(body)
+                insert_at = 0
+                for i, m in enumerate(cur_msgs):
+                    if m.get("role") in ("system", "developer"):
+                        insert_at = i + 1
+                    else:
+                        break
+                fmt.insert_items(body, insert_at, turn_msgs)
+                turn_budget -= turn_tokens
+                turns_added += 1
+
+    if summaries_added or turns_added:
+        logger.info(
+            "FILL-PASS: added %d summaries (%d tokens) + %d turns, headroom=%d target=%d",
+            summaries_added, tokens_used, turns_added, headroom, target_tokens,
+        )
+
+    return body, summaries_added, turns_added
+
+
+def _append_to_context(body: dict, fmt: PayloadFormat, text: str) -> dict:
+    """Append text to the existing context injection point.
+
+    Returns the updated body. ``fmt.inject_context()`` returns a new
+    deep-copied body and already wraps input in ``<system-reminder>``
+    tags, so we pass raw section text (no pre-wrapping).
+    """
+    return fmt.inject_context(body, text)
+
+
+def _format_breadth_section(ts) -> str:
+    """Render a TagSummary breadth item as a simple tag section."""
+    return (
+        f'<virtual-context tags="{ts.tag}" type="breadth">\n'
+        f"{ts.summary}\n"
+        f"</virtual-context>"
+    )
+
+
+def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
+    """Sanitize restored turn messages: strip thinking blocks, replace media."""
+    sanitized = []
+    for msg in messages:
+        msg = dict(msg)  # shallow copy
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            cleaned = []
+            for block in content:
+                if not isinstance(block, dict):
+                    cleaned.append(block)
+                    continue
+                btype = block.get("type", "")
+                if btype == "thinking":
+                    continue
+                if btype in ("image", "image_url") or block.get("source", {}).get("type") == "base64":
+                    cleaned.append({"type": "text", "text": "[image removed from restored turn]"})
+                    continue
+                if btype == "input_image":
+                    cleaned.append({"type": "input_text", "text": "[image removed from restored turn]"})
+                    continue
+                cleaned.append(block)
+            msg["content"] = cleaned
+        parts = msg.get("parts", [])
+        if isinstance(parts, list) and parts:
+            cleaned_parts = []
+            for part in parts:
+                if isinstance(part, dict) and "inlineData" in part:
+                    cleaned_parts.append({"text": "[image removed from restored turn]"})
+                else:
+                    cleaned_parts.append(part)
+            msg["parts"] = cleaned_parts
+        sanitized.append(msg)
+    return sanitized
