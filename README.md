@@ -3,7 +3,7 @@
     <img src="assets/dashboard.png" alt="virtual-context dashboard" width="800">
   </a>
 </p>
-<p align="center"><sub>(fig 1.) virtual-context cloud running 3 Million Token Context Window at 80k Actual Tokens</sub></p>
+<p align="center"><sub>virtual-context cloud - running 3 million virtual token window at 80k actual tokens</sub></p>
 
 # virtual-context
 
