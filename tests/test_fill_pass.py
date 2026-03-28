@@ -31,3 +31,23 @@ def test_assembled_context_presented_tags_populated():
     ac = AssembledContext(presented_tags={"cooking", "baking", "recipes"})
     assert "cooking" in ac.presented_tags
     assert len(ac.presented_tags) == 3
+
+
+def test_format_tag_section_standalone():
+    """Standalone format_tag_section produces the same XML format as the assembler."""
+    from virtual_context.core.assembler import format_tag_section
+    from virtual_context.types import StoredSummary, SegmentMetadata
+    from datetime import datetime, timezone
+
+    s1 = StoredSummary(
+        ref="s1", primary_tag="cooking", summary="Italian cooking techniques",
+        summary_tokens=100, tags=["cooking", "italian"],
+        metadata=SegmentMetadata(),
+        start_timestamp=datetime.now(timezone.utc),
+    )
+
+    result = format_tag_section("cooking", [s1])
+    assert '<virtual-context tags="cooking, italian"' in result
+    assert "[1/1]" in result
+    assert "Italian cooking techniques" in result
+    assert "</virtual-context>" in result
