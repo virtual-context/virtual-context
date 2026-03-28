@@ -2498,7 +2498,12 @@ def _format_breadth_section(ts) -> str:
 
 
 def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
-    """Sanitize restored turn messages: strip thinking blocks, replace media."""
+    """Sanitize restored turn messages: strip thinking, media, and tool scaffolding.
+
+    Restored turns may contain tool_result blocks whose matching tool_use
+    is in a different (non-restored) turn.  Sending an orphaned tool_result
+    causes Anthropic API 400.  Strip all tool scaffolding from restored turns.
+    """
     sanitized = []
     for msg in messages:
         msg = dict(msg)  # shallow copy
@@ -2510,8 +2515,13 @@ def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
                     cleaned.append(block)
                     continue
                 btype = block.get("type", "")
+                # Strip thinking blocks
                 if btype == "thinking":
                     continue
+                # Strip tool_use and tool_result �� their partners may not be restored
+                if btype in ("tool_use", "tool_result"):
+                    continue
+                # Replace media with passive placeholder
                 if btype in ("image", "image_url") or block.get("source", {}).get("type") == "base64":
                     cleaned.append({"type": "text", "text": "[image removed from restored turn]"})
                     continue
@@ -2519,7 +2529,14 @@ def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
                     cleaned.append({"type": "input_text", "text": "[image removed from restored turn]"})
                     continue
                 cleaned.append(block)
+            # If stripping left no content, add a placeholder
+            if not cleaned:
+                cleaned = [{"type": "text", "text": "[restored turn — tool content removed]"}]
             msg["content"] = cleaned
+        # Strip OpenAI tool_calls from assistant messages
+        msg.pop("tool_calls", None)
+        if msg.get("role") == "tool":
+            continue  # skip entire tool-role messages
         parts = msg.get("parts", [])
         if isinstance(parts, list) and parts:
             cleaned_parts = []
