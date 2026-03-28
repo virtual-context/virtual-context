@@ -818,16 +818,22 @@ class AnthropicFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the LAST user message (current turn) so the system
-        # prompt remains stable and cacheable by Anthropic prompt caching.
-        # Using the last user message avoids disturbing tool_use/tool_result
-        # chains in historical messages.
+        # Inject into the last user message that does NOT contain tool_result
+        # blocks.  Prepending text before tool_result breaks Anthropic's
+        # "tool_result must immediately follow tool_use" constraint.
+        # This keeps the system prompt stable and cacheable.
         messages = body.get("messages", [])
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
+            # Skip tool_result-bearing user messages
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                continue
             if isinstance(content, str):
                 messages[i] = dict(msg)
                 messages[i]["content"] = f"{context_block}\n\n{content}"
