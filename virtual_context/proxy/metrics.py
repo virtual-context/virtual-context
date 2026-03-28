@@ -215,7 +215,10 @@ class ProxyMetrics:
             if etype == "request":
                 extras = f" turn={event.get('turn')} passthrough={event.get('passthrough')} in={event.get('input_tokens',0)} ctx={event.get('context_tokens',0)}"
             elif etype == "response":
-                extras = f" turn={event.get('turn')} ms={event.get('upstream_ms',0)}"
+                _cr = event.get('cache_read_input_tokens', 0)
+                _cc = event.get('cache_creation_input_tokens', 0)
+                _cache_str = f" cache_read={_cr} cache_create={_cc}" if _cr or _cc else ""
+                extras = f" turn={event.get('turn')} ms={event.get('upstream_ms',0)}{_cache_str}"
             elif etype == "turn_complete":
                 extras = f" turn={event.get('turn')} tags={event.get('tags',[])} primary={event.get('primary_tag','')}"
             elif etype == "compaction":
@@ -366,6 +369,21 @@ class ProxyMetrics:
             r.get("context_tokens", 0) for r in requests
         )
 
+        # Cache metrics from upstream LLM responses
+        total_cache_creation = sum(
+            r.get("cache_creation_input_tokens", 0) for r in responses
+        )
+        total_cache_read = sum(
+            r.get("cache_read_input_tokens", 0) for r in responses
+        )
+        total_upstream_input = sum(
+            r.get("upstream_input_tokens", 0) for r in responses
+        )
+        # Cache hit ratio: cache_read / (cache_read + cache_creation + uncached)
+        # Total input from upstream = input_tokens (which includes all three components)
+        _cache_denominator = total_upstream_input if total_upstream_input > 0 else 1
+        cache_hit_ratio = round(total_cache_read / _cache_denominator, 3) if total_upstream_input > 0 else 0.0
+
         # Session efficiency: actual vs baseline input tokens
         total_actual_input = sum(
             r.get("input_tokens", 0) for r in requests
@@ -462,6 +480,12 @@ class ProxyMetrics:
                 for tc in tool_intercepts[-20:]
             ],
             "compaction_progress": list(compaction_progress),
+            "cache": {
+                "total_cache_creation_tokens": total_cache_creation,
+                "total_cache_read_tokens": total_cache_read,
+                "total_upstream_input_tokens": total_upstream_input,
+                "cache_hit_ratio": cache_hit_ratio,
+            },
             "telemetry": telemetry,
             "budget_promoted": next(
                 (e for e in reversed(self._events)
