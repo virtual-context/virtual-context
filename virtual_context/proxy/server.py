@@ -654,7 +654,7 @@ async def prepare_payload(
             # Stage 2: full chain collapse (post-compaction)
             from .message_filter import collapse_turn_chains
             _deep_ratio = getattr(
-                state.engine.config.compaction, "deep_compaction_ratio", 0.5,
+                state.engine.config.compactor, "deep_compaction_ratio", 0.5,
             )
             body, _collapse_count, _chain_refs = collapse_turn_chains(
                 body, fmt,
