@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -275,6 +276,18 @@ class ContextAssembler:
 
         total_tokens = core_tokens + tag_tokens + facts_tokens_actual + conv_tokens
 
+        # Compute presented_tags from rendered <virtual-context tags="..."> headers
+        _vc_tags_re = re.compile(r'<virtual-context\s+tags="([^"]*)"')
+        _presented_tags: set[str] = set()
+        for _section_text in tag_sections.values():
+            for _m in _vc_tags_re.finditer(_section_text):
+                for _t in _m.group(1).split(", "):
+                    _t = _t.strip()
+                    if _t:
+                        _presented_tags.add(_t)
+        # Also include section keys as baseline for edge cases
+        _presented_tags.update(tag_sections.keys())
+
         return AssembledContext(
             core_context=core,
             tag_sections=tag_sections,
@@ -291,6 +304,8 @@ class ContextAssembler:
             prepend_text=prepend_text,
             presented_segment_refs=presented_refs,
             selected_facts=selected_facts,
+            retrieval_result=retrieval_result,
+            presented_tags=_presented_tags,
         )
 
     def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
