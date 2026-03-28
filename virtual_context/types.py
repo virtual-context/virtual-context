@@ -742,6 +742,9 @@ class MonitorConfig:
     soft_threshold: float = 0.70
     hard_threshold: float = 0.85
     protected_recent_turns: int = 6
+    fill_pass_enabled: bool = True
+    fill_pass_target: str = "soft"  # "soft", "hard", or float fraction
+    fill_pass_summary_ratio: float = 0.60
 
 
 @dataclass
