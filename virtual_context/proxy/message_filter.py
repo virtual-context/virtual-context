@@ -1327,13 +1327,20 @@ def _extract_tool_metadata_from_chain(
     chain_global_indices: tuple[int, ...],
     tool_call_map: dict[str, dict],
 ) -> list[str]:
-    """Extract compact tool call descriptions from a turn chain.
+    """Extract deduplicated tool call descriptions from a turn chain.
 
-    Returns a list of strings like ``"Read(file.py)"``, ``"Exec(cmd)"``.
+    Collects all tool calls, deduplicates by ``name(args)`` string, and
+    returns compact descriptions with repeat counts.  e.g.::
+
+        ["Read(/root/.openclaw/memory/2026-03-25.md)",
+         "Read(/root/.openclaw/memory/2026-03-26.md)",
+         "session_status (x20)",
+         "message (x3)"]
     """
     from ..core.tool_loop import VC_TOOL_NAMES
 
-    seen: list[str] = []
+    # Collect raw descriptions (with duplicates)
+    raw: list[str] = []
     seen_ids: set[str] = set()
     for gi in chain_global_indices:
         msg = messages[gi]
@@ -1352,7 +1359,7 @@ def _extract_tool_metadata_from_chain(
                     if name in VC_TOOL_NAMES:
                         continue
                     args = _summarise_arguments(block.get("input"), max_len=60)
-                    seen.append(f"{name}({args})" if args else name)
+                    raw.append(f"{name}({args})" if args else name)
         # OpenAI Chat tool_calls
         for tc in msg.get("tool_calls", []):
             if isinstance(tc, dict) and "id" in tc:
@@ -1364,7 +1371,7 @@ def _extract_tool_metadata_from_chain(
                 if name in VC_TOOL_NAMES:
                     continue
                 args = _summarise_arguments(tc.get("function", {}).get("arguments"), max_len=60)
-                seen.append(f"{name}({args})" if args else name)
+                raw.append(f"{name}({args})" if args else name)
         # OpenAI Responses bare function_call items
         if msg.get("type") == "function_call" and "call_id" in msg:
             call_id = msg["call_id"]
@@ -1373,7 +1380,7 @@ def _extract_tool_metadata_from_chain(
                 name = msg.get("name", "")
                 if name not in VC_TOOL_NAMES:
                     args = _summarise_arguments(msg.get("arguments"), max_len=60)
-                    seen.append(f"{name}({args})" if args else name)
+                    raw.append(f"{name}({args})" if args else name)
         # Gemini functionCall parts
         parts = msg.get("parts", [])
         if isinstance(parts, list):
@@ -1384,8 +1391,23 @@ def _extract_tool_metadata_from_chain(
                     if name in VC_TOOL_NAMES:
                         continue
                     args = _summarise_arguments(fc.get("args"), max_len=60)
-                    seen.append(f"{name}({args})" if args else name)
-    return seen
+                    raw.append(f"{name}({args})" if args else name)
+
+    # Deduplicate: preserve first-seen order, count repeats
+    from collections import Counter
+    counts = Counter(raw)
+    seen_descs: set[str] = set()
+    result: list[str] = []
+    for desc in raw:
+        if desc in seen_descs:
+            continue
+        seen_descs.add(desc)
+        count = counts[desc]
+        if count > 1:
+            result.append(f"{desc} (x{count})")
+        else:
+            result.append(desc)
+    return result
 
 
 def _find_pre_filter_chain(
