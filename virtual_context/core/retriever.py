@@ -120,6 +120,7 @@ class ContextRetriever:
         """
         start_time = time.monotonic()
         active_tags = set(current_active_tags or [])
+        overflow: list[StoredSummary] = []
 
         # Tag the inbound message — scope vocabulary to current conversation
         store_tags = [ts.tag for ts in self.store.get_all_tags(
@@ -207,6 +208,7 @@ class ContextRetriever:
                         summaries=floor_summaries,
                         total_tokens=floor_tokens,
                         facts=self._fetch_all_facts(),
+                        overflow_summaries=overflow,
                         retrieval_metadata={
                             "elapsed_ms": round(elapsed * 1000, 1),
                             "tags_from_message": tag_result.tags,
@@ -226,6 +228,7 @@ class ContextRetriever:
                 summaries=[],
                 total_tokens=0,
                 facts=self._fetch_all_facts(),
+                overflow_summaries=overflow,
                 retrieval_metadata={
                     "elapsed_ms": round(elapsed * 1000, 1),
                     "tags_from_message": tag_result.tags,
@@ -293,15 +296,18 @@ class ContextRetriever:
         selected: list[StoredSummary] = []
         selected_refs: set[str] = set()
         total_tokens = 0
+        _overflow_cap = 50
         for summary in all_summaries:
             if summary.ref in selected_refs:
                 continue
             if total_tokens + summary.summary_tokens > token_budget:
-                logger.info(
-                    "Retriever: '%s' SKIP (budget exhausted: need %dt, have %dt remaining of %dt)",
-                    summary.primary_tag, summary.summary_tokens, token_budget - total_tokens, token_budget,
-                )
-                break
+                if len(overflow) < _overflow_cap:
+                    overflow.append(summary)
+                    logger.debug(
+                        "Retriever: '%s' OVERFLOW (%dt, %d candidates)",
+                        summary.primary_tag, summary.summary_tokens, len(overflow),
+                    )
+                continue
             selected.append(summary)
             selected_refs.add(summary.ref)
             total_tokens += summary.summary_tokens
@@ -401,6 +407,7 @@ class ContextRetriever:
             full_detail=full_detail,
             total_tokens=total_tokens,
             facts=facts,
+            overflow_summaries=overflow,
             retrieval_metadata=retrieval_metadata,
             retrieval_scores=retrieval_scores,
             query_embedding=query_embedding,
