@@ -314,12 +314,16 @@ def resolve_conversation_id(
     """
     if explicit_id and explicit_id.strip():
         explicit_id = explicit_id.strip()
-        if format_name:
-            return _candidate_to_uuid("explicit_id", f"{format_name}:{explicit_id}")
+        # If explicit_id is already a valid UUID (e.g. from a vc:conversation
+        # marker in a previous response), use it as-is.  The marker IS the
+        # canonical conversation ID — re-hashing it with format_name would
+        # break the round-trip and create orphan conversations.
         try:
             _uuid.UUID(explicit_id)
             return explicit_id
         except ValueError:
+            if format_name:
+                return _candidate_to_uuid("explicit_id", f"{format_name}:{explicit_id}")
             return _candidate_to_uuid("explicit_id", explicit_id)
 
     if not body:
