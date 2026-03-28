@@ -587,19 +587,19 @@ async def prepare_payload(
         if _media_compressed:
             logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
 
-    # PROXY-025: Stub compacted messages via hash matching
-    turns_stubbed = 0
+    # Drop compacted non-tool turns — their content is already in VC segments
+    _compacted_dropped = 0
     try:
         if state and int(state.engine._engine_state.compacted_through) > 0:
-            from .message_filter import stub_compacted_messages
-            body, turns_stubbed = stub_compacted_messages(
+            from .message_filter import drop_compacted_turns
+            body, _compacted_dropped = drop_compacted_turns(
                 body,
                 state.engine._turn_tag_index,
                 state.engine._engine_state.compacted_through,
                 fmt=fmt,
             )
-            if turns_stubbed:
-                logger.info("STUB Stubbed %d compacted turns", turns_stubbed)
+            if _compacted_dropped:
+                logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", _compacted_dropped)
     except (TypeError, ValueError, AttributeError):
         pass
 
