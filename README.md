@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="assets/hero.png" alt="virtual-context" width="100%">
+  <a href="assets/dashboard.png">
+    <img src="assets/dashboard.png" alt="virtual-context dashboard" width="800">
+  </a>
 </p>
 
 # virtual-context
