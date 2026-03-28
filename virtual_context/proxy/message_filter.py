@@ -628,8 +628,11 @@ def _extract_text_for_stub_hash(msg: dict) -> str:
     if isinstance(content, str):
         return _strip_envelope(content).strip()
     if isinstance(content, list):
+        # Accept "text" (Anthropic), "input_text" (OpenAI Responses user),
+        # and "output_text" (OpenAI Responses assistant).
+        _text_types = {"text", "input_text", "output_text"}
         for block in reversed(content):
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") in _text_types:
                 text = block.get("text", "")
                 return _strip_envelope(text).strip()
     return ""
@@ -1323,7 +1326,7 @@ def _extract_tool_metadata_from_chain(
                         continue
                     args = _summarise_arguments(block.get("input"), max_len=60)
                     seen.append(f"{name}({args})" if args else name)
-        # OpenAI tool_calls
+        # OpenAI Chat tool_calls
         for tc in msg.get("tool_calls", []):
             if isinstance(tc, dict) and "id" in tc:
                 call_id = tc["id"]
@@ -1335,6 +1338,15 @@ def _extract_tool_metadata_from_chain(
                     continue
                 args = _summarise_arguments(tc.get("function", {}).get("arguments"), max_len=60)
                 seen.append(f"{name}({args})" if args else name)
+        # OpenAI Responses bare function_call items
+        if msg.get("type") == "function_call" and "call_id" in msg:
+            call_id = msg["call_id"]
+            if call_id not in seen_ids:
+                seen_ids.add(call_id)
+                name = msg.get("name", "")
+                if name not in VC_TOOL_NAMES:
+                    args = _summarise_arguments(msg.get("arguments"), max_len=60)
+                    seen.append(f"{name}({args})" if args else name)
     return seen
 
 
@@ -1536,22 +1548,39 @@ def collapse_turn_chains(
     # Map: turn_idx -> (ref, stub_user, stub_asst) for turns to collapse
     collapse_map: dict[int, tuple[str, dict, dict]] = {}
 
+    _skip_no_tool = 0
+    _skip_no_user_text = 0
+    _skip_no_pf_match = 0
+    _skip_no_canonical = 0
+
+    logger.info(
+        "CHAIN-COLLAPSE: analyzing %d turns (%d protected, %d collapsible) format=%s",
+        total_turns, protected, protected_start, fmt.name,
+    )
+
     for tidx in range(protected_start):
         turn = history_turns[tidx]
         canonical_turn = turn_canonical.get(tidx, -1)
 
         # Skip turns without tool activity -- handled by stub_compacted_messages
         if not turn.has_tool_activity:
+            _skip_no_tool += 1
             continue
 
         user_text = turn_user_text.get(tidx, "")
         if not user_text:
+            _skip_no_user_text += 1
             continue
 
         # a. Find corresponding messages in pre_filter_body
         pf_chain = _find_pre_filter_chain(pre_filter_messages, user_text, _asst_role, used_indices=_pf_used)
         if pf_chain is None:
-            logger.debug("CHAIN-COLLAPSE: no pre-filter match for turn %d (canonical %d)", tidx, canonical_turn)
+            _skip_no_pf_match += 1
+            if _skip_no_pf_match <= 3:
+                logger.info(
+                    "CHAIN-COLLAPSE: no pre-filter match turn %d (canonical %d) user_text=%s",
+                    tidx, canonical_turn, user_text[:80],
+                )
             continue
 
         _pf_used.update(pf_chain)
@@ -1648,6 +1677,13 @@ def collapse_turn_chains(
         collapse_map[tidx] = (ref, stub_user, stub_asst)
         chain_refs.append(ref)
         collapse_count += 1
+
+    logger.info(
+        "CHAIN-COLLAPSE: results — collapsed=%d skip_no_tool=%d skip_no_user_text=%d "
+        "skip_no_pf_match=%d skip_no_canonical=%d",
+        len(collapse_map), _skip_no_tool, _skip_no_user_text,
+        _skip_no_pf_match, _skip_no_canonical,
+    )
 
     if not collapse_map:
         return body, 0, []
