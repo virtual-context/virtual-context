@@ -588,18 +588,18 @@ async def prepare_payload(
             logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
 
     # Drop compacted non-tool turns — their content is already in VC segments
-    _compacted_dropped = 0
+    turns_stubbed = 0  # kept for downstream metrics compatibility
     try:
         if state and int(state.engine._engine_state.compacted_through) > 0:
             from .message_filter import drop_compacted_turns
-            body, _compacted_dropped = drop_compacted_turns(
+            body, turns_stubbed = drop_compacted_turns(
                 body,
                 state.engine._turn_tag_index,
                 state.engine._engine_state.compacted_through,
                 fmt=fmt,
             )
-            if _compacted_dropped:
-                logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", _compacted_dropped)
+            if turns_stubbed:
+                logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", turns_stubbed)
     except (TypeError, ValueError, AttributeError):
         pass
 
