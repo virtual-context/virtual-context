@@ -16,6 +16,7 @@ This module is the ``create_app`` factory that wires together:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -565,7 +566,7 @@ async def prepare_payload(
         _effective_budget = 0
 
     # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
-    _pre_filter_body = body
+    _pre_filter_body = copy.deepcopy(body)
 
     # Media compression — compress images on first sight, store on disk
     if state and state.engine.config.tool_output.enabled:
@@ -589,6 +590,8 @@ async def prepare_payload(
 
     # Drop compacted non-tool turns — their content is already in VC segments
     turns_stubbed = 0  # kept for downstream metrics compatibility
+    _fill_summaries = 0
+    _fill_turns = 0
     try:
         if state and int(state.engine._engine_state.compacted_through) > 0:
             from .message_filter import drop_compacted_turns
@@ -898,6 +901,8 @@ async def prepare_payload(
                     _think_t, _think_t / _budget * 100, _budget,
                 )
 
+    _bloat_fallback = False
+
     # ------------------------------------------------------------------
     # PAYLOAD BUDGET ENFORCEMENT — hard cap on VC context window
     # ------------------------------------------------------------------
@@ -918,11 +923,59 @@ async def prepare_payload(
                 _budget_reductions, _budget_freed, outbound_tokens, _budget_window,
             )
 
+    # ------------------------------------------------------------------
+    # FILL PASS — replenish from VC floor to soft threshold
+    # ------------------------------------------------------------------
+    if state and not _bloat_fallback:
+        _fill_enabled = getattr(
+            state.engine.config.monitor, "fill_pass_enabled", True,
+        )
+        if _fill_enabled and outbound_tokens < inbound_tokens:
+            from .message_filter import fill_pass
+
+            _soft = state.engine.config.monitor.soft_threshold
+            _fill_target_str = getattr(
+                state.engine.config.monitor, "fill_pass_target", "soft",
+            )
+            if _fill_target_str == "soft":
+                _fill_target = int(state.engine.config.monitor.context_window * _soft)
+            elif _fill_target_str == "hard":
+                _fill_target = int(state.engine.config.monitor.context_window * state.engine.config.monitor.hard_threshold)
+            else:
+                try:
+                    _fill_target = int(state.engine.config.monitor.context_window * float(_fill_target_str))
+                except (ValueError, TypeError):
+                    _fill_target = int(state.engine.config.monitor.context_window * _soft)
+
+            # Clamp: never exceed inbound, never exceed upstream - max_tokens
+            _max_tokens = body.get("max_tokens", 0) or 0
+            _fill_target = min(_fill_target, inbound_tokens, _upstream_limit - _max_tokens)
+
+            _summary_ratio = getattr(
+                state.engine.config.monitor, "fill_pass_summary_ratio", 0.60,
+            )
+
+            if _fill_target > outbound_tokens:
+                enriched_body, _fill_summaries, _fill_turns = fill_pass(
+                    body=enriched_body,
+                    fmt=fmt,
+                    outbound_tokens=outbound_tokens,
+                    target_tokens=_fill_target,
+                    assembled=assembled,
+                    pre_filter_body=_pre_filter_body,
+                    store=state.engine._store,
+                    conversation_id=state.engine.config.conversation_id,
+                    summary_ratio=_summary_ratio,
+                )
+                if _fill_summaries or _fill_turns:
+                    _outbound_json = json.dumps(enriched_body, default=str)
+                    _outbound_bytes = len(_outbound_json.encode("utf-8"))
+                    outbound_tokens = fmt._count(_outbound_json)
+
     # VC must never send more than the client sent. If enrichment bloated
     # the payload beyond inbound, revert to the original client body and
     # treat as passthrough — all downstream metrics/capture will record
     # the passthrough values.
-    _bloat_fallback = False
     if outbound_tokens > inbound_tokens:
         logger.warning(
             "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — reverting to passthrough (delta +%dt)",
@@ -1144,10 +1197,10 @@ async def prepare_payload(
     if _upstream_trimmed:
         _out_str = f"out={outbound_tokens}t TRIMMED from {_pre_trim_tokens}t"
     logger.info(
-        "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d "
+        "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d fill=%d+%d "
         "ctx=%dt in=%dt %s upstream=%dt vc=%sms | %s",
         turn, api_format, is_streaming, _tags_str, _flag_str,
-        len(body.get("messages", [])), turns_dropped, turns_stubbed,
+        len(body.get("messages", [])), turns_dropped, turns_stubbed, _fill_summaries, _fill_turns,
         context_tokens, inbound_tokens, _out_str, _upstream_limit,
         overhead_ms, user_message[:60],
     )
