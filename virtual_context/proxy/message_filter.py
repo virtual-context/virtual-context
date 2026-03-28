@@ -1380,14 +1380,33 @@ def _find_pre_filter_chain(
         text = _extract_text_for_stub_hash(msg)
         if text != user_text_needle:
             continue
-        # Found the matching user message — build the chain
+        # Found the matching user message — build the chain.
+        # For OpenAI Responses, bare items (function_call, reasoning) can
+        # appear between the user message and the first assistant message.
+        # Scan forward past them to find the assistant.
         chain: list[int] = [i]
-        if i + 1 >= len(pre_filter_messages):
-            continue
-        if pre_filter_messages[i + 1].get("role") != _asst_role:
-            continue
-        chain.append(i + 1)
-        j = i + 2
+        j = i + 1
+        while j < len(pre_filter_messages):
+            _next = pre_filter_messages[j]
+            _next_role = _next.get("role", "")
+            _next_type = _next.get("type", "")
+            if _next_role == _asst_role:
+                chain.append(j)
+                j += 1
+                break
+            # Accept bare Responses items (function_call, function_call_output,
+            # reasoning) between user and first assistant
+            if _next_type in ("function_call", "function_call_output", "reasoning"):
+                chain.append(j)
+                j += 1
+                continue
+            # Anything else (user, developer, system) means no assistant follows
+            break
+        else:
+            continue  # no assistant found
+        if len(chain) < 2:
+            continue  # no assistant was appended
+        # j is now past the first assistant — continue looking for tool rounds
         while j < len(pre_filter_messages):
             next_msg = pre_filter_messages[j]
             next_role = next_msg.get("role", "")
