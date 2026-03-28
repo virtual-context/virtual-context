@@ -1452,6 +1452,7 @@ def collapse_turn_chains(
     store: ContextStore | None,
     conversation_id: str,
     pre_filter_body: dict | None = None,
+    deep_compaction_ratio: float = 0.5,
 ) -> tuple[dict, int, list[str]]:
     """Collapse turn chains outside protected window to stub pairs (stage 2).
 
@@ -1460,6 +1461,12 @@ def collapse_turn_chains(
     The original messages (including thinking blocks) are captured from
     *pre_filter_body* and stored as a chain snapshot for later restore.
     Individual tool outputs are also stored for FTS search.
+
+    **Deep compaction:** Turns whose canonical turn number is below
+    ``compacted_through * deep_compaction_ratio`` are dropped entirely
+    (no stub pair inserted).  Their tool outputs are already linked to
+    segments and recoverable via ``vc_find_quote`` / ``vc_expand_topic``.
+    Set *deep_compaction_ratio* to 0 to disable (keep all stubs).
 
     Uses ``fmt.group_into_turns()`` for turn boundary detection and format
     mutation methods for list manipulation, making this work across all
@@ -1571,15 +1578,23 @@ def collapse_turn_chains(
     chain_refs: list[str] = []
     # Map: turn_idx -> (ref, stub_user, stub_asst) for turns to collapse
     collapse_map: dict[int, tuple[str, dict, dict]] = {}
+    # Set of turn indices to deep-drop (remove without stub)
+    deep_drop_set: set[int] = set()
+
+    # Compute deep compaction threshold from canonical turn numbers.
+    # Turns below this threshold are dropped entirely (no stub).
+    _max_canonical = max((v for v in turn_canonical.values() if v >= 0), default=0)
+    _deep_threshold = int(_max_canonical * deep_compaction_ratio) if deep_compaction_ratio > 0 else 0
 
     _skip_no_tool = 0
     _skip_no_user_text = 0
     _skip_no_pf_match = 0
     _skip_no_canonical = 0
+    _deep_dropped = 0
 
     logger.info(
-        "CHAIN-COLLAPSE: analyzing %d turns (%d protected, %d collapsible) format=%s",
-        total_turns, protected, protected_start, fmt.name,
+        "CHAIN-COLLAPSE: analyzing %d turns (%d protected, %d collapsible) format=%s deep_threshold=%d",
+        total_turns, protected, protected_start, fmt.name, _deep_threshold,
     )
 
     for tidx in range(protected_start):
@@ -1718,6 +1733,16 @@ def collapse_turn_chains(
                 "content": [{"type": "text", "text": stub_text}],
             }
 
+        # Deep compaction: if this turn is well below the compaction frontier,
+        # drop it entirely instead of inserting a stub.  Segment linkage
+        # already provides recovery via vc_find_quote / vc_expand_topic.
+        if _deep_threshold > 0 and canonical_turn >= 0 and canonical_turn < _deep_threshold:
+            deep_drop_set.add(tidx)
+            chain_refs.append(ref)
+            collapse_count += 1
+            _deep_dropped += 1
+            continue
+
         fmt.mark_as_vc_stub(stub_user)
         fmt.mark_as_vc_stub(stub_asst)
 
@@ -1726,22 +1751,24 @@ def collapse_turn_chains(
         collapse_count += 1
 
     logger.info(
-        "CHAIN-COLLAPSE: results — collapsed=%d skip_no_tool=%d skip_no_user_text=%d "
+        "CHAIN-COLLAPSE: results — stubbed=%d deep_dropped=%d skip_no_tool=%d skip_no_user_text=%d "
         "skip_no_pf_match=%d skip_no_canonical=%d",
-        len(collapse_map), _skip_no_tool, _skip_no_user_text,
+        len(collapse_map), _deep_dropped, _skip_no_tool, _skip_no_user_text,
         _skip_no_pf_match, _skip_no_canonical,
     )
 
-    if not collapse_map:
+    if not collapse_map and not deep_drop_set:
         return body, 0, []
 
     # ------------------------------------------------------------------
     # 7. Apply mutations: remove collapsed items, insert stubs, clean orphans
     # ------------------------------------------------------------------
     # Collect all indices to remove and tool_use IDs for orphan cleanup.
+    # Includes both stubbed turns (collapse_map) and deep-dropped turns.
     collapsed_indices: set[int] = set()
     collapsed_tool_use_ids: set[str] = set()
-    for tidx, (ref, stub_user, stub_asst) in collapse_map.items():
+    _all_collapsed_tidxs = set(collapse_map.keys()) | deep_drop_set
+    for tidx in _all_collapsed_tidxs:
         turn = history_turns[tidx]
         for gi in turn.indices:
             collapsed_indices.add(gi)

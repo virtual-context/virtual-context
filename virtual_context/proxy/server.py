@@ -653,6 +653,9 @@ async def prepare_payload(
         if _ct > 0:
             # Stage 2: full chain collapse (post-compaction)
             from .message_filter import collapse_turn_chains
+            _deep_ratio = getattr(
+                state.engine.config.compaction, "deep_compaction_ratio", 0.5,
+            )
             body, _collapse_count, _chain_refs = collapse_turn_chains(
                 body, fmt,
                 pre_filter_body=_pre_filter_body,
@@ -660,6 +663,7 @@ async def prepare_payload(
                 turn_tag_index=state.engine._turn_tag_index,
                 store=state.engine._store,
                 conversation_id=state.engine.config.conversation_id,
+                deep_compaction_ratio=_deep_ratio,
             )
             if _collapse_count:
                 _tool_stubs_present = True
