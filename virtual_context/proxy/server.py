@@ -971,6 +971,16 @@ async def prepare_payload(
                     _outbound_json = json.dumps(enriched_body, default=str)
                     _outbound_bytes = len(_outbound_json.encode("utf-8"))
                     outbound_tokens = fmt._count(_outbound_json)
+                    # Update prepend_text to reflect fill additions so
+                    # context_tokens and persisted metrics are accurate.
+                    _sys = enriched_body.get("system", enriched_body.get("instructions", ""))
+                    if isinstance(_sys, str):
+                        prepend_text = _sys
+                    elif isinstance(_sys, list):
+                        prepend_text = "\n".join(
+                            b.get("text", "") for b in _sys
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
 
     # VC must never send more than the client sent. If enrichment bloated
     # the payload beyond inbound, revert to the original client body and
@@ -991,6 +1001,8 @@ async def prepare_payload(
         context_tokens = 0
         turns_dropped = 0
         turns_stubbed = 0
+        _fill_summaries = 0
+        _fill_turns = 0
         paging_enabled = False
         tool_output_find_quote = False
         _tool_stubs_present = False

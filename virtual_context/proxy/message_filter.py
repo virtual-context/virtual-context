@@ -2405,7 +2405,9 @@ def fill_pass(
                 continue
             if summary.ref in presented_refs:
                 continue
-            text = format_tag_section(summary.primary_tag, [summary], store=store, conversation_id=conversation_id)
+            # Don't pass store — tool hint enrichment would add vc_restore_tool
+            # references, but the fill pass runs after tool injection decisions.
+            text = format_tag_section(summary.primary_tag, [summary])
             tokens = len(text) // 4  # rough estimate
             if tokens_used + tokens > summary_budget:
                 continue
