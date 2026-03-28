@@ -677,21 +677,20 @@ def _extract_text_for_stub_hash(msg: dict) -> str:
     return ""
 
 
-def stub_compacted_messages(
+def drop_compacted_turns(
     body: dict,
     turn_tag_index: TurnTagIndex,
     compacted_through: int,
     *,
     fmt: PayloadFormat | None = None,
 ) -> tuple[dict, int]:
-    """Replace compacted turns with lightweight stubs using hash-based identification.
+    """Drop compacted non-tool turns from the payload entirely.
 
-    Walks user-text messages in the client payload, computes SHA-256 hash
-    (matching engine's combined_text), looks up in TurnTagIndex.  If the
-    matched entry's turn < compacted_through // 2, stubs the entire
-    message group (user + assistant + any tool chain messages).
+    These turns are already represented by compacted segments in the VC
+    context injection.  Keeping per-turn stubs is redundant and wastes
+    tokens.  Tool-bearing turns are left for chain collapse to handle.
 
-    Returns (modified_body, stub_count).
+    Returns (modified_body, drop_count).
     """
     if compacted_through <= 0:
         return body, 0
@@ -723,8 +722,6 @@ def stub_compacted_messages(
     for i, msg in enumerate(messages):
         if msg.get("role") != "user":
             continue
-        # Skip tool_result-only user messages (they're part of a tool chain,
-        # not the start of a new turn).
         content = msg.get("content", "")
         if isinstance(content, list):
             _text_block_types = {"text", "input_text", "output_text"}
@@ -738,6 +735,18 @@ def stub_compacted_messages(
             )
             if has_tool_result and not has_text:
                 continue
+        # Gemini: check parts
+        parts = msg.get("parts", [])
+        if isinstance(parts, list) and parts:
+            has_func_response = any(
+                isinstance(p, dict) and "functionResponse" in p for p in parts
+            )
+            has_text_part = any(
+                isinstance(p, dict) and "text" in p and "functionResponse" not in p
+                for p in parts
+            )
+            if has_func_response and not has_text_part:
+                continue
         text = _extract_text_for_stub_hash(msg)
         if text:
             user_text_indices.append(i)
@@ -746,7 +755,6 @@ def stub_compacted_messages(
         return body, 0
 
     # Group messages into turns.
-    # Each turn spans from one user-text message to the next.
     turn_groups: list[tuple[int, int]] = []  # (start_idx, end_idx_exclusive)
     for g, uti in enumerate(user_text_indices):
         if g + 1 < len(user_text_indices):
@@ -755,15 +763,14 @@ def stub_compacted_messages(
             end = len(messages)
         turn_groups.append((uti, end))
 
-    # Hash each turn group and match against the index.
-    stubs: list[tuple[int, int, object]] = []  # (start, end, TurnTagEntry)
+    # Hash each turn group and identify compacted non-tool turns to drop.
+    drop_ranges: list[tuple[int, int]] = []
     for start, end in turn_groups:
         msg = messages[start]
         user_text = _extract_text_for_stub_hash(msg)
         if not user_text:
             continue
 
-        # Find first assistant message in group for combined hash
         asst_text = ""
         for j in range(start + 1, end):
             if messages[j].get("role") == _asst_role:
@@ -775,63 +782,29 @@ def stub_compacted_messages(
 
         entry = turn_tag_index.get_entry_by_hash(h)
         if entry is not None and entry.turn_number < watermark_turn:
-            # Skip tool-bearing turn groups — position-based stubbing
-            # handles their tool outputs separately.
+            # Skip tool-bearing turns — chain collapse handles those
             if _chain_has_tool_activity(messages, range(start, end)):
                 continue
-            stubs.append((start, end, entry))
+            drop_ranges.append((start, end))
 
-    if not stubs:
+    if not drop_ranges:
         return body, 0
 
-    # Build new message list, replacing stub ranges with lightweight markers.
-    # Use format-appropriate content block types.
-    _fname = fmt.name
-    _asst_block_type = "output_text" if _fname == "openai_responses" else "text"
-
-    stub_starts: dict[int, tuple[int, int, object]] = {
-        s[0]: s for s in sorted(stubs, key=lambda s: s[0])
-    }
+    # Build new message list, skipping dropped ranges entirely
+    drop_starts: dict[int, int] = {s: e for s, e in drop_ranges}
     new_messages: list[dict] = []
     i = 0
     while i < len(messages):
-        stub = stub_starts.get(i)
-        if stub:
-            start, end, entry = stub
-            tags_str = ", ".join(entry.tags[:5])
-            # Tool-bearing turns are skipped above (position-based
-            # stubbing handles them), so only non-tool turns reach here.
-            stub_text = (
-                f"[Compacted turn {entry.turn_number}: "
-                f"topics={tags_str}. "
-                f"Content stored in virtual-context.]"
-            )
-            if _fname == "gemini":
-                new_messages.append({
-                    "role": "user",
-                    "parts": [{"text": f"[Compacted turn {entry.turn_number}]"}],
-                })
-                new_messages.append({
-                    "role": "model",
-                    "parts": [{"text": stub_text}],
-                })
-            else:
-                new_messages.append({
-                    "role": "user",
-                    "content": f"[Compacted turn {entry.turn_number}]",
-                })
-                new_messages.append({
-                    "role": _asst_role,
-                    "content": [{"type": _asst_block_type, "text": stub_text}],
-                })
-            i = end
+        end = drop_starts.get(i)
+        if end is not None:
+            i = end  # skip entire turn
         else:
             new_messages.append(messages[i])
             i += 1
 
     body = dict(body)
     body[_msg_key] = new_messages
-    return body, len(stubs)
+    return body, len(drop_ranges)
 
 
 # ---------------------------------------------------------------------------
@@ -1646,7 +1619,7 @@ def collapse_turn_chains(
         turn = history_turns[tidx]
         canonical_turn = turn_canonical.get(tidx, -1)
 
-        # Skip turns without tool activity -- handled by stub_compacted_messages
+        # Skip turns without tool activity -- handled by drop_compacted_turns
         if not turn.has_tool_activity:
             _skip_no_tool += 1
             continue
