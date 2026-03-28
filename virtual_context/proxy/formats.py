@@ -818,13 +818,25 @@ class AnthropicFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        existing = body.get("system", "")
-        if isinstance(existing, list):
-            body["system"] = existing + [{"type": "text", "text": context_block}]
+        # Inject into the first user message (not system prompt) so the
+        # system prompt remains stable and cacheable by Anthropic prompt
+        # caching.  This matches Claude Code's own pattern.
+        messages = body.get("messages", [])
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                messages[i] = dict(msg)
+                messages[i]["content"] = f"{context_block}\n\n{content}"
+            elif isinstance(content, list):
+                messages[i] = dict(msg)
+                messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
+            break
         else:
-            # Append VC block AFTER existing system prompt so the stable prefix
-            # remains cacheable by Anthropic prompt caching.
-            body["system"] = f"{existing}\n\n{context_block}" if existing else context_block
+            # No user message found — fall back to prepending as a user message
+            messages.insert(0, {"role": "user", "content": context_block})
+        body["messages"] = messages
         return body
 
     def extract_conversation_id(self, body: dict) -> str | None:
@@ -1185,17 +1197,24 @@ class OpenAIFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
+        # Inject into the first user message (not system) so the system
+        # message remains stable and cacheable by OpenAI prefix caching.
         messages = body.get("messages", [])
-        if messages and messages[0].get("role") == "system":
-            existing = messages[0].get("content", "")
-            messages[0] = dict(messages[0])
-            # Append VC block AFTER existing system prompt so the stable prefix
-            # remains cacheable by OpenAI prefix caching.
-            messages[0]["content"] = (
-                f"{existing}\n\n{context_block}" if existing else context_block
-            )
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                messages[i] = dict(msg)
+                messages[i]["content"] = f"{context_block}\n\n{content}"
+            elif isinstance(content, list):
+                messages[i] = dict(msg)
+                messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
+            break
         else:
-            messages.insert(0, {"role": "system", "content": context_block})
+            # No user message — insert after system message if present
+            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(insert_at, {"role": "user", "content": context_block})
         body["messages"] = messages
         return body
 
@@ -1535,14 +1554,20 @@ class GeminiFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-
-        # Gemini uses system_instruction.parts[] for system prompt
-        si = body.get("system_instruction", {})
-        existing_parts = si.get("parts", []) if isinstance(si, dict) else []
-        # Append VC block AFTER existing system instruction so the stable prefix
-        # remains cacheable by Gemini context caching.
-        new_parts = list(existing_parts) + [{"text": context_block}]
-        body["system_instruction"] = {"parts": new_parts}
+        # Inject into the first user message (not system_instruction) so the
+        # system instruction remains stable and cacheable by Gemini context caching.
+        contents = body.get("contents", [])
+        for i, msg in enumerate(contents):
+            if msg.get("role") != "user":
+                continue
+            parts = msg.get("parts", [])
+            contents[i] = dict(msg)
+            contents[i]["parts"] = [{"text": context_block}] + list(parts)
+            break
+        else:
+            # No user message — prepend as user message
+            contents.insert(0, {"role": "user", "parts": [{"text": context_block}]})
+        body["contents"] = contents
         return body
 
     # -- Conversation markers --
@@ -2082,12 +2107,29 @@ class OpenAIResponsesFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        existing = body.get("instructions", "")
-        # Append VC block AFTER existing instructions so the stable prefix
-        # remains cacheable by OpenAI prefix caching.
-        body["instructions"] = (
-            f"{existing}\n\n{context_block}" if existing else context_block
-        )
+        # Inject into the first user item in input (not instructions) so the
+        # instructions remain stable and cacheable by OpenAI prefix caching.
+        items = body.get("input", [])
+        if isinstance(items, list):
+            for i, item in enumerate(items):
+                if not isinstance(item, dict) or item.get("role") != "user":
+                    continue
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    items[i] = dict(item)
+                    items[i]["content"] = f"{context_block}\n\n{content}"
+                elif isinstance(content, list):
+                    items[i] = dict(item)
+                    items[i]["content"] = [{"type": "input_text", "text": context_block}] + list(content)
+                break
+            else:
+                # No user item — insert at beginning of input
+                if isinstance(items, list):
+                    items.insert(0, {"role": "user", "content": context_block})
+            body["input"] = items
+        elif isinstance(items, str):
+            # input is a plain string — prepend context
+            body["input"] = f"{context_block}\n\n{items}"
         return body
 
     # -- Conversation markers --
