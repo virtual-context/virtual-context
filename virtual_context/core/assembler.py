@@ -25,6 +25,60 @@ from ..types import (
 )
 
 
+def format_tag_section(
+    tag: str,
+    summaries: list["StoredSummary"],
+    store: "ContextStore | None" = None,
+    conversation_id: str = "",
+) -> str:
+    """Render a tag section in the canonical <virtual-context> format.
+
+    Shared by the assembler and the fill pass. Tool-hint enrichment is
+    optional (gracefully degrades if store is None).
+    """
+    if not summaries:
+        return ""
+
+    summaries = sorted(summaries, key=lambda s: s.start_timestamp)
+
+    all_tags = sorted({t for s in summaries for t in s.tags})
+    tags_attr = ", ".join(all_tags) if all_tags else tag
+
+    total = len(summaries)
+    summary_texts: list[str] = []
+    for idx, s in enumerate(summaries, 1):
+        prefix = f"[{idx}/{total}]"
+        session = s.metadata.session_date
+        if session:
+            prefix += f" [{session}]"
+        text = f"{prefix}\n{s.summary}"
+        tool_tags = [t for t in s.tags if t.startswith("tool_")]
+        if tool_tags:
+            text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
+        # Optional tool hint enrichment
+        if store and conversation_id and s.ref:
+            get_refs = getattr(store, "get_tool_outputs_for_segment", None)
+            get_names = getattr(store, "get_tool_names_for_segment", None)
+            if callable(get_refs) and callable(get_names):
+                try:
+                    refs = get_refs(conversation_id, s.ref)
+                    if refs:
+                        names = get_names(conversation_id, s.ref)
+                        names_str = ", ".join(names) if names else "tools"
+                        text += f"\n[Tools: {names_str} -- {len(refs)} outputs restorable via vc_restore_tool]"
+                except Exception:
+                    pass
+        summary_texts.append(text)
+
+    body = "\n\n---\n\n".join(summary_texts)
+
+    return (
+        f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}">\n'
+        f"{body}\n"
+        f"</virtual-context>"
+    )
+
+
 class ContextAssembler:
     """Assemble enriched context within token budget.
 
@@ -328,39 +382,7 @@ class ContextAssembler:
         return "<facts>\n" + "\n".join(lines) + "\n</facts>"
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
-        if not summaries:
-            return ""
-
-        # Sort chronologically so reader sees old → new progression
-        summaries = sorted(summaries, key=lambda s: s.start_timestamp)
-
-        all_tags = sorted({t for s in summaries for t in s.tags})
-        tags_attr = ", ".join(all_tags) if all_tags else tag
-
-        # Prefix each summary with sequence number and optional session date
-        total = len(summaries)
-        summary_texts: list[str] = []
-        for idx, s in enumerate(summaries, 1):
-            prefix = f"[{idx}/{total}]"
-            session = s.metadata.session_date
-            if session:
-                prefix += f" [{session}]"
-            text = f"{prefix}\n{s.summary}"
-            # Expansion hint for tool segments
-            tool_tags = [t for t in s.tags if t.startswith("tool_")]
-            if tool_tags:
-                text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
-            # Tool-enriched segment summary: append tool hint at assembly time
-            text = self._maybe_append_tool_hint(text, s.ref)
-            summary_texts.append(text)
-
-        body = "\n\n---\n\n".join(summary_texts)
-
-        return (
-            f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}">\n'
-            f"{body}\n"
-            f"</virtual-context>"
-        )
+        return format_tag_section(tag, summaries, store=self._store, conversation_id=self._conversation_id)
 
     def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
         if not segments:
