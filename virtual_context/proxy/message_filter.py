@@ -688,8 +688,9 @@ def stub_compacted_messages(
         # not the start of a new turn).
         content = msg.get("content", "")
         if isinstance(content, list):
+            _text_block_types = {"text", "input_text", "output_text"}
             has_text = any(
-                isinstance(b, dict) and b.get("type") == "text"
+                isinstance(b, dict) and b.get("type") in _text_block_types
                 for b in content
             )
             has_tool_result = any(
@@ -745,6 +746,10 @@ def stub_compacted_messages(
         return body, 0
 
     # Build new message list, replacing stub ranges with lightweight markers.
+    # Use format-appropriate content block types.
+    _fname = fmt.name
+    _asst_block_type = "output_text" if _fname == "openai_responses" else "text"
+
     stub_starts: dict[int, tuple[int, int, object]] = {
         s[0]: s for s in sorted(stubs, key=lambda s: s[0])
     }
@@ -768,7 +773,7 @@ def stub_compacted_messages(
             )
             new_messages.append({
                 "role": _asst_role,
-                "content": [{"type": "text", "text": stub_text}],
+                "content": [{"type": _asst_block_type, "text": stub_text}],
             })
             i = end
         else:
@@ -1646,8 +1651,19 @@ def collapse_turn_chains(
         tool_descs = _extract_tool_metadata_from_chain(messages, turn.indices, tool_call_map)
         tool_str = ", ".join(tool_descs) if tool_descs else ""
 
-        # g. Build stub pair
+        # g. Build stub pair (format-aware content block types)
         turn_label = canonical_turn if canonical_turn >= 0 else tidx
+        _fname = fmt.name
+        if _fname == "openai_responses":
+            _user_block_type = "input_text"
+            _asst_block_type = "output_text"
+        elif _fname == "gemini":
+            _user_block_type = "text"  # Gemini uses parts with "text" key, not type
+            _asst_block_type = "text"
+        else:
+            _user_block_type = "text"
+            _asst_block_type = "text"
+
         stub_user = {
             "role": "user",
             "content": f"[Compacted turn {turn_label}]",
@@ -1668,7 +1684,7 @@ def collapse_turn_chains(
         )
         stub_asst = {
             "role": _asst_role,
-            "content": [{"type": "text", "text": stub_text}],
+            "content": [{"type": _asst_block_type, "text": stub_text}],
         }
 
         fmt.mark_as_vc_stub(stub_user)
