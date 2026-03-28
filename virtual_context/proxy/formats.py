@@ -818,11 +818,13 @@ class AnthropicFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the first user message (not system prompt) so the
-        # system prompt remains stable and cacheable by Anthropic prompt
-        # caching.  This matches Claude Code's own pattern.
+        # Inject into the LAST user message (current turn) so the system
+        # prompt remains stable and cacheable by Anthropic prompt caching.
+        # Using the last user message avoids disturbing tool_use/tool_result
+        # chains in historical messages.
         messages = body.get("messages", [])
-        for i, msg in enumerate(messages):
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
@@ -834,8 +836,7 @@ class AnthropicFormat(PayloadFormat):
                 messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
             break
         else:
-            # No user message found — fall back to prepending as a user message
-            messages.insert(0, {"role": "user", "content": context_block})
+            messages.append({"role": "user", "content": context_block})
         body["messages"] = messages
         return body
 
@@ -1197,10 +1198,11 @@ class OpenAIFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the first user message (not system) so the system
+        # Inject into the LAST user message (current turn) so the system
         # message remains stable and cacheable by OpenAI prefix caching.
         messages = body.get("messages", [])
-        for i, msg in enumerate(messages):
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
@@ -1212,9 +1214,7 @@ class OpenAIFormat(PayloadFormat):
                 messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
             break
         else:
-            # No user message — insert after system message if present
-            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
-            messages.insert(insert_at, {"role": "user", "content": context_block})
+            messages.append({"role": "user", "content": context_block})
         body["messages"] = messages
         return body
 
@@ -1554,10 +1554,11 @@ class GeminiFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the first user message (not system_instruction) so the
+        # Inject into the LAST user message (current turn) so the
         # system instruction remains stable and cacheable by Gemini context caching.
         contents = body.get("contents", [])
-        for i, msg in enumerate(contents):
+        for i in range(len(contents) - 1, -1, -1):
+            msg = contents[i]
             if msg.get("role") != "user":
                 continue
             parts = msg.get("parts", [])
@@ -2107,11 +2108,12 @@ class OpenAIResponsesFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the first user item in input (not instructions) so the
+        # Inject into the LAST user item in input (current turn) so the
         # instructions remain stable and cacheable by OpenAI prefix caching.
         items = body.get("input", [])
         if isinstance(items, list):
-            for i, item in enumerate(items):
+            for i in range(len(items) - 1, -1, -1):
+                item = items[i]
                 if not isinstance(item, dict) or item.get("role") != "user":
                     continue
                 content = item.get("content", "")
@@ -2123,9 +2125,7 @@ class OpenAIResponsesFormat(PayloadFormat):
                     items[i]["content"] = [{"type": "input_text", "text": context_block}] + list(content)
                 break
             else:
-                # No user item — insert at beginning of input
-                if isinstance(items, list):
-                    items.insert(0, {"role": "user", "content": context_block})
+                items.append({"role": "user", "content": context_block})
             body["input"] = items
         elif isinstance(items, str):
             # input is a plain string — prepend context
