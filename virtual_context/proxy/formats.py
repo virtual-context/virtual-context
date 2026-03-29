@@ -968,7 +968,10 @@ class AnthropicFormat(PayloadFormat):
             return body
         body = dict(body)
         tools = list(body.get("tools") or [])
-        tools.extend(tool_defs)
+        existing_names = {t.get("name") for t in tools if isinstance(t, dict)}
+        for td in tool_defs:
+            if isinstance(td, dict) and td.get("name") not in existing_names:
+                tools.append(td)
         body["tools"] = tools
         # Anthropic API rejects tool_choice=any/tool when thinking is enabled.
         # Downgrade any forcing tool_choice to auto in that case — tools are
@@ -2321,13 +2324,15 @@ class OpenAIResponsesFormat(PayloadFormat):
             return body
         body = dict(body)
         tools = list(body.get("tools") or [])
+        existing_names = {t.get("name") for t in tools if isinstance(t, dict)}
         for td in tool_defs:
-            tools.append({
-                "type": "function",
-                "name": td["name"],
-                "description": td.get("description", ""),
-                "parameters": td.get("input_schema", {}),
-            })
+            if td["name"] not in existing_names:
+                tools.append({
+                    "type": "function",
+                    "name": td["name"],
+                    "description": td.get("description", ""),
+                    "parameters": td.get("input_schema", {}),
+                })
         body["tools"] = tools
         if require_tool_use and "tool_choice" not in body:
             body["tool_choice"] = "required"
