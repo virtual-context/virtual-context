@@ -601,6 +601,10 @@ async def _handle_streaming(
                 "total_ms": round(overhead_ms + upstream_ms, 1),
                 "streaming": True,
                 "conversation_id": conversation_id,
+                "input_tokens": _usage.get("input_tokens", 0),
+                "upstream_input_tokens": _usage.get("input_tokens", 0),
+                "cache_creation_input_tokens": _usage.get("cache_creation_input_tokens", 0),
+                "cache_read_input_tokens": _usage.get("cache_read_input_tokens", 0),
             })
         assistant_text = "".join(text_chunks)
         # Capture response for dashboard inspector
@@ -1570,6 +1574,10 @@ async def _handle_non_streaming(
             "total_ms": round(overhead_ms + upstream_ms, 1),
             "streaming": False,
             "conversation_id": conversation_id,
+            "input_tokens": _ns_usage.get("input_tokens", 0),
+            "upstream_input_tokens": _ns_usage.get("input_tokens", 0),
+            "cache_creation_input_tokens": _ns_usage.get("cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": _ns_usage.get("cache_read_input_tokens", 0),
         })
 
     # Log upstream LLM call to telemetry ledger
