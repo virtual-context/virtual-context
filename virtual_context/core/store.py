@@ -459,6 +459,18 @@ class ContextStore(ABC):
         """
         return None
 
+    def get_chain_snapshots_for_conversation(
+        self,
+        conversation_id: str,
+        min_turn: int = 0,
+    ) -> list[dict]:
+        """Return metadata for chain snapshots where turn_number >= min_turn.
+        Returns list of {ref, turn_number, tool_output_refs, message_count}. No chain_json."""
+        return []
+
+    def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
+        return []
+
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         """Return distinct tool names linked to a segment via segment_tool_outputs.
 

@@ -1103,6 +1103,12 @@ class FilesystemStore(ContextStore):
     def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
         return None
 
+    def get_chain_snapshots_for_conversation(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
+        return []
+
+    def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
+        return []
+
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         return []
 

@@ -745,6 +745,7 @@ class MonitorConfig:
     fill_pass_enabled: bool = True
     fill_pass_target: str = "soft"  # "soft", "hard", or float fraction
     fill_pass_summary_ratio: float = 0.60
+    store_recovery_threshold: float = 0.70  # trigger store recovery when payload < this fraction of store turns
 
 
 @dataclass

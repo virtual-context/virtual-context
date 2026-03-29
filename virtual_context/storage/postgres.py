@@ -1321,6 +1321,27 @@ class PostgresStore(ContextStore):
             "tool_output_refs": row["tool_output_refs"],
         }
 
+    def get_chain_snapshots_for_conversation(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT ref, turn_number, tool_output_refs, message_count
+            FROM chain_snapshots WHERE conversation_id = %s AND turn_number >= %s
+            ORDER BY turn_number""",
+            (conversation_id, min_turn),
+        ).fetchall()
+        return [{"ref": r["ref"], "turn_number": r["turn_number"],
+                 "tool_output_refs": r["tool_output_refs"], "message_count": r["message_count"]} for r in rows]
+
+    def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
+        if not refs:
+            return []
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT tool_name FROM tool_outputs WHERE ref = ANY(%s) AND tool_name != ''",
+            (refs,),
+        ).fetchall()
+        return [row["tool_name"] for row in rows]
+
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         conn = self._get_conn()
         rows = conn.execute(
