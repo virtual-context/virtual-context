@@ -568,6 +568,23 @@ async def prepare_payload(
     # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
     _pre_filter_body = copy.deepcopy(body)
 
+    # Detect client truncation — compare what the CLIENT sent (pre-filter)
+    # against the store. Must run BEFORE drop_compacted_turns / filter
+    # mutate the body.
+    _client_truncated = False
+    if state:
+        _payload_turns = len(fmt.group_into_turns(_pre_filter_body))
+        _store_turns = len(state.engine._turn_tag_index.entries)
+        _recovery_threshold = getattr(
+            state.engine.config.monitor, "store_recovery_threshold", 0.70,
+        )
+        if _store_turns > 10 and _payload_turns < _store_turns * _recovery_threshold:
+            _client_truncated = True
+            logger.info(
+                "STORE-RECOVERY: payload_turns=%d store_turns=%d threshold=%.0f%% — recovering from store",
+                _payload_turns, _store_turns, _recovery_threshold * 100,
+            )
+
     # Media compression — compress images on first sight, store on disk
     if state and state.engine.config.tool_output.enabled:
         from .media import compress_media_in_payload
@@ -592,6 +609,8 @@ async def prepare_payload(
     turns_stubbed = 0  # kept for downstream metrics compatibility
     _fill_summaries = 0
     _fill_turns = 0
+    _recovery_chains = 0
+    _recovery_turns = 0
     try:
         if state and int(state.engine._engine_state.compacted_through) > 0:
             from .message_filter import drop_compacted_turns
@@ -659,7 +678,7 @@ async def prepare_payload(
             _deep_ratio = getattr(
                 state.engine.config.compactor, "deep_compaction_ratio", 0.5,
             )
-            body, _collapse_count, _chain_refs, _ = collapse_turn_chains(
+            body, _collapse_count, _chain_refs, _recovery_chains = collapse_turn_chains(
                 body, fmt,
                 pre_filter_body=_pre_filter_body,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
@@ -667,6 +686,7 @@ async def prepare_payload(
                 store=state.engine._store,
                 conversation_id=state.engine.config.conversation_id,
                 deep_compaction_ratio=_deep_ratio,
+                client_truncated=_client_truncated,
             )
             if _collapse_count:
                 _tool_stubs_present = True
@@ -966,7 +986,11 @@ async def prepare_payload(
                     store=state.engine._store,
                     conversation_id=state.engine.config.conversation_id,
                     summary_ratio=_summary_ratio,
+                    client_truncated=_client_truncated,
+                    turn_tag_index=state.engine._turn_tag_index,
                 )
+                if _client_truncated:
+                    _recovery_turns = _fill_turns
                 if _fill_summaries or _fill_turns:
                     _outbound_json = json.dumps(enriched_body, default=str)
                     _outbound_bytes = len(_outbound_json.encode("utf-8"))
@@ -1208,11 +1232,13 @@ async def prepare_payload(
     _out_str = f"out={outbound_tokens}t"
     if _upstream_trimmed:
         _out_str = f"out={outbound_tokens}t TRIMMED from {_pre_trim_tokens}t"
+    _recovery_str = f" recovery={_recovery_chains}+{_recovery_turns}" if _client_truncated else ""
     logger.info(
-        "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d fill=%d+%d "
+        "T%d POST %s stream=%s tags=[%s]%s msgs=%d dropped=%d stubbed=%d fill=%d+%d%s "
         "ctx=%dt in=%dt %s upstream=%dt vc=%sms | %s",
         turn, api_format, is_streaming, _tags_str, _flag_str,
         len(body.get("messages", [])), turns_dropped, turns_stubbed, _fill_summaries, _fill_turns,
+        _recovery_str,
         context_tokens, inbound_tokens, _out_str, _upstream_limit,
         overhead_ms, user_message[:60],
     )
