@@ -2480,6 +2480,30 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "tool_output_refs": row["tool_output_refs"],
         }
 
+    def get_chain_snapshots_for_conversation(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT ref, turn_number, tool_output_refs, message_count
+            FROM chain_snapshots WHERE conversation_id = ? AND turn_number >= ?
+            ORDER BY turn_number""",
+            (conversation_id, min_turn),
+        ).fetchall()
+        return [{"ref": row[0] if isinstance(row, tuple) else row["ref"],
+                 "turn_number": row[1] if isinstance(row, tuple) else row["turn_number"],
+                 "tool_output_refs": row[2] if isinstance(row, tuple) else row["tool_output_refs"],
+                 "message_count": row[3] if isinstance(row, tuple) else row["message_count"]} for row in rows]
+
+    def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
+        if not refs:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" * len(refs))
+        rows = conn.execute(
+            f"SELECT DISTINCT tool_name FROM tool_outputs WHERE ref IN ({placeholders}) AND tool_name != ''",
+            refs,
+        ).fetchall()
+        return [row[0] if isinstance(row, tuple) else row["tool_name"] for row in rows]
+
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         conn = self._get_conn()
         rows = conn.execute(
