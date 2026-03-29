@@ -1674,6 +1674,7 @@ def create_app(
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                    skip_marker_injection=bool(inbound_conversation_id),
                 )
             else:
                 return await _handle_non_streaming(
@@ -1683,6 +1684,7 @@ def create_app(
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                    skip_marker_injection=bool(inbound_conversation_id),
                 )
         else:
             _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote or result.restore_tool_injected
@@ -1698,6 +1700,7 @@ def create_app(
                     paging_enabled=_intercept_vc_tools,
                     request_log_dir=_effective_log_dir,
                     log_prefix=_log_prefix if _effective_log_dir else "",
+                    skip_marker_injection=bool(inbound_conversation_id),
                 )
             else:
                 return await _handle_non_streaming(
@@ -1708,6 +1711,7 @@ def create_app(
                     response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                    skip_marker_injection=bool(inbound_conversation_id),
                 )
 
     return app

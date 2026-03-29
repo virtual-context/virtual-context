@@ -847,7 +847,9 @@ class AnthropicFormat(PayloadFormat):
         return body
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        for msg in reversed(body.get("messages", [])):
+        # Search FORWARD — the first marker is the original conversation.
+        # Later markers may be from orphan sessions that injected their own IDs.
+        for msg in body.get("messages", []):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
@@ -856,7 +858,7 @@ class AnthropicFormat(PayloadFormat):
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
-                for block in reversed(content):
+                for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         m = _VC_CONVERSATION_RE.search(block.get("text", ""))
                         if m:
@@ -1225,7 +1227,9 @@ class OpenAIFormat(PayloadFormat):
         return body
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        for msg in reversed(body.get("messages", [])):
+        # Search FORWARD — the first marker is the original conversation.
+        # Later markers may be from orphan sessions that injected their own IDs.
+        for msg in body.get("messages", []):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
@@ -1234,7 +1238,7 @@ class OpenAIFormat(PayloadFormat):
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
-                for block in reversed(content):
+                for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         m = _VC_CONVERSATION_RE.search(block.get("text", ""))
                         if m:
@@ -1580,11 +1584,12 @@ class GeminiFormat(PayloadFormat):
     # -- Conversation markers --
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        for msg in reversed(body.get("contents", [])):
+        # Search FORWARD — first marker is the original conversation.
+        for msg in body.get("contents", []):
             if msg.get("role") != "model":
                 continue
             parts = msg.get("parts", [])
-            for part in reversed(parts):
+            for part in parts:
                 if isinstance(part, dict) and "text" in part:
                     m = _VC_CONVERSATION_RE.search(part["text"])
                     if m:
@@ -2141,10 +2146,11 @@ class OpenAIResponsesFormat(PayloadFormat):
     # -- Conversation markers --
 
     def extract_conversation_id(self, body: dict) -> str | None:
+        # Search FORWARD — first marker is the original conversation.
         items = body.get("input", [])
         if not isinstance(items, list):
             return None
-        for item in reversed(items):
+        for item in items:
             if not isinstance(item, dict) or item.get("role") != "assistant":
                 continue
             content = item.get("content", "")
@@ -2153,7 +2159,7 @@ class OpenAIResponsesFormat(PayloadFormat):
                 if m:
                     return m.group(1)
             elif isinstance(content, list):
-                for block in reversed(content):
+                for block in content:
                     if isinstance(block, dict):
                         text = block.get("text", "")
                         if text:
