@@ -1938,6 +1938,65 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Delete fact_tags first (before facts are removed)
+            conn.execute(
+                "DELETE FROM fact_tags WHERE fact_id IN "
+                "(SELECT id FROM facts WHERE conversation_id = ? AND segment_ref = ?)",
+                (conversation_id, segment_ref),
+            )
+            cursor = conn.execute(
+                "DELETE FROM facts WHERE conversation_id = ? AND segment_ref = ?",
+                (conversation_id, segment_ref),
+            )
+            deleted = cursor.rowcount
+            # Insert new facts using same logic as store_facts
+            inserted = 0
+            for fact in facts:
+                conn.execute(
+                    """INSERT OR REPLACE INTO facts
+                    (id, subject, verb, object, status, what, who, when_date,
+                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                     turn_numbers_json, mentioned_at, session_date, superseded_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        fact.id,
+                        fact.subject,
+                        fact.verb,
+                        fact.object,
+                        fact.status,
+                        fact.what,
+                        fact.who,
+                        fact.when_date,
+                        fact.where,
+                        fact.why,
+                        fact.fact_type,
+                        json.dumps(fact.tags),
+                        fact.segment_ref,
+                        fact.conversation_id,
+                        json.dumps(fact.turn_numbers),
+                        _dt_to_str(fact.mentioned_at),
+                        fact.session_date or "",
+                        fact.superseded_by,
+                    ),
+                )
+                # Update fact_tags junction
+                conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
+                for tag in fact.tags:
+                    conn.execute(
+                        "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
+                        (fact.id, tag),
+                    )
+                inserted += 1
+            conn.execute("COMMIT")
+            return deleted, inserted
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact subject, verb, object, what fields.
 

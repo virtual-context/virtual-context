@@ -1,0 +1,50 @@
+"""Tests for fact extraction redesign."""
+from virtual_context.types import CompactorConfig
+
+
+def test_compactor_config_has_code_mode():
+    cc = CompactorConfig()
+    assert hasattr(cc, "code_mode")
+    assert cc.code_mode is True
+
+
+def test_config_loader_reads_code_mode():
+    from virtual_context.config import load_config
+    import tempfile, os, yaml
+    cfg = {"compaction": {"code_mode": False}, "context_window": 100000}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(cfg, f)
+        tmp_path = f.name
+    try:
+        config = load_config(tmp_path)
+        assert config.compactor.code_mode is False
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_replace_facts_for_segment_default():
+    from virtual_context.core.store import ContextStore
+
+    class MinimalStore(ContextStore):
+        """Minimal concrete subclass that only implements abstract methods as no-ops."""
+        def store_segment(self, segment): return ""
+        def get_segment(self, ref, *, conversation_id=None): return None
+        def get_summary(self, ref, *, conversation_id=None): return None
+        def get_summaries_by_tags(self, tags, min_overlap=1, limit=10, before=None, after=None, conversation_id=None): return []
+        def search(self, query, tags=None, limit=5, conversation_id=None): return []
+        def get_all_tags(self, conversation_id=None): return []
+        def get_conversation_stats(self): return []
+        def get_tag_aliases(self, conversation_id=None): return {}
+        def set_tag_alias(self, alias, canonical, conversation_id=""): pass
+        def delete_segment(self, ref): return False
+        def cleanup(self, max_age=None, max_total_tokens=None): return 0
+        def save_tag_summary(self, tag_summary, conversation_id=""): pass
+        def get_tag_summary(self, tag, conversation_id=""): return None
+        def get_all_tag_summaries(self, *, conversation_id=None): return []
+        def search_full_text(self, query, limit=5, conversation_id=None): return []
+        def get_segments_by_tags(self, tags, min_overlap=1, limit=20, conversation_id=None): return []
+
+    store = MinimalStore()
+    deleted, inserted = store.replace_facts_for_segment("conv1", "seg1", [])
+    assert deleted == 0
+    assert inserted == 0

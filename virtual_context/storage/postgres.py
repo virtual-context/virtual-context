@@ -1848,6 +1848,17 @@ class PostgresStore(ContextStore):
         rows = conn.execute("SELECT * FROM facts WHERE segment_ref = %s ORDER BY mentioned_at", (segment_ref,)).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        conn = self._get_conn()
+        with conn.transaction():
+            result = conn.execute(
+                "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
+                (conversation_id, segment_ref),
+            )
+            deleted = result.rowcount
+            inserted = self.store_facts(facts) if facts else 0
+        return deleted, inserted
+
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         conn = self._get_conn()
         tsquery = " & ".join(query.split())

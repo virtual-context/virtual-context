@@ -178,6 +178,17 @@ class Neo4jFactStore:
             )
             return [self._record_to_fact(record["f"]) for record in result]
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        with self._driver.session() as session:
+            result = session.run(
+                "MATCH (f:Fact {conversation_id: $conv_id, segment_ref: $seg_ref}) DETACH DELETE f RETURN count(f) as deleted",
+                conv_id=conversation_id, seg_ref=segment_ref,
+            )
+            record = result.single()
+            deleted = record["deleted"] if record else 0
+        inserted = self.store_facts(facts) if facts else 0
+        return deleted, inserted
+
     def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
         # Neo4j full-text search requires an explicit index; fall back to CONTAINS
         terms = query.lower().split()

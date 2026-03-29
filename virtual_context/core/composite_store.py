@@ -208,6 +208,9 @@ class CompositeStore:
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return self._facts.get_facts_by_segment(segment_ref)
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        return self._facts.replace_facts_for_segment(conversation_id, segment_ref, facts)
+
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
 
