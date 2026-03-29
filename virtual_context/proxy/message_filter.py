@@ -2454,6 +2454,8 @@ def fill_pass(
     store: "ContextStore | None",
     conversation_id: str,
     summary_ratio: float = 0.60,
+    client_truncated: bool = False,
+    turn_tag_index: "TurnTagIndex | None" = None,
 ) -> tuple[dict, int, int]:
     """Fill payload from VC floor up to target threshold.
 
@@ -2526,23 +2528,70 @@ def fill_pass(
     turn_budget = headroom - tokens_used
     turns_added = 0
 
-    if turn_budget > 200 and pre_filter_body is not None:
-        pre_turns = fmt.group_into_turns(pre_filter_body)
-        cur_turn_count = len(fmt.group_into_turns(body))
-        pre_messages = fmt.get_messages(pre_filter_body)
+    if turn_budget > 200:
+        if client_truncated and store is not None:
+            # Store-backed: restore from turn_messages (unpruned suffix)
+            import hashlib as _hl
+            store_turns = store.load_recent_turn_messages(conversation_id, limit=200)
 
-        if len(pre_turns) > cur_turn_count:
-            dropped_end = len(pre_turns) - cur_turn_count
-            for tidx in range(dropped_end - 1, -1, -1):
-                turn = pre_turns[tidx]
-                if turn.has_tool_activity:
+            # Build set of canonical turn numbers already in the payload
+            # using hash lookup (same approach as collapse_turn_chains)
+            _payload_canonical_turns: set[int] = set()
+            if turn_tag_index is not None:
+                for g in fmt.group_into_turns(body):
+                    msgs = fmt.get_messages(body)
+                    user_text_hash = ""
+                    asst_text_hash = ""
+                    for gi in g.indices:
+                        msg = msgs[gi]
+                        if msg.get("role") in ("user", "human"):
+                            user_text_hash = _extract_text_for_stub_hash(msg)
+                        elif msg.get("role") in ("assistant", "model"):
+                            if not asst_text_hash:
+                                asst_text_hash = _extract_text_for_stub_hash(msg)
+                    if user_text_hash:
+                        combined = f"{user_text_hash} {asst_text_hash}"
+                        h = _hl.sha256(combined.encode()).hexdigest()[:16]
+                        entry = turn_tag_index.get_entry_by_hash(h)
+                        if entry is not None:
+                            _payload_canonical_turns.add(entry.turn_number)
+
+            # Restore newest first
+            for turn_num, user_text, asst_text in reversed(store_turns):
+                if not user_text.strip():
                     continue
-                turn_msgs = [pre_messages[i] for i in turn.indices if 0 <= i < len(pre_messages)]
-                turn_msgs = _sanitize_restored_turn(turn_msgs)
+                # Skip turns already in the payload
+                if turn_num in _payload_canonical_turns:
+                    continue
+                # Skip tool-bearing turns (chain recovery handles those)
+                try:
+                    tool_refs = store.get_tool_outputs_for_turn(conversation_id, turn_num)
+                    if tool_refs:
+                        continue
+                except Exception:
+                    pass
+                # Build format-appropriate message pair
+                _fname = fmt.name
+                if _fname == "gemini":
+                    turn_msgs = [
+                        {"role": "user", "parts": [{"text": user_text}]},
+                        {"role": "model", "parts": [{"text": asst_text}]},
+                    ]
+                elif _fname == "openai_responses":
+                    turn_msgs = [
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": [{"type": "output_text", "text": asst_text}]},
+                    ]
+                else:
+                    turn_msgs = [
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": [{"type": "text", "text": asst_text}]},
+                    ]
                 turn_text = json.dumps(turn_msgs, default=str)
                 turn_tokens = len(turn_text) // 4
                 if turn_tokens > turn_budget:
                     continue
+                # Insert after system/developer prefix
                 cur_msgs = fmt.get_messages(body)
                 insert_at = 0
                 for i, m in enumerate(cur_msgs):
@@ -2553,6 +2602,35 @@ def fill_pass(
                 fmt.insert_items(body, insert_at, turn_msgs)
                 turn_budget -= turn_tokens
                 turns_added += 1
+
+        elif pre_filter_body is not None:
+            # Normal path — restore from pre_filter_body snapshot
+            pre_turns = fmt.group_into_turns(pre_filter_body)
+            cur_turn_count = len(fmt.group_into_turns(body))
+            pre_messages = fmt.get_messages(pre_filter_body)
+
+            if len(pre_turns) > cur_turn_count:
+                dropped_end = len(pre_turns) - cur_turn_count
+                for tidx in range(dropped_end - 1, -1, -1):
+                    turn = pre_turns[tidx]
+                    if turn.has_tool_activity:
+                        continue
+                    turn_msgs = [pre_messages[i] for i in turn.indices if 0 <= i < len(pre_messages)]
+                    turn_msgs = _sanitize_restored_turn(turn_msgs)
+                    turn_text = json.dumps(turn_msgs, default=str)
+                    turn_tokens = len(turn_text) // 4
+                    if turn_tokens > turn_budget:
+                        continue
+                    cur_msgs = fmt.get_messages(body)
+                    insert_at = 0
+                    for i, m in enumerate(cur_msgs):
+                        if m.get("role") in ("system", "developer"):
+                            insert_at = i + 1
+                        else:
+                            break
+                    fmt.insert_items(body, insert_at, turn_msgs)
+                    turn_budget -= turn_tokens
+                    turns_added += 1
 
     if summaries_added or turns_added:
         logger.info(
