@@ -524,6 +524,7 @@ async def _handle_streaming(
     paging_enabled: bool = False,
     request_log_dir: object | None = None,
     log_prefix: str = "",
+    skip_marker_injection: bool = False,
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -1459,9 +1460,11 @@ async def _handle_streaming(
 
                 # Inject session marker as a final SSE delta so the client SDK
                 # accumulates it into the stored assistant message.
-                _marker_sid = state.engine.config.conversation_id
-                _fmt = get_format(api_format)
-                yield _fmt.emit_conversation_marker_sse(_marker_sid)
+                # Skip if the inbound already had a marker — never overwrite.
+                if not skip_marker_injection:
+                    _marker_sid = state.engine.config.conversation_id
+                    _fmt = get_format(api_format)
+                    yield _fmt.emit_conversation_marker_sse(_marker_sid)
 
             # Session state dump (after response + history update)
             if session_log_path and state:
@@ -1507,6 +1510,7 @@ async def _handle_non_streaming(
     session_log_path: object | None = None,
     request_log_dir: object | None = None,
     log_prefix: str = "",
+    skip_marker_injection: bool = False,
 ) -> JSONResponse:
     """Forward JSON response, parse assistant text, fire on_turn_complete."""
     t_upstream = time.monotonic()
@@ -1560,10 +1564,13 @@ async def _handle_non_streaming(
                 turn_id=turn_id,
             )
 
-        # Inject session marker into the response body so the client stores it
-        conversation_id = state.engine.config.conversation_id
-        marker = f"\n<!-- vc:conversation={conversation_id} -->"
-        response_body = _inject_conversation_marker(response_body, marker, api_format)
+        # Inject session marker into the response body so the client stores it.
+        # Skip if the inbound payload already had a marker — never overwrite
+        # an established conversation identity with a new one.
+        if not skip_marker_injection:
+            conversation_id = state.engine.config.conversation_id
+            marker = f"\n<!-- vc:conversation={conversation_id} -->"
+            response_body = _inject_conversation_marker(response_body, marker, api_format)
 
     if metrics:
         metrics.record({
