@@ -659,7 +659,7 @@ async def prepare_payload(
             _deep_ratio = getattr(
                 state.engine.config.compactor, "deep_compaction_ratio", 0.5,
             )
-            body, _collapse_count, _chain_refs = collapse_turn_chains(
+            body, _collapse_count, _chain_refs, _ = collapse_turn_chains(
                 body, fmt,
                 pre_filter_body=_pre_filter_body,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,

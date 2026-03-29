@@ -43,3 +43,51 @@ def test_get_chain_snapshots_for_conversation_abstract():
 def test_get_tool_names_for_refs_abstract():
     s = _make_dummy_store()
     assert s.get_tool_names_for_refs(["ref1", "ref2"]) == []
+
+
+def test_collapse_turn_chains_recovers_from_store():
+    from unittest.mock import MagicMock
+    from virtual_context.proxy.message_filter import collapse_turn_chains
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.core.turn_tag_index import TurnTagIndex, TurnTagEntry
+
+    body = {
+        "system": "test",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": "current question"},
+        ],
+        "model": "claude-opus-4-6",
+    }
+    fmt = detect_format(body)
+    tti = TurnTagIndex()
+    for i in range(100):
+        tti.entries.append(TurnTagEntry(turn_number=i, message_hash=f"hash_{i}", tags=[f"tag_{i}"]))
+
+    mock_store = MagicMock()
+    mock_store.get_chain_snapshots_for_conversation.return_value = [
+        {"ref": "chain_50_abc123", "turn_number": 50, "tool_output_refs": "tool_ref1,tool_ref2", "message_count": 4},
+        {"ref": "chain_80_def456", "turn_number": 80, "tool_output_refs": "tool_ref3", "message_count": 3},
+    ]
+    mock_store.get_tool_names_for_refs.return_value = ["web_search", "Read"]
+
+    result, count, refs, recovered = collapse_turn_chains(
+        body, fmt,
+        protected_recent_turns=6,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        client_truncated=True,
+    )
+
+    mock_store.get_chain_snapshots_for_conversation.assert_called_once()
+    assert recovered == 2
+    assert "chain_50_abc123" in refs
+    assert "chain_80_def456" in refs
+
+    import json
+    result_json = json.dumps(result)
+    assert "Compacted turn 50" in result_json
+    assert "Compacted turn 80" in result_json
+    assert "vc_restore_tool" in result_json
