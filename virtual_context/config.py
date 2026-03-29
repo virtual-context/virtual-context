@@ -173,6 +173,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         merge_lookback=compaction.get("merge_lookback", _cmp_defaults.merge_lookback),
         max_segment_tokens=compaction.get("max_segment_tokens", _cmp_defaults.max_segment_tokens),
         merge_overlap_threshold=compaction.get("merge_overlap_threshold", _cmp_defaults.merge_overlap_threshold),
+        code_mode=compaction.get("code_mode", _cmp_defaults.code_mode),
     )
 
     # Summarization

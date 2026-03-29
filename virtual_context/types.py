@@ -767,6 +767,7 @@ class CompactorConfig:
     merge_lookback: int = 5         # check last N segments for merge candidate
     max_segment_tokens: int = 2000  # don't merge if combined full_text would exceed this
     merge_overlap_threshold: float = 0.35  # minimum relatedness score to merge
+    code_mode: bool = True  # modifies fact extraction to exclude investigatory actions
 
 
 @dataclass

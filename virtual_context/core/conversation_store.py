@@ -27,6 +27,7 @@ class ConversationStoreView:
         "set_tag_alias",
         "store_chunk_embeddings",
         "store_fact_links",
+        "replace_facts_for_segment",
         "store_facts",
         "store_chain_snapshot",
         "store_segment",

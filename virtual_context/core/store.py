@@ -301,6 +301,10 @@ class ContextStore(ABC):
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return []
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        """Atomically replace all facts for a segment. Returns (deleted, inserted)."""
+        return 0, self.store_facts(facts)
+
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact fields. Returns non-superseded facts."""
         return []

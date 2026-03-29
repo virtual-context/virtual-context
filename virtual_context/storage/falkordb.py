@@ -168,6 +168,15 @@ class FalkorDBFactStore:
         )
         return [self._node_to_fact(row[0]) for row in rows]
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        rows = self._query(
+            "MATCH (f:Fact {conversation_id: $conv_id, segment_ref: $seg_ref}) DETACH DELETE f RETURN count(f) as deleted",
+            {"conv_id": conversation_id, "seg_ref": segment_ref},
+        )
+        deleted = rows[0][0] if rows and rows[0] else 0
+        inserted = self.store_facts(facts) if facts else 0
+        return deleted, inserted
+
     def search_facts(self, query: str, limit: int = 10) -> list[Fact]:
         terms = query.lower().split()
         if not terms:

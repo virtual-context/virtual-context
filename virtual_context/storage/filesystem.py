@@ -1068,6 +1068,9 @@ class FilesystemStore(ContextStore):
     ) -> list:
         return []
 
+    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+        return 0, 0
+
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list:
         return []
 
