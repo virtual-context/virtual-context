@@ -48,3 +48,19 @@ def test_replace_facts_for_segment_default():
     deleted, inserted = store.replace_facts_for_segment("conv1", "seg1", [])
     assert deleted == 0
     assert inserted == 0
+
+
+def test_compaction_uses_replace_facts_for_segment():
+    """Verify the compaction pipeline calls replace_facts_for_segment."""
+    import inspect
+    from virtual_context.core import compaction_pipeline
+    source = inspect.getsource(compaction_pipeline)
+    assert "replace_facts_for_segment" in source, \
+        "compaction_pipeline must call replace_facts_for_segment"
+
+
+def test_code_mode_prompt_appended():
+    """When code_mode is True, the compactor prompt should include the code mode block."""
+    from virtual_context.core.compactor import CODE_MODE_FACT_PROMPT
+    assert "Do NOT extract intermediary" in CODE_MODE_FACT_PROMPT
+    assert "conclusions, findings, discoveries" in CODE_MODE_FACT_PROMPT

@@ -812,8 +812,14 @@ class CompactionPipeline:
                 for fact in result.facts:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
-                self._store.store_facts(result.facts)
-                logger.info("  Stored %d facts for segment %s", len(result.facts), result.primary_tag)
+                _deleted, _inserted = self._store.replace_facts_for_segment(
+                    self._config.conversation_id, _seg_ref, result.facts,
+                )
+                if _deleted:
+                    logger.info("  Replaced %d old facts with %d new for segment %s",
+                                _deleted, _inserted, result.primary_tag)
+                else:
+                    logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
                 _superseded_count = 0
                 _links_count = 0
                 if self._supersession_checker:

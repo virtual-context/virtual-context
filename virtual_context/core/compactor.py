@@ -179,6 +179,14 @@ If two signals describe the same event, emit one fact with the richest details.
 Include "facts" in the JSON response.
 Only extract facts with genuine substance. Skip greetings and filler."""
 
+CODE_MODE_FACT_PROMPT = """
+
+CODING CONVERSATION MODE:
+- Do NOT extract intermediary/investigative actions (e.g. "Assistant ran the tests", "Assistant checked the file").
+- DO extract: conclusions, findings, discoveries, decisions made, user preferences, configuration values, deployment details, architectural choices, bugs found and their fixes, tool/library choices.
+- DO extract: facts about the user's projects, infrastructure, workflows, and environment.
+- The subject for findings should be the THING, not "Assistant" — e.g. "Deploy target is Linode at 45.33.74.201" not "Assistant deployed to Linode"."""
+
 
 class DomainCompactor:
     """Summarize each TaggedSegment independently using an LLM."""
@@ -429,6 +437,9 @@ class DomainCompactor:
             )
             if signals_text:
                 prompt += signals_text
+
+        if getattr(self.config, "code_mode", False):
+            prompt += CODE_MODE_FACT_PROMPT
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
