@@ -91,3 +91,102 @@ def test_collapse_turn_chains_recovers_from_store():
     assert "Compacted turn 50" in result_json
     assert "Compacted turn 80" in result_json
     assert "vc_restore_tool" in result_json
+
+
+def test_fill_pass_restores_from_store_on_truncation():
+    from unittest.mock import MagicMock
+    from virtual_context.proxy.message_filter import fill_pass
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.types import AssembledContext, RetrievalResult
+    from virtual_context.core.turn_tag_index import TurnTagIndex, TurnTagEntry
+    import copy
+
+    body = {
+        "system": "test",
+        "messages": [
+            {"role": "user", "content": "recent question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "recent reply"}]},
+            {"role": "user", "content": "current question"},
+        ],
+        "model": "claude-opus-4-6",
+    }
+    fmt = detect_format(body)
+
+    mock_store = MagicMock()
+    mock_store.get_all_tag_summaries.return_value = []
+    mock_store.load_recent_turn_messages.return_value = [
+        (10, "older question about cooking", "I explained Italian techniques"),
+        (11, "what about baking?", "Bread baking involves..."),
+    ]
+    mock_store.get_tool_outputs_for_turn.return_value = []
+
+    assembled = AssembledContext(
+        presented_segment_refs=set(),
+        presented_tags=set(),
+        tag_sections={},
+        retrieval_result=RetrievalResult(),
+    )
+
+    tti = TurnTagIndex()
+    for i in range(50):
+        tti.entries.append(TurnTagEntry(turn_number=i, message_hash=f"hash_{i}", tags=[f"tag_{i}"]))
+
+    result_body, summaries, turns = fill_pass(
+        body=body, fmt=fmt,
+        outbound_tokens=70000, target_tokens=90000,
+        assembled=assembled, pre_filter_body=copy.deepcopy(body),
+        store=mock_store, conversation_id="test-conv",
+        summary_ratio=0.0,
+        client_truncated=True,
+        turn_tag_index=tti,
+    )
+
+    mock_store.load_recent_turn_messages.assert_called_once()
+    assert turns >= 1
+
+
+def test_fill_pass_skips_tool_turns_from_store():
+    from unittest.mock import MagicMock
+    from virtual_context.proxy.message_filter import fill_pass
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.types import AssembledContext, RetrievalResult
+    from virtual_context.core.turn_tag_index import TurnTagIndex, TurnTagEntry
+    import copy, json
+
+    body = {
+        "system": "test",
+        "messages": [{"role": "user", "content": "current question"}],
+        "model": "claude-opus-4-6",
+    }
+    fmt = detect_format(body)
+
+    mock_store = MagicMock()
+    mock_store.get_all_tag_summaries.return_value = []
+    mock_store.load_recent_turn_messages.return_value = [
+        (10, "run the tests", "Here are the results"),
+        (11, "what about baking?", "Bread baking involves..."),
+    ]
+    mock_store.get_tool_outputs_for_turn.side_effect = lambda cid, tn: ["ref1"] if tn == 10 else []
+
+    assembled = AssembledContext(
+        presented_segment_refs=set(), presented_tags=set(),
+        tag_sections={}, retrieval_result=RetrievalResult(),
+    )
+
+    tti = TurnTagIndex()
+    for i in range(50):
+        tti.entries.append(TurnTagEntry(turn_number=i, message_hash=f"hash_{i}", tags=[f"tag_{i}"]))
+
+    result_body, summaries, turns = fill_pass(
+        body=body, fmt=fmt,
+        outbound_tokens=70000, target_tokens=90000,
+        assembled=assembled, pre_filter_body=copy.deepcopy(body),
+        store=mock_store, conversation_id="test-conv",
+        summary_ratio=0.0,
+        client_truncated=True,
+        turn_tag_index=tti,
+    )
+
+    result_json = json.dumps(result_body)
+    assert "Bread baking" in result_json
+    assert "run the tests" not in result_json
