@@ -184,6 +184,7 @@ CODE_MODE_FACT_PROMPT = """
 CODING CONVERSATION MODE:
 - Do NOT extract intermediary/investigative actions (e.g. "Assistant ran the tests", "Assistant checked the file").
 - DO extract: conclusions, findings, discoveries, decisions made, user preferences, configuration values, deployment details, architectural choices, bugs found and their fixes, tool/library choices.
+- DO extract: what was built, fixed, changed, or implemented as a result of the conversation. Frame these as facts about the THING, not about the assistant. E.g. "Facts endpoint now supports date_created sorting" not "Assistant added sorting to the endpoint".
 - DO extract: facts about the user's projects, infrastructure, workflows, and environment.
 - The subject for findings should be the THING, not "Assistant" — e.g. "Deploy target is Linode at 45.33.74.201" not "Assistant deployed to Linode"."""
 
