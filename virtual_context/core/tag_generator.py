@@ -206,6 +206,7 @@ class LLMTagGenerator:
         telemetry_ledger: TelemetryLedger | None = None,
         embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
         cost_tracker=None,  # deprecated, ignored — legacy parameter
+        code_mode: bool = False,
     ) -> None:
         self.llm = llm_provider
         self.config = config
@@ -213,6 +214,7 @@ class LLMTagGenerator:
         self._canonicalizer = canonicalizer
         self._telemetry = telemetry_ledger
         self._embed_fn_factory = embed_fn_factory
+        self._code_mode = code_mode
         self._temporal_patterns = _compile_temporal_patterns(config.temporal_patterns)
 
     def generate_tags(
@@ -228,6 +230,10 @@ class LLMTagGenerator:
             min_tags=self.config.min_tags,
             max_tags=self.config.max_tags,
         )
+
+        if self._code_mode:
+            from .compactor import CODE_MODE_FACT_PROMPT
+            system += CODE_MODE_FACT_PROMPT
 
         # Disable thinking mode for models that support it (e.g. qwen3)
         if self.config.disable_thinking:
@@ -543,12 +549,14 @@ def build_tag_generator(
     telemetry_ledger: TelemetryLedger | None = None,
     embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
     cost_tracker=None,  # deprecated, ignored — re-exported for existing callers
+    code_mode: bool = False,
 ) -> TagGenerator:
     if config.type == "llm" and llm_provider is not None:
         return LLMTagGenerator(
             llm_provider=llm_provider, config=config,
             canonicalizer=canonicalizer, telemetry_ledger=telemetry_ledger,
             embed_fn_factory=embed_fn_factory,
+            code_mode=code_mode,
         )
 
     if config.type == "embedding":
