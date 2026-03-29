@@ -336,6 +336,7 @@ class VirtualContextEngine:
             self.config.tag_generator, llm_provider,
             canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
             embed_fn_factory=lambda: self._embedding_provider.get_embed_fn() if self._embedding_provider else None,
+            code_mode=self.config.compactor.code_mode,
         )
 
     def _init_store(self) -> None:

@@ -64,3 +64,32 @@ def test_code_mode_prompt_appended():
     from virtual_context.core.compactor import CODE_MODE_FACT_PROMPT
     assert "Do NOT extract intermediary" in CODE_MODE_FACT_PROMPT
     assert "conclusions, findings, discoveries" in CODE_MODE_FACT_PROMPT
+
+
+def test_tag_generator_accepts_code_mode():
+    from virtual_context.core.tag_generator import LLMTagGenerator
+    from virtual_context.types import TagGeneratorConfig
+    from unittest.mock import MagicMock
+    gen = LLMTagGenerator(llm_provider=MagicMock(), config=TagGeneratorConfig(), code_mode=True)
+    assert gen._code_mode is True
+
+
+def test_build_tag_generator_passes_code_mode():
+    from virtual_context.core.tag_generator import build_tag_generator, LLMTagGenerator
+    from virtual_context.types import TagGeneratorConfig
+    from unittest.mock import MagicMock
+    config = TagGeneratorConfig(type="llm", provider="openrouter", model="test")
+    gen = build_tag_generator(config, MagicMock(), code_mode=True)
+    assert isinstance(gen, LLMTagGenerator)
+    assert gen._code_mode is True
+    gen2 = build_tag_generator(config, MagicMock())
+    assert gen2._code_mode is False
+
+
+def test_engine_passes_code_mode_to_tag_generator():
+    import inspect
+    from virtual_context import engine
+    source = inspect.getsource(engine)
+    assert "code_mode" in source, "engine.py must reference code_mode"
+    assert "compactor.code_mode" in source or "config.compactor.code_mode" in source, \
+        "engine.py must read code_mode from compactor config"
