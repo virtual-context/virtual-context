@@ -1454,7 +1454,8 @@ def collapse_turn_chains(
     conversation_id: str,
     pre_filter_body: dict | None = None,
     deep_compaction_ratio: float = 0.5,
-) -> tuple[dict, int, list[str]]:
+    client_truncated: bool = False,
+) -> tuple[dict, int, list[str], int]:
     """Collapse turn chains outside protected window to stub pairs (stage 2).
 
     Each turn chain outside the protected window is replaced with a compact
@@ -1473,10 +1474,13 @@ def collapse_turn_chains(
     mutation methods for list manipulation, making this work across all
     provider formats (Anthropic, OpenAI Chat, OpenAI Responses, Gemini).
 
-    Returns ``(modified_body, collapse_count, list_of_chain_refs)``.
+    Returns ``(modified_body, collapse_count, list_of_chain_refs, recovered_count)``.
     """
     if pre_filter_body is None:
         pre_filter_body = body
+
+    _recovered_stubs: list[tuple[int, dict, dict]] = []
+    _recovered_count = 0
 
     if fmt.name == "gemini":
         _msg_key = "contents"
@@ -1490,14 +1494,14 @@ def collapse_turn_chains(
 
     messages = fmt.get_messages(body)
     if not messages:
-        return body, 0, []
+        return body, 0, [], 0
 
     # ------------------------------------------------------------------
     # 1. Identify turn groups via format abstraction
     # ------------------------------------------------------------------
     turn_groups = fmt.group_into_turns(body)
     if not turn_groups:
-        return body, 0, []
+        return body, 0, [], 0
 
     # Separate trailing user-only group (current question) from history turns.
     # A trailing group is one whose last item is a user message (no assistant
@@ -1520,7 +1524,7 @@ def collapse_turn_chains(
         history_turns = turn_groups
 
     if not history_turns:
-        return body, 0, []
+        return body, 0, [], 0
 
     # ------------------------------------------------------------------
     # 2. Identify protected window (last N turn groups)
@@ -1758,8 +1762,74 @@ def collapse_turn_chains(
         _skip_no_pf_match, _skip_no_canonical,
     )
 
-    if not collapse_map and not deep_drop_set:
-        return body, 0, []
+    # ------------------------------------------------------------------
+    # 6b. Store-backed chain recovery (when client truncated)
+    # ------------------------------------------------------------------
+    if client_truncated and store is not None:
+        _tti_entries = turn_tag_index.entries
+        _canonical_max = _tti_entries[-1].turn_number if _tti_entries else 0
+        _recovery_deep = int(_canonical_max * deep_compaction_ratio) if deep_compaction_ratio > 0 else 0
+        _protected_canonical = _canonical_max - protected_recent_turns + 1
+
+        stored_snapshots = store.get_chain_snapshots_for_conversation(
+            conversation_id, min_turn=_recovery_deep,
+        )
+        _existing_refs = set(chain_refs)
+
+        for snap in stored_snapshots:
+            snap_turn = snap["turn_number"]
+            snap_ref = snap["ref"]
+            if snap_ref in _existing_refs:
+                continue
+            if snap_turn >= _protected_canonical:
+                continue
+
+            tool_names_str = ""
+            raw_refs = [r.strip() for r in snap.get("tool_output_refs", "").split(",") if r.strip()]
+            if raw_refs:
+                try:
+                    names = store.get_tool_names_for_refs(raw_refs)
+                    tool_names_str = ", ".join(names) if names else "tools used"
+                except Exception:
+                    tool_names_str = "tools used"
+
+            desc_parts = [f"Compacted turn {snap_turn}"]
+            if tool_names_str:
+                desc_parts.append(tool_names_str)
+            desc_line = " | ".join(desc_parts)
+            stub_text = (
+                f"[{desc_line}.\n"
+                f'To restore and uncompact full tool call results in place: '
+                f'{{"type": "tool_use", "name": "vc_restore_tool", '
+                f'"input": {{"ref": "{snap_ref}"}}}}]'
+            )
+
+            _fname = fmt.name
+            if _fname == "gemini":
+                stub_user = {"role": "user", "parts": [{"text": f"[Compacted turn {snap_turn}]"}]}
+                stub_asst = {"role": "model", "parts": [{"text": stub_text}]}
+            elif _fname == "openai_responses":
+                stub_user = {"role": "user", "content": f"[Compacted turn {snap_turn}]"}
+                stub_asst = {"role": "assistant", "content": [{"type": "output_text", "text": stub_text}]}
+            else:
+                stub_user = {"role": "user", "content": f"[Compacted turn {snap_turn}]"}
+                stub_asst = {"role": _asst_role, "content": [{"type": "text", "text": stub_text}]}
+
+            fmt.mark_as_vc_stub(stub_user)
+            fmt.mark_as_vc_stub(stub_asst)
+            _recovered_stubs.append((snap_turn, stub_user, stub_asst))
+            chain_refs.append(snap_ref)
+            collapse_count += 1
+
+        if _recovered_stubs:
+            logger.info(
+                "STORE-RECOVERY: recovered %d chain stubs from store (deep_threshold=%d, protected=%d)",
+                len(_recovered_stubs), _recovery_deep, _protected_canonical,
+            )
+        _recovered_count = len(_recovered_stubs)
+
+    if not collapse_map and not deep_drop_set and not _recovered_stubs:
+        return body, 0, [], 0
 
     # ------------------------------------------------------------------
     # 7. Apply mutations: remove collapsed items, insert stubs, clean orphans
@@ -1843,7 +1913,22 @@ def collapse_turn_chains(
         fmt.insert_items(body, adjusted_pos, [stub_user, stub_asst])
         offset += 2  # each stub pair adds 2 items
 
-    return body, collapse_count, chain_refs
+    # Insert recovered stubs after system/developer prefix
+    if _recovered_stubs:
+        _recovered_stubs.sort(key=lambda x: x[0])
+        messages = fmt.get_messages(body)
+        insert_at = 0
+        for i, m in enumerate(messages):
+            if m.get("role") in ("system", "developer"):
+                insert_at = i + 1
+            else:
+                break
+        recovery_items = []
+        for _, stub_user, stub_asst in _recovered_stubs:
+            recovery_items.extend([stub_user, stub_asst])
+        fmt.insert_items(body, insert_at, recovery_items)
+
+    return body, collapse_count, chain_refs, _recovered_count
 
 
 @dataclass

@@ -450,7 +450,7 @@ class TestCollapseChainsCrossFormat:
         fmt = detect_format(body)
         tti = TurnTagIndex()
         original_count = len(body["messages"])
-        result, collapsed, refs = collapse_turn_chains(
+        result, collapsed, refs, _ = collapse_turn_chains(
             body, fmt, protected_recent_turns=3, turn_tag_index=tti,
             store=None, conversation_id="test",
         )
@@ -480,7 +480,7 @@ class TestCollapseChainsCrossFormat:
         fmt = detect_format(body)
         tti = TurnTagIndex()
         original_count = len(body["input"])
-        result, collapsed, refs = collapse_turn_chains(
+        result, collapsed, refs, _ = collapse_turn_chains(
             body, fmt, protected_recent_turns=3, turn_tag_index=tti,
             store=None, conversation_id="test",
         )
@@ -507,7 +507,7 @@ class TestCollapseChainsCrossFormat:
         fmt = detect_format(body)
         tti = TurnTagIndex()
         original_count = len(body["messages"])
-        result, collapsed, refs = collapse_turn_chains(
+        result, collapsed, refs, _ = collapse_turn_chains(
             body, fmt, protected_recent_turns=3, turn_tag_index=tti,
             store=None, conversation_id="test",
         )
