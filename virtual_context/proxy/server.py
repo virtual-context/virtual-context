@@ -301,6 +301,28 @@ async def prepare_payload(
         if state.is_conversation_deleted():
             state = None
 
+    # Media compression — compress images on first sight, store on disk.
+    # Runs BEFORE passthrough/active split so both paths benefit.
+    # A 391KB screenshot → ~40KB compressed saves ~88k tokens in passthrough trim.
+    if state and state.engine.config.tool_output.enabled:
+        from .media import compress_media_in_payload
+        _data_dir = getattr(state.engine._store, '_data_dir', '')
+        if not _data_dir:
+            _db_path = getattr(state.engine._store, 'db_path', None)
+            if _db_path:
+                _data_dir = str(getattr(_db_path, 'parent', ''))
+            if not _data_dir:
+                _data_dir = os.environ.get('VC_DATA_DIR', '/data/tenants')
+        _media_dir = os.path.join(_data_dir, 'media')
+        body, _media_compressed = compress_media_in_payload(
+            body, fmt,
+            store=state.engine._store,
+            conversation_id=state.engine.config.conversation_id,
+            media_dir=_media_dir,
+        )
+        if _media_compressed:
+            logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
+
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
     # ---------------------------------------------------------------
@@ -584,26 +606,6 @@ async def prepare_payload(
                 "STORE-RECOVERY: payload_turns=%d store_turns=%d threshold=%.0f%% — recovering from store",
                 _payload_turns, _store_turns, _recovery_threshold * 100,
             )
-
-    # Media compression — compress images on first sight, store on disk
-    if state and state.engine.config.tool_output.enabled:
-        from .media import compress_media_in_payload
-        _data_dir = getattr(state.engine._store, '_data_dir', '')
-        if not _data_dir:
-            _db_path = getattr(state.engine._store, 'db_path', None)
-            if _db_path:
-                _data_dir = str(getattr(_db_path, 'parent', ''))
-            if not _data_dir:
-                _data_dir = os.environ.get('VC_DATA_DIR', '/data/tenants')
-        _media_dir = os.path.join(_data_dir, 'media')
-        body, _media_compressed = compress_media_in_payload(
-            body, fmt,
-            store=state.engine._store,
-            conversation_id=state.engine.config.conversation_id,
-            media_dir=_media_dir,
-        )
-        if _media_compressed:
-            logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
 
     # Drop compacted non-tool turns — their content is already in VC segments
     turns_stubbed = 0  # kept for downstream metrics compatibility
