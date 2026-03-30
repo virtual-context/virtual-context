@@ -133,10 +133,16 @@ proxy:
 **Daemon mode:** run as a background service:
 
 ```bash
-virtual-context onboard --install-daemon --upstream https://api.anthropic.com
+# Creates config if needed, installs + starts daemon
+virtual-context daemon install --upstream https://api.anthropic.com
+
+# Or: guided interactive setup with daemon
+virtual-context onboard --wizard --install-daemon
 ```
 
-Daemon setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
+Daemon lifecycle: `daemon status | start | stop | restart | uninstall`
+
+Full setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
 
 ### Python SDK
 
@@ -592,10 +598,14 @@ virtual-context transform -m "What about auth?"# tag + retrieve + assemble
 virtual-context aliases list                   # show all tag aliases
 virtual-context aliases suggest                # auto-detect potential aliases
 virtual-context aliases add db database        # register alias manually
+virtual-context init coding                    # create config from preset
+virtual-context onboard                        # guided setup (create/validate config)
+virtual-context onboard --wizard               # interactive multi-instance setup
 virtual-context proxy -u https://api.anthropic.com  # single-instance proxy
 virtual-context proxy                               # multi-instance (from config)
 virtual-context presets list                   # list available config presets
 virtual-context presets show coding            # dump preset config as YAML
+virtual-context daemon install                 # install daemon/service
 virtual-context daemon status                  # service status (platform-specific)
 virtual-context daemon start                   # start/enable daemon
 virtual-context daemon stop                    # stop daemon

@@ -291,7 +291,7 @@ async def prepare_payload(
     # Ground truth: actual byte-measured inbound token count
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
-    _inbound_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace")) if body_bytes else 0
+    _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
     if state:
         state._last_payload_kb = _payload_kb
         state._last_payload_tokens = _inbound_tokens
@@ -378,7 +378,7 @@ async def prepare_payload(
                 from .message_filter import trim_to_upstream_limit
                 _pre_trim_msgs = len(body.get(fmt.get_message_key(body) if hasattr(fmt, 'get_message_key') else 'messages', []))
                 body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
-                _post_trim_tokens = fmt._count(json.dumps(body, default=str))
+                _post_trim_tokens = fmt.estimate_payload_tokens(body)
                 _post_trim_msgs = len(body.get('messages', body.get('input', body.get('contents', []))))
                 if _pt_trimmed:
                     logger.info(
@@ -405,7 +405,7 @@ async def prepare_payload(
                     })
 
             # Compute outbound tokens (after trim + tool interception)
-            _outbound_tokens = fmt._count(json.dumps(body, default=str))
+            _outbound_tokens = fmt.estimate_payload_tokens(body)
             _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
 
             # Non-virtualizable floor: system prompt + tools + anything VC can't touch
@@ -420,7 +420,7 @@ async def prepare_payload(
                 "type": "request",
                 "turn": turn,
                 "turn_id": _turn_id,
-                "message_preview": user_message[:60],
+                "message_preview": user_message[:200],
                 "api_format": api_format,
                 "streaming": is_streaming,
                 "tags": [],
@@ -455,7 +455,7 @@ async def prepare_payload(
                 outbound_tokens=_outbound_tokens,
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
-                message_preview=user_message[:60],
+                message_preview=user_message[:200],
                 non_virtualizable_floor=_pt_floor,
                 upstream_context_limit=_upstream_limit,
                 passthrough_trim_limit=_pt_limit,
@@ -1122,7 +1122,7 @@ async def prepare_payload(
         "turn": turn,
         "turn_id": _turn_id,
         "model": body.get("model", ""),
-        "message_preview": user_message[:60],
+        "message_preview": user_message[:200],
         "api_format": api_format,
         "streaming": is_streaming,
         "tags": assembled.matched_tags if assembled else [],
@@ -1258,7 +1258,7 @@ async def prepare_payload(
         overhead_ms=overhead_ms,
         turns_dropped=turns_dropped,
         turns_stubbed=turns_stubbed,
-        message_preview=user_message[:60],
+        message_preview=user_message[:200],
         non_virtualizable_floor=_non_virtualizable_floor,
         upstream_context_limit=_upstream_limit,
         passthrough_trim_limit=int(

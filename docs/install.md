@@ -60,11 +60,16 @@ virtual-context onboard --wizard
 
 ## One-Command Daemon Setup
 
-Use the onboarding wizard to install and start a background proxy service:
+Install and start a background proxy service (creates config automatically if none exists):
+
+```bash
+virtual-context daemon install --upstream https://api.anthropic.com
+```
+
+Or use the interactive wizard for multi-instance setups:
 
 ```bash
 virtual-context onboard --wizard --install-daemon
-virtual-context onboard --install-daemon --upstream https://api.anthropic.com
 ```
 
 Options:
@@ -77,6 +82,7 @@ After install, use daemon lifecycle commands:
 virtual-context daemon status
 virtual-context daemon start
 virtual-context daemon stop
+virtual-context daemon restart
 virtual-context daemon uninstall
 ```
 

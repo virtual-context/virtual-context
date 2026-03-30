@@ -2375,7 +2375,7 @@ def enforce_payload_budget(
     """
     _MAX_ITERATIONS = 200
 
-    outbound_tokens = fmt._count(json.dumps(body, default=str))
+    outbound_tokens = fmt.estimate_payload_tokens(body)
     if outbound_tokens <= context_window:
         return body, 0, 0
 
@@ -2421,7 +2421,7 @@ def enforce_payload_budget(
 
         reductions += 1
         total_freed += freed
-        outbound_tokens = fmt._count(json.dumps(body, default=str))
+        outbound_tokens = fmt.estimate_payload_tokens(body)
 
         logger.info(
             "BUDGET_ENFORCE: [%d] cut %s at msg %d (%d bytes freed) — now %dt/%dt",
