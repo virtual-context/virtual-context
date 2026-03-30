@@ -13,9 +13,12 @@ Usage:
 
 from __future__ import annotations
 
+import base64 as _b64_mod
 import copy
 import hashlib
+import io
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -77,6 +80,37 @@ class MediaBlockInfo(NamedTuple):
     setter: Callable                   # existing setter for raw data replacement
     replace_with_text: Callable[[str], None]  # replaces block with text placeholder
     carrier: dict                      # the parent message/item
+
+
+# ---------------------------------------------------------------------------
+# Image token estimation helpers
+# ---------------------------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+
+
+def _get_image_dimensions(b64_data: str) -> tuple[int, int] | None:
+    """Read (width, height) from a base64-encoded image by parsing the header only."""
+    try:
+        from PIL import Image
+        # Only decode first ~32 KB — enough for any image header
+        prefix = b64_data[:43700]
+        padding = (4 - len(prefix) % 4) % 4
+        raw = _b64_mod.b64decode(prefix + "=" * padding)
+        img = Image.open(io.BytesIO(raw))
+        return img.size  # (width, height)
+    except Exception:
+        return None
+
+
+def _anthropic_image_tokens(width: int, height: int) -> int:
+    """Anthropic's image token formula: scale to fit 1568×1568, then (w*h)/750."""
+    max_dim = max(width, height)
+    if max_dim > 1568:
+        scale = 1568 / max_dim
+        width = int(width * scale)
+        height = int(height * scale)
+    return max(1, -(-width * height // 750))  # ceiling division
 
 
 # ---------------------------------------------------------------------------
@@ -303,15 +337,68 @@ class PayloadFormat(ABC):
     def extract_assistant_text(self, response_body: dict) -> str:
         ...
 
+    # -- Image base64 extraction (for token adjustment) -----------------------
+
+    def _extract_base64_data_from_block(self, block: dict) -> str | None:
+        """Return raw base64 string from an image content block, or None."""
+        # Anthropic: {"type": "image", "source": {"type": "base64", "data": "..."}}
+        if block.get("type") == "image":
+            source = block.get("source", {})
+            if isinstance(source, dict) and source.get("type") == "base64":
+                return source.get("data")
+        # OpenAI Chat: {"type": "image_url", "image_url": {"url": "data:...;base64,..."}}
+        if block.get("type") == "image_url":
+            url = block.get("image_url", {}).get("url", "")
+            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                return url.split(";base64,", 1)[1]
+        return None
+
+    def _collect_image_base64(self, body: dict) -> list[str]:
+        """Return all base64 image data strings found in the payload."""
+        results: list[str] = []
+        for msg in self.get_messages(body):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                b64 = self._extract_base64_data_from_block(block)
+                if b64:
+                    results.append(b64)
+        return results
+
     # -- Payload token estimation --------------------------------------------
 
     def estimate_payload_tokens(self, body: dict) -> int:
         """Estimate total input tokens from a request body.
 
-        Uses _count on the full JSON serialization for consistency with
-        all other token estimation paths in the proxy.
+        Images are counted using Anthropic's formula (width*height/750)
+        instead of tokenizing the raw base64 string.
         """
-        return self._count(json.dumps(body, default=str))
+        raw_json = json.dumps(body, default=str)
+        image_b64_list = self._collect_image_base64(body)
+        if not image_b64_list:
+            return self._count(raw_json)
+
+        total_b64_chars = 0
+        total_image_tokens = 0
+        for b64 in image_b64_list:
+            total_b64_chars += len(b64)
+            dims = _get_image_dimensions(b64)
+            if dims:
+                total_image_tokens += _anthropic_image_tokens(*dims)
+            else:
+                # Can't read dimensions — use a conservative fallback
+                # Assume a typical 1024x768 image (~1049 tokens)
+                total_image_tokens += 1049
+
+        # Subtract approximate tokens the counter assigned to base64 chars,
+        # add actual image tokens.  For the default len//4 estimator this is
+        # exact; for tiktoken it's close enough (base64 is ~3-4 chars/token).
+        text_tokens = self._count(raw_json)
+        b64_text_tokens = max(1, total_b64_chars // 4)
+        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
 
     def _estimate_system_tokens(self, body: dict) -> int:
         return 0
@@ -1557,8 +1644,28 @@ class GeminiFormat(PayloadFormat):
                             carrier=msg,
                         )
 
-    def estimate_payload_tokens(self, body: dict) -> int:
-        return self._count(json.dumps(body, default=str))
+    def _extract_base64_data_from_block(self, block: dict) -> str | None:
+        """Gemini: inline_data blocks contain base64 image data."""
+        if "inline_data" in block:
+            inline = block["inline_data"]
+            if isinstance(inline, dict):
+                return inline.get("data")
+        return None
+
+    def _collect_image_base64(self, body: dict) -> list[str]:
+        """Gemini: iterate parts for inline_data blocks."""
+        results: list[str] = []
+        for msg in self.get_messages(body):
+            parts = msg.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                b64 = self._extract_base64_data_from_block(part)
+                if b64:
+                    results.append(b64)
+        return results
 
     # -- Context injection --
 
@@ -2272,8 +2379,38 @@ class OpenAIResponsesFormat(PayloadFormat):
             return self._count(instructions)
         return 0
 
-    def estimate_payload_tokens(self, body: dict) -> int:
-        return self._count(json.dumps(body, default=str))
+    def _extract_base64_data_from_block(self, block: dict) -> str | None:
+        """Responses: input_image blocks contain base64 in image_url."""
+        if block.get("type") == "input_image":
+            url = block.get("image_url", "")
+            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                return url.split(";base64,", 1)[1]
+        # Fall back to base class (Anthropic/OpenAI Chat shapes)
+        return super()._extract_base64_data_from_block(block)
+
+    def _collect_image_base64(self, body: dict) -> list[str]:
+        """Responses: check both content arrays and bare input_image items."""
+        results: list[str] = []
+        for item in self.get_messages(body):
+            if not isinstance(item, dict):
+                continue
+            # Bare input_image items
+            if item.get("type") == "input_image":
+                url = item.get("image_url", "")
+                if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                    results.append(url.split(";base64,", 1)[1])
+                continue
+            # Items with content arrays
+            content = item.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                b64 = self._extract_base64_data_from_block(block)
+                if b64:
+                    results.append(b64)
+        return results
 
     # -- Fingerprinting --
 

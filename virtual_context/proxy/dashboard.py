@@ -1088,7 +1088,7 @@ async def _replay_worker(
                 metrics.record({
                     "type": "request",
                     "turn": turn,
-                    "message_preview": prompt[:60],
+                    "message_preview": prompt[:200],
                     "api_format": prov["format"],
                     "streaming": False,
                     "tags": assembled.matched_tags,

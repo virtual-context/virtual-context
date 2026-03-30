@@ -369,7 +369,7 @@ class ProxyMetrics:
             r.get("context_tokens", 0) for r in requests
         )
 
-        # Cache metrics from upstream LLM responses
+        # Cache metrics from upstream LLM responses (cumulative)
         total_cache_creation = sum(
             r.get("cache_creation_input_tokens", 0) for r in responses
         )

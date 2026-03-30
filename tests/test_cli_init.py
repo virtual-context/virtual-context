@@ -97,6 +97,46 @@ def test_daemon_restart_in_help(tmp_cwd):
     assert "restart" in result.stdout
 
 
+def test_daemon_not_installed_guard(tmp_cwd):
+    """daemon commands should fail with a helpful message when no daemon is installed."""
+    env = {**__import__("os").environ, "HOME": str(tmp_cwd)}
+    for action in ("status", "start", "stop", "restart"):
+        result = subprocess.run(
+            [sys.executable, "-m", "virtual_context.cli.main", "daemon", action],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode != 0, f"daemon {action} should fail when not installed"
+        assert "not installed" in result.stdout.lower(), (
+            f"daemon {action} should mention 'not installed'"
+        )
+        assert "daemon install" in result.stdout, (
+            f"daemon {action} should suggest 'daemon install'"
+        )
+
+
+def test_daemon_install_creates_config(tmp_cwd):
+    """daemon install should auto-create config from agentic preset if none exists."""
+    config_path = tmp_cwd / "virtual-context.yaml"
+    assert not config_path.exists()
+    # daemon install will fail on launchctl/systemctl, but should create config first
+    result = _run_cli("daemon", "install")
+    assert config_path.exists(), "daemon install should create config"
+    assert "Created config" in result.stdout
+    content = config_path.read_text()
+    assert "tag_generator" in content
+
+
+def test_daemon_install_preserves_existing_config(tmp_cwd):
+    """daemon install should not overwrite an existing config."""
+    config_path = tmp_cwd / "virtual-context.yaml"
+    config_path.write_text("custom: true\n")
+    result = _run_cli("daemon", "install")
+    assert config_path.read_text() == "custom: true\n"
+    assert "Created config" not in result.stdout
+
+
 def test_presets_list(tmp_cwd):
     result = _run_cli("presets", "list")
     assert result.returncode == 0

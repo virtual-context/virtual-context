@@ -908,43 +908,106 @@ def _daemon_systemd_unit_path() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / "virtual-context.service"
 
 
+def _resolve_daemon_config(args) -> Path:
+    """Resolve the config path for daemon install, creating one if missing."""
+    config_path = Path(args.config) if hasattr(args, "config") and args.config else Path.cwd() / "virtual-context.yaml"
+    if not config_path.exists():
+        preset = get_preset("agentic")
+        config_path.write_text(preset.template)
+        print(f"Created config: {config_path} (preset: agentic)")
+    return config_path
+
+
 def cmd_daemon(args):
     import time
 
     action = args.daemon_action
     system = _daemon_platform()
 
+    # Handle install separately — it creates the daemon definition
+    if action == "install":
+        config_path = _resolve_daemon_config(args)
+        upstream = getattr(args, "upstream", None)
+        start = not getattr(args, "no_start", False)
+        try:
+            if system == "darwin":
+                _install_launchd_daemon(config_path, upstream, start=start)
+            elif system == "linux":
+                _install_systemd_user_daemon(config_path, upstream, start=start)
+            elif system == "windows":
+                _install_windows_task_daemon(config_path, upstream, start=start)
+            else:
+                print(f"Unsupported platform for daemon install: {system}", file=sys.stderr)
+                sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"Daemon installation failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    _not_installed_msg = "Run 'virtual-context daemon install' first."
+
     try:
         if system == "darwin":
             label = "io.virtualcontext.proxy"
             plist_path = _daemon_plist_path()
+
+            if action != "uninstall" and not plist_path.exists():
+                print(f"Daemon not installed (no plist at {plist_path}).")
+                print(_not_installed_msg)
+                sys.exit(1)
+
             if action == "status":
-                subprocess.run(["launchctl", "list"], check=False)
+                result = subprocess.run(
+                    ["launchctl", "list", label],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    print(result.stdout)
+                else:
+                    print("Daemon is not loaded.")
             elif action == "start":
-                subprocess.run(["launchctl", "load", str(plist_path)], check=False)
+                subprocess.run(["launchctl", "load", "-w", str(plist_path)], check=True)
                 subprocess.run(["launchctl", "start", label], check=True)
+                print("Daemon started (launchd).")
             elif action == "stop":
                 subprocess.run(["launchctl", "stop", label], check=False)
+                subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+                print("Daemon stopped (launchd).")
             elif action == "restart":
                 subprocess.run(["launchctl", "stop", label], check=False)
+                subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
                 time.sleep(1)
+                subprocess.run(["launchctl", "load", "-w", str(plist_path)], check=True)
                 subprocess.run(["launchctl", "start", label], check=True)
                 print("Daemon restarted (launchd).")
             elif action == "uninstall":
+                subprocess.run(["launchctl", "stop", label], check=False)
                 subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
                 if plist_path.exists():
                     plist_path.unlink()
                     print(f"Removed {plist_path}")
+                else:
+                    print("Daemon was not installed.")
+
         elif system == "linux":
             unit = "virtual-context"
             unit_path = _daemon_systemd_unit_path()
+
+            if action != "uninstall" and not unit_path.exists():
+                print(f"Daemon not installed (no unit at {unit_path}).")
+                print(_not_installed_msg)
+                sys.exit(1)
+
             if action == "status":
                 subprocess.run(["systemctl", "--user", "status", unit, "--no-pager"], check=False)
             elif action == "start":
                 subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
                 subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
+                print("Daemon started (systemd).")
             elif action == "stop":
                 subprocess.run(["systemctl", "--user", "stop", unit], check=False)
+                print("Daemon stopped (systemd).")
             elif action == "restart":
                 subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
                 subprocess.run(["systemctl", "--user", "restart", unit], check=True)
@@ -954,15 +1017,32 @@ def cmd_daemon(args):
                 if unit_path.exists():
                     unit_path.unlink()
                     print(f"Removed {unit_path}")
+                else:
+                    print("Daemon was not installed.")
                 subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
         elif system == "windows":
             task = "virtual-context-proxy"
+
+            if action != "uninstall":
+                probe = subprocess.run(
+                    ["schtasks", "/query", "/tn", task],
+                    capture_output=True,
+                    text=True,
+                )
+                if probe.returncode != 0:
+                    print(f"Daemon not installed (no scheduled task '{task}').")
+                    print(_not_installed_msg)
+                    sys.exit(1)
+
             if action == "status":
-                subprocess.run(["schtasks", "/query", "/tn", task], check=False)
+                subprocess.run(["schtasks", "/query", "/tn", task, "/v", "/fo", "LIST"], check=False)
             elif action == "start":
                 subprocess.run(["schtasks", "/run", "/tn", task], check=True)
+                print("Daemon started (Task Scheduler).")
             elif action == "stop":
                 subprocess.run(["schtasks", "/end", "/tn", task], check=False)
+                print("Daemon stopped (Task Scheduler).")
             elif action == "restart":
                 subprocess.run(["schtasks", "/end", "/tn", task], check=False)
                 time.sleep(1)
@@ -970,6 +1050,8 @@ def cmd_daemon(args):
                 print("Daemon restarted (Task Scheduler).")
             elif action == "uninstall":
                 subprocess.run(["schtasks", "/delete", "/tn", task, "/f"], check=False)
+                print(f"Removed scheduled task '{task}'.")
+
         else:
             print(f"Unsupported platform: {system}", file=sys.stderr)
             sys.exit(1)
@@ -1112,8 +1194,17 @@ def main():
     daemon_parser = subparsers.add_parser("daemon", help="Manage proxy daemon/service")
     daemon_parser.add_argument(
         "daemon_action",
-        choices=["status", "start", "stop", "restart", "uninstall"],
+        choices=["install", "status", "start", "stop", "restart", "uninstall"],
         help="Daemon action",
+    )
+    daemon_parser.add_argument(
+        "--upstream",
+        help="Upstream LLM API base URL (for install)",
+    )
+    daemon_parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Install daemon but do not start it (for install)",
     )
 
     # config validate

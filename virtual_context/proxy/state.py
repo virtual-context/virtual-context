@@ -1233,7 +1233,7 @@ class ProxyState:
                         turn_num,
                     )
                     raw_content = history_pairs[i].content
-                    preview = _strip_envelope(raw_content)[:60]
+                    preview = _strip_envelope(raw_content)[:200]
                     # Estimate turn pair tokens for baseline calculation
                     pair_chars = len(history_pairs[i].content) + len(history_pairs[i + 1].content)
                     tpt = pair_chars // 4
@@ -1556,7 +1556,7 @@ class ProxyState:
                 tpt = 0
                 if pair_idx < len(pairs):
                     raw_content = pairs[pair_idx].content
-                    preview = _strip_envelope(raw_content)[:60]
+                    preview = _strip_envelope(raw_content)[:200]
                     if pair_idx + 1 < len(pairs):
                         pair_chars = len(pairs[pair_idx].content) + len(pairs[pair_idx + 1].content)
                         tpt = pair_chars // 4
