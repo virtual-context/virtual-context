@@ -263,6 +263,15 @@ async def prepare_payload(
     import asyncio
     import time
 
+    # Ground truth: measure inbound BEFORE normalization so the compaction
+    # monitor sees the client's actual conversation size, not our compressed version.
+    _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
+    _inbound_bytes = len(body_bytes)
+    _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
+    if state:
+        state._last_payload_kb = _payload_kb
+        state._last_payload_tokens = _inbound_tokens
+
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
     from .formats import normalize_messages
@@ -294,14 +303,6 @@ async def prepare_payload(
     except (TypeError, ValueError, AttributeError):
         _global_limit = 0
     _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
-
-    # Ground truth: actual byte-measured inbound token count
-    _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
-    _inbound_bytes = len(body_bytes)
-    _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
-    if state:
-        state._last_payload_kb = _payload_kb
-        state._last_payload_tokens = _inbound_tokens
         if state._initial_payload_kb is None:
             state._initial_payload_kb = _payload_kb
             state._initial_payload_tokens = _inbound_tokens
