@@ -172,9 +172,13 @@ def _estimate_media_tokens(media: MediaBlock) -> int:
 def normalize_messages(messages: list) -> list:
     """Normalize non-standard message formats in-place.
 
-    OpenClaw stores messages with non-standard roles and block types:
+    Handles OpenClaw's internal storage format and other non-standard schemas:
       - role: "toolResult" → role: "tool" + tool_call_id
       - content block type: "toolCall" → converted to tool_calls array
+      - Anthropic-style tool_use content blocks → tool_calls array
+      - User messages with only tool_result blocks → role: "tool" messages
+      - Error/failed assistant messages (stopReason: "error", empty content) → removed
+      - Non-standard metadata keys cleaned from all messages
     This runs once before any pipeline processing so that all downstream
     code (group_into_turns, chain collapse, trim, iter_tool_*) works
     correctly without per-consumer special cases.
@@ -184,6 +188,18 @@ def normalize_messages(messages: list) -> list:
         msg = messages[i]
         if not isinstance(msg, dict):
             i += 1
+            continue
+
+        # --- Remove error/failed messages entirely ---
+        if (msg.get("role") == "assistant"
+                and msg.get("stopReason") == "error"):
+            messages.pop(i)
+            continue
+        # Also catch empty-content assistant messages with errorMessage
+        if (msg.get("role") == "assistant"
+                and msg.get("errorMessage")
+                and not _has_real_content(msg)):
+            messages.pop(i)
             continue
 
         # --- toolResult → role: "tool" ---
@@ -204,20 +220,35 @@ def normalize_messages(messages: list) -> list:
             msg.pop("isError", None)
             msg.pop("timestamp", None)
 
-        # --- assistant content blocks with toolCall → tool_calls array ---
+        # --- assistant content blocks with toolCall or tool_use → tool_calls array ---
         elif msg.get("role") == "assistant":
             content = msg.get("content", "")
             if isinstance(content, list):
                 tool_calls = []
                 remaining = []
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "toolCall":
+                    if not isinstance(block, dict):
+                        remaining.append(block)
+                        continue
+                    btype = block.get("type", "")
+                    if btype == "toolCall":
+                        # OpenClaw format
                         tool_calls.append({
                             "id": block.get("id", ""),
                             "type": "function",
                             "function": {
                                 "name": block.get("name", ""),
                                 "arguments": block.get("arguments", ""),
+                            },
+                        })
+                    elif btype == "tool_use":
+                        # Anthropic format in Chat-detected payload
+                        tool_calls.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": block.get("input", ""),
                             },
                         })
                     else:
@@ -227,20 +258,58 @@ def normalize_messages(messages: list) -> list:
                     msg["content"] = remaining if remaining else None
 
             # Clean up non-standard keys on assistant messages
-            msg.pop("api", None)
-            msg.pop("provider", None)
-            msg.pop("stopReason", None)
-            msg.pop("usage", None)
-            msg.pop("responseId", None)
-            msg.pop("timestamp", None)
+            for k in ("api", "provider", "stopReason", "usage",
+                       "responseId", "timestamp", "errorMessage",
+                       "thinkingSignature"):
+                msg.pop(k, None)
 
-        # Clean timestamp from user messages too
+        # --- user messages with only tool_result blocks → split into role: "tool" ---
         elif msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                tool_results = []
+                other = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+                    else:
+                        other.append(block)
+                if tool_results and not other:
+                    # All content is tool_result — convert to role: "tool" messages
+                    messages.pop(i)
+                    for tr in tool_results:
+                        tr_content = tr.get("content", "")
+                        if isinstance(tr_content, list):
+                            tr_content = "\n".join(
+                                b.get("text", "") for b in tr_content
+                                if isinstance(b, dict)
+                            ) or str(tr_content)
+                        messages.insert(i, {
+                            "role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", ""),
+                            "content": tr_content if isinstance(tr_content, str) else str(tr_content),
+                        })
+                        i += 1
+                    continue  # skip the i += 1 at the bottom
+
             msg.pop("timestamp", None)
 
         i += 1
 
     return messages
+
+
+def _has_real_content(msg: dict) -> bool:
+    """Check if a message has non-empty text content."""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("text", "").strip()
+            for b in content
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
