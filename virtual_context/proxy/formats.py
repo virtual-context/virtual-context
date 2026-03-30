@@ -220,7 +220,9 @@ def normalize_messages(messages: list) -> list:
             msg.pop("isError", None)
             msg.pop("timestamp", None)
 
-        # --- assistant content blocks with toolCall or tool_use → tool_calls array ---
+        # --- assistant content blocks: only convert OpenClaw "toolCall" blocks ---
+        # IMPORTANT: Do NOT convert standard Anthropic "tool_use" blocks —
+        # those are the native format for Anthropic requests and must stay as-is.
         elif msg.get("role") == "assistant":
             content = msg.get("content", "")
             if isinstance(content, list):
@@ -230,25 +232,14 @@ def normalize_messages(messages: list) -> list:
                     if not isinstance(block, dict):
                         remaining.append(block)
                         continue
-                    btype = block.get("type", "")
-                    if btype == "toolCall":
-                        # OpenClaw format
+                    if block.get("type") == "toolCall":
+                        # OpenClaw-specific format → OpenAI Chat tool_calls
                         tool_calls.append({
                             "id": block.get("id", ""),
                             "type": "function",
                             "function": {
                                 "name": block.get("name", ""),
                                 "arguments": block.get("arguments", ""),
-                            },
-                        })
-                    elif btype == "tool_use":
-                        # Anthropic format in Chat-detected payload
-                        tool_calls.append({
-                            "id": block.get("id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name", ""),
-                                "arguments": block.get("input", ""),
                             },
                         })
                     else:
@@ -263,35 +254,10 @@ def normalize_messages(messages: list) -> list:
                        "thinkingSignature"):
                 msg.pop(k, None)
 
-        # --- user messages with only tool_result blocks → split into role: "tool" ---
+        # --- user messages: only clean non-standard keys ---
+        # IMPORTANT: Do NOT convert standard Anthropic "tool_result" blocks
+        # to role: "tool" messages — Anthropic requires them as user content.
         elif msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                tool_results = []
-                other = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        tool_results.append(block)
-                    else:
-                        other.append(block)
-                if tool_results and not other:
-                    # All content is tool_result — convert to role: "tool" messages
-                    messages.pop(i)
-                    for tr in tool_results:
-                        tr_content = tr.get("content", "")
-                        if isinstance(tr_content, list):
-                            tr_content = "\n".join(
-                                b.get("text", "") for b in tr_content
-                                if isinstance(b, dict)
-                            ) or str(tr_content)
-                        messages.insert(i, {
-                            "role": "tool",
-                            "tool_call_id": tr.get("tool_use_id", ""),
-                            "content": tr_content if isinstance(tr_content, str) else str(tr_content),
-                        })
-                        i += 1
-                    continue  # skip the i += 1 at the bottom
-
             msg.pop("timestamp", None)
 
         i += 1
