@@ -263,6 +263,13 @@ async def prepare_payload(
     import asyncio
     import time
 
+    # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
+    # before any pipeline processing. Runs for both proxy and REST paths.
+    from .formats import normalize_messages
+    _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
+    if _msg_key in body and isinstance(body[_msg_key], list):
+        normalize_messages(body[_msg_key])
+
     api_format = fmt.name
     user_message = fmt.extract_user_message(body)
     is_streaming = body.get("stream", False)

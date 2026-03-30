@@ -166,6 +166,84 @@ def _estimate_media_tokens(media: MediaBlock) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Non-standard message normalization (e.g. OpenClaw internal format)
+# ---------------------------------------------------------------------------
+
+def normalize_messages(messages: list) -> list:
+    """Normalize non-standard message formats in-place.
+
+    OpenClaw stores messages with non-standard roles and block types:
+      - role: "toolResult" → role: "tool" + tool_call_id
+      - content block type: "toolCall" → converted to tool_calls array
+    This runs once before any pipeline processing so that all downstream
+    code (group_into_turns, chain collapse, trim, iter_tool_*) works
+    correctly without per-consumer special cases.
+    """
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict):
+            i += 1
+            continue
+
+        # --- toolResult → role: "tool" ---
+        if msg.get("role") == "toolResult":
+            content = msg.get("content", "")
+            # Flatten content blocks to string for OpenAI Chat tool format
+            if isinstance(content, list):
+                text_parts = []
+                for b in content:
+                    if isinstance(b, dict) and b.get("text"):
+                        text_parts.append(b["text"])
+                content = "\n".join(text_parts) if text_parts else str(content)
+            msg["role"] = "tool"
+            msg["tool_call_id"] = msg.pop("toolCallId", msg.get("tool_call_id", ""))
+            msg["content"] = content
+            # Clean up non-standard keys
+            msg.pop("toolName", None)
+            msg.pop("isError", None)
+            msg.pop("timestamp", None)
+
+        # --- assistant content blocks with toolCall → tool_calls array ---
+        elif msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                tool_calls = []
+                remaining = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "toolCall":
+                        tool_calls.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": block.get("arguments", ""),
+                            },
+                        })
+                    else:
+                        remaining.append(block)
+                if tool_calls:
+                    msg["tool_calls"] = msg.get("tool_calls", []) + tool_calls
+                    msg["content"] = remaining if remaining else None
+
+            # Clean up non-standard keys on assistant messages
+            msg.pop("api", None)
+            msg.pop("provider", None)
+            msg.pop("stopReason", None)
+            msg.pop("usage", None)
+            msg.pop("responseId", None)
+            msg.pop("timestamp", None)
+
+        # Clean timestamp from user messages too
+        elif msg.get("role") == "user":
+            msg.pop("timestamp", None)
+
+        i += 1
+
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------
 
