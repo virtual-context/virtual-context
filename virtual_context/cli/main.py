@@ -517,7 +517,10 @@ def _prompt_tagging_provider() -> tuple[str, str]:
     )
     models = _PROVIDER_MODELS.get(provider)
     if models:
-        model = _prompt_choice(f"{provider} model:", models, default=models[0])
+        choices = models + ["custom model..."]
+        model = _prompt_choice(f"{provider} model:", choices, default=models[0])
+        if model == "custom model...":
+            model = _prompt("Model name", "")
     else:
         model = _prompt("Model name", "")
     return provider, model
