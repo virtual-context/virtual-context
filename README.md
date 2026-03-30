@@ -235,6 +235,7 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 | Tool | `collapse_topic` | Collapse a topic back to summary or none |
 | Tool | `find_quote` | Full-text search across all stored conversation text |
 | Tool | `query_facts` | Structured fact lookup with subject/verb/object/status filters |
+| Tool | `restore_tool` | Recover full content from compacted chain stubs or compressed media |
 | Resource | `virtualcontext://domains` | List all tags |
 | Resource | `virtualcontext://domains/{tag}` | Summaries for a specific tag |
 | Prompt | `recall` | Suggest context retrieval for a topic |
@@ -246,11 +247,12 @@ Exposes virtual-context as an MCP server for integration with Claude Desktop, Cu
 User message arrives
     │
     ▼
-Session routing (proxy mode)
-    │  ├─ Extract session ID from <!-- vc:session=UUID --> markers in assistant messages
-    │  ├─ Route to existing session or load persisted state from store
-    │  ├─ No marker? → reuse default session (first request) or create new
-    │  └─ Strip session markers before forwarding to upstream
+Conversation routing (proxy mode)
+    │  ├─ Extract conversation ID from <!-- vc:conversation=UUID --> markers
+    │  ├─ Route to existing conversation or load persisted state from store + Redis
+    │  ├─ No marker? → derive stable ID from system prompt hash + format
+    │  ├─ Redis session cache: lossless restart, write-through history persistence
+    │  └─ Strip conversation markers before forwarding upstream
     │
     ▼
 Strip client envelope + extract metadata
@@ -260,13 +262,20 @@ Strip client envelope + extract metadata
     │  └─ Metadata preserved on Message.metadata for downstream use
     │
     ▼
+Media compression (all paths — passthrough and active)
+    │  ├─ Detect base64 images across all 4 formats (Anthropic, OpenAI Chat, Responses, Gemini)
+    │  ├─ Compress to JPEG, store originals to disk for later recovery
+    │  ├─ Image token counting uses Anthropic formula: (width × height) / 750
+    │  └─ A 391KB screenshot → ~40KB compressed, saving ~88k tokens
+    │
+    ▼
 History ingestion (first request only)
     │  ├─ Extract and tag all prior user+assistant pairs → bootstrap TurnTagIndex
     │  ├─ Stub detection: media attachments/image placeholders get _stub tag (skip LLM tagger)
     │  └─ Conversation-scoped: each conversation's index is independent
     │
     ▼
-Inbound tagging - identify what this message is about
+Inbound tagging — identify what this message is about
     │  ├─ Embedding tagger (recommended): cosine similarity against existing tag vocabulary
     │  │   (closed-set, deterministic, can't hallucinate novel tags)
     │  ├─ LLM / keyword tagger: alternative with vocabulary feedback
@@ -288,37 +297,64 @@ Assemble context within token budget
     │  └─ Tag sections: retrieved summaries ordered by tag priority
     │
     ▼
+Chain collapse — compress tool-bearing history turns
+    │  ├─ Group raw messages into logical turns via group_into_turns()
+    │  ├─ Tool chains (assistant tool_use → user tool_result → assistant) → compact stubs
+    │  ├─ Stubs contain tool names, truncated previews, and restore refs
+    │  ├─ Handles all 4 formats: Anthropic, OpenAI Chat, OpenAI Responses, Gemini
+    │  ├─ Deep compaction: drops stubs entirely past configurable age threshold
+    │  └─ Non-tool turns outside protected window are dropped (summaries cover them)
+    │
+    ▼
+Store-backed recovery (when client truncates history)
+    │  ├─ Detect truncation: payload turns < 70% of stored turns
+    ��  ├─ Recover chain snapshots from durable store (compact stubs with metadata)
+    │  ├─ Recover recent turns from stored turn_messages
+    │  └─ Sanitize restored turns: strip thinking blocks, replace media with placeholders
+    │
+    ▼
 Filter conversation history
     │  ├─ Drop turns whose tags don't overlap with inbound tags
     │  ├─ Preserve tool chains atomically (tool_use ↔ tool_result never separated)
+    │  ├─ Protected zone intrusion: stub tool results in protected turns 3+ when zone exceeds budget %
     │  ├─ Protect recent turns (always kept regardless of tags)
     │  └─ Temporal queries skip filtering entirely
     │
     ▼
-Inject <virtual-context> block → forward enriched request to LLM
+Budget enforcement — iterative payload reduction
+    │  ├─ Scan reducible items: conversation text, tool results, thinking blocks, images
+    │  ├─ Cut largest reducible item per iteration until under budget
+    │  ├─ Bloat fallback: if VC enrichment exceeds inbound size, fall back to pure passthrough
+    │  └─ Upstream trim: final trim to model's actual context window limit
+    │
+    ▼
+Fill pass — replenish context after compression
+    │  ├─ Phase 1a: overflow tag summaries (topics that didn't fit during assembly)
+    │  ├─ Phase 1b: breadth summaries (sample from remaining tags)
+    │  ├─ Phase 2: recent turns from store (newest first)
+    │  └─ Target: soft threshold between floor and budget ceiling
+    │
+    ▼
+Inject <virtual-context> block into last user message → forward to LLM
+    │  (injected into user messages, not system prompt, for Anthropic cache stability)
     │
     ▼
 LLM processes enriched context → produces response
     │
     ▼
-Inject session marker into response (proxy mode)
-    │  ├─ Streaming: emit final SSE delta with <!-- vc:session=UUID -->
-    │  └─ Non-streaming: append marker to last text content block
+Inject conversation marker into response (proxy mode)
+    │  ├─ Streaming: emit final SSE delta with <!-- vc:conversation=UUID -->
+    │  ├─ Non-streaming: append marker to last text content block
+    │  └─ Skip injection when payload already contains a conversation marker
     │
     ▼
-Response tagging - LLM tags the full user+assistant pair (background thread)
+Response tagging — LLM tags the full user+assistant pair (background thread)
     │  ├─ Context lookback: feed N recent pairs as tagger context for short/ambiguous messages
     │  ├─ Context bleed gate: embedding similarity blocks stale context on topic shifts
     │  ├─ Retry on _general: if tagger returns only _general, retry with expanded context
     │  ├─ Authoritative tags written to TurnTagIndex (vocabulary-building)
-    │  ├─ Fact signal extraction: lightweight subject/verb/object triples per turn
     │  ├─ Related tags generated for cross-vocabulary retrieval
     │  └─ Compactor generates related_tags at write time (vocabulary bridging)
-    │
-    ▼
-Fact curation (on inbound, before assembly)
-    │  └─ LLM scores retrieved facts for relevance to current query
-    │     Low-relevance facts dropped before assembly
     │
     ▼
 Check token thresholds (soft 70%, hard 85%)
@@ -330,14 +366,14 @@ Segment by tag → summarize each segment (concurrent, ThreadPoolExecutor)
     │  ├─ Stub segments: media/attachment stubs get passthrough (no LLM), inherit neighbor's tags
     │  ├─ XML-tagged prev_context: structural separation prevents context leak into summaries
     │  ├─ Tags preserved: LLM can ADD refined/related tags but never REMOVE originals
-    │  ├─ Fact consolidation: per-turn fact signals → structured Fact records with provenance
+    │  ├─ Fact extraction: delete-and-replace per segment, code_mode filters investigatory noise
     │  └─ Related tags written into stored segments for future cross-vocabulary retrieval
     │
     ▼
 Compute greedy set cover → build/update per-tag summaries (Layer 2)
     │
     ▼
-Persist engine state (TurnTagIndex + compaction watermark → store)
+Persist engine state (TurnTagIndex + compaction watermark → store + Redis)
 ```
 
 ## Key Capabilities
@@ -404,7 +440,7 @@ For proxy/OpenClaw conversations, session dates come from envelope metadata time
 
 ### Context Awareness Hints
 
-After compaction, the LLM loses visibility into what topics have been stored. virtual-context injects a lightweight `<context-topics>` block into the system prompt:
+After compaction, the LLM loses visibility into what topics have been stored. virtual-context injects a lightweight `<context-topics>` block into the last user message (not the system prompt, so the system prompt remains stable and cacheable):
 
 ```xml
 <context-topics>
@@ -422,9 +458,9 @@ This costs ~50-200 tokens and enables a natural drill-down loop: the user asks f
 
 Summaries compress information but inevitably lose specific details. When the user says "I run 5K every morning" at turn 14, a summary might retain "runs regularly" but drop the exact distance and timing. Most memory systems extract facts in a single LLM pass and trust the output directly: raw text goes in, extracted facts come out, and those facts are stored as-is. virtual-context takes a fundamentally different approach with a two-phase pipeline where per-turn signals are treated as hints, not ground truth.
 
-**Phase 1: Fact signals (per-turn).** The response tagger extracts lightweight subject/verb/object triples from each turn as it's processed, with full surrounding context (the same context lookback and bleed gating used for tagging). "I run 5K every morning" becomes `{subject: "user", verb: "runs", object: "5K every morning"}`. These are fast, cheap, and stored on the TurnTagIndex. Critically, they are not yet committed as permanent facts.
+**Fact extraction (at compaction).** Facts are extracted from the full turn group when the compactor processes a segment, not per-turn during ingestion. This produces higher-quality facts because the LLM sees the complete conversation flow across multiple turns: what the user asked, how the assistant responded, what was clarified or corrected. The result is a structured `Fact` with full provenance: subject, verb, what (the core assertion), `fact_type` classification (`preference`, `biographical`, `decision`, `plan`, `opinion`, `routine`, `relationship`, `skill`, `medical`, `financial`, `general`), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
 
-**Phase 2: Fact consolidation (at compaction).** When segments are compacted, per-turn fact signals are verified and consolidated into structured `Fact` records with the full multi-turn segment as context. The consolidation pass can see the complete conversation flow across multiple turns: what the user asked, how the assistant responded, what was clarified or corrected. This means a fact signal from turn 14 gets validated against turns 12-18 before becoming a permanent record. The result is a structured `Fact` with full provenance: subject, verb, what (the core assertion), `fact_type` classification (`preference`, `biographical`, `decision`, `plan`, `opinion`, `routine`, `relationship`, `skill`, `medical`, `financial`, `general`), temporal status (active/completed/planned/abandoned/recurring), associated tags, session ID, and source turn numbers. Facts are stored in dedicated SQLite tables with indexes for efficient querying.
+**Delete-and-replace on re-compaction.** When a segment is re-compacted (e.g., after new turns are added to an existing topic), all facts for that segment are atomically deleted and re-extracted from the full turn group. This prevents fact duplication across re-compaction cycles and ensures facts always reflect the latest understanding. A `code_mode` prompt modifier filters investigatory noise from coding conversations (e.g., "assistant examined file X") and focuses extraction on outcomes: what was built, fixed, changed, or decided.
 
 **Why two phases matter.** A single-pass extractor processing "yes, let's go with PostgreSQL" in isolation has no idea what "yes" refers to. It might extract nothing, or hallucinate a fact. virtual-context's response tagger sees the surrounding turns ("Should we use PostgreSQL or MySQL for the user table?") and generates the correct signal. The consolidation pass then verifies it against the full segment before storing a permanent fact. Two chances to get it right, each with progressively more context.
 
@@ -446,6 +482,61 @@ vc_query_facts(fact_type="preference")
 **Semantic verb expansion.** Queries like `verb="runs"` automatically expand to morphologically similar verbs in the database (e.g., "running", "run", "jogs") via sentence-transformer embedding similarity. This means the reader doesn't need to guess the exact verb form used during extraction.
 
 **Semantic fact search.** When structured filters return sparse results, a fallback embedding search matches the query intent against all stored facts' `what` fields by cosine similarity, surfacing relevant facts even when the subject/verb/object decomposition doesn't align.
+
+### Chain Collapse and Tool Compression
+
+Agent conversations are dominated by tool calls. A coding session with 50 tool rounds might have 900K tokens of tool output but only 60K of actual conversation. Raw tool output (file contents, search results, command output) is high-volume, low-reuse information that crushes the context window.
+
+virtual-context collapses entire tool chains into compact stubs:
+
+```
+Before (3 messages, ~18K tokens):
+  assistant: [tool_use: Read file.py]
+  user:      [tool_result: <full 500-line file contents>]
+  assistant: "The file has a bug on line 42..."
+
+After (2 messages, ~200 tokens):
+  user:      [compacted turn — tool activity: Read(file.py) — vc_restore_tool can recover full content]
+  assistant: "The file has a bug on line 42..."
+```
+
+Chain collapse handles all four provider formats (Anthropic `tool_use`/`tool_result`, OpenAI Chat `tool_calls`/`role:tool`, OpenAI Responses `function_call`/`function_call_output`, Gemini `functionCall`/`functionResponse`). Full raw tool output is stored durably with content-addressed refs and recoverable via `vc_restore_tool`.
+
+**Deep compaction** drops stubs entirely past a configurable age threshold (`deep_compaction_ratio`). A stub from turn 5 in a 200-turn conversation adds no value; the segment summaries already cover that content.
+
+### Media Compression
+
+Base64 images in API payloads are enormous: a single screenshot is 300-500KB of base64, consuming ~100K tokens. Multimodal conversations with dozens of images can reach 10MB+.
+
+virtual-context compresses images on first sight, before any pipeline processing:
+
+- Detect base64 images across all 4 formats
+- Compress to JPEG at configurable quality, store originals to disk
+- Replace in-flight payload with compressed version
+- A 391KB screenshot → ~40KB compressed, saving ~88K tokens per image
+- Recovery via `vc_restore_tool` returns the original uncompressed content
+
+Media compression runs on both passthrough and active paths, so even conversations that haven't triggered compaction benefit.
+
+### Fill Pass
+
+After chain collapse and budget enforcement compress the payload, the context window may have significant unused capacity. The fill pass replenishes it with high-value content from the store:
+
+- **Phase 1a**: Overflow tag summaries — topics that didn't fit during initial assembly
+- **Phase 1b**: Breadth summaries — sample from remaining tags for broader coverage
+- **Phase 2**: Recent turns from store — newest first, filling toward a soft target threshold
+
+The fill pass runs after all compression, so it never fights against budget enforcement. When clients truncate history (detected via `payload_turns < store_turns * 0.70`), the fill pass works with store-backed recovery to restore the most valuable context.
+
+### Store-Backed Recovery
+
+Clients (Claude Code, OpenClaw) sometimes truncate conversation history to manage their own context windows. When this happens, virtual-context detects the truncation and recovers from its durable store:
+
+- **Chain snapshot recovery**: Restore compact tool chain stubs from stored `chain_snapshots`
+- **Turn recovery**: Restore recent raw turns from stored `turn_messages`
+- **Sanitization**: Strip thinking blocks, replace media with passive placeholders, remove orphaned tool scaffolding
+
+Recovery is transparent to the client. The payload that reaches the LLM contains the recovered context as if it had never been truncated.
 
 ### Virtual Memory Paging
 
@@ -649,19 +740,23 @@ virtual-context chat --replay vc-session.json
 
 ### Proxy Deep Dive
 
-**Session continuity.** The proxy injects an invisible `<!-- vc:session=UUID -->` marker into every assistant response. On subsequent requests, the proxy extracts the marker, routes to the correct session, and strips markers before forwarding upstream. If the proxy restarts, it loads persisted engine state from the store. Multiple concurrent conversations are routed independently via a session registry.
+**Conversation continuity.** The proxy injects an invisible `<!-- vc:conversation=UUID -->` marker into every assistant response. On subsequent requests, the proxy extracts the first marker in the conversation history, routes to the correct conversation, and strips markers before forwarding upstream. Stable conversation identity is derived from a format-specific hash of the system prompt and early messages, so the same client session always routes to the same conversation even across restarts. Valid UUID markers in the payload are accepted as-is without re-hashing.
+
+**Redis session cache.** A write-through Redis cache persists conversation history and engine state across container restarts. On startup, conversations are restored from Redis with full history, eliminating cold-start re-ingestion. Degraded mode: if Redis is unavailable, the proxy falls back to store-only persistence with no interruption.
 
 **Conversation-scoped retrieval.** All store retrieval methods are scoped by `conversation_id`. Multiple conversations sharing the same SQLite database are fully isolated; a new conversation never gets context from another conversation's segments.
 
-**Session suppression.** When a session has no compacted data, the pipeline is suppressed; requests pass through as-is. Once the first compaction runs, the pipeline activates automatically.
+**Pipeline suppression.** When a conversation has no compacted data, the pipeline is suppressed; requests pass through as-is. Once the first compaction runs, the pipeline activates automatically.
 
 **History ingestion.** On the first request, the proxy extracts user+assistant pairs from the client's existing conversation history and tags each to bootstrap the TurnTagIndex. No cold-start period.
 
-**Format-agnostic.** Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats. Context is injected into the appropriate location per format. A single proxy instance handles all formats on one port.
+**Four-format support.** Auto-detects Anthropic, OpenAI Chat, OpenAI Responses, and Gemini request formats. Every pipeline stage (chain collapse, media compression, budget enforcement, context injection, stub generation, token counting) is format-aware through the `PayloadFormat` abstraction. A single proxy instance handles all formats on one port.
+
+**Image-aware token counting.** Base64 images are counted using the Anthropic formula `(width × height) / 750` after scaling to 1568px max dimension, instead of tokenizing the raw base64 string. This prevents massive over-counting (a 10MB image payload is ~107K tokens, not 7M) and ensures budget enforcement and tier checks operate on accurate numbers.
 
 **Streaming with zero added latency.** SSE streams are forwarded byte-for-byte. Text deltas are accumulated in the background for response tagging.
 
-**Error-resilient.** If the engine fails, the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls.
+**Error-resilient.** If the engine fails, the request is forwarded to upstream unmodified. The proxy never blocks your LLM calls. If VC enrichment produces a larger payload than the original, the bloat fallback reverts to a pure passthrough with the original client body.
 
 **Envelope stripping + metadata extraction.** Strips client metadata while extracting sender identity and timestamps from labeled JSON blocks. Group chat participants appear as "Sania" and "Yur" instead of generic "User". Original message timestamps give segments accurate chronological ordering.
 
@@ -719,8 +814,13 @@ Plugin for OpenClaw agents using lifecycle hooks for sync retrieval (`message.pr
 | **ProxyServer** | `proxy/server.py` | HTTP proxy factory (`create_app`), delegates to state/registry/handlers |
 | **ProxyState** | `proxy/state.py` | Session state machine: ingestion, tagging, compaction lifecycle |
 | **SessionRegistry** | `proxy/registry.py` | Multi-session routing with fingerprint matching |
+| **MessageFilter** | `proxy/message_filter.py` | Chain collapse, turn grouping, budget enforcement, fill pass, upstream trim |
+| **TokenCounter** | `token_counter.py` | Image-aware token counting (Anthropic formula for images, tiktoken/estimate for text) |
+| **MediaCompressor** | `proxy/media.py` | Base64 image compression, disk storage, intrusion detection |
+| **ConversationIdentity** | `conversation_identity.py` | Stable per-format conversation ID hashing, marker extraction |
 | **ProxyHandlers** | `proxy/handlers.py` | Streaming/non-streaming/passthrough HTTP request handlers |
 | **MultiInstance** | `proxy/multi.py` | Multi-instance launcher: N uvicorn listeners, shared or per-port engine/store |
+| **RedisSessionCache** | `proxy/redis_cache.py` | Write-through history cache for lossless restarts |
 | **ProxyDashboard** | `proxy/dashboard.py` | Live SSE dashboard with request grid, turn inspector, session stats (auth-gated mutations) |
 | **ProxyMetrics** | `proxy/metrics.py` | Thread-safe event collector with bounded deque + request capture ring buffer |
 
@@ -769,7 +869,7 @@ Both providers reuse a persistent `httpx.Client` across calls (connection poolin
 
 **Tag preservation.** During compaction, the LLM can add refined tags but never remove original ones. A segment tagged `[ux, recipes, frontend]` stays tagged with all three even after summarization, ensuring cross-topic retrieval always works.
 
-**Tool chain integrity.** The history filter preserves API-required message dependencies atomically. Every `tool_use` block in an assistant message is kept with its corresponding `tool_result`, and vice versa. Forward and backward scanning ensures multi-step tool chains are never broken, even when surrounding turns are filtered out.
+**Tool chain collapse.** Historical tool chains (assistant `tool_use` → user `tool_result` → assistant response, and their OpenAI/Gemini equivalents) are collapsed into compact stubs containing tool names, truncated previews, and content-addressed restore refs. This is the single largest compression lever: a 937K-token payload with 52 tool chains collapses to ~65K. Full tool output is stored durably and recoverable via `vc_restore_tool`. Deep compaction drops stubs entirely past a configurable age threshold. The history filter preserves API-required message dependencies atomically; tool chains are never partially broken.
 
 **The virtual memory analogy is literal, not metaphorical.** Every component in VC maps to a systems-level equivalent:
 
