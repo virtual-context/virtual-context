@@ -838,7 +838,7 @@ async def prepare_payload(
     # Ground truth: actual byte-measured outbound token count
     _outbound_json = json.dumps(enriched_body, default=str)
     _outbound_bytes = len(_outbound_json.encode("utf-8"))
-    outbound_tokens = fmt._count(_outbound_json)
+    outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
 
     # Ground truth: inbound tokens (what the client sent us, measured above)
     inbound_tokens = _inbound_tokens
@@ -939,7 +939,7 @@ async def prepare_payload(
         if _budget_reductions > 0:
             _outbound_json = json.dumps(enriched_body, default=str)
             _outbound_bytes = len(_outbound_json.encode("utf-8"))
-            outbound_tokens = fmt._count(_outbound_json)
+            outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
             logger.info(
                 "BUDGET_ENFORCE: %d reductions, %d bytes freed, now %dt/%dt",
                 _budget_reductions, _budget_freed, outbound_tokens, _budget_window,
@@ -996,7 +996,7 @@ async def prepare_payload(
                 if _fill_summaries or _fill_turns:
                     _outbound_json = json.dumps(enriched_body, default=str)
                     _outbound_bytes = len(_outbound_json.encode("utf-8"))
-                    outbound_tokens = fmt._count(_outbound_json)
+                    outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
                     # Update prepend_text to reflect fill additions so
                     # context_tokens and persisted metrics are accurate.
                     _sys = enriched_body.get("system", enriched_body.get("instructions", ""))
@@ -1022,7 +1022,7 @@ async def prepare_payload(
         body = _pre_filter_body
         _outbound_json = json.dumps(enriched_body, default=str)
         _outbound_bytes = len(_outbound_json.encode("utf-8"))
-        outbound_tokens = fmt._count(_outbound_json)
+        outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
         prepend_text = ""
         context_tokens = 0
         turns_dropped = 0
@@ -1082,7 +1082,7 @@ async def prepare_payload(
         if _upstream_trimmed:
             _outbound_json = json.dumps(enriched_body, default=str)
             _outbound_bytes = len(_outbound_json.encode("utf-8"))
-            outbound_tokens = fmt._count(_outbound_json)
+            outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
             logger.info(
                 "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
                 _pre_trim_tokens, _upstream_limit, _upstream_trimmed, outbound_tokens,
