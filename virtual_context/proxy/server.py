@@ -271,6 +271,11 @@ async def prepare_payload(
     if state:
         state._last_payload_kb = _payload_kb
         state._last_payload_tokens = _inbound_tokens
+        if state._initial_payload_kb is None:
+            state._initial_payload_kb = _payload_kb
+            state._initial_payload_tokens = _inbound_tokens
+        if state.is_conversation_deleted():
+            state = None
 
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
@@ -303,11 +308,6 @@ async def prepare_payload(
     except (TypeError, ValueError, AttributeError):
         _global_limit = 0
     _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
-        if state._initial_payload_kb is None:
-            state._initial_payload_kb = _payload_kb
-            state._initial_payload_tokens = _inbound_tokens
-        if state.is_conversation_deleted():
-            state = None
 
     # Media compression — compress images on first sight, store on disk.
     # Runs BEFORE passthrough/active split so both paths benefit.
