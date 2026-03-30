@@ -400,6 +400,34 @@ class PayloadFormat(ABC):
         b64_text_tokens = max(1, total_b64_chars // 4)
         return max(1, text_tokens - b64_text_tokens + total_image_tokens)
 
+    def estimate_message_tokens(self, msg: dict) -> int:
+        """Count tokens for a single message/item, using image formula for base64 blocks."""
+        raw_json = json.dumps(msg, default=str)
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            return self._count(raw_json)
+
+        total_b64_chars = 0
+        total_image_tokens = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            b64 = self._extract_base64_data_from_block(block)
+            if b64:
+                total_b64_chars += len(b64)
+                dims = _get_image_dimensions(b64)
+                if dims:
+                    total_image_tokens += _anthropic_image_tokens(*dims)
+                else:
+                    total_image_tokens += 1049
+
+        if not total_b64_chars:
+            return self._count(raw_json)
+
+        text_tokens = self._count(raw_json)
+        b64_text_tokens = max(1, total_b64_chars // 4)
+        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+
     def _estimate_system_tokens(self, body: dict) -> int:
         return 0
 
@@ -1667,6 +1695,34 @@ class GeminiFormat(PayloadFormat):
                     results.append(b64)
         return results
 
+    def estimate_message_tokens(self, msg: dict) -> int:
+        """Gemini: check parts for inline_data blocks."""
+        raw_json = json.dumps(msg, default=str)
+        parts = msg.get("parts", [])
+        if not isinstance(parts, list):
+            return self._count(raw_json)
+
+        total_b64_chars = 0
+        total_image_tokens = 0
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            b64 = self._extract_base64_data_from_block(part)
+            if b64:
+                total_b64_chars += len(b64)
+                dims = _get_image_dimensions(b64)
+                if dims:
+                    total_image_tokens += _anthropic_image_tokens(*dims)
+                else:
+                    total_image_tokens += 1049
+
+        if not total_b64_chars:
+            return self._count(raw_json)
+
+        text_tokens = self._count(raw_json)
+        b64_text_tokens = max(1, total_b64_chars // 4)
+        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+
     # -- Context injection --
 
     def inject_context(self, body: dict, prepend_text: str) -> dict:
@@ -2411,6 +2467,43 @@ class OpenAIResponsesFormat(PayloadFormat):
                 if b64:
                     results.append(b64)
         return results
+
+    def estimate_message_tokens(self, msg: dict) -> int:
+        """Responses: handle bare input_image items and content arrays."""
+        raw_json = json.dumps(msg, default=str)
+        if not isinstance(msg, dict):
+            return self._count(raw_json)
+
+        total_b64_chars = 0
+        total_image_tokens = 0
+
+        # Bare input_image item
+        if msg.get("type") == "input_image":
+            url = msg.get("image_url", "")
+            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                b64 = url.split(";base64,", 1)[1]
+                total_b64_chars += len(b64)
+                dims = _get_image_dimensions(b64)
+                total_image_tokens += _anthropic_image_tokens(*dims) if dims else 1049
+        else:
+            # Content array
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    b64 = self._extract_base64_data_from_block(block)
+                    if b64:
+                        total_b64_chars += len(b64)
+                        dims = _get_image_dimensions(b64)
+                        total_image_tokens += _anthropic_image_tokens(*dims) if dims else 1049
+
+        if not total_b64_chars:
+            return self._count(raw_json)
+
+        text_tokens = self._count(raw_json)
+        b64_text_tokens = max(1, total_b64_chars // 4)
+        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
 
     # -- Fingerprinting --
 

@@ -860,15 +860,15 @@ def trim_to_upstream_limit(
 
     # Always count trailing items
     for idx in trailing:
-        budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
+        budget_used += fmt.estimate_message_tokens(original_messages[idx])
     # Count system-prefix groups (always kept)
     for g in system_groups:
         for idx in g.indices:
-            budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
+            budget_used += fmt.estimate_message_tokens(original_messages[idx])
     # Count protected turn groups
     for g in keep_groups:
         for idx in g.indices:
-            budget_used += fmt._count(json.dumps(original_messages[idx], default=str))
+            budget_used += fmt.estimate_message_tokens(original_messages[idx])
 
     # Walk backwards from the oldest unprotected turn group
     added = 0
@@ -877,7 +877,7 @@ def trim_to_upstream_limit(
         g = trimmable[g_idx]
         g_tokens = 0
         for idx in g.indices:
-            g_tokens += fmt._count(json.dumps(original_messages[idx], default=str))
+            g_tokens += fmt.estimate_message_tokens(original_messages[idx])
         if budget_used + g_tokens <= available:
             keep_groups.insert(0, g)
             budget_used += g_tokens
