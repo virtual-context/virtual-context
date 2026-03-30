@@ -83,10 +83,16 @@ class MediaBlockInfo(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# Image token estimation helpers
+# Media token estimation helpers
 # ---------------------------------------------------------------------------
 
 _log = logging.getLogger(__name__)
+
+
+class MediaBlock(NamedTuple):
+    """Base64 media found in a content block."""
+    b64_data: str
+    media_type: str  # "image/png", "application/pdf", etc.
 
 
 def _get_image_dimensions(b64_data: str) -> tuple[int, int] | None:
@@ -104,13 +110,59 @@ def _get_image_dimensions(b64_data: str) -> tuple[int, int] | None:
 
 
 def _anthropic_image_tokens(width: int, height: int) -> int:
-    """Anthropic's image token formula: scale to fit 1568×1568, then (w*h)/750."""
+    """Anthropic's image token formula: scale to fit 1568x1568, then (w*h)/750."""
     max_dim = max(width, height)
     if max_dim > 1568:
         scale = 1568 / max_dim
         width = int(width * scale)
         height = int(height * scale)
     return max(1, -(-width * height // 750))  # ceiling division
+
+
+def _count_pdf_pages(b64_data: str) -> int:
+    """Count pages in a base64-encoded PDF without external libraries."""
+    try:
+        raw = _b64_mod.b64decode(b64_data)
+        # Look for /Type /Page (not /Pages) in the cross-reference objects.
+        # This is the standard way pages are declared in PDF structure.
+        import re as _re
+        # Match /Type /Page with optional whitespace, but NOT /Type /Pages
+        count = len(_re.findall(rb'/Type\s*/Page(?!s)', raw))
+        return max(1, count)
+    except Exception:
+        # Fallback: estimate from base64 size (~100KB per page is typical)
+        decoded_size = len(b64_data) * 3 // 4
+        return max(1, decoded_size // 100_000)
+
+
+def _estimate_media_tokens(media: MediaBlock) -> int:
+    """Estimate tokens for a base64-encoded media block based on its type."""
+    mt = media.media_type.lower()
+
+    # Images: use Anthropic's (w*h)/750 formula
+    if mt.startswith("image/"):
+        dims = _get_image_dimensions(media.b64_data)
+        if dims:
+            return _anthropic_image_tokens(*dims)
+        return 1049  # fallback: typical 1024x768
+
+    # PDFs: Anthropic renders each page as ~1568x1196 image → ~2502 tokens/page
+    if mt == "application/pdf" or mt.endswith("/pdf"):
+        pages = _count_pdf_pages(media.b64_data)
+        return pages * 2502
+
+    # Audio: Anthropic charges ~1 token per 1.6 seconds of audio.
+    # Average base64 size per second varies by codec, but ~16KB/s for mp3 is typical.
+    # Decoded bytes / 16000 ≈ seconds, then seconds / 1.6 ≈ tokens.
+    if mt.startswith("audio/"):
+        decoded_size = len(media.b64_data) * 3 // 4
+        seconds = max(1, decoded_size // 16000)
+        return max(1, -(-seconds * 10 // 16))  # seconds / 1.6
+
+    # Unknown media: use decoded byte size as conservative proxy.
+    # Better than tokenizing the base64 as text (which is ~33% larger).
+    decoded_size = len(media.b64_data) * 3 // 4
+    return max(1, decoded_size // 40)  # ~40 bytes per token is conservative
 
 
 # ---------------------------------------------------------------------------
@@ -339,23 +391,30 @@ class PayloadFormat(ABC):
 
     # -- Image base64 extraction (for token adjustment) -----------------------
 
-    def _extract_base64_data_from_block(self, block: dict) -> str | None:
-        """Return raw base64 string from an image content block, or None."""
-        # Anthropic: {"type": "image", "source": {"type": "base64", "data": "..."}}
-        if block.get("type") == "image":
-            source = block.get("source", {})
-            if isinstance(source, dict) and source.get("type") == "base64":
-                return source.get("data")
+    def _extract_media_from_block(self, block: dict) -> MediaBlock | None:
+        """Extract base64 media from a content block with its media type, or None.
+
+        Handles all Anthropic base64 source blocks (image, document, audio, etc.)
+        and OpenAI Chat data-URI image blocks.
+        """
+        # Anthropic: {"type": "image"|"document"|..., "source": {"type": "base64", "data": "...", "media_type": "..."}}
+        source = block.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            data = source.get("data")
+            if data:
+                return MediaBlock(data, source.get("media_type", "application/octet-stream"))
         # OpenAI Chat: {"type": "image_url", "image_url": {"url": "data:...;base64,..."}}
         if block.get("type") == "image_url":
             url = block.get("image_url", {}).get("url", "")
             if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                return url.split(";base64,", 1)[1]
+                header, b64 = url.split(";base64,", 1)
+                mt = header.replace("data:", "") or "image/unknown"
+                return MediaBlock(b64, mt)
         return None
 
-    def _collect_image_base64(self, body: dict) -> list[str]:
-        """Return all base64 image data strings found in the payload."""
-        results: list[str] = []
+    def _collect_media(self, body: dict) -> list[MediaBlock]:
+        """Return all base64 media blocks found in the payload."""
+        results: list[MediaBlock] = []
         for msg in self.get_messages(body):
             content = msg.get("content", "")
             if not isinstance(content, list):
@@ -363,9 +422,9 @@ class PayloadFormat(ABC):
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                b64 = self._extract_base64_data_from_block(block)
-                if b64:
-                    results.append(b64)
+                media = self._extract_media_from_block(block)
+                if media:
+                    results.append(media)
         return results
 
     # -- Payload token estimation --------------------------------------------
@@ -373,60 +432,47 @@ class PayloadFormat(ABC):
     def estimate_payload_tokens(self, body: dict) -> int:
         """Estimate total input tokens from a request body.
 
-        Images are counted using Anthropic's formula (width*height/750)
-        instead of tokenizing the raw base64 string.
+        Base64 media (images, PDFs, audio, etc.) is counted using
+        provider-appropriate formulas instead of tokenizing the raw base64.
         """
         raw_json = json.dumps(body, default=str)
-        image_b64_list = self._collect_image_base64(body)
-        if not image_b64_list:
+        media_list = self._collect_media(body)
+        if not media_list:
             return self._count(raw_json)
 
         total_b64_chars = 0
-        total_image_tokens = 0
-        for b64 in image_b64_list:
-            total_b64_chars += len(b64)
-            dims = _get_image_dimensions(b64)
-            if dims:
-                total_image_tokens += _anthropic_image_tokens(*dims)
-            else:
-                # Can't read dimensions — use a conservative fallback
-                # Assume a typical 1024x768 image (~1049 tokens)
-                total_image_tokens += 1049
+        total_media_tokens = 0
+        for media in media_list:
+            total_b64_chars += len(media.b64_data)
+            total_media_tokens += _estimate_media_tokens(media)
 
-        # Subtract approximate tokens the counter assigned to base64 chars,
-        # add actual image tokens.  For the default len//4 estimator this is
-        # exact; for tiktoken it's close enough (base64 is ~3-4 chars/token).
         text_tokens = self._count(raw_json)
         b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
 
     def estimate_message_tokens(self, msg: dict) -> int:
-        """Count tokens for a single message/item, using image formula for base64 blocks."""
+        """Count tokens for a single message/item, using media formulas for base64 blocks."""
         raw_json = json.dumps(msg, default=str)
         content = msg.get("content", "")
         if not isinstance(content, list):
             return self._count(raw_json)
 
         total_b64_chars = 0
-        total_image_tokens = 0
+        total_media_tokens = 0
         for block in content:
             if not isinstance(block, dict):
                 continue
-            b64 = self._extract_base64_data_from_block(block)
-            if b64:
-                total_b64_chars += len(b64)
-                dims = _get_image_dimensions(b64)
-                if dims:
-                    total_image_tokens += _anthropic_image_tokens(*dims)
-                else:
-                    total_image_tokens += 1049
+            media = self._extract_media_from_block(block)
+            if media:
+                total_b64_chars += len(media.b64_data)
+                total_media_tokens += _estimate_media_tokens(media)
 
         if not total_b64_chars:
             return self._count(raw_json)
 
         text_tokens = self._count(raw_json)
         b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
 
     def _estimate_system_tokens(self, body: dict) -> int:
         return 0
@@ -1672,17 +1718,17 @@ class GeminiFormat(PayloadFormat):
                             carrier=msg,
                         )
 
-    def _extract_base64_data_from_block(self, block: dict) -> str | None:
-        """Gemini: inline_data blocks contain base64 image data."""
+    def _extract_media_from_block(self, block: dict) -> MediaBlock | None:
+        """Gemini: inline_data blocks contain base64 media."""
         if "inline_data" in block:
             inline = block["inline_data"]
-            if isinstance(inline, dict):
-                return inline.get("data")
+            if isinstance(inline, dict) and inline.get("data"):
+                return MediaBlock(inline["data"], inline.get("mime_type", "application/octet-stream"))
         return None
 
-    def _collect_image_base64(self, body: dict) -> list[str]:
+    def _collect_media(self, body: dict) -> list[MediaBlock]:
         """Gemini: iterate parts for inline_data blocks."""
-        results: list[str] = []
+        results: list[MediaBlock] = []
         for msg in self.get_messages(body):
             parts = msg.get("parts", [])
             if not isinstance(parts, list):
@@ -1690,9 +1736,9 @@ class GeminiFormat(PayloadFormat):
             for part in parts:
                 if not isinstance(part, dict):
                     continue
-                b64 = self._extract_base64_data_from_block(part)
-                if b64:
-                    results.append(b64)
+                media = self._extract_media_from_block(part)
+                if media:
+                    results.append(media)
         return results
 
     def estimate_message_tokens(self, msg: dict) -> int:
@@ -1703,25 +1749,21 @@ class GeminiFormat(PayloadFormat):
             return self._count(raw_json)
 
         total_b64_chars = 0
-        total_image_tokens = 0
+        total_media_tokens = 0
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            b64 = self._extract_base64_data_from_block(part)
-            if b64:
-                total_b64_chars += len(b64)
-                dims = _get_image_dimensions(b64)
-                if dims:
-                    total_image_tokens += _anthropic_image_tokens(*dims)
-                else:
-                    total_image_tokens += 1049
+            media = self._extract_media_from_block(part)
+            if media:
+                total_b64_chars += len(media.b64_data)
+                total_media_tokens += _estimate_media_tokens(media)
 
         if not total_b64_chars:
             return self._count(raw_json)
 
         text_tokens = self._count(raw_json)
         b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
 
     # -- Context injection --
 
@@ -2435,18 +2477,20 @@ class OpenAIResponsesFormat(PayloadFormat):
             return self._count(instructions)
         return 0
 
-    def _extract_base64_data_from_block(self, block: dict) -> str | None:
-        """Responses: input_image blocks contain base64 in image_url."""
+    def _extract_media_from_block(self, block: dict) -> MediaBlock | None:
+        """Responses: input_image blocks contain base64 in image_url data URI."""
         if block.get("type") == "input_image":
             url = block.get("image_url", "")
             if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                return url.split(";base64,", 1)[1]
-        # Fall back to base class (Anthropic/OpenAI Chat shapes)
-        return super()._extract_base64_data_from_block(block)
+                header, b64 = url.split(";base64,", 1)
+                mt = header.replace("data:", "") or "image/unknown"
+                return MediaBlock(b64, mt)
+        # Fall back to base class (Anthropic source blocks, OpenAI Chat data URIs)
+        return super()._extract_media_from_block(block)
 
-    def _collect_image_base64(self, body: dict) -> list[str]:
+    def _collect_media(self, body: dict) -> list[MediaBlock]:
         """Responses: check both content arrays and bare input_image items."""
-        results: list[str] = []
+        results: list[MediaBlock] = []
         for item in self.get_messages(body):
             if not isinstance(item, dict):
                 continue
@@ -2454,7 +2498,9 @@ class OpenAIResponsesFormat(PayloadFormat):
             if item.get("type") == "input_image":
                 url = item.get("image_url", "")
                 if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                    results.append(url.split(";base64,", 1)[1])
+                    header, b64 = url.split(";base64,", 1)
+                    mt = header.replace("data:", "") or "image/unknown"
+                    results.append(MediaBlock(b64, mt))
                 continue
             # Items with content arrays
             content = item.get("content", "")
@@ -2463,9 +2509,9 @@ class OpenAIResponsesFormat(PayloadFormat):
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                b64 = self._extract_base64_data_from_block(block)
-                if b64:
-                    results.append(b64)
+                media = self._extract_media_from_block(block)
+                if media:
+                    results.append(media)
         return results
 
     def estimate_message_tokens(self, msg: dict) -> int:
@@ -2475,16 +2521,17 @@ class OpenAIResponsesFormat(PayloadFormat):
             return self._count(raw_json)
 
         total_b64_chars = 0
-        total_image_tokens = 0
+        total_media_tokens = 0
 
         # Bare input_image item
         if msg.get("type") == "input_image":
             url = msg.get("image_url", "")
             if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                b64 = url.split(";base64,", 1)[1]
+                header, b64 = url.split(";base64,", 1)
+                mt = header.replace("data:", "") or "image/unknown"
+                media = MediaBlock(b64, mt)
                 total_b64_chars += len(b64)
-                dims = _get_image_dimensions(b64)
-                total_image_tokens += _anthropic_image_tokens(*dims) if dims else 1049
+                total_media_tokens += _estimate_media_tokens(media)
         else:
             # Content array
             content = msg.get("content", "")
@@ -2492,18 +2539,17 @@ class OpenAIResponsesFormat(PayloadFormat):
                 for block in content:
                     if not isinstance(block, dict):
                         continue
-                    b64 = self._extract_base64_data_from_block(block)
-                    if b64:
-                        total_b64_chars += len(b64)
-                        dims = _get_image_dimensions(b64)
-                        total_image_tokens += _anthropic_image_tokens(*dims) if dims else 1049
+                    media = self._extract_media_from_block(block)
+                    if media:
+                        total_b64_chars += len(media.b64_data)
+                        total_media_tokens += _estimate_media_tokens(media)
 
         if not total_b64_chars:
             return self._count(raw_json)
 
         text_tokens = self._count(raw_json)
         b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_image_tokens)
+        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
 
     # -- Fingerprinting --
 
