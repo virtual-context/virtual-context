@@ -1382,11 +1382,14 @@ class VirtualContextEngine:
         if not pairs:
             return 0
 
-        # Refresh the guarded store's generation so writes are not suppressed
+        # Use the underlying store directly for bulk backfill.
+        # The guarded store's refresh_generation doesn't reliably unblock
+        # bulk writes across conversation_id mismatches (short vs full UUID).
+        # This is an authoritative backfill from the current client request.
         store = self._store
-        _refresh = getattr(store, "refresh_generation", None)
-        if callable(_refresh):
-            _refresh()
+        _inner = getattr(store, '_store', None)
+        if _inner is not None:
+            store = _inner
 
         # Determine which turns already exist so we can report new count.
         try:
