@@ -60,7 +60,7 @@ virtual-context onboard --wizard
 
 ## One-Command Daemon Setup
 
-Install and start a background proxy service (creates config automatically if none exists):
+Install and start a background proxy service. Creates `~/.virtualcontext/` with config and data automatically:
 
 ```bash
 virtual-context daemon install --upstream https://api.anthropic.com
@@ -90,7 +90,7 @@ virtual-context daemon uninstall
 
 Create a LaunchAgent so the proxy runs in the background.
 
-1. Create config first (`virtual-context.yaml`) and make sure it includes your upstream strategy.
+1. Run `virtual-context daemon install --upstream ...` (recommended), or manually create the plist below.
 2. Save this as `~/Library/LaunchAgents/io.virtualcontext.proxy.plist`:
 
 ```xml
@@ -105,7 +105,7 @@ Create a LaunchAgent so the proxy runs in the background.
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>virtual-context -c $HOME/virtual-context.yaml proxy --upstream https://api.anthropic.com</string>
+    <string>virtual-context -c $HOME/.virtualcontext/config.yaml proxy --upstream https://api.anthropic.com</string>
   </array>
 
   <key>RunAtLoad</key>
