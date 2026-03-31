@@ -1323,6 +1323,92 @@ class VirtualContextEngine:
     def get_working_set_summary(self) -> dict:
         return self._paging.get_working_set_summary()
 
+    def sync_turns_from_payload(
+        self,
+        body: dict,
+        fmt: "PayloadFormat",
+    ) -> int:
+        """Persist turn text from a client request body to the durable store.
+
+        Uses fmt.group_into_turns(body) for format-agnostic grouping across
+        Anthropic, OpenAI Chat, OpenAI Responses, and Gemini. Extracts
+        user + assistant/model text per turn group and upserts ALL turns
+        to turn_messages. Since save_turn_message uses ON CONFLICT DO UPDATE,
+        this repairs gaps from earlier partial failures.
+
+        Returns the number of genuinely new turns persisted (0 if all existed).
+        """
+        conv_id = self.config.conversation_id
+        messages = fmt.get_messages(body)
+        if not messages:
+            return 0
+
+        # OpenAI Responses string-input shorthand: {"input": "some text"}
+        # get_messages() synthesizes a user message, but group_into_turns()
+        # returns [] because it checks for a list.
+        raw_input = body.get("input")
+        if isinstance(raw_input, str) and raw_input.strip():
+            return 0
+
+        turns = fmt.group_into_turns(body)
+
+        # Role names differ by format: Gemini uses "model" for assistant
+        assistant_roles = {"assistant", "model"}
+
+        pairs: list[tuple[str, str]] = []
+        for turn in turns:
+            u_parts: list[str] = []
+            a_parts: list[str] = []
+            for idx in turn.indices:
+                if idx >= len(messages):
+                    continue
+                m = messages[idx]
+                if not isinstance(m, dict):
+                    continue
+                text = fmt.extract_message_text(m)
+                if not text:
+                    continue
+                role = m.get("role", "")
+                if role == "user":
+                    u_parts.append(text)
+                elif role in assistant_roles:
+                    a_parts.append(text)
+            u_text = "\n".join(u_parts)
+            a_text = "\n".join(a_parts)
+            if u_text or a_text:
+                pairs.append((u_text, a_text))
+
+        if not pairs:
+            return 0
+
+        # Refresh the guarded store's generation so writes are not suppressed
+        store = self._store
+        _refresh = getattr(store, "refresh_generation", None)
+        if callable(_refresh):
+            _refresh()
+
+        # Determine which turns already exist so we can report new count.
+        try:
+            stored = store.load_recent_turn_messages(conv_id, limit=len(pairs))
+            stored_nums = {t[0] for t in stored}
+        except Exception:
+            stored_nums = set()
+
+        # Upsert ALL turns unconditionally. save_turn_message uses
+        # ON CONFLICT DO UPDATE, so this fills gaps AND refreshes
+        # stale/incomplete rows from earlier partial writes.
+        new_count = 0
+        for turn_num, (u, a) in enumerate(pairs):
+            try:
+                store.save_turn_message(conv_id, turn_num, u, a)
+                if turn_num not in stored_nums:
+                    new_count += 1
+            except Exception:
+                logger.warning(
+                    "Failed to persist turn %d for %s", turn_num, conv_id[:12])
+
+        return new_count
+
     def find_quote(
         self,
         query: str,
