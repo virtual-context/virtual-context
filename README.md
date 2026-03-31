@@ -133,7 +133,7 @@ proxy:
 **Daemon mode:** run as a background service:
 
 ```bash
-# Creates config if needed, installs + starts daemon
+# Creates ~/.virtualcontext/ with config + data, installs + starts daemon
 virtual-context daemon install --upstream https://api.anthropic.com
 
 # Or: guided interactive setup with daemon

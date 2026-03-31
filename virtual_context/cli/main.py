@@ -912,11 +912,25 @@ def _daemon_systemd_unit_path() -> Path:
 
 
 def _resolve_daemon_config(args) -> Path:
-    """Resolve the config path for daemon install, creating one if missing."""
-    config_path = Path(args.config) if hasattr(args, "config") and args.config else Path.cwd() / "virtual-context.yaml"
+    """Resolve the config path for daemon install, creating one if missing.
+
+    Priority: explicit ``-c`` flag → ``~/.virtualcontext/config.yaml`` (auto-created
+    from agentic preset with absolute storage paths so the daemon works from any CWD).
+    """
+    if hasattr(args, "config") and args.config:
+        return Path(args.config)
+
+    import yaml
+
+    home_vc = Path.home() / ".virtualcontext"
+    home_vc.mkdir(exist_ok=True)
+    config_path = home_vc / "config.yaml"
     if not config_path.exists():
         preset = get_preset("agentic")
-        config_path.write_text(preset.template)
+        cfg = yaml.safe_load(preset.template)
+        cfg["storage_root"] = str(home_vc)
+        cfg["storage"]["sqlite"]["path"] = str(home_vc / "store.db")
+        config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
         print(f"Created config: {config_path} (preset: agentic)")
     return config_path
 

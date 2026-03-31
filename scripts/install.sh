@@ -62,11 +62,9 @@ main() {
 
   log "Install complete"
   log "Next:"
-  log "  1) virtual-context onboard --wizard    # guided setup (config + proxy instances + daemon)"
-  log "  Or manual setup:"
-  log "  1) virtual-context init coding"
-  log "  2) virtual-context config validate"
-  log "  3) virtual-context proxy --upstream https://api.anthropic.com"
+  log "  1) virtual-context daemon install --upstream https://api.anthropic.com"
+  log "     (creates ~/.virtualcontext/ with config + data, installs + starts daemon)"
+  log "  Or: virtual-context onboard --wizard    # interactive multi-instance setup"
 }
 
 main "$@"

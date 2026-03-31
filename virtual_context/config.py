@@ -48,7 +48,11 @@ CONFIG_FILENAMES = [
 
 
 def _discover_config() -> Path | None:
-    """Search CWD then parent dirs up to home for a config file."""
+    """Search CWD then parent dirs up to home for a config file.
+
+    Falls back to ``~/.virtualcontext/config.yaml`` if nothing is found in the
+    directory tree, so daemon-created home configs are discovered automatically.
+    """
     cwd = Path.cwd()
     home = Path.home()
     search = cwd
@@ -60,6 +64,10 @@ def _discover_config() -> Path | None:
         if search == home or search == search.parent:
             break
         search = search.parent
+    # Fallback: home-level config created by `daemon install`
+    home_config = home / ".virtualcontext" / "config.yaml"
+    if home_config.is_file():
+        return home_config
     return None
 
 
