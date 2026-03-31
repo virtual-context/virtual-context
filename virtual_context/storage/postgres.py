@@ -1615,6 +1615,53 @@ class PostgresStore(ContextStore):
              user_raw_content, assistant_raw_content),
         )
 
+    def search_turn_messages(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list["QuoteResult"]:
+        """Search raw turn_messages for a phrase (ILIKE). Returns QuoteResult list.
+
+        Covers uncompacted turns that haven't been indexed into segments yet.
+        """
+        from ..types import QuoteResult
+        conn = self._get_conn()
+        pattern = f"%{query}%"
+        sql = """SELECT turn_number, user_content, assistant_content
+                 FROM turn_messages
+                 WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
+        params: list = [pattern, pattern]
+        if conversation_id is not None:
+            sql += " AND conversation_id = %s"
+            params.append(conversation_id)
+        sql += " ORDER BY turn_number DESC LIMIT %s"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            turn = row["turn_number"]
+            u = row["user_content"] or ""
+            a = row["assistant_content"] or ""
+            # Build excerpt showing the matching turn
+            combined = f"User: {u}\n\nAssistant: {a}"
+            # Extract a window around the match
+            q_lower = query.lower()
+            idx = combined.lower().find(q_lower)
+            if idx >= 0:
+                start = max(0, idx - 100)
+                end = min(len(combined), idx + len(query) + 200)
+                excerpt = combined[start:end]
+            else:
+                excerpt = combined[:300]
+            results.append(QuoteResult(
+                text=excerpt,
+                tag="uncompacted",
+                segment_ref=f"turn_{turn}",
+                match_type="turn_search",
+            ))
+        return results
+
     def get_turn_messages(
         self,
         conversation_id: str,

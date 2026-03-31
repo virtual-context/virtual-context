@@ -340,6 +340,14 @@ def find_quote(
         tool_results = store.search_tool_outputs(query, limit=tool_remaining, conversation_id=conversation_id)
         results.extend(tool_results)
 
+    # ---- Uncompacted turn search (raw turn_messages not yet in segments) ----
+    turn_remaining = max_results - len(results)
+    if turn_remaining > 0:
+        _search_turns = getattr(store, "search_turn_messages", None)
+        if callable(_search_turns):
+            turn_results = _search_turns(query, limit=turn_remaining, conversation_id=conversation_id)
+            results.extend(turn_results)
+
     # ---- Span-union: merge overlapping excerpts from the same segment ----
     results = _merge_segment_excerpts(store, results, conversation_id=conversation_id)
 
