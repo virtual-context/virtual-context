@@ -1327,6 +1327,7 @@ class VirtualContextEngine:
         self,
         body: dict,
         fmt: "PayloadFormat",
+        conversation_id: str | None = None,
     ) -> int:
         """Persist turn text from a client request body to the durable store.
 
@@ -1338,7 +1339,7 @@ class VirtualContextEngine:
 
         Returns the number of genuinely new turns persisted (0 if all existed).
         """
-        conv_id = self.config.conversation_id
+        conv_id = conversation_id or self.config.conversation_id
         messages = fmt.get_messages(body)
         if not messages:
             return 0
