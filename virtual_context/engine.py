@@ -1401,15 +1401,19 @@ class VirtualContextEngine:
         # Upsert ALL turns unconditionally. save_turn_message uses
         # ON CONFLICT DO UPDATE, so this fills gaps AND refreshes
         # stale/incomplete rows from earlier partial writes.
+        logger.info(
+            "SYNC_TURNS: conv=%s store=%s pairs=%d stored_nums=%s",
+            conv_id[:12], type(store).__name__, len(pairs), sorted(stored_nums)[:5],
+        )
         new_count = 0
         for turn_num, (u, a) in enumerate(pairs):
             try:
                 store.save_turn_message(conv_id, turn_num, u, a)
                 if turn_num not in stored_nums:
                     new_count += 1
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "Failed to persist turn %d for %s", turn_num, conv_id[:12])
+                    "Failed to persist turn %d for %s: %s", turn_num, conv_id[:12], exc)
 
         return new_count
 
