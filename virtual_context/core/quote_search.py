@@ -321,6 +321,17 @@ def find_quote(
 
     results = store.search_full_text(query, limit=max_results, conversation_id=conversation_id)
 
+    # ---- Uncompacted turn search (raw turn_messages not yet in segments) ----
+    # Runs early — right after FTS on segments — because these are exact text
+    # matches on recent turns that haven't been compacted yet. Without this,
+    # semantic search fills the quota and uncompacted content is never found.
+    turn_remaining = max_results - len(results)
+    if turn_remaining > 0:
+        _search_turns = getattr(store, "search_turn_messages", None)
+        if callable(_search_turns):
+            turn_results = _search_turns(query, limit=turn_remaining, conversation_id=conversation_id)
+            results.extend(turn_results)
+
     # Always run semantic search to supplement FTS — surfaces chunks
     # that match semantically but use different words, and may return
     # different excerpts from the same segment FTS already found.
@@ -339,14 +350,6 @@ def find_quote(
     if tool_remaining > 0:
         tool_results = store.search_tool_outputs(query, limit=tool_remaining, conversation_id=conversation_id)
         results.extend(tool_results)
-
-    # ---- Uncompacted turn search (raw turn_messages not yet in segments) ----
-    turn_remaining = max_results - len(results)
-    if turn_remaining > 0:
-        _search_turns = getattr(store, "search_turn_messages", None)
-        if callable(_search_turns):
-            turn_results = _search_turns(query, limit=turn_remaining, conversation_id=conversation_id)
-            results.extend(turn_results)
 
     # ---- Span-union: merge overlapping excerpts from the same segment ----
     results = _merge_segment_excerpts(store, results, conversation_id=conversation_id)
