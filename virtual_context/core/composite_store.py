@@ -192,6 +192,14 @@ class CompositeStore:
     def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
         return self._segments.prune_turn_messages(conversation_id, keep_from_turn)
 
+    def search_turn_messages(
+        self, query: str, limit: int = 5, conversation_id: str | None = None,
+    ) -> list:
+        _search = getattr(self._segments, "search_turn_messages", None)
+        if callable(_search):
+            return _search(query, limit=limit, conversation_id=conversation_id)
+        return []
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------
