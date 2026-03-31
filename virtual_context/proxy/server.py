@@ -42,7 +42,6 @@ from ..types import Fact, Message, PreparedPayload, SplitResult, StoredSummary  
 from .dashboard import register_dashboard_routes
 from .formats import (
     PayloadFormat,  # noqa: F401 — re-exported
-    _estimate_media_tokens,
     detect_format,
     get_format,
 )
@@ -264,21 +263,15 @@ async def prepare_payload(
     import asyncio
     import time
 
-    # Ground truth: measure inbound from raw bytes so the compaction monitor
-    # sees the client's actual payload size.  estimate_payload_tokens(body)
-    # re-serializes to compact JSON which loses original formatting and
-    # undercounts by ~3x.  Use raw bytes with media adjustment.
+    # Ground truth: measure inbound BEFORE normalization using estimate_payload_tokens.
+    # Verified against Anthropic count_tokens API:
+    #   - Tool chains payload: estimate=418K, real=329K (1.27x — acceptable)
+    #   - Image payload: estimate=107K, real=106K (1.01x — near exact)
+    #   - raw_bytes//4 for images: 2.5M vs real 106K (24x — catastrophically wrong)
+    # estimate_payload_tokens is the only method that handles media correctly.
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
-    # Start from raw byte count, then subtract any media base64 overcounting
-    _raw_text_tokens = fmt._count(body_bytes.decode("utf-8", errors="replace")) if body_bytes else 0
-    _media_list = fmt._collect_media(body) if body_bytes else []
-    if _media_list:
-        _b64_chars = sum(len(m.b64_data) for m in _media_list)
-        _media_tokens = sum(_estimate_media_tokens(m) for m in _media_list)
-        _inbound_tokens = max(1, _raw_text_tokens - (_b64_chars // 4) + _media_tokens)
-    else:
-        _inbound_tokens = _raw_text_tokens
+    _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
     if state:
         state._last_payload_kb = _payload_kb
         state._last_payload_tokens = _inbound_tokens
