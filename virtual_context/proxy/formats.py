@@ -548,28 +548,52 @@ class PayloadFormat(ABC):
         Base64 media (images, PDFs, audio, etc.) is counted using
         provider-appropriate formulas instead of tokenizing the raw base64.
         """
-        raw_json = json.dumps(body, default=str)
         media_list = self._collect_media(body)
         if not media_list:
-            return self._count(raw_json)
+            return self._count(json.dumps(body, default=str))
 
-        # Build a version of the JSON with base64 data stripped out,
-        # then count tokens on that. This is exact regardless of which
-        # tokenizer is set (len//4, tiktoken, or Anthropic tokenizer).
-        stripped_json = raw_json
-        for media in media_list:
-            stripped_json = stripped_json.replace(media.b64_data, "", 1)
+        # Blank base64 in the source dicts, serialize, count, restore.
+        # O(n) serialization instead of O(n*m) str.replace on the JSON string.
+        saved = self._blank_media_data(body)
+        stripped_json = json.dumps(body, default=str)
+        self._restore_media_data(body, saved)
 
         text_tokens = self._count(stripped_json)
         media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
         return max(1, text_tokens + media_tokens)
 
+    def _blank_media_data(self, body: dict) -> list[tuple[dict, str, str]]:
+        """Blank base64 data in all media source dicts. Returns save list for restore."""
+        saved = []
+        for msg in self.get_messages(body):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                source = block.get("source")
+                if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
+                    saved.append((source, "data", source["data"]))
+                    source["data"] = ""
+                elif block.get("type") == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    if isinstance(url, str) and ";base64," in url:
+                        saved.append((block["image_url"], "url", url))
+                        block["image_url"]["url"] = url.split(";base64,")[0] + ";base64,"
+        return saved
+
+    @staticmethod
+    def _restore_media_data(body: dict, saved: list[tuple[dict, str, str]]) -> None:
+        """Restore blanked base64 data from save list."""
+        for container, key, original in saved:
+            container[key] = original
+
     def estimate_message_tokens(self, msg: dict) -> int:
         """Count tokens for a single message/item, using media formulas for base64 blocks."""
-        raw_json = json.dumps(msg, default=str)
         content = msg.get("content", "")
         if not isinstance(content, list):
-            return self._count(raw_json)
+            return self._count(json.dumps(msg, default=str))
 
         media_list = []
         for block in content:
@@ -580,11 +604,25 @@ class PayloadFormat(ABC):
                 media_list.append(media)
 
         if not media_list:
-            return self._count(raw_json)
+            return self._count(json.dumps(msg, default=str))
 
-        stripped_json = raw_json
-        for media in media_list:
-            stripped_json = stripped_json.replace(media.b64_data, "", 1)
+        # Blank base64 in source dicts, serialize, count, restore
+        saved = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            source = block.get("source")
+            if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
+                saved.append((source, "data", source["data"]))
+                source["data"] = ""
+            elif block.get("type") == "image_url":
+                url = block.get("image_url", {}).get("url", "")
+                if isinstance(url, str) and ";base64," in url:
+                    saved.append((block["image_url"], "url", url))
+                    block["image_url"]["url"] = url.split(";base64,")[0] + ";base64,"
+        stripped_json = json.dumps(msg, default=str)
+        for container, key, original in saved:
+            container[key] = original
 
         text_tokens = self._count(stripped_json)
         media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
