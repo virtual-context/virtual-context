@@ -1014,15 +1014,23 @@ class AnthropicFormat(PayloadFormat):
         has_tool = False
 
         def _is_real_user(msg: dict) -> bool:
-            """True if user message has real content (not just tool_result blocks)."""
+            """True if user message has real content (not just tool_result blocks).
+
+            A user message carrying tool_result blocks (even alongside media
+            or text) is a tool_result carrier if any tool_result is present.
+            This keeps the tool chain atomic with the preceding tool_use.
+            """
             if msg.get("role") != "user":
                 return False
             content = msg.get("content", "")
             if isinstance(content, str):
                 return True
             if isinstance(content, list):
-                types = {b.get("type") for b in content if isinstance(b, dict)}
-                return not (types and types <= {"tool_result"})
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+                return not has_tool_result
             return True
 
         for i, msg in enumerate(messages):
