@@ -553,15 +553,16 @@ class PayloadFormat(ABC):
         if not media_list:
             return self._count(raw_json)
 
-        total_b64_chars = 0
-        total_media_tokens = 0
+        # Build a version of the JSON with base64 data stripped out,
+        # then count tokens on that. This is exact regardless of which
+        # tokenizer is set (len//4, tiktoken, or Anthropic tokenizer).
+        stripped_json = raw_json
         for media in media_list:
-            total_b64_chars += len(media.b64_data)
-            total_media_tokens += _estimate_media_tokens(media)
+            stripped_json = stripped_json.replace(media.b64_data, "", 1)
 
-        text_tokens = self._count(raw_json)
-        b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
+        text_tokens = self._count(stripped_json)
+        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
+        return max(1, text_tokens + media_tokens)
 
     def estimate_message_tokens(self, msg: dict) -> int:
         """Count tokens for a single message/item, using media formulas for base64 blocks."""
@@ -570,22 +571,24 @@ class PayloadFormat(ABC):
         if not isinstance(content, list):
             return self._count(raw_json)
 
-        total_b64_chars = 0
-        total_media_tokens = 0
+        media_list = []
         for block in content:
             if not isinstance(block, dict):
                 continue
             media = self._extract_media_from_block(block)
             if media:
-                total_b64_chars += len(media.b64_data)
-                total_media_tokens += _estimate_media_tokens(media)
+                media_list.append(media)
 
-        if not total_b64_chars:
+        if not media_list:
             return self._count(raw_json)
 
-        text_tokens = self._count(raw_json)
-        b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
+        stripped_json = raw_json
+        for media in media_list:
+            stripped_json = stripped_json.replace(media.b64_data, "", 1)
+
+        text_tokens = self._count(stripped_json)
+        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
+        return max(1, text_tokens + media_tokens)
 
     def _estimate_system_tokens(self, body: dict) -> int:
         return 0
@@ -874,9 +877,14 @@ class AnthropicFormat(PayloadFormat):
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                return _strip_envelope(content)
-            if isinstance(content, list):
-                return _strip_envelope(_last_text_block(content))
+                text = _strip_envelope(content)
+                if text:
+                    return text
+            elif isinstance(content, list):
+                text = _strip_envelope(_last_text_block(content))
+                if text:
+                    return text
+            # No text in this user message (e.g. tool_result only) — keep looking
         return ""
 
     def extract_user_raw_content(self, body: dict) -> list[dict] | None:
@@ -1861,22 +1869,24 @@ class GeminiFormat(PayloadFormat):
         if not isinstance(parts, list):
             return self._count(raw_json)
 
-        total_b64_chars = 0
-        total_media_tokens = 0
+        media_list = []
         for part in parts:
             if not isinstance(part, dict):
                 continue
             media = self._extract_media_from_block(part)
             if media:
-                total_b64_chars += len(media.b64_data)
-                total_media_tokens += _estimate_media_tokens(media)
+                media_list.append(media)
 
-        if not total_b64_chars:
+        if not media_list:
             return self._count(raw_json)
 
-        text_tokens = self._count(raw_json)
-        b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
+        stripped_json = raw_json
+        for media in media_list:
+            stripped_json = stripped_json.replace(media.b64_data, "", 1)
+
+        text_tokens = self._count(stripped_json)
+        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
+        return max(1, text_tokens + media_tokens)
 
     # -- Context injection --
 
@@ -2633,8 +2643,7 @@ class OpenAIResponsesFormat(PayloadFormat):
         if not isinstance(msg, dict):
             return self._count(raw_json)
 
-        total_b64_chars = 0
-        total_media_tokens = 0
+        media_list = []
 
         # Bare input_image item
         if msg.get("type") == "input_image":
@@ -2642,9 +2651,7 @@ class OpenAIResponsesFormat(PayloadFormat):
             if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
                 header, b64 = url.split(";base64,", 1)
                 mt = header.replace("data:", "") or "image/unknown"
-                media = MediaBlock(b64, mt)
-                total_b64_chars += len(b64)
-                total_media_tokens += _estimate_media_tokens(media)
+                media_list.append(MediaBlock(b64, mt))
         else:
             # Content array
             content = msg.get("content", "")
@@ -2654,15 +2661,17 @@ class OpenAIResponsesFormat(PayloadFormat):
                         continue
                     media = self._extract_media_from_block(block)
                     if media:
-                        total_b64_chars += len(media.b64_data)
-                        total_media_tokens += _estimate_media_tokens(media)
+                        media_list.append(media)
 
-        if not total_b64_chars:
+        if not media_list:
             return self._count(raw_json)
 
-        text_tokens = self._count(raw_json)
-        b64_text_tokens = max(1, total_b64_chars // 4)
-        return max(1, text_tokens - b64_text_tokens + total_media_tokens)
+        stripped_json = raw_json
+        for media in media_list:
+            stripped_json = stripped_json.replace(media.b64_data, "", 1)
+        text_tokens = self._count(stripped_json)
+        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
+        return max(1, text_tokens + media_tokens)
 
     # -- Fingerprinting --
 
