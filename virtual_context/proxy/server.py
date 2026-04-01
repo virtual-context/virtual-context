@@ -292,6 +292,47 @@ async def prepare_payload(
     user_message = fmt.extract_user_message(body)
     is_streaming = body.get("stream", False)
 
+    # --- VCATTACH command detection ---
+    import re as _re
+    _vcattach_match = _re.match(r"^VCATTACH\s+(.+)$", user_message.strip(), _re.IGNORECASE)
+    if _vcattach_match:
+        _vcattach_target = _vcattach_match.group(1).strip()
+        # Resolution happens in the caller (cloud or core routing layer).
+        # Return early with the flag set — no pipeline processing.
+        return PreparedPayload(
+            body=body,
+            enriched_body=body,
+            conversation_id=state.engine.config.conversation_id if state else "",
+            is_passthrough=False,
+            turn=0,
+            turn_id="",
+            api_format=api_format,
+            user_message=user_message,
+            is_streaming=is_streaming,
+            inbound_tokens=0,
+            outbound_tokens=0,
+            context_tokens=0,
+            non_virtualizable_floor=0,
+            upstream_limit=0,
+            tags_matched=[],
+            budget_breakdown={},
+            turns_dropped=0,
+            turns_stubbed=0,
+            wait_ms=0,
+            inbound_ms=0,
+            overhead_ms=0,
+            assembled=None,
+            pre_filter_body=None,
+            paging_enabled=False,
+            tool_output_find_quote=False,
+            restore_tool_injected=False,
+            inbound_bytes=0,
+            outbound_bytes=0,
+            is_vcattach=True,
+            vcattach_target_id="",  # resolved by caller
+            vcattach_label=_vcattach_target,
+        )
+
     # Resolve upstream context window limit for this model
     from .helpers import (
         _extract_history_pairs,

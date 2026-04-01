@@ -35,3 +35,41 @@ def test_alias_chain_not_followed(sqlite_store):
     sqlite_store.save_conversation_alias("a", "b")
     sqlite_store.save_conversation_alias("b", "c")
     assert sqlite_store.resolve_conversation_alias("a") == "b"
+
+
+# --- VCATTACH regex tests ---
+
+import re
+
+_VCATTACH_RE = re.compile(r"^VCATTACH\s+(.+)$", re.IGNORECASE)
+
+
+def test_vcattach_regex_label():
+    m = _VCATTACH_RE.match("VCATTACH website")
+    assert m and m.group(1) == "website"
+
+
+def test_vcattach_regex_uuid():
+    m = _VCATTACH_RE.match("VCATTACH d4f83259-4ffc-fa3f-5914-a266d0a4577c")
+    assert m and m.group(1) == "d4f83259-4ffc-fa3f-5914-a266d0a4577c"
+
+
+def test_vcattach_regex_prefix():
+    m = _VCATTACH_RE.match("VCATTACH d4f83259")
+    assert m and m.group(1) == "d4f83259"
+
+
+def test_vcattach_regex_case_insensitive():
+    m = _VCATTACH_RE.match("vcattach Website")
+    assert m and m.group(1) == "Website"
+
+
+def test_vcattach_regex_no_target():
+    m = _VCATTACH_RE.match("VCATTACH")
+    assert m is None
+
+
+def test_vcattach_regex_not_triggered_by_history():
+    """Only the last user message should trigger, not history."""
+    m = _VCATTACH_RE.match("I said VCATTACH website earlier")
+    assert m is None
