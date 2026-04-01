@@ -202,6 +202,20 @@ class SessionRegistry:
         3. Claim unclaimed session (first request after startup)
         4. Create new session
         """
+        # --- Alias resolution: follow redirects from VCATTACH ---
+        if conversation_id:
+            _store = None
+            # Try to get a store from any existing session
+            for _st in self._conversations.values():
+                _store = _st.engine._store
+                break
+            if _store:
+                _alias_resolve = getattr(_store, "resolve_conversation_alias", None)
+                if callable(_alias_resolve):
+                    _redirected = _alias_resolve(conversation_id)
+                    if _redirected:
+                        conversation_id = _redirected
+
         # --- 0. Explicit conversation marker (highest priority) ---
         if conversation_id:
             for sid, st in self._conversations.items():
