@@ -946,6 +946,10 @@ class PreparedPayload:
     inbound_bytes: int
     outbound_bytes: int
     metadata: dict = field(default_factory=dict)  # catch-all for anything else
+    is_vcattach: bool = False
+    vcattach_target_id: str = ""
+    vcattach_label: str = ""
+    vcattach_old_id: str = ""
 
 
 @dataclass
