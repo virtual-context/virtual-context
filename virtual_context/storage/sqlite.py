@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     PRIMARY KEY (conversation_id, turn_number)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_aliases (
+    alias_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
 CREATE INDEX IF NOT EXISTS idx_segments_conversation_id ON segments(conversation_id);
@@ -1771,6 +1776,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 match_type="turn_search",
             ))
         return results
+
+    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO conversation_aliases (alias_id, target_id) VALUES (?, ?)",
+            (alias_id, target_id),
+        )
+        conn.commit()
+
+    def resolve_conversation_alias(self, alias_id: str) -> str | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+            (alias_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def get_turn_messages(
         self,
