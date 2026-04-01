@@ -1642,6 +1642,9 @@ async def _handle_vcattach(
     fmt,
     state,
     registry,
+    *,
+    labels: dict | None = None,
+    conv_ids: list | None = None,
 ):
     """Handle VCATTACH command — resolve target, execute attach, return fake response."""
     from starlette.responses import StreamingResponse, JSONResponse
@@ -1649,21 +1652,22 @@ async def _handle_vcattach(
 
     target_raw = result.vcattach_label
 
-    # Resolve target (core proxy: UUID only, no labels).
-    # Include both in-memory sessions AND persisted conversations from store.
-    conv_ids = list(registry._conversations.keys()) if registry else []
-    if state and state.engine._store:
-        _stats = getattr(state.engine._store, "get_conversation_stats", None)
-        if callable(_stats):
-            try:
-                for s in _stats():
-                    cid = getattr(s, "conversation_id", "")
-                    if cid and cid not in conv_ids:
-                        conv_ids.append(cid)
-            except Exception:
-                pass
+    # In cloud mode, labels and conv_ids are passed from the tenant registry.
+    # In standalone mode, fall back to in-memory sessions + store stats.
+    if conv_ids is None:
+        conv_ids = list(registry._conversations.keys()) if registry else []
+        if state and state.engine._store:
+            _stats = getattr(state.engine._store, "get_conversation_stats", None)
+            if callable(_stats):
+                try:
+                    for s in _stats():
+                        cid = getattr(s, "conversation_id", "")
+                        if cid and cid not in conv_ids:
+                            conv_ids.append(cid)
+                except Exception:
+                    pass
     target_id, target_label, error = resolve_target(
-        target_raw, result.conversation_id, conv_ids, labels={},
+        target_raw, result.conversation_id, conv_ids, labels=labels or {},
     )
 
     if error:
