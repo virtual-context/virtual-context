@@ -73,3 +73,49 @@ def test_vcattach_regex_not_triggered_by_history():
     """Only the last user message should trigger, not history."""
     m = _VCATTACH_RE.match("I said VCATTACH website earlier")
     assert m is None
+
+
+def test_emit_fake_response_sse_anthropic():
+    from virtual_context.proxy.formats import detect_format
+    body = {"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]}
+    fmt = detect_format(body)
+    events = fmt.emit_fake_response_sse("Test response", "conv-123")
+    assert isinstance(events, bytes)
+    text = events.decode()
+    assert "Test response" in text
+    assert "vc:conversation=conv-123" in text
+    assert "message_start" in text
+    assert "message_stop" in text
+
+
+def test_emit_fake_response_sse_openai():
+    from virtual_context.proxy.formats import detect_format
+    body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    fmt = detect_format(body)
+    events = fmt.emit_fake_response_sse("Test response", "conv-123")
+    text = events.decode()
+    assert "Test response" in text
+    assert "vc:conversation=conv-123" in text
+    assert "[DONE]" in text
+
+
+def test_build_fake_response_anthropic():
+    from virtual_context.proxy.formats import detect_format
+    body = {"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]}
+    fmt = detect_format(body)
+    resp = fmt.build_fake_response("Test response", "conv-123")
+    assert isinstance(resp, dict)
+    assert resp["role"] == "assistant"
+    assert "Test response" in resp["content"][0]["text"]
+    assert "vc:conversation=conv-123" in resp["content"][0]["text"]
+
+
+def test_build_fake_response_openai():
+    from virtual_context.proxy.formats import detect_format
+    body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    fmt = detect_format(body)
+    resp = fmt.build_fake_response("Test response", "conv-123")
+    assert isinstance(resp, dict)
+    assert "choices" in resp
+    assert "Test response" in resp["choices"][0]["message"]["content"]
+    assert "vc:conversation=conv-123" in resp["choices"][0]["message"]["content"]
