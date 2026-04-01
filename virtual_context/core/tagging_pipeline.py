@@ -87,6 +87,7 @@ class TaggingPipeline:
         monitor: ContextMonitor,
         compactor: DomainCompactor | None,
         save_state_callback: Callable,
+        next_tool_tag_callback: Callable[[], int] | None = None,
     ) -> None:
         self._tag_generator = tag_generator
         self._turn_tag_index = turn_tag_index
@@ -100,6 +101,7 @@ class TaggingPipeline:
         self._monitor = monitor
         self._compactor = compactor
         self._save_state_callback = save_state_callback
+        self._next_tool_tag = next_tool_tag_callback
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -263,8 +265,12 @@ class TaggingPipeline:
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn(latest_pair):
-                self._engine_state.tool_tag_counter += 1
-                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
+                if self._next_tool_tag is not None:
+                    tag_num = self._next_tool_tag()
+                else:
+                    self._engine_state.tool_tag_counter += 1
+                    tag_num = self._engine_state.tool_tag_counter
+                tag_name = f"tool_{tag_num}"
                 self._turn_tag_index.append(TurnTagEntry(
                     turn_number=len(self._turn_tag_index.entries),
                     message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
@@ -488,8 +494,12 @@ class TaggingPipeline:
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn([user_msg, asst_msg]):
-                self._engine_state.tool_tag_counter += 1
-                tag_name = f"tool_{self._engine_state.tool_tag_counter}"
+                if self._next_tool_tag is not None:
+                    tag_num = self._next_tool_tag()
+                else:
+                    self._engine_state.tool_tag_counter += 1
+                    tag_num = self._engine_state.tool_tag_counter
+                tag_name = f"tool_{tag_num}"
                 entry = TurnTagEntry(
                     turn_number=turn_offset + (i // 2),
                     message_hash=hashlib.sha256(

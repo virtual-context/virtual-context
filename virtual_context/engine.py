@@ -113,6 +113,7 @@ class VirtualContextEngine:
         config: VirtualContextConfig | None = None,
         session_cache=None,  # RedisSessionCache or None
         embedding_provider=None,  # EmbeddingProvider or None
+        session_state_provider=None,  # SessionStateProvider or None
     ) -> None:
         self._config_path = str(config_path) if config_path else None
         self.config = config or load_config(config_path)
@@ -143,6 +144,8 @@ class VirtualContextEngine:
         self._engine_state = EngineState()  # mutable shared state for delegates
         self._engine_state.conversation_generation = self._conversation_generation
         self._session_cache = session_cache
+        self._session_state_provider = session_state_provider
+        self._session_state_version: int = 0  # Tracks loaded Redis version for optimistic save
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
@@ -151,72 +154,80 @@ class VirtualContextEngine:
         self._restored_from_checkpoint = False
         self._restored_checkpoint_source = ""
 
-        # Restore persisted state BEFORE creating delegates so they get the
-        # final turn_tag_index / engine_state — no re-sync needed.
-        # The durable store is authoritative; Redis may only supply a richer
-        # history snapshot when it matches the committed checkpoint.
-        _store_loaded = False
-        _cached = None
-        try:
-            _saved = self._store.load_engine_state(self.config.conversation_id)
-        except Exception:
-            logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
-            _saved = None
-        if _saved:
-            self._load_persisted_state(saved=_saved)
-            _store_loaded = True
-
-        if self._session_cache and self._session_cache.is_available():
+        if self._session_state_provider is None:
+            # Self-managed restore (local proxy mode)
+            # Restore persisted state BEFORE creating delegates so they get the
+            # final turn_tag_index / engine_state — no re-sync needed.
+            # The durable store is authoritative; Redis may only supply a richer
+            # history snapshot when it matches the committed checkpoint.
+            _store_loaded = False
+            _cached = None
             try:
-                _cached = self._session_cache.load_snapshot(self.config.conversation_id)
-            except Exception as e:
-                logger.warning("Redis cache load failed: %s — continuing without cache", e)
-                _cached = None
+                _saved = self._store.load_engine_state(self.config.conversation_id)
+            except Exception:
+                logger.warning("Failed to load persisted state, starting fresh", exc_info=True)
+                _saved = None
+            if _saved:
+                self._load_persisted_state(saved=_saved)
+                _store_loaded = True
 
-        if _cached and _cached.get("conversation_id") == self.config.conversation_id:
-            cached_generation = int(_cached.get("conversation_generation", -1) or -1)
-            cache_generation_matches = (
-                cached_generation == self._conversation_generation
-                if cached_generation >= 0
-                else self._conversation_generation == 0
-            )
-            if not cache_generation_matches:
-                logger.info(
-                    "Ignoring Redis snapshot for conversation %s because its generation does not match the active lifecycle",
-                    self.config.conversation_id[:12],
+            if self._session_cache and self._session_cache.is_available():
+                try:
+                    _cached = self._session_cache.load_snapshot(self.config.conversation_id)
+                except Exception as e:
+                    logger.warning("Redis cache load failed: %s — continuing without cache", e)
+                    _cached = None
+
+            if _cached and _cached.get("conversation_id") == self.config.conversation_id:
+                cached_generation = int(_cached.get("conversation_generation", -1) or -1)
+                cache_generation_matches = (
+                    cached_generation == self._conversation_generation
+                    if cached_generation >= 0
+                    else self._conversation_generation == 0
                 )
-            elif not _store_loaded:
-                self._apply_cached_state(_cached)
-                logger.info(
-                    "Session cache restore: %d messages, %d turns from Redis (version=%s)",
-                    len(_cached.get("history", [])),
-                    len(_cached.get("turn_tag_entries", [])),
-                    _cached.get("version", "?"),
-                )
-            elif self._cache_checkpoint_matches_store(_saved, _cached):
-                self._restored_conversation_history = _cached.get("history", [])
-                if self._restored_conversation_history:
-                    self._restored_checkpoint_source = "store+redis"
+                if not cache_generation_matches:
                     logger.info(
-                        "Session cache history accepted for committed checkpoint %s (messages=%d, version=%s)",
+                        "Ignoring Redis snapshot for conversation %s because its generation does not match the active lifecycle",
                         self.config.conversation_id[:12],
-                        len(self._restored_conversation_history),
+                    )
+                elif not _store_loaded:
+                    self._apply_cached_state(_cached)
+                    logger.info(
+                        "Session cache restore: %d messages, %d turns from Redis (version=%s)",
+                        len(_cached.get("history", [])),
+                        len(_cached.get("turn_tag_entries", [])),
                         _cached.get("version", "?"),
                     )
-            else:
-                logger.info(
-                    "Ignoring Redis snapshot for conversation %s because it does not match the committed store checkpoint",
-                    self.config.conversation_id[:12],
-                )
-        if _store_loaded:
-            try:
-                self.prune_committed_turn_messages()
-            except Exception:
-                logger.warning(
-                    "Startup turn_messages prune failed for conversation %s",
-                    self.config.conversation_id[:12],
-                    exc_info=True,
-                )
+                elif self._cache_checkpoint_matches_store(_saved, _cached):
+                    self._restored_conversation_history = _cached.get("history", [])
+                    if self._restored_conversation_history:
+                        self._restored_checkpoint_source = "store+redis"
+                        logger.info(
+                            "Session cache history accepted for committed checkpoint %s (messages=%d, version=%s)",
+                            self.config.conversation_id[:12],
+                            len(self._restored_conversation_history),
+                            _cached.get("version", "?"),
+                        )
+                else:
+                    logger.info(
+                        "Ignoring Redis snapshot for conversation %s because it does not match the committed store checkpoint",
+                        self.config.conversation_id[:12],
+                    )
+            if _store_loaded:
+                try:
+                    self.prune_committed_turn_messages()
+                except Exception:
+                    logger.warning(
+                        "Startup turn_messages prune failed for conversation %s",
+                        self.config.conversation_id[:12],
+                        exc_info=True,
+                    )
+        else:
+            # Provider mode: state will be injected by caller before each request.
+            # Skip store/Redis restore entirely.
+            self._session_cache = None
+            self._restored_from_checkpoint = False
+            self._restored_checkpoint_source = ""
 
         # Create delegates with the (possibly restored) turn_tag_index
         self._semantic = SemanticSearchManager(
@@ -248,6 +259,11 @@ class VirtualContextEngine:
         self._init_supersession_checker()
         self._fact_curator = None
         self._init_fact_curator()
+        _tool_tag_cb = None
+        if self._session_state_provider:
+            _conv_id = self.config.conversation_id
+            _provider = self._session_state_provider
+            _tool_tag_cb = lambda: _provider.next_tool_tag(_conv_id)
         self._tagging = TaggingPipeline(
             tag_generator=self._tag_generator,
             turn_tag_index=self._turn_tag_index,
@@ -261,6 +277,7 @@ class VirtualContextEngine:
             monitor=self._monitor,
             compactor=self._compactor,
             save_state_callback=self._save_state,
+            next_tool_tag_callback=_tool_tag_cb,
         )
         self._compaction = CompactionPipeline(
             compactor=self._compactor,
@@ -735,6 +752,194 @@ class VirtualContextEngine:
                 len(tag_counts),
             )
 
+    # ---- SessionStateProvider integration ----
+
+    def hydrate_from_session_state(self, state) -> None:
+        """Inject checkpoint state from SessionStateProvider before processing.
+
+        IMPORTANT: After replacing _turn_tag_index and _engine_state, this method
+        must rebind delegate references so tagging, compaction, retrieval, and
+        search operate on the new objects. Follows the same pattern as
+        ProxyState._rebind_engine_references().
+        """
+        from .proxy.session_state import SessionState  # noqa: F811
+
+        # Carry the Redis version so extract_session_state can pass it back
+        self._session_state_version = state.version
+
+        # Engine state markers (including tool_tag_counter for fallback continuity)
+        self._engine_state.tool_tag_counter = state.tool_tag_counter
+        self._engine_state.compacted_through = state.compacted_through
+        self._engine_state.last_compacted_turn = state.last_compacted_turn
+        self._engine_state.last_completed_turn = state.last_completed_turn
+        self._engine_state.last_indexed_turn = state.last_indexed_turn
+        self._engine_state.checkpoint_version = state.checkpoint_version
+        self._engine_state.conversation_generation = state.conversation_generation
+        self._engine_state.split_processed_tags = set(state.split_processed_tags)
+        self._engine_state.trailing_fingerprint = state.trailing_fingerprint
+        self._engine_state.provider = state.provider
+
+        # Turn tag index — replace and rebuild
+        self._turn_tag_index = TurnTagIndex()
+        for entry_dict in state.turn_tag_entries:
+            # Parse timestamp from ISO string, default to now if missing
+            ts_raw = entry_dict.get("timestamp")
+            if isinstance(ts_raw, str):
+                try:
+                    ts = datetime.fromisoformat(ts_raw)
+                except (ValueError, TypeError):
+                    ts = datetime.now(timezone.utc)
+            else:
+                ts = datetime.now(timezone.utc)
+
+            # Restore fact_signals if present
+            fs_raw = entry_dict.get("fact_signals", [])
+            fs = None
+            if fs_raw:
+                from .types import FactSignal
+                fs = [
+                    FactSignal(
+                        subject=f.get("subject", ""),
+                        verb=f.get("verb", ""),
+                        object=f.get("object", ""),
+                        status=f.get("status", ""),
+                        fact_type=f.get("fact_type", ""),
+                        what=f.get("what", ""),
+                    )
+                    for f in fs_raw if isinstance(f, dict)
+                ]
+
+            self._turn_tag_index.append(TurnTagEntry(
+                turn_number=entry_dict.get("turn_number", 0),
+                tags=entry_dict.get("tags", []),
+                primary_tag=entry_dict.get("primary_tag", "_general"),
+                message_hash=entry_dict.get("message_hash", ""),
+                sender=entry_dict.get("sender", ""),
+                timestamp=ts,
+                session_date=entry_dict.get("session_date", ""),
+                fact_signals=fs,
+            ))
+
+        # Working set — uses DepthLevel enum, NOT PagingDepth
+        from .types import WorkingSetEntry, DepthLevel
+        self._paging.working_set = {}
+        for ws in state.working_set:
+            tag = ws.get("tag", "")
+            self._paging.working_set[tag] = WorkingSetEntry(
+                tag=tag,
+                depth=DepthLevel(ws.get("depth", "summary")),
+                tokens=ws.get("tokens", 0),
+                last_accessed_turn=ws.get("last_accessed_turn", 0),
+            )
+
+        # Restore telemetry rollup. On a REUSED engine, the ledger already
+        # has state from the previous request. Reset it first to avoid
+        # double-counting, then restore the persisted rollup.
+        if hasattr(self, '_telemetry'):
+            reset = getattr(self._telemetry, 'reset', None)
+            if callable(reset):
+                reset()
+            if state.telemetry_rollup:
+                restore = getattr(self._telemetry, 'restore_from_rollup', None)
+                if callable(restore):
+                    restore(state.telemetry_rollup)
+
+        # Request captures: _restored_request_captures is consumed only during
+        # ProxyState.__init__, which has ALREADY run by the time hydrate is called.
+        # So we don't set that field — it would never be read.
+        #
+        # Instead, request captures are NOT restored per-request. They accumulate
+        # naturally through metrics.capture_request() during normal processing.
+        # The persisted request_captures in SessionState serve only as a Postgres
+        # backup for the dashboard's /dashboard/requests endpoint, which reads
+        # from the metrics DB (SQLite), not from in-memory state.
+        #
+        # On a full cold start (no metrics DB), request captures are lost.
+        # This matches current behavior — the metrics DB is local per-worker.
+
+        # Rebind delegates — critical! Without this, tagging/compaction/retrieval
+        # still point at the pre-hydration _turn_tag_index and _engine_state.
+        new_tti = self._turn_tag_index
+        new_es = self._engine_state
+        for attr in ("_tagging", "_compaction", "_retrieval", "_search"):
+            delegate = getattr(self, attr, None)
+            if delegate is None:
+                continue
+            if hasattr(delegate, "_turn_tag_index"):
+                delegate._turn_tag_index = new_tti
+            if hasattr(delegate, "_engine_state"):
+                delegate._engine_state = new_es
+        if hasattr(self, "_retriever"):
+            self._retriever._turn_tag_index = new_tti
+        retrieval = getattr(self, "_retrieval", None)
+        if retrieval and hasattr(retrieval, "_retriever"):
+            retrieval._retriever._turn_tag_index = new_tti
+        # Segmenter also reads _turn_tag_index during compaction
+        if hasattr(self, "_segmenter") and hasattr(self._segmenter, "_turn_tag_index"):
+            self._segmenter._turn_tag_index = new_tti
+
+    def extract_session_state(self):
+        """Extract current checkpoint state for SessionStateProvider save.
+
+        Preserves the loaded Redis version so provider.save() can do
+        optimistic version checking. Also preserves timestamp and fact_signals
+        on TurnTagEntry — these are used by tag velocity and compaction.
+        """
+        from .proxy.session_state import SessionState
+
+        return SessionState(
+            compacted_through=self._engine_state.compacted_through,
+            last_compacted_turn=self._engine_state.last_compacted_turn,
+            last_completed_turn=self._engine_state.last_completed_turn,
+            last_indexed_turn=self._engine_state.last_indexed_turn,
+            checkpoint_version=self._engine_state.checkpoint_version,
+            conversation_generation=self._engine_state.conversation_generation,
+            split_processed_tags=set(self._engine_state.split_processed_tags),
+            trailing_fingerprint=self._engine_state.trailing_fingerprint,
+            provider=self._engine_state.provider,
+            version=self._session_state_version,  # Carry loaded version for CAS
+            tool_tag_counter=self._engine_state.tool_tag_counter,
+            # Use rollup only — strip raw events to keep Redis blobs small.
+            telemetry_rollup={
+                k: v for k, v in (
+                    self._telemetry.to_dict() if hasattr(self._telemetry, 'to_dict') else {}
+                ).items()
+                if k != "events"
+            },
+            request_captures=(
+                self._request_captures_provider()
+                if callable(self._request_captures_provider) else []
+            ),
+            turn_tag_entries=[
+                {
+                    "turn_number": e.turn_number,
+                    "tags": e.tags,
+                    "primary_tag": e.primary_tag,
+                    "message_hash": e.message_hash,
+                    "sender": e.sender,
+                    "timestamp": e.timestamp.isoformat() if e.timestamp else "",
+                    "session_date": getattr(e, "session_date", ""),
+                    "fact_signals": [
+                        {"subject": fs.subject, "verb": fs.verb,
+                         "object": fs.object, "status": fs.status,
+                         "fact_type": getattr(fs, "fact_type", ""),
+                         "what": getattr(fs, "what", "")}
+                        for fs in (e.fact_signals or [])
+                    ] if e.fact_signals else [],
+                }
+                for e in self._turn_tag_index.entries
+            ],
+            working_set=[
+                {
+                    "tag": ws.tag,
+                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                    "tokens": ws.tokens,
+                    "last_accessed_turn": ws.last_accessed_turn,
+                }
+                for ws in self._paging.working_set.values()
+            ],
+        )
+
     def _save_state(
         self,
         conversation_history: list[Message] | None,
@@ -742,6 +947,16 @@ class VirtualContextEngine:
         last_completed_turn: int | None = None,
         last_indexed_turn: int | None = None,
     ) -> bool:
+        if self._session_state_provider is not None:
+            # Provider mode: caller manages saves. Don't write to store/Redis directly.
+            # Still update checkpoint markers for in-memory consistency.
+            self._update_checkpoint_markers(
+                conversation_history,
+                last_completed_turn=last_completed_turn,
+                last_indexed_turn=last_indexed_turn,
+            )
+            self._engine_state.checkpoint_version += 1
+            return True
         try:
             self._update_checkpoint_markers(
                 conversation_history,
