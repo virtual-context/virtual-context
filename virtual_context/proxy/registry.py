@@ -216,6 +216,17 @@ class SessionRegistry:
                     if _redirected:
                         conversation_id = _redirected
 
+        # --- Redis invalidation check (VCATTACH cross-worker eviction) ---
+        # The key has a 60s TTL — do NOT delete it. Let every worker see it
+        # within the TTL window. Each worker evicts locally when it observes
+        # the key, then naturally the key expires.
+        if conversation_id and self._session_cache and hasattr(self._session_cache, "_redis"):
+            try:
+                if self._session_cache._redis.get(f"vc:invalidate:{conversation_id}"):
+                    self.remove_conversation(conversation_id)
+            except Exception:
+                pass
+
         # --- 0. Explicit conversation marker (highest priority) ---
         if conversation_id:
             for sid, st in self._conversations.items():
@@ -359,6 +370,18 @@ class SessionRegistry:
                 if value != conversation_id
             }
             return state
+
+    def invalidate_conversation(self, conversation_id: str) -> None:
+        """Evict locally and write Redis invalidation key for other workers."""
+        # Write Redis key BEFORE evicting, using the registry's own cache handle
+        # (not one from a loaded session that might be about to be removed).
+        if self._session_cache and hasattr(self._session_cache, "_redis"):
+            try:
+                self._session_cache._redis.set(
+                    f"vc:invalidate:{conversation_id}", "1", ex=60)
+            except Exception:
+                pass
+        self.remove_conversation(conversation_id)
 
     def shutdown_all(self) -> None:
         with self._lock:
