@@ -1720,7 +1720,19 @@ def create_app(
 
         if result.is_vcattach:
             from .handlers import _handle_vcattach
-            return await _handle_vcattach(result, fmt, state, registry)
+            # In cloud mode, get labels + conv IDs from the tenant registry
+            # so VCATTACH can resolve by label (not just UUID).
+            _vcattach_labels = {}
+            _vcattach_conv_ids = None
+            _tenant_reg = getattr(app.state, "tenant_registry", None)
+            _tid = getattr(request.state, "tenant_id", None)
+            if _tenant_reg and _tid:
+                _vcattach_labels = _tenant_reg.get_conversation_labels(_tid)
+                _vcattach_conv_ids = _tenant_reg.list_persisted_conversation_ids(_tid)
+            return await _handle_vcattach(
+                result, fmt, state, registry,
+                labels=_vcattach_labels, conv_ids=_vcattach_conv_ids,
+            )
 
         if result.is_passthrough:
             if result.is_streaming:
