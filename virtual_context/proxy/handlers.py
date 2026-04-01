@@ -2078,14 +2078,15 @@ def _handle_vcforget(tag: str, state):
     store = engine._store
     conv_id = engine.config.conversation_id
 
-    # Check if tag exists
-    all_tags = store.get_all_tags(conversation_id=conv_id)
-    if tag not in all_tags:
+    # Check if tag exists — get_all_tags returns TagStats objects
+    all_tag_stats = store.get_all_tags(conversation_id=conv_id)
+    all_tag_names = [ts.tag for ts in all_tag_stats if hasattr(ts, "tag")]
+    if tag not in all_tag_names:
         # Try case-insensitive match
         tag_lower = tag.lower()
-        matches = [t for t in all_tags if t.lower() == tag_lower]
+        matches = [t for t in all_tag_names if t.lower() == tag_lower]
         if not matches:
-            available = ", ".join(sorted(all_tags)[:20])
+            available = ", ".join(sorted(all_tag_names)[:20])
             return f"Tag '{tag}' not found. Available tags: {available}"
         tag = matches[0]
 
