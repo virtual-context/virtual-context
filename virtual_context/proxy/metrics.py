@@ -74,7 +74,8 @@ class ProxyMetrics:
 
     def __init__(self, context_window: int = 120_000, telemetry_ledger=None,
                  db_path: str | None = None, store=None,
-                 restore_captures: bool = True) -> None:
+                 restore_captures: bool = True,
+                 on_event=None) -> None:
         self.start_time: float = time.time()
         self.context_window: int = context_window
         self._events: list[dict] = []
@@ -83,6 +84,7 @@ class ProxyMetrics:
         self._seq = 0
         self._request_bodies: deque[dict] = deque(maxlen=50)
         self._telemetry_ledger = telemetry_ledger
+        self._on_event = on_event  # Optional callback for cross-worker broadcasting
         self._db: sqlite3.Connection | None = None
 
         if db_path:
@@ -244,6 +246,13 @@ class ProxyMetrics:
                 self._evict_old()
             if len(self._events) > self.MAX_EVENTS:
                 del self._events[:len(self._events) - self.MAX_EVENTS]
+
+            # Broadcast to cross-worker listeners (e.g., Redis pub/sub)
+            if self._on_event:
+                try:
+                    self._on_event(event)
+                except Exception:
+                    pass
 
     _STALE_EVENT_TYPES = frozenset((
         "ingested_turn", "history_ingestion",
