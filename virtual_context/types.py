@@ -950,6 +950,9 @@ class PreparedPayload:
     vcattach_target_id: str = ""
     vcattach_label: str = ""
     vcattach_old_id: str = ""
+    # Generic VC command support (attach, label, status, recall, compact, list, forget)
+    vc_command: str = ""
+    vc_command_arg: str = ""
 
 
 @dataclass

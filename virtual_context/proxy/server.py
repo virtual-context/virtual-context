@@ -292,13 +292,16 @@ async def prepare_payload(
     user_message = fmt.extract_user_message(body)
     is_streaming = body.get("stream", False)
 
-    # --- VCATTACH command detection ---
+    # --- VC command detection (VCATTACH, VCLABEL, VCSTATUS, VCRECALL, VCCOMPACT, VCLIST, VCFORGET) ---
     import re as _re
-    _vcattach_match = _re.match(r"^VCATTACH\s+(.+)$", user_message.strip(), _re.IGNORECASE)
-    if _vcattach_match:
-        _vcattach_target = _vcattach_match.group(1).strip()
-        # Resolution happens in the caller (cloud or core routing layer).
-        # Return early with the flag set — no pipeline processing.
+    _vc_cmd_match = _re.match(
+        r"^VC(ATTACH|LABEL|STATUS|RECALL|COMPACT|LIST|FORGET)(?:\s+(.+))?$",
+        user_message.strip(), _re.IGNORECASE,
+    )
+    if _vc_cmd_match:
+        _vc_cmd = _vc_cmd_match.group(1).upper()
+        _vc_arg = (_vc_cmd_match.group(2) or "").strip()
+        # Early return — no pipeline processing for VC commands.
         return PreparedPayload(
             body=body,
             enriched_body=body,
@@ -328,9 +331,11 @@ async def prepare_payload(
             restore_tool_injected=False,
             inbound_bytes=0,
             outbound_bytes=0,
-            is_vcattach=True,
-            vcattach_target_id="",  # resolved by caller
-            vcattach_label=_vcattach_target,
+            is_vcattach=(_vc_cmd == "ATTACH"),
+            vcattach_target_id="",
+            vcattach_label=_vc_arg if _vc_cmd == "ATTACH" else "",
+            vc_command=_vc_cmd.lower(),
+            vc_command_arg=_vc_arg,
         )
 
     # Resolve upstream context window limit for this model
@@ -1718,20 +1723,13 @@ def create_app(
         # Override overhead_ms with total wall-clock time for the full VC pipeline
         result.overhead_ms = round((time.monotonic() - _t_prepare) * 1000, 1)
 
-        if result.is_vcattach:
-            from .handlers import _handle_vcattach
-            # In cloud mode, get labels + conv IDs from the tenant registry
-            # so VCATTACH can resolve by label (not just UUID).
-            _vcattach_labels = {}
-            _vcattach_conv_ids = None
+        if result.vc_command:
+            from .handlers import _handle_vc_command
             _tenant_reg = getattr(app.state, "tenant_registry", None)
             _tid = getattr(request.state, "tenant_id", None)
-            if _tenant_reg and _tid:
-                _vcattach_labels = _tenant_reg.get_conversation_labels(_tid)
-                _vcattach_conv_ids = _tenant_reg.list_persisted_conversation_ids(_tid)
-            return await _handle_vcattach(
+            return await _handle_vc_command(
                 result, fmt, state, registry,
-                labels=_vcattach_labels, conv_ids=_vcattach_conv_ids,
+                tenant_registry=_tenant_reg, tenant_id=_tid,
             )
 
         if result.is_passthrough:
