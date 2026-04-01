@@ -1718,6 +1718,10 @@ def create_app(
         # Override overhead_ms with total wall-clock time for the full VC pipeline
         result.overhead_ms = round((time.monotonic() - _t_prepare) * 1000, 1)
 
+        if result.is_vcattach:
+            from .handlers import _handle_vcattach
+            return await _handle_vcattach(result, fmt, state, registry)
+
         if result.is_passthrough:
             if result.is_streaming:
                 return await _handle_streaming(
