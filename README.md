@@ -14,15 +14,21 @@
 
 # virtual-context
 
-**100x your agent's context by virtualizing it. Better reasoning. Unlimited memory. Lower costs.**
+**100x your agent's context by virtualizing it. Better reasoning. Persistent memory. Shared across platforms. Lower costs.**
 
 *95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#benchmark-results)*
 
 Your client sets `contextWindow: 20000000` (20 million). Your model's real window is 200K. virtual-context sits between them and makes it work, the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal.
 
-The result is measurably better reasoning, recall and cost than raw full context.
+Virtualizing the context window has consequences that go well beyond compression:
 
-This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive*: they retrieve chunks and compete for the context window your agent is working in right now. They are not working to evict or curate the context to what you really need.
+- **Compression**: Topic-level summarization with structured fact extraction. A 937K-token payload collapses to ~65K. Everything is stored, indexed, and recoverable at full fidelity.
+- **Memory**: Your agent recalls what the user said at turn 12 when it reaches turn 1000. Facts, preferences, and decisions persist across the full conversation, not just what fits in the raw window.
+- **Reasoning quality**: A curated 60K window of dense signal produces measurably better answers than a raw 200K window full of noise. The model reasons over what matters, not over everything.
+- **Cost**: Smaller payloads, fewer tokens billed. A conversation running at a 1M-token virtual window regularly produces 60-90K actual payloads, a fraction of the raw cost. The payload is organized to maximize prompt cache hits, so even compressed conversations achieve significant caching in most cases.
+- **Collaboration**: VCATTACH lets agents share memory across platforms and sessions. Custom agents, local tools, and API clients can all work from the same context. Multiple agents collaborate through shared memory. Conversations survive client restarts, platform switches, and session boundaries.
+
+This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive*: they retrieve chunks and compete for the context window your agent is working in right now. They do nothing to evict or curate what's already there.
 
 virtual-context *manages* the window itself: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The client thinks it has 20M tokens. The model sees 60K of curated signal. Nothing is lost. Everything is addressable, at varying levels of compression.
 
@@ -31,8 +37,6 @@ Layer 0: Raw conversation turns              (active memory, in the context wind
 Layer 1: Segment summaries + Facts per tag   (compressed pages, per-topic summaries)
 Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-eye view)
 ```
-
-The result: an agent that recalls details from turn 12 at turn 1000 with the same fidelity as if the conversation just started.
 
 **[Full documentation →](https://virtual-context.com/docs/)** including [architecture and pipeline](https://virtual-context.com/docs/architecture/), [features deep dive](https://virtual-context.com/docs/capabilities/), [proxy internals](https://virtual-context.com/docs/proxy/), [design decisions](https://virtual-context.com/docs/design/), and [user commands](https://virtual-context.com/docs/vcattach/).
 
@@ -243,7 +247,7 @@ Handles all four provider formats (Anthropic, OpenAI Chat, OpenAI Responses, Gem
 
 ### Media Compression
 
-Base64 images in API payloads are enormous: a single screenshot is 300-500KB of base64, consuming ~100K tokens. virtual-context compresses images on first sight: a 391KB screenshot becomes ~40KB, saving ~88K tokens per image. Originals are stored to disk for recovery. This runs on both passthrough and active paths, so even conversations that haven't triggered compaction benefit.
+Base64 images in API payloads are enormous: a single screenshot is 300-500KB of base64. Providers process images through vision encoders with fixed token costs based on dimensions, not base64 string length, but payload size still matters for bandwidth, latency, and TTFB. virtual-context compresses images on first sight: a 391KB screenshot becomes ~40KB, cutting payload size by ~90%. Originals are stored to disk for recovery. This runs on both passthrough and active paths, so even conversations that haven't triggered compaction benefit.
 
 ### Virtual Memory Paging
 
