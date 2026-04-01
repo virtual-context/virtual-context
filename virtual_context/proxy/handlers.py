@@ -1740,3 +1740,378 @@ async def _handle_vcattach(
             media_type="text/event-stream",
         )
     return JSONResponse(fmt.build_fake_response(text, target_id))
+
+
+async def _handle_vc_command(
+    result,
+    fmt,
+    state,
+    registry,
+    *,
+    tenant_registry=None,
+    tenant_id: str | None = None,
+):
+    """Dispatch all VC commands (attach, label, status, recall, compact, list, forget)."""
+    from starlette.responses import StreamingResponse, JSONResponse
+
+    cmd = result.vc_command
+    arg = result.vc_command_arg
+    conv_id = result.conversation_id
+
+    if cmd == "attach":
+        labels = {}
+        conv_ids = None
+        if tenant_registry and tenant_id:
+            labels = tenant_registry.get_conversation_labels(tenant_id)
+            conv_ids = tenant_registry.list_persisted_conversation_ids(tenant_id)
+        return await _handle_vcattach(
+            result, fmt, state, registry,
+            labels=labels, conv_ids=conv_ids,
+        )
+
+    if cmd == "label":
+        text = _handle_vclabel(arg, conv_id, state, tenant_registry, tenant_id)
+    elif cmd == "status":
+        text = _handle_vcstatus(conv_id, state, tenant_registry, tenant_id)
+    elif cmd == "recall":
+        text = _handle_vcrecall(arg, state)
+    elif cmd == "compact":
+        text = _handle_vccompact(state)
+    elif cmd == "list":
+        text = _handle_vclist(tenant_registry, tenant_id)
+    elif cmd == "forget":
+        text = _handle_vcforget(arg, state)
+    else:
+        text = f"Unknown VC command: {cmd}"
+
+    if result.is_streaming:
+        return StreamingResponse(
+            iter([fmt.emit_fake_response_sse(text, conv_id)]),
+            media_type="text/event-stream",
+        )
+    return JSONResponse(fmt.build_fake_response(text, conv_id))
+
+
+def _handle_vclabel(label: str, conv_id: str, state, tenant_registry, tenant_id):
+    """Set or show the current conversation's label."""
+    if not label:
+        # Show current label
+        if tenant_registry and tenant_id:
+            labels = tenant_registry.get_conversation_labels(tenant_id)
+            current = labels.get(conv_id, "")
+            if current:
+                return f"Current label: {current}"
+            return f"No label set. Use VCLABEL <name> to set one."
+        return "Labels not available (no tenant registry)."
+
+    if not tenant_registry or not tenant_id:
+        return "Labels not available (no tenant registry)."
+
+    tenant_registry.set_conversation_label(tenant_id, conv_id, label)
+    return f"Label set to '{label}'"
+
+
+def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
+    """Return conversation status summary."""
+    if not state:
+        return "No active conversation."
+
+    engine = state.engine
+    es = engine._engine_state
+    tti = engine._turn_tag_index
+
+    label = ""
+    if tenant_registry and tenant_id:
+        labels = tenant_registry.get_conversation_labels(tenant_id)
+        label = labels.get(conv_id, "")
+
+    turns = len(tti.entries) if tti else 0
+    compacted = getattr(es, "compacted_through", 0)
+    generation = getattr(es, "conversation_generation", 0)
+
+    # Segment count from store
+    segments = 0
+    try:
+        store = engine._store
+        stats = getattr(store, "get_conversation_stats", None)
+        if callable(stats):
+            for s in stats():
+                if getattr(s, "conversation_id", "") == conv_id:
+                    segments = getattr(s, "segment_count", 0)
+                    break
+    except Exception:
+        pass
+
+    # Working set
+    ws = getattr(engine, "_paging", None)
+    ws_entries = list(ws.working_set.values()) if ws and hasattr(ws, "working_set") else []
+    ws_tokens = sum(e.tokens for e in ws_entries)
+
+    # Active tags
+    active_tags = sorted(tti.get_active_tags(lookback=6)) if tti else []
+
+    lines = [
+        f"Conversation: {conv_id}",
+    ]
+    if label:
+        lines.append(f"Label: {label}")
+    lines.extend([
+        f"Turns: {turns} (compacted through {compacted})",
+        f"Segments: {segments}",
+        f"Generation: {generation}",
+        f"Working set: {len(ws_entries)} tags, {ws_tokens:,} tokens",
+        f"Active tags: {', '.join(active_tags[:15]) if active_tags else 'none'}",
+    ])
+    return "\n".join(lines)
+
+
+def _handle_vcrecall(query: str, state):
+    """Search for content and promote matching tags to working set."""
+    if not query:
+        return "Usage: VCRECALL <query>"
+    if not state:
+        return "No active conversation."
+
+    engine = state.engine
+    store = engine._store
+
+    # Search across all sources
+    from ..core.quote_search import find_quote
+    semantic = getattr(engine, "_semantic", None)
+    results = find_quote(
+        store, semantic, query, max_results=10,
+        conversation_id=engine.config.conversation_id,
+    )
+
+    if not results.get("found"):
+        return f"No matches found for '{query}'."
+
+    # Extract unique tags from results
+    matched_tags = set()
+    for r in results.get("results", []):
+        tag = r.get("tag", "")
+        if tag:
+            matched_tags.add(tag)
+        # Also check source segments
+        for seg in r.get("segments", []):
+            tags = seg.get("tags", [])
+            for t in tags:
+                matched_tags.add(t)
+
+    if not matched_tags:
+        return f"Found content for '{query}' but no tags to promote."
+
+    # Promote matching tags to working set at full depth
+    promoted = []
+    for tag in sorted(matched_tags)[:5]:  # cap at 5 to avoid budget explosion
+        try:
+            result = engine.expand_topic(tag=tag, depth="full")
+            if result and not result.get("error"):
+                tokens = result.get("tokens", 0)
+                promoted.append(f"  {tag} ({tokens:,} tokens)")
+        except Exception:
+            pass
+
+    if not promoted:
+        return f"Found matches for '{query}' but could not promote any tags."
+
+    lines = [
+        f"Recalled {len(promoted)} topic(s) for '{query}':",
+        *promoted,
+        "",
+        "These topics are now in the working set and will be included in context for subsequent turns.",
+    ]
+    return "\n".join(lines)
+
+
+def _handle_vccompact(state):
+    """Force compaction now."""
+    if not state:
+        return "No active conversation."
+
+    engine = state.engine
+    tti = engine._turn_tag_index
+    es = engine._engine_state
+
+    turns = len(tti.entries) if tti else 0
+    compacted = getattr(es, "compacted_through", 0)
+    uncompacted = turns - compacted
+
+    if uncompacted < 2:
+        return f"Nothing to compact ({turns} turns, all compacted through {compacted})."
+
+    # Force compaction via _compact_after_ingestion pattern —
+    # submits to background pool, doesn't block response.
+    try:
+        from ..types import CompactionSignal
+        history = state.conversation_history if state.conversation_history else []
+        signal = CompactionSignal(
+            priority="soft",
+            current_tokens=uncompacted * 100,
+            budget_tokens=engine.config.monitor.context_window,
+            overflow_tokens=uncompacted * 50,
+        )
+        state._compact_pool.submit(state._run_compact, history, signal, turns)
+        return f"Compaction started for {uncompacted} uncompacted turns (turns {compacted + 1}\u2013{turns})."
+    except Exception as e:
+        return f"Could not trigger compaction: {e}"
+
+
+def _handle_vclist(tenant_registry, tenant_id):
+    """List all conversations with labels."""
+    if not tenant_registry or not tenant_id:
+        return "Conversation list not available (no tenant registry)."
+
+    labels = tenant_registry.get_conversation_labels(tenant_id)
+    conv_ids = tenant_registry.list_persisted_conversation_ids(tenant_id)
+
+    if not conv_ids:
+        return "No conversations found."
+
+    lines = ["Conversations:"]
+    for cid in conv_ids:
+        label = labels.get(cid, "")
+        # Try to get turn count from loaded state
+        st = tenant_registry.get_state(tenant_id, cid)
+        turns = "?"
+        if st:
+            tti = st.engine._turn_tag_index
+            turns = str(len(tti.entries)) if tti else "0"
+        label_str = f" ({label})" if label else ""
+        lines.append(f"  {cid[:12]}{label_str} — {turns} turns")
+
+    return "\n".join(lines)
+
+
+def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
+    """REST endpoint handler for all VC commands. Returns JSONResponse."""
+    from starlette.responses import JSONResponse
+    cmd = result.vc_command
+    arg = result.vc_command_arg
+    conv_id = vcconv or result.conversation_id
+
+    if cmd == "attach":
+        # VCATTACH has special REST handling — alias, delete, reset
+        from .vcattach import resolve_target, execute_attach
+
+        labels = registry.get_conversation_labels(tenant_id)
+        conv_ids = registry.list_persisted_conversation_ids(tenant_id)
+        target_id, target_label, error = resolve_target(arg, conv_id, conv_ids, labels)
+
+        if error:
+            return JSONResponse({"conversation_id": conv_id, "vc_command": "attach", "error": error})
+
+        _store = state.engine._store
+        _inner = getattr(_store, '_store', _store)
+
+        def _reset_target(tid):
+            _load = getattr(_inner, 'load_engine_state', None)
+            _save = getattr(_inner, 'save_engine_state', None)
+            if callable(_load) and callable(_save):
+                existing = _load(tid)
+                if existing:
+                    existing.compacted_through = 0
+                    existing.last_compacted_turn = -1
+                    existing.last_completed_turn = -1
+                    existing.last_indexed_turn = -1
+                    existing.turn_tag_entries = []
+                    _save(existing)
+
+        def _invalidate(tid):
+            if registry._session_state_provider:
+                try:
+                    registry._session_state_provider.delete(tid)
+                except Exception:
+                    pass
+
+        execute_attach(
+            old_id=conv_id,
+            target_id=target_id,
+            store=_inner,
+            registry_invalidate=_invalidate,
+            delete_conversation=lambda cid: registry.delete_conversation(tenant_id, cid),
+            reset_engine_state=_reset_target,
+        )
+
+        marker = f"\n<!-- vc:conversation={target_id} -->"
+        message = f"Conversation attached to {target_label} ({target_id}). History restored."
+        return JSONResponse({
+            "conversation_id": target_id,
+            "vc_command": "attach",
+            "label": target_label,
+            "message": message,
+            "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": message + marker}]}]},
+        })
+
+    # All other commands: dispatch to shared handlers, return JSON
+    if cmd == "label":
+        text = _handle_vclabel(arg, conv_id, state, registry, tenant_id)
+    elif cmd == "status":
+        text = _handle_vcstatus(conv_id, state, registry, tenant_id)
+    elif cmd == "recall":
+        text = _handle_vcrecall(arg, state)
+    elif cmd == "compact":
+        text = _handle_vccompact(state)
+    elif cmd == "list":
+        text = _handle_vclist(registry, tenant_id)
+    elif cmd == "forget":
+        text = _handle_vcforget(arg, state)
+    else:
+        text = f"Unknown VC command: {cmd}"
+
+    marker = f"\n<!-- vc:conversation={conv_id} -->"
+    return JSONResponse({
+        "conversation_id": conv_id,
+        "vc_command": cmd,
+        "message": text,
+        "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": text + marker}]}]},
+    })
+
+
+def _handle_vcforget(tag: str, state):
+    """Delete segments and summaries for a specific tag."""
+    if not tag:
+        return "Usage: VCFORGET <tag>"
+    if not state:
+        return "No active conversation."
+
+    engine = state.engine
+    store = engine._store
+    conv_id = engine.config.conversation_id
+
+    # Check if tag exists
+    all_tags = store.get_all_tags(conversation_id=conv_id)
+    if tag not in all_tags:
+        # Try case-insensitive match
+        tag_lower = tag.lower()
+        matches = [t for t in all_tags if t.lower() == tag_lower]
+        if not matches:
+            available = ", ".join(sorted(all_tags)[:20])
+            return f"Tag '{tag}' not found. Available tags: {available}"
+        tag = matches[0]
+
+    # Delete segments for this tag
+    deleted = 0
+    try:
+        segments = store.get_segments_by_tags([tag], conversation_id=conv_id)
+        for seg in segments:
+            ref = getattr(seg, "ref", "") or getattr(seg, "segment_ref", "")
+            if ref:
+                store.delete_segment(ref)
+                deleted += 1
+    except Exception:
+        pass
+
+    # Delete tag summary
+    try:
+        if hasattr(store, "delete_tag_summary"):
+            store.delete_tag_summary(tag, conversation_id=conv_id)
+    except Exception:
+        pass
+
+    # Remove from working set if present
+    paging = getattr(engine, "_paging", None)
+    if paging and hasattr(paging, "working_set"):
+        paging.working_set.pop(tag, None)
+
+    return f"Forgot '{tag}': {deleted} segment(s) removed."
