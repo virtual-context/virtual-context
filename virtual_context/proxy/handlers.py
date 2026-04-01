@@ -1631,3 +1631,106 @@ async def _handle_non_streaming(
         status_code=resp.status_code,
         headers=resp_headers,
     )
+
+
+# -------------------------------------------------------------------
+# VCATTACH handler
+# -------------------------------------------------------------------
+
+async def _handle_vcattach(
+    result,
+    fmt,
+    state,
+    registry,
+):
+    """Handle VCATTACH command — resolve target, execute attach, return fake response."""
+    from starlette.responses import StreamingResponse, JSONResponse
+    from .vcattach import resolve_target, execute_attach
+
+    target_raw = result.vcattach_label
+
+    # Resolve target (core proxy: UUID only, no labels).
+    # Include both in-memory sessions AND persisted conversations from store.
+    conv_ids = list(registry._conversations.keys()) if registry else []
+    if state and state.engine._store:
+        _stats = getattr(state.engine._store, "get_conversation_stats", None)
+        if callable(_stats):
+            try:
+                for s in _stats():
+                    cid = getattr(s, "conversation_id", "")
+                    if cid and cid not in conv_ids:
+                        conv_ids.append(cid)
+            except Exception:
+                pass
+    target_id, target_label, error = resolve_target(
+        target_raw, result.conversation_id, conv_ids, labels={},
+    )
+
+    if error:
+        if result.is_streaming:
+            return StreamingResponse(
+                iter([fmt.emit_fake_response_sse(error, result.conversation_id)]),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(fmt.build_fake_response(error, result.conversation_id))
+
+    # Execute attach with full authoritative delete
+    _store = state.engine._store if state else None
+    _inner = getattr(_store, '_store', _store) if _store else None
+
+    def _full_delete(cid):
+        if _inner:
+            begin = getattr(_inner, "begin_conversation_deletion", None)
+            if callable(begin):
+                begin(cid)
+        target_state = registry.remove_conversation(cid) if registry else None
+        if target_state is not None:
+            try:
+                target_state.reset_for_conversation_deletion(cid, authoritative=True)
+            except Exception:
+                pass
+            try:
+                target_state.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        if _inner and hasattr(_inner, "delete_conversation"):
+            _inner.delete_conversation(cid)
+        if target_state and hasattr(target_state.engine, "_session_cache"):
+            cache = target_state.engine._session_cache
+            if cache:
+                try:
+                    cache.delete_conversation(cid)
+                except Exception:
+                    pass
+
+    def _reset_target(tid):
+        if not _inner:
+            return
+        _load = getattr(_inner, "load_engine_state", None)
+        _save = getattr(_inner, "save_engine_state", None)
+        if callable(_load) and callable(_save):
+            existing = _load(tid)
+            if existing:
+                existing.compacted_through = 0
+                existing.last_compacted_turn = -1
+                existing.last_completed_turn = -1
+                existing.last_indexed_turn = -1
+                existing.turn_tag_entries = []
+                _save(existing)
+
+    execute_attach(
+        old_id=result.conversation_id,
+        target_id=target_id,
+        store=_inner,
+        registry_invalidate=registry.invalidate_conversation if registry else None,
+        delete_conversation=_full_delete,
+        reset_engine_state=_reset_target,
+    )
+
+    text = f"Conversation attached to {target_label} ({target_id}). History restored."
+    if result.is_streaming:
+        return StreamingResponse(
+            iter([fmt.emit_fake_response_sse(text, target_id)]),
+            media_type="text/event-stream",
+        )
+    return JSONResponse(fmt.build_fake_response(text, target_id))
