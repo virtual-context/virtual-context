@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     PRIMARY KEY (conversation_id, turn_number)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_aliases (
+    alias_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS segment_chunks (
     segment_ref TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -1661,6 +1666,23 @@ class PostgresStore(ContextStore):
                 match_type="turn_search",
             ))
         return results
+
+    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO conversation_aliases (alias_id, target_id)
+            VALUES (%s, %s)
+            ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id""",
+            (alias_id, target_id),
+        )
+
+    def resolve_conversation_alias(self, alias_id: str) -> str | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
+            (alias_id,),
+        ).fetchone()
+        return row["target_id"] if row else None
 
     def get_turn_messages(
         self,

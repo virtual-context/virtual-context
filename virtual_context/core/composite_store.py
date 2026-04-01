@@ -200,6 +200,12 @@ class CompositeStore:
             return _search(query, limit=limit, conversation_id=conversation_id)
         return []
 
+    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
+        self._segments.save_conversation_alias(alias_id, target_id)
+
+    def resolve_conversation_alias(self, alias_id: str) -> str | None:
+        return self._segments.resolve_conversation_alias(alias_id)
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------

@@ -183,6 +183,9 @@ class FilesystemStore(ContextStore):
         self._ensure_root()
         self._load_index()
         self._load_aliases()
+        self._vcattach_aliases_path = self.root / "_vcattach_aliases.json"
+        self._vcattach_aliases: dict[str, str] = {}
+        self._load_vcattach_aliases()
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -974,6 +977,33 @@ class FilesystemStore(ContextStore):
         if removed:
             path.write_text(json.dumps(kept, indent=2))
         return removed
+
+    # ------------------------------------------------------------------
+    # Conversation aliases (VCATTACH)
+    # ------------------------------------------------------------------
+
+    def _load_vcattach_aliases(self) -> None:
+        if self._vcattach_aliases_path.is_file():
+            try:
+                self._vcattach_aliases = json.loads(
+                    self._vcattach_aliases_path.read_text()
+                )
+            except (json.JSONDecodeError, OSError):
+                self._vcattach_aliases = {}
+        else:
+            self._vcattach_aliases = {}
+
+    def _save_vcattach_aliases(self) -> None:
+        tmp = self._vcattach_aliases_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self._vcattach_aliases, indent=2))
+        os.replace(str(tmp), str(self._vcattach_aliases_path))
+
+    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
+        self._vcattach_aliases[alias_id] = target_id
+        self._save_vcattach_aliases()
+
+    def resolve_conversation_alias(self, alias_id: str) -> str | None:
+        return self._vcattach_aliases.get(alias_id)
 
     # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
