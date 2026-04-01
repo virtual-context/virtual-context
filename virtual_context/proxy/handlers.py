@@ -1886,17 +1886,16 @@ def _handle_vcrecall(query: str, state):
     if not results.get("found"):
         return f"No matches found for '{query}'."
 
-    # Extract unique tags from results
+    # Extract unique tags from results — find_quote uses "topic" key,
+    # which may be a single tag or comma-separated list of merged tags.
     matched_tags = set()
     for r in results.get("results", []):
-        tag = r.get("tag", "")
-        if tag:
-            matched_tags.add(tag)
-        # Also check source segments
-        for seg in r.get("segments", []):
-            tags = seg.get("tags", [])
-            for t in tags:
-                matched_tags.add(t)
+        topic = r.get("topic", "")
+        if topic:
+            for t in topic.split(", "):
+                t = t.strip()
+                if t:
+                    matched_tags.add(t)
 
     if not matched_tags:
         return f"Found content for '{query}' but no tags to promote."
