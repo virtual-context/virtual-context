@@ -545,6 +545,44 @@ Clients (Claude Code, OpenClaw) sometimes truncate conversation history to manag
 
 Recovery is transparent to the client. The payload that reaches the LLM contains the recovered context as if it had never been truncated.
 
+### Conversation Identity and VCATTACH
+
+Every conversation gets a stable identity derived from the system prompt hash and conversation markers embedded in assistant responses. This identity routes requests to the right conversation's compacted segments, facts, and tags across restarts, deploys, and client changes.
+
+When identity detaches — system prompt changes, client truncation loses the marker, a deploy produces a different hash — the user can reattach by typing:
+
+```
+VCATTACH <conversation_id>
+```
+
+The target can be a conversation label (`VCATTACH website`), a full UUID, or a UUID prefix. The proxy intercepts this before reaching the LLM, resolves the target, and returns a response with the correct conversation marker. From the next request onward, the client routes to the target conversation with its full compacted context.
+
+**What VCATTACH enables:**
+
+**Reattachment after detachment.** The most common case. A deploy or system prompt change creates an orphan conversation. The user types `VCATTACH <label>` and is back on their original conversation with all segments, facts, and tags intact.
+
+**Cross-platform shared memory.** A user builds up deep context in Claude Code — architecture decisions, code patterns, debugging history — all compacted into segments and facts. They type `VCATTACH code-project` in a Telegram conversation with a different model and immediately get that full context. Both clients now share the same conversation identity: messages from either platform enrich the same compacted knowledge base. This isn't document sharing or chat mirroring — it's shared memory across platforms and models.
+
+**Multi-agent collaboration.** Two agents (or two humans using different clients) can work on the same problem space simultaneously. Agent A researches an RFP in Claude Code, compacting findings into segments. Agent B drafts the proposal in a Telegram group, pulling from the same segments via retrieval. Each agent's contributions are compacted into the shared store. The next agent to query sees everything the other contributed — no manual handoff, no copy-paste, no shared documents. The virtual context IS the shared workspace.
+
+
+**Client compaction recovery.** When clients manage their own context windows (Claude Code truncates old turns, OpenClaw resets sessions), the conversation marker can be lost. VCATTACH lets the user reconnect to the original conversation. The stored segments and facts survive independently of the client's history.
+
+**Conversation merging.** A user accidentally creates two conversations about the same topic. They pick the one with richer context and `VCATTACH` the other to it. The old conversation is deleted; the target keeps all its compacted data.
+
+**How it works:**
+
+1. User types `VCATTACH <label_or_id>` as a normal message
+2. Proxy detects the command (regex on the last user message only — history is inert)
+3. Resolves target by label (case-insensitive) or UUID (exact or prefix match)
+4. Registers an alias so old markers redirect permanently
+5. Deletes the old conversation's engine state
+6. Resets the target's compaction checkpoints (segments/facts preserved)
+7. Returns a fake response with the target's conversation marker — no LLM call
+8. Next request carries the new marker and routes to the target
+
+The alias table is persistent — if a stale marker resurfaces from a cached client or different session, it follows the alias instead of creating a new orphan.
+
 ### Virtual Memory Paging
 
 RAG retrieves content and appends it to the context window. It never frees space from what's already there. When a 100k document needs to enter a 120k window that already has 60k of conversation history, RAG has three options: truncate (lossy), error (useless), or chunk (every chunking approach either costs extra user turns, loses cross-chunk coherence, or both). Nobody touches the existing 60k. It sits there, potentially full of stale context from 30 turns ago that nobody needs anymore.

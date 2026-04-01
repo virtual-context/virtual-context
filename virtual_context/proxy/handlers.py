@@ -1722,7 +1722,9 @@ async def _handle_vcattach(
         old_id=result.conversation_id,
         target_id=target_id,
         store=_inner,
-        registry_invalidate=registry.invalidate_conversation if registry else None,
+        # Core proxy: local eviction only. Cloud path: per-request Redis hydration
+        # ensures all workers see the reset state on next request.
+        registry_invalidate=registry.remove_conversation if registry else None,
         delete_conversation=_full_delete,
         reset_engine_state=_reset_target,
     )
