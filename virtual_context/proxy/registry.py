@@ -203,18 +203,14 @@ class SessionRegistry:
         4. Create new session
         """
         # --- Alias resolution: follow redirects from VCATTACH ---
-        if conversation_id:
-            _store = None
-            # Try to get a store from any existing session
-            for _st in self._conversations.values():
-                _store = _st.engine._store
-                break
-            if _store:
-                _alias_resolve = getattr(_store, "resolve_conversation_alias", None)
-                if callable(_alias_resolve):
-                    _redirected = _alias_resolve(conversation_id)
-                    if _redirected:
-                        conversation_id = _redirected
+        # Use the registry's own durable store handle (self._store), not a
+        # session's store — sessions may be empty after VCATTACH eviction.
+        if conversation_id and self._store:
+            _alias_resolve = getattr(self._store, "resolve_conversation_alias", None)
+            if callable(_alias_resolve):
+                _redirected = _alias_resolve(conversation_id)
+                if _redirected:
+                    conversation_id = _redirected
 
         # --- Redis invalidation check (VCATTACH cross-worker eviction) ---
         # The key has a 60s TTL — do NOT delete it. Let every worker see it
