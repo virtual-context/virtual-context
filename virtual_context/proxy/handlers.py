@@ -1808,6 +1808,15 @@ def _handle_vclabel(label: str, conv_id: str, state, tenant_registry, tenant_id)
         return "Labels not available (no tenant registry)."
 
     tenant_registry.set_conversation_label(tenant_id, conv_id, label)
+
+    # Emit event so dashboard SSE updates
+    if state and state.metrics:
+        state.metrics.record({
+            "type": "label_changed",
+            "conversation_id": conv_id,
+            "label": label,
+        })
+
     return f"Label set to '{label}'"
 
 
@@ -2113,5 +2122,14 @@ def _handle_vcforget(tag: str, state):
     paging = getattr(engine, "_paging", None)
     if paging and hasattr(paging, "working_set"):
         paging.working_set.pop(tag, None)
+
+    # Emit event so dashboard updates
+    if state and state.metrics:
+        state.metrics.record({
+            "type": "tag_forgotten",
+            "conversation_id": conv_id,
+            "tag": tag,
+            "segments_removed": deleted,
+        })
 
     return f"Forgot '{tag}': {deleted} segment(s) removed."
