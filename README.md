@@ -20,7 +20,7 @@
 
 Your client sets `contextWindow: 20000000` (20 million). Your model's real window is 200K. virtual-context sits between them and makes it work, the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal.
 
-Virtualizing the context window has consequences that go well beyond compression:
+Virtualizing the context window has many advantages:
 
 - **Compression**: Topic-level summarization with structured fact extraction. A 937K-token payload collapses to ~65K. Everything is stored, indexed, and recoverable at full fidelity.
 - **Memory**: Your agent recalls what the user said at turn 12 when it reaches turn 1000. Facts, preferences, and decisions persist across the full conversation, not just what fits in the raw window.
