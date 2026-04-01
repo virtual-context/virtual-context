@@ -474,6 +474,14 @@ class PayloadFormat(ABC):
     def emit_conversation_marker_sse(self, conversation_id: str) -> bytes:
         """Return a single SSE event bytes that injects a conversation marker."""
 
+    @abstractmethod
+    def emit_fake_response_sse(self, text: str, conversation_id: str) -> bytes:
+        """Return SSE bytes for a complete fake LLM response with conversation marker."""
+
+    @abstractmethod
+    def build_fake_response(self, text: str, conversation_id: str) -> dict:
+        """Return a format-correct non-streaming response body with conversation marker."""
+
     # -- Raw content extraction -----------------------------------------------
 
     def extract_user_raw_content(self, body: dict) -> list[dict] | None:
@@ -1257,6 +1265,30 @@ class AnthropicFormat(PayloadFormat):
         })
         return f"event: content_block_delta\ndata: {marker_event}\n\n".encode()
 
+    def emit_fake_response_sse(self, text: str, conversation_id: str) -> bytes:
+        import uuid as _uuid
+        msg_id = f"msg_vcattach_{_uuid.uuid4().hex[:12]}"
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        full_text = text + marker
+        events = []
+        events.append(f'event: message_start\ndata: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": "vcattach", "stop_reason": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})}\n\n')
+        events.append(f'event: content_block_start\ndata: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n')
+        events.append(f'event: content_block_delta\ndata: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": full_text}})}\n\n')
+        events.append(f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n')
+        events.append(f'event: message_delta\ndata: {json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}})}\n\n')
+        events.append(f'event: message_stop\ndata: {json.dumps({"type": "message_stop"})}\n\n')
+        return "".join(events).encode()
+
+    def build_fake_response(self, text: str, conversation_id: str) -> dict:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        return {
+            "id": "msg_vcattach", "type": "message", "role": "assistant",
+            "model": "vcattach",
+            "content": [{"type": "text", "text": text + marker}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
     def extract_delta_text(self, data: dict) -> str:
         event_type = data.get("type", "")
         if event_type == "content_block_delta":
@@ -1636,6 +1668,24 @@ class OpenAIFormat(PayloadFormat):
             "choices": [{"index": 0, "delta": {"content": marker}}],
         })
         return f"data: {marker_event}\n\n".encode()
+
+    def emit_fake_response_sse(self, text: str, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        full_text = text + marker
+        events = []
+        events.append(f'data: {json.dumps({"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]})}\n\n')
+        events.append(f'data: {json.dumps({"choices": [{"index": 0, "delta": {"content": full_text}}]})}\n\n')
+        events.append(f'data: {json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n')
+        events.append("data: [DONE]\n\n")
+        return "".join(events).encode()
+
+    def build_fake_response(self, text: str, conversation_id: str) -> dict:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        return {
+            "id": "chatcmpl-vcattach", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text + marker}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
     def extract_delta_text(self, data: dict) -> str:
         choices = data.get("choices", [])
@@ -2031,6 +2081,18 @@ class GeminiFormat(PayloadFormat):
             }],
         })
         return f"data: {event_data}\n\n".encode()
+
+    def emit_fake_response_sse(self, text: str, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        full_text = text + marker
+        event = json.dumps({"candidates": [{"content": {"parts": [{"text": full_text}], "role": "model"}, "finishReason": "STOP"}]})
+        return f"data: {event}\n\n".encode()
+
+    def build_fake_response(self, text: str, conversation_id: str) -> dict:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        return {
+            "candidates": [{"content": {"parts": [{"text": text + marker}], "role": "model"}, "finishReason": "STOP"}],
+        }
 
     # -- SSE / response parsing --
 
@@ -2616,6 +2678,24 @@ class OpenAIResponsesFormat(PayloadFormat):
             "delta": marker,
         })
         return f"event: response.output_text.delta\ndata: {marker_event}\n\n".encode()
+
+    def emit_fake_response_sse(self, text: str, conversation_id: str) -> bytes:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        full_text = text + marker
+        events = []
+        events.append(f'data: {json.dumps({"type": "response.output_text.delta", "delta": full_text})}\n\n')
+        events.append(f'data: {json.dumps({"type": "response.output_text.done", "text": full_text})}\n\n')
+        events.append(f'data: {json.dumps({"type": "response.completed"})}\n\n')
+        return "".join(events).encode()
+
+    def build_fake_response(self, text: str, conversation_id: str) -> dict:
+        marker = f"\n<!-- vc:conversation={conversation_id} -->"
+        return {
+            "id": "resp_vcattach", "object": "response",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text + marker}]}],
+            "status": "completed",
+        }
 
     # -- SSE / response parsing --
 
