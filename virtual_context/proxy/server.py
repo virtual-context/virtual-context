@@ -293,10 +293,18 @@ async def prepare_payload(
     is_streaming = body.get("stream", False)
 
     # --- VC command detection (VCATTACH, VCLABEL, VCSTATUS, VCRECALL, VCCOMPACT, VCLIST, VCFORGET) ---
+    # OpenClaw wraps user messages in metadata envelopes (```json``` fenced blocks)
+    # with the actual user text after the last fence. Strip the envelope first.
     import re as _re
+    _vc_user_text = user_message.strip()
+    _last_fence = _vc_user_text.rfind("```")
+    if _last_fence >= 0:
+        _after_fence = _vc_user_text[_last_fence + 3:].strip()
+        if _after_fence:
+            _vc_user_text = _after_fence
     _vc_cmd_match = _re.match(
         r"^VC(ATTACH|LABEL|STATUS|RECALL|COMPACT|LIST|FORGET)(?:\s+(.+))?$",
-        user_message.strip(), _re.IGNORECASE,
+        _vc_user_text, _re.IGNORECASE,
     )
     if _vc_cmd_match:
         _vc_cmd = _vc_cmd_match.group(1).upper()
