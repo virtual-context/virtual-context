@@ -672,14 +672,54 @@ async def _handle_streaming(
             need_continuation = False
             _stream_usage: dict = {}  # accumulate input/output tokens
 
+            # --- EXPERIMENTAL: decoupled upstream read via asyncio.Queue ---
+            # Reads from Anthropic in a background task, yields to client from queue.
+            # This prevents client backpressure from blocking upstream reads.
+            import asyncio as _asyncio
+            _upstream_q: _asyncio.Queue = _asyncio.Queue(maxsize=1000)
+            _upstream_done = _asyncio.Event()
+            _upstream_error: list = []
+
+            async def _upstream_reader():
+                """Background task: read from Anthropic, put chunks in queue."""
+                try:
+                    async for raw_chunk in upstream.aiter_bytes():
+                        await _upstream_q.put(raw_chunk)
+                except Exception as e:
+                    _upstream_error.append(e)
+                finally:
+                    _upstream_done.set()
+
+            _reader_task = _asyncio.create_task(_upstream_reader())
+
             _pg_stream_t0 = time.monotonic()
             _pg_first_chunk = True
             _pg_chunk_count = 0
             _pg_total_bytes = 0
             _pg_last_chunk_at = _pg_stream_t0
             _pg_max_gap = 0.0
+            _pg_max_yield_time = 0.0
             try:
-                async for raw_chunk in upstream.aiter_bytes():
+                while True:
+                    # Wait for a chunk or upstream completion
+                    try:
+                        raw_chunk = await _asyncio.wait_for(
+                            _upstream_q.get(), timeout=5.0,
+                        )
+                    except _asyncio.TimeoutError:
+                        if _upstream_done.is_set() and _upstream_q.empty():
+                            break
+                        # Log queue state during waits
+                        _pg_now = time.monotonic()
+                        _elapsed = _pg_now - _pg_stream_t0
+                        if _elapsed > 30.0 and _pg_chunk_count < 5:
+                            logger.warning(
+                                "STREAM_QUEUE_WAIT conv=%s turn=%d elapsed=%.1fs chunks=%d qsize=%d reader_done=%s",
+                                conversation_id[:12], turn, _elapsed,
+                                _pg_chunk_count, _upstream_q.qsize(), _upstream_done.is_set(),
+                            )
+                        continue
+
                     _pg_now = time.monotonic()
                     _pg_gap = _pg_now - _pg_last_chunk_at
                     if _pg_gap > _pg_max_gap:
@@ -690,12 +730,12 @@ async def _handle_streaming(
                     if _pg_first_chunk:
                         _pg_first_chunk = False
                         logger.info(
-                            "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs (paging)",
+                            "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs (paging/decoupled)",
                             conversation_id[:12], turn, _pg_now - _pg_stream_t0,
                         )
                     if _pg_gap > 30.0:
                         logger.warning(
-                            "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs (paging)",
+                            "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs (paging/decoupled)",
                             conversation_id[:12], turn, _pg_gap,
                             _pg_chunk_count, _pg_total_bytes, _pg_now - _pg_stream_t0,
                         )
@@ -707,7 +747,16 @@ async def _handle_streaming(
 
                     for _evt_type, data_str, raw_bytes in events:
                         if not data_str or data_str.strip() == "[DONE]":
+                            _yt0 = time.monotonic()
                             yield raw_bytes
+                            _yt = time.monotonic() - _yt0
+                            if _yt > 1.0:
+                                logger.warning(
+                                    "STREAM_YIELD_SLOW conv=%s turn=%d yield_time=%.1fs (empty/done event)",
+                                    conversation_id[:12], turn, _yt,
+                                )
+                            if _yt > _pg_max_yield_time:
+                                _pg_max_yield_time = _yt
                             continue
 
                         try:
@@ -961,13 +1010,32 @@ async def _handle_streaming(
                                     continue
 
                         # Default: forward event to client
+                        _yt0 = time.monotonic()
                         yield raw_bytes
+                        _yt = time.monotonic() - _yt0
+                        if _yt > 1.0:
+                            logger.warning(
+                                "STREAM_YIELD_SLOW conv=%s turn=%d yield_time=%.1fs dtype=%s",
+                                conversation_id[:12], turn, _yt, dtype,
+                            )
+                        if _yt > _pg_max_yield_time:
+                            _pg_max_yield_time = _yt
+
+                # Wait for reader task to finish
+                if not _reader_task.done():
+                    _reader_task.cancel()
+                    try:
+                        await _reader_task
+                    except (_asyncio.CancelledError, Exception):
+                        pass
+
             finally:
                 _pg_elapsed = time.monotonic() - _pg_stream_t0
                 logger.info(
-                    "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs (paging)",
+                    "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs max_yield=%.1fs reader_err=%s (paging/decoupled)",
                     conversation_id[:12], turn, _pg_elapsed,
                     _pg_chunk_count, _pg_total_bytes, _pg_max_gap,
+                    _pg_max_yield_time, _upstream_error or "none",
                 )
                 if _pg_elapsed > 60.0:
                     logger.warning(
