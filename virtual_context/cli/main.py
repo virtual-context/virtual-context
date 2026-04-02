@@ -545,11 +545,11 @@ def _write_instance_config(
 ) -> str:
     """Generate a standalone YAML config for one proxy instance.
 
-    Creates isolated storage at ``<base_dir>/.virtualcontext/<label>/store.db``
+    Creates isolated storage at ``~/.virtual-context/<label>/store.db``
     and writes config to ``<base_dir>/virtual-context-proxy-<label>.yaml``.
     Returns the path to the written file.
     """
-    storage_root = f".virtualcontext/{label}"
+    storage_root = str(Path.home() / ".virtual-context" / label)
     provider_label, base_url = _provider_defaults(provider)
     provider_block: dict = {}
     if provider == "ollama":
@@ -620,7 +620,8 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
     instances: list[dict] = []
     config_paths: list[str] = []
     used_ports: set[int] = set()
-    base_dir = Path.cwd()
+    base_dir = Path.home() / ".virtual-context"
+    base_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(count):
         print(f"\n--- Instance {i + 1}/{count} ---")
@@ -829,7 +830,9 @@ def _install_windows_task_daemon(config_path: Path, upstream: str | None, start:
 
 
 def cmd_onboard(args):
-    config_path = Path(args.config) if args.config else Path.cwd() / "virtual-context.yaml"
+    vc_home = Path.home() / ".virtual-context"
+    vc_home.mkdir(parents=True, exist_ok=True)
+    config_path = Path(args.config) if args.config else vc_home / "virtual-context.yaml"
 
     if not config_path.exists():
         preset = get_preset(args.preset)
