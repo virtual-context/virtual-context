@@ -71,6 +71,7 @@ exclude = [
 artifacts = [
     "virtual_context/proxy/static/*",
     "virtual_context/data/anthropic-tokenizer/tokenizer.json",
+    "virtual_context/data/models.yaml",
 ]
 
 [tool.hatch.build.targets.wheel]
