@@ -1510,7 +1510,14 @@ def create_app(
         logger.info("Engine init failed: %s", e)
         metrics = shared_metrics or ProxyMetrics()
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=0,  # disable keepalive — stale connections cause streaming stalls
+            keepalive_expiry=0,
+        ),
+    )
     shutdown_event = asyncio.Event()
 
     # --------------- Raw request log setup ---------------
