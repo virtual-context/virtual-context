@@ -508,6 +508,23 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "openrouter": ["qwen/qwen3-30b-a3b", "qwen/qwen3-32b", "google/gemini-2.5-flash-preview"],
 }
 
+# Context window sizes for upstream providers — used to set correct defaults
+_UPSTREAM_CONTEXT_WINDOWS: dict[str, int] = {
+    "anthropic": 1_000_000,
+    "openai": 128_000,
+    "gemini": 1_000_000,
+    "ollama": 128_000,
+    "openrouter": 200_000,
+    "custom": 128_000,
+}
+
+# API key env var names per provider
+_PROVIDER_KEY_ENVS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
 
 def _prompt_tagging_provider() -> tuple[str, str]:
     provider = _prompt_choice(
@@ -542,6 +559,12 @@ def _provider_defaults(provider: str) -> tuple[str, str]:
 
 def _write_instance_config(
     base_dir: Path, label: str, provider: str, model: str, inbound_tagger_type: str,
+    *,
+    context_window: int = 200_000,
+    host: str = "127.0.0.1",
+    port: int = 5757,
+    dashboard_token: str = "",
+    tag_api_key_env: str = "",
 ) -> str:
     """Generate a standalone YAML config for one proxy instance.
 
@@ -555,18 +578,24 @@ def _write_instance_config(
     if provider == "ollama":
         provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url + "/v1"}}
     elif provider == "anthropic":
-        provider_block = {provider_label: {"type": "anthropic"}}
+        prov = {"type": "anthropic"}
+        if tag_api_key_env:
+            prov["api_key_env"] = tag_api_key_env
+        provider_block = {provider_label: prov}
     elif provider == "openai":
-        provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
+        prov = {"type": "generic_openai", "base_url": base_url}
+        if tag_api_key_env:
+            prov["api_key_env"] = tag_api_key_env
+        provider_block = {provider_label: prov}
     elif provider == "openrouter":
-        provider_block = {provider_label: {"type": "openrouter", "base_url": base_url, "api_key_env": "OPENROUTER_API_KEY"}}
+        provider_block = {provider_label: {"type": "openrouter", "base_url": base_url, "api_key_env": tag_api_key_env or "OPENROUTER_API_KEY"}}
     else:
         provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url}}
 
     cfg: dict = {
         "version": "0.2",
         "storage_root": storage_root,
-        "context_window": 120_000,
+        "context_window": context_window,
         "token_counter": "estimate",
         "tag_generator": {
             "type": "llm" if provider != "keyword" else "keyword",
@@ -596,6 +625,23 @@ def _write_instance_config(
     return str(out_path)
 
 
+def _check_provider_reachable(provider: str) -> bool:
+    """Quick check if a tagging provider is reachable."""
+    if provider == "ollama":
+        try:
+            import urllib.request
+            urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3)
+            return True
+        except Exception:
+            return False
+    return True  # Remote providers — can't cheaply validate without a key
+
+
+def _generate_dashboard_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
 def _run_instance_wizard() -> tuple[list[dict], list[str]]:
     """Interactive wizard for proxy instance setup.
 
@@ -606,13 +652,47 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
     print("\n--- Tagging & Summarization ---")
     tag_provider, tag_model = _prompt_tagging_provider()
 
+    # Validate tagging provider is reachable
+    if not _check_provider_reachable(tag_provider):
+        print(f"\n  WARNING: {tag_provider} does not appear to be running.")
+        if tag_provider == "ollama":
+            print("  Start Ollama first: ollama serve")
+        if not _prompt_yes_no("Continue anyway?", default_yes=False):
+            sys.exit(0)
+
+    # API key for tagging provider
+    tag_api_key_env = ""
+    tag_key_env = _PROVIDER_KEY_ENVS.get(tag_provider)
+    if tag_key_env:
+        existing = os.environ.get(tag_key_env, "")
+        if existing:
+            print(f"\n  Found {tag_key_env} in environment.")
+            tag_api_key_env = tag_key_env
+        else:
+            print(f"\n  The {tag_provider} tagger needs an API key.")
+            print(f"  Set {tag_key_env} in your environment before starting the proxy.")
+            tag_api_key_env = tag_key_env
+
     inbound_tagger_type = _prompt_choice(
         "Inbound tagging mode:",
         ["embedding", "llm", "keyword"],
         default="embedding",
     )
 
-    multi = _prompt_yes_no("Configure multiple proxy instances?", default_yes=False)
+    # Client selection — determines post-wizard instructions
+    client = _prompt_choice(
+        "What client will you use with this proxy?",
+        ["Claude Code", "Claude Desktop", "Other / REST API"],
+        default="Claude Code",
+    )
+
+    # Dashboard token
+    print("\n--- Security ---")
+    dashboard_token = _generate_dashboard_token()
+    print(f"  Generated dashboard token: {dashboard_token}")
+    print("  (protects dashboard mutating endpoints)")
+
+    multi = _prompt_yes_no("\nConfigure multiple proxy instances?", default_yes=False)
     count = 1
     if multi:
         count = _prompt_int("How many proxy instances?", default=2, min_value=1)
@@ -635,6 +715,10 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
         label = _prompt("Label", default_label)
         upstream = _prompt("Upstream URL", default_upstream)
 
+        # Context window — default based on upstream provider
+        default_cw = _UPSTREAM_CONTEXT_WINDOWS.get(provider, 200_000)
+        context_window = _prompt_int("Context window (tokens)", default=default_cw, min_value=8_000)
+
         default_port = 5757 + i
         while True:
             port = _prompt_int("Port", default=default_port, min_value=1)
@@ -648,19 +732,26 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
 
         # Per-instance tagger override
         use_different_tagger = False
+        inst_tag_provider = tag_provider
+        inst_tag_model = tag_model
+        inst_tag_key_env = tag_api_key_env
         if count > 1:
             use_different_tagger = _prompt_yes_no(
                 f"Use a different tagger provider for '{label}'?", default_yes=False,
             )
 
-        inst_tag_provider = tag_provider
-        inst_tag_model = tag_model
         if use_different_tagger:
             inst_tag_provider, inst_tag_model = _prompt_tagging_provider()
+            inst_tag_key_env = _PROVIDER_KEY_ENVS.get(inst_tag_provider, "")
 
         # Write per-instance config
         cfg_path = _write_instance_config(
             base_dir, label, inst_tag_provider, inst_tag_model, inbound_tagger_type,
+            context_window=context_window,
+            host=host,
+            port=port,
+            dashboard_token=dashboard_token,
+            tag_api_key_env=inst_tag_key_env,
         )
         config_paths.append(cfg_path)
 
@@ -671,19 +762,64 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
                 "label": label,
                 "host": host,
                 "config": cfg_path,
+                "context_window": context_window,
+                "dashboard_token": dashboard_token,
             }
         )
 
     # Review screen
     print("\n--- Review ---")
     for inst in instances:
-        print(f"  [{inst['label']}] :{inst['port']} -> {inst['upstream']}")
+        print(f"  [{inst['label']}] {inst['host']}:{inst['port']} -> {inst['upstream']}")
+        print(f"    context window: {inst['context_window']:,} tokens")
         print(f"    config: {inst['config']}")
     print()
 
     if not _prompt_yes_no("Proceed with this configuration?", default_yes=True):
         print("Aborted.")
         sys.exit(0)
+
+    # Post-wizard summary
+    print("\n" + "=" * 60)
+    print("SETUP COMPLETE")
+    print("=" * 60)
+    vc_home = Path.home() / ".virtual-context"
+    print(f"\n  Config files:  {vc_home}/")
+    print(f"  Storage:       {vc_home}/<label>/")
+    print(f"  Dashboard:     http://{instances[0]['host']}:{instances[0]['port']}/dashboard")
+
+    # API key reminders
+    needed_keys = set()
+    if tag_key_env and not os.environ.get(tag_key_env, ""):
+        needed_keys.add(tag_key_env)
+    if needed_keys:
+        print("\n  API keys needed (set before starting proxy):")
+        for k in sorted(needed_keys):
+            print(f"    export {k}=\"your-key-here\"")
+
+    # Client-specific instructions
+    inst = instances[0]
+    if "Claude Code" in client:
+        print(f"\n  Claude Code setup:")
+        print(f"    Set this in your environment or .claude/settings.json:")
+        print(f"    ANTHROPIC_BASE_URL=http://{inst['host']}:{inst['port']}/")
+        print(f"\n    Disable auto-compact in Claude Code:")
+        print(f"    Type /config -> Auto-compact -> disable")
+        print(f"\n    Set VC_DASHBOARD_TOKEN in your environment:")
+        print(f"    export VC_DASHBOARD_TOKEN=\"{dashboard_token}\"")
+    elif "Desktop" in client:
+        print(f"\n  Claude Desktop setup:")
+        print(f"    In Claude Desktop settings, set the API base URL to:")
+        print(f"    http://{inst['host']}:{inst['port']}/")
+    else:
+        print(f"\n  REST API / Custom client:")
+        print(f"    Proxy endpoint: http://{inst['host']}:{inst['port']}/")
+        print(f"    Forward your LLM API requests through this proxy.")
+
+    print(f"\n  Logs:")
+    print(f"    Proxy: tail -f ~/Library/Logs/virtual-context.log")
+    print(f"    Errors: tail -f ~/Library/Logs/virtual-context.err.log")
+    print()
 
     return instances, config_paths
 
@@ -704,7 +840,10 @@ def _proxy_command(config_path: Path, upstream: str | None) -> str:
     return cmd
 
 
-def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool) -> None:
+def _install_launchd_daemon(
+    config_path: Path, upstream: str | None, start: bool,
+    *, dashboard_token: str = "",
+) -> None:
     from xml.sax.saxutils import escape as _xml_escape
 
     launch_agents = Path.home() / "Library" / "LaunchAgents"
@@ -713,6 +852,17 @@ def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool
     cmd = _proxy_command(config_path, upstream)
     log_path = Path.home() / "Library" / "Logs" / "virtual-context.log"
     err_path = Path.home() / "Library" / "Logs" / "virtual-context.err.log"
+
+    # Build optional EnvironmentVariables block
+    env_block = ""
+    if dashboard_token:
+        env_block = f"""  <key>EnvironmentVariables</key>
+  <dict>
+    <key>VC_DASHBOARD_TOKEN</key>
+    <string>{_xml_escape(dashboard_token)}</string>
+  </dict>
+"""
+
     # Escape XML special characters to prevent XML injection
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -734,7 +884,7 @@ def _install_launchd_daemon(config_path: Path, upstream: str | None, start: bool
   <string>{_xml_escape(str(log_path))}</string>
   <key>StandardErrorPath</key>
   <string>{_xml_escape(str(err_path))}</string>
-</dict>
+{env_block}</dict>
 </plist>
 """
     plist_path.write_text(plist)
@@ -866,12 +1016,20 @@ def cmd_onboard(args):
     interactive = bool(args.wizard and sys.stdin.isatty())
     selected_upstream = args.upstream
 
+    _wizard_dashboard_token = ""
     if interactive:
         instances, _config_paths = _run_instance_wizard()
         _apply_proxy_instances(config_path, instances)
         print(f"Updated {config_path} with {len(instances)} proxy instance(s).")
-        # In multi-instance mode, upstream comes from config; daemon command should omit it.
-        selected_upstream = None
+        # In wizard mode, use the first instance's config for daemon install
+        if _config_paths:
+            config_path = Path(_config_paths[0])
+        # Extract upstream and dashboard token from first instance
+        if instances:
+            selected_upstream = instances[0].get("upstream")
+            _wizard_dashboard_token = instances[0].get("dashboard_token", "")
+        else:
+            selected_upstream = None
         if not daemon_requested:
             daemon_requested = _prompt_yes_no("Install daemon/service now?", default_yes=True)
 
@@ -887,7 +1045,10 @@ def cmd_onboard(args):
     system = platform.system().lower()
     try:
         if system == "darwin":
-            _install_launchd_daemon(config_path, selected_upstream, start=not args.no_start)
+            _install_launchd_daemon(
+                config_path, selected_upstream, start=not args.no_start,
+                dashboard_token=_wizard_dashboard_token,
+            )
         elif system == "linux":
             _install_systemd_user_daemon(config_path, selected_upstream, start=not args.no_start)
         elif system == "windows":
