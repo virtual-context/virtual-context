@@ -672,8 +672,33 @@ async def _handle_streaming(
             need_continuation = False
             _stream_usage: dict = {}  # accumulate input/output tokens
 
+            _pg_stream_t0 = time.monotonic()
+            _pg_first_chunk = True
+            _pg_chunk_count = 0
+            _pg_total_bytes = 0
+            _pg_last_chunk_at = _pg_stream_t0
+            _pg_max_gap = 0.0
             try:
                 async for raw_chunk in upstream.aiter_bytes():
+                    _pg_now = time.monotonic()
+                    _pg_gap = _pg_now - _pg_last_chunk_at
+                    if _pg_gap > _pg_max_gap:
+                        _pg_max_gap = _pg_gap
+                    _pg_last_chunk_at = _pg_now
+                    _pg_chunk_count += 1
+                    _pg_total_bytes += len(raw_chunk)
+                    if _pg_first_chunk:
+                        _pg_first_chunk = False
+                        logger.info(
+                            "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs (paging)",
+                            conversation_id[:12], turn, _pg_now - _pg_stream_t0,
+                        )
+                    if _pg_gap > 30.0:
+                        logger.warning(
+                            "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs (paging)",
+                            conversation_id[:12], turn, _pg_gap,
+                            _pg_chunk_count, _pg_total_bytes, _pg_now - _pg_stream_t0,
+                        )
                     raw_events.append(
                         raw_chunk.decode("utf-8", errors="replace"),
                     )
@@ -938,6 +963,17 @@ async def _handle_streaming(
                         # Default: forward event to client
                         yield raw_bytes
             finally:
+                _pg_elapsed = time.monotonic() - _pg_stream_t0
+                logger.info(
+                    "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs (paging)",
+                    conversation_id[:12], turn, _pg_elapsed,
+                    _pg_chunk_count, _pg_total_bytes, _pg_max_gap,
+                )
+                if _pg_elapsed > 60.0:
+                    logger.warning(
+                        "STREAM_SLOW conv=%s turn=%d elapsed=%.1fs max_gap=%.1fs chunks=%d (paging) — investigate",
+                        conversation_id[:12], turn, _pg_elapsed, _pg_max_gap, _pg_chunk_count,
+                    )
                 await upstream.aclose()
 
             # --- Continuation phase ---
@@ -1373,8 +1409,39 @@ async def _handle_streaming(
         np_current_text_parts: list[str] = []
         np_current_tool_input_parts: list[str] = []
         np_current_tool: dict | None = None
+        _stream_t0 = time.monotonic()
+        _stream_first_chunk = True
+        _stream_chunk_count = 0
+        _stream_total_bytes = 0
+        _stream_last_chunk_at = _stream_t0
+        _stream_max_gap = 0.0
         try:
             async for raw_chunk in upstream.aiter_bytes():
+                _now = time.monotonic()
+                _gap = _now - _stream_last_chunk_at
+                if _gap > _stream_max_gap:
+                    _stream_max_gap = _gap
+                _stream_last_chunk_at = _now
+                _stream_chunk_count += 1
+                _stream_total_bytes += len(raw_chunk)
+
+                if _stream_first_chunk:
+                    _stream_first_chunk = False
+                    logger.info(
+                        "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs",
+                        conversation_id[:12], turn,
+                        _now - _stream_t0,
+                    )
+
+                # Log if any gap between chunks exceeds 30 seconds
+                if _gap > 30.0:
+                    logger.warning(
+                        "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs",
+                        conversation_id[:12], turn, _gap,
+                        _stream_chunk_count, _stream_total_bytes,
+                        _now - _stream_t0,
+                    )
+
                 yield raw_chunk  # forward raw bytes unchanged
 
                 # Side-channel: parse for text accumulation + log capture
@@ -1442,6 +1509,17 @@ async def _handle_streaming(
                         except json.JSONDecodeError:
                             pass
         finally:
+            _stream_elapsed = time.monotonic() - _stream_t0
+            logger.info(
+                "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs",
+                conversation_id[:12], turn, _stream_elapsed,
+                _stream_chunk_count, _stream_total_bytes, _stream_max_gap,
+            )
+            if _stream_elapsed > 60.0:
+                logger.warning(
+                    "STREAM_SLOW conv=%s turn=%d elapsed=%.1fs max_gap=%.1fs chunks=%d — investigate",
+                    conversation_id[:12], turn, _stream_elapsed, _stream_max_gap, _stream_chunk_count,
+                )
             await upstream.aclose()
             assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
             if state and assistant_text and not state.is_conversation_deleted():
