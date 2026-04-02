@@ -30,11 +30,23 @@ class ModelCatalog:
 
     @classmethod
     def default(cls) -> ModelCatalog:
+        # Search order:
+        # 1. ~/.virtual-context/models.yaml (user override)
+        # 2. Bundled inside the package (virtual_context/data/models.yaml)
+        # 3. Project root (dev checkout)
+        user_path = os.path.join(os.path.expanduser("~"), ".virtual-context", "models.yaml")
+        if os.path.exists(user_path):
+            return cls(user_path)
+
         here = os.path.dirname(os.path.abspath(__file__))
-        # core/ -> virtual_context/ -> project root
+        pkg_path = os.path.join(os.path.dirname(here), "data", "models.yaml")
+        if os.path.exists(pkg_path):
+            return cls(pkg_path)
+
+        # Dev checkout: core/ -> virtual_context/ -> project root
         root = os.path.dirname(os.path.dirname(here))
-        path = os.path.join(root, "models.yaml")
-        return cls(path)
+        root_path = os.path.join(root, "models.yaml")
+        return cls(root_path)
 
     def _load(self, path: str) -> None:
         if not os.path.exists(path):

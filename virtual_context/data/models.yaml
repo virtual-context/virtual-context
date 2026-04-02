@@ -1,0 +1,207 @@
+# Model pricing catalog for Virtual Context telemetry.
+# Prices in USD per million tokens. Updated 2026-03-15.
+
+models:
+  # ---------------------------------------------------------------------------
+  # Anthropic
+  # ---------------------------------------------------------------------------
+  claude-haiku-4-5-20251001:
+    provider: anthropic
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+    context_window: 200000
+    aliases: [haiku, claude-haiku, claude-haiku-4-5]
+
+  claude-sonnet-4-5-20250929:
+    provider: anthropic
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    context_window: 200000
+    aliases: [claude-sonnet-4-5, claude-sonnet-4-20250514]
+
+  claude-sonnet-4-6:
+    provider: anthropic
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    context_window: 200000
+    aliases: [sonnet, claude-sonnet]
+
+  claude-opus-4-5:
+    provider: anthropic
+    input_per_mtok: 5.00
+    output_per_mtok: 25.00
+    context_window: 200000
+    aliases: [claude-opus-4-20250514]
+
+  claude-opus-4-6:
+    provider: anthropic
+    input_per_mtok: 5.00
+    output_per_mtok: 25.00
+    context_window: 200000
+    aliases: [opus, claude-opus]
+
+  # ---------------------------------------------------------------------------
+  # OpenAI
+  # ---------------------------------------------------------------------------
+  gpt-5.2:
+    provider: openai
+    input_per_mtok: 1.75
+    output_per_mtok: 14.00
+    context_window: 128000
+    aliases: [gpt5.2]
+
+  gpt-5.2-pro:
+    provider: openai
+    input_per_mtok: 21.00
+    output_per_mtok: 168.00
+    context_window: 128000
+    aliases: [gpt5.2-pro]
+
+  gpt-5.3-codex:
+    provider: openai
+    input_per_mtok: 1.75
+    output_per_mtok: 14.00
+    context_window: 128000
+    aliases: [gpt5-codex, codex]
+
+  gpt-5.4:
+    provider: openai
+    input_per_mtok: 2.50
+    output_per_mtok: 15.00
+    context_window: 1050000
+    aliases: [gpt5.4]
+
+  gpt-5-mini:
+    provider: openai
+    input_per_mtok: 0.25
+    output_per_mtok: 2.00
+    context_window: 128000
+    aliases: [gpt5-mini]
+
+  gpt-5-nano:
+    provider: openai
+    input_per_mtok: 0.05
+    output_per_mtok: 0.40
+    context_window: 128000
+    aliases: [gpt5-nano]
+
+  gpt-4.1-nano:
+    provider: openai
+    input_per_mtok: 0.10
+    output_per_mtok: 0.40
+    context_window: 128000
+    aliases: [gpt4-nano]
+
+  gpt-4.1-mini:
+    provider: openai
+    input_per_mtok: 0.40
+    output_per_mtok: 1.60
+    context_window: 128000
+    aliases: [gpt4-mini]
+
+  gpt-4o:
+    provider: openai
+    input_per_mtok: 2.50
+    output_per_mtok: 10.00
+    context_window: 128000
+    aliases: [gpt4o]
+
+  gpt-4o-mini:
+    provider: openai
+    input_per_mtok: 0.15
+    output_per_mtok: 0.60
+    context_window: 128000
+    aliases: [gpt4o-mini]
+
+  gpt-4.1:
+    provider: openai
+    input_per_mtok: 2.00
+    output_per_mtok: 8.00
+    context_window: 1050000
+    aliases: [gpt4.1]
+
+  gpt-5:
+    provider: openai
+    input_per_mtok: 1.25
+    output_per_mtok: 10.00
+    context_window: 128000
+    aliases: [gpt5]
+
+  o1:
+    provider: openai
+    input_per_mtok: 15.00
+    output_per_mtok: 60.00
+    context_window: 200000
+    aliases: []
+
+  o3:
+    provider: openai
+    input_per_mtok: 2.00
+    output_per_mtok: 8.00
+    context_window: 200000
+    aliases: []
+
+  o4-mini:
+    provider: openai
+    input_per_mtok: 1.10
+    output_per_mtok: 4.40
+    context_window: 200000
+    aliases: []
+
+  # ---------------------------------------------------------------------------
+  # Google Gemini
+  # ---------------------------------------------------------------------------
+  gemini-2.5-pro:
+    provider: google
+    input_per_mtok: 1.25
+    output_per_mtok: 10.00
+    context_window: 1000000
+    aliases: [gemini-pro, gemini-2.5-pro-preview-03-25]
+
+  gemini-2.5-flash:
+    provider: google
+    input_per_mtok: 0.30
+    output_per_mtok: 2.50
+    context_window: 1000000
+    aliases: [gemini-flash, gemini-2.5-flash-preview-04-17]
+
+  gemini-3.1-pro-preview:
+    provider: google
+    input_per_mtok: 2.00
+    output_per_mtok: 12.00
+    context_window: 1000000
+    aliases: [gemini-3.1-pro]
+
+  gemini-3-pro-preview:
+    provider: google
+    input_per_mtok: 2.00
+    output_per_mtok: 12.00
+    context_window: 1000000
+    aliases: [gemini-3-pro]
+
+  gemini-2.0-flash:
+    provider: google
+    input_per_mtok: 0.10
+    output_per_mtok: 0.40
+    context_window: 1000000
+    aliases: [gemini-2.0-flash-001]
+
+  # ---------------------------------------------------------------------------
+  # Xiaomi MiMo
+  # ---------------------------------------------------------------------------
+  mimo-v2-flash:
+    provider: xiaomi
+    input_per_mtok: 0.09
+    output_per_mtok: 0.29
+    context_window: 262000
+    aliases: [mimo, mimo-flash]
+
+  # ---------------------------------------------------------------------------
+  # Local / Ollama (free)
+  # ---------------------------------------------------------------------------
+  qwen3:4b-instruct-2507-fp16:
+    provider: ollama
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+    context_window: 32768
+    aliases: [qwen3-4b]
