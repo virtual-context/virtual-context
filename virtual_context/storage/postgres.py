@@ -1009,19 +1009,8 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         if conversation_id is not None:
             rows = conn.execute(
-                """SELECT ts.* FROM tag_summaries ts
-                   WHERE NOT EXISTS (
-                       SELECT 1 FROM segments s,
-                              jsonb_array_elements_text(ts.source_segment_refs::jsonb) je
-                       WHERE s.ref = je AND s.conversation_id != %s
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM segments s,
-                              jsonb_array_elements_text(ts.source_segment_refs::jsonb) je
-                       WHERE s.ref = je AND s.conversation_id = %s
-                   )
-                   ORDER BY ts.updated_at DESC""",
-                (conversation_id, conversation_id),
+                "SELECT * FROM tag_summaries WHERE conversation_id = %s ORDER BY updated_at DESC",
+                (conversation_id,),
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM tag_summaries ORDER BY updated_at DESC").fetchall()
