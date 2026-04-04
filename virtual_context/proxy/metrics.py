@@ -537,6 +537,8 @@ class ProxyMetrics:
         upstream_context_limit: int = 0,
         passthrough_trim_limit: int = 0,
         system_tokens: int = 0,
+        protected_turn_tokens: int = 0,
+        protected_turn_count: int = 0,
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
         with self._lock:
@@ -567,6 +569,8 @@ class ProxyMetrics:
                 "upstream_context_limit": upstream_context_limit,
                 "passthrough_trim_limit": passthrough_trim_limit,
                 "system_tokens": system_tokens,
+                "protected_turn_tokens": protected_turn_tokens,
+                "protected_turn_count": protected_turn_count,
             }
             existing = self._find_capture(turn, conv_id)
             if existing is not None:
