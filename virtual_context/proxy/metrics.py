@@ -43,6 +43,8 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "upstream_context_limit": 0,
     "passthrough_trim_limit": 0,
     "system_tokens": 0,
+    "protected_turn_tokens": 0,
+    "protected_turn_count": 0,
 }
 
 
