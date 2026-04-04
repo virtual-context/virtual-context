@@ -526,6 +526,8 @@ async def prepare_payload(
                 upstream_context_limit=_upstream_limit,
                 passthrough_trim_limit=_pt_limit,
                 system_tokens=_pt_system_tokens,
+                protected_turn_tokens=0,
+                protected_turn_count=0,
             )
 
             # 2-to-llm: log passthrough body sent to the LLM (after trim)
@@ -989,6 +991,33 @@ async def prepare_payload(
                     _think_t, _think_t / _budget * 100, _budget,
                 )
 
+    # Protected zone token accounting — report to dashboard so users can
+    # see how much budget the protected recent turns consume and decide
+    # whether to dial back protected_recent_turns.
+    _protected_turn_tokens = 0
+    _protected_turn_count = 0
+    if state and outbound_tokens > 0:
+        try:
+            _prt = state.engine.config.monitor.protected_recent_turns
+            _turn_groups = fmt.group_into_turns(enriched_body)
+            _prot_start = max(0, len(_turn_groups) - _prt)
+            _prot_groups = _turn_groups[_prot_start:]
+            _protected_turn_count = len(_prot_groups)
+            _msgs = enriched_body.get(
+                "messages", enriched_body.get("input", enriched_body.get("contents", []))
+            )
+            if isinstance(_msgs, list):
+                _prot_indices = set()
+                for g in _prot_groups:
+                    _prot_indices.update(g.indices)
+                _protected_turn_tokens = sum(
+                    fmt.estimate_message_tokens(_msgs[i])
+                    for i in sorted(_prot_indices)
+                    if i < len(_msgs)
+                )
+        except Exception:
+            pass
+
     _bloat_fallback = False
 
     # ------------------------------------------------------------------
@@ -1209,6 +1238,8 @@ async def prepare_payload(
         "turns_dropped": turns_dropped,
         "turns_stubbed": turns_stubbed,
         "non_virtualizable_floor": _non_virtualizable_floor,
+        "protected_turn_tokens": _protected_turn_tokens,
+        "protected_turn_count": _protected_turn_count,
         "upstream_context_limit": _upstream_limit,
         "passthrough_trim_limit": int(
             _upstream_limit * (state.engine.config.proxy.passthrough_trim_ratio if state else 0.40)
@@ -1331,6 +1362,8 @@ async def prepare_payload(
             _upstream_limit * (state.engine.config.proxy.passthrough_trim_ratio if state else 0.40)
         ),
         system_tokens=system_tokens,
+        protected_turn_tokens=_protected_turn_tokens,
+        protected_turn_count=_protected_turn_count,
     )
     # Capture enriched body (what we actually send to the LLM)
     metrics.capture_enriched(
