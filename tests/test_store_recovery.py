@@ -155,6 +155,67 @@ def test_collapse_turn_chains_reuses_existing_snapshot_for_canonical_turn():
     mock_store.store_chain_snapshot.assert_not_called()
 
 
+def test_collapse_turn_chains_reuses_runtime_snapshot_cache():
+    from unittest.mock import MagicMock
+
+    from virtual_context.core.turn_tag_index import TurnTagIndex
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.proxy.message_filter import collapse_turn_chains
+    from virtual_context.types import TurnTagEntry
+
+    body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": "read file"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/tmp/x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "file contents shown"}]},
+            {"role": "user", "content": "current"},
+        ],
+    }
+    fmt = detect_format(body)
+
+    combined = "read file file contents shown"
+    msg_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+    tti = TurnTagIndex()
+    tti.append(TurnTagEntry(turn_number=10, message_hash=msg_hash, tags=["file-ops"]))
+
+    mock_store = MagicMock()
+    mock_store.get_chain_snapshots_for_conversation.return_value = [
+        {"ref": "chain_existing_ref", "turn_number": 10, "tool_output_refs": "tool_ref", "message_count": 4},
+    ]
+    runtime_cache = {"loaded": False, "refs_by_turn": {}}
+
+    collapse_turn_chains(
+        body=body,
+        fmt=fmt,
+        protected_recent_turns=1,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        pre_filter_body={"messages": []},
+        collapse_runtime_cache=runtime_cache,
+    )
+    collapse_turn_chains(
+        body=body,
+        fmt=fmt,
+        protected_recent_turns=1,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        pre_filter_body={"messages": []},
+        collapse_runtime_cache=runtime_cache,
+    )
+
+    assert runtime_cache["loaded"] is True
+    assert runtime_cache["refs_by_turn"] == {10: "chain_existing_ref"}
+    mock_store.get_chain_snapshots_for_conversation.assert_called_once_with("test-conv", min_turn=0)
+
+
 def test_fill_pass_restores_from_store_on_truncation():
     from unittest.mock import MagicMock
     from virtual_context.proxy.message_filter import fill_pass

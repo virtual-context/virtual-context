@@ -145,10 +145,16 @@ class EmbeddingTagGenerator:
         text_embedding = self._embed([text[:2000]])[0]  # truncate to avoid OOM
         self._note_breakdown(_breakdown, "embed_query", _query_stage)
 
-        # Compute cosine similarity against all tag embeddings
+        # Score only the vocabulary in scope for this request. The generator's
+        # cache can outlive a single request, so scoring the whole cache would
+        # waste time on stale tags and could bias matching.
         _similarity_stage = time.monotonic()
         scores: list[tuple[str, float]] = []
-        for tag, tag_emb in self._tag_embeddings.items():
+        candidate_tags = [tag for tag in unique_tags if tag in self._tag_embeddings]
+        if not candidate_tags:
+            candidate_tags = list(self._tag_embeddings.keys())
+        for tag in candidate_tags:
+            tag_emb = self._tag_embeddings[tag]
             sim = _cosine_similarity(text_embedding, tag_emb)
             if sim >= self.similarity_threshold:
                 scores.append((tag, sim))
@@ -181,10 +187,11 @@ class EmbeddingTagGenerator:
                 if ms > 0
             ]
             logger.info(
-                "EMBED_TAG_BREAKDOWN model=%s total=%sms vocab=%d local_hits=%d shared_hits=%d embedded_missing=%d matched=%d %s",
+                "EMBED_TAG_BREAKDOWN model=%s total=%sms vocab=%d scored=%d local_hits=%d shared_hits=%d embedded_missing=%d matched=%d %s",
                 self.model_name,
                 total_ms,
                 len(unique_tags),
+                len(candidate_tags),
                 local_hits,
                 shared_hits,
                 embedded_missing,
@@ -202,4 +209,3 @@ class EmbeddingTagGenerator:
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
         self._tag_vocabulary.update(tag_counts)
         self._ensure_tag_embeddings(list(tag_counts))
-
