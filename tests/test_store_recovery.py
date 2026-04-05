@@ -1,5 +1,7 @@
 """Tests for store-backed pipeline recovery."""
 
+import hashlib
+
 from virtual_context.types import MonitorConfig
 
 
@@ -81,7 +83,7 @@ def test_collapse_turn_chains_recovers_from_store():
         client_truncated=True,
     )
 
-    mock_store.get_chain_snapshots_for_conversation.assert_called_once()
+    assert mock_store.get_chain_snapshots_for_conversation.call_count == 2
     assert recovered == 2
     assert "chain_50_abc123" in refs
     assert "chain_80_def456" in refs
@@ -91,6 +93,66 @@ def test_collapse_turn_chains_recovers_from_store():
     assert "Compacted turn 50" in result_json
     assert "Compacted turn 80" in result_json
     assert "vc_restore_tool" in result_json
+
+
+def test_collapse_turn_chains_reuses_existing_snapshot_for_canonical_turn():
+    import json
+    from unittest.mock import MagicMock
+
+    from virtual_context.core.turn_tag_index import TurnTagIndex
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.proxy.message_filter import collapse_turn_chains
+    from virtual_context.types import TurnTagEntry
+
+    body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {"role": "user", "content": "read file"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/tmp/x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "file contents shown"}]},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "user", "content": "current"},
+        ],
+    }
+    fmt = detect_format(body)
+
+    combined = "read file file contents shown"
+    msg_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+    tti = TurnTagIndex()
+    tti.append(TurnTagEntry(turn_number=10, message_hash=msg_hash, tags=["file-ops"]))
+
+    mock_store = MagicMock()
+    mock_store.get_chain_snapshots_for_conversation.return_value = [
+        {"ref": "chain_existing_ref", "turn_number": 10, "tool_output_refs": "tool_ref", "message_count": 4},
+    ]
+
+    result, count, refs, recovered = collapse_turn_chains(
+        body=body,
+        fmt=fmt,
+        protected_recent_turns=3,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        pre_filter_body={"messages": []},
+    )
+
+    assert count == 1
+    assert recovered == 0
+    assert refs == ["chain_existing_ref"]
+    assert "chain_existing_ref" in json.dumps(result)
+    mock_store.get_chain_snapshots_for_conversation.assert_called_once_with("test-conv", min_turn=0)
+    mock_store.store_tool_output.assert_not_called()
+    mock_store.store_chain_snapshot.assert_not_called()
 
 
 def test_fill_pass_restores_from_store_on_truncation():
