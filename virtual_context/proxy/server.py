@@ -422,13 +422,16 @@ async def prepare_payload(
     _note_prep("normalize_messages", _normalize_stage)
 
     api_format = fmt.name
+    _extract_user_stage = time.monotonic()
     user_message = fmt.extract_user_message(body)
+    _note_prep("extract_user_message", _extract_user_stage)
     is_streaming = body.get("stream", False)
 
     # --- VC command detection (VCATTACH, VCLABEL, VCSTATUS, VCRECALL, VCCOMPACT, VCLIST, VCFORGET) ---
     # OpenClaw wraps user messages in metadata envelopes (```json``` fenced blocks)
     # with the actual user text after the last fence. Strip the envelope first.
     import re as _re
+    _vc_parse_stage = time.monotonic()
     _vc_user_text = user_message.strip()
     _last_fence = _vc_user_text.rfind("```")
     if _last_fence >= 0:
@@ -439,6 +442,7 @@ async def prepare_payload(
         r"^VC(ATTACH|LABEL|STATUS|RECALL|COMPACT|LIST|FORGET)(?:\s+(.+))?$",
         _vc_user_text, _re.IGNORECASE,
     )
+    _note_prep("parse_vc_command", _vc_parse_stage)
     if _vc_cmd_match:
         _vc_cmd = _vc_cmd_match.group(1).upper()
         _vc_arg = (_vc_cmd_match.group(2) or "").strip()
@@ -493,6 +497,7 @@ async def prepare_payload(
     if state:
         state._last_model = _model_name
     try:
+        _limit_stage = time.monotonic()
         _instance_limit = int(getattr(state, '_instance_upstream_limit', 0)) if state else 0
     except (TypeError, ValueError):
         _instance_limit = 0
@@ -501,6 +506,7 @@ async def prepare_payload(
     except (TypeError, ValueError, AttributeError):
         _global_limit = 0
     _upstream_limit = resolve_upstream_limit(_model_name, _instance_limit, _global_limit)
+    _note_prep("resolve_upstream_limit", _limit_stage)
 
     # Media compression — compress images on first sight, store on disk.
     # Runs BEFORE passthrough/active split so both paths benefit.
@@ -530,6 +536,7 @@ async def prepare_payload(
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
     # ---------------------------------------------------------------
     if state:
+        _dispatch_stage = time.monotonic()
         state._total_requests += 1
         current_state = state.session_state
 
@@ -549,6 +556,7 @@ async def prepare_payload(
                 current_state = state.session_state
             elif needed > 0 and existing < needed:
                 current_state = SessionState.PASSTHROUGH
+        _note_prep("session_state_dispatch", _dispatch_stage)
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
             # Store latest body for catch-up loop
@@ -745,6 +753,7 @@ async def prepare_payload(
 
     # One-time history rebuild from client payload if persisted history is insufficient
     if state:
+        _history_rebuild_stage = time.monotonic()
         _expected = len(state.engine._turn_tag_index.entries)
         _have = len(state.conversation_history) // 2
         if _have < _expected and _expected > 0:
@@ -755,6 +764,7 @@ async def prepare_payload(
                     "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d pairs)",
                     _have, _expected, len(_client_pairs) // 2,
                 )
+        _note_prep("history_rebuild", _history_rebuild_stage)
 
     prepend_text = ""
     assembled = None
@@ -934,6 +944,7 @@ async def prepare_payload(
                 conversation_id=state.engine.config.conversation_id,
                 deep_compaction_ratio=_deep_ratio,
                 client_truncated=_client_truncated,
+                collapse_runtime_cache=getattr(state, "_chain_snapshot_cache", None),
             )
             _note_prep("collapse_turn_chains", _collapse_stage)
             if _collapse_count:
@@ -1084,7 +1095,9 @@ async def prepare_payload(
     is_streaming = body.get("stream", False)
 
     # Component-level estimate (diagnostic breakdown, not source of truth)
+    _system_tokens_stage = time.monotonic()
     system_tokens = fmt._estimate_system_tokens(body)
+    _note_prep("estimate_system_tokens", _system_tokens_stage)
 
     # Strip VC internal markers before token counting and upstream send
     _strip_stage = time.monotonic()
@@ -1352,6 +1365,7 @@ async def prepare_payload(
 
     # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
     _non_virtualizable_floor = 0
+    _floor_stage = time.monotonic()
     if state:
         state._last_enriched_payload_tokens = outbound_tokens
         # Non-virtualizable floor: system + tools (what VC can't touch)
@@ -1384,6 +1398,7 @@ async def prepare_payload(
                 })
         except (TypeError, ValueError):
             pass
+    _note_prep("floor_accounting", _floor_stage)
 
     # Upstream context enforcement — trim if enriched payload exceeds upstream limit
     _upstream_trimmed = 0
@@ -1429,7 +1444,9 @@ async def prepare_payload(
     # Record request event
     turn = len(state.engine._turn_tag_index.entries) if state else 0
     _turn_id = uuid.uuid4().hex[:12]
+    _context_tokens_stage = time.monotonic()
     context_tokens = fmt._count(prepend_text) if prepend_text else 0
+    _note_prep("context_token_count", _context_tokens_stage)
     total_turns = turn
     _prepare_meta = _prepare_metadata()
     overhead_ms = _prepare_meta["prepare_total_ms"]

@@ -109,3 +109,27 @@ class TestEmbeddingTagGenerator:
         assert any(call == ["api"] for call in embed_calls)
         assert all(call != ["database", "api"] for call in embed_calls)
         assert "api" in saved["all-MiniLM-L6-v2"]
+
+    def test_generate_only_scores_current_request_vocabulary(self):
+        vectors = {
+            "frontend": [1.0, 0.0],
+            "database": [0.0, 1.0],
+            "frontend question": [1.0, 0.0],
+        }
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            return [vectors[t.lower()] for t in texts]
+
+        config = TagGeneratorConfig(type="embedding", max_tags=3, min_tags=1)
+        gen = EmbeddingTagGenerator(
+            config=config,
+            embed_fn=embed,
+            similarity_threshold=0.5,
+        )
+
+        first = gen.generate_tags("frontend question", existing_tags=["frontend"])
+        assert first.tags == ["frontend"]
+
+        second = gen.generate_tags("frontend question", existing_tags=["database"])
+        assert second.tags == ["_general"]
+        assert second.source == "fallback"

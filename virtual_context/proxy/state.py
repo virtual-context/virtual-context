@@ -141,6 +141,10 @@ class ProxyState:
         self._last_enriched_payload_tokens: int = 0
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         self._inbound_payload_token_cache = None
+        self._chain_snapshot_cache: dict[str, object] = {
+            "loaded": False,
+            "refs_by_turn": {},
+        }
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
         # Upstream context window enforcement
@@ -1092,6 +1096,10 @@ class ProxyState:
         self._last_enriched_payload_tokens = 0
         self._last_non_virtualizable_floor = 0
         self._inbound_payload_token_cache = None
+        self._chain_snapshot_cache = {
+            "loaded": False,
+            "refs_by_turn": {},
+        }
         self._total_requests = 0
         self._last_model = ""
 

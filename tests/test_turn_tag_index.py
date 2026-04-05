@@ -35,6 +35,18 @@ class TestTurnTagIndex:
         index = TurnTagIndex()
         assert index.get_active_tags() == set()
 
+    def test_all_tags_tracks_replacements(self):
+        index = TurnTagIndex()
+        index.append(TurnTagEntry(turn_number=0, message_hash="a", tags=["database", "api"], primary_tag="database"))
+        index.append(TurnTagEntry(turn_number=1, message_hash="b", tags=["frontend"], primary_tag="frontend"))
+
+        assert index.all_tags() == {"database", "api", "frontend"}
+
+        modified = index.replace_tag("database", {0: ["storage", "schema"]})
+
+        assert modified == 1
+        assert index.all_tags() == {"storage", "schema", "api", "frontend"}
+
     def test_get_tag_velocity(self):
         index = TurnTagIndex()
         now = datetime.now(timezone.utc)

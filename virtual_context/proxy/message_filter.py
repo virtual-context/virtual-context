@@ -9,6 +9,8 @@ import hashlib
 import json
 import logging
 import math
+import time
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -22,6 +24,9 @@ if TYPE_CHECKING:
     from ..types import AssembledContext
 
 logger = logging.getLogger(__name__)
+
+_CHAIN_COLLAPSE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
+_CHAIN_COLLAPSE_BREAKDOWN_MAX_STAGES = 8
 
 
 def _is_tool_result_only_user(msg: dict) -> bool:
@@ -1493,6 +1498,7 @@ def collapse_turn_chains(
     pre_filter_body: dict | None = None,
     deep_compaction_ratio: float = 0.5,
     client_truncated: bool = False,
+    collapse_runtime_cache: dict[str, object] | None = None,
 ) -> tuple[dict, int, list[str], int]:
     """Collapse turn chains outside protected window to stub pairs (stage 2).
 
@@ -1514,6 +1520,13 @@ def collapse_turn_chains(
 
     Returns ``(modified_body, collapse_count, list_of_chain_refs, recovered_count)``.
     """
+    _started = time.monotonic()
+    _breakdown: dict[str, float] = {}
+
+    def _note(stage: str, started_at: float) -> None:
+        elapsed = round((time.monotonic() - started_at) * 1000, 1)
+        _breakdown[stage] = round(_breakdown.get(stage, 0.0) + elapsed, 1)
+
     if pre_filter_body is None:
         pre_filter_body = body
 
@@ -1537,7 +1550,9 @@ def collapse_turn_chains(
     # ------------------------------------------------------------------
     # 1. Identify turn groups via format abstraction
     # ------------------------------------------------------------------
+    _group_stage = time.monotonic()
     turn_groups = fmt.group_into_turns(body)
+    _note("group_turns", _group_stage)
     if not turn_groups:
         return body, 0, [], 0
 
@@ -1574,6 +1589,7 @@ def collapse_turn_chains(
     # ------------------------------------------------------------------
     # 3. Build tool call map
     # ------------------------------------------------------------------
+    _tool_map_stage = time.monotonic()
     tool_call_map: dict[str, dict] = {}
     for tc in fmt.iter_tool_calls(body):
         if tc.call_id:
@@ -1581,13 +1597,20 @@ def collapse_turn_chains(
                 "name": tc.name,
                 "arguments": tc.arguments,
             }
+    _note("tool_call_map", _tool_map_stage)
 
     # ------------------------------------------------------------------
     # 4. Resolve canonical turn numbers via hash lookup
     # ------------------------------------------------------------------
     turn_canonical: dict[int, int] = {}
     turn_user_text: dict[int, str] = {}
-    for tidx, turn in enumerate(history_turns):
+    _canonical_stage = time.monotonic()
+    collapsible_turns = [
+        tidx for tidx in range(protected_start)
+        if history_turns[tidx].has_tool_activity
+    ]
+    for tidx in collapsible_turns:
+        turn = history_turns[tidx]
         user_text = ""
         asst_text = ""
         for gi in turn.indices:
@@ -1605,6 +1628,7 @@ def collapse_turn_chains(
                 turn_canonical[tidx] = entry.turn_number
                 continue
         turn_canonical[tidx] = -1
+    _note("canonical_lookup", _canonical_stage)
 
     # ------------------------------------------------------------------
     # 5. Prepare pre_filter messages for snapshot extraction
@@ -1614,19 +1638,40 @@ def collapse_turn_chains(
     pre_filter_chain_offsets: dict[str, int] = {}
     tool_outputs_by_msg_index: dict[int, list] | None = None
     existing_chain_refs_by_turn: dict[int, str] = {}
-    if store is not None:
+    _runtime_refs: dict[int, str] | None = None
+    _runtime_loaded = False
+    if collapse_runtime_cache is not None:
+        loaded_flag = collapse_runtime_cache.get("loaded")
+        refs_by_turn = collapse_runtime_cache.get("refs_by_turn")
+        if isinstance(loaded_flag, bool):
+            _runtime_loaded = loaded_flag
+        if isinstance(refs_by_turn, dict):
+            _runtime_refs = refs_by_turn
+    if _runtime_loaded and _runtime_refs is not None:
+        existing_chain_refs_by_turn = {
+            int(turn): ref
+            for turn, ref in _runtime_refs.items()
+            if isinstance(turn, int) and isinstance(ref, str) and ref
+        }
+    elif store is not None:
+        _snapshot_stage = time.monotonic()
         try:
             for snap in store.get_chain_snapshots_for_conversation(conversation_id, min_turn=0):
                 ref = snap.get("ref", "")
                 turn_number = snap.get("turn_number")
                 if isinstance(turn_number, int) and turn_number >= 0 and ref:
                     existing_chain_refs_by_turn.setdefault(turn_number, ref)
+            if _runtime_refs is not None:
+                _runtime_refs.clear()
+                _runtime_refs.update(existing_chain_refs_by_turn)
+                collapse_runtime_cache["loaded"] = True
         except Exception:
             logger.warning(
                 "CHAIN-COLLAPSE: failed to load existing snapshots conversation=%s",
                 conversation_id,
                 exc_info=True,
             )
+        _note("load_snapshot_refs", _snapshot_stage)
 
     # ------------------------------------------------------------------
     # 6. Collapse turns outside the protected window
@@ -1643,7 +1688,8 @@ def collapse_turn_chains(
 
     # Compute deep compaction threshold from canonical turn numbers.
     # Turns below this threshold are dropped entirely (no stub).
-    _max_canonical = max((v for v in turn_canonical.values() if v >= 0), default=0)
+    _tti_entries = turn_tag_index.entries
+    _max_canonical = _tti_entries[-1].turn_number if _tti_entries else 0
     _deep_threshold = int(_max_canonical * deep_compaction_ratio) if deep_compaction_ratio > 0 else 0
 
     _skip_no_tool = 0
@@ -1679,7 +1725,9 @@ def collapse_turn_chains(
             _reused_existing += 1
         else:
             if pre_filter_chain_index is None:
+                _prefilter_index_stage = time.monotonic()
                 pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role)
+                _note("index_pre_filter_chains", _prefilter_index_stage)
 
             # b. Find corresponding messages in pre_filter_body
             pf_chain = None
@@ -1715,7 +1763,10 @@ def collapse_turn_chains(
             tool_output_refs_for_chain: list[str] = []
             if store is not None:
                 if tool_outputs_by_msg_index is None:
+                    _tool_output_index_stage = time.monotonic()
                     tool_outputs_by_msg_index = _index_tool_outputs_by_message(body, fmt)
+                    _note("index_tool_outputs", _tool_output_index_stage)
+                _store_snapshot_stage = time.monotonic()
                 for msg_index in turn.indices:
                     for output in tool_outputs_by_msg_index.get(msg_index, []):
                         call_info = tool_call_map.get(output.call_id, {})
@@ -1760,6 +1811,11 @@ def collapse_turn_chains(
                     logger.warning("CHAIN-COLLAPSE: failed to store chain snapshot ref=%s", ref, exc_info=True)
                     continue
                 existing_chain_refs_by_turn.setdefault(canonical_turn, ref)
+                if _runtime_refs is not None and canonical_turn >= 0:
+                    _runtime_refs[canonical_turn] = ref
+                    if collapse_runtime_cache is not None:
+                        collapse_runtime_cache["loaded"] = True
+                _note("store_new_snapshot", _store_snapshot_stage)
             _new_snapshots += 1
 
         # f. Build tool metadata for stub
@@ -1842,6 +1898,7 @@ def collapse_turn_chains(
     # 6b. Store-backed chain recovery (when client truncated)
     # ------------------------------------------------------------------
     if client_truncated and store is not None:
+        _recovery_stage = time.monotonic()
         _tti_entries = turn_tag_index.entries
         _canonical_max = _tti_entries[-1].turn_number if _tti_entries else 0
         _recovery_deep = int(_canonical_max * deep_compaction_ratio) if deep_compaction_ratio > 0 else 0
@@ -1903,6 +1960,7 @@ def collapse_turn_chains(
                 len(_recovered_stubs), _recovery_deep, _protected_canonical,
             )
         _recovered_count = len(_recovered_stubs)
+        _note("store_recovery", _recovery_stage)
 
     if not collapse_map and not deep_drop_set and not _recovered_stubs:
         return body, 0, [], 0
@@ -1951,6 +2009,7 @@ def collapse_turn_chains(
 
     # Strip orphaned tool_result / function_call_output blocks from
     # non-collapsed messages before removing collapsed indices.
+    _orphan_stage = time.monotonic()
     for mi in range(len(messages)):
         if mi in collapsed_indices:
             continue
@@ -1973,17 +2032,19 @@ def collapse_turn_chains(
         # chains but referencing collapsed call_ids
         if msg.get("type") == "function_call_output" and msg.get("call_id") in collapsed_tool_use_ids:
             msg["output"] = "[tool results removed — parent tool call was compacted]"
+    _note("orphan_cleanup", _orphan_stage)
 
     # Remove collapsed items (highest index first to preserve positions)
-    fmt.remove_items(body, sorted(collapsed_indices))
+    _mutation_stage = time.monotonic()
+    collapsed_sorted = sorted(collapsed_indices)
+    fmt.remove_items(body, collapsed_sorted)
 
     # Insert stub pairs. After removal, indices shift, so we track the offset.
     # For each insertion point, count how many collapsed indices were below it
     # and adjust accordingly.
     offset = 0
     for orig_pos, stub_user, stub_asst in insertions:
-        # How many collapsed items were before (or at) this position?
-        removed_before = sum(1 for ci in collapsed_indices if ci < orig_pos)
+        removed_before = bisect_left(collapsed_sorted, orig_pos)
         # How many stub pairs were already inserted before this position?
         adjusted_pos = orig_pos - removed_before + offset
         fmt.insert_items(body, adjusted_pos, [stub_user, stub_asst])
@@ -2003,6 +2064,26 @@ def collapse_turn_chains(
         for _, stub_user, stub_asst in _recovered_stubs:
             recovery_items.extend([stub_user, stub_asst])
         fmt.insert_items(body, insert_at, recovery_items)
+    _note("apply_mutations", _mutation_stage)
+
+    total_ms = round((time.monotonic() - _started) * 1000, 1)
+    if total_ms >= _CHAIN_COLLAPSE_BREAKDOWN_LOG_THRESHOLD_MS:
+        stage_bits = [
+            f"{stage}={ms:.1f}ms"
+            for stage, ms in sorted(_breakdown.items(), key=lambda item: item[1], reverse=True)
+            [:_CHAIN_COLLAPSE_BREAKDOWN_MAX_STAGES]
+            if ms > 0
+        ]
+        logger.info(
+            "CHAIN_COLLAPSE_BREAKDOWN conv=%s total=%sms collapse=%d reused=%d new=%d recovered=%d %s",
+            conversation_id[:12] if conversation_id else "none",
+            total_ms,
+            collapse_count,
+            _reused_existing,
+            _new_snapshots,
+            _recovered_count,
+            " ".join(stage_bits) if stage_bits else "no-stages",
+        )
 
     return body, collapse_count, chain_refs, _recovered_count
 

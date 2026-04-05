@@ -145,8 +145,7 @@ class ContextRetriever:
             # conversation's engine_state), so all its tags are in scope.
             vocab_tags = list(set(store_tags))
             if self._turn_tag_index:
-                all_index_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
-                vocab_tags = list(set(vocab_tags) | all_index_tags)
+                vocab_tags = list(set(vocab_tags) | self._turn_tag_index.all_tags())
             tag_result = self._inbound_tagger.generate_tags(
                 message, vocab_tags, context_turns=context_turns,
             )

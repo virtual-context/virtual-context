@@ -18,6 +18,7 @@ class TurnTagIndex:
         self.entries: list[TurnTagEntry] = []
         self._by_turn: dict[int, TurnTagEntry] = {}
         self._by_hash: dict[str, TurnTagEntry] = {}
+        self._all_tags: set[str] = set()
 
     def append(self, entry: TurnTagEntry) -> None:
         if entry.turn_number in self._by_turn:
@@ -33,6 +34,7 @@ class TurnTagIndex:
         self._by_turn[entry.turn_number] = entry
         if entry.message_hash:
             self._by_hash[entry.message_hash] = entry
+        self._all_tags.update(entry.tags)
 
     def get_active_tags(self, lookback: int = 4) -> set[str]:
         recent = self.entries[-lookback:] if len(self.entries) >= lookback else self.entries
@@ -47,6 +49,10 @@ class TurnTagIndex:
 
     def get_entry_by_hash(self, message_hash: str) -> TurnTagEntry | None:
         return self._by_hash.get(message_hash)
+
+    def all_tags(self) -> set[str]:
+        """Return every tag currently present in the index."""
+        return set(self._all_tags)
 
     def get_tag_velocity(self, tag: str, window_hours: float = 72) -> float:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
@@ -89,6 +95,8 @@ class TurnTagIndex:
                     if entry.primary_tag == old_tag:
                         entry.primary_tag = new_tags[0]
                     modified += 1
+        if modified:
+            self._all_tags = {tag for entry in self.entries for tag in entry.tags}
         return modified
 
     def get_tag_counts(self) -> dict[str, int]:
