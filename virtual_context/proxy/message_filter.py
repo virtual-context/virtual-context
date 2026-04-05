@@ -1472,6 +1472,17 @@ def _index_pre_filter_chains(
     return index
 
 
+def _index_tool_outputs_by_message(
+    body: dict,
+    fmt: PayloadFormat,
+) -> dict[int, list]:
+    """Pre-index tool outputs by source message index."""
+    index: dict[int, list] = {}
+    for output in fmt.iter_tool_outputs(body):
+        index.setdefault(output.msg_index, []).append(output)
+    return index
+
+
 def collapse_turn_chains(
     body: dict,
     fmt: PayloadFormat,
@@ -1599,8 +1610,23 @@ def collapse_turn_chains(
     # 5. Prepare pre_filter messages for snapshot extraction
     # ------------------------------------------------------------------
     pre_filter_messages = pre_filter_body.get(_msg_key, [])
-    pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role)
+    pre_filter_chain_index: dict[str, list[list[int]]] | None = None
     pre_filter_chain_offsets: dict[str, int] = {}
+    tool_outputs_by_msg_index: dict[int, list] | None = None
+    existing_chain_refs_by_turn: dict[int, str] = {}
+    if store is not None:
+        try:
+            for snap in store.get_chain_snapshots_for_conversation(conversation_id, min_turn=0):
+                ref = snap.get("ref", "")
+                turn_number = snap.get("turn_number")
+                if isinstance(turn_number, int) and turn_number >= 0 and ref:
+                    existing_chain_refs_by_turn.setdefault(turn_number, ref)
+        except Exception:
+            logger.warning(
+                "CHAIN-COLLAPSE: failed to load existing snapshots conversation=%s",
+                conversation_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # 6. Collapse turns outside the protected window
@@ -1625,6 +1651,8 @@ def collapse_turn_chains(
     _skip_no_pf_match = 0
     _skip_no_canonical = 0
     _deep_dropped = 0
+    _reused_existing = 0
+    _new_snapshots = 0
 
     logger.info(
         "CHAIN-COLLAPSE: analyzing %d turns (%d protected, %d collapsible) format=%s deep_threshold=%d",
@@ -1645,85 +1673,94 @@ def collapse_turn_chains(
             _skip_no_user_text += 1
             continue
 
-        # a. Find corresponding messages in pre_filter_body
-        pf_chain = None
-        candidates = pre_filter_chain_index.get(user_text, [])
-        cursor = pre_filter_chain_offsets.get(user_text, 0)
-        while cursor < len(candidates):
-            candidate = candidates[cursor]
-            cursor += 1
-            if any(idx in _pf_used for idx in candidate):
+        # a. Reuse an existing stored snapshot when the canonical turn matches.
+        ref = existing_chain_refs_by_turn.get(canonical_turn, "")
+        if ref:
+            _reused_existing += 1
+        else:
+            if pre_filter_chain_index is None:
+                pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role)
+
+            # b. Find corresponding messages in pre_filter_body
+            pf_chain = None
+            candidates = pre_filter_chain_index.get(user_text, [])
+            cursor = pre_filter_chain_offsets.get(user_text, 0)
+            while cursor < len(candidates):
+                candidate = candidates[cursor]
+                cursor += 1
+                if any(idx in _pf_used for idx in candidate):
+                    continue
+                pf_chain = candidate
+                break
+            pre_filter_chain_offsets[user_text] = cursor
+            if pf_chain is None:
+                _skip_no_pf_match += 1
+                if _skip_no_pf_match <= 3:
+                    logger.info(
+                        "CHAIN-COLLAPSE: no pre-filter match turn %d (canonical %d) user_text=%s",
+                        tidx, canonical_turn, user_text[:80],
+                    )
                 continue
-            pf_chain = candidate
-            break
-        pre_filter_chain_offsets[user_text] = cursor
-        if pf_chain is None:
-            _skip_no_pf_match += 1
-            if _skip_no_pf_match <= 3:
-                logger.info(
-                    "CHAIN-COLLAPSE: no pre-filter match turn %d (canonical %d) user_text=%s",
-                    tidx, canonical_turn, user_text[:80],
-                )
-            continue
 
-        _pf_used.update(pf_chain)
+            _pf_used.update(pf_chain)
 
-        # b. Serialize chain snapshot from pre-filter body
-        pf_msgs = [pre_filter_messages[pi] for pi in pf_chain]
-        chain_json = json.dumps(pf_msgs, default=str)
+            # c. Serialize chain snapshot from pre-filter body
+            pf_msgs = [pre_filter_messages[pi] for pi in pf_chain]
+            chain_json = json.dumps(pf_msgs, default=str)
 
-        # c. Generate composite ref
-        ref = f"chain_{canonical_turn}_{hashlib.sha256(chain_json.encode()).hexdigest()[:12]}"
+            # d. Generate composite ref
+            ref = f"chain_{canonical_turn}_{hashlib.sha256(chain_json.encode()).hexdigest()[:12]}"
 
-        # d. Store individual tool outputs (only when store is available)
-        tool_output_refs_for_chain: list[str] = []
-        if store is not None:
-            for output in fmt.iter_tool_outputs(body):
-                if output.msg_index not in turn.indices:
-                    continue
-                call_info = tool_call_map.get(output.call_id, {})
-                tool_name = call_info.get("name", "")
-                if tool_name in VC_TOOL_NAMES:
-                    continue
-                content_text = output.content
-                if not content_text:
-                    continue
-                tool_ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
-                args_summary = _summarise_arguments(call_info.get("arguments"))
+            # e. Store individual tool outputs (only when store is available)
+            tool_output_refs_for_chain: list[str] = []
+            if store is not None:
+                if tool_outputs_by_msg_index is None:
+                    tool_outputs_by_msg_index = _index_tool_outputs_by_message(body, fmt)
+                for msg_index in turn.indices:
+                    for output in tool_outputs_by_msg_index.get(msg_index, []):
+                        call_info = tool_call_map.get(output.call_id, {})
+                        tool_name = call_info.get("name", "")
+                        if tool_name in VC_TOOL_NAMES:
+                            continue
+                        content_text = output.content
+                        if not content_text:
+                            continue
+                        tool_ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
+                        args_summary = _summarise_arguments(call_info.get("arguments"))
+                        try:
+                            store.store_tool_output(
+                                ref=tool_ref,
+                                conversation_id=conversation_id,
+                                tool_name=tool_name,
+                                command=args_summary,
+                                turn=canonical_turn,
+                                content=content_text,
+                                original_bytes=len(content_text.encode("utf-8")),
+                            )
+                        except Exception:
+                            logger.warning("CHAIN-COLLAPSE: failed to store tool output ref=%s", tool_ref, exc_info=True)
+                            continue
+                        if canonical_turn >= 0:
+                            try:
+                                store.link_turn_tool_output(conversation_id, canonical_turn, tool_ref)
+                            except Exception:
+                                pass
+                        tool_output_refs_for_chain.append(tool_ref)
+
                 try:
-                    store.store_tool_output(
-                        ref=tool_ref,
+                    store.store_chain_snapshot(
+                        ref=ref,
                         conversation_id=conversation_id,
-                        tool_name=tool_name,
-                        command=args_summary,
-                        turn=canonical_turn,
-                        content=content_text,
-                        original_bytes=len(content_text.encode("utf-8")),
+                        turn_number=canonical_turn,
+                        chain_json=chain_json,
+                        message_count=len(pf_msgs),
+                        tool_output_refs=",".join(tool_output_refs_for_chain),
                     )
                 except Exception:
-                    logger.warning("CHAIN-COLLAPSE: failed to store tool output ref=%s", tool_ref, exc_info=True)
+                    logger.warning("CHAIN-COLLAPSE: failed to store chain snapshot ref=%s", ref, exc_info=True)
                     continue
-                if canonical_turn >= 0:
-                    try:
-                        store.link_turn_tool_output(conversation_id, canonical_turn, tool_ref)
-                    except Exception:
-                        pass
-                tool_output_refs_for_chain.append(tool_ref)
-
-        # e. Store chain snapshot (only when store is available)
-        if store is not None:
-            try:
-                store.store_chain_snapshot(
-                    ref=ref,
-                    conversation_id=conversation_id,
-                    turn_number=canonical_turn,
-                    chain_json=chain_json,
-                    message_count=len(pf_msgs),
-                    tool_output_refs=",".join(tool_output_refs_for_chain),
-                )
-            except Exception:
-                logger.warning("CHAIN-COLLAPSE: failed to store chain snapshot ref=%s", ref, exc_info=True)
-                continue
+                existing_chain_refs_by_turn.setdefault(canonical_turn, ref)
+            _new_snapshots += 1
 
         # f. Build tool metadata for stub
         tool_descs = _extract_tool_metadata_from_chain(messages, turn.indices, tool_call_map)
@@ -1795,10 +1832,10 @@ def collapse_turn_chains(
         collapse_count += 1
 
     logger.info(
-        "CHAIN-COLLAPSE: results — stubbed=%d deep_dropped=%d skip_no_tool=%d skip_no_user_text=%d "
-        "skip_no_pf_match=%d skip_no_canonical=%d",
-        len(collapse_map), _deep_dropped, _skip_no_tool, _skip_no_user_text,
-        _skip_no_pf_match, _skip_no_canonical,
+        "CHAIN-COLLAPSE: results — stubbed=%d deep_dropped=%d reused_existing=%d new_snapshots=%d "
+        "skip_no_tool=%d skip_no_user_text=%d skip_no_pf_match=%d skip_no_canonical=%d",
+        len(collapse_map), _deep_dropped, _reused_existing, _new_snapshots,
+        _skip_no_tool, _skip_no_user_text, _skip_no_pf_match, _skip_no_canonical,
     )
 
     # ------------------------------------------------------------------
