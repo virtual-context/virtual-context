@@ -420,25 +420,16 @@ class CompactionPipeline:
         prune = getattr(self._store, "prune_turn_messages", None)
         if prune is None:
             return
-        try:
-            committed = self._store.load_engine_state(self._config.conversation_id)
-        except Exception:
-            logger.warning(
-                "Failed to reload committed compaction checkpoint for conversation %s before pruning turn_messages",
-                self._config.conversation_id[:12],
-                exc_info=True,
-            )
-            return
-        if not committed:
-            return
-        committed_turn = int(getattr(committed, "last_compacted_turn", -1) or -1)
+        # Trust in-memory engine_state rather than reloading from Postgres.
+        # In provider mode, _save_state writes to Redis/memory but
+        # store.load_engine_state() reads from Postgres which lags behind,
+        # causing false "checkpoint regression" warnings and skipped prunes.
+        committed_turn = int(self._engine_state.last_compacted_turn)
         if committed_turn < expected_last_compacted_turn:
             logger.warning(
                 "Compaction checkpoint regression for conversation %s: "
-                "store.load_engine_state() returned last_compacted_turn=%d "
-                "but in-memory expected=%d. This happens when _save_state "
-                "writes to Redis/memory but store reads from Postgres "
-                "(provider mode deferred flush). Skipping turn_messages prune.",
+                "engine_state.last_compacted_turn=%d but expected=%d. "
+                "Skipping turn_messages prune.",
                 self._config.conversation_id[:12],
                 committed_turn,
                 expected_last_compacted_turn,

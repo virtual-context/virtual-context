@@ -41,7 +41,8 @@ def test_compaction_prunes_only_after_committed_checkpoint_save():
     pipeline._commit_compaction_state([])
 
     pipeline._save_state_callback.assert_called_once()
-    store.load_engine_state.assert_called_once_with("conv-1")
+    # No longer reloads from Postgres — trusts in-memory engine_state
+    store.load_engine_state.assert_not_called()
     store.prune_turn_messages.assert_called_once_with("conv-1", 5)
 
 
@@ -55,8 +56,16 @@ def test_compaction_skips_prune_when_checkpoint_save_fails():
 
 
 def test_compaction_skips_prune_when_committed_checkpoint_lags_expected():
-    pipeline, store = _make_pipeline(save_ok=True, committed_turn=2)
-    pipeline._engine_state.last_compacted_turn = 4
+    """Regression guard: if save_state_callback mutates engine_state to a
+    lower value, the prune is skipped."""
+    pipeline, store = _make_pipeline(save_ok=True, committed_turn=4)
+
+    # Simulate save_state_callback clobbering the checkpoint to a lower value
+    def regressing_save(history):
+        pipeline._engine_state.last_compacted_turn = 2
+        return True
+
+    pipeline._save_state_callback = regressing_save
 
     pipeline._commit_compaction_state([])
 
