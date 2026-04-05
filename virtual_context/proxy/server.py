@@ -348,18 +348,30 @@ async def prepare_payload(
         _note_prep(count_stage, _count_started)
         return payload_json, payload_bytes, payload_tokens
 
-    # Ground truth: measure inbound BEFORE normalization using estimate_payload_tokens.
-    # Verified against Anthropic count_tokens API:
-    #   - Tool chains payload: estimate=418K, real=329K (1.27x — acceptable)
-    #   - Image payload: estimate=107K, real=106K (1.01x — near exact)
-    #   - raw_bytes//4 for images: 2.5M vs real 106K (24x — catastrophically wrong)
-    # estimate_payload_tokens is the only method that handles media correctly.
+    # Measure inbound BEFORE normalization using the media-aware segmented
+    # estimator. It composes shell + per-message counts, which closely tracks
+    # the legacy whole-body estimator while allowing stable prefix reuse.
+    # Verified against the legacy estimate on a live 3.9MB Anthropic payload:
+    #   - full-body estimator: 1,157,338t
+    #   - segmented estimator: 1,158,117t (+0.07%)
+    # This keeps media handling correct without re-tokenizing the entire raw
+    # payload on every append-only turn.
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
     _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
     _initial_message_count = len(body[_msg_key]) if _msg_key in body and isinstance(body[_msg_key], list) else 0
     _inbound_stage = time.monotonic()
-    _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
+    _inbound_cache_estimate = None
+    if body_bytes:
+        _inbound_cache_estimate = fmt.estimate_payload_tokens_segmented(
+            body,
+            cache=state._inbound_payload_token_cache if state else None,
+        )
+        _inbound_tokens = _inbound_cache_estimate.total_tokens
+        if state:
+            state._inbound_payload_token_cache = _inbound_cache_estimate.cache
+    else:
+        _inbound_tokens = 0
     _note_prep("inbound_token_count", _inbound_stage)
     if state:
         state._last_payload_kb = _payload_kb
@@ -369,6 +381,16 @@ async def prepare_payload(
             state._initial_payload_tokens = _inbound_tokens
         if state.is_conversation_deleted():
             state = None
+    if _inbound_cache_estimate and _inbound_cache_estimate.reused_prefix_messages:
+        logger.info(
+            "INBOUND_TOKEN_CACHE: conv=%s reused=%d/%d recounted=%d shell_cached=%s total=%dt",
+            conversation_id[:12] if conversation_id else "none",
+            _inbound_cache_estimate.reused_prefix_messages,
+            _initial_message_count,
+            _inbound_cache_estimate.recounted_messages,
+            _inbound_cache_estimate.shell_cache_hit,
+            _inbound_tokens,
+        )
 
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
