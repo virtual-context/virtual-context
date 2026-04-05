@@ -7,6 +7,7 @@ reassemble_context, retrieve, transform, filter_history, and context hint buildi
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from .engine_utils import get_recent_context
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_INBOUND_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
+_INBOUND_BREAKDOWN_MAX_STAGES = 8
 
 
 class RetrievalAssembler:
@@ -106,15 +110,26 @@ class RetrievalAssembler:
         max_context_tokens: int | None = None,
     ) -> AssembledContext:
         """Before sending to LLM: tag, retrieve, assemble enriched context."""
+        _started = time.monotonic()
+        _breakdown: dict[str, float] = {}
+
+        def _note(stage: str, started_at: float) -> float:
+            elapsed = round((time.monotonic() - started_at) * 1000, 1)
+            _breakdown[stage] = round(_breakdown.get(stage, 0.0) + elapsed, 1)
+            return elapsed
+
         # Determine active tags from recent tag results
         # Post-compaction: don't suppress retrieval -- stored summaries are needed
         # since raw turns have been compacted away
+        _active_stage = time.monotonic()
         if self._engine_state.compacted_through > 0:
             active_tags = []
         else:
             active_tags = self._get_active_tags(conversation_history)
+        _note("active_tags", _active_stage)
 
         # Compute current utilization (only count un-compacted history)
+        _snapshot_stage = time.monotonic()
         _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
         _offset = self._engine_state.history_offset(
             len(conversation_history), total_turns_indexed=_total_turns,
@@ -123,17 +138,21 @@ class RetrievalAssembler:
             conversation_history[_offset:]
         )
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
+        _note("history_snapshot", _snapshot_stage)
 
         # Build context for inbound tagger.
         # Include recent turns even post-compaction so query-time tagging can
         # use immediate conversational cues.
+        _context_stage = time.monotonic()
         n_context = self.config.tag_generator.context_lookback_pairs
         # For inbound, the current message is not yet in history -- no need to exclude
         context = self._get_recent_context(
             conversation_history, n_context, exclude_last=0,
         )
+        _note("recent_context", _context_stage)
 
         # Retrieve relevant tag summaries
+        _retrieve_stage = time.monotonic()
         retrieval_result = self._retriever.retrieve(
             message=message,
             current_active_tags=active_tags,
@@ -141,23 +160,32 @@ class RetrievalAssembler:
             post_compaction=(self._engine_state.compacted_through > 0),
             context_turns=context,
         )
+        _note("retrieve_primary", _retrieve_stage)
 
         # D2: Curate facts down to query-relevant subset before assembly
         if self._fact_curator and retrieval_result.facts:
+            _curate_stage = time.monotonic()
             retrieval_result.facts = self._fact_curator.curate(
                 retrieval_result.facts,
                 question=message,
             )
+            _note("fact_curate_primary", _curate_stage)
 
         # Build context awareness hint (post-compaction only)
+        _hint_stage = time.monotonic()
         _paging_mode = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
         context_hint = self._build_context_hint(paging_mode=_paging_mode)
+        _note("context_hint", _hint_stage)
 
         # Load core context
+        _core_stage = time.monotonic()
         core_context = self._assembler.load_core_context()
+        _note("load_core_context", _core_stage)
 
         # Paging: load content at working set depth levels
+        _working_set_stage = time.monotonic()
         ws_param, full_segments_param = self._load_working_set_segments()
+        _note("load_working_set", _working_set_stage)
         if ws_param:
             # Update last_accessed_turn for tags matched by current query
             query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
@@ -167,6 +195,7 @@ class RetrievalAssembler:
 
         # Assemble enriched context -- only pass uncompacted messages
         uncompacted = conversation_history[_offset:]
+        _assemble_stage = time.monotonic()
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=retrieval_result,
@@ -177,6 +206,7 @@ class RetrievalAssembler:
             full_segments=full_segments_param,
             max_context_tokens=max_context_tokens,
         )
+        _note("assemble_primary", _assemble_stage)
 
         # Expose the message's own tags for downstream use (e.g. history filtering).
         # Use tags_from_message (what the tag generator produced for this message)
@@ -188,10 +218,13 @@ class RetrievalAssembler:
         # Retry with expanded context if only _general was produced.
         # Applies both pre- and post-compaction.
         if message_tags == ["_general"]:
+            _retry_context_stage = time.monotonic()
             expanded = self._get_recent_context(
                 conversation_history, n_context * 2, exclude_last=0,
             )
+            _note("retry_context", _retry_context_stage)
             if expanded:
+                _retry_retrieve_stage = time.monotonic()
                 retry_result = self._retriever.retrieve(
                     message=message,
                     current_active_tags=active_tags,
@@ -199,6 +232,7 @@ class RetrievalAssembler:
                     post_compaction=(self._engine_state.compacted_through > 0),
                     context_turns=expanded,
                 )
+                _note("retrieve_retry_general", _retry_retrieve_stage)
                 retry_tags = retry_result.retrieval_metadata.get(
                     "tags_from_message", retry_result.tags_matched
                 )
@@ -208,9 +242,12 @@ class RetrievalAssembler:
                     # Re-assemble with the improved retrieval result so
                     # prepend_text includes the newly matched summaries.
                     if self._fact_curator and retrieval_result.facts:
+                        _retry_curate_stage = time.monotonic()
                         retrieval_result.facts = self._fact_curator.curate(
                             retrieval_result.facts, question=message,
                         )
+                        _note("fact_curate_retry", _retry_curate_stage)
+                    _retry_assemble_stage = time.monotonic()
                     assembled = self._assembler.assemble(
                         core_context=core_context,
                         retrieval_result=retrieval_result,
@@ -221,19 +258,44 @@ class RetrievalAssembler:
                         full_segments=full_segments_param,
                         max_context_tokens=max_context_tokens,
                     )
+                    _note("assemble_retry", _retry_assemble_stage)
 
         # Final fallback: inherit from most recent meaningful turn in the index
         if message_tags == ["_general"]:
+            _inherit_stage = time.monotonic()
             prev = self._turn_tag_index.latest_meaningful_tags()
             if prev:
                 message_tags = list(prev.tags)
+            _note("inherit_previous_tags", _inherit_stage)
+
+        inbound_total_ms = round((time.monotonic() - _started) * 1000, 1)
+        inbound_breakdown = {
+            stage: ms
+            for stage, ms in sorted(_breakdown.items(), key=lambda item: item[1], reverse=True)
+            if ms > 0
+        }
 
         assembled.matched_tags = message_tags
         assembled.context_hint = context_hint
         assembled.retrieval_metadata = dict(retrieval_result.retrieval_metadata or {})
+        assembled.retrieval_metadata["inbound_total_ms"] = inbound_total_ms
+        assembled.retrieval_metadata["inbound_breakdown"] = inbound_breakdown
         assembled.retrieval_scores = dict(retrieval_result.retrieval_scores or {})
         assembled.retrieval_summaries = list(retrieval_result.summaries or [])
         assembled.retrieval_full_segments = list(retrieval_result.full_detail or [])
+
+        if inbound_total_ms >= _INBOUND_BREAKDOWN_LOG_THRESHOLD_MS:
+            stage_bits = [
+                f"{stage}={ms:.1f}ms"
+                for stage, ms in list(inbound_breakdown.items())[:_INBOUND_BREAKDOWN_MAX_STAGES]
+            ]
+            logger.info(
+                "INBOUND_BREAKDOWN conv=%s history_msgs=%d total=%sms %s",
+                self.config.conversation_id[:12] if self.config.conversation_id else "none",
+                len(conversation_history),
+                inbound_total_ms,
+                " ".join(stage_bits) if stage_bits else "no-stages",
+            )
 
         # Cache for reassemble_context() -- used after paging tool execution
         self._last_retrieval_result = retrieval_result

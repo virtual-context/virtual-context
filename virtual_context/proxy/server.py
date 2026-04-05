@@ -330,6 +330,24 @@ async def prepare_payload(
             " ".join(stage_bits) if stage_bits else "no-stages",
         )
 
+    def _serialize_payload_and_estimate(
+        payload: dict,
+        *,
+        serialize_stage: str,
+        count_stage: str,
+    ) -> tuple[str, int, int]:
+        _serialize_started = time.monotonic()
+        payload_json = json.dumps(payload, default=str)
+        payload_bytes = len(payload_json.encode("utf-8"))
+        _note_prep(serialize_stage, _serialize_started)
+        _count_started = time.monotonic()
+        payload_tokens = fmt.estimate_payload_tokens_from_serialized(
+            payload,
+            payload_json,
+        )
+        _note_prep(count_stage, _count_started)
+        return payload_json, payload_bytes, payload_tokens
+
     # Ground truth: measure inbound BEFORE normalization using estimate_payload_tokens.
     # Verified against Anthropic count_tokens API:
     #   - Tool chains payload: estimate=418K, real=329K (1.27x — acceptable)
@@ -516,11 +534,19 @@ async def prepare_payload(
             # Passthrough payload trimming — trim to upstream_limit * ratio
             _pt_ratio = state.engine.config.proxy.passthrough_trim_ratio if state else 0.40
             _pt_limit = int(_upstream_limit * _pt_ratio) if _pt_ratio > 0 else _upstream_limit
+            _pt_outbound_json = ""
+            _outbound_bytes = 0
+            _outbound_tokens = _inbound_tokens
             if _inbound_tokens > _pt_limit:
                 from .message_filter import trim_to_upstream_limit
                 _pre_trim_msgs = len(body.get(fmt.get_message_key(body) if hasattr(fmt, 'get_message_key') else 'messages', []))
                 body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
-                _post_trim_tokens = fmt.estimate_payload_tokens(body)
+                _pt_outbound_json, _outbound_bytes, _post_trim_tokens = _serialize_payload_and_estimate(
+                    body,
+                    serialize_stage="passthrough_serialize_outbound",
+                    count_stage="passthrough_count_outbound",
+                )
+                _outbound_tokens = _post_trim_tokens
                 _post_trim_msgs = len(body.get('messages', body.get('input', body.get('contents', []))))
                 if _pt_trimmed:
                     logger.info(
@@ -547,13 +573,12 @@ async def prepare_payload(
                     })
 
             # Compute outbound tokens (after trim + tool interception)
-            _pt_json_stage = time.monotonic()
-            _pt_outbound_json = json.dumps(body, default=str)
-            _outbound_bytes = len(_pt_outbound_json.encode("utf-8"))
-            _note_prep("passthrough_serialize_outbound", _pt_json_stage)
-            _pt_count_stage = time.monotonic()
-            _outbound_tokens = fmt.estimate_payload_tokens(body)
-            _note_prep("passthrough_count_outbound", _pt_count_stage)
+            if not _pt_outbound_json:
+                _pt_outbound_json, _outbound_bytes, _outbound_tokens = _serialize_payload_and_estimate(
+                    body,
+                    serialize_stage="passthrough_serialize_outbound",
+                    count_stage="passthrough_count_outbound",
+                )
 
             # Non-virtualizable floor: system prompt + tools + anything VC can't touch
             _pt_system_tokens = fmt._estimate_system_tokens(body)
@@ -629,7 +654,7 @@ async def prepare_payload(
             if log_dir and log_prefix:
                 try:
                     _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
-                    _to_llm_log.write_text(json.dumps(body, default=str))
+                    _to_llm_log.write_text(_pt_outbound_json)
                 except Exception:
                     logger.debug("passthrough to-llm log write failed", exc_info=True)
 
@@ -1011,12 +1036,6 @@ async def prepare_payload(
         enriched_body = sanitize_vc_tool_errors(enriched_body, fmt)
         _note_prep("sanitize_vc_tool_errors", _sanitize_stage)
 
-    # Track enriched payload size
-    if state:
-        _size_stage = time.monotonic()
-        state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
-        _note_prep("measure_enriched_payload_kb", _size_stage)
-
     is_streaming = body.get("stream", False)
 
     # Component-level estimate (diagnostic breakdown, not source of truth)
@@ -1027,24 +1046,24 @@ async def prepare_payload(
     fmt.strip_vc_markers(enriched_body)
     _note_prep("strip_vc_markers", _strip_stage)
 
+    # Ground truth: actual byte-measured outbound token count
+    _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+        enriched_body,
+        serialize_stage="serialize_outbound",
+        count_stage="count_outbound_tokens",
+    )
+    if state:
+        state._last_enriched_payload_kb = round(_outbound_bytes / 1024, 1)
+
     # 2-to-llm: exact payload sent to the LLM (after strip — byte-for-byte what goes upstream)
     if log_dir and log_prefix:
         try:
             _llm_log_stage = time.monotonic()
             _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
-            _to_llm_log.write_text(json.dumps(enriched_body, default=str))
+            _to_llm_log.write_text(_outbound_json)
             _note_prep("write_to_llm_log", _llm_log_stage)
         except Exception:
             logger.debug("enriched body log write failed", exc_info=True)
-
-    # Ground truth: actual byte-measured outbound token count
-    _serialize_stage = time.monotonic()
-    _outbound_json = json.dumps(enriched_body, default=str)
-    _outbound_bytes = len(_outbound_json.encode("utf-8"))
-    _note_prep("serialize_outbound", _serialize_stage)
-    _outbound_count_stage = time.monotonic()
-    outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
-    _note_prep("count_outbound_tokens", _outbound_count_stage)
 
     # Ground truth: inbound tokens (what the client sent us, measured above)
     inbound_tokens = _inbound_tokens
@@ -1171,11 +1190,14 @@ async def prepare_payload(
             enriched_body, fmt, _budget_window,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
+            initial_tokens=outbound_tokens,
         )
         if _budget_reductions > 0:
-            _outbound_json = json.dumps(enriched_body, default=str)
-            _outbound_bytes = len(_outbound_json.encode("utf-8"))
-            outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
+            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+                enriched_body,
+                serialize_stage="serialize_outbound",
+                count_stage="count_outbound_tokens",
+            )
             logger.info(
                 "BUDGET_ENFORCE: %d reductions, %d bytes freed, now %dt/%dt",
                 _budget_reductions, _budget_freed, outbound_tokens, _budget_window,
@@ -1232,9 +1254,11 @@ async def prepare_payload(
                 if _client_truncated:
                     _recovery_turns = _fill_turns
                 if _fill_summaries or _fill_turns:
-                    _outbound_json = json.dumps(enriched_body, default=str)
-                    _outbound_bytes = len(_outbound_json.encode("utf-8"))
-                    outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
+                    _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+                        enriched_body,
+                        serialize_stage="serialize_outbound",
+                        count_stage="count_outbound_tokens",
+                    )
                     # Update prepend_text to reflect fill additions so
                     # context_tokens and persisted metrics are accurate.
                     _sys = enriched_body.get("system", enriched_body.get("instructions", ""))
@@ -1260,9 +1284,11 @@ async def prepare_payload(
         _bloat_fallback = True
         enriched_body = _pre_filter_body
         body = _pre_filter_body
-        _outbound_json = json.dumps(enriched_body, default=str)
-        _outbound_bytes = len(_outbound_json.encode("utf-8"))
-        outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
+        _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+            enriched_body,
+            serialize_stage="serialize_outbound",
+            count_stage="count_outbound_tokens",
+        )
         prepend_text = ""
         context_tokens = 0
         turns_dropped = 0
@@ -1322,9 +1348,11 @@ async def prepare_payload(
         from .message_filter import trim_to_upstream_limit
         enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
         if _upstream_trimmed:
-            _outbound_json = json.dumps(enriched_body, default=str)
-            _outbound_bytes = len(_outbound_json.encode("utf-8"))
-            outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
+            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+                enriched_body,
+                serialize_stage="serialize_outbound",
+                count_stage="count_outbound_tokens",
+            )
             logger.info(
                 "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
                 _pre_trim_tokens, _upstream_limit, _upstream_trimmed, outbound_tokens,

@@ -550,15 +550,17 @@ class PayloadFormat(ABC):
 
     # -- Payload token estimation --------------------------------------------
 
-    def estimate_payload_tokens(self, body: dict) -> int:
-        """Estimate total input tokens from a request body.
-
-        Base64 media (images, PDFs, audio, etc.) is counted using
-        provider-appropriate formulas instead of tokenizing the raw base64.
-        """
-        media_list = self._collect_media(body)
+    def _estimate_payload_tokens_with_media(
+        self,
+        body: dict,
+        media_list: list[MediaBlock],
+        *,
+        serialized_json: str | None = None,
+    ) -> int:
         if not media_list:
-            return self._count(json.dumps(body, default=str))
+            if serialized_json is None:
+                serialized_json = json.dumps(body, default=str)
+            return self._count(serialized_json)
 
         # Blank base64 in the source dicts, serialize, count, restore.
         # O(n) serialization instead of O(n*m) str.replace on the JSON string.
@@ -569,6 +571,28 @@ class PayloadFormat(ABC):
         text_tokens = self._count(stripped_json)
         media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
         return max(1, text_tokens + media_tokens)
+
+    def estimate_payload_tokens(self, body: dict) -> int:
+        """Estimate total input tokens from a request body.
+
+        Base64 media (images, PDFs, audio, etc.) is counted using
+        provider-appropriate formulas instead of tokenizing the raw base64.
+        """
+        media_list = self._collect_media(body)
+        return self._estimate_payload_tokens_with_media(body, media_list)
+
+    def estimate_payload_tokens_from_serialized(
+        self,
+        body: dict,
+        serialized_json: str,
+    ) -> int:
+        """Estimate payload tokens, reusing an already-serialized payload when possible."""
+        media_list = self._collect_media(body)
+        return self._estimate_payload_tokens_with_media(
+            body,
+            media_list,
+            serialized_json=serialized_json,
+        )
 
     def _blank_media_data(self, body: dict) -> list[tuple[dict, str, str]]:
         """Blank base64 data in all media source dicts. Returns save list for restore."""
