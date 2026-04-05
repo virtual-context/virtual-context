@@ -359,18 +359,37 @@ async def prepare_payload(
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
     _cache_conv_id = state.engine.config.conversation_id if state else ""
+    _cache_provider = getattr(state.engine, "_session_state_provider", None) if state else None
     _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
     _initial_message_count = len(body[_msg_key]) if _msg_key in body and isinstance(body[_msg_key], list) else 0
     _inbound_stage = time.monotonic()
     _inbound_cache_estimate = None
+    _inbound_cache_source = "none"
+    _inbound_cache = state._inbound_payload_token_cache if state else None
+    if _inbound_cache is not None:
+        _inbound_cache_source = "memory"
+    elif _cache_provider and _cache_conv_id:
+        _cache_load_stage = time.monotonic()
+        _inbound_cache = _cache_provider.load_payload_token_cache(_cache_conv_id)
+        _note_prep("inbound_token_cache_load", _cache_load_stage)
+        if _inbound_cache is not None and state:
+            state._inbound_payload_token_cache = _inbound_cache
+            _inbound_cache_source = "redis"
     if body_bytes:
         _inbound_cache_estimate = fmt.estimate_payload_tokens_segmented(
             body,
-            cache=state._inbound_payload_token_cache if state else None,
+            cache=_inbound_cache,
         )
         _inbound_tokens = _inbound_cache_estimate.total_tokens
         if state:
             state._inbound_payload_token_cache = _inbound_cache_estimate.cache
+        if _cache_provider and _cache_conv_id:
+            _cache_save_stage = time.monotonic()
+            _cache_provider.save_payload_token_cache(
+                _cache_conv_id,
+                _inbound_cache_estimate.cache,
+            )
+            _note_prep("inbound_token_cache_save", _cache_save_stage)
     else:
         _inbound_tokens = 0
     _note_prep("inbound_token_count", _inbound_stage)
@@ -382,10 +401,11 @@ async def prepare_payload(
             state._initial_payload_tokens = _inbound_tokens
         if state.is_conversation_deleted():
             state = None
-    if _inbound_cache_estimate and _inbound_cache_estimate.reused_prefix_messages:
+    if _inbound_cache_estimate and _inbound_cache_source != "none":
         logger.info(
-            "INBOUND_TOKEN_CACHE: conv=%s reused=%d/%d recounted=%d shell_cached=%s total=%dt",
+            "INBOUND_TOKEN_CACHE: conv=%s source=%s reused=%d/%d recounted=%d shell_cached=%s total=%dt",
             _cache_conv_id[:12] if _cache_conv_id else "none",
+            _inbound_cache_source,
             _inbound_cache_estimate.reused_prefix_messages,
             _initial_message_count,
             _inbound_cache_estimate.recounted_messages,

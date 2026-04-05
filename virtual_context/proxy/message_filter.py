@@ -1382,68 +1382,94 @@ def _find_pre_filter_chain(
         text = _extract_text_for_stub_hash(msg)
         if text != user_text_needle:
             continue
-        # Found the matching user message — build the chain.
-        # For OpenAI Responses, bare items (function_call, reasoning) can
-        # appear between the user message and the first assistant message.
-        # Scan forward past them to find the assistant.
-        chain: list[int] = [i]
-        j = i + 1
-        while j < len(pre_filter_messages):
-            _next = pre_filter_messages[j]
-            _next_role = _next.get("role", "")
-            _next_type = _next.get("type", "")
-            if _next_role == _asst_role:
-                chain.append(j)
-                j += 1
-                break
-            # Accept bare Responses items (function_call, function_call_output,
-            # reasoning) between user and first assistant
-            if _next_type in ("function_call", "function_call_output", "reasoning"):
-                chain.append(j)
-                j += 1
-                continue
-            # Anything else (user, developer, system) means no assistant follows
-            break
-        else:
-            continue  # no assistant found
-        if len(chain) < 2:
-            continue  # no assistant was appended
-        # j is now past the first assistant — continue looking for tool rounds
-        while j < len(pre_filter_messages):
-            next_msg = pre_filter_messages[j]
-            next_role = next_msg.get("role", "")
-            # OpenAI tool response
-            if next_role == "tool":
-                tool_batch = [j]
-                k = j + 1
-                while k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == "tool":
-                    tool_batch.append(k)
-                    k += 1
-                if k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == _asst_role:
-                    chain.extend(tool_batch)
-                    chain.append(k)
-                    j = k + 1
-                    continue
-                else:
-                    break
-            # OpenAI Responses bare round
-            responses_round = _consume_responses_tool_round(pre_filter_messages, j, _asst_role)
-            if responses_round:
-                round_indices, next_index = responses_round
-                chain.extend(round_indices)
-                j = next_index
-                continue
-            # Anthropic tool result
-            if next_role not in ("user", "human"):
-                break
-            if not _is_tool_result_only_user(next_msg):
-                break
-            if j + 1 >= len(pre_filter_messages) or pre_filter_messages[j + 1].get("role") != _asst_role:
-                break
-            chain.extend([j, j + 1])
-            j += 2
-        return chain
+        chain = _build_pre_filter_chain_from_index(pre_filter_messages, i, _asst_role)
+        if chain is not None:
+            return chain
     return None
+
+
+def _build_pre_filter_chain_from_index(
+    pre_filter_messages: list[dict],
+    start_index: int,
+    _asst_role: str,
+) -> list[int] | None:
+    """Build the full chain starting at a matched user message index."""
+    if start_index < 0 or start_index >= len(pre_filter_messages):
+        return None
+    if pre_filter_messages[start_index].get("role") != "user":
+        return None
+
+    chain: list[int] = [start_index]
+    j = start_index + 1
+    while j < len(pre_filter_messages):
+        _next = pre_filter_messages[j]
+        _next_role = _next.get("role", "")
+        _next_type = _next.get("type", "")
+        if _next_role == _asst_role:
+            chain.append(j)
+            j += 1
+            break
+        if _next_type in ("function_call", "function_call_output", "reasoning"):
+            chain.append(j)
+            j += 1
+            continue
+        break
+    else:
+        return None
+    if len(chain) < 2:
+        return None
+
+    while j < len(pre_filter_messages):
+        next_msg = pre_filter_messages[j]
+        next_role = next_msg.get("role", "")
+        if next_role == "tool":
+            tool_batch = [j]
+            k = j + 1
+            while k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == "tool":
+                tool_batch.append(k)
+                k += 1
+            if k < len(pre_filter_messages) and pre_filter_messages[k].get("role") == _asst_role:
+                chain.extend(tool_batch)
+                chain.append(k)
+                j = k + 1
+                continue
+            break
+        responses_round = _consume_responses_tool_round(pre_filter_messages, j, _asst_role)
+        if responses_round:
+            round_indices, next_index = responses_round
+            chain.extend(round_indices)
+            j = next_index
+            continue
+        if next_role not in ("user", "human"):
+            break
+        if not _is_tool_result_only_user(next_msg):
+            break
+        if j + 1 >= len(pre_filter_messages) or pre_filter_messages[j + 1].get("role") != _asst_role:
+            break
+        chain.extend([j, j + 1])
+        j += 2
+    return chain
+
+
+def _index_pre_filter_chains(
+    pre_filter_messages: list[dict],
+    _asst_role: str,
+) -> dict[str, list[list[int]]]:
+    """Pre-index candidate chains by leading user text for reuse during collapse."""
+    index: dict[str, list[list[int]]] = {}
+    for i, msg in enumerate(pre_filter_messages):
+        if msg.get("role") != "user":
+            continue
+        if _is_tool_result_only_user(msg):
+            continue
+        text = _extract_text_for_stub_hash(msg)
+        if not text:
+            continue
+        chain = _build_pre_filter_chain_from_index(pre_filter_messages, i, _asst_role)
+        if chain is None:
+            continue
+        index.setdefault(text, []).append(chain)
+    return index
 
 
 def collapse_turn_chains(
@@ -1573,6 +1599,8 @@ def collapse_turn_chains(
     # 5. Prepare pre_filter messages for snapshot extraction
     # ------------------------------------------------------------------
     pre_filter_messages = pre_filter_body.get(_msg_key, [])
+    pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role)
+    pre_filter_chain_offsets: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # 6. Collapse turns outside the protected window
@@ -1618,7 +1646,17 @@ def collapse_turn_chains(
             continue
 
         # a. Find corresponding messages in pre_filter_body
-        pf_chain = _find_pre_filter_chain(pre_filter_messages, user_text, _asst_role, used_indices=_pf_used)
+        pf_chain = None
+        candidates = pre_filter_chain_index.get(user_text, [])
+        cursor = pre_filter_chain_offsets.get(user_text, 0)
+        while cursor < len(candidates):
+            candidate = candidates[cursor]
+            cursor += 1
+            if any(idx in _pf_used for idx in candidate):
+                continue
+            pf_chain = candidate
+            break
+        pre_filter_chain_offsets[user_text] = cursor
         if pf_chain is None:
             _skip_no_pf_match += 1
             if _skip_no_pf_match <= 3:
