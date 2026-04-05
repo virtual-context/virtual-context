@@ -431,6 +431,7 @@ class VirtualContextEngine:
         self._monitor = ContextMonitor(
             config=self.config.monitor,
             token_counter=self._token_counter,
+            conversation_id=self.config.conversation_id,
         )
 
     def _init_segmenter(self) -> None:

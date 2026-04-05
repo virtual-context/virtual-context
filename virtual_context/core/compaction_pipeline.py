@@ -434,7 +434,11 @@ class CompactionPipeline:
         committed_turn = int(getattr(committed, "last_compacted_turn", -1) or -1)
         if committed_turn < expected_last_compacted_turn:
             logger.warning(
-                "Committed compaction checkpoint regressed for conversation %s (%d < %d); skipping turn_messages prune",
+                "Compaction checkpoint regression for conversation %s: "
+                "store.load_engine_state() returned last_compacted_turn=%d "
+                "but in-memory expected=%d. This happens when _save_state "
+                "writes to Redis/memory but store reads from Postgres "
+                "(provider mode deferred flush). Skipping turn_messages prune.",
                 self._config.conversation_id[:12],
                 committed_turn,
                 expected_last_compacted_turn,
