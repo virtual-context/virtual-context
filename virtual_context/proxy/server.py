@@ -764,12 +764,14 @@ async def prepare_payload(
         try:
             t0 = time.monotonic()
             await asyncio.to_thread(state.wait_for_tag)
+            wait_ms += _note_prep("wait_for_prior_tag", t0)
             # Backpressure: if last tag_turn hit the hard threshold,
             # wait for pending compaction to finish before proceeding.
             # Soft threshold → async (no wait), hard → block until caught up.
             if state._last_compact_priority == "hard":
-                await asyncio.to_thread(state.wait_for_complete)
-            wait_ms = _note_prep("wait_for_tag", t0)
+                t_compact = time.monotonic()
+                await asyncio.to_thread(state.wait_for_compact)
+                wait_ms += _note_prep("wait_for_prior_compact", t_compact)
 
             if not state.is_conversation_deleted():
                 state.conversation_history.append(

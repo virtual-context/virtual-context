@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -19,7 +21,7 @@ from virtual_context.config import load_config
 from virtual_context.proxy.formats import AnthropicFormat, PayloadTokenCache, PayloadTokenEstimate
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.core.turn_tag_index import TurnTagIndex
-from virtual_context.types import AssembledContext, EngineState, Message, TagResult, TurnTagEntry
+from virtual_context.types import AssembledContext, EngineState, Message, SplitResult, TagResult, TurnTagEntry
 
 # ---------------------------------------------------------------------------
 # ProxyState
@@ -44,7 +46,11 @@ class TestProxyState:
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_tag()
-        engine.tag_turn.assert_called_once_with(history, payload_tokens=None)
+        engine.tag_turn.assert_called_once_with(
+            history,
+            payload_tokens=None,
+            run_broad_split=False,
+        )
 
     def test_fire_and_wait_for_complete(self):
         engine = MagicMock()
@@ -53,7 +59,55 @@ class TestProxyState:
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()
-        engine.tag_turn.assert_called_once_with(history, payload_tokens=None)
+        engine.tag_turn.assert_called_once_with(
+            history,
+            payload_tokens=None,
+            run_broad_split=False,
+        )
+
+    def test_wait_for_tag_does_not_block_on_deferred_split(self):
+        engine = MagicMock()
+        engine.tag_turn.return_value = None
+        release_split = threading.Event()
+
+        def _split(*args, **kwargs):
+            release_split.wait(0.5)
+            return None
+
+        engine.process_broad_tag_split.side_effect = _split
+        state = ProxyState(engine)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+
+        state.fire_turn_complete(history)
+        started = time.monotonic()
+        state.wait_for_tag()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        release_split.set()
+        state._drain_background_work()
+
+    def test_deferred_tag_split_emits_metrics(self):
+        engine = MagicMock()
+        engine.tag_turn.return_value = None
+        engine.process_broad_tag_split.return_value = SplitResult(
+            tag="troubleshooting",
+            splittable=True,
+            groups={"api-troubleshooting": [0], "db-troubleshooting": [1]},
+        )
+        metrics = ProxyMetrics()
+        state = ProxyState(engine, metrics=metrics)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+
+        state.fire_turn_complete(history)
+        state.wait_for_tag()
+        state._drain_background_work()
+
+        events = metrics.events_since(-1)
+        split = next(event for event in events if event["type"] == "tag_split")
+        assert split["tag"] == "troubleshooting"
+        assert split["splittable"] is True
+        assert split["new_tags"] == ["api-troubleshooting", "db-troubleshooting"]
 
     def test_compaction_fires_in_background(self):
         engine = MagicMock()
