@@ -21,6 +21,9 @@ from .tag_canonicalizer import TagCanonicalizer
 
 logger = logging.getLogger(__name__)
 
+_LLM_TAG_BREAKDOWN_LOG_THRESHOLD_MS = 300.0
+_LLM_TAG_BREAKDOWN_MAX_STAGES = 8
+
 TAG_GENERATOR_PROMPT_DETAILED = """\
 You are a semantic tagger for conversation segments. Given a piece of conversation,
 generate {min_tags}-{max_tags} short, lowercase tags that capture the key topics.
@@ -205,6 +208,9 @@ class LLMTagGenerator:
         canonicalizer: TagCanonicalizer | None = None,
         telemetry_ledger: TelemetryLedger | None = None,
         embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
+        embedding_model_name: str = "all-MiniLM-L6-v2",
+        load_cached_embeddings: "Callable[[str, list[str]], dict[str, list[float]]] | None" = None,
+        save_cached_embeddings: "Callable[[str, dict[str, list[float]]], None] | None" = None,
         cost_tracker=None,  # deprecated, ignored — legacy parameter
         code_mode: bool = False,
     ) -> None:
@@ -214,14 +220,42 @@ class LLMTagGenerator:
         self._canonicalizer = canonicalizer
         self._telemetry = telemetry_ledger
         self._embed_fn_factory = embed_fn_factory
+        self._embedding_model_name = embedding_model_name
+        self._load_cached_embeddings = load_cached_embeddings
+        self._save_cached_embeddings = save_cached_embeddings
+        self._store_tag_embeddings: dict[str, list[float]] = {}
         self._code_mode = code_mode
         self._temporal_patterns = _compile_temporal_patterns(config.temporal_patterns)
+
+    @staticmethod
+    def _note_breakdown(breakdown: dict[str, float], stage: str, started_at: float) -> None:
+        elapsed = round((time.monotonic() - started_at) * 1000, 1)
+        breakdown[stage] = round(breakdown.get(stage, 0.0) + elapsed, 1)
+
+    @staticmethod
+    def _dedupe_tags(tags: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            unique.append(tag)
+        return unique
 
     def generate_tags(
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:
-        prompt = self._build_prompt(text, existing_tags, context_turns=context_turns)
+        _started = time.monotonic()
+        _breakdown: dict[str, float] = {}
+        _prompt_stage = time.monotonic()
+        prompt = self._build_prompt(
+            text,
+            existing_tags,
+            context_turns=context_turns,
+            breakdown=_breakdown,
+        )
 
         prompt_template = TAG_GENERATOR_PROMPTS.get(
             self.config.prompt_mode, TAG_GENERATOR_PROMPT_DETAILED
@@ -234,21 +268,25 @@ class LLMTagGenerator:
         if self._code_mode:
             from .compactor import CODE_MODE_FACT_PROMPT
             system += CODE_MODE_FACT_PROMPT
+        self._note_breakdown(_breakdown, "build_prompt", _prompt_stage)
 
         # Disable thinking mode for models that support it (e.g. qwen3)
         if self.config.disable_thinking:
             prompt = "/no_think\n" + prompt
 
         try:
-            t0 = time.time()
+            t0 = time.monotonic()
             response, _usage = self.llm.complete(
                 system=system,
                 user=prompt,
                 max_tokens=self.config.max_tokens,
             )
-            duration_ms = (time.time() - t0) * 1000
+            duration_ms = (time.monotonic() - t0) * 1000
+            _breakdown["llm_complete"] = round(duration_ms, 1)
             self._log_usage(duration_ms=duration_ms, usage=_usage)
+            _parse_stage = time.monotonic()
             result = self._parse_response(response)
+            self._note_breakdown(_breakdown, "parse_response", _parse_stage)
         except Exception as e:
             logger.warning(f"LLM tag generation failed: {e}")
             result = TagResult(
@@ -262,11 +300,73 @@ class LLMTagGenerator:
             logger.debug("Temporal heuristic override: LLM missed temporal, heuristic caught it")
             result.temporal = True
 
+        total_ms = round((time.monotonic() - _started) * 1000, 1)
+        if total_ms >= _LLM_TAG_BREAKDOWN_LOG_THRESHOLD_MS:
+            stage_bits = [
+                f"{stage}={ms:.1f}ms"
+                for stage, ms in sorted(_breakdown.items(), key=lambda item: item[1], reverse=True)
+                [:_LLM_TAG_BREAKDOWN_MAX_STAGES]
+                if ms > 0
+            ]
+            logger.info(
+                "LLM_TAG_BREAKDOWN total=%sms existing_tags=%d vocab=%d %s",
+                total_ms,
+                len(existing_tags or []),
+                len(self._tag_vocabulary),
+                " ".join(stage_bits) if stage_bits else "no-stages",
+            )
+
         return result
+
+    def _ensure_store_tag_embeddings(
+        self,
+        store_tags: list[str],
+        embed_fn: Callable[[list[str]], list[list[float]]],
+        *,
+        breakdown: dict[str, float] | None = None,
+    ) -> tuple[int, int, int]:
+        unique_tags = self._dedupe_tags(store_tags)
+        if not unique_tags:
+            return 0, 0, 0
+
+        missing = [tag for tag in unique_tags if tag not in self._store_tag_embeddings]
+        local_hits = len(unique_tags) - len(missing)
+        shared_hits = 0
+
+        if missing and self._load_cached_embeddings is not None:
+            _load_stage = time.monotonic()
+            cached = self._load_cached_embeddings(self._embedding_model_name, missing) or {}
+            if breakdown is not None:
+                self._note_breakdown(breakdown, "select_store_tags_cache_load", _load_stage)
+            for tag, embedding in cached.items():
+                if embedding is not None:
+                    self._store_tag_embeddings[tag] = list(embedding)
+            shared_hits = sum(1 for tag in missing if tag in self._store_tag_embeddings)
+            missing = [tag for tag in missing if tag not in self._store_tag_embeddings]
+
+        embedded_missing = 0
+        if missing:
+            _embed_stage = time.monotonic()
+            embeddings = embed_fn(missing)
+            if breakdown is not None:
+                self._note_breakdown(breakdown, "select_store_tags_embed_missing", _embed_stage)
+            saved: dict[str, list[float]] = {}
+            for tag, embedding in zip(missing, embeddings):
+                self._store_tag_embeddings[tag] = embedding
+                saved[tag] = embedding
+            embedded_missing = len(saved)
+            if saved and self._save_cached_embeddings is not None:
+                _save_stage = time.monotonic()
+                self._save_cached_embeddings(self._embedding_model_name, saved)
+                if breakdown is not None:
+                    self._note_breakdown(breakdown, "select_store_tags_cache_save", _save_stage)
+
+        return local_hits, shared_hits, embedded_missing
 
     def _select_relevant_store_tags(
         self, text: str, store_tags: list[str], limit: int = 30,
         similarity_threshold: float = 0.25,
+        breakdown: dict[str, float] | None = None,
     ) -> list[str]:
         """Select store tags most relevant to *text* using embedding similarity,
         then fill remaining slots with high-usage tags.
@@ -294,21 +394,32 @@ class LLMTagGenerator:
 
         try:
             import numpy as np
+            self._ensure_store_tag_embeddings(store_tags, embed_fn, breakdown=breakdown)
 
             # Truncate text for embedding (first 500 chars is plenty for topic signal)
             snippet = text[:500]
-            all_texts = [snippet] + store_tags
-            vectors = embed_fn(all_texts)
-            text_vec = np.array(vectors[0])
-            tag_vecs = np.array(vectors[1:])
+            _query_stage = time.monotonic()
+            text_vec = np.array(embed_fn([snippet])[0])
+            if breakdown is not None:
+                self._note_breakdown(breakdown, "select_store_tags_embed_query", _query_stage)
+            tag_vecs = np.array([
+                self._store_tag_embeddings[tag]
+                for tag in store_tags
+                if tag in self._store_tag_embeddings
+            ])
+            if len(tag_vecs) != len(store_tags):
+                return store_tags[:limit]
 
             # Cosine similarity
+            _similarity_stage = time.monotonic()
             norms = np.linalg.norm(tag_vecs, axis=1)
             norms[norms == 0] = 1.0
             text_norm = np.linalg.norm(text_vec)
             if text_norm == 0:
                 return store_tags[:limit]
             similarities = tag_vecs @ text_vec / (norms * text_norm)
+            if breakdown is not None:
+                self._note_breakdown(breakdown, "select_store_tags_similarity", _similarity_stage)
 
             # Take tags above threshold, ranked by similarity
             above = [(float(similarities[i]), i) for i in range(len(store_tags))
@@ -330,7 +441,13 @@ class LLMTagGenerator:
             logger.debug("Embed-based tag selection failed, falling back to usage-count", exc_info=True)
             return store_tags[:limit]
 
-    def _build_prompt(self, text: str, existing_tags: list[str] | None = None, context_turns: list[str] | None = None) -> str:
+    def _build_prompt(
+        self,
+        text: str,
+        existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
+        breakdown: dict[str, float] | None = None,
+    ) -> str:
         """Build the tagging prompt with vocabulary hint.
 
         Splits tags into recent session tags (highest reuse priority) and
@@ -353,7 +470,12 @@ class LLMTagGenerator:
         # Select store tags relevant to this text (embed-based when available)
         session_set = set(session_tags)
         candidates = [t for t in store_tags if t not in session_set]
-        extra_store = self._select_relevant_store_tags(text, candidates, limit=30)
+        extra_store = self._select_relevant_store_tags(
+            text,
+            candidates,
+            limit=30,
+            breakdown=breakdown,
+        )
 
         if session_tags:
             parts.append(
@@ -548,6 +670,9 @@ def build_tag_generator(
     canonicalizer: TagCanonicalizer | None = None,
     telemetry_ledger: TelemetryLedger | None = None,
     embed_fn_factory: "Callable[[], Callable[[list[str]], list[list[float]]] | None] | None" = None,
+    embedding_model_name: str = "all-MiniLM-L6-v2",
+    load_cached_embeddings: "Callable[[str, list[str]], dict[str, list[float]]] | None" = None,
+    save_cached_embeddings: "Callable[[str, dict[str, list[float]]], None] | None" = None,
     cost_tracker=None,  # deprecated, ignored — re-exported for existing callers
     code_mode: bool = False,
 ) -> TagGenerator:
@@ -556,6 +681,9 @@ def build_tag_generator(
             llm_provider=llm_provider, config=config,
             canonicalizer=canonicalizer, telemetry_ledger=telemetry_ledger,
             embed_fn_factory=embed_fn_factory,
+            embedding_model_name=embedding_model_name,
+            load_cached_embeddings=load_cached_embeddings,
+            save_cached_embeddings=save_cached_embeddings,
             code_mode=code_mode,
         )
 
@@ -563,7 +691,13 @@ def build_tag_generator(
         from .embedding_tag_generator import EmbeddingTagGenerator
         # Use embed_fn from factory if available (shared EmbeddingProvider)
         _embed_fn = embed_fn_factory() if embed_fn_factory else None
-        return EmbeddingTagGenerator(config=config, embed_fn=_embed_fn)
+        return EmbeddingTagGenerator(
+            config=config,
+            embed_fn=_embed_fn,
+            model_name=embedding_model_name,
+            load_cached_embeddings=load_cached_embeddings,
+            save_cached_embeddings=save_cached_embeddings,
+        )
 
     if config.keyword_fallback:
         return KeywordTagGenerator(config=config.keyword_fallback)

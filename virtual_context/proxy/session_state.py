@@ -7,6 +7,7 @@ payload every request).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, field
@@ -84,6 +85,8 @@ class SessionStateProvider:
     """Redis-backed session state. Load at request start, save at request end."""
 
     _PAYLOAD_TOKEN_CACHE_TTL_SECONDS = 6 * 60 * 60
+    _TAG_EMBEDDING_CACHE_TTL_SECONDS = 24 * 60 * 60
+    _CONTEXT_HINT_CACHE_TTL_SECONDS = 6 * 60 * 60
 
     def __init__(self, redis_client=None, redis_url: str = "", store=None) -> None:
         if redis_client is not None:
@@ -101,6 +104,13 @@ class SessionStateProvider:
 
     def _payload_token_cache_key(self, conversation_id: str) -> str:
         return f"vc:payload_tokens:{conversation_id}"
+
+    def _tag_embedding_cache_key(self, model_name: str, tag: str) -> str:
+        digest = hashlib.sha1(f"{model_name}\0{tag}".encode("utf-8")).hexdigest()
+        return f"vc:tag_embedding:{digest}"
+
+    def _context_hint_cache_key(self, conversation_id: str, cache_key: str) -> str:
+        return f"vc:context_hint:{conversation_id}:{cache_key}"
 
     def load(self, conversation_id: str) -> SessionState | None:
         """Load session state from Redis. Returns None if not found.
@@ -206,6 +216,112 @@ class SessionStateProvider:
             self._redis.delete(self._payload_token_cache_key(conversation_id))
         except Exception:
             pass
+
+    def load_tag_embeddings(self, model_name: str, tags: list[str]) -> dict[str, list[float]]:
+        """Load cached tag embeddings for a model."""
+        unique_tags: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            unique_tags.append(tag)
+        if not unique_tags:
+            return {}
+
+        try:
+            keys = [self._tag_embedding_cache_key(model_name, tag) for tag in unique_tags]
+            mget = getattr(self._redis, "mget", None)
+            if callable(mget):
+                raw_values = mget(keys)
+            else:
+                raw_values = [self._redis.get(key) for key in keys]
+
+            loaded: dict[str, list[float]] = {}
+            for tag, raw in zip(unique_tags, raw_values):
+                if raw is None:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                value = json.loads(raw)
+                if isinstance(value, list):
+                    loaded[tag] = value
+            return loaded
+        except Exception:
+            logger.warning(
+                "Redis tag-embedding cache load failed (model=%s tags=%d)",
+                model_name,
+                len(unique_tags),
+                exc_info=True,
+            )
+            return {}
+
+    def save_tag_embeddings(
+        self,
+        model_name: str,
+        embeddings_by_tag: dict[str, list[float]],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Save tag embeddings for a model in shared Redis cache."""
+        if not embeddings_by_tag:
+            return
+        try:
+            ttl = ttl_seconds or self._TAG_EMBEDDING_CACHE_TTL_SECONDS
+            with self._redis.pipeline() as pipe:
+                for tag, embedding in embeddings_by_tag.items():
+                    pipe.set(
+                        self._tag_embedding_cache_key(model_name, tag),
+                        json.dumps(embedding, default=str).encode("utf-8"),
+                        ex=ttl,
+                    )
+                pipe.execute()
+        except Exception:
+            logger.warning(
+                "Redis tag-embedding cache save failed (model=%s tags=%d)",
+                model_name,
+                len(embeddings_by_tag),
+                exc_info=True,
+            )
+
+    def load_context_hint_cache(self, conversation_id: str, cache_key: str) -> str | None:
+        """Load a rendered context hint for a conversation fingerprint."""
+        try:
+            raw = self._redis.get(self._context_hint_cache_key(conversation_id, cache_key))
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8")
+            return str(raw)
+        except Exception:
+            logger.warning(
+                "Redis context-hint cache load failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+
+    def save_context_hint_cache(
+        self,
+        conversation_id: str,
+        cache_key: str,
+        hint: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Save a rendered context hint for a conversation fingerprint."""
+        try:
+            self._redis.set(
+                self._context_hint_cache_key(conversation_id, cache_key),
+                hint.encode("utf-8"),
+                ex=ttl_seconds or self._CONTEXT_HINT_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "Redis context-hint cache save failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
 
     def delete(self, conversation_id: str) -> None:
         """Tombstone the conversation. BOTH backends must succeed.

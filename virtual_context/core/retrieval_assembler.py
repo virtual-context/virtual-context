@@ -6,6 +6,8 @@ reassemble_context, retrieve, transform, filter_history, and context hint buildi
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -58,6 +60,7 @@ class RetrievalAssembler:
         fact_curator,
         config: VirtualContextConfig,
         token_counter,
+        session_state_provider=None,
     ) -> None:
         self._retriever = retriever
         self._assembler = assembler
@@ -69,12 +72,15 @@ class RetrievalAssembler:
         self._fact_curator = fact_curator
         self.config = config
         self._token_counter = token_counter
+        self._session_state_provider = session_state_provider
 
         # Internal state
         self._last_retrieval_result: RetrievalResult | None = None
         self._last_conversation_history: list[Message] | None = None
         self._last_model_name: str = ""
         self._presented_segment_refs: set[str] = set()
+        self._context_hint_cache_key: str = ""
+        self._context_hint_cache_value: str = ""
 
     # ------------------------------------------------------------------
     # Semantic helper (needed for context bleed gate in _get_recent_context)
@@ -462,6 +468,29 @@ class RetrievalAssembler:
     # Context hint building
     # ------------------------------------------------------------------
 
+    def _build_context_hint_cache_key(self, paging_mode: str | None) -> str:
+        working_set = [
+            {
+                "tag": tag,
+                "depth": entry.depth.value if hasattr(entry.depth, "value") else str(entry.depth),
+                "tokens": entry.tokens,
+            }
+            for tag, entry in sorted(self._paging.working_set.items())
+        ]
+        payload = {
+            "mode": paging_mode or "default",
+            "compacted_through": self._engine_state.compacted_through,
+            "last_compacted_turn": self._engine_state.last_compacted_turn,
+            "generation": self._engine_state.conversation_generation,
+            "context_hint_max_tokens": self.config.assembler.context_hint_max_tokens,
+            "tag_context_max_tokens": self.config.assembler.tag_context_max_tokens,
+            "max_tool_rounds": self.config.paging.max_tool_loops,
+            "working_set": working_set,
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+
     def _build_context_hint(self, paging_mode: str | None = None) -> str:
         """Build a topic list for post-compaction prompts.
 
@@ -481,16 +510,33 @@ class RetrievalAssembler:
         if self._engine_state.compacted_through == 0:
             return ""
 
+        # Determine paging mode
+        paging_enabled = self.config.paging.enabled
+        if paging_mode is None and paging_enabled:
+            paging_mode = self._resolve_paging_mode()
+
+        cache_key = self._build_context_hint_cache_key(paging_mode)
+        if cache_key and cache_key == self._context_hint_cache_key:
+            return self._context_hint_cache_value
+        if (
+            cache_key
+            and self._session_state_provider is not None
+            and self.config.conversation_id
+        ):
+            cached = self._session_state_provider.load_context_hint_cache(
+                self.config.conversation_id,
+                cache_key,
+            )
+            if cached is not None:
+                self._context_hint_cache_key = cache_key
+                self._context_hint_cache_value = cached
+                return cached
+
         tag_summaries = self._store.get_all_tag_summaries(
             conversation_id=self.config.conversation_id,
         )
         if not tag_summaries:
             return ""
-
-        # Determine paging mode
-        paging_enabled = self.config.paging.enabled
-        if paging_mode is None and paging_enabled:
-            paging_mode = self._resolve_paging_mode()
 
         if paging_enabled and paging_mode == "autonomous":
             tag_full_tokens = {
@@ -507,6 +553,16 @@ class RetrievalAssembler:
             hint = self._build_supervised_hint(tag_summaries)
         else:
             hint = self._build_default_hint(tag_summaries)
+
+        if cache_key:
+            self._context_hint_cache_key = cache_key
+            self._context_hint_cache_value = hint
+            if self._session_state_provider is not None and self.config.conversation_id:
+                self._session_state_provider.save_context_hint_cache(
+                    self.config.conversation_id,
+                    cache_key,
+                    hint,
+                )
 
         return hint
 

@@ -33,6 +33,7 @@ def mock_redis():
 
     # Direct get for load() path
     r.get.side_effect = lambda k: _store.get(k)
+    r.mget.side_effect = lambda keys: [_store.get(k) for k in keys]
 
     # Direct set for delete() tombstone path
     r.set.side_effect = lambda k, v, **kw: _store.update({k: v})
@@ -186,3 +187,22 @@ def test_delete_clears_payload_token_cache(provider, mock_redis):
     provider.delete("conv-123")
 
     assert mock_redis._test_store.get("vc:payload_tokens:conv-123") is None
+
+
+def test_tag_embedding_cache_roundtrip(provider):
+    embeddings = {
+        "database": [0.1, 0.2, 0.3],
+        "api": [0.4, 0.5, 0.6],
+    }
+
+    provider.save_tag_embeddings("model-x", embeddings)
+
+    loaded = provider.load_tag_embeddings("model-x", ["database", "api", "missing"])
+    assert loaded == embeddings
+
+
+def test_context_hint_cache_roundtrip(provider):
+    provider.save_context_hint_cache("conv-123", "fingerprint-1", "<context-topics>cached</context-topics>")
+
+    loaded = provider.load_context_hint_cache("conv-123", "fingerprint-1")
+    assert loaded == "<context-topics>cached</context-topics>"
