@@ -28,6 +28,11 @@ class TestRequestCapturesPersistence:
             "outbound_bytes": 2048,
             "context_tokens": 800,
             "overhead_ms": 42.5,
+            "prepare_total_ms": 84.2,
+            "prepare_breakdown": {
+                "filter_body_messages": 51.0,
+                "collapse_turn_chains": 19.7,
+            },
             "turns_dropped": 0,
             "turns_stubbed": 1,
             "message_preview": "Write a test for...",
@@ -43,6 +48,11 @@ class TestRequestCapturesPersistence:
         assert loaded[0]["model"] == "claude-sonnet-4-6"
         assert loaded[0]["inbound_tags"] == ["python", "testing"]
         assert loaded[0]["overhead_ms"] == 42.5
+        assert loaded[0]["prepare_total_ms"] == 84.2
+        assert loaded[0]["prepare_breakdown"] == {
+            "filter_body_messages": 51.0,
+            "collapse_turn_chains": 19.7,
+        }
         assert loaded[0]["message_preview"] == "Write a test for..."
 
     def test_prune_keeps_newest_50(self, tmp_path):

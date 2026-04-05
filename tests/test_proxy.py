@@ -605,6 +605,33 @@ class TestRequestCapture:
         assert req["inbound_tags"] == []
         assert req["response_tags"] == []
 
+    def test_capture_stores_prepare_breakdown(self):
+        m = ProxyMetrics()
+        m.capture_request(
+            0,
+            {"messages": [{"role": "user", "content": "big payload"}]},
+            "openai",
+            prepare_total_ms=1234.5,
+            prepare_breakdown={
+                "filter_body_messages": 611.2,
+                "collapse_turn_chains": 402.1,
+            },
+        )
+
+        req = m.get_captured_request(0)
+        assert req["prepare_total_ms"] == 1234.5
+        assert req["prepare_breakdown"] == {
+            "filter_body_messages": 611.2,
+            "collapse_turn_chains": 402.1,
+        }
+
+        summaries = m.get_captured_requests_summary()
+        assert summaries[0]["prepare_total_ms"] == 1234.5
+        assert summaries[0]["prepare_breakdown"] == {
+            "filter_body_messages": 611.2,
+            "collapse_turn_chains": 402.1,
+        }
+
     def test_update_request_tags(self):
         m = ProxyMetrics()
         m.capture_request(

@@ -89,6 +89,10 @@ from .handlers import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+_PREP_BREAKDOWN_LOG_THRESHOLD_MS = 1_000.0
+_PREP_BREAKDOWN_LOG_THRESHOLD_BYTES = 1_000_000
+_PREP_BREAKDOWN_MAX_STAGES = 8
+
 
 # ---------------------------------------------------------------------------
 # Budget helpers
@@ -263,6 +267,69 @@ async def prepare_payload(
     import asyncio
     import time
 
+    _prepare_started = time.monotonic()
+    _prep_breakdown: dict[str, float] = {}
+
+    def _note_prep(stage: str, started_at: float) -> float:
+        elapsed = round((time.monotonic() - started_at) * 1000, 1)
+        _prep_breakdown[stage] = round(_prep_breakdown.get(stage, 0.0) + elapsed, 1)
+        return elapsed
+
+    def _prepare_metadata(total_ms: float | None = None) -> dict:
+        total = total_ms if total_ms is not None else round(
+            (time.monotonic() - _prepare_started) * 1000, 1,
+        )
+        breakdown = {
+            stage: ms for stage, ms in _prep_breakdown.items()
+            if ms > 0
+        }
+        accounted = round(sum(breakdown.values()), 1)
+        unaccounted = round(max(total - accounted, 0.0), 1)
+        if unaccounted > 0.1:
+            breakdown["unaccounted"] = unaccounted
+        return {
+            "prepare_total_ms": total,
+            "prepare_breakdown": breakdown,
+        }
+
+    def _log_prepare_breakdown(
+        *,
+        total_ms: float,
+        conversation_id: str,
+        turn: int,
+        outbound_tokens: int,
+    ) -> None:
+        if (
+            total_ms < _PREP_BREAKDOWN_LOG_THRESHOLD_MS
+            and _inbound_bytes < _PREP_BREAKDOWN_LOG_THRESHOLD_BYTES
+        ):
+            return
+        meta = _prepare_metadata(total_ms)
+        breakdown = meta["prepare_breakdown"]
+        stages = sorted(
+            (
+                (stage, ms) for stage, ms in breakdown.items()
+                if stage != "unaccounted"
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:_PREP_BREAKDOWN_MAX_STAGES]
+        stage_bits = [f"{stage}={ms:.1f}ms" for stage, ms in stages]
+        if "unaccounted" in breakdown:
+            stage_bits.append(f"unaccounted={breakdown['unaccounted']:.1f}ms")
+        logger.info(
+            "PREP_BREAKDOWN conv=%s turn=%s format=%s msgs=%d payload=%sKB in=%dt out=%dt total=%sms %s",
+            conversation_id[:12] if conversation_id else "none",
+            turn,
+            api_format,
+            _initial_message_count,
+            _payload_kb,
+            _inbound_tokens,
+            outbound_tokens,
+            total_ms,
+            " ".join(stage_bits) if stage_bits else "no-stages",
+        )
+
     # Ground truth: measure inbound BEFORE normalization using estimate_payload_tokens.
     # Verified against Anthropic count_tokens API:
     #   - Tool chains payload: estimate=418K, real=329K (1.27x — acceptable)
@@ -271,7 +338,11 @@ async def prepare_payload(
     # estimate_payload_tokens is the only method that handles media correctly.
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
+    _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
+    _initial_message_count = len(body[_msg_key]) if _msg_key in body and isinstance(body[_msg_key], list) else 0
+    _inbound_stage = time.monotonic()
     _inbound_tokens = fmt.estimate_payload_tokens(body) if body_bytes else 0
+    _note_prep("inbound_token_count", _inbound_stage)
     if state:
         state._last_payload_kb = _payload_kb
         state._last_payload_tokens = _inbound_tokens
@@ -284,9 +355,10 @@ async def prepare_payload(
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
     from .formats import normalize_messages
-    _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
+    _normalize_stage = time.monotonic()
     if _msg_key in body and isinstance(body[_msg_key], list):
         normalize_messages(body[_msg_key])
+    _note_prep("normalize_messages", _normalize_stage)
 
     api_format = fmt.name
     user_message = fmt.extract_user_message(body)
@@ -310,6 +382,7 @@ async def prepare_payload(
         _vc_cmd = _vc_cmd_match.group(1).upper()
         _vc_arg = (_vc_cmd_match.group(2) or "").strip()
         # Early return — no pipeline processing for VC commands.
+        _vc_meta = _prepare_metadata()
         return PreparedPayload(
             body=body,
             enriched_body=body,
@@ -331,7 +404,7 @@ async def prepare_payload(
             turns_stubbed=0,
             wait_ms=0,
             inbound_ms=0,
-            overhead_ms=0,
+            overhead_ms=_vc_meta["prepare_total_ms"],
             assembled=None,
             pre_filter_body=None,
             paging_enabled=False,
@@ -339,6 +412,7 @@ async def prepare_payload(
             restore_tool_injected=False,
             inbound_bytes=0,
             outbound_bytes=0,
+            metadata=_vc_meta,
             is_vcattach=(_vc_cmd == "ATTACH"),
             vcattach_target_id="",
             vcattach_label=_vc_arg if _vc_cmd == "ATTACH" else "",
@@ -380,12 +454,14 @@ async def prepare_payload(
             if not _data_dir:
                 _data_dir = os.environ.get('VC_DATA_DIR', '/data/tenants')
         _media_dir = os.path.join(_data_dir, 'media')
+        _media_stage = time.monotonic()
         body, _media_compressed = compress_media_in_payload(
             body, fmt,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
             media_dir=_media_dir,
         )
+        _note_prep("compress_media", _media_stage)
         if _media_compressed:
             logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
 
@@ -471,8 +547,13 @@ async def prepare_payload(
                     })
 
             # Compute outbound tokens (after trim + tool interception)
+            _pt_json_stage = time.monotonic()
+            _pt_outbound_json = json.dumps(body, default=str)
+            _outbound_bytes = len(_pt_outbound_json.encode("utf-8"))
+            _note_prep("passthrough_serialize_outbound", _pt_json_stage)
+            _pt_count_stage = time.monotonic()
             _outbound_tokens = fmt.estimate_payload_tokens(body)
-            _outbound_bytes = len(json.dumps(body, default=str).encode("utf-8"))
+            _note_prep("passthrough_count_outbound", _pt_count_stage)
 
             # Non-virtualizable floor: system prompt + tools + anything VC can't touch
             _pt_system_tokens = fmt._estimate_system_tokens(body)
@@ -480,6 +561,16 @@ async def prepare_payload(
             _pt_floor = _pt_system_tokens + _pt_tools_tokens
             if state:
                 state._last_non_virtualizable_floor = _pt_floor
+
+            _prepare_meta = _prepare_metadata()
+            _prepare_total_ms = _prepare_meta["prepare_total_ms"]
+            _conversation_id = state.engine.config.conversation_id
+            _log_prepare_breakdown(
+                total_ms=_prepare_total_ms,
+                conversation_id=_conversation_id,
+                turn=turn,
+                outbound_tokens=_outbound_tokens,
+            )
 
             # Record passthrough request event with accurate post-trim values
             metrics.record({
@@ -497,7 +588,9 @@ async def prepare_payload(
                 "compacted_through": 0,
                 "wait_ms": 0,
                 "inbound_ms": 0,
-                "overhead_ms": 0,
+                "overhead_ms": _prepare_total_ms,
+                "prepare_total_ms": _prepare_total_ms,
+                "prepare_breakdown": _prepare_meta["prepare_breakdown"],
                 "total_turns": turn,
                 "filtered_turns": turn,
                 "inbound_tokens": _inbound_tokens,
@@ -522,6 +615,8 @@ async def prepare_payload(
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
                 message_preview=user_message[:200],
+                prepare_total_ms=_prepare_total_ms,
+                prepare_breakdown=_prepare_meta["prepare_breakdown"],
                 non_virtualizable_floor=_pt_floor,
                 upstream_context_limit=_upstream_limit,
                 passthrough_trim_limit=_pt_limit,
@@ -565,7 +660,7 @@ async def prepare_payload(
                 turns_stubbed=0,
                 wait_ms=0,
                 inbound_ms=0,
-                overhead_ms=0,
+                overhead_ms=_prepare_total_ms,
                 assembled=None,
                 pre_filter_body=None,
                 paging_enabled=False,
@@ -573,6 +668,7 @@ async def prepare_payload(
                 restore_tool_injected=False,
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
+                metadata=_prepare_meta,
             )
 
     # ---------------------------------------------------------------
@@ -605,7 +701,7 @@ async def prepare_payload(
             # Soft threshold → async (no wait), hard → block until caught up.
             if state._last_compact_priority == "hard":
                 await asyncio.to_thread(state.wait_for_complete)
-            wait_ms = round((time.monotonic() - t0) * 1000, 1)
+            wait_ms = _note_prep("wait_for_tag", t0)
 
             if not state.is_conversation_deleted():
                 state.conversation_history.append(
@@ -621,7 +717,7 @@ async def prepare_payload(
                     state.conversation_history,
                     body.get("model", ""),
                 )
-                inbound_ms = round((time.monotonic() - t1) * 1000, 1)
+                inbound_ms = _note_prep("on_message_inbound", t1)
 
                 prepend_text = assembled.prepend_text
         except Exception as e:
@@ -630,6 +726,7 @@ async def prepare_payload(
     # PROXY-025: Budget auto-promotion
     _effective_budget = 0
     _budget_promoted = False
+    _budget_stage = time.monotonic()
     try:
         if state:
             _cw = int(state.engine.config.context_window)
@@ -654,14 +751,18 @@ async def prepare_payload(
                 })
     except (TypeError, ValueError, AttributeError):
         _effective_budget = 0
+    _note_prep("budget_auto_promotion", _budget_stage)
 
     # Capture the raw client body BEFORE any VC modifications (stubbing/filtering)
+    _copy_stage = time.monotonic()
     _pre_filter_body = copy.deepcopy(body)
+    _note_prep("copy_pre_filter_body", _copy_stage)
 
     # Detect client truncation — compare what the CLIENT sent (pre-filter)
     # against the store. Must run BEFORE drop_compacted_turns / filter
     # mutate the body.
     _client_truncated = False
+    _truncation_stage = time.monotonic()
     if state:
         _payload_turns = len(fmt.group_into_turns(_pre_filter_body))
         _store_turns = len(state.engine._turn_tag_index.entries)
@@ -674,6 +775,7 @@ async def prepare_payload(
                 "STORE-RECOVERY: payload_turns=%d store_turns=%d threshold=%.0f%% — recovering from store",
                 _payload_turns, _store_turns, _recovery_threshold * 100,
             )
+    _note_prep("client_truncation_check", _truncation_stage)
 
     # Drop compacted non-tool turns — their content is already in VC segments
     turns_stubbed = 0  # kept for downstream metrics compatibility
@@ -681,6 +783,7 @@ async def prepare_payload(
     _fill_turns = 0
     _recovery_chains = 0
     _recovery_turns = 0
+    _drop_compacted_stage = time.monotonic()
     try:
         if state and int(state.engine._engine_state.compacted_through) > 0:
             from .message_filter import drop_compacted_turns
@@ -695,10 +798,12 @@ async def prepare_payload(
                 logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", turns_stubbed)
     except (TypeError, ValueError, AttributeError):
         pass
+    _note_prep("drop_compacted_turns", _drop_compacted_stage)
 
     # Filter irrelevant history turns from the request body
     turns_dropped = 0
     _real_tags = [t for t in (assembled.matched_tags if assembled else []) if t != "_general"]
+    _filter_stage = time.monotonic()
     if _real_tags and state:
         # Use protected_recent_turns (compaction protection) for the
         # drop filter — NOT recent_turns_always_included (assembly).
@@ -735,6 +840,7 @@ async def prepare_payload(
             logger.info("FILTER Dropped %d turns (%s)", turns_dropped, _phase)
         elif _pre_compaction and _pcf_mode == "off":
             logger.info("FILTER Skipped filtering (mode=off, pre-compaction)")
+    _note_prep("filter_body_messages", _filter_stage)
 
     # Tool output handling — active path only
     # Stage gate: post-compaction uses full chain collapse (stage 2),
@@ -748,6 +854,7 @@ async def prepare_payload(
             _deep_ratio = getattr(
                 state.engine.config.compactor, "deep_compaction_ratio", 0.5,
             )
+            _collapse_stage = time.monotonic()
             body, _collapse_count, _chain_refs, _recovery_chains = collapse_turn_chains(
                 body, fmt,
                 pre_filter_body=_pre_filter_body,
@@ -758,11 +865,13 @@ async def prepare_payload(
                 deep_compaction_ratio=_deep_ratio,
                 client_truncated=_client_truncated,
             )
+            _note_prep("collapse_turn_chains", _collapse_stage)
             if _collapse_count:
                 _tool_stubs_present = True
                 logger.info("CHAIN-COLLAPSE: collapsed %d turn chains (%d chain refs)", _collapse_count, len(_chain_refs))
             # After collapse, stub tool outputs in the protected zone if it's bloated
             from .message_filter import stub_tool_outputs_by_position
+            _protected_stub_stage = time.monotonic()
             body, _prot_stub_count, _prot_stub_refs = stub_tool_outputs_by_position(
                 body, fmt,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
@@ -772,12 +881,14 @@ async def prepare_payload(
                 protected_intrusion_threshold=0.6,
                 context_budget=state.engine.config.monitor.context_window,
             )
+            _note_prep("protected_tool_stub", _protected_stub_stage)
             if _prot_stub_count:
                 _tool_stubs_present = True
                 logger.info("PROTECTED-STUB: stubbed %d tool outputs in protected zone", _prot_stub_count)
         else:
             # Stage 1: tool result stubbing only (pre-compaction)
             from .message_filter import stub_tool_outputs_by_position
+            _tool_stub_stage = time.monotonic()
             body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
                 body, fmt,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
@@ -787,6 +898,7 @@ async def prepare_payload(
                 protected_intrusion_threshold=0.6,
                 context_budget=state.engine.config.monitor.context_window,
             )
+            _note_prep("tool_stub_outputs", _tool_stub_stage)
             if _stub_count:
                 _tool_stubs_present = True
                 logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
@@ -794,26 +906,34 @@ async def prepare_payload(
     # Media stubbing — stub images outside protected window
     if state and state.engine.config.tool_output.enabled:
         from .media import stub_media_by_position
+        _media_stub_stage = time.monotonic()
         body, _media_stubbed = stub_media_by_position(
             body, fmt,
             protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
             protected_intrusion_threshold=0.6,
             context_budget=state.engine.config.monitor.context_window,
         )
+        _note_prep("media_stub", _media_stub_stage)
         if _media_stubbed:
             _tool_stubs_present = True
             logger.info("MEDIA-STUB: stubbed %d images outside protected window", _media_stubbed)
 
     # Drop topic-only stubs — stubs without restore refs are dead weight
     from .message_filter import drop_topic_only_stubs
+    _drop_stub_stage = time.monotonic()
     body, _stubs_dropped = drop_topic_only_stubs(body, fmt)
+    _note_prep("drop_topic_only_stubs", _drop_stub_stage)
     if _stubs_dropped:
         logger.info("STUB-DROP: removed %d topic-only stubs", _stubs_dropped)
 
     # Merge consecutive conversational messages — fixes alternation violations
+    _merge_stage = time.monotonic()
     fmt.merge_consecutive_conversational(body)
+    _note_prep("merge_consecutive_messages", _merge_stage)
 
+    _inject_stage = time.monotonic()
     enriched_body = _inject_context(body, prepend_text, api_format)
+    _note_prep("inject_context", _inject_stage)
 
     # Inject VC paging tools for autonomous mode (formats that support it)
     paging_enabled = False
@@ -832,12 +952,14 @@ async def prepare_payload(
             except (TypeError, ValueError):
                 compacted_count = 0
             require_tools = compacted_count > 0
+            _paging_stage = time.monotonic()
             enriched_body = _inject_vc_tools(
                 enriched_body,
                 state.engine,
                 require_tool_use=require_tools,
                 restore_available=_tool_stubs_present,
             )
+            _note_prep("inject_paging_tools", _paging_stage)
             paging_enabled = True
             _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
             logger.info(
@@ -861,7 +983,9 @@ async def prepare_payload(
         _all_defs = vc_tool_definitions()
         _fq_def = [d for d in _all_defs if d["name"] == "vc_find_quote"]
         if _fq_def:
+            _find_quote_stage = time.monotonic()
             enriched_body = fmt.inject_tools(enriched_body, _fq_def)
+            _note_prep("inject_find_quote_tool", _find_quote_stage)
             tool_output_find_quote = True
             logger.info("TOOL-OUTPUT Injected vc_find_quote tool for truncated output retrieval")
 
@@ -873,7 +997,9 @@ async def prepare_payload(
             from ..core.tool_loop import vc_tool_definitions
             _restore_def = [d for d in vc_tool_definitions() if d["name"] == "vc_restore_tool"]
             if _restore_def:
+                _restore_stage = time.monotonic()
                 enriched_body = fmt.inject_tools(enriched_body, _restore_def)
+                _note_prep("inject_restore_tool", _restore_stage)
                 _restore_tool_injected = True
                 logger.info("TOOL-STUB Injected vc_restore_tool for stub restoration")
 
@@ -881,11 +1007,15 @@ async def prepare_payload(
     # poisoned by previous client-side "No such tool" rejections.
     if _restore_tool_injected or paging_enabled:
         from .message_filter import sanitize_vc_tool_errors
+        _sanitize_stage = time.monotonic()
         enriched_body = sanitize_vc_tool_errors(enriched_body, fmt)
+        _note_prep("sanitize_vc_tool_errors", _sanitize_stage)
 
     # Track enriched payload size
     if state:
+        _size_stage = time.monotonic()
         state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
+        _note_prep("measure_enriched_payload_kb", _size_stage)
 
     is_streaming = body.get("stream", False)
 
@@ -893,20 +1023,28 @@ async def prepare_payload(
     system_tokens = fmt._estimate_system_tokens(body)
 
     # Strip VC internal markers before token counting and upstream send
+    _strip_stage = time.monotonic()
     fmt.strip_vc_markers(enriched_body)
+    _note_prep("strip_vc_markers", _strip_stage)
 
     # 2-to-llm: exact payload sent to the LLM (after strip — byte-for-byte what goes upstream)
     if log_dir and log_prefix:
         try:
+            _llm_log_stage = time.monotonic()
             _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
             _to_llm_log.write_text(json.dumps(enriched_body, default=str))
+            _note_prep("write_to_llm_log", _llm_log_stage)
         except Exception:
             logger.debug("enriched body log write failed", exc_info=True)
 
     # Ground truth: actual byte-measured outbound token count
+    _serialize_stage = time.monotonic()
     _outbound_json = json.dumps(enriched_body, default=str)
     _outbound_bytes = len(_outbound_json.encode("utf-8"))
+    _note_prep("serialize_outbound", _serialize_stage)
+    _outbound_count_stage = time.monotonic()
     outbound_tokens = fmt.estimate_payload_tokens(enriched_body)
+    _note_prep("count_outbound_tokens", _outbound_count_stage)
 
     # Ground truth: inbound tokens (what the client sent us, measured above)
     inbound_tokens = _inbound_tokens
@@ -996,6 +1134,7 @@ async def prepare_payload(
     # whether to dial back protected_recent_turns.
     _protected_turn_tokens = 0
     _protected_turn_count = 0
+    _protected_stage = time.monotonic()
     if state and outbound_tokens > 0:
         try:
             _prt = state.engine.config.monitor.protected_recent_turns
@@ -1017,12 +1156,14 @@ async def prepare_payload(
                 )
         except Exception:
             pass
+    _note_prep("protected_turn_accounting", _protected_stage)
 
     _bloat_fallback = False
 
     # ------------------------------------------------------------------
     # PAYLOAD BUDGET ENFORCEMENT — hard cap on VC context window
     # ------------------------------------------------------------------
+    _budget_enforce_stage = time.monotonic()
     if state and outbound_tokens > state.engine.config.monitor.context_window:
         from .message_filter import enforce_payload_budget
         _budget_window = state.engine.config.monitor.context_window
@@ -1039,10 +1180,12 @@ async def prepare_payload(
                 "BUDGET_ENFORCE: %d reductions, %d bytes freed, now %dt/%dt",
                 _budget_reductions, _budget_freed, outbound_tokens, _budget_window,
             )
+    _note_prep("budget_enforce", _budget_enforce_stage)
 
     # ------------------------------------------------------------------
     # FILL PASS — replenish from VC floor to soft threshold
     # ------------------------------------------------------------------
+    _fill_stage = time.monotonic()
     if state and not _bloat_fallback:
         _fill_enabled = getattr(
             state.engine.config.monitor, "fill_pass_enabled", True,
@@ -1102,11 +1245,13 @@ async def prepare_payload(
                             b.get("text", "") for b in _sys
                             if isinstance(b, dict) and b.get("type") == "text"
                         )
+    _note_prep("fill_pass", _fill_stage)
 
     # VC must never send more than the client sent. If enrichment bloated
     # the payload beyond inbound, revert to the original client body and
     # treat as passthrough — all downstream metrics/capture will record
     # the passthrough values.
+    _bloat_stage = time.monotonic()
     if outbound_tokens > inbound_tokens:
         logger.warning(
             "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — reverting to passthrough (delta +%dt)",
@@ -1128,6 +1273,7 @@ async def prepare_payload(
         tool_output_find_quote = False
         _tool_stubs_present = False
         assembled = None
+    _note_prep("bloat_fallback", _bloat_stage)
 
     # Legacy aliases for downstream consumers
     input_tokens = outbound_tokens
@@ -1171,6 +1317,7 @@ async def prepare_payload(
     # Upstream context enforcement — trim if enriched payload exceeds upstream limit
     _upstream_trimmed = 0
     _pre_trim_tokens = outbound_tokens
+    _upstream_trim_stage = time.monotonic()
     if outbound_tokens > _upstream_limit - body.get("max_tokens", 4096):
         from .message_filter import trim_to_upstream_limit
         enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
@@ -1190,6 +1337,7 @@ async def prepare_payload(
                 "pairs_trimmed": _upstream_trimmed,
                 "final_tokens": outbound_tokens,
             })
+    _note_prep("upstream_trim", _upstream_trim_stage)
 
     # PROXY-025: Over-budget alert
     if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
@@ -1210,8 +1358,15 @@ async def prepare_payload(
     _turn_id = uuid.uuid4().hex[:12]
     context_tokens = fmt._count(prepend_text) if prepend_text else 0
     total_turns = turn
-    overhead_ms = round(wait_ms + inbound_ms, 1)
+    _prepare_meta = _prepare_metadata()
+    overhead_ms = _prepare_meta["prepare_total_ms"]
     _conversation_id = state.engine.config.conversation_id if state else ""
+    _log_prepare_breakdown(
+        total_ms=overhead_ms,
+        conversation_id=_conversation_id,
+        turn=turn,
+        outbound_tokens=outbound_tokens,
+    )
     metrics.record({
         "type": "request",
         "turn": turn,
@@ -1228,6 +1383,8 @@ async def prepare_payload(
         "wait_ms": wait_ms,
         "inbound_ms": inbound_ms,
         "overhead_ms": overhead_ms,
+        "prepare_total_ms": overhead_ms,
+        "prepare_breakdown": _prepare_meta["prepare_breakdown"],
         "total_turns": total_turns,
         "filtered_turns": total_turns - turns_dropped,
         "inbound_tokens": inbound_tokens,
@@ -1356,6 +1513,8 @@ async def prepare_payload(
         turns_dropped=turns_dropped,
         turns_stubbed=turns_stubbed,
         message_preview=user_message[:200],
+        prepare_total_ms=overhead_ms,
+        prepare_breakdown=_prepare_meta["prepare_breakdown"],
         non_virtualizable_floor=_non_virtualizable_floor,
         upstream_context_limit=_upstream_limit,
         passthrough_trim_limit=int(
@@ -1401,6 +1560,7 @@ async def prepare_payload(
         restore_tool_injected=_restore_tool_injected,
         inbound_bytes=_inbound_bytes,
         outbound_bytes=_outbound_bytes,
+        metadata=_prepare_meta,
     )
 
 
@@ -1769,7 +1929,6 @@ def create_app(
         # ---------------------------------------------------------------
         # Enrichment: passthrough or active path via prepare_payload()
         # ---------------------------------------------------------------
-        _t_prepare = time.monotonic()
         result = await prepare_payload(
             body, state, fmt, metrics,
             body_bytes=body_bytes,
@@ -1777,8 +1936,6 @@ def create_app(
             log_dir=_effective_log_dir,
             log_prefix=_log_prefix,
         )
-        # Override overhead_ms with total wall-clock time for the full VC pipeline
-        result.overhead_ms = round((time.monotonic() - _t_prepare) * 1000, 1)
 
         if result.vc_command:
             from .handlers import _handle_vc_command

@@ -32,6 +32,8 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "outbound_bytes": 0,
     "context_tokens": 0,
     "overhead_ms": 0,
+    "prepare_total_ms": 0,
+    "prepare_breakdown": {},
     "turns_dropped": 0,
     "turns_stubbed": 0,
     "message_preview": "",
@@ -218,6 +220,9 @@ class ProxyMetrics:
             extras = ""
             if etype == "request":
                 extras = f" turn={event.get('turn')} passthrough={event.get('passthrough')} in={event.get('input_tokens',0)} ctx={event.get('context_tokens',0)}"
+                _prep_total = event.get("prepare_total_ms", 0)
+                if _prep_total:
+                    extras += f" prep={_prep_total}"
             elif etype == "response":
                 _cr = event.get('cache_read_input_tokens', 0)
                 _cc = event.get('cache_creation_input_tokens', 0)
@@ -532,6 +537,8 @@ class ProxyMetrics:
         outbound_bytes: int = 0,
         context_tokens: int = 0,
         overhead_ms: float = 0,
+        prepare_total_ms: float = 0,
+        prepare_breakdown: dict | None = None,
         turns_dropped: int = 0,
         turns_stubbed: int = 0,
         message_preview: str = "",
@@ -564,6 +571,8 @@ class ProxyMetrics:
                 "outbound_bytes": outbound_bytes,
                 "context_tokens": context_tokens,
                 "overhead_ms": overhead_ms,
+                "prepare_total_ms": prepare_total_ms,
+                "prepare_breakdown": dict(prepare_breakdown or {}),
                 "turns_dropped": turns_dropped,
                 "turns_stubbed": turns_stubbed,
                 "message_preview": message_preview,
