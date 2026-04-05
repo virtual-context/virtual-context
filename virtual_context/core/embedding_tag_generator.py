@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Callable
 
@@ -13,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 _EMBED_TAG_BREAKDOWN_LOG_THRESHOLD_MS = 100.0
 _EMBED_TAG_BREAKDOWN_MAX_STAGES = 6
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy is optional in test/dev envs
+    np = None
 
 
 class EmbeddingTagGenerator:
@@ -76,6 +82,21 @@ class EmbeddingTagGenerator:
         elapsed = round((time.monotonic() - started_at) * 1000, 1)
         breakdown[stage] = round(breakdown.get(stage, 0.0) + elapsed, 1)
 
+    @staticmethod
+    def _normalize_embedding(embedding: list[float]) -> list[float]:
+        if not embedding:
+            return []
+        if np is not None:
+            arr = np.asarray(embedding, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            if norm == 0.0:
+                return arr.tolist()
+            return (arr / norm).tolist()
+        norm = math.sqrt(sum(value * value for value in embedding))
+        if norm == 0.0:
+            return list(embedding)
+        return [value / norm for value in embedding]
+
     def _ensure_tag_embeddings(
         self,
         tags: list[str] | None,
@@ -97,7 +118,7 @@ class EmbeddingTagGenerator:
                 self._note_breakdown(breakdown, "shared_cache_load", _load_stage)
             for tag, embedding in cached.items():
                 if embedding is not None:
-                    self._tag_embeddings[tag] = list(embedding)
+                    self._tag_embeddings[tag] = self._normalize_embedding(list(embedding))
             shared_hits = sum(1 for tag in missing if tag in self._tag_embeddings)
             missing = [tag for tag in missing if tag not in self._tag_embeddings]
 
@@ -109,8 +130,9 @@ class EmbeddingTagGenerator:
                 self._note_breakdown(breakdown, "embed_missing_tags", _embed_stage)
             saved: dict[str, list[float]] = {}
             for tag, embedding in zip(missing, embeddings):
-                self._tag_embeddings[tag] = embedding
-                saved[tag] = embedding
+                normalized = self._normalize_embedding(list(embedding))
+                self._tag_embeddings[tag] = normalized
+                saved[tag] = normalized
             embedded_missing = len(saved)
             if saved and self._save_cached_embeddings is not None:
                 _save_stage = time.monotonic()
@@ -153,11 +175,30 @@ class EmbeddingTagGenerator:
         candidate_tags = [tag for tag in unique_tags if tag in self._tag_embeddings]
         if not candidate_tags:
             candidate_tags = list(self._tag_embeddings.keys())
-        for tag in candidate_tags:
-            tag_emb = self._tag_embeddings[tag]
-            sim = _cosine_similarity(text_embedding, tag_emb)
-            if sim >= self.similarity_threshold:
-                scores.append((tag, sim))
+        if np is not None and candidate_tags:
+            query_vec = np.asarray(text_embedding, dtype=np.float32)
+            query_norm = float(np.linalg.norm(query_vec))
+            if query_norm > 0.0:
+                query_vec = query_vec / query_norm
+                embedding_matrix = np.asarray(
+                    [self._tag_embeddings[tag] for tag in candidate_tags],
+                    dtype=np.float32,
+                )
+                similarities = embedding_matrix @ query_vec
+                matching = np.flatnonzero(similarities >= self.similarity_threshold)
+                if matching.size:
+                    ordered = matching[np.argsort(similarities[matching])[::-1]]
+                    scores = [
+                        (candidate_tags[int(idx)], float(similarities[int(idx)]))
+                        for idx in ordered
+                    ]
+        else:
+            normalized_query = self._normalize_embedding(list(text_embedding))
+            for tag in candidate_tags:
+                tag_emb = self._tag_embeddings[tag]
+                sim = _cosine_similarity(normalized_query, tag_emb)
+                if sim >= self.similarity_threshold:
+                    scores.append((tag, sim))
         self._note_breakdown(_breakdown, "similarity", _similarity_stage)
 
         if not scores:

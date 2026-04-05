@@ -42,6 +42,12 @@ def test_get_chain_snapshots_for_conversation_abstract():
     assert s.get_chain_snapshots_for_conversation("conv1", min_turn=100) == []
 
 
+def test_get_chain_recovery_manifest_abstract():
+    s = _make_dummy_store()
+    assert s.get_chain_recovery_manifest("conv1") == []
+    assert s.get_chain_recovery_manifest("conv1", min_turn=100) == []
+
+
 def test_get_tool_names_for_refs_abstract():
     s = _make_dummy_store()
     assert s.get_tool_names_for_refs(["ref1", "ref2"]) == []
@@ -72,6 +78,10 @@ def test_collapse_turn_chains_recovers_from_store():
         {"ref": "chain_50_abc123", "turn_number": 50, "tool_output_refs": "tool_ref1,tool_ref2", "message_count": 4},
         {"ref": "chain_80_def456", "turn_number": 80, "tool_output_refs": "tool_ref3", "message_count": 3},
     ]
+    mock_store.get_chain_recovery_manifest.return_value = [
+        {"ref": "chain_50_abc123", "turn_number": 50, "tool_output_refs": "tool_ref1,tool_ref2", "message_count": 4, "tool_names": "Read, web_search"},
+        {"ref": "chain_80_def456", "turn_number": 80, "tool_output_refs": "tool_ref3", "message_count": 3, "tool_names": "Read"},
+    ]
     mock_store.get_tool_names_for_refs.return_value = ["web_search", "Read"]
 
     result, count, refs, recovered = collapse_turn_chains(
@@ -83,7 +93,8 @@ def test_collapse_turn_chains_recovers_from_store():
         client_truncated=True,
     )
 
-    assert mock_store.get_chain_snapshots_for_conversation.call_count == 2
+    mock_store.get_chain_recovery_manifest.assert_called_once_with("test-conv", min_turn=0)
+    assert mock_store.get_tool_names_for_refs.call_count == 0
     assert recovered == 2
     assert "chain_50_abc123" in refs
     assert "chain_80_def456" in refs
@@ -135,6 +146,7 @@ def test_collapse_turn_chains_reuses_existing_snapshot_for_canonical_turn():
     mock_store.get_chain_snapshots_for_conversation.return_value = [
         {"ref": "chain_existing_ref", "turn_number": 10, "tool_output_refs": "tool_ref", "message_count": 4},
     ]
+    mock_store.get_chain_recovery_manifest.return_value = []
 
     result, count, refs, recovered = collapse_turn_chains(
         body=body,
@@ -189,6 +201,8 @@ def test_collapse_turn_chains_reuses_runtime_snapshot_cache():
         {"ref": "chain_existing_ref", "turn_number": 10, "tool_output_refs": "tool_ref", "message_count": 4},
     ]
     runtime_cache = {"loaded": False, "refs_by_turn": {}}
+    runtime_cache["recovery_loaded"] = False
+    runtime_cache["recovery_manifest"] = []
 
     collapse_turn_chains(
         body=body,
@@ -213,7 +227,67 @@ def test_collapse_turn_chains_reuses_runtime_snapshot_cache():
 
     assert runtime_cache["loaded"] is True
     assert runtime_cache["refs_by_turn"] == {10: "chain_existing_ref"}
+    assert runtime_cache["recovery_loaded"] is False
     mock_store.get_chain_snapshots_for_conversation.assert_called_once_with("test-conv", min_turn=0)
+
+
+def test_collapse_turn_chains_reuses_runtime_recovery_manifest():
+    from unittest.mock import MagicMock
+
+    from virtual_context.core.turn_tag_index import TurnTagIndex, TurnTagEntry
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.proxy.message_filter import collapse_turn_chains
+
+    body = {
+        "model": "claude-opus-4-6",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": "current question"},
+        ],
+    }
+    fmt = detect_format(body)
+    tti = TurnTagIndex()
+    for i in range(100):
+        tti.entries.append(TurnTagEntry(turn_number=i, message_hash=f"hash_{i}", tags=[f"tag_{i}"]))
+
+    mock_store = MagicMock()
+    mock_store.get_chain_recovery_manifest.return_value = [
+        {"ref": "chain_50_abc123", "turn_number": 50, "tool_output_refs": "tool_ref1,tool_ref2", "message_count": 4, "tool_names": "Read, web_search"},
+    ]
+    runtime_cache = {
+        "loaded": False,
+        "refs_by_turn": {},
+        "recovery_loaded": False,
+        "recovery_manifest": [],
+    }
+
+    collapse_turn_chains(
+        body=body,
+        fmt=fmt,
+        protected_recent_turns=6,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        client_truncated=True,
+        collapse_runtime_cache=runtime_cache,
+    )
+    collapse_turn_chains(
+        body=body,
+        fmt=fmt,
+        protected_recent_turns=6,
+        turn_tag_index=tti,
+        store=mock_store,
+        conversation_id="test-conv",
+        client_truncated=True,
+        collapse_runtime_cache=runtime_cache,
+    )
+
+    assert runtime_cache["recovery_loaded"] is True
+    assert runtime_cache["recovery_manifest"] == [
+        {"ref": "chain_50_abc123", "turn_number": 50, "tool_output_refs": "tool_ref1,tool_ref2", "message_count": 4, "tool_names": "Read, web_search"},
+    ]
+    mock_store.get_chain_recovery_manifest.assert_called_once_with("test-conv", min_turn=0)
 
 
 def test_fill_pass_restores_from_store_on_truncation():

@@ -402,6 +402,9 @@ class CompositeStore:
     def get_chain_snapshots_for_conversation(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
         return self._search.get_chain_snapshots_for_conversation(conversation_id, min_turn=min_turn)
 
+    def get_chain_recovery_manifest(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
+        return self._search.get_chain_recovery_manifest(conversation_id, min_turn=min_turn)
+
     def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
         return self._search.get_tool_names_for_refs(refs)
 

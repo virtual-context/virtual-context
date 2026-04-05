@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class SessionStateProvider:
     _PAYLOAD_TOKEN_CACHE_TTL_SECONDS = 6 * 60 * 60
     _TAG_EMBEDDING_CACHE_TTL_SECONDS = 24 * 60 * 60
     _CONTEXT_HINT_CACHE_TTL_SECONDS = 6 * 60 * 60
+    _TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL = 5000
 
     def __init__(self, redis_client=None, redis_url: str = "", store=None) -> None:
         if redis_client is not None:
@@ -98,6 +100,7 @@ class SessionStateProvider:
             raise ValueError("redis_client or redis_url required")
         self._store = store  # Optional ContextStore for Postgres backup/fallback
         self._degraded = False
+        self._tag_embedding_runtime_cache: dict[str, OrderedDict[str, list[float]]] = {}
 
     def _key(self, conversation_id: str) -> str:
         return f"vc:session:{conversation_id}"
@@ -111,6 +114,25 @@ class SessionStateProvider:
 
     def _context_hint_cache_key(self, conversation_id: str, cache_key: str) -> str:
         return f"vc:context_hint:{conversation_id}:{cache_key}"
+
+    def _runtime_tag_cache(self, model_name: str) -> OrderedDict[str, list[float]]:
+        cache = self._tag_embedding_runtime_cache.get(model_name)
+        if cache is None:
+            cache = OrderedDict()
+            self._tag_embedding_runtime_cache[model_name] = cache
+        return cache
+
+    def _remember_runtime_tag_embedding(
+        self,
+        model_name: str,
+        tag: str,
+        embedding: list[float],
+    ) -> None:
+        cache = self._runtime_tag_cache(model_name)
+        cache[tag] = list(embedding)
+        cache.move_to_end(tag)
+        while len(cache) > self._TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL:
+            cache.popitem(last=False)
 
     def load(self, conversation_id: str) -> SessionState | None:
         """Load session state from Redis. Returns None if not found.
@@ -229,16 +251,28 @@ class SessionStateProvider:
         if not unique_tags:
             return {}
 
+        loaded: dict[str, list[float]] = {}
+        runtime_cache = self._runtime_tag_cache(model_name)
+        missing: list[str] = []
+        for tag in unique_tags:
+            cached = runtime_cache.get(tag)
+            if cached is None:
+                missing.append(tag)
+                continue
+            runtime_cache.move_to_end(tag)
+            loaded[tag] = list(cached)
+        if not missing:
+            return loaded
+
         try:
-            keys = [self._tag_embedding_cache_key(model_name, tag) for tag in unique_tags]
+            keys = [self._tag_embedding_cache_key(model_name, tag) for tag in missing]
             mget = getattr(self._redis, "mget", None)
             if callable(mget):
                 raw_values = mget(keys)
             else:
                 raw_values = [self._redis.get(key) for key in keys]
 
-            loaded: dict[str, list[float]] = {}
-            for tag, raw in zip(unique_tags, raw_values):
+            for tag, raw in zip(missing, raw_values):
                 if raw is None:
                     continue
                 if isinstance(raw, bytes):
@@ -246,12 +280,13 @@ class SessionStateProvider:
                 value = json.loads(raw)
                 if isinstance(value, list):
                     loaded[tag] = value
+                    self._remember_runtime_tag_embedding(model_name, tag, value)
             return loaded
         except Exception:
             logger.warning(
                 "Redis tag-embedding cache load failed (model=%s tags=%d)",
                 model_name,
-                len(unique_tags),
+                len(missing),
                 exc_info=True,
             )
             return {}
@@ -270,6 +305,7 @@ class SessionStateProvider:
             ttl = ttl_seconds or self._TAG_EMBEDDING_CACHE_TTL_SECONDS
             with self._redis.pipeline() as pipe:
                 for tag, embedding in embeddings_by_tag.items():
+                    self._remember_runtime_tag_embedding(model_name, tag, embedding)
                     pipe.set(
                         self._tag_embedding_cache_key(model_name, tag),
                         json.dumps(embedding, default=str).encode("utf-8"),
