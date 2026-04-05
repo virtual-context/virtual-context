@@ -33,6 +33,7 @@ from .types import (
     EngineStateSnapshot,
     Message,
     RetrievalResult,
+    SplitResult,
     ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
@@ -1456,8 +1457,25 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
         payload_tokens: int | None = None,
+        *,
+        run_broad_split: bool = True,
     ) -> CompactionSignal | None:
-        return self._tagging.tag_turn(conversation_history, payload_tokens)
+        return self._tagging.tag_turn(
+            conversation_history,
+            payload_tokens,
+            run_broad_split=run_broad_split,
+        )
+
+    def process_broad_tag_split(
+        self,
+        conversation_history: list[Message],
+        *,
+        mode: str = "deferred",
+    ) -> SplitResult | None:
+        return self._tagging.process_broad_tag_split(
+            conversation_history,
+            mode=mode,
+        )
 
     def compact_if_needed(
         self,

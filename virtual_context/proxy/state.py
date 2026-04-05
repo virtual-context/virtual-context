@@ -111,6 +111,7 @@ class ProxyState:
         self._compact_pool = ThreadPoolExecutor(max_workers=1)  # compaction (background)
         self._pending_tag: Future | None = None
         self._pending_compact: Future | None = None
+        self._pending_split: Future | None = None
         self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
         self._ingested_conversations: set[str] = set()
         self._ingested_first_hash: dict[str, str] = {}  # conversation_id → hash of first message
@@ -503,12 +504,16 @@ class ProxyState:
             self._pending_tag.result()
             self._pending_tag = None
 
-    def wait_for_complete(self) -> None:
-        """Block until tag + compact both finish."""
-        self.wait_for_tag()
+    def wait_for_compact(self) -> None:
+        """Block until compaction finishes. Tagging should already be complete."""
         if self._pending_compact is not None:
             self._pending_compact.result()
             self._pending_compact = None
+
+    def wait_for_complete(self) -> None:
+        """Block until tag + compact both finish."""
+        self.wait_for_tag()
+        self.wait_for_compact()
 
     def fire_turn_complete(
         self,
@@ -556,7 +561,9 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         try:
             signal = self.engine.tag_turn(
-                history, payload_tokens=payload_tokens,
+                history,
+                payload_tokens=payload_tokens,
+                run_broad_split=False,
             )
             self._last_compact_priority = signal.priority if signal else ""
 
@@ -613,31 +620,6 @@ class ProxyState:
                     "conversation_id": conversation_id,
                 })
 
-                # Emit tag split event if splitting occurred
-                split_result = self.engine._engine_state.last_split_result
-                if isinstance(split_result, SplitResult):
-                    if split_result.splittable:
-                        new_tags = list(split_result.groups.keys())
-                        logger.info(
-                            "T%d SPLIT \"%s\" -> %s (%d turns)",
-                            turn, split_result.tag, new_tags,
-                            sum(len(v) for v in split_result.groups.values()),
-                        )
-                    else:
-                        logger.info(
-                            "T%d SUMMARIZED \"%s\" (unsplittable: %s)",
-                            turn, split_result.tag, split_result.reason,
-                        )
-                    self.metrics.record({
-                        "type": "tag_split",
-                        "turn": turn,
-                        "tag": split_result.tag,
-                        "splittable": split_result.splittable,
-                        "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
-                        "conversation_id": conversation_id,
-                    })
-                    self.engine._engine_state.last_split_result = None  # consume
-
             # Fire compaction in background if needed — but NOT during ingestion.
             # During ingestion, only a fraction of turns are tagged. Compacting now
             # would process hundreds of untagged turns via expensive LLM fallback.
@@ -656,8 +638,87 @@ class ProxyState:
                             turn, conversation_id[:12],
                         )
 
+            self._queue_deferred_tag_split(history, turn)
+
         except Exception as e:
             logger.error("tag_turn error: %s", e, exc_info=True)
+
+    def _record_tag_split_event(
+        self,
+        turn: int,
+        conversation_id: str,
+        split_result: SplitResult,
+    ) -> None:
+        if split_result.splittable:
+            new_tags = list(split_result.groups.keys())
+            logger.info(
+                "T%d SPLIT \"%s\" -> %s (%d turns)",
+                turn, split_result.tag, new_tags,
+                sum(len(v) for v in split_result.groups.values()),
+            )
+        else:
+            logger.info(
+                "T%d SUMMARIZED \"%s\" (unsplittable: %s)",
+                turn, split_result.tag, split_result.reason,
+            )
+        if self.metrics:
+            self.metrics.record({
+                "type": "tag_split",
+                "turn": turn,
+                "tag": split_result.tag,
+                "splittable": split_result.splittable,
+                "new_tags": list(split_result.groups.keys()) if split_result.splittable else [],
+                "conversation_id": conversation_id,
+            })
+        self.engine._engine_state.last_split_result = None  # consume
+
+    def _clear_pending_split(self, future: Future) -> None:
+        if self._pending_split is future:
+            self._pending_split = None
+
+    def _queue_deferred_tag_split(
+        self,
+        history: list[Message],
+        turn: int,
+    ) -> None:
+        conversation_id = self.engine.config.conversation_id
+        if self._pending_split is not None and not self._pending_split.done():
+            logger.info(
+                "T%d TAG_SPLIT already queued for %s — skipping requeue",
+                turn, conversation_id[:12],
+            )
+            return
+        try:
+            future = self._compact_pool.submit(
+                self._run_deferred_tag_split, history, turn,
+            )
+            self._pending_split = future
+            future.add_done_callback(self._clear_pending_split)
+        except RuntimeError:
+            logger.info(
+                "T%d tag split suppressed for shut down session %s",
+                turn, conversation_id[:12],
+            )
+
+    def _run_deferred_tag_split(
+        self,
+        history: list[Message],
+        turn: int,
+    ) -> None:
+        conversation_id = self.engine.config.conversation_id
+        try:
+            split_result = self.engine.process_broad_tag_split(
+                history,
+                mode="deferred",
+            )
+            if isinstance(split_result, SplitResult):
+                self._record_tag_split_event(
+                    turn,
+                    conversation_id,
+                    split_result,
+                )
+        except Exception as e:
+            logger.error("tag_split error: %s", e, exc_info=True)
 
     def _run_compact(
         self,
@@ -1019,6 +1080,7 @@ class ProxyState:
         self._state = SessionState.ACTIVE
         self._pending_tag = None
         self._pending_compact = None
+        self._pending_split = None
         self._last_compact_priority = ""
         self._initial_turns = None
         self._initial_tag_count = None
@@ -1035,7 +1097,7 @@ class ProxyState:
 
     def _drain_background_work(self) -> None:
         """Wait for queued tag/compaction work without propagating old failures."""
-        for attr in ("_pending_tag", "_pending_compact"):
+        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
             future = getattr(self, attr, None)
             if future is None:
                 continue
@@ -1054,7 +1116,7 @@ class ProxyState:
     def _request_background_stop(self) -> None:
         """Signal queued/running background work to stop without dropping handles."""
         self._compaction_cancelled.set()
-        for attr in ("_pending_tag", "_pending_compact"):
+        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
             future = getattr(self, attr, None)
             if future is None:
                 continue
@@ -1071,7 +1133,7 @@ class ProxyState:
     def _cancel_background_work(self) -> None:
         """Cancel queued tag/compaction futures without blocking on completion."""
         self._compaction_cancelled.set()
-        for attr in ("_pending_tag", "_pending_compact"):
+        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
             future = getattr(self, attr, None)
             if future is None:
                 continue

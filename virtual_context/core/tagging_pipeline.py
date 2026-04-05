@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TAG_BREAKDOWN_LOG_THRESHOLD_MS = 250.0
+_TAG_BREAKDOWN_MAX_STAGES = 8
+
 # Imported lazily at module level so tests that patch engine._is_stub_content
 # still work.  The actual definitions live in engine.py.
 _SESSION_HEADER_RE: re.Pattern | None = None
@@ -234,6 +237,43 @@ class TaggingPipeline:
         for ts in summaries:
             self._store.save_tag_summary(ts, conversation_id=self.config.conversation_id)
 
+    @staticmethod
+    def _record_timing(
+        breakdown: dict[str, float],
+        stage: str,
+        started_at: float,
+    ) -> float:
+        elapsed = round((time.monotonic() - started_at) * 1000, 1)
+        breakdown[stage] = round(breakdown.get(stage, 0.0) + elapsed, 1)
+        return elapsed
+
+    def _log_breakdown(
+        self,
+        label: str,
+        *,
+        turn_number: int,
+        total_ms: float,
+        breakdown: dict[str, float],
+        extras: list[str],
+    ) -> None:
+        if total_ms < _TAG_BREAKDOWN_LOG_THRESHOLD_MS:
+            return
+        stages = sorted(
+            ((stage, ms) for stage, ms in breakdown.items() if ms > 0),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:_TAG_BREAKDOWN_MAX_STAGES]
+        stage_bits = [f"{stage}={ms:.1f}ms" for stage, ms in stages]
+        parts = [*extras, *stage_bits]
+        logger.info(
+            "%s conv=%s turn=%d total=%.1fms %s",
+            label,
+            self.config.conversation_id[:12],
+            turn_number,
+            total_ms,
+            " ".join(parts) if parts else "no-stages",
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -242,6 +282,8 @@ class TaggingPipeline:
         self,
         conversation_history: list[Message],
         payload_tokens: int | None = None,
+        *,
+        run_broad_split: bool = True,
     ) -> CompactionSignal | None:
         """Phase 1 of turn processing: tag the latest turn and check thresholds.
 
@@ -256,8 +298,11 @@ class TaggingPipeline:
         """
         from ..types import TagResult, TurnTagEntry, get_sender_name
 
+        turn_number = len(self._turn_tag_index.entries)
+        tag_started = time.monotonic()
+        breakdown: dict[str, float] = {}
+
         # Tag the latest round trip
-        _t_tag = time.monotonic()
         latest_pair = self._get_latest_turn_pair(conversation_history)
         sender = get_sender_name(latest_pair[0].metadata) if latest_pair else ""
         if latest_pair:
@@ -286,17 +331,28 @@ class TaggingPipeline:
                 latest_pair = None
 
         if latest_pair:
-            store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
+            t_stage = time.monotonic()
+            store_tags = [
+                ts.tag for ts in self._store.get_all_tags(
+                    conversation_id=self.config.conversation_id,
+                )
+            ]
+            self._record_timing(breakdown, "load_store_tags", t_stage)
             n_context = self.config.tag_generator.context_lookback_pairs
+            t_stage = time.monotonic()
             context = self._get_recent_context(
                 conversation_history, n_context, current_text=combined_text,
             )
+            self._record_timing(breakdown, "build_context", t_stage)
+            t_stage = time.monotonic()
             tag_result = self._tag_generator.generate_tags(
                 combined_text, store_tags, context_turns=context,
             )
+            self._record_timing(breakdown, "generate_tags", t_stage)
 
             # Retry with expanded context if only _general was produced
             if tag_result.tags == ["_general"]:
+                t_stage = time.monotonic()
                 expanded = self._get_recent_context(
                     conversation_history, n_context * 2,
                     current_text=combined_text,
@@ -305,9 +361,11 @@ class TaggingPipeline:
                     tag_result = self._tag_generator.generate_tags(
                         combined_text, store_tags, context_turns=expanded,
                     )
+                self._record_timing(breakdown, "retry_general", t_stage)
 
             # Final fallback: inherit from most recent meaningful turn
             if tag_result.tags == ["_general"]:
+                t_stage = time.monotonic()
                 prev = self._turn_tag_index.latest_meaningful_tags()
                 if prev:
                     tag_result = TagResult(
@@ -315,7 +373,9 @@ class TaggingPipeline:
                         primary=prev.primary_tag,
                         source="inherited",
                     )
+                self._record_timing(breakdown, "inherit_fallback", t_stage)
 
+            t_stage = time.monotonic()
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=len(self._turn_tag_index.entries),
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
@@ -325,14 +385,10 @@ class TaggingPipeline:
                 sender=sender or "",
                 session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             ))
-
-        self._engine_state.last_tag_ms = round((time.monotonic() - _t_tag) * 1000, 1)
-
-        # Check for overly-broad tags needing splitting
-        if self._tag_splitter:
-            self._check_and_split_broad_tags(conversation_history)
+            self._record_timing(breakdown, "append_turn_index", t_stage)
 
         # Build snapshot (only count un-compacted messages)
+        t_stage = time.monotonic()
         _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
         _offset = self._engine_state.history_offset(
             len(conversation_history), total_turns_indexed=_total_turns,
@@ -341,15 +397,19 @@ class TaggingPipeline:
             conversation_history[_offset:],
             payload_tokens=payload_tokens,
         )
+        self._record_timing(breakdown, "build_snapshot", t_stage)
 
         # Check thresholds
+        t_stage = time.monotonic()
         signal = self._monitor.check(snapshot)
+        self._record_timing(breakdown, "monitor_check", t_stage)
 
         if signal is None:
             self._engine_state.last_compact_ms = 0.0
             # Persist turn message text for post-restart recall
             if latest_pair:
                 turn_num = len(self._turn_tag_index.entries) - 1
+                t_stage = time.monotonic()
                 try:
                     self._store.save_turn_message(
                         self.config.conversation_id,
@@ -362,23 +422,58 @@ class TaggingPipeline:
                 except Exception:
                     pass  # never block tagging for message persistence
                 self._link_turn_tool_outputs(turn_num)
+                self._record_timing(breakdown, "persist_turn_message", t_stage)
+            t_stage = time.monotonic()
             self._save_state_callback(
                 conversation_history,
                 last_indexed_turn=len(self._turn_tag_index.entries) - 1,
             )
+            self._record_timing(breakdown, "save_state", t_stage)
+
+        if self._tag_splitter and run_broad_split:
+            t_stage = time.monotonic()
+            self.process_broad_tag_split(conversation_history, mode="inline")
+            self._record_timing(breakdown, "broad_split", t_stage)
+
+        total_ms = round((time.monotonic() - tag_started) * 1000, 1)
+        self._engine_state.last_tag_ms = total_ms
+        self._log_breakdown(
+            "TAG_BREAKDOWN",
+            turn_number=turn_number,
+            total_ms=total_ms,
+            breakdown=breakdown,
+            extras=[
+                f"history={len(conversation_history)}",
+                f"payload={payload_tokens if payload_tokens is not None else 'na'}t",
+                f"split_mode={'inline' if self._tag_splitter and run_broad_split else 'deferred' if self._tag_splitter else 'disabled'}",
+                f"signal={signal.priority if signal is not None else 'none'}",
+            ],
+        )
 
         return signal
 
     def _check_and_split_broad_tags(
         self, conversation_history: list[Message],
     ) -> SplitResult | None:
+        return self.process_broad_tag_split(conversation_history, mode="direct")
+
+    def process_broad_tag_split(
+        self,
+        conversation_history: list[Message],
+        *,
+        mode: str = "deferred",
+    ) -> SplitResult | None:
         """Check for overly-broad tags and split or summarize them."""
         if not self._tag_splitter:
             return None
 
+        split_started = time.monotonic()
+        breakdown: dict[str, float] = {}
         cfg = self.config.tag_generator.tag_splitting
+        t_stage = time.monotonic()
         tag_counts = self._turn_tag_index.get_tag_counts()
         total_turns = len(self._turn_tag_index.entries)
+        self._record_timing(breakdown, "find_candidates", t_stage)
 
         if total_turns == 0:
             return None
@@ -400,16 +495,29 @@ class TaggingPipeline:
         tag, count = candidates[0]
 
         # Collect turn content
+        t_stage = time.monotonic()
         turn_contents = self._collect_turn_text(tag, conversation_history)
+        self._record_timing(breakdown, "collect_turn_text", t_stage)
         if not turn_contents:
             self._engine_state.split_processed_tags.add(tag)
+            t_stage = time.monotonic()
+            self._save_state_callback(
+                conversation_history,
+                last_indexed_turn=len(self._turn_tag_index.entries) - 1,
+            )
+            self._record_timing(breakdown, "save_state", t_stage)
             return None
 
+        t_stage = time.monotonic()
         existing_tags = {t for e in self._turn_tag_index.entries for t in e.tags}
+        self._record_timing(breakdown, "collect_existing_tags", t_stage)
+        t_stage = time.monotonic()
         result = self._tag_splitter.split(tag, turn_contents, existing_tags, total_turns)
+        self._record_timing(breakdown, "split_llm", t_stage)
 
         if result.splittable:
             # Apply split to TurnTagIndex
+            t_stage = time.monotonic()
             turn_to_new: dict[int, list[str]] = {}
             for new_tag, turn_numbers in result.groups.items():
                 for tn in turn_numbers:
@@ -426,6 +534,7 @@ class TaggingPipeline:
                 self._tag_generator._tag_vocabulary.pop(tag, None)
                 for new_tag, turns in result.groups.items():
                     self._tag_generator._tag_vocabulary[new_tag] = len(turns)
+            self._record_timing(breakdown, "apply_split", t_stage)
 
             logger.info(
                 "Split '%s' (%d turns) → %s",
@@ -433,13 +542,35 @@ class TaggingPipeline:
             )
         else:
             # Fallback: build tag summary from raw turn text
+            t_stage = time.monotonic()
             self._build_broad_tag_summary(tag, conversation_history)
+            self._record_timing(breakdown, "build_summary", t_stage)
             logger.info(
                 "Tag '%s' unsplittable (%s), built summary", tag, result.reason,
             )
 
         self._engine_state.split_processed_tags.add(tag)
         self._engine_state.last_split_result = result
+        t_stage = time.monotonic()
+        self._save_state_callback(
+            conversation_history,
+            last_indexed_turn=len(self._turn_tag_index.entries) - 1,
+        )
+        self._record_timing(breakdown, "save_state", t_stage)
+        total_ms = round((time.monotonic() - split_started) * 1000, 1)
+        self._log_breakdown(
+            "TAG_SPLIT_BREAKDOWN",
+            turn_number=len(self._turn_tag_index.entries) - 1,
+            total_ms=total_ms,
+            breakdown=breakdown,
+            extras=[
+                f"mode={mode}",
+                f"tag={tag}",
+                f"candidate_turns={count}",
+                f"total_turns={total_turns}",
+                f"result={'split' if result.splittable else 'summary'}",
+            ],
+        )
         return result
 
     def ingest_history(
