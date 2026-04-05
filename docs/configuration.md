@@ -40,7 +40,7 @@ Controls how conversation turns are tagged for indexing.
 ```yaml
 tag_generator:
   type: "llm"                       # "llm", "embedding", or "keyword"
-  provider: "anthropic"             # "anthropic", "openai", or "ollama"
+  provider: "anthropic"             # "anthropic", "openai", "gemini", "local", or "openrouter"
   model: "claude-haiku-4-5-20251001"
   max_tags: 10                      # maximum tags per turn
   min_tags: 5                       # minimum tags to assign
@@ -80,7 +80,7 @@ Controls the LLM used for compaction summaries and fact extraction.
 
 ```yaml
 summarization:
-  provider: "anthropic"             # "anthropic", "openai", or "ollama"
+  provider: "anthropic"             # "anthropic", "openai", "gemini", "local", or "openrouter"
   model: "claude-haiku-4-5-20251001"
   temperature: 0.3                  # lower = more faithful summaries
 ```
@@ -200,4 +200,6 @@ Reports missing required fields, invalid types, and cross-field constraint viola
 |----------|---------|
 | `ANTHROPIC_API_KEY` | API key for Anthropic provider (tagger, summarizer, or upstream) |
 | `OPENAI_API_KEY` | API key for OpenAI provider |
+| `GEMINI_API_KEY` | API key for Google Gemini provider |
+| `OPENROUTER_API_KEY` | API key for OpenRouter |
 | `VIRTUAL_CONTEXT_CONFIG` | Override config file path (equivalent to `-c`) |

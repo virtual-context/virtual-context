@@ -1391,6 +1391,10 @@ class VirtualContextEngine:
     def _build_provider(self, provider_name: str, provider_config: dict):
         ptype = provider_config.get("type", provider_name)
 
+        # Backwards compat: bare "ollama" or "local" without explicit type → generic_openai
+        if ptype in ("ollama", "local"):
+            ptype = "generic_openai"
+
         if ptype in ("generic_openai", "openrouter"):
             from .providers.generic_openai import GenericOpenAIProvider
             if ptype == "openrouter":

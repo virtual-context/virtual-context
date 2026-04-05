@@ -197,10 +197,10 @@ models:
     aliases: [mimo, mimo-flash]
 
   # ---------------------------------------------------------------------------
-  # Local / Ollama (free)
+  # Local LLM (free)
   # ---------------------------------------------------------------------------
   qwen3:4b-instruct-2507-fp16:
-    provider: ollama
+    provider: local
     input_per_mtok: 0.00
     output_per_mtok: 0.00
     context_window: 32768
