@@ -22,6 +22,8 @@ from ..types import (
 
 logger = logging.getLogger(__name__)
 
+_RETRIEVAL_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
+
 
 class ContextRetriever:
 
@@ -43,15 +45,16 @@ class ContextRetriever:
         # Pre-compile heuristic patterns for embedding-based inbound tagger
         self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
 
-    def _compute_idf_weights(self) -> dict[str, float]:
+    def _compute_idf_weights(self, all_tags: list | None = None) -> dict[str, float]:
         """Compute IDF weights from tag usage counts in the store.
 
         Returns a dict mapping tag → log(1 + total_segments / usage_count).
         Rare tags get higher weights than common ones.
         """
-        all_tags = self.store.get_all_tags(
-            conversation_id=self._conversation_id,
-        )
+        if all_tags is None:
+            all_tags = self.store.get_all_tags(
+                conversation_id=self._conversation_id,
+            )
         if not all_tags:
             return {}
         total = sum(ts.usage_count for ts in all_tags)
@@ -119,13 +122,22 @@ class ContextRetriever:
             context_turns: Recent user/assistant text for context-aware tagging.
         """
         start_time = time.monotonic()
+        _breakdown: dict[str, float] = {}
+
+        def _note(stage: str, started_at: float) -> None:
+            _breakdown[stage] = round((time.monotonic() - started_at) * 1000, 1)
+
         active_tags = set(current_active_tags or [])
         overflow: list[StoredSummary] = []
 
         # Tag the inbound message — scope vocabulary to current conversation
-        store_tags = [ts.tag for ts in self.store.get_all_tags(
+        _load_tags_stage = time.monotonic()
+        all_tags = self.store.get_all_tags(
             conversation_id=self._conversation_id,
-        )]
+        )
+        _note("load_all_tags", _load_tags_stage)
+        store_tags = [ts.tag for ts in all_tags]
+        _tag_stage = time.monotonic()
         if self._inbound_tagger is not None:
             # Embedding-based: match against existing vocabulary (no hallucination)
             # Store tags are conversation-scoped via get_all_tags().
@@ -148,6 +160,7 @@ class ContextRetriever:
             tag_result = self.tag_generator.generate_tags(
                 message, store_tags, context_turns=context_turns,
             )
+        _note("tag_generate", _tag_stage)
 
         query_embedding = getattr(tag_result, 'query_embedding', None)
 
@@ -251,8 +264,11 @@ class ContextRetriever:
 
         from .retrieval_scoring import score_candidates
 
-        idf_weights = self._compute_idf_weights()
-        tag_stats = {ts.tag: ts.usage_count for ts in self.store.get_all_tags(conversation_id=self._conversation_id)}
+        _idf_stage = time.monotonic()
+        idf_weights = self._compute_idf_weights(all_tags)
+        tag_stats = {ts.tag: ts.usage_count for ts in all_tags}
+        _note("idf_prepare", _idf_stage)
+        _score_stage = time.monotonic()
         scores, breakdowns = score_candidates(
             query_tags=query_tags,
             related_tags=related_query_tags,
@@ -264,6 +280,7 @@ class ContextRetriever:
             config=self.config.scoring,
             tag_stats=tag_stats,
         )
+        _note("score_candidates", _score_stage)
         retrieval_scores = scores
 
         # Fetch summaries for top-scored tags and apply token budget
@@ -281,11 +298,13 @@ class ContextRetriever:
         top_tags = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)[:strategy.max_results]
 
         # Fetch summaries for all top-scored tags at once, then rank by RRF score
+        _summary_fetch_stage = time.monotonic()
         all_summaries = self.store.get_summaries_by_tags(
             tags=top_tags, min_overlap=1,
             limit=strategy.max_results * 3,
             conversation_id=self._conversation_id,
         )
+        _note("fetch_ranked_summaries", _summary_fetch_stage)
         # Sort by (RRF fused score of best matching tag, IDF query-tag overlap) descending
         def _summary_sort_key(s: StoredSummary) -> tuple[float, float]:
             best_rrf = max((scores.get(t, 0.0) for t in s.tags), default=0.0)
@@ -367,10 +386,12 @@ class ContextRetriever:
         # Deep retrieval: fetch full segments when we have matches
         full_detail: list[StoredSegment] = []
         if selected:
+            _full_detail_stage = time.monotonic()
             for summary in selected[:3]:  # limit to top 3
                 segment = self.store.get_segment(summary.ref, conversation_id=self._conversation_id)
                 if segment:
                     full_detail.append(segment)
+            _note("fetch_full_detail", _full_detail_stage)
 
         # Collect matched tags (include related tag matches too)
         expanded_set = set(expanded_tags)
@@ -393,6 +414,7 @@ class ContextRetriever:
         })
 
         # Fetch facts: prefetch by tag relevance or fetch all
+        _facts_stage = time.monotonic()
         if self.config.prefetch_facts and expanded_tags:
             facts = self._fetch_facts_by_tags(expanded_tags)
             logger.info("Retriever: facts=%d (prefetch tags=%s)", len(facts), expanded_tags)
@@ -400,6 +422,25 @@ class ContextRetriever:
             facts = self._fetch_all_facts()
             logger.info("Retriever: facts=%d (all, prefetch=%s)", len(facts),
                         "off" if not self.config.prefetch_facts else "no-tags")
+        _note("fetch_facts", _facts_stage)
+
+        total_ms = round((time.monotonic() - start_time) * 1000, 1)
+        if total_ms >= _RETRIEVAL_BREAKDOWN_LOG_THRESHOLD_MS:
+            stages = " ".join(
+                f"{stage}={ms:.1f}ms"
+                for stage, ms in sorted(_breakdown.items(), key=lambda item: item[1], reverse=True)
+                if ms > 0
+            )
+            logger.info(
+                "RETRIEVE_BREAKDOWN conv=%s total=%sms query_tags=%d expanded=%d selected=%d facts=%d %s",
+                (self._conversation_id or "")[:12] or "none",
+                total_ms,
+                len(query_tags),
+                len(expanded_tags),
+                len(selected),
+                len(facts),
+                stages or "no-stages",
+            )
 
         return RetrievalResult(
             tags_matched=matched_tags,

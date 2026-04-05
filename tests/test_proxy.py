@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -12,11 +13,13 @@ from virtual_context.proxy.server import (
     _build_continuation_request,
     _inject_vc_tools,
     create_app,
+    prepare_payload,
 )
 from virtual_context.config import load_config
+from virtual_context.proxy.formats import AnthropicFormat, PayloadTokenCache, PayloadTokenEstimate
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.core.turn_tag_index import TurnTagIndex
-from virtual_context.types import AssembledContext, Message, TagResult, TurnTagEntry
+from virtual_context.types import AssembledContext, EngineState, Message, TagResult, TurnTagEntry
 
 # ---------------------------------------------------------------------------
 # ProxyState
@@ -289,6 +292,81 @@ class TestIntegration:
 
             assert resp.status_code == 200
             engine.on_message_inbound.assert_not_called()
+
+
+class TestPreparePayloadInboundTokenCache:
+    def test_prepare_payload_loads_and_saves_redis_payload_cache(self, tmp_path):
+        config = load_config(config_dict={
+            "conversation_id": "conv-123",
+            "context_window": 10000,
+            "storage_root": str(tmp_path),
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "store.db")}},
+            "tool_output": {"enabled": False},
+        })
+        engine = MagicMock()
+        engine.config = config
+        engine._turn_tag_index = TurnTagIndex()
+        engine._engine_state = EngineState()
+        engine._store = MagicMock()
+        engine._restored_request_captures = []
+        engine._restored_conversation_history = []
+        engine._restored_pending_turns = []
+        engine._restored_working_set = []
+        engine.on_message_inbound.return_value = AssembledContext()
+        provider = MagicMock()
+        cached = PayloadTokenCache(
+            format_name="anthropic",
+            message_key="messages",
+            shell_fingerprint="shell-old",
+            shell_tokens=10,
+            message_fingerprints=["m1"],
+            message_tokens=[5],
+            separator_tokens=0,
+            total_tokens=15,
+        )
+        next_cache = PayloadTokenCache(
+            format_name="anthropic",
+            message_key="messages",
+            shell_fingerprint="shell-new",
+            shell_tokens=12,
+            message_fingerprints=["m1", "m2"],
+            message_tokens=[5, 6],
+            separator_tokens=1,
+            total_tokens=24,
+        )
+        provider.load_payload_token_cache.return_value = cached
+        engine._session_state_provider = provider
+
+        state = ProxyState(engine)
+        fmt = AnthropicFormat()
+        fmt.estimate_payload_tokens_segmented = MagicMock(return_value=PayloadTokenEstimate(
+            total_tokens=24,
+            cache=next_cache,
+            reused_prefix_messages=1,
+            recounted_messages=1,
+            shell_cache_hit=True,
+        ))
+        body = {
+            "model": "claude-opus-4-6",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        metrics = ProxyMetrics()
+
+        asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                fmt,
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        provider.load_payload_token_cache.assert_called_once_with("conv-123")
+        provider.save_payload_token_cache.assert_called_once_with("conv-123", next_cache)
+        assert fmt.estimate_payload_tokens_segmented.call_args.kwargs["cache"] == cached
+        assert state._inbound_payload_token_cache == next_cache
 
 
 # ---------------------------------------------------------------------------

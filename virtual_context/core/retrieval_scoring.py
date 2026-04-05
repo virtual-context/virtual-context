@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from .tag_scoring import compute_tag_overlap_score
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
     from ..types import ScoringConfig
 
 logger = logging.getLogger(__name__)
+
+_RETRIEVAL_SCORE_BREAKDOWN_LOG_THRESHOLD_MS = 300.0
 
 
 def rrf_fuse(
@@ -225,30 +228,43 @@ def score_candidates(
     tag_stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """3-signal RRF fusion. Returns ({tag: fused_score}, {tag: signal_breakdown})."""
+    _started = time.monotonic()
+    _breakdown: dict[str, float] = {}
+
+    def _note(stage: str, started_at: float) -> None:
+        _breakdown[stage] = round((time.monotonic() - started_at) * 1000, 1)
 
     # Compute 3 independent candidate sets
+    _idf_stage = time.monotonic()
     idf_scores = compute_idf_candidates(
         query_tags, related_tags, store, idf_weights, conversation_id,
     )
+    _note("idf_candidates", _idf_stage)
+    _bm25_stage = time.monotonic()
     bm25_scores = compute_bm25_candidates(
         query_text, store, conversation_id, limit=config.bm25_limit,
     )
+    _note("bm25_candidates", _bm25_stage)
+    _embed_stage = time.monotonic()
     embed_scores = compute_embedding_candidates(
         query_embedding, store, conversation_id,
         limit=config.embedding_limit,
         min_threshold=config.embedding_min_threshold,
     )
+    _note("embedding_candidates", _embed_stage)
 
     # --- Phase 2: Dampening (pre-RRF) ---
     dampening = config.dampening
 
     # Gravity (pre-RRF): halve embedding scores with zero BM25 support
     if dampening.gravity_enabled and embed_scores:
+        _gravity_stage = time.monotonic()
         apply_gravity_dampening(
             embed_scores, bm25_scores,
             threshold=dampening.gravity_threshold,
             factor=dampening.gravity_factor,
         )
+        _note("gravity_dampening", _gravity_stage)
 
     # Union all candidates
     all_tags = set(idf_scores) | set(bm25_scores) | set(embed_scores)
@@ -277,20 +293,25 @@ def score_candidates(
     }
 
     # RRF fusion
+    _rrf_stage = time.monotonic()
     fused = rrf_fuse(rankings, weights, k=config.rrf_k)
+    _note("rrf_fuse", _rrf_stage)
 
     # --- Phase 2: Dampening (post-RRF) ---
 
     # Hub dampening (post-RRF)
     if dampening.hub_enabled and tag_stats:
+        _hub_stage = time.monotonic()
         apply_hub_dampening(
             fused, tag_stats, set(query_tags),
             penalty_strength=dampening.hub_penalty_strength,
             min_score_fraction=dampening.hub_min_score,
         )
+        _note("hub_dampening", _hub_stage)
 
     # Resolution boost (post-RRF)
     if dampening.resolution_enabled:
+        _resolution_stage = time.monotonic()
         try:
             actionable = store.get_actionable_fact_tags(
                 list(all_tags), conversation_id=conversation_id,
@@ -299,6 +320,7 @@ def score_candidates(
                 apply_resolution_boost(fused, actionable, boost=dampening.resolution_boost)
         except Exception:
             pass
+        _note("resolution_boost", _resolution_stage)
 
     # Build breakdowns for logging
     breakdowns: dict[str, dict] = {}
@@ -323,5 +345,22 @@ def score_candidates(
     top = sorted(fused.keys(), key=lambda t: fused[t], reverse=True)[:10]
     logger.info("Retriever: Top %d by RRF: %s", len(top),
                 ", ".join(f"{t}={fused[t]:.4f}" for t in top))
+
+    total_ms = round((time.monotonic() - _started) * 1000, 1)
+    if total_ms >= _RETRIEVAL_SCORE_BREAKDOWN_LOG_THRESHOLD_MS:
+        stages = " ".join(
+            f"{stage}={ms:.1f}ms"
+            for stage, ms in sorted(_breakdown.items(), key=lambda item: item[1], reverse=True)
+            if ms > 0
+        )
+        logger.info(
+            "RETRIEVAL_SCORE_BREAKDOWN total=%sms candidates=%d idf=%d bm25=%d embed=%d %s",
+            total_ms,
+            len(all_tags),
+            len(idf_scores),
+            len(bm25_scores),
+            len(embed_scores),
+            stages or "no-stages",
+        )
 
     return fused, breakdowns

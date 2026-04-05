@@ -7,6 +7,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 from virtual_context.proxy.session_state import SessionState, SessionStateProvider
+from virtual_context.proxy.formats import PayloadTokenCache
 
 
 @pytest.fixture
@@ -35,6 +36,7 @@ def mock_redis():
 
     # Direct set for delete() tombstone path
     r.set.side_effect = lambda k, v, **kw: _store.update({k: v})
+    r.delete.side_effect = lambda k: _store.pop(k, None)
 
     r._test_store = _store  # expose for assertions
     return r
@@ -146,3 +148,41 @@ def test_turn_tag_entries_roundtrip(provider, mock_redis):
     loaded = provider.load("conv-123")
     assert len(loaded.turn_tag_entries) == 2
     assert loaded.turn_tag_entries[0]["tags"] == ["auth", "debug"]
+
+
+def test_payload_token_cache_roundtrip(provider, mock_redis):
+    cache = PayloadTokenCache(
+        format_name="anthropic",
+        message_key="messages",
+        shell_fingerprint="shell-123",
+        shell_tokens=42,
+        message_fingerprints=["m1", "m2"],
+        message_tokens=[10, 12],
+        separator_tokens=1,
+        total_tokens=65,
+    )
+
+    provider.save_payload_token_cache("conv-123", cache)
+
+    loaded = provider.load_payload_token_cache("conv-123")
+    assert loaded == cache
+
+
+def test_delete_clears_payload_token_cache(provider, mock_redis):
+    provider.save_payload_token_cache(
+        "conv-123",
+        PayloadTokenCache(
+            format_name="anthropic",
+            message_key="messages",
+            shell_fingerprint="shell-123",
+            shell_tokens=42,
+            message_fingerprints=["m1"],
+            message_tokens=[10],
+            separator_tokens=0,
+            total_tokens=52,
+        ),
+    )
+
+    provider.delete("conv-123")
+
+    assert mock_redis._test_store.get("vc:payload_tokens:conv-123") is None

@@ -493,7 +493,16 @@ class RetrievalAssembler:
             paging_mode = self._resolve_paging_mode()
 
         if paging_enabled and paging_mode == "autonomous":
-            hint = self._build_autonomous_hint(tag_summaries)
+            tag_full_tokens = {
+                ts.tag: ts.total_full_tokens
+                for ts in self._store.get_all_tags(
+                    conversation_id=self.config.conversation_id,
+                )
+            }
+            hint = self._build_autonomous_hint(
+                tag_summaries,
+                full_depth_tokens_by_tag=tag_full_tokens,
+            )
         elif paging_enabled and paging_mode == "supervised":
             hint = self._build_supervised_hint(tag_summaries)
         else:
@@ -501,7 +510,12 @@ class RetrievalAssembler:
 
         return hint
 
-    def _build_autonomous_hint(self, tag_summaries: list) -> str:
+    def _build_autonomous_hint(
+        self,
+        tag_summaries: list,
+        *,
+        full_depth_tokens_by_tag: dict[str, int] | None = None,
+    ) -> str:
         return build_autonomous_hint(
             tag_summaries=tag_summaries,
             working_set=self._paging.working_set,
@@ -509,6 +523,7 @@ class RetrievalAssembler:
             max_hint_tokens=self.config.assembler.context_hint_max_tokens,
             token_counter=self._token_counter,
             calculate_depth_tokens=self._paging.calculate_depth_tokens,
+            full_depth_tokens_by_tag=full_depth_tokens_by_tag,
             fact_counts=self._store.get_fact_count_by_tags(conversation_id=self.config.conversation_id),
             max_tool_rounds=self.config.paging.max_tool_loops,
         )

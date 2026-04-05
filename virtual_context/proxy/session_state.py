@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,8 @@ class SessionState:
 class SessionStateProvider:
     """Redis-backed session state. Load at request start, save at request end."""
 
+    _PAYLOAD_TOKEN_CACHE_TTL_SECONDS = 6 * 60 * 60
+
     def __init__(self, redis_client=None, redis_url: str = "", store=None) -> None:
         if redis_client is not None:
             self._redis = redis_client
@@ -96,6 +98,9 @@ class SessionStateProvider:
 
     def _key(self, conversation_id: str) -> str:
         return f"vc:session:{conversation_id}"
+
+    def _payload_token_cache_key(self, conversation_id: str) -> str:
+        return f"vc:payload_tokens:{conversation_id}"
 
     def load(self, conversation_id: str) -> SessionState | None:
         """Load session state from Redis. Returns None if not found.
@@ -153,6 +158,55 @@ class SessionStateProvider:
                            conversation_id[:12], exc_info=True)
             self._degraded = True
 
+    def load_payload_token_cache(self, conversation_id: str):
+        """Load the segmented inbound token cache for a conversation.
+
+        This cache is an optional hot-path optimization only. Failures should
+        never affect correctness or the primary session-state flow.
+        """
+        try:
+            raw = self._redis.get(self._payload_token_cache_key(conversation_id))
+            if raw is None:
+                return None
+            from .formats import PayloadTokenCache
+            return PayloadTokenCache(**json.loads(raw))
+        except Exception:
+            logger.warning(
+                "Redis payload-token cache load failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+
+    def save_payload_token_cache(self, conversation_id: str, cache, *, ttl_seconds: int | None = None) -> None:
+        """Save the segmented inbound token cache for a conversation.
+
+        Stored separately from durable session state so it can be updated on
+        every request without inflating the authoritative checkpoint blob.
+        """
+        if cache is None:
+            return
+        try:
+            payload = asdict(cache) if hasattr(cache, "__dataclass_fields__") else cache
+            self._redis.set(
+                self._payload_token_cache_key(conversation_id),
+                json.dumps(payload, default=str).encode("utf-8"),
+                ex=ttl_seconds or self._PAYLOAD_TOKEN_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "Redis payload-token cache save failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+
+    def delete_payload_token_cache(self, conversation_id: str) -> None:
+        """Best-effort delete for the segmented inbound token cache."""
+        try:
+            self._redis.delete(self._payload_token_cache_key(conversation_id))
+        except Exception:
+            pass
+
     def delete(self, conversation_id: str) -> None:
         """Tombstone the conversation. BOTH backends must succeed.
 
@@ -170,6 +224,7 @@ class SessionStateProvider:
                 tombstone.to_json(),
                 ex=86400,
             )
+            self.delete_payload_token_cache(conversation_id)
             self._degraded = False
         except Exception as e:
             errors.append(f"Redis: {e}")

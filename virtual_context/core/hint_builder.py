@@ -16,7 +16,8 @@ def build_autonomous_hint(
     budget: int,
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
-    calculate_depth_tokens: Callable[[str, DepthLevel], int],
+    calculate_depth_tokens: Callable[[str, DepthLevel], int] | None = None,
+    full_depth_tokens_by_tag: dict[str, int] | None = None,
     fact_counts: dict[str, int] | None = None,
     max_tool_rounds: int = 10,
 ) -> str:
@@ -32,19 +33,27 @@ def build_autonomous_hint(
     # Partition into expanded (in working set) vs available (depth:none)
     expanded_lines: list[str] = []
     available_entries: list[str] = []
+
+    def _full_tokens(tag: str) -> int:
+        if full_depth_tokens_by_tag is not None:
+            return int(full_depth_tokens_by_tag.get(tag, 0) or 0)
+        if calculate_depth_tokens is None:
+            return 0
+        return calculate_depth_tokens(tag, DepthLevel.FULL)
+
     for ts in tag_summaries:
         n_facts = fc.get(ts.tag, 0)
         facts_label = f", {n_facts} facts" if n_facts > 0 else ""
         ws = working_set.get(ts.tag)
         if ws and ws.depth != DepthLevel.NONE:
-            full_t = calculate_depth_tokens(ts.tag, DepthLevel.FULL)
+            full_t = _full_tokens(ts.tag)
             desc_part = f" — {ts.description}" if ts.description else ""
             expanded_lines.append(
                 f"  {ts.tag}: {ws.depth.value} {ws.tokens}t"
                 f" \u2192 {full_t}t full{facts_label}{desc_part}"
             )
         else:
-            full_t = calculate_depth_tokens(ts.tag, DepthLevel.FULL)
+            full_t = _full_tokens(ts.tag)
             entry = ts.tag
             if full_t > 0:
                 entry += f"({full_t}t{facts_label})"
