@@ -35,6 +35,7 @@ class ContextRetriever:
         turn_tag_index: TurnTagIndex | None = None,
         inbound_tagger: TagGenerator | None = None,
         conversation_id: str | None = None,
+        session_state_provider=None,
     ) -> None:
         self.tag_generator = tag_generator
         self.store = store
@@ -42,8 +43,43 @@ class ContextRetriever:
         self._turn_tag_index = turn_tag_index
         self._inbound_tagger = inbound_tagger
         self._conversation_id = conversation_id
+        self._session_state_provider = session_state_provider
         # Pre-compile heuristic patterns for embedding-based inbound tagger
         self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
+
+    def _load_all_tags_snapshot(self) -> list:
+        if self._session_state_provider is not None and self._conversation_id:
+            cached = self._session_state_provider.load_tag_stats_snapshot(
+                self._conversation_id,
+            )
+            if cached is not None:
+                return cached
+        all_tags = self.store.get_all_tags(
+            conversation_id=self._conversation_id,
+        )
+        if self._session_state_provider is not None and self._conversation_id:
+            self._session_state_provider.save_tag_stats_snapshot(
+                self._conversation_id,
+                all_tags,
+            )
+        return all_tags
+
+    def _load_tag_summary_embedding_snapshot(self) -> dict[str, list[float]] | None:
+        if self._session_state_provider is not None and self._conversation_id:
+            cached = self._session_state_provider.load_tag_summary_embedding_snapshot(
+                self._conversation_id,
+            )
+            if cached is not None:
+                return cached
+        stored = self.store.load_tag_summary_embeddings(
+            conversation_id=self._conversation_id,
+        )
+        if self._session_state_provider is not None and self._conversation_id:
+            self._session_state_provider.save_tag_summary_embedding_snapshot(
+                self._conversation_id,
+                stored,
+            )
+        return stored
 
     def _compute_idf_weights(self, all_tags: list | None = None) -> dict[str, float]:
         """Compute IDF weights from tag usage counts in the store.
@@ -132,9 +168,7 @@ class ContextRetriever:
 
         # Tag the inbound message — scope vocabulary to current conversation
         _load_tags_stage = time.monotonic()
-        all_tags = self.store.get_all_tags(
-            conversation_id=self._conversation_id,
-        )
+        all_tags = self._load_all_tags_snapshot()
         _note("load_all_tags", _load_tags_stage)
         store_tags = [ts.tag for ts in all_tags]
         _tag_stage = time.monotonic()
@@ -268,6 +302,10 @@ class ContextRetriever:
         tag_stats = {ts.tag: ts.usage_count for ts in all_tags}
         _note("idf_prepare", _idf_stage)
         _score_stage = time.monotonic()
+        stored_embeddings = (
+            self._load_tag_summary_embedding_snapshot()
+            if query_embedding is not None else None
+        )
         scores, breakdowns = score_candidates(
             query_tags=query_tags,
             related_tags=related_query_tags,
@@ -278,6 +316,7 @@ class ContextRetriever:
             conversation_id=self._conversation_id,
             config=self.config.scoring,
             tag_stats=tag_stats,
+            stored_embeddings=stored_embeddings,
         )
         _note("score_candidates", _score_stage)
         retrieval_scores = scores

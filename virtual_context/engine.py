@@ -292,6 +292,7 @@ class VirtualContextEngine:
             semantic=self._semantic,
             telemetry=self._telemetry,
             save_state_callback=self._save_state,
+            session_state_provider=self._session_state_provider,
         )
         self._retrieval = RetrievalAssembler(
             retriever=self._retriever,
@@ -475,6 +476,7 @@ class VirtualContextEngine:
             turn_tag_index=self._turn_tag_index,
             inbound_tagger=inbound_tagger,
             conversation_id=self.config.conversation_id,
+            session_state_provider=self._session_state_provider,
         )
 
     def _build_inbound_embedding_tagger(self) -> TagGenerator:

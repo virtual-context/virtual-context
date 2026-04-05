@@ -82,6 +82,23 @@ class RetrievalAssembler:
         self._context_hint_cache_key: str = ""
         self._context_hint_cache_value: str = ""
 
+    def _load_tag_stats_snapshot(self) -> list:
+        if self._session_state_provider is not None and self.config.conversation_id:
+            cached = self._session_state_provider.load_tag_stats_snapshot(
+                self.config.conversation_id,
+            )
+            if cached is not None:
+                return cached
+        tag_stats = self._store.get_all_tags(
+            conversation_id=self.config.conversation_id,
+        )
+        if self._session_state_provider is not None and self.config.conversation_id:
+            self._session_state_provider.save_tag_stats_snapshot(
+                self.config.conversation_id,
+                tag_stats,
+            )
+        return tag_stats
+
     # ------------------------------------------------------------------
     # Semantic helper (needed for context bleed gate in _get_recent_context)
     # ------------------------------------------------------------------
@@ -541,9 +558,7 @@ class RetrievalAssembler:
         if paging_enabled and paging_mode == "autonomous":
             tag_full_tokens = {
                 ts.tag: ts.total_full_tokens
-                for ts in self._store.get_all_tags(
-                    conversation_id=self.config.conversation_id,
-                )
+                for ts in self._load_tag_stats_snapshot()
             }
             hint = self._build_autonomous_hint(
                 tag_summaries,

@@ -688,6 +688,7 @@ class AssembledContext:
     selected_facts: list[Fact] = field(default_factory=list)
     retrieval_result: RetrievalResult | None = None  # for fill pass overflow access
     presented_tags: set[str] = field(default_factory=set)  # ALL tags visible in rendered output
+    assembly_breakdown: dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

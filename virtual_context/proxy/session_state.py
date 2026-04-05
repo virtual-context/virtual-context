@@ -10,8 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
+
+from ..types import TagStats
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +90,9 @@ class SessionStateProvider:
     """Redis-backed session state. Load at request start, save at request end."""
 
     _PAYLOAD_TOKEN_CACHE_TTL_SECONDS = 6 * 60 * 60
+    _TAG_STATS_CACHE_TTL_SECONDS = 6 * 60 * 60
     _TAG_EMBEDDING_CACHE_TTL_SECONDS = 24 * 60 * 60
+    _TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
     _CONTEXT_HINT_CACHE_TTL_SECONDS = 6 * 60 * 60
     _TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL = 5000
 
@@ -101,6 +107,8 @@ class SessionStateProvider:
         self._store = store  # Optional ContextStore for Postgres backup/fallback
         self._degraded = False
         self._tag_embedding_runtime_cache: dict[str, OrderedDict[str, list[float]]] = {}
+        self._tag_stats_runtime_cache: dict[str, list[TagStats]] = {}
+        self._tag_summary_embedding_snapshot_runtime_cache: dict[str, dict[str, list[float]]] = {}
 
     def _key(self, conversation_id: str) -> str:
         return f"vc:session:{conversation_id}"
@@ -108,9 +116,15 @@ class SessionStateProvider:
     def _payload_token_cache_key(self, conversation_id: str) -> str:
         return f"vc:payload_tokens:{conversation_id}"
 
+    def _tag_stats_cache_key(self, conversation_id: str) -> str:
+        return f"vc:tag_stats:{conversation_id}"
+
     def _tag_embedding_cache_key(self, model_name: str, tag: str) -> str:
         digest = hashlib.sha1(f"{model_name}\0{tag}".encode("utf-8")).hexdigest()
         return f"vc:tag_embedding:{digest}"
+
+    def _tag_summary_embedding_snapshot_key(self, conversation_id: str) -> str:
+        return f"vc:tag_summary_embeddings:{conversation_id}"
 
     def _context_hint_cache_key(self, conversation_id: str, cache_key: str) -> str:
         return f"vc:context_hint:{conversation_id}:{cache_key}"
@@ -133,6 +147,75 @@ class SessionStateProvider:
         cache.move_to_end(tag)
         while len(cache) > self._TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL:
             cache.popitem(last=False)
+
+    @staticmethod
+    def _clone_tag_stats(stats: list[TagStats]) -> list[TagStats]:
+        return [
+            TagStats(
+                tag=item.tag,
+                usage_count=item.usage_count,
+                total_full_tokens=item.total_full_tokens,
+                total_summary_tokens=item.total_summary_tokens,
+                oldest_segment=item.oldest_segment,
+                newest_segment=item.newest_segment,
+            )
+            for item in stats
+        ]
+
+    @staticmethod
+    def _clone_embedding_map(
+        embeddings: dict[str, list[float]],
+    ) -> dict[str, list[float]]:
+        return {tag: list(values) for tag, values in embeddings.items()}
+
+    @staticmethod
+    def _parse_datetime(value):
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return None
+
+    @staticmethod
+    def _serialize_tag_stats(stats: list[TagStats]) -> list[dict]:
+        return [
+            {
+                "tag": item.tag,
+                "usage_count": item.usage_count,
+                "total_full_tokens": item.total_full_tokens,
+                "total_summary_tokens": item.total_summary_tokens,
+                "oldest_segment": item.oldest_segment.isoformat() if item.oldest_segment else None,
+                "newest_segment": item.newest_segment.isoformat() if item.newest_segment else None,
+            }
+            for item in stats
+        ]
+
+    @classmethod
+    def _deserialize_tag_stats(cls, payload: list[dict] | None) -> list[TagStats]:
+        stats: list[TagStats] = []
+        for row in payload or []:
+            if not isinstance(row, dict):
+                continue
+            stats.append(TagStats(
+                tag=str(row.get("tag", "")),
+                usage_count=int(row.get("usage_count", 0) or 0),
+                total_full_tokens=int(row.get("total_full_tokens", 0) or 0),
+                total_summary_tokens=int(row.get("total_summary_tokens", 0) or 0),
+                oldest_segment=cls._parse_datetime(row.get("oldest_segment")),
+                newest_segment=cls._parse_datetime(row.get("newest_segment")),
+            ))
+        return stats
+
+    @staticmethod
+    def _normalize_embedding(embedding: list[float]) -> list[float]:
+        if not embedding:
+            return []
+        norm = math.sqrt(sum(float(value) * float(value) for value in embedding))
+        if norm == 0.0:
+            return [float(value) for value in embedding]
+        return [float(value) / norm for value in embedding]
 
     def load(self, conversation_id: str) -> SessionState | None:
         """Load session state from Redis. Returns None if not found.
@@ -209,6 +292,65 @@ class SessionStateProvider:
                 exc_info=True,
             )
             return None
+
+    def load_tag_stats_snapshot(self, conversation_id: str) -> list[TagStats] | None:
+        """Load cached conversation-scoped TagStats snapshot."""
+        if conversation_id in self._tag_stats_runtime_cache:
+            return self._clone_tag_stats(self._tag_stats_runtime_cache[conversation_id])
+        try:
+            raw = self._redis.get(self._tag_stats_cache_key(conversation_id))
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            stats = self._deserialize_tag_stats(json.loads(raw))
+            self._tag_stats_runtime_cache[conversation_id] = self._clone_tag_stats(stats)
+            return stats
+        except Exception:
+            logger.warning(
+                "Redis tag-stats cache load failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+
+    def save_tag_stats_snapshot(
+        self,
+        conversation_id: str,
+        tag_stats: list[TagStats],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Save shared TagStats snapshot for a conversation."""
+        try:
+            serialized = self._serialize_tag_stats(tag_stats)
+            self._tag_stats_runtime_cache[conversation_id] = self._deserialize_tag_stats(serialized)
+            self._redis.set(
+                self._tag_stats_cache_key(conversation_id),
+                json.dumps(serialized, default=str).encode("utf-8"),
+                ex=ttl_seconds or self._TAG_STATS_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "Redis tag-stats cache save failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+
+    def refresh_tag_stats_snapshot(self, conversation_id: str) -> list[TagStats] | None:
+        """Rebuild the shared TagStats snapshot from the backing store."""
+        if self._store is None or not hasattr(self._store, "get_all_tags"):
+            return None
+        tag_stats = self._store.get_all_tags(conversation_id=conversation_id)
+        self.save_tag_stats_snapshot(conversation_id, tag_stats)
+        return self._clone_tag_stats(tag_stats)
+
+    def delete_tag_stats_snapshot(self, conversation_id: str) -> None:
+        self._tag_stats_runtime_cache.pop(conversation_id, None)
+        try:
+            self._redis.delete(self._tag_stats_cache_key(conversation_id))
+        except Exception:
+            pass
 
     def save_payload_token_cache(self, conversation_id: str, cache, *, ttl_seconds: int | None = None) -> None:
         """Save the segmented inbound token cache for a conversation.
@@ -320,6 +462,90 @@ class SessionStateProvider:
                 exc_info=True,
             )
 
+    def load_tag_summary_embedding_snapshot(
+        self,
+        conversation_id: str,
+    ) -> dict[str, list[float]] | None:
+        """Load cached normalized tag-summary embeddings for a conversation."""
+        if conversation_id in self._tag_summary_embedding_snapshot_runtime_cache:
+            return self._clone_embedding_map(
+                self._tag_summary_embedding_snapshot_runtime_cache[conversation_id]
+            )
+        try:
+            raw = self._redis.get(self._tag_summary_embedding_snapshot_key(conversation_id))
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            normalized = {
+                str(tag): self._normalize_embedding(list(values))
+                for tag, values in parsed.items()
+                if isinstance(values, list)
+            }
+            self._tag_summary_embedding_snapshot_runtime_cache[conversation_id] = (
+                self._clone_embedding_map(normalized)
+            )
+            return normalized
+        except Exception:
+            logger.warning(
+                "Redis tag-summary embedding snapshot load failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+
+    def save_tag_summary_embedding_snapshot(
+        self,
+        conversation_id: str,
+        embeddings_by_tag: dict[str, list[float]],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Save normalized tag-summary embeddings for retrieval scoring."""
+        try:
+            normalized = {
+                str(tag): self._normalize_embedding(list(values))
+                for tag, values in embeddings_by_tag.items()
+                if isinstance(values, list)
+            }
+            self._tag_summary_embedding_snapshot_runtime_cache[conversation_id] = (
+                self._clone_embedding_map(normalized)
+            )
+            self._redis.set(
+                self._tag_summary_embedding_snapshot_key(conversation_id),
+                json.dumps(normalized, default=str).encode("utf-8"),
+                ex=ttl_seconds or self._TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "Redis tag-summary embedding snapshot save failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+
+    def refresh_tag_summary_embedding_snapshot(
+        self,
+        conversation_id: str,
+    ) -> dict[str, list[float]] | None:
+        """Rebuild the shared tag-summary embedding snapshot from the store."""
+        if self._store is None or not hasattr(self._store, "load_tag_summary_embeddings"):
+            return None
+        embeddings = self._store.load_tag_summary_embeddings(conversation_id=conversation_id)
+        self.save_tag_summary_embedding_snapshot(conversation_id, embeddings)
+        return self._clone_embedding_map(
+            self._tag_summary_embedding_snapshot_runtime_cache.get(conversation_id, {})
+        )
+
+    def delete_tag_summary_embedding_snapshot(self, conversation_id: str) -> None:
+        self._tag_summary_embedding_snapshot_runtime_cache.pop(conversation_id, None)
+        try:
+            self._redis.delete(self._tag_summary_embedding_snapshot_key(conversation_id))
+        except Exception:
+            pass
+
     def load_context_hint_cache(self, conversation_id: str, cache_key: str) -> str | None:
         """Load a rendered context hint for a conversation fingerprint."""
         try:
@@ -377,6 +603,8 @@ class SessionStateProvider:
                 ex=86400,
             )
             self.delete_payload_token_cache(conversation_id)
+            self.delete_tag_stats_snapshot(conversation_id)
+            self.delete_tag_summary_embedding_snapshot(conversation_id)
             self._degraded = False
         except Exception as e:
             errors.append(f"Redis: {e}")
