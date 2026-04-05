@@ -16,18 +16,17 @@ Or run locally from a clone:
 bash scripts/install.sh
 ```
 
-Bootstrap config and validate:
+Run guided setup (creates config, picks your tagger provider, and optionally installs daemon):
+
+```bash
+virtual-context onboard --upstream https://api.anthropic.com
+```
+
+Or use a preset without the interactive wizard:
 
 ```bash
 virtual-context init coding
 virtual-context config validate
-```
-
-Or run guided setup (creates config if missing):
-
-```bash
-virtual-context onboard
-virtual-context onboard --wizard
 ```
 
 ## Windows (PowerShell)
@@ -44,18 +43,17 @@ Or run locally from a clone:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Bootstrap config and validate:
+Run guided setup:
+
+```powershell
+virtual-context onboard --upstream https://api.anthropic.com
+```
+
+Or use a preset without the interactive wizard:
 
 ```powershell
 virtual-context init coding
 virtual-context config validate
-```
-
-Or run guided setup (creates config if missing):
-
-```powershell
-virtual-context onboard
-virtual-context onboard --wizard
 ```
 
 ## One-Command Daemon Setup
@@ -66,10 +64,10 @@ Install and start a background proxy service. Creates `~/.virtualcontext/` with 
 virtual-context daemon install --upstream https://api.anthropic.com
 ```
 
-Or use the interactive wizard for multi-instance setups:
+The wizard runs automatically in a terminal. For multi-instance setups:
 
 ```bash
-virtual-context onboard --wizard --install-daemon
+virtual-context onboard --install-daemon
 ```
 
 Options:
@@ -187,19 +185,22 @@ Check task state:
 Get-ScheduledTask -TaskName "virtual-context-proxy"
 ```
 
-## Enhanced Wizard
+## Interactive Wizard
 
-The `onboard --wizard` flow guides you through:
+The `onboard` command runs an interactive wizard by default in a terminal:
 
-1. **Tagging/summarization provider + model** (Anthropic, OpenAI, Ollama, or custom)
-2. **Inbound tagging mode** (embedding, LLM, or keyword)
-3. **Proxy instances** — one or multiple, each with its own upstream provider, port, and label
-4. **Per-instance config** — each instance gets a standalone YAML config with isolated storage
-5. **Daemon install** — optionally install as a background service
+1. **Upstream provider** — where your LLM requests go (Anthropic, OpenAI, Gemini, custom)
+2. **Tagging/summarization provider + model** — auto-inferred from upstream (cheapest option), with override
+3. **Inbound tagging mode** (embedding, LLM, or keyword)
+4. **Proxy instances** — one or multiple, each with its own upstream provider, port, and label
+5. **Per-instance config** — each instance gets a standalone YAML config with isolated storage
+6. **Daemon install** — optionally install as a background service
 
 ```bash
-virtual-context onboard --wizard
+virtual-context onboard
 ```
+
+Skip the wizard with `--no-wizard` to use preset defaults.
 
 ## Per-Instance Config
 

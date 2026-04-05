@@ -118,7 +118,7 @@ CODING_CONFIG: dict = {
     },
     "tag_generator": {
         "type": "llm",
-        "provider": "ollama",
+        "provider": "local",
         "model": "qwen3:4b-instruct-2507-fp16",
         "max_tags": 10,
         "min_tags": 5,
@@ -144,13 +144,13 @@ CODING_CONFIG: dict = {
         "llm_token_overhead": 2000,
     },
     "summarization": {
-        "provider": "ollama",
+        "provider": "local",
         "model": "qwen3:4b-instruct-2507-fp16",
         "max_tokens": 1000,
         "temperature": 0.3,
     },
     "providers": {
-        "ollama": {
+        "local": {
             "type": "generic_openai",
             "base_url": "http://127.0.0.1:11434/v1",
         },
@@ -221,7 +221,7 @@ paging:
 
 tag_generator:
   type: "llm"
-  provider: "ollama"
+  provider: "local"
   model: "qwen3:4b-instruct-2507-fp16"
   max_tags: 10
   min_tags: 5
@@ -354,13 +354,13 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "ollama"
+  provider: "local"
   model: "qwen3:4b-instruct-2507-fp16"
   max_tokens: 1000
   temperature: 0.3
 
 providers:
-  ollama:
+  local:
     type: "generic_openai"
     base_url: "http://127.0.0.1:11434/v1"
 

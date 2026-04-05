@@ -190,10 +190,10 @@ def cmd_init(args):
     print(f"Preset: {preset.name} — {preset.description}")
     print()
     print("Next steps:")
-    print("  1. Install Ollama:    brew install ollama && ollama pull qwen3:4b-instruct-2507-fp16")
-    print("  2. Start Ollama:      ollama serve")
-    print("  3. Validate config:   virtual-context config validate")
-    print("  4. List tags:         virtual-context tags")
+    print("  1. Start your local LLM server (Ollama, llama.cpp, LM Studio, vLLM)")
+    print("     or set a cloud provider in the config (anthropic, openai, gemini)")
+    print("  2. Validate config:   virtual-context config validate")
+    print("  3. List tags:         virtual-context tags")
 
 
 def cmd_presets(args):
@@ -503,9 +503,10 @@ def _prompt_choice(text: str, options: list[str], default: str | None = None) ->
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-6"],
-    "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-nano"],
-    "ollama": ["qwen3:4b-instruct-2507-fp16", "llama3.1:8b", "mistral:7b"],
-    "openrouter": ["qwen/qwen3-30b-a3b", "qwen/qwen3-32b", "google/gemini-2.5-flash-preview"],
+    "openai": ["gpt-4.1-nano", "gpt-4o-mini", "gpt-4o"],
+    "gemini": ["gemini-2.0-flash", "gemini-2.5-flash-preview"],
+    "local": ["qwen3:4b-instruct-2507-fp16", "llama3.1:8b", "mistral:7b"],
+    "openrouter": ["google/gemini-2.0-flash", "qwen/qwen3-30b-a3b", "qwen/qwen3-32b"],
 }
 
 # Context window sizes for upstream providers — used to set correct defaults
@@ -513,7 +514,7 @@ _UPSTREAM_CONTEXT_WINDOWS: dict[str, int] = {
     "anthropic": 1_000_000,
     "openai": 128_000,
     "gemini": 1_000_000,
-    "ollama": 128_000,
+    "local": 128_000,
     "openrouter": 200_000,
     "custom": 128_000,
 }
@@ -522,15 +523,61 @@ _UPSTREAM_CONTEXT_WINDOWS: dict[str, int] = {
 _PROVIDER_KEY_ENVS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
 
+# Auto-inferred tagger models per upstream provider (cheapest capable option)
+_TAGGER_DEFAULTS: dict[str, tuple[str, str]] = {
+    "anthropic": ("anthropic", "claude-haiku-4-5-20251001"),
+    "openai": ("openai", "gpt-4.1-nano"),
+    "gemini": ("gemini", "gemini-2.0-flash"),
+    "openrouter": ("openrouter", "google/gemini-2.0-flash"),
+    "local": ("local", ""),
+}
 
-def _prompt_tagging_provider() -> tuple[str, str]:
+
+def _infer_provider_from_url(url: str) -> str | None:
+    """Infer the upstream provider name from a URL."""
+    url_lower = url.lower()
+    if "api.anthropic.com" in url_lower:
+        return "anthropic"
+    if "api.openai.com" in url_lower:
+        return "openai"
+    if "generativelanguage.googleapis.com" in url_lower:
+        return "gemini"
+    if "openrouter.ai" in url_lower:
+        return "openrouter"
+    if "127.0.0.1" in url_lower or "localhost" in url_lower:
+        return "local"
+    return None
+
+
+def _prompt_tagging_provider(
+    upstream_url: str | None = None,
+) -> tuple[str, str]:
+    """Prompt for tagging/summarization provider and model.
+
+    If upstream_url is provided, auto-infers a default and asks for confirmation.
+    """
+    inferred_provider = None
+    inferred_model = None
+
+    if upstream_url:
+        upstream_name = _infer_provider_from_url(upstream_url)
+        if upstream_name and upstream_name in _TAGGER_DEFAULTS:
+            inferred_provider, inferred_model = _TAGGER_DEFAULTS[upstream_name]
+
+    if inferred_provider and inferred_model:
+        print(f"\n  Auto-selected tagger: {inferred_provider} / {inferred_model}")
+        if _prompt_yes_no("Use this for tagging and summarization?", default_yes=True):
+            return inferred_provider, inferred_model
+        print()  # blank line before full picker
+
     provider = _prompt_choice(
         "Tagging/summarization provider:",
-        ["anthropic", "openai", "ollama", "openrouter", "custom"],
-        default="ollama",
+        ["anthropic", "openai", "gemini", "local", "openrouter", "custom"],
+        default=inferred_provider or "local",
     )
     models = _PROVIDER_MODELS.get(provider)
     if models:
@@ -550,10 +597,13 @@ def _provider_defaults(provider: str) -> tuple[str, str]:
         return "openai", "https://api.openai.com/v1"
     if provider == "gemini":
         return "gemini", "https://generativelanguage.googleapis.com"
-    if provider == "ollama":
-        return "ollama", "http://127.0.0.1:11434"
+    if provider == "local":
+        return "local", "http://127.0.0.1:11434"
     if provider == "openrouter":
         return "openrouter", "https://openrouter.ai/api/v1"
+    # Backwards compat: old configs may still say "ollama"
+    if provider == "ollama":
+        return "local", "http://127.0.0.1:11434"
     return "custom", "https://api.example.com"
 
 
@@ -575,7 +625,7 @@ def _write_instance_config(
     storage_root = str(Path.home() / ".virtual-context" / label)
     provider_label, base_url = _provider_defaults(provider)
     provider_block: dict = {}
-    if provider == "ollama":
+    if provider in ("local", "ollama"):
         provider_block = {provider_label: {"type": "generic_openai", "base_url": base_url + "/v1"}}
     elif provider == "anthropic":
         prov = {"type": "anthropic"}
@@ -627,13 +677,19 @@ def _write_instance_config(
 
 def _check_provider_reachable(provider: str) -> bool:
     """Quick check if a tagging provider is reachable."""
-    if provider == "ollama":
+    if provider in ("local", "ollama"):
         try:
             import urllib.request
-            urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3)
+            # Try OpenAI-compatible /v1/models endpoint (works with Ollama, llama.cpp, vLLM, LM Studio)
+            urllib.request.urlopen("http://127.0.0.1:11434/v1/models", timeout=3)
             return True
         except Exception:
-            return False
+            try:
+                # Fallback: Ollama native endpoint
+                urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3)
+                return True
+            except Exception:
+                return False
     return True  # Remote providers — can't cheaply validate without a key
 
 
@@ -649,14 +705,25 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
         (instances, config_paths): instances list (dicts for YAML) and
         list of written per-instance config file paths.
     """
+    # --- Upstream first (so we can auto-infer tagger) ---
+    print("\n--- Upstream Provider ---")
+    first_provider = _prompt_choice(
+        "Upstream provider:",
+        ["anthropic", "openai", "gemini", "custom"],
+        default="anthropic",
+    )
+    _first_label, first_upstream = _provider_defaults(first_provider)
+    first_upstream = _prompt("Upstream URL", first_upstream)
+
+    # --- Tagging & Summarization (auto-inferred from upstream) ---
     print("\n--- Tagging & Summarization ---")
-    tag_provider, tag_model = _prompt_tagging_provider()
+    tag_provider, tag_model = _prompt_tagging_provider(upstream_url=first_upstream)
 
     # Validate tagging provider is reachable
     if not _check_provider_reachable(tag_provider):
         print(f"\n  WARNING: {tag_provider} does not appear to be running.")
-        if tag_provider == "ollama":
-            print("  Start Ollama first: ollama serve")
+        if tag_provider in ("local", "ollama"):
+            print("  Start your local LLM server (Ollama, llama.cpp, LM Studio, vLLM)")
         if not _prompt_yes_no("Continue anyway?", default_yes=False):
             sys.exit(0)
 
@@ -705,15 +772,21 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
 
     for i in range(count):
         print(f"\n--- Instance {i + 1}/{count} ---")
-        provider = _prompt_choice(
-            "Upstream provider:",
-            ["anthropic", "openai", "gemini", "custom"],
-            default="anthropic" if i == 0 else "openai",
-        )
-
-        default_label, default_upstream = _provider_defaults(provider)
-        label = _prompt("Label", default_label)
-        upstream = _prompt("Upstream URL", default_upstream)
+        if i == 0:
+            # First instance uses the upstream we already asked about
+            provider = first_provider
+            default_label, _ = _provider_defaults(provider)
+            label = _prompt("Label", default_label)
+            upstream = first_upstream
+        else:
+            provider = _prompt_choice(
+                "Upstream provider:",
+                ["anthropic", "openai", "gemini", "custom"],
+                default="openai",
+            )
+            default_label, default_upstream = _provider_defaults(provider)
+            label = _prompt("Label", default_label)
+            upstream = _prompt("Upstream URL", default_upstream)
 
         # Context window — default based on upstream provider
         default_cw = _UPSTREAM_CONTEXT_WINDOWS.get(provider, 200_000)
@@ -1013,7 +1086,9 @@ def cmd_onboard(args):
     print("Config is valid.")
 
     daemon_requested = bool(args.install_daemon)
-    interactive = bool(args.wizard and sys.stdin.isatty())
+    # Wizard runs by default in a TTY; --no-wizard disables it
+    no_wizard = getattr(args, "no_wizard", False)
+    interactive = bool(not no_wizard and sys.stdin.isatty())
     selected_upstream = args.upstream
 
     _wizard_dashboard_token = ""
@@ -1080,6 +1155,8 @@ def _resolve_daemon_config(args) -> Path:
 
     Priority: explicit ``-c`` flag → ``~/.virtualcontext/config.yaml`` (auto-created
     from agentic preset with absolute storage paths so the daemon works from any CWD).
+
+    If no config exists and stdin is a TTY, prompts the user to run onboard first.
     """
     if hasattr(args, "config") and args.config:
         return Path(args.config)
@@ -1090,6 +1167,9 @@ def _resolve_daemon_config(args) -> Path:
     home_vc.mkdir(exist_ok=True)
     config_path = home_vc / "config.yaml"
     if not config_path.exists():
+        if sys.stdin.isatty():
+            print("No config found. Running onboard setup first...")
+            print("  (run 'virtual-context onboard' for the full guided setup)\n")
         preset = get_preset("agentic")
         cfg = yaml.safe_load(preset.template)
         cfg["storage_root"] = str(home_vc)
@@ -1303,7 +1383,12 @@ def main():
     onboard_parser.add_argument(
         "--wizard",
         action="store_true",
-        help="Run interactive setup wizard (instances, ports, providers)",
+        help="(deprecated, wizard now runs by default in TTY)",
+    )
+    onboard_parser.add_argument(
+        "--no-wizard",
+        action="store_true",
+        help="Skip interactive wizard, use preset defaults",
     )
 
     # telemetry (cost-report is a deprecated alias)

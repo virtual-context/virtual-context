@@ -176,7 +176,7 @@ proxy:
 
 ```bash
 virtual-context daemon install --upstream https://api.anthropic.com
-virtual-context onboard --wizard --install-daemon
+virtual-context onboard --install-daemon
 ```
 
 Daemon lifecycle: `daemon status | start | stop | restart | uninstall`
@@ -359,7 +359,7 @@ virtual-context transform -m "What about auth?"      # tag + retrieve + assemble
 virtual-context compact -i msgs.json                 # manual compaction
 virtual-context aliases list|suggest|add             # tag alias management
 virtual-context init coding                          # create config from preset
-virtual-context onboard [--wizard]                   # guided setup
+virtual-context onboard [--upstream URL]              # guided setup (interactive wizard)
 virtual-context daemon install|status|start|stop     # background service
 virtual-context config validate                      # check config syntax
 virtual-context telemetry [--verbose] [--json]       # cost, tokens, timing
@@ -526,7 +526,7 @@ cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest tests/ -v --ignore=tests/ollama    # ~1500 unit tests
-python -m pytest tests/ollama/ -v -m ollama          # integration (requires Ollama)
+python -m pytest tests/ollama/ -v -m ollama          # integration (requires local LLM)
 ```
 
 ## License

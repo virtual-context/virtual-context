@@ -848,8 +848,8 @@ class SearchConfig:
 
 @dataclass
 class SummarizationConfig:
-    provider: str = "ollama_native"
-    model: str = "qwen3:4b-instruct-2507-fp16"
+    provider: str = ""
+    model: str = ""
     max_tokens: int = 1000
     temperature: float = 0.3
 

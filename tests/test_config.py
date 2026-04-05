@@ -22,13 +22,13 @@ class TestLoadConfig:
             "context_window": 50_000,
             "tag_generator": {
                 "type": "llm",
-                "provider": "ollama",
+                "provider": "local",
                 "model": "qwen3:4b-instruct-2507-fp16",
             },
         })
         assert config.context_window == 50_000
         assert config.tag_generator.type == "llm"
-        assert config.tag_generator.provider == "ollama"
+        assert config.tag_generator.provider == "local"
 
     def test_load_from_yaml_file(self):
         raw = {

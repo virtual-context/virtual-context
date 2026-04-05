@@ -91,7 +91,7 @@ def test_catch_all_rule_exists():
 def test_coding_config_loads():
     config = load_config(config_dict=CODING_CONFIG)
     assert config.tag_generator.type == "llm"
-    assert config.tag_generator.provider == "ollama"
+    assert config.tag_generator.provider == "local"
 
 
 def test_coding_config_validates():
@@ -149,7 +149,7 @@ def test_template_roundtrip_thresholds_match():
 def test_template_has_tag_generator():
     parsed = yaml.safe_load(CODING_TEMPLATE)
     assert parsed["tag_generator"]["type"] == "llm"
-    assert parsed["tag_generator"]["provider"] == "ollama"
+    assert parsed["tag_generator"]["provider"] == "local"
 
 
 def test_template_regex_patterns_compile():
