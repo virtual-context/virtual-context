@@ -358,6 +358,7 @@ async def prepare_payload(
     # payload on every append-only turn.
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
     _inbound_bytes = len(body_bytes)
+    _cache_conv_id = state.engine.config.conversation_id if state else ""
     _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
     _initial_message_count = len(body[_msg_key]) if _msg_key in body and isinstance(body[_msg_key], list) else 0
     _inbound_stage = time.monotonic()
@@ -384,7 +385,7 @@ async def prepare_payload(
     if _inbound_cache_estimate and _inbound_cache_estimate.reused_prefix_messages:
         logger.info(
             "INBOUND_TOKEN_CACHE: conv=%s reused=%d/%d recounted=%d shell_cached=%s total=%dt",
-            conversation_id[:12] if conversation_id else "none",
+            _cache_conv_id[:12] if _cache_conv_id else "none",
             _inbound_cache_estimate.reused_prefix_messages,
             _initial_message_count,
             _inbound_cache_estimate.recounted_messages,
