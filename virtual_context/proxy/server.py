@@ -887,14 +887,6 @@ async def prepare_payload(
     if state:
         state._last_enriched_payload_kb = round(len(json.dumps(enriched_body)) / 1024, 1)
 
-    # 2-to-llm: enriched body sent to the LLM (after filtering + context + tools)
-    if log_dir and log_prefix:
-        try:
-            _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
-            _to_llm_log.write_text(json.dumps(enriched_body, default=str))
-        except Exception:
-            logger.debug("enriched body log write failed", exc_info=True)
-
     is_streaming = body.get("stream", False)
 
     # Component-level estimate (diagnostic breakdown, not source of truth)
@@ -902,6 +894,14 @@ async def prepare_payload(
 
     # Strip VC internal markers before token counting and upstream send
     fmt.strip_vc_markers(enriched_body)
+
+    # 2-to-llm: exact payload sent to the LLM (after strip — byte-for-byte what goes upstream)
+    if log_dir and log_prefix:
+        try:
+            _to_llm_log = log_dir / f"{log_prefix}.2-to-llm.json"
+            _to_llm_log.write_text(json.dumps(enriched_body, default=str))
+        except Exception:
+            logger.debug("enriched body log write failed", exc_info=True)
 
     # Ground truth: actual byte-measured outbound token count
     _outbound_json = json.dumps(enriched_body, default=str)
