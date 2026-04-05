@@ -472,6 +472,37 @@ class ContextStore(ABC):
         Returns list of {ref, turn_number, tool_output_refs, message_count}. No chain_json."""
         return []
 
+    def get_chain_recovery_manifest(
+        self,
+        conversation_id: str,
+        min_turn: int = 0,
+    ) -> list[dict]:
+        """Return recovery metadata for collapsed chain stubs.
+
+        Default implementation falls back to snapshot metadata plus one tool-name
+        lookup per snapshot. Storage backends can override this with a single
+        optimized query.
+        """
+        manifest: list[dict] = []
+        for snap in self.get_chain_snapshots_for_conversation(
+            conversation_id,
+            min_turn=min_turn,
+        ):
+            raw_refs = [
+                ref.strip()
+                for ref in str(snap.get("tool_output_refs", "")).split(",")
+                if ref.strip()
+            ]
+            tool_names = self.get_tool_names_for_refs(raw_refs) if raw_refs else []
+            manifest.append({
+                "ref": snap.get("ref", ""),
+                "turn_number": snap.get("turn_number", -1),
+                "tool_output_refs": snap.get("tool_output_refs", ""),
+                "message_count": snap.get("message_count", 0),
+                "tool_names": ", ".join(tool_names) if tool_names else "",
+            })
+        return manifest
+
     def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
         return []
 

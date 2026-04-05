@@ -201,6 +201,24 @@ def test_tag_embedding_cache_roundtrip(provider):
     assert loaded == embeddings
 
 
+def test_tag_embedding_runtime_cache_avoids_repeat_redis_loads(provider, mock_redis):
+    embeddings = {
+        "database": [0.1, 0.2, 0.3],
+        "api": [0.4, 0.5, 0.6],
+    }
+    provider.save_tag_embeddings("model-x", embeddings)
+    provider._tag_embedding_runtime_cache.clear()
+
+    first = provider.load_tag_embeddings("model-x", ["database", "api"])
+    assert first == embeddings
+    assert mock_redis.mget.call_count == 1
+
+    mock_redis.mget.reset_mock()
+    second = provider.load_tag_embeddings("model-x", ["database", "api"])
+    assert second == embeddings
+    mock_redis.mget.assert_not_called()
+
+
 def test_context_hint_cache_roundtrip(provider):
     provider.save_context_hint_cache("conv-123", "fingerprint-1", "<context-topics>cached</context-topics>")
 

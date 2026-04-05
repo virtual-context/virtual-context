@@ -1639,14 +1639,22 @@ def collapse_turn_chains(
     tool_outputs_by_msg_index: dict[int, list] | None = None
     existing_chain_refs_by_turn: dict[int, str] = {}
     _runtime_refs: dict[int, str] | None = None
+    _runtime_recovery_manifest: list[dict] | None = None
     _runtime_loaded = False
+    _runtime_recovery_loaded = False
     if collapse_runtime_cache is not None:
         loaded_flag = collapse_runtime_cache.get("loaded")
         refs_by_turn = collapse_runtime_cache.get("refs_by_turn")
+        recovery_loaded_flag = collapse_runtime_cache.get("recovery_loaded")
+        recovery_manifest = collapse_runtime_cache.get("recovery_manifest")
         if isinstance(loaded_flag, bool):
             _runtime_loaded = loaded_flag
+        if isinstance(recovery_loaded_flag, bool):
+            _runtime_recovery_loaded = recovery_loaded_flag
         if isinstance(refs_by_turn, dict):
             _runtime_refs = refs_by_turn
+        if isinstance(recovery_manifest, list):
+            _runtime_recovery_manifest = recovery_manifest
     if _runtime_loaded and _runtime_refs is not None:
         existing_chain_refs_by_turn = {
             int(turn): ref
@@ -1761,6 +1769,7 @@ def collapse_turn_chains(
 
             # e. Store individual tool outputs (only when store is available)
             tool_output_refs_for_chain: list[str] = []
+            tool_names_for_chain: set[str] = set()
             if store is not None:
                 if tool_outputs_by_msg_index is None:
                     _tool_output_index_stage = time.monotonic()
@@ -1776,6 +1785,8 @@ def collapse_turn_chains(
                         content_text = output.content
                         if not content_text:
                             continue
+                        if tool_name:
+                            tool_names_for_chain.add(tool_name)
                         tool_ref = f"tool_{hashlib.sha256(content_text.encode()).hexdigest()[:12]}"
                         args_summary = _summarise_arguments(call_info.get("arguments"))
                         try:
@@ -1815,6 +1826,24 @@ def collapse_turn_chains(
                     _runtime_refs[canonical_turn] = ref
                     if collapse_runtime_cache is not None:
                         collapse_runtime_cache["loaded"] = True
+                if _runtime_recovery_manifest is not None and canonical_turn >= 0:
+                    _runtime_recovery_manifest = [
+                        snap for snap in _runtime_recovery_manifest
+                        if snap.get("ref") != ref
+                    ]
+                    _runtime_recovery_manifest.append({
+                        "ref": ref,
+                        "turn_number": canonical_turn,
+                        "tool_output_refs": ",".join(tool_output_refs_for_chain),
+                        "message_count": len(pf_msgs),
+                        "tool_names": ", ".join(sorted(tool_names_for_chain)),
+                    })
+                    _runtime_recovery_manifest.sort(
+                        key=lambda snap: int(snap.get("turn_number", -1)),
+                    )
+                    if collapse_runtime_cache is not None:
+                        collapse_runtime_cache["recovery_manifest"] = _runtime_recovery_manifest
+                        collapse_runtime_cache["recovery_loaded"] = True
                 _note("store_new_snapshot", _store_snapshot_stage)
             _new_snapshots += 1
 
@@ -1904,9 +1933,39 @@ def collapse_turn_chains(
         _recovery_deep = int(_canonical_max * deep_compaction_ratio) if deep_compaction_ratio > 0 else 0
         _protected_canonical = _canonical_max - protected_recent_turns + 1
 
-        stored_snapshots = store.get_chain_snapshots_for_conversation(
-            conversation_id, min_turn=_recovery_deep,
-        )
+        if _runtime_recovery_loaded and _runtime_recovery_manifest is not None:
+            stored_snapshots = [
+                snap for snap in _runtime_recovery_manifest
+                if int(snap.get("turn_number", -1)) >= _recovery_deep
+            ]
+        else:
+            recovery_manifest_loader = getattr(store, "get_chain_recovery_manifest", None)
+            if callable(recovery_manifest_loader):
+                loaded_manifest = recovery_manifest_loader(
+                    conversation_id,
+                    min_turn=0,
+                )
+                if isinstance(loaded_manifest, list):
+                    stored_snapshots = loaded_manifest
+                else:
+                    stored_snapshots = store.get_chain_snapshots_for_conversation(
+                        conversation_id,
+                        min_turn=0,
+                    )
+            else:
+                stored_snapshots = store.get_chain_snapshots_for_conversation(
+                    conversation_id,
+                    min_turn=0,
+                )
+            if collapse_runtime_cache is not None:
+                collapse_runtime_cache["recovery_manifest"] = list(stored_snapshots)
+                collapse_runtime_cache["recovery_loaded"] = True
+                _runtime_recovery_manifest = collapse_runtime_cache["recovery_manifest"]
+                _runtime_recovery_loaded = True
+            stored_snapshots = [
+                snap for snap in stored_snapshots
+                if int(snap.get("turn_number", -1)) >= _recovery_deep
+            ]
         _existing_refs = set(chain_refs)
 
         for snap in stored_snapshots:
@@ -1917,14 +1976,15 @@ def collapse_turn_chains(
             if snap_turn >= _protected_canonical:
                 continue
 
-            tool_names_str = ""
-            raw_refs = [r.strip() for r in snap.get("tool_output_refs", "").split(",") if r.strip()]
-            if raw_refs:
-                try:
-                    names = store.get_tool_names_for_refs(raw_refs)
-                    tool_names_str = ", ".join(names) if names else "tools used"
-                except Exception:
-                    tool_names_str = "tools used"
+            tool_names_str = str(snap.get("tool_names", "") or "")
+            if not tool_names_str:
+                raw_refs = [r.strip() for r in snap.get("tool_output_refs", "").split(",") if r.strip()]
+                if raw_refs:
+                    try:
+                        names = store.get_tool_names_for_refs(raw_refs)
+                        tool_names_str = ", ".join(names) if names else "tools used"
+                    except Exception:
+                        tool_names_str = "tools used"
 
             desc_parts = [f"Compacted turn {snap_turn}"]
             if tool_names_str:

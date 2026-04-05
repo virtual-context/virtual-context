@@ -1326,6 +1326,41 @@ class PostgresStore(ContextStore):
         return [{"ref": r["ref"], "turn_number": r["turn_number"],
                  "tool_output_refs": r["tool_output_refs"], "message_count": r["message_count"]} for r in rows]
 
+    def get_chain_recovery_manifest(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT
+                s.ref,
+                s.turn_number,
+                s.tool_output_refs,
+                s.message_count,
+                COALESCE(
+                    STRING_AGG(DISTINCT t.tool_name, ', ' ORDER BY t.tool_name)
+                        FILTER (WHERE t.tool_name != ''),
+                    ''
+                ) AS tool_names
+            FROM chain_snapshots s
+            LEFT JOIN tool_outputs t
+                ON t.ref = ANY(string_to_array(NULLIF(s.tool_output_refs, ''), ','))
+            WHERE s.conversation_id = %s
+              AND s.turn_number >= %s
+            GROUP BY s.ref, s.turn_number, s.tool_output_refs, s.message_count
+            ORDER BY s.turn_number
+            """,
+            (conversation_id, min_turn),
+        ).fetchall()
+        return [
+            {
+                "ref": row["ref"],
+                "turn_number": row["turn_number"],
+                "tool_output_refs": row["tool_output_refs"],
+                "message_count": row["message_count"],
+                "tool_names": row["tool_names"] or "",
+            }
+            for row in rows
+        ]
+
     def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
         if not refs:
             return []
