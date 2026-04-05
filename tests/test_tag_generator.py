@@ -122,6 +122,50 @@ class TestLLMTagGenerator:
         assert generator._tag_vocabulary["auth"] == 10
         assert generator._tag_vocabulary["database"] == 5
 
+    def test_select_relevant_store_tags_reuses_cached_embeddings(self):
+        provider = MockLLMProvider(response='{"tags": ["database"], "primary": "database"}')
+        cache_loads: list[list[str]] = []
+        cache_saves: list[dict[str, list[float]]] = []
+        embed_calls: list[list[str]] = []
+
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            embed_calls.append(list(texts))
+            vectors = {
+                "database": [1.0, 0.0, 0.0],
+                "api": [0.0, 1.0, 0.0],
+                "schema design": [0.9, 0.1, 0.0],
+            }
+            return [vectors.get(text.lower(), [0.0, 0.0, 1.0]) for text in texts]
+
+        def load_cached(model_name: str, tags: list[str]) -> dict[str, list[float]]:
+            cache_loads.append(list(tags))
+            return {"database": [1.0, 0.0, 0.0]}
+
+        def save_cached(model_name: str, embeddings: dict[str, list[float]]) -> None:
+            cache_saves.append(dict(embeddings))
+
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(
+            llm_provider=provider,
+            config=config,
+            embed_fn_factory=lambda: embed_fn,
+            embedding_model_name="model-x",
+            load_cached_embeddings=load_cached,
+            save_cached_embeddings=save_cached,
+        )
+
+        selected = generator._select_relevant_store_tags(
+            "schema design",
+            ["database", "api"],
+            limit=2,
+        )
+
+        assert selected[0] == "database"
+        assert cache_loads == [["database", "api"]]
+        assert cache_saves and "api" in cache_saves[0]
+        assert ["api"] in embed_calls
+        assert ["schema design"] in embed_calls
+
 
 class TestRelatedTagsParsing:
     """Test that related_tags are parsed and normalized from LLM response."""
@@ -248,6 +292,33 @@ class TestBuildTagGenerator:
         provider = MockLLMProvider()
         gen = build_tag_generator(config, llm_provider=provider)
         assert isinstance(gen, LLMTagGenerator)
+
+    def test_build_embedding_generator_passes_shared_cache_hooks(self):
+        config = TagGeneratorConfig(type="embedding")
+        loaded: list[list[str]] = []
+        saved: list[dict[str, list[float]]] = []
+
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            return [[1.0] for _ in texts]
+
+        def load_cached(model_name: str, tags: list[str]) -> dict[str, list[float]]:
+            loaded.append(list(tags))
+            return {}
+
+        def save_cached(model_name: str, embeddings: dict[str, list[float]]) -> None:
+            saved.append(dict(embeddings))
+
+        gen = build_tag_generator(
+            config,
+            embed_fn_factory=lambda: embed_fn,
+            embedding_model_name="model-x",
+            load_cached_embeddings=load_cached,
+            save_cached_embeddings=save_cached,
+        )
+
+        gen.generate_tags("hello", existing_tags=["alpha"])
+        assert loaded == [["alpha"]]
+        assert saved and "alpha" in saved[0]
 
     def test_fallback_to_keyword_when_no_provider(self):
         config = TagGeneratorConfig(

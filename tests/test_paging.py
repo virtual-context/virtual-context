@@ -1005,6 +1005,49 @@ class TestContextHintModes:
         # Default hint uses description when available instead of summary[:60]
         assert "Interval training and HR zone programming" in hint
 
+    def test_context_hint_reuses_cached_render_when_state_unchanged(self, tmp_path):
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        self._seed_tag_summary(engine, "database")
+
+        original = engine._retrieval._build_supervised_hint
+        calls = {"count": 0}
+
+        def wrapped(tag_summaries):
+            calls["count"] += 1
+            return original(tag_summaries)
+
+        engine._retrieval._build_supervised_hint = wrapped
+
+        hint1 = engine._retrieval._build_context_hint(paging_mode="supervised")
+        hint2 = engine._retrieval._build_context_hint(paging_mode="supervised")
+
+        assert hint1 == hint2
+        assert calls["count"] == 1
+
+    def test_context_hint_cache_invalidates_on_working_set_change(self, tmp_path):
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        self._seed_tag_summary(engine, "database")
+
+        original = engine._retrieval._build_supervised_hint
+        calls = {"count": 0}
+
+        def wrapped(tag_summaries):
+            calls["count"] += 1
+            return original(tag_summaries)
+
+        engine._retrieval._build_supervised_hint = wrapped
+
+        engine._retrieval._build_context_hint(paging_mode="supervised")
+        engine._paging.working_set["database"] = WorkingSetEntry(
+            tag="database",
+            depth=DepthLevel.SUMMARY,
+            tokens=120,
+            last_accessed_turn=5,
+        )
+        engine._retrieval._build_context_hint(paging_mode="supervised")
+
+        assert calls["count"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Phase 5: MCP Tools

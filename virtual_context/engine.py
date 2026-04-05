@@ -119,6 +119,8 @@ class VirtualContextEngine:
         self._config_path = str(config_path) if config_path else None
         self.config = config or load_config(config_path)
         self._token_counter = create_token_counter(self.config.token_counter)
+        self._session_cache = session_cache
+        self._session_state_provider = session_state_provider
 
         # Shared embedding provider — single model load across all components
         if embedding_provider is not None:
@@ -144,8 +146,6 @@ class VirtualContextEngine:
         self._init_tag_splitter()
         self._engine_state = EngineState()  # mutable shared state for delegates
         self._engine_state.conversation_generation = self._conversation_generation
-        self._session_cache = session_cache
-        self._session_state_provider = session_state_provider
         self._session_state_version: int = 0  # Tracks loaded Redis version for optimistic save
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
@@ -304,6 +304,7 @@ class VirtualContextEngine:
             fact_curator=self._fact_curator,
             config=self.config,
             token_counter=self._token_counter,
+            session_state_provider=self._session_state_provider,
         )
         self._retrieval._set_semantic(self._semantic)
         self._apply_persisted_state_to_delegates()
@@ -341,6 +342,11 @@ class VirtualContextEngine:
 
     def _init_tag_generator(self) -> None:
         llm_provider = None
+        shared_embedding_loader = None
+        shared_embedding_saver = None
+        if self._session_state_provider is not None:
+            shared_embedding_loader = self._session_state_provider.load_tag_embeddings
+            shared_embedding_saver = self._session_state_provider.save_tag_embeddings
 
         # Try to build an LLM provider for tagging
         if self.config.tag_generator.type == "llm":
@@ -354,6 +360,9 @@ class VirtualContextEngine:
             self.config.tag_generator, llm_provider,
             canonicalizer=self._canonicalizer, telemetry_ledger=self._telemetry,
             embed_fn_factory=lambda: self._embedding_provider.get_embed_fn() if self._embedding_provider else None,
+            embedding_model_name=self.config.retriever.embedding_model,
+            load_cached_embeddings=shared_embedding_loader,
+            save_cached_embeddings=shared_embedding_saver,
             code_mode=self.config.compactor.code_mode,
         )
 
@@ -483,6 +492,14 @@ class VirtualContextEngine:
             model_name=self.config.retriever.embedding_model,
             similarity_threshold=self.config.retriever.embedding_threshold,
             embed_fn=embed_fn,
+            load_cached_embeddings=(
+                self._session_state_provider.load_tag_embeddings
+                if self._session_state_provider is not None else None
+            ),
+            save_cached_embeddings=(
+                self._session_state_provider.save_tag_embeddings
+                if self._session_state_provider is not None else None
+            ),
         )
 
     def _init_compactor(self) -> None:

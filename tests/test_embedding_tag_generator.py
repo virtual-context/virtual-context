@@ -42,6 +42,8 @@ class TestEmbeddingTagGenerator:
             config=config,
             embed_fn=_mock_embed,
             similarity_threshold=kwargs.get("threshold", 0.3),
+            load_cached_embeddings=kwargs.get("load_cached_embeddings"),
+            save_cached_embeddings=kwargs.get("save_cached_embeddings"),
         )
 
     def test_generate_with_existing_tags(self):
@@ -78,3 +80,32 @@ class TestEmbeddingTagGenerator:
         result = gen.generate_tags("something random", existing_tags=["database", "api"])
         assert result.tags == ["_general"]
 
+    def test_shared_cache_reuses_remote_embeddings(self):
+        saved: dict[str, dict[str, list[float]]] = {}
+        embed_calls: list[list[str]] = []
+
+        def cached_loader(model_name: str, tags: list[str]) -> dict[str, list[float]]:
+            assert model_name == "all-MiniLM-L6-v2"
+            return {"database": _mock_embed(["database"])[0]}
+
+        def cached_saver(model_name: str, embeddings: dict[str, list[float]]) -> None:
+            saved[model_name] = dict(embeddings)
+
+        def recording_embed(texts: list[str]) -> list[list[float]]:
+            embed_calls.append(list(texts))
+            return _mock_embed(texts)
+
+        config = TagGeneratorConfig(type="embedding", max_tags=3, min_tags=1)
+        gen = EmbeddingTagGenerator(
+            config=config,
+            embed_fn=recording_embed,
+            load_cached_embeddings=cached_loader,
+            save_cached_embeddings=cached_saver,
+        )
+
+        result = gen.generate_tags("database schema migration", existing_tags=["database", "api"])
+
+        assert result.source == "embedding"
+        assert any(call == ["api"] for call in embed_calls)
+        assert all(call != ["database", "api"] for call in embed_calls)
+        assert "api" in saved["all-MiniLM-L6-v2"]
