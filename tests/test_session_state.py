@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 from virtual_context.proxy.session_state import SessionState, SessionStateProvider
 from virtual_context.proxy.formats import PayloadTokenCache
+from virtual_context.types import TagStats
 
 
 @pytest.fixture
@@ -224,3 +225,31 @@ def test_context_hint_cache_roundtrip(provider):
 
     loaded = provider.load_context_hint_cache("conv-123", "fingerprint-1")
     assert loaded == "<context-topics>cached</context-topics>"
+
+
+def test_tag_stats_snapshot_roundtrip(provider):
+    stats = [
+        TagStats(tag="api", usage_count=3, total_full_tokens=300, total_summary_tokens=75),
+        TagStats(tag="auth", usage_count=1, total_full_tokens=120, total_summary_tokens=30),
+    ]
+
+    provider.save_tag_stats_snapshot("conv-123", stats)
+    loaded = provider.load_tag_stats_snapshot("conv-123")
+
+    assert loaded == stats
+
+
+def test_tag_summary_embedding_snapshot_roundtrip(provider):
+    embeddings = {
+        "api": [3.0, 4.0],
+        "auth": [0.0, 2.0],
+    }
+
+    provider.save_tag_summary_embedding_snapshot("conv-123", embeddings)
+    loaded = provider.load_tag_summary_embedding_snapshot("conv-123")
+
+    assert loaded is not None
+    assert pytest.approx(loaded["api"][0], rel=1e-4) == 0.6
+    assert pytest.approx(loaded["api"][1], rel=1e-4) == 0.8
+    assert pytest.approx(loaded["auth"][0], rel=1e-4) == 0.0
+    assert pytest.approx(loaded["auth"][1], rel=1e-4) == 1.0

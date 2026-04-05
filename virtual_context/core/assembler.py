@@ -5,11 +5,15 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+_ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
+_ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
 
 from ..types import (
     AssembledContext,
@@ -126,16 +130,29 @@ class ContextAssembler:
         to fit within available headroom. Used by proxy to prevent exceeding
         the upstream model's context limit.
         """
+        _started = time.monotonic()
+        _breakdown: dict[str, float] = {}
+
+        def _note(stage: str, started_at: float) -> None:
+            _breakdown[stage] = round((time.monotonic() - started_at) * 1000, 1)
+
         core_budget = self.config.core_context_max_tokens
 
         # Truncate core context to budget
+        _stage = time.monotonic()
         core = self._truncate_core(core_context, core_budget)
+        _note("truncate_core", _stage)
+        _stage = time.monotonic()
         core_tokens = self.token_counter(core)
+        _note("count_core_tokens", _stage)
 
         # Context hint tokens
+        _stage = time.monotonic()
         hint_tokens = self.token_counter(context_hint) if context_hint else 0
+        _note("count_hint_tokens", _stage)
 
         # Group summaries by primary_tag
+        _stage = time.monotonic()
         summaries_by_tag: dict[str, list[StoredSummary]] = {}
         for s in retrieval_result.summaries:
             summaries_by_tag.setdefault(s.primary_tag, []).append(s)
@@ -145,13 +162,16 @@ class ContextAssembler:
             for tag in full_segments:
                 if tag not in summaries_by_tag:
                     summaries_by_tag[tag] = []
+        _note("prepare_summary_groups", _stage)
 
         # Sort tags by priority (higher priority first)
+        _stage = time.monotonic()
         sorted_tags = sorted(
             summaries_by_tag.keys(),
             key=lambda t: self._tag_priority(t),
             reverse=True,
         )
+        _note("sort_tags", _stage)
 
         # --- Unified pool allocation ---
         pool = self.config.context_injection_max_tokens
@@ -163,6 +183,7 @@ class ContextAssembler:
         facts_cap = self.config.facts_max_tokens
 
         # Build all tag section candidates
+        _stage = time.monotonic()
         _built_sections: dict[str, str] = {}
         _section_tokens: dict[str, int] = {}
         for tag in sorted_tags:
@@ -184,8 +205,10 @@ class ContextAssembler:
                 section = self._format_tag_section(tag, sums)
             _built_sections[tag] = section
             _section_tokens[tag] = self.token_counter(section)
+        _note("build_tag_sections", _stage)
 
         # Score all candidates
+        _stage = time.monotonic()
         scored_items: list[tuple[float, str, str, int]] = []  # (score, kind, key, tokens)
 
         for tag in _built_sections:
@@ -210,11 +233,15 @@ class ContextAssembler:
             fact_score = tag_overlap + recency
             scored_items.append((fact_score, "fact", str(i), line_tokens))
             _fact_lines[i] = line
+        _note("score_candidates", _stage)
 
         # Sort by score descending
+        _stage = time.monotonic()
         scored_items.sort(key=lambda x: x[0], reverse=True)
+        _note("sort_candidates", _stage)
 
         # Greedy fill with soft caps
+        _stage = time.monotonic()
         tag_tokens = 0
         facts_tokens = 0
         pool_used = 0
@@ -245,17 +272,21 @@ class ContextAssembler:
                 selected_fact_indices.append(int(key))
                 facts_tokens += tokens
                 pool_used += tokens
+        _note("pool_fill", _stage)
 
         logger.info("Pool allocation: tags=%dt (%d sections), facts=%dt (%d facts), total=%d/%dt",
                     tag_tokens, len(tag_sections), facts_tokens, len(selected_fact_indices),
                     pool_used, pool)
 
         # Format selected facts (budget already enforced by pool allocation)
+        _stage = time.monotonic()
         selected_facts = [retrieval_result.facts[i] for i in sorted(selected_fact_indices)]
         facts_text = self._format_facts(selected_facts, facts_tokens + 100) if selected_facts else ""
         facts_tokens_actual = self.token_counter(facts_text) if facts_text else 0
+        _note("format_facts", _stage)
 
         # Track presented segment refs
+        _stage = time.monotonic()
         presented_refs: set[str] = set()
         for s in retrieval_result.summaries:
             if s.primary_tag in tag_sections and s.ref:
@@ -266,6 +297,7 @@ class ContextAssembler:
                     for seg in segs:
                         if seg.ref:
                             presented_refs.add(seg.ref)
+        _note("track_presented_refs", _stage)
 
         # Conversation budget = remaining tokens
         conversation_budget = (
@@ -273,10 +305,15 @@ class ContextAssembler:
         )
 
         # Trim conversation to budget
+        _stage = time.monotonic()
         trimmed = self._trim_conversation(conversation_history, conversation_budget)
+        _note("trim_conversation", _stage)
+        _stage = time.monotonic()
         conv_tokens = sum(self.token_counter(m.content) for m in trimmed)
+        _note("count_conversation_tokens", _stage)
 
         # Build prepend text (core + context hint + tag sections + facts)
+        _stage = time.monotonic()
         prepend_parts: list[str] = []
         if core:
             prepend_parts.append(core)
@@ -289,9 +326,11 @@ class ContextAssembler:
             prepend_parts.append(facts_text)
 
         prepend_text = "\n\n".join(prepend_parts)
+        _note("build_prepend", _stage)
 
         # Hard budget cap: if prepend_text exceeds token_budget,
         # drop least-relevant tag sections until it fits.
+        _stage = time.monotonic()
         prepend_tokens = self.token_counter(prepend_text)
         if prepend_tokens > token_budget:
             logger.error(
@@ -327,10 +366,12 @@ class ContextAssembler:
                 prepend_tokens = self.token_counter(prepend_text)
                 if prepend_tokens <= token_budget:
                     break
+        _note("hard_cap_trim", _stage)
 
         total_tokens = core_tokens + tag_tokens + facts_tokens_actual + conv_tokens
 
         # Compute presented_tags from rendered <virtual-context tags="..."> headers
+        _stage = time.monotonic()
         _vc_tags_re = re.compile(r'<virtual-context\s+tags="([^"]*)"')
         _presented_tags: set[str] = set()
         for _section_text in tag_sections.values():
@@ -341,6 +382,24 @@ class ContextAssembler:
                         _presented_tags.add(_t)
         # Also include section keys as baseline for edge cases
         _presented_tags.update(tag_sections.keys())
+        _note("extract_presented_tags", _stage)
+
+        total_ms = round((time.monotonic() - _started) * 1000, 1)
+        if total_ms >= _ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS:
+            stages = sorted(
+                ((stage, ms) for stage, ms in _breakdown.items() if ms > 0),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:_ASSEMBLE_BREAKDOWN_MAX_STAGES]
+            stage_bits = [f"{stage}={ms:.1f}ms" for stage, ms in stages]
+            logger.info(
+                "ASSEMBLE_BREAKDOWN tags=%d facts=%d history=%d total=%sms %s",
+                len(tag_sections),
+                len(selected_facts),
+                len(trimmed),
+                total_ms,
+                " ".join(stage_bits) if stage_bits else "no-stages",
+            )
 
         return AssembledContext(
             core_context=core,
@@ -360,6 +419,7 @@ class ContextAssembler:
             selected_facts=selected_facts,
             retrieval_result=retrieval_result,
             presented_tags=_presented_tags,
+            assembly_breakdown=_breakdown,
         )
 
     def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:

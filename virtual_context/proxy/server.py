@@ -1365,6 +1365,7 @@ async def prepare_payload(
 
     # Track enriched payload tokens for dashboard — outbound_tokens is ground truth
     _non_virtualizable_floor = 0
+    _vc_tokens = 0
     _floor_stage = time.monotonic()
     if state:
         state._last_enriched_payload_tokens = outbound_tokens
@@ -1445,7 +1446,7 @@ async def prepare_payload(
     turn = len(state.engine._turn_tag_index.entries) if state else 0
     _turn_id = uuid.uuid4().hex[:12]
     _context_tokens_stage = time.monotonic()
-    context_tokens = fmt._count(prepend_text) if prepend_text else 0
+    context_tokens = _vc_tokens if state else (fmt._count(prepend_text) if prepend_text else 0)
     _note_prep("context_token_count", _context_tokens_stage)
     total_turns = turn
     _prepare_meta = _prepare_metadata()

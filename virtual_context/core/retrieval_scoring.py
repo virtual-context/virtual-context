@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING
 from .tag_scoring import compute_tag_overlap_score
 from .math_utils import cosine_similarity
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional in test/dev envs
+    np = None
+
 if TYPE_CHECKING:
     from .store import ContextStore
     from ..types import ScoringConfig
@@ -122,20 +127,53 @@ def compute_embedding_candidates(
     conversation_id: str | None,
     limit: int = 20,
     min_threshold: float = 0.25,
+    stored_embeddings: dict[str, list[float]] | None = None,
 ) -> dict[str, float]:
     """Signal 3: Embedding cosine similarity. Returns {primary_tag: cosine_score}."""
     if query_embedding is None:
         return {}
 
-    stored = store.load_tag_summary_embeddings(conversation_id=conversation_id)
+    stored = stored_embeddings
+    if stored is None:
+        stored = store.load_tag_summary_embeddings(conversation_id=conversation_id)
     if not stored:
         return {}
 
     scored: list[tuple[str, float]] = []
-    for tag, emb in stored.items():
-        sim = cosine_similarity(query_embedding, emb)
-        if sim >= min_threshold:
-            scored.append((tag, sim))
+    if np is not None:
+        query_vec = np.asarray(query_embedding, dtype=np.float32)
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_norm > 0.0:
+            query_vec = query_vec / query_norm
+            candidate_tags: list[str] = []
+            embedding_rows: list[list[float]] = []
+            for tag, emb in stored.items():
+                if not emb:
+                    continue
+                candidate_tags.append(tag)
+                embedding_rows.append(emb)
+            if candidate_tags:
+                embedding_matrix = np.asarray(embedding_rows, dtype=np.float32)
+                row_norms = np.linalg.norm(embedding_matrix, axis=1)
+                valid = row_norms > 0.0
+                if np.any(valid):
+                    embedding_matrix = embedding_matrix[valid] / row_norms[valid][:, None]
+                    filtered_tags = [
+                        candidate_tags[idx] for idx, ok in enumerate(valid.tolist()) if ok
+                    ]
+                    similarities = embedding_matrix @ query_vec
+                    matching = np.flatnonzero(similarities >= min_threshold)
+                    if matching.size:
+                        ordered = matching[np.argsort(similarities[matching])[::-1]]
+                        scored = [
+                            (filtered_tags[int(idx)], float(similarities[int(idx)]))
+                            for idx in ordered
+                        ]
+    else:
+        for tag, emb in stored.items():
+            sim = cosine_similarity(query_embedding, emb)
+            if sim >= min_threshold:
+                scored.append((tag, sim))
 
     scored.sort(key=lambda x: x[1], reverse=True)
     result = {tag: sim for tag, sim in scored[:limit]}
@@ -226,6 +264,7 @@ def score_candidates(
     conversation_id: str | None,
     config: "ScoringConfig",
     tag_stats: dict[str, int] | None = None,
+    stored_embeddings: dict[str, list[float]] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """3-signal RRF fusion. Returns ({tag: fused_score}, {tag: signal_breakdown})."""
     _started = time.monotonic()
@@ -250,6 +289,7 @@ def score_candidates(
         query_embedding, store, conversation_id,
         limit=config.embedding_limit,
         min_threshold=config.embedding_min_threshold,
+        stored_embeddings=stored_embeddings,
     )
     _note("embedding_candidates", _embed_stage)
 

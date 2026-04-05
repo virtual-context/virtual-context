@@ -68,6 +68,7 @@ class CompactionPipeline:
         semantic: SemanticSearchManager,
         telemetry: TelemetryLedger,
         save_state_callback: Callable,
+        session_state_provider=None,
     ) -> None:
         self._compactor = compactor
         self._segmenter = segmenter
@@ -80,6 +81,7 @@ class CompactionPipeline:
         self._semantic = semantic
         self._telemetry = telemetry
         self._save_state_callback = save_state_callback
+        self._session_state_provider = session_state_provider
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -405,7 +407,33 @@ class CompactionPipeline:
             if min_ttl is not None:
                 self._store.cleanup(max_age=timedelta(days=min_ttl))
 
+        self._refresh_shared_retrieval_snapshots()
+
         return report
+
+    def _refresh_shared_retrieval_snapshots(self) -> None:
+        if self._session_state_provider is None or not self._config.conversation_id:
+            return
+        try:
+            self._session_state_provider.refresh_tag_stats_snapshot(
+                self._config.conversation_id,
+            )
+        except Exception:
+            logger.warning(
+                "Tag-stats snapshot refresh failed for %s",
+                self._config.conversation_id[:12],
+                exc_info=True,
+            )
+        try:
+            self._session_state_provider.refresh_tag_summary_embedding_snapshot(
+                self._config.conversation_id,
+            )
+        except Exception:
+            logger.warning(
+                "Tag-summary embedding snapshot refresh failed for %s",
+                self._config.conversation_id[:12],
+                exc_info=True,
+            )
 
     def _commit_compaction_state(self, conversation_history: list[Message]) -> None:
         """Persist the committed compaction checkpoint, then prune raw turns from that prefix."""

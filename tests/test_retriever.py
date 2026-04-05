@@ -1,6 +1,7 @@
 """Tests for ContextRetriever (tag-based)."""
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,6 +13,7 @@ from virtual_context.types import (
     SegmentMetadata,
     StoredSegment,
     StrategyConfig,
+    TagStats,
     TagGeneratorConfig,
     TagResult,
     TagSummary,
@@ -153,6 +155,49 @@ def test_no_active_tag_skip_when_disabled(tmp_sqlite_db):
     # Should still retrieve even though legal is active
     assert len(result.summaries) > 0
     store.close()
+
+
+def test_retriever_prefers_cached_tag_snapshots_over_store_calls():
+    tag_gen = MockTagGenerator(default_tag="api", default_tags=["api"])
+    inbound_tagger = MagicMock()
+    inbound_tagger.generate_tags.return_value = TagResult(
+        tags=["api"],
+        primary="api",
+        source="embedding",
+        query_embedding=[1.0, 0.0, 0.0],
+    )
+    store = MagicMock()
+    store.get_all_tags.side_effect = AssertionError("store.get_all_tags should not be called")
+    store.load_tag_summary_embeddings.side_effect = AssertionError(
+        "store.load_tag_summary_embeddings should not be called"
+    )
+    store.get_summaries_by_tags.return_value = []
+    store.search_tag_summaries_fts.return_value = []
+    store.search_full_text.return_value = []
+    store.get_actionable_fact_tags.return_value = set()
+    store.query_facts.return_value = []
+
+    provider = MagicMock()
+    provider.load_tag_stats_snapshot.return_value = [
+        TagStats(tag="api", usage_count=3, total_full_tokens=300, total_summary_tokens=60),
+    ]
+    provider.load_tag_summary_embedding_snapshot.return_value = {
+        "api": [1.0, 0.0, 0.0],
+    }
+
+    retriever = ContextRetriever(
+        tag_generator=tag_gen,
+        store=store,
+        config=RetrieverConfig(strategy_configs={"default": StrategyConfig()}),
+        conversation_id="conv-1",
+        inbound_tagger=inbound_tagger,
+        session_state_provider=provider,
+    )
+
+    result = retriever.retrieve("api design review")
+    assert result is not None
+    provider.load_tag_stats_snapshot.assert_called_once_with("conv-1")
+    provider.load_tag_summary_embedding_snapshot.assert_called_once_with("conv-1")
 
 
 def test_fts_fallback_on_tag_miss(tmp_sqlite_db):
