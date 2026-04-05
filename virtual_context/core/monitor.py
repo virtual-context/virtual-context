@@ -21,10 +21,12 @@ class ContextMonitor:
         self,
         config: MonitorConfig,
         token_counter: Callable[[str], int] | None = None,
+        conversation_id: str = "",
     ) -> None:
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self._last_snapshot: ContextSnapshot | None = None
+        self._conv_short = conversation_id[:12] if conversation_id else ""
 
     def check(self, snapshot: ContextSnapshot) -> CompactionSignal | None:
         self._last_snapshot = snapshot
@@ -35,12 +37,20 @@ class ContextMonitor:
 
         usage_ratio = snapshot.total_tokens / budget
 
+        soft_tokens = int(budget * self.config.soft_threshold)
+        hard_tokens = int(budget * self.config.hard_threshold)
+
         if usage_ratio >= self.config.hard_threshold:
-            overflow = snapshot.total_tokens - int(budget * self.config.soft_threshold)
+            overflow = snapshot.total_tokens - soft_tokens
             logger.info(
-                "Compaction check: %d/%dt (%.0f%%) >= hard %.0f%% — triggering",
+                "Compaction check:%s payload=%dt context_window=%dt usage=%.0f%% "
+                "soft=%.0f%%(%dt) hard=%.0f%%(%dt) — ABOVE HARD, triggering "
+                "(overflow=%dt)",
+                f" conv={self._conv_short}" if self._conv_short else "",
                 snapshot.total_tokens, budget, usage_ratio * 100,
-                self.config.hard_threshold * 100,
+                self.config.soft_threshold * 100, soft_tokens,
+                self.config.hard_threshold * 100, hard_tokens,
+                overflow,
             )
             return CompactionSignal(
                 priority="hard",
@@ -50,11 +60,16 @@ class ContextMonitor:
             )
 
         if usage_ratio >= self.config.soft_threshold:
-            overflow = snapshot.total_tokens - int(budget * self.config.soft_threshold)
+            overflow = snapshot.total_tokens - soft_tokens
             logger.info(
-                "Compaction check: %d/%dt (%.0f%%) >= soft %.0f%% — triggering",
+                "Compaction check:%s payload=%dt context_window=%dt usage=%.0f%% "
+                "soft=%.0f%%(%dt) hard=%.0f%%(%dt) — ABOVE SOFT, triggering "
+                "(overflow=%dt)",
+                f" conv={self._conv_short}" if self._conv_short else "",
                 snapshot.total_tokens, budget, usage_ratio * 100,
-                self.config.soft_threshold * 100,
+                self.config.soft_threshold * 100, soft_tokens,
+                self.config.hard_threshold * 100, hard_tokens,
+                overflow,
             )
             return CompactionSignal(
                 priority="soft",
@@ -64,9 +79,14 @@ class ContextMonitor:
             )
 
         logger.info(
-            "Compaction check: %d/%dt (%.0f%%) below soft %.0f%% — no compaction",
+            "Compaction check:%s payload=%dt context_window=%dt usage=%.0f%% "
+            "soft=%.0f%%(%dt) hard=%.0f%%(%dt) — below soft, no compaction "
+            "(headroom=%dt)",
+            f" conv={self._conv_short}" if self._conv_short else "",
             snapshot.total_tokens, budget, usage_ratio * 100,
-            self.config.soft_threshold * 100,
+            self.config.soft_threshold * 100, soft_tokens,
+            self.config.hard_threshold * 100, hard_tokens,
+            soft_tokens - snapshot.total_tokens,
         )
         return None
 
