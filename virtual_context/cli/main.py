@@ -337,6 +337,86 @@ def cmd_chat(args):
     )
 
 
+def _discover_config_path() -> Path | None:
+    """Try to find an existing config file without creating one."""
+    from ..config import _discover_config
+    return _discover_config()
+
+
+def _build_zero_config(upstream_url: str) -> dict | None:
+    """Build a minimal config dict from an upstream URL for zero-config proxy mode.
+
+    Returns None if the upstream can't be inferred (user should run onboard).
+    """
+    provider_name = _infer_provider_from_url(upstream_url)
+    if not provider_name or provider_name not in _TAGGER_DEFAULTS:
+        return None
+
+    tag_provider, tag_model = _TAGGER_DEFAULTS[provider_name]
+
+    # For local providers with no model specified, we can't auto-configure
+    if not tag_model:
+        return None
+
+    # Build provider block
+    tag_label, tag_base_url = _provider_defaults(tag_provider)
+    api_key_env = _PROVIDER_KEY_ENVS.get(tag_provider, "")
+
+    if tag_provider == "anthropic":
+        provider_block = {tag_label: {"type": "anthropic"}}
+        if api_key_env:
+            provider_block[tag_label]["api_key_env"] = api_key_env
+    elif tag_provider in ("openai", "gemini"):
+        provider_block = {tag_label: {"type": "generic_openai", "base_url": tag_base_url}}
+        if api_key_env:
+            provider_block[tag_label]["api_key_env"] = api_key_env
+    elif tag_provider == "openrouter":
+        provider_block = {tag_label: {"type": "openrouter", "base_url": tag_base_url, "api_key_env": api_key_env or "OPENROUTER_API_KEY"}}
+    elif tag_provider in ("local", "ollama"):
+        provider_block = {tag_label: {"type": "generic_openai", "base_url": tag_base_url + "/v1"}}
+    else:
+        return None
+
+    context_window = _UPSTREAM_CONTEXT_WINDOWS.get(provider_name, 200_000)
+
+    # Write to ~/.virtualcontext/ so it persists for future runs
+    vc_home = Path.home() / ".virtualcontext"
+    vc_home.mkdir(parents=True, exist_ok=True)
+    storage_root = str(vc_home)
+
+    cfg = {
+        "version": "0.2",
+        "storage_root": storage_root,
+        "context_window": context_window,
+        "token_counter": "estimate",
+        "tag_generator": {
+            "type": "llm",
+            "provider": tag_label,
+            "model": tag_model,
+            "max_tags": 5,
+            "min_tags": 1,
+        },
+        "summarization": {
+            "provider": tag_label,
+            "model": tag_model,
+            "max_tokens": 1000,
+            "temperature": 0.3,
+        },
+        "providers": provider_block,
+        "storage": {
+            "backend": "sqlite",
+            "sqlite": {"path": f"{storage_root}/store.db"},
+        },
+    }
+
+    # Persist for future runs
+    config_path = vc_home / "config.yaml"
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    print(f"Auto-created config: {config_path} (tagger: {tag_provider}/{tag_model})")
+
+    return cfg
+
+
 def cmd_proxy(args):
     try:
         import uvicorn
@@ -372,7 +452,31 @@ def cmd_proxy(args):
 
     # Check if multi-instance mode is configured
     from ..config import load_config as _load_config
-    _cfg = _load_config(config_path=args.config)
+
+    # Zero-config mode: if no config file exists and --upstream is provided,
+    # auto-infer tagger provider from the upstream URL and build a config
+    # in memory so `pip install && proxy --upstream` just works.
+    config_path_for_proxy = args.config
+    if not config_path_for_proxy and args.upstream:
+        discovered = _discover_config_path()
+        if discovered is None:
+            config_dict = _build_zero_config(args.upstream)
+            if config_dict:
+                # Config was persisted to ~/.virtualcontext/config.yaml
+                config_path_for_proxy = str(Path.home() / ".virtualcontext" / "config.yaml")
+                _cfg = _load_config(config_dict=config_dict)
+            else:
+                print(
+                    "Could not auto-configure tagger for this upstream. "
+                    "Run: virtual-context onboard",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            _cfg = _load_config(config_path=str(discovered))
+            config_path_for_proxy = str(discovered)
+    else:
+        _cfg = _load_config(config_path=config_path_for_proxy)
     instances = _cfg.proxy.instances
 
     if instances:
@@ -394,7 +498,7 @@ def cmd_proxy(args):
             )
             sys.exit(1)
 
-        app = create_app(upstream=args.upstream, config_path=args.config)
+        app = create_app(upstream=args.upstream, config_path=config_path_for_proxy)
         print(f"virtual-context proxy on {args.host}:{args.port} -> {args.upstream}")
         uvicorn.run(
             app, host=args.host, port=args.port, log_level="info",
