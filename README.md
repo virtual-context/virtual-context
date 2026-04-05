@@ -22,7 +22,7 @@ Your client sets `contextWindow: 20000000` (20 million). Your model's real windo
 
 Virtualizing the context window has many advantages:
 
-- **Compression**: Topic-level summarization with structured fact extraction. A 937K-token payload collapses to ~65K. Everything is stored, indexed, and recoverable at full fidelity.
+- **Compression**: Topic-level summarization with structured fact extraction, tool chain stubbing (52 tool call/response pairs collapse to a single retrievable stub), and image scaling (a 391KB base64 screenshot becomes ~40KB, cutting payload size by ~90%). A 937K-token payload collapses to ~65K. Everything is stored, indexed, and recoverable at full fidelity.
 - **Memory**: Your agent recalls what the user said at turn 12 when it reaches turn 1000. Facts, preferences, and decisions persist across the full conversation, not just what fits in the raw window.
 - **Reasoning quality**: A curated 60K window of dense signal produces measurably better answers than a raw 200K window full of noise. The model reasons over what matters, not over everything.
 - **Cost**: Smaller payloads, fewer tokens billed. A conversation running at a 1M-token virtual window regularly produces 60-90K actual payloads, a fraction of the raw cost. The payload is organized to maximize prompt cache hits, so even compressed conversations achieve significant caching in most cases.
