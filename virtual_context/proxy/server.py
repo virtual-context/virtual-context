@@ -1649,33 +1649,22 @@ def create_app(
         # Check app.state for runtime-configurable log dir (cloud layer sets this)
         # app.state takes priority over config default (cloud overrides engine config)
         _state_log_dir = getattr(app.state, "request_log_dir", None)
-        _effective_log_dir = _state_log_dir or _request_log_dir
-        if _effective_log_dir and isinstance(_effective_log_dir, (str, Path)):
-            _effective_log_dir = Path(_effective_log_dir)
-            _effective_log_dir.mkdir(parents=True, exist_ok=True)
+        _base_log_dir = _state_log_dir or _request_log_dir
+        if _base_log_dir and isinstance(_base_log_dir, (str, Path)):
+            _base_log_dir = Path(_base_log_dir)
+            _base_log_dir.mkdir(parents=True, exist_ok=True)
         else:
-            logger.warning(
-                "DIAG_LOG_DIR state=%r config=%r effective=%r type=%s",
-                _state_log_dir, _request_log_dir, _effective_log_dir,
-                type(_effective_log_dir).__name__,
-            )
-            _effective_log_dir = None
+            if _base_log_dir is not None:
+                logger.warning(
+                    "DIAG_LOG_DIR state=%r config=%r base=%r type=%s",
+                    _state_log_dir, _request_log_dir, _base_log_dir,
+                    type(_base_log_dir).__name__,
+                )
+            _base_log_dir = None
+        _effective_log_dir: Path | None = None
         _response_log_path: Path | None = None
         _session_log_path: Path | None = None
         _log_prefix = ""
-        if _effective_log_dir and body_bytes:
-            _seq = next(_log_seq)
-            import datetime as _dt_log
-            ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            _log_prefix = f"{_seq:06d}_{ts}_{path.replace('/', '_')}"
-            # 1-inbound: raw request from client
-            req_log = _effective_log_dir / f"{_log_prefix}.1-inbound.json"
-            _response_log_path = _effective_log_dir / f"{_log_prefix}.3-from-llm.json"
-            _session_log_path = _effective_log_dir / f"{_log_prefix}.session.json"
-            try:
-                req_log.write_bytes(body_bytes)
-            except Exception as _log_err:
-                logger.error("DIAG_WRITE_FAIL 1-inbound: %s path=%s", _log_err, req_log)
 
         try:
             body = json.loads(body_bytes)
@@ -1689,6 +1678,26 @@ def create_app(
 
         # Extract conversation ID from markers before stripping them
         inbound_conversation_id = _extract_conversation_id(body)
+
+        # Organize logs by conversation_id when available
+        if _base_log_dir and body_bytes:
+            if inbound_conversation_id:
+                _effective_log_dir = _base_log_dir / inbound_conversation_id
+            else:
+                _effective_log_dir = _base_log_dir
+            _effective_log_dir.mkdir(parents=True, exist_ok=True)
+            _seq = next(_log_seq)
+            import datetime as _dt_log
+            ts = _dt_log.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            _log_prefix = f"{_seq:06d}_{ts}_{path.replace('/', '_')}"
+            # 1-inbound: raw request from client
+            req_log = _effective_log_dir / f"{_log_prefix}.1-inbound.json"
+            _response_log_path = _effective_log_dir / f"{_log_prefix}.3-from-llm.json"
+            _session_log_path = _effective_log_dir / f"{_log_prefix}.session.json"
+            try:
+                req_log.write_bytes(body_bytes)
+            except Exception as _log_err:
+                logger.error("DIAG_WRITE_FAIL 1-inbound: %s path=%s", _log_err, req_log)
 
         # Strip conversation markers from assistant messages before any processing.
         # The LLM should never see stale markers.
