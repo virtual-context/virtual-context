@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1941,6 +1942,69 @@ class ReducibleItem:
     location: str           # "messages" or "system" — where the item lives
 
 
+def _estimated_reduction_bytes(item: ReducibleItem) -> int:
+    """Approximate bytes saved if this candidate is reduced.
+
+    Used for reduction planning only; final accounting still comes from
+    ``apply_reduction()`` after the mutation is attempted.
+    """
+    if item.category == "thinking_sig":
+        return item.size_bytes
+    if item.category in {"tool_result", "conversation_text"}:
+        return max(item.size_bytes - 480, 0)
+    if item.category == "tool_result_last2":
+        return max(item.size_bytes - 520, 0)
+    if item.category == "vc_context":
+        return max(item.size_bytes // 2, 0)
+    if item.category == "image":
+        return max(item.size_bytes // 2, 0)
+    return item.size_bytes
+
+
+def _plan_budget_reductions(
+    items: list[ReducibleItem],
+    deficit_tokens: int,
+    remaining_slots: int,
+) -> list[ReducibleItem]:
+    """Pick enough high-yield candidates to likely cover the current deficit."""
+    if deficit_tokens <= 0 or remaining_slots <= 0:
+        return []
+
+    planned: list[ReducibleItem] = []
+    estimated_tokens_saved = 0
+    ordered = sorted(
+        items,
+        key=lambda item: (_estimated_reduction_bytes(item), item.size_bytes),
+        reverse=True,
+    )
+    for item in ordered:
+        if len(planned) >= remaining_slots:
+            break
+        planned.append(item)
+        estimated_tokens_saved += max(math.ceil(_estimated_reduction_bytes(item) / 4), 1)
+        if estimated_tokens_saved >= deficit_tokens:
+            break
+    return planned
+
+
+def _mutation_safe_reduction_order(items: list[ReducibleItem]) -> list[ReducibleItem]:
+    """Apply planned reductions in an order that keeps list indexes stable."""
+    system_items = sorted(
+        (item for item in items if item.location == "system"),
+        key=lambda item: item.block_index,
+        reverse=True,
+    )
+    message_items = sorted(
+        (item for item in items if item.location != "system"),
+        key=lambda item: (
+            item.msg_index,
+            item.block_index if item.block_index >= 0 else 1_000_000,
+        ),
+        reverse=True,
+    )
+    return [*system_items, *message_items]
+
+
 def scan_reducible_items(
     body: dict,
     fmt: PayloadFormat,
@@ -2365,32 +2429,38 @@ def enforce_payload_budget(
     context_window: int,
     store: "ContextStore | None" = None,
     conversation_id: str = "",
+    *,
+    initial_tokens: int | None = None,
+    token_estimator: Callable[[dict], int] | None = None,
 ) -> tuple[dict, int, int]:
     """Enforce the VC context window budget on the assembled payload.
 
-    Iteratively reduces the largest reducible item until the payload fits.
-    Only meaningful when outbound_tokens > context_window.
+    Plans a batch of high-yield reductions from one scan, then rescans only if
+    the payload is still over budget. This keeps large-history requests from
+    repeatedly rescanning and recounting the full body after every single cut.
 
     Returns (modified_body, reductions_applied, total_bytes_freed).
     """
-    _MAX_ITERATIONS = 200
+    _MAX_TOTAL_REDUCTIONS = 200
+    _MAX_RESCAN_ROUNDS = 8
+    estimate_tokens = token_estimator or fmt.estimate_payload_tokens
 
-    outbound_tokens = fmt.estimate_payload_tokens(body)
+    outbound_tokens = initial_tokens if initial_tokens is not None else estimate_tokens(body)
     if outbound_tokens <= context_window:
         return body, 0, 0
 
     logger.info(
-        "BUDGET_ENFORCE: payload %dt exceeds budget %dt — starting reduction loop",
+        "BUDGET_ENFORCE: payload %dt exceeds budget %dt — starting reduction planner",
         outbound_tokens, context_window,
     )
 
     total_freed = 0
     reductions = 0
 
-    for iteration in range(_MAX_ITERATIONS):
-        if outbound_tokens <= context_window:
+    for round_idx in range(_MAX_RESCAN_ROUNDS):
+        remaining_slots = _MAX_TOTAL_REDUCTIONS - reductions
+        if outbound_tokens <= context_window or remaining_slots <= 0:
             break
-
         items = scan_reducible_items(body, fmt)
         if not items:
             logger.warning(
@@ -2399,34 +2469,53 @@ def enforce_payload_budget(
             )
             break
 
-        # Try items from largest to smallest — skip any that can't be reduced
-        items.sort(key=lambda x: x.size_bytes, reverse=True)
-        freed = 0
-        largest = None
-        for candidate in items:
-            freed = apply_reduction(body, candidate, fmt, store=store, conversation_id=conversation_id)
-            if freed > 0:
-                largest = candidate
-                break
-            logger.debug(
-                "BUDGET_ENFORCE: skipping %s (%d bytes at msg %d) — not reducible",
-                candidate.category, candidate.size_bytes, candidate.msg_index,
-            )
-
-        if freed <= 0 or largest is None:
+        planned = _plan_budget_reductions(
+            items,
+            deficit_tokens=outbound_tokens - context_window,
+            remaining_slots=remaining_slots,
+        )
+        if not planned:
             logger.info(
-                "BUDGET_ENFORCE: no items could be reduced — stopping",
+                "BUDGET_ENFORCE: planner found no useful reductions — stopping",
             )
             break
 
-        reductions += 1
-        total_freed += freed
-        outbound_tokens = fmt.estimate_payload_tokens(body)
+        round_freed = 0
+        round_reductions = 0
+        for candidate in _mutation_safe_reduction_order(planned):
+            freed = apply_reduction(
+                body,
+                candidate,
+                fmt,
+                store=store,
+                conversation_id=conversation_id,
+            )
+            if freed <= 0:
+                logger.debug(
+                    "BUDGET_ENFORCE: skipping %s (%d bytes at msg %d) — not reducible",
+                    candidate.category, candidate.size_bytes, candidate.msg_index,
+                )
+                continue
+            reductions += 1
+            round_reductions += 1
+            total_freed += freed
+            round_freed += freed
+            if reductions >= _MAX_TOTAL_REDUCTIONS:
+                break
 
+        if round_reductions == 0:
+            logger.info("BUDGET_ENFORCE: no planned reductions could be applied — stopping")
+            break
+
+        outbound_tokens = estimate_tokens(body)
         logger.info(
-            "BUDGET_ENFORCE: [%d] cut %s at msg %d (%d bytes freed) — now %dt/%dt",
-            iteration + 1, largest.category, largest.msg_index, freed,
-            outbound_tokens, context_window,
+            "BUDGET_ENFORCE: round %d planned=%d applied=%d freed=%d bytes — now %dt/%dt",
+            round_idx + 1,
+            len(planned),
+            round_reductions,
+            round_freed,
+            outbound_tokens,
+            context_window,
         )
 
     if outbound_tokens > context_window:

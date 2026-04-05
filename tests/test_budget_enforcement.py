@@ -1,6 +1,7 @@
 import copy
 import json
 import pytest
+from virtual_context.proxy import message_filter as message_filter_module
 from virtual_context.proxy.message_filter import scan_reducible_items, apply_reduction, ReducibleItem, enforce_payload_budget
 from virtual_context.proxy.formats import detect_format
 
@@ -413,6 +414,58 @@ class TestEnforcePayloadBudget:
         fmt_copy.set_token_counter(lambda text: len(text) // 4)
         result, reductions, freed = enforce_payload_budget(body, fmt_copy, 5000)
         assert reductions > 0
+
+    def test_batches_reductions_before_rescanning(self, monkeypatch):
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "A" * 8000},
+                {"type": "text", "text": "response one"},
+            ]},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "B" * 8000},
+                {"type": "text", "text": "response two"},
+            ]},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "C" * 8000},
+                {"type": "text", "text": "response three"},
+            ]},
+            {"role": "user", "content": "bye"},
+        ]
+        body = _make_payload(msgs)
+        fmt = self._fmt()
+        total_before = fmt._count(json.dumps(body))
+        budget = total_before - 3500
+
+        calls = {"scan": 0, "estimate": 0}
+        original_scan = message_filter_module.scan_reducible_items
+        original_estimate = fmt.estimate_payload_tokens
+
+        def counting_scan(*args, **kwargs):
+            calls["scan"] += 1
+            return original_scan(*args, **kwargs)
+
+        def counting_estimate(payload):
+            calls["estimate"] += 1
+            return original_estimate(payload)
+
+        monkeypatch.setattr(message_filter_module, "scan_reducible_items", counting_scan)
+
+        result, reductions, freed = enforce_payload_budget(
+            body,
+            fmt,
+            budget,
+            initial_tokens=original_estimate(body),
+            token_estimator=counting_estimate,
+        )
+
+        total_after = fmt._count(json.dumps(result))
+        assert total_after <= budget
+        assert reductions > 1
+        assert calls["scan"] < reductions
+        assert calls["estimate"] < reductions
 
 
 class TestSmallPayloadProtection:

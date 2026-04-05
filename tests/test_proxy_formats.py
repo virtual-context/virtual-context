@@ -1008,6 +1008,17 @@ class TestOpenAIResponsesFormat:
         tokens = self.fmt.estimate_payload_tokens(body)
         assert tokens == 25 + 50  # 100//4 + 200//4
 
+    def test_estimate_payload_tokens_from_serialized_matches_standard_path(self):
+        body = {"input": [
+            {"role": "user", "content": "x" * 100},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "y" * 200}]},
+        ], "instructions": "z" * 120}
+        serialized = json.dumps(body, default=str)
+        assert (
+            self.fmt.estimate_payload_tokens_from_serialized(body, serialized)
+            == self.fmt.estimate_payload_tokens(body)
+        )
+
     # -- Fingerprinting --
 
     def test_compute_fingerprint(self):

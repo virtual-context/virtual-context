@@ -195,6 +195,31 @@ class TestOnMessageInboundLookback:
             # 1 pair = 2 strings
             assert len(context) == 2, f"Expected 2 context strings (1 pair), got {len(context)}"
 
+    def test_inbound_records_breakdown_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = _make_engine(tmpdir)
+
+            mock_tagger = MagicMock()
+            mock_tagger.generate_tags = MagicMock(return_value=TagResult(
+                tags=["database"], primary="database", source="mock",
+            ))
+            self._patch_tagger(engine, mock_tagger)
+
+            history = _build_history(
+                ("How do I optimize the users table query?",
+                 "Add an index on the email column."),
+                ("What about the orders table?",
+                 "Consider a composite index on (user_id, created_at)."),
+            )
+
+            assembled = engine.on_message_inbound("tell me more", history)
+
+            breakdown = assembled.retrieval_metadata.get("inbound_breakdown")
+            assert isinstance(breakdown, dict)
+            assert assembled.retrieval_metadata.get("inbound_total_ms", -1) >= 0
+            assert "retrieve_primary" in breakdown
+            assert breakdown
+
 
 class TestOnTurnCompleteLookback:
     """Test that on_turn_complete passes context to tagger and retries on _general."""
