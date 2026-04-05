@@ -22,6 +22,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,29 @@ class MediaBlock(NamedTuple):
     """Base64 media found in a content block."""
     b64_data: str
     media_type: str  # "image/png", "application/pdf", etc.
+
+
+@dataclass
+class PayloadTokenCache:
+    """Reusable token-count cache for append-mostly client payloads."""
+    format_name: str
+    message_key: str
+    shell_fingerprint: str
+    shell_tokens: int
+    message_fingerprints: list[str]
+    message_tokens: list[int]
+    separator_tokens: int
+    total_tokens: int
+
+
+@dataclass
+class PayloadTokenEstimate:
+    """Structured result for segmented payload token estimation."""
+    total_tokens: int
+    cache: PayloadTokenCache
+    reused_prefix_messages: int
+    recounted_messages: int
+    shell_cache_hit: bool
 
 
 def _get_image_dimensions(b64_data: str) -> tuple[int, int] | None:
@@ -550,6 +574,34 @@ class PayloadFormat(ABC):
 
     # -- Payload token estimation --------------------------------------------
 
+    def _message_key(self, body: dict) -> str:
+        if "messages" in body:
+            return "messages"
+        if "input" in body:
+            return "input"
+        if "contents" in body:
+            return "contents"
+        return ""
+
+    def _body_without_messages(self, body: dict) -> dict:
+        shell = copy.deepcopy(body)
+        key = self._message_key(shell)
+        if key:
+            shell[key] = []
+        return shell
+
+    @staticmethod
+    def _fingerprint_payload_shell(body: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(body, default=str, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
+    @staticmethod
+    def _fingerprint_message_for_cache(msg: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(msg, default=str, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
     def _estimate_payload_tokens_with_media(
         self,
         body: dict,
@@ -592,6 +644,90 @@ class PayloadFormat(ABC):
             body,
             media_list,
             serialized_json=serialized_json,
+        )
+
+    def estimate_payload_tokens_segmented(
+        self,
+        body: dict,
+        *,
+        cache: PayloadTokenCache | None = None,
+    ) -> PayloadTokenEstimate:
+        """Estimate payload tokens via shell + per-message counts with prefix reuse.
+
+        This is designed for append-mostly client payloads that resend a large
+        stable history on every request. We fingerprint each message, reuse the
+        cached prefix when it still matches, and only recount the changed tail.
+        """
+        messages = self.get_messages(body)
+        message_key = self._message_key(body)
+        shell = self._body_without_messages(body)
+        shell_fingerprint = self._fingerprint_payload_shell(shell)
+
+        shell_cache_hit = bool(
+            cache
+            and cache.format_name == self.name
+            and cache.message_key == message_key
+            and cache.shell_fingerprint == shell_fingerprint
+        )
+        if shell_cache_hit:
+            shell_tokens = cache.shell_tokens
+        else:
+            shell_tokens = self.estimate_payload_tokens(shell)
+
+        reusable_cache = None
+        if (
+            cache
+            and cache.format_name == self.name
+            and cache.message_key == message_key
+        ):
+            reusable_cache = cache
+
+        message_fingerprints: list[str] = []
+        message_tokens: list[int] = []
+        total_message_tokens = 0
+        reused_prefix_messages = 0
+
+        if reusable_cache:
+            reusable = min(
+                len(messages),
+                len(reusable_cache.message_fingerprints),
+                len(reusable_cache.message_tokens),
+            )
+            for idx in range(reusable):
+                fingerprint = self._fingerprint_message_for_cache(messages[idx])
+                if fingerprint != reusable_cache.message_fingerprints[idx]:
+                    break
+                message_fingerprints.append(fingerprint)
+                cached_tokens = reusable_cache.message_tokens[idx]
+                message_tokens.append(cached_tokens)
+                total_message_tokens += cached_tokens
+                reused_prefix_messages += 1
+
+        for msg in messages[reused_prefix_messages:]:
+            fingerprint = self._fingerprint_message_for_cache(msg)
+            token_count = self.estimate_message_tokens(msg)
+            message_fingerprints.append(fingerprint)
+            message_tokens.append(token_count)
+            total_message_tokens += token_count
+
+        separator_tokens = self._count("," * max(0, len(messages) - 1))
+        total_tokens = shell_tokens + total_message_tokens + separator_tokens
+        next_cache = PayloadTokenCache(
+            format_name=self.name,
+            message_key=message_key,
+            shell_fingerprint=shell_fingerprint,
+            shell_tokens=shell_tokens,
+            message_fingerprints=message_fingerprints,
+            message_tokens=message_tokens,
+            separator_tokens=separator_tokens,
+            total_tokens=total_tokens,
+        )
+        return PayloadTokenEstimate(
+            total_tokens=total_tokens,
+            cache=next_cache,
+            reused_prefix_messages=reused_prefix_messages,
+            recounted_messages=max(0, len(messages) - reused_prefix_messages),
+            shell_cache_hit=shell_cache_hit,
         )
 
     def _blank_media_data(self, body: dict) -> list[tuple[dict, str, str]]:

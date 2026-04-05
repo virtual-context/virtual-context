@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from unittest.mock import MagicMock
 
@@ -2528,3 +2529,92 @@ class TestExtractHistoryPairs:
         assert pairs[0].content == "Q1"
         assert pairs[2].content == "Batch 3"
         assert pairs[4].content == "Q3"
+
+
+class TestSegmentedPayloadTokenEstimation:
+    def setup_method(self):
+        self.fmt = AnthropicFormat()
+
+    def test_segmented_matches_standard_path(self):
+        body = {
+            "system": "Be helpful.",
+            "tools": [{"name": "lookup", "description": "Search."}],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AAAA",
+                        },
+                    },
+                ]},
+            ],
+        }
+
+        result = self.fmt.estimate_payload_tokens_segmented(body)
+        baseline = self.fmt.estimate_payload_tokens(copy.deepcopy(body))
+
+        assert abs(result.total_tokens - baseline) <= 2
+        assert result.reused_prefix_messages == 0
+        assert result.recounted_messages == 3
+        assert result.shell_cache_hit is False
+
+    def test_segmented_reuses_append_only_prefix(self):
+        body = {
+            "system": "Be helpful.",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2"},
+            ],
+        }
+        first = self.fmt.estimate_payload_tokens_segmented(body)
+
+        next_body = copy.deepcopy(body)
+        next_body["messages"].extend([
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+        ])
+
+        second = self.fmt.estimate_payload_tokens_segmented(
+            next_body,
+            cache=first.cache,
+        )
+        baseline = self.fmt.estimate_payload_tokens(copy.deepcopy(next_body))
+
+        assert abs(second.total_tokens - baseline) <= 4
+        assert second.reused_prefix_messages == 4
+        assert second.recounted_messages == 2
+        assert second.shell_cache_hit is True
+
+    def test_segmented_recounts_from_first_rewritten_message(self):
+        body = {
+            "system": "Be helpful.",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2"},
+            ],
+        }
+        first = self.fmt.estimate_payload_tokens_segmented(body)
+
+        rewritten = copy.deepcopy(body)
+        rewritten["messages"][1]["content"] = "a1 revised"
+
+        second = self.fmt.estimate_payload_tokens_segmented(
+            rewritten,
+            cache=first.cache,
+        )
+        baseline = self.fmt.estimate_payload_tokens(copy.deepcopy(rewritten))
+
+        assert abs(second.total_tokens - baseline) <= 4
+        assert second.reused_prefix_messages == 1
+        assert second.recounted_messages == 3
+        assert second.shell_cache_hit is True
