@@ -1154,28 +1154,24 @@ class AnthropicFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the last user message that does NOT contain tool_result
-        # blocks.  Prepending text before tool_result breaks Anthropic's
-        # "tool_result must immediately follow tool_use" constraint.
-        # This keeps the system prompt stable and cacheable.
+        # Append to the last user message.  We append (not prepend) so that
+        # tool_result blocks stay at the front of the content list — Anthropic
+        # requires tool_result to immediately follow the preceding tool_use.
+        # Appending also maximises prompt-cache hits: the entire conversation
+        # prefix up to this point stays byte-identical between turns, and only
+        # the VC context block (which changes every turn) sits at the very end.
         messages = body.get("messages", [])
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
-            # Skip tool_result-bearing user messages
-            if isinstance(content, list) and any(
-                isinstance(b, dict) and b.get("type") == "tool_result"
-                for b in content
-            ):
-                continue
             if isinstance(content, str):
                 messages[i] = dict(msg)
-                messages[i]["content"] = f"{context_block}\n\n{content}"
+                messages[i]["content"] = f"{content}\n\n{context_block}"
             elif isinstance(content, list):
                 messages[i] = dict(msg)
-                messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
+                messages[i]["content"] = list(content) + [{"type": "text", "text": context_block}]
             break
         else:
             messages.append({"role": "user", "content": context_block})
@@ -1569,8 +1565,9 @@ class OpenAIFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the LAST user message (current turn) so the system
-        # message remains stable and cacheable by OpenAI prefix caching.
+        # Append to the LAST user message (current turn) so the conversation
+        # prefix stays byte-identical between turns, maximising OpenAI prefix
+        # caching.  Appending keeps tool-call content at the front.
         messages = body.get("messages", [])
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
@@ -1579,10 +1576,10 @@ class OpenAIFormat(PayloadFormat):
             content = msg.get("content", "")
             if isinstance(content, str):
                 messages[i] = dict(msg)
-                messages[i]["content"] = f"{context_block}\n\n{content}"
+                messages[i]["content"] = f"{content}\n\n{context_block}"
             elif isinstance(content, list):
                 messages[i] = dict(msg)
-                messages[i]["content"] = [{"type": "text", "text": context_block}] + list(content)
+                messages[i]["content"] = list(content) + [{"type": "text", "text": context_block}]
             break
         else:
             messages.append({"role": "user", "content": context_block})
@@ -1991,8 +1988,9 @@ class GeminiFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the LAST user message (current turn) so the
-        # system instruction remains stable and cacheable by Gemini context caching.
+        # Append to the LAST user message (current turn) so the conversation
+        # prefix stays byte-identical between turns, maximising Gemini context
+        # caching.
         contents = body.get("contents", [])
         for i in range(len(contents) - 1, -1, -1):
             msg = contents[i]
@@ -2000,7 +1998,7 @@ class GeminiFormat(PayloadFormat):
                 continue
             parts = msg.get("parts", [])
             contents[i] = dict(msg)
-            contents[i]["parts"] = [{"text": context_block}] + list(parts)
+            contents[i]["parts"] = list(parts) + [{"text": context_block}]
             break
         else:
             # No user message — prepend as user message
@@ -2558,8 +2556,9 @@ class OpenAIResponsesFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Inject into the LAST user item in input (current turn) so the
-        # instructions remain stable and cacheable by OpenAI prefix caching.
+        # Append to the LAST user item in input (current turn) so the
+        # conversation prefix stays byte-identical between turns, maximising
+        # OpenAI prefix caching.
         items = body.get("input", [])
         if isinstance(items, list):
             for i in range(len(items) - 1, -1, -1):
@@ -2569,17 +2568,17 @@ class OpenAIResponsesFormat(PayloadFormat):
                 content = item.get("content", "")
                 if isinstance(content, str):
                     items[i] = dict(item)
-                    items[i]["content"] = f"{context_block}\n\n{content}"
+                    items[i]["content"] = f"{content}\n\n{context_block}"
                 elif isinstance(content, list):
                     items[i] = dict(item)
-                    items[i]["content"] = [{"type": "input_text", "text": context_block}] + list(content)
+                    items[i]["content"] = list(content) + [{"type": "input_text", "text": context_block}]
                 break
             else:
                 items.append({"role": "user", "content": context_block})
             body["input"] = items
         elif isinstance(items, str):
-            # input is a plain string — prepend context
-            body["input"] = f"{context_block}\n\n{items}"
+            # input is a plain string — append context
+            body["input"] = f"{items}\n\n{context_block}"
         return body
 
     # -- Conversation markers --
