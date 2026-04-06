@@ -16,6 +16,7 @@ from ..types import (
     RetrievalCostReport,
     RetrievalResult,
     RetrieverConfig,
+    SegmentMetadata,
     StoredSegment,
     StoredSummary,
 )
@@ -134,6 +135,7 @@ class ContextRetriever:
                 tags=[ts.tag],
                 summary=ts.summary,
                 summary_tokens=ts.summary_tokens,
+                metadata=SegmentMetadata(code_refs=list(getattr(ts, "code_refs", []) or [])),
                 created_at=ts.updated_at,
                 start_timestamp=ts.created_at,
                 end_timestamp=ts.updated_at,

@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
 _ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
 
+from .llm_utils import format_code_ref
+
 from ..types import (
     AssembledContext,
     AssemblerConfig,
@@ -56,6 +58,11 @@ def format_tag_section(
         if session:
             prefix += f" [{session}]"
         text = f"{prefix}\n{s.summary}"
+        code_refs = getattr(s.metadata, "code_refs", None) or []
+        if code_refs:
+            refs = [format_code_ref(ref) for ref in code_refs if ref.get("file")]
+            if refs:
+                text += f"\n[refs: {', '.join(refs)}]"
         tool_tags = [t for t in s.tags if t.startswith("tool_")]
         if tool_tags:
             text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'

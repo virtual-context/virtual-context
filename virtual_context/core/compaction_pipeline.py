@@ -536,17 +536,23 @@ class CompactionPipeline:
         turn_offset = self._engine_state.compacted_through // 2
         seg_cursor = turn_offset
         segment_signals: dict[str, list[FactSignal]] = {}
+        segment_code_refs: dict[str, list[dict]] = {}
         segment_turn_ranges: dict[str, tuple[int, int]] = {}  # seg.id -> (start, end_exclusive)
         for seg in segments:
             seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
             segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
             signals: list[FactSignal] = []
+            code_refs: list[dict] = []
             for t in range(seg_cursor, seg_cursor + seg_turn_count):
                 entry = self._turn_tag_index.get_tags_for_turn(t)
                 if entry and entry.fact_signals:
                     signals.extend(entry.fact_signals)
+                if entry and getattr(entry, "code_refs", None):
+                    code_refs.extend(entry.code_refs)
             if signals:
                 segment_signals[seg.id] = signals
+            if code_refs:
+                segment_code_refs[seg.id] = code_refs
             seg_cursor += seg_turn_count
 
         merge_lookback = self._config.compactor.merge_lookback
@@ -611,6 +617,7 @@ class CompactionPipeline:
                     original_tokens=seg.token_count,
                     messages=[{"role": m.role, "content": m.content} for m in seg.messages],
                     metadata=SegmentMetadata(
+                        code_refs=segment_code_refs.get(seg.id, []),
                         turn_count=seg.turn_count,
                         session_date=getattr(seg, "session_date", ""),
                     ),
@@ -734,6 +741,10 @@ class CompactionPipeline:
             seg.id: segment_signals[seg.id]
             for seg in compactable if seg.id in segment_signals
         } or None
+        code_refs_by_segment = {
+            seg.id: segment_code_refs[seg.id]
+            for seg in compactable if seg.id in segment_code_refs
+        } or None
 
         def _compactor_progress(done: int, total: int, result, **kwargs) -> None:
             kwargs.pop("phase", None)  # avoid double-passing phase
@@ -751,6 +762,7 @@ class CompactionPipeline:
         results = self._compactor.compact(
             compactable,
             fact_signals_by_segment=fact_signals_by_segment,
+            code_refs_by_segment=code_refs_by_segment,
             progress_callback=_compactor_progress,
         )
 

@@ -498,6 +498,7 @@ class TestSummaryFloor:
             tag="authentication",
             summary="JWT setup with RS256 signing and 1-hour expiry. Refresh token rotation.",
             summary_tokens=25,
+            code_refs=[{"file": "auth/jwt.py", "line": 88, "symbol": "issue_token"}],
             source_turn_numbers=[0, 1],
             created_at=now,
             updated_at=now,
@@ -531,6 +532,12 @@ class TestSummaryFloor:
         assert len(result.summaries) == 2
         assert result.total_tokens > 0
         assert result.retrieval_metadata.get("summary_floor") is True
+        assert any(
+            summary.metadata.code_refs == [
+                {"file": "auth/jwt.py", "line": 88, "symbol": "issue_token"}
+            ]
+            for summary in result.summaries
+        )
         store.close()
 
     def test_floor_inactive_pre_compaction(self, tmp_sqlite_db):

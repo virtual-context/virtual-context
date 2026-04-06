@@ -49,6 +49,7 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
         "key_decisions": seg.metadata.key_decisions,
         "action_items": seg.metadata.action_items,
         "date_references": seg.metadata.date_references,
+        "code_refs": getattr(seg.metadata, "code_refs", []),
         "turn_count": seg.metadata.turn_count,
     }
     if seg.metadata.session_date:
@@ -130,6 +131,7 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
         key_decisions=fm.get("key_decisions", []),
         action_items=fm.get("action_items", []),
         date_references=fm.get("date_references", []),
+        code_refs=fm.get("code_refs", []),
         turn_count=fm.get("turn_count", 0),
         session_date=fm.get("session_date", ""),
     )
@@ -549,6 +551,7 @@ class FilesystemStore(ContextStore):
             "tag": tag_summary.tag,
             "summary": tag_summary.summary,
             "description": tag_summary.description,
+            "code_refs": getattr(tag_summary, "code_refs", []) or [],
             "summary_tokens": tag_summary.summary_tokens,
             "source_segment_refs": tag_summary.source_segment_refs,
             "source_turn_numbers": tag_summary.source_turn_numbers,
@@ -571,6 +574,7 @@ class FilesystemStore(ContextStore):
             tag=data["tag"],
             summary=data.get("summary", ""),
             description=data.get("description", ""),
+            code_refs=data.get("code_refs", []),
             summary_tokens=data.get("summary_tokens", 0),
             source_segment_refs=data.get("source_segment_refs", []),
             source_turn_numbers=data.get("source_turn_numbers", []),
@@ -690,6 +694,7 @@ class FilesystemStore(ContextStore):
                     "timestamp": _dt_to_str(e.timestamp),
                     "session_date": e.session_date,
                     "sender": e.sender,
+                    "code_refs": list(getattr(e, "code_refs", []) or []),
                 }
                 for e in state.turn_tag_entries
             ],
@@ -722,6 +727,7 @@ class FilesystemStore(ContextStore):
                 timestamp=_str_to_dt(e["timestamp"]),
                 session_date=e.get("session_date", ""),
                 sender=e.get("sender", ""),
+                code_refs=e.get("code_refs", []) or [],
             )
             for e in data.get("turn_tag_entries", [])
         ]

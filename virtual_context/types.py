@@ -233,6 +233,7 @@ class TagResult:
     temporal: bool = False  # True when query references a time position ("first thing", "early on")
     related_tags: list[str] = field(default_factory=list)  # semantic alternates for query expansion
     fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
+    code_refs: list[dict] = field(default_factory=list)  # code artifacts materially discussed in the turn
     query_embedding: list[float] | None = None
 
 
@@ -295,6 +296,7 @@ class TurnTagEntry:
     session_date: str = ""         # e.g. "2023/05/25 (Thu) 10:04" or ISO timestamp
     fact_signals: list[FactSignal] = field(default_factory=list)  # D1: per-turn fact signals
     sender: str = ""                # sender identity from envelope metadata
+    code_refs: list[dict] = field(default_factory=list)  # code artifacts carried into compaction
 
 
 @dataclass
@@ -458,6 +460,7 @@ class SegmentMetadata:
     key_decisions: list[str] = field(default_factory=list)
     action_items: list[str] = field(default_factory=list)
     date_references: list[str] = field(default_factory=list)
+    code_refs: list[dict] = field(default_factory=list)
     turn_count: int = 0
     time_span: tuple[datetime, datetime] | None = None
     session_date: str = ""         # propagated from constituent turns
@@ -564,6 +567,7 @@ class TagSummary:
     summary_tokens: int = 0
     source_segment_refs: list[str] = field(default_factory=list)
     source_turn_numbers: list[int] = field(default_factory=list)
+    code_refs: list[dict] = field(default_factory=list)
     covers_through_turn: int = -1  # highest turn number covered; -1 = never built
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
