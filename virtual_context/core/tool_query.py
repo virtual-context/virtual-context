@@ -119,15 +119,16 @@ class ToolQueryRunner:
         # Convert tool definitions to provider format
         converted_tools = adapter.convert_tool_defs(all_tools) if all_tools else None
 
-        # Wrap VC context in <system-reminder> so inject_context can
-        # find-and-replace on reassembly instead of stacking.
-        wrapped_system = f"<system-reminder>\n{system}\n</system-reminder>" if system else ""
+        # Keep the caller's system prompt byte-stable. Anthropic-specific VC
+        # reassembly appends its own trailing <system-reminder> block via
+        # adapter.inject_context(); wrapping the whole system here would make
+        # the entire system mutable and destroy the stable cache prefix.
 
         # Build provider-specific request body
         body = adapter.build_request_body(
             model=model,
             messages=messages,
-            system=wrapped_system,
+            system=system,
             max_tokens=max_tokens,
             temperature=temperature,
             tools=converted_tools,

@@ -31,6 +31,7 @@ from virtual_context.core.tool_loop import (
     run_tool_loop,
     vc_tool_definitions,
 )
+from virtual_context.core.tool_query import ToolQueryRunner
 
 
 # ---------------------------------------------------------------------------
@@ -1290,15 +1291,18 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "NEW expanded text")
-        assert "<system-reminder>\nNEW expanded text\n</system-reminder>" in body["system"]
-        assert "old summaries" not in body["system"]
-        assert "Be helpful." in body["system"]
+        assert isinstance(body["system"], list)
+        assert body["system"][0]["text"] == "Be helpful."
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert body["system"][1]["text"] == "<system-reminder>\nNEW expanded text\n</system-reminder>"
 
     def test_no_existing_block_prepends(self):
         body = {"system": "Be helpful.", "messages": []}
         self.adapter.inject_context(body, "injected text")
-        assert body["system"].startswith("<system-reminder>\ninjected text\n</system-reminder>")
-        assert "Be helpful." in body["system"]
+        assert isinstance(body["system"], list)
+        assert body["system"][0]["text"] == "Be helpful."
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert body["system"][1]["text"] == "<system-reminder>\ninjected text\n</system-reminder>"
 
     def test_empty_system_sets_block(self):
         body = {"system": "", "messages": []}
@@ -1314,8 +1318,9 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "new content")
-        assert "<system-reminder>\nnew content\n</system-reminder>" in body["system"][0]["text"]
-        assert "old" not in body["system"][0]["text"]
+        assert body["system"][0]["text"] == "Other instructions"
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert body["system"][1]["text"] == "<system-reminder>\nnew content\n</system-reminder>"
 
     def test_list_system_no_existing_inserts(self):
         body = {
@@ -1323,8 +1328,9 @@ class TestAnthropicAdapterInjectContext:
             "messages": [],
         }
         self.adapter.inject_context(body, "new content")
-        assert body["system"][0]["text"] == "<system-reminder>\nnew content\n</system-reminder>"
-        assert body["system"][1]["text"] == "Other instructions"
+        assert body["system"][0]["text"] == "Other instructions"
+        assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert body["system"][1]["text"] == "<system-reminder>\nnew content\n</system-reminder>"
 
     def test_no_system_key(self):
         body = {"messages": []}
@@ -1453,8 +1459,10 @@ class TestToolLoopInjectsReassembledContext:
         # Verify the captured continuation request has updated context
         assert len(result.raw_requests) == 1
         sent_system = result.raw_requests[0]["system"]
-        assert "EXPANDED full DB conversation" in sent_system
-        assert "summary only" not in sent_system
+        assert isinstance(sent_system, list)
+        assert sent_system[0]["text"] == "Be helpful."
+        assert sent_system[0]["cache_control"] == {"type": "ephemeral"}
+        assert sent_system[1]["text"] == "<system-reminder>\nEXPANDED full DB conversation\n</system-reminder>"
 
     def test_openai_continuation_has_updated_context(self):
         """OpenAI path: system message in messages[0] is updated."""
@@ -1526,3 +1534,34 @@ class TestToolLoopInjectsReassembledContext:
 
         sent_system = result.raw_requests[0]["system"]
         assert sent_system == "original system"
+
+
+class TestToolQueryRunnerAnthropicCaching:
+    def test_initial_request_preserves_stable_system_prefix(self):
+        engine = MagicMock()
+        engine._engine_state.flushed_through = 0
+
+        config = MagicMock()
+        config.paging.enabled = False
+        config.paging.max_tool_loops = 2
+
+        runner = ToolQueryRunner(engine=engine, config=config)
+        response = _make_response([{"type": "text", "text": "done"}])
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = _MockHTTPResponse(response)
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = runner.query_with_tools(
+                messages=[{"role": "user", "content": "hi"}],
+                model="claude-sonnet-4-5-20250929",
+                system="Be helpful.",
+                max_tokens=1024,
+                api_key="test-key",
+                provider="anthropic",
+            )
+
+        assert result.raw_requests[0]["system"] == "Be helpful."

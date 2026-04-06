@@ -1072,6 +1072,8 @@ class PayloadFormat(ABC):
 class AnthropicFormat(PayloadFormat):
     """Anthropic Messages API format."""
 
+    _CACHE_BREAKPOINT = {"type": "ephemeral"}
+
     @property
     def name(self) -> str:
         return "anthropic"
@@ -1313,28 +1315,51 @@ class AnthropicFormat(PayloadFormat):
         if not prepend_text:
             return body
         body = copy.deepcopy(body)
-        context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
+        context_text = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
         # Append to the last user message.  We append (not prepend) so that
         # tool_result blocks stay at the front of the content list — Anthropic
         # requires tool_result to immediately follow the preceding tool_use.
-        # Appending also maximises prompt-cache hits: the entire conversation
-        # prefix up to this point stays byte-identical between turns, and only
-        # the VC context block (which changes every turn) sits at the very end.
+        # Anthropic prompt caching works best when the last stable block is the
+        # explicit cache breakpoint, and the mutable VC reminder is isolated as
+        # the trailing suffix after that breakpoint.
         messages = body.get("messages", [])
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
+            context_block = {"type": "text", "text": context_text}
             if isinstance(content, str):
                 messages[i] = dict(msg)
-                messages[i]["content"] = f"{content}\n\n{context_block}"
+                if content:
+                    messages[i]["content"] = [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": dict(self._CACHE_BREAKPOINT),
+                        },
+                        context_block,
+                    ]
+                else:
+                    messages[i]["content"] = [context_block]
             elif isinstance(content, list):
                 messages[i] = dict(msg)
-                messages[i]["content"] = list(content) + [{"type": "text", "text": context_block}]
+                blocks = list(content)
+                for j in range(len(blocks) - 1, -1, -1):
+                    block = blocks[j]
+                    if isinstance(block, dict):
+                        updated = dict(block)
+                        updated["cache_control"] = dict(self._CACHE_BREAKPOINT)
+                        blocks[j] = updated
+                        break
+                blocks.append(context_block)
+                messages[i]["content"] = blocks
             break
         else:
-            messages.append({"role": "user", "content": context_block})
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": context_text}],
+            })
         body["messages"] = messages
         return body
 
