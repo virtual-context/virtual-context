@@ -23,7 +23,7 @@ from ..types import (
     TemporalStatus,
     get_sender_name,
 )
-from .llm_utils import normalize_tag, parse_llm_json
+from .llm_utils import format_code_ref, normalize_code_refs, normalize_tag, parse_llm_json
 from .telemetry import TelemetryLedger
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,35 @@ Respond with JSON:
   "entities": ["..."],
   "key_decisions": ["..."],
   "action_items": ["..."]
+}}"""
+
+
+CODE_TAG_SUMMARY_ROLLUP_PROMPT = """\
+You are rolling up engineering context for the tag "{tag}" from {count} segment summaries.
+Preserve codebase state, architecture decisions, deployments, regressions, rejected approaches,
+and open work. Compress investigative narration unless it led to a concrete finding.
+
+Merge rules:
+- Preserve chronology when the same artifact changed more than once.
+- Deduplicate repeated findings across segments.
+- Keep the final state of files, functions, services, and config values explicit.
+- Prefer a stable verb vocabulary when it fits: changed/modified, has bug/broken, fixed,
+  added/created, removed/deleted, deployed, reverted.
+- Carry forward concrete code references into a deduplicated "code_refs" list.
+
+Target length: {target_tokens} tokens or fewer.
+
+Segment summaries:
+{segment_summaries}
+
+Respond with JSON:
+{{
+  "summary": "...",
+  "description": "concise topic paragraph, max 80 words",
+  "entities": ["..."],
+  "key_decisions": ["..."],
+  "action_items": ["..."],
+  "code_refs": [{{"file": "...", "line": 123, "symbol": "..."}}]
 }}"""
 
 
@@ -179,14 +208,97 @@ If two signals describe the same event, emit one fact with the richest details.
 Include "facts" in the JSON response.
 Only extract facts with genuine substance. Skip greetings and filler."""
 
-CODE_MODE_FACT_PROMPT = """
+
+CODE_SUMMARY_PROMPT = """\
+SESSION DATE: {session_date}
+
+Summarize the following engineering conversation segment (tags: {tags}).
+
+Preserve:
+- What changed in the codebase: files, functions, classes, config keys, schemas, services
+- Why it changed: bug, feature request, deployment need, or explicit user decision
+- What was tried and rejected when it explains the final design
+- Current state: what works now, what is still broken, what is deployed vs local only
+- Open items: TODOs, deferred decisions, known follow-up fixes
+
+Suppress:
+- Emotional texture and conversational filler
+- Investigation steps like reading files, grepping, or running commands unless they produced a finding
+- Assistant-centered narration; capture the resulting artifact state instead
+
+CRITICAL:
+- Preserve all numbers exactly: dates, ports, durations, prices, versions, token counts
+- Preserve file paths, symbols, config keys, env vars, and endpoint names verbatim
+
+Extract facts about the resulting codebase state and the user's decisions.
+Good subjects are files, functions, services, config keys, or "User" for explicit preferences/decisions.
+Never use "Assistant" as a subject.
+Prefer a stable verb vocabulary when it fits:
+- changed / modified
+- has bug / broken
+- fixed
+- added / created
+- removed / deleted
+- deployed
+- reverted
+
+Also extract "code_refs": a deduplicated list of the files/functions/classes materially discussed or changed.
+Each ref should be an object like {{"file": "path/to/file.py", "line": 123, "symbol": "function_name"}}.
+Use the best available file path even if line/symbol is unknown.
+
+The summary should be {target_tokens} tokens or fewer.
+
+Conversation:
+{conversation_text}
+
+Respond with JSON:
+{{
+  "summary": "...",
+  "entities": ["..."],
+  "key_decisions": ["..."],
+  "action_items": ["..."],
+  "date_references": ["..."],
+  "refined_tags": ["tag1", "tag2"],
+  "related_tags": ["alternate-term1", "alternate-term2"],
+  "facts": [{{"subject": "...", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "..."}}],
+  "code_refs": [{{"file": "...", "line": 123, "symbol": "..."}}]
+}}
+
+Only output valid JSON."""
+
+CODE_FACT_EXTRACTION_PROMPT = """
 
 CODING CONVERSATION MODE:
 - Do NOT extract intermediary/investigative actions (e.g. "Assistant ran the tests", "Assistant checked the file").
 - DO extract: conclusions, findings, discoveries, decisions made, user preferences, configuration values, deployment details, architectural choices, bugs found and their fixes, tool/library choices.
 - DO extract: what was built, fixed, changed, or implemented as a result of the conversation. Frame these as facts about the THING, not about the assistant. E.g. "Facts endpoint now supports date_created sorting" not "Assistant added sorting to the endpoint".
 - DO extract: facts about the user's projects, infrastructure, workflows, and environment.
-- The subject for findings should be the THING, not "Assistant" — e.g. "Deploy target is Linode at 45.33.74.201" not "Assistant deployed to Linode"."""
+- The subject for findings should be the THING, not "Assistant" — e.g. "Deploy target is Linode at 45.33.74.201" not "Assistant deployed to Linode".
+- Prefer these verbs when they fit the actual event: changed/modified, has bug/broken, fixed, added/created, removed/deleted, deployed, reverted.
+- Also emit "code_refs": a deduplicated list of concrete file/function/class refs that were materially discussed or changed.
+  Each item should look like {"file": "path/to/file.py", "line": 123, "symbol": "function_name"}.
+  Use line/symbol only when the conversation provides them confidently.
+  Never emit more than 12 refs."""
+
+CODE_MODE_FACT_PROMPT = CODE_FACT_EXTRACTION_PROMPT
+
+def _collect_code_refs(*groups: object, max_refs: int = 12) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[tuple[str, int | None, str]] = set()
+    for group in groups:
+        for ref in normalize_code_refs(group, max_refs=max_refs):
+            key = (
+                ref.get("file", ""),
+                ref.get("line") if isinstance(ref.get("line"), int) else None,
+                ref.get("symbol", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+            if len(merged) >= max_refs:
+                return merged
+    return merged
 
 
 class DomainCompactor:
@@ -213,6 +325,7 @@ class DomainCompactor:
         self,
         segments: list[TaggedSegment],
         fact_signals_by_segment: dict[str, list[FactSignal]] | None = None,
+        code_refs_by_segment: dict[str, list[dict]] | None = None,
         progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
         """Summarize each segment independently.
@@ -225,6 +338,7 @@ class DomainCompactor:
         prompt for verification and consolidation.
         """
         signals = fact_signals_by_segment or {}
+        code_refs = code_refs_by_segment or {}
         import sys as _sys
         import time as _time
         from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -285,7 +399,12 @@ class DomainCompactor:
             _emit_progress(0, None, in_flight=len(segments))
             results: list[CompactionResult] = []
             for idx, segment in enumerate(segments, start=1):
-                result = self._compact_one(segment, signals.get(segment.id, []), prev_context=prev_contexts[idx - 1])
+                result = self._compact_one(
+                    segment,
+                    signals.get(segment.id, []),
+                    code_refs.get(segment.id, []),
+                    prev_context=prev_contexts[idx - 1],
+                )
                 results.append(result)
                 _emit_progress(idx, result, in_flight=max(len(segments) - idx, 0))
             return results
@@ -298,8 +417,13 @@ class DomainCompactor:
         heartbeat_interval_s = 2.0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             pending = {
-                executor.submit(self._compact_one, segment, signals.get(segment.id, []),
-                                prev_context=prev_contexts[i]): i
+                executor.submit(
+                    self._compact_one,
+                    segment,
+                    signals.get(segment.id, []),
+                    code_refs.get(segment.id, []),
+                    prev_context=prev_contexts[i],
+                ): i
                 for i, segment in enumerate(segments)
             }
             _emit_progress(0, None, in_flight=len(pending))
@@ -351,7 +475,10 @@ class DomainCompactor:
         return results
 
     def _compact_one(
-        self, segment: TaggedSegment, fact_signals: list[FactSignal] | None = None,
+        self,
+        segment: TaggedSegment,
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
         prev_context: str = "",
     ) -> CompactionResult:
         conversation_text = self._format_conversation(segment.messages)
@@ -391,6 +518,15 @@ class DomainCompactor:
                     + "\n".join(hint_lines)
                 )
 
+        refs_text = ""
+        normalized_refs = normalize_code_refs(code_refs)
+        if normalized_refs:
+            ref_lines = [f"- {format_code_ref(ref)}" for ref in normalized_refs]
+            refs_text = (
+                "\n\nPer-turn code references (use only if they genuinely apply to this segment):\n"
+                + "\n".join(ref_lines)
+            )
+
         # Previous segment context for pronoun resolution — XML-tagged
         # to structurally separate it from the segment to summarize.
         context_block = ""
@@ -422,15 +558,23 @@ class DomainCompactor:
                 f"Target length: {target_tokens} tokens or fewer.\n\n"
                 f"{context_block}"
                 f"{conv_block}"
-                f"{signals_text}\n\n"
+                f"{signals_text}"
+                f"{refs_text}\n\n"
                 'Respond with JSON: {{"summary": "...", "entities": ["..."], '
                 '"key_decisions": ["..."], "action_items": ["..."], '
                 '"date_references": ["..."], "refined_tags": ["tag1", "tag2"], '
-                '"facts": [...]}}'
+                '"facts": [...], "code_refs": [...]}}'
             )
+            if getattr(self.config, "code_mode", False):
+                prompt += CODE_FACT_EXTRACTION_PROMPT
         else:
             tags_str = ", ".join(segment.tags) if segment.tags else segment.primary_tag
-            prompt = DEFAULT_SUMMARY_PROMPT.format(
+            prompt_template = (
+                CODE_SUMMARY_PROMPT
+                if getattr(self.config, "code_mode", False)
+                else DEFAULT_SUMMARY_PROMPT
+            )
+            prompt = prompt_template.format(
                 tags=tags_str,
                 target_tokens=target_tokens,
                 conversation_text=context_block + conv_block,
@@ -438,9 +582,10 @@ class DomainCompactor:
             )
             if signals_text:
                 prompt += signals_text
-
-        if getattr(self.config, "code_mode", False):
-            prompt += CODE_MODE_FACT_PROMPT
+            if refs_text:
+                prompt += refs_text
+            if getattr(self.config, "code_mode", False):
+                prompt += CODE_FACT_EXTRACTION_PROMPT
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
@@ -494,11 +639,14 @@ class DomainCompactor:
             all_tags.update(self._normalize_tag_list(related_tags))
         refined_tags = sorted(all_tags)
 
+        parsed_code_refs = _collect_code_refs(parsed.get("code_refs"), normalized_refs)
+
         metadata = SegmentMetadata(
             entities=parsed.get("entities", []),
             key_decisions=parsed.get("key_decisions", []),
             action_items=parsed.get("action_items", []),
             date_references=parsed.get("date_references", []),
+            code_refs=parsed_code_refs,
             turn_count=segment.turn_count,
             time_span=(segment.start_timestamp, segment.end_timestamp),
             session_date=segment.session_date,
@@ -706,6 +854,7 @@ class DomainCompactor:
                     "action_items": [],
                     "date_references": [],
                     "refined_tags": [],
+                    "code_refs": [],
                 }
         return {
             "summary": text,
@@ -714,6 +863,7 @@ class DomainCompactor:
             "action_items": [],
             "date_references": [],
             "refined_tags": [],
+            "code_refs": [],
         }
 
     def compact_tag_summaries(
@@ -804,6 +954,9 @@ class DomainCompactor:
                         summary_tokens=self.token_counter(fallback_text),
                         source_segment_refs=[s.ref for s in summaries],
                         source_turn_numbers=sorted(set(tag_to_turns.get(tag, []))),
+                        code_refs=_collect_code_refs(
+                            *[getattr(s.metadata, "code_refs", []) for s in summaries]
+                        ),
                         covers_through_turn=max_turn,
                     )
 
@@ -819,7 +972,15 @@ class DomainCompactor:
         max_turn: int,
     ) -> TagSummary:
         combined = "\n\n---\n\n".join(
-            f"[Segment {s.ref}, tags: {', '.join(s.tags)}]\n{s.summary}"
+            (
+                f"[Segment {s.ref}, tags: {', '.join(s.tags)}]\n"
+                f"{s.summary}"
+                + (
+                    "\nRefs: " + ", ".join(format_code_ref(ref) for ref in s.metadata.code_refs)
+                    if getattr(s.metadata, "code_refs", None)
+                    else ""
+                )
+            )
             for s in summaries
         )
         combined_tokens = self.token_counter(combined)
@@ -828,7 +989,12 @@ class DomainCompactor:
             min(self.config.max_summary_tokens, int(combined_tokens * self.config.summary_ratio)),
         )
 
-        prompt = TAG_SUMMARY_ROLLUP_PROMPT.format(
+        prompt_template = (
+            CODE_TAG_SUMMARY_ROLLUP_PROMPT
+            if getattr(self.config, "code_mode", False)
+            else TAG_SUMMARY_ROLLUP_PROMPT
+        )
+        prompt = prompt_template.format(
             tag=tag,
             count=len(summaries),
             target_tokens=target_tokens,
@@ -856,6 +1022,10 @@ class DomainCompactor:
 
         summary_text = parsed.get("summary", "")
         description = parsed.get("description", "")
+        code_refs = _collect_code_refs(
+            parsed.get("code_refs"),
+            *[getattr(s.metadata, "code_refs", []) for s in summaries],
+        )
         return TagSummary(
             tag=tag,
             summary=summary_text,
@@ -863,5 +1033,6 @@ class DomainCompactor:
             summary_tokens=self.token_counter(summary_text),
             source_segment_refs=[s.ref for s in summaries],
             source_turn_numbers=sorted(set(turn_numbers)),
+            code_refs=code_refs,
             covers_through_turn=max_turn,
         )

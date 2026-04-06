@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     tag TEXT NOT NULL,
     conversation_id TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    code_refs TEXT NOT NULL DEFAULT '[]',
     summary_tokens INTEGER NOT NULL DEFAULT 0,
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
@@ -239,6 +241,7 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
             key_decisions=metadata_raw.get("key_decisions", []),
             action_items=metadata_raw.get("action_items", []),
             date_references=metadata_raw.get("date_references", []),
+            code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
             session_date=metadata_raw.get("session_date", ""),
         ),
@@ -264,6 +267,7 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
             key_decisions=metadata_raw.get("key_decisions", []),
             action_items=metadata_raw.get("action_items", []),
             date_references=metadata_raw.get("date_references", []),
+            code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
             session_date=metadata_raw.get("session_date", ""),
         ),
@@ -340,6 +344,10 @@ class SQLiteStore(ContextStore):
         # Migrations: add columns that didn't exist in earlier schema versions
         try:
             conn.execute("ALTER TABLE tag_summaries ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE tag_summaries ADD COLUMN code_refs TEXT NOT NULL DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass  # Column already exists
         try:
@@ -574,6 +582,7 @@ class SQLiteStore(ContextStore):
                     conversation_id TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
+                    code_refs TEXT NOT NULL DEFAULT '[]',
                     summary_tokens INTEGER NOT NULL DEFAULT 0,
                     source_segment_refs TEXT NOT NULL DEFAULT '[]',
                     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
@@ -583,10 +592,10 @@ class SQLiteStore(ContextStore):
                     PRIMARY KEY (tag, conversation_id)
                 );
                 INSERT OR IGNORE INTO tag_summaries_new
-                    (tag, conversation_id, summary, description, summary_tokens,
+                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
                      source_segment_refs, source_turn_numbers, covers_through_turn,
                      created_at, updated_at)
-                SELECT tag, '', summary, description, summary_tokens,
+                SELECT tag, '', summary, description, '[]', summary_tokens,
                        source_segment_refs, source_turn_numbers, covers_through_turn,
                        created_at, updated_at
                 FROM tag_summaries;
@@ -808,6 +817,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "key_decisions": segment.metadata.key_decisions,
             "action_items": segment.metadata.action_items,
             "date_references": segment.metadata.date_references,
+            "code_refs": getattr(segment.metadata, "code_refs", []),
             "turn_count": segment.metadata.turn_count,
         }
         if segment.metadata.session_date:
@@ -1392,14 +1402,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO tag_summaries
-            (tag, conversation_id, summary, description, summary_tokens, source_segment_refs,
+            (tag, conversation_id, summary, description, code_refs, summary_tokens, source_segment_refs,
              source_turn_numbers, covers_through_turn, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 tag_summary.tag,
                 conversation_id,
                 tag_summary.summary,
                 tag_summary.description,
+                json.dumps(getattr(tag_summary, "code_refs", []) or []),
                 tag_summary.summary_tokens,
                 json.dumps(tag_summary.source_segment_refs),
                 json.dumps(tag_summary.source_turn_numbers),
@@ -1423,10 +1434,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
             desc = row["description"]
         except (IndexError, KeyError):
             pass
+        refs = []
+        try:
+            refs = json.loads(row["code_refs"] or "[]")
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+            pass
         return TagSummary(
             tag=row["tag"],
             summary=row["summary"],
             description=desc,
+            code_refs=refs,
             summary_tokens=row["summary_tokens"],
             source_segment_refs=json.loads(row["source_segment_refs"]),
             source_turn_numbers=json.loads(row["source_turn_numbers"]),
@@ -1453,10 +1470,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 desc = row["description"]
             except (IndexError, KeyError):
                 pass
+            refs = []
+            try:
+                refs = json.loads(row["code_refs"] or "[]")
+            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                pass
             results.append(TagSummary(
                 tag=row["tag"],
                 summary=row["summary"],
                 description=desc,
+                code_refs=refs,
                 summary_tokens=row["summary_tokens"],
                 source_segment_refs=json.loads(row["source_segment_refs"]),
                 source_turn_numbers=json.loads(row["source_turn_numbers"]),
@@ -1549,6 +1572,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                      "object": fs.object, "status": fs.status}
                     for fs in e.fact_signals
                 ] if e.fact_signals else [],
+                "code_refs": list(getattr(e, "code_refs", []) or []),
                 "sender": e.sender,
             }
             for e in state.turn_tag_entries
@@ -1654,6 +1678,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     )
                     for fs in e.get("fact_signals", [])
                 ],
+                code_refs=e.get("code_refs", []) or [],
                 sender=e.get("sender", ""),
             )
             for e in entries_raw

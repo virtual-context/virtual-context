@@ -63,3 +63,83 @@ def normalize_tag(tag: str) -> str:
     tag = re.sub(r"[^a-z0-9-]", "-", tag)
     tag = re.sub(r"-+", "-", tag).strip("-")
     return tag
+
+
+def normalize_code_refs(
+    raw_refs: object,
+    *,
+    max_refs: int = 12,
+    max_file_len: int = 256,
+    max_symbol_len: int = 128,
+) -> list[dict]:
+    """Normalize LLM-emitted code references into a stable, compact shape.
+
+    Accepted input items are dict-like objects with a required ``file`` or
+    ``path`` key and optional ``line`` and ``symbol``/``name``/``function``/
+    ``class`` fields. Invalid items are dropped, refs are deduplicated, and the
+    final list is capped to keep prompt bloat under control.
+    """
+    if not isinstance(raw_refs, list):
+        return []
+
+    normalized: list[dict] = []
+    seen: set[tuple[str, int | None, str]] = set()
+
+    for item in raw_refs:
+        if not isinstance(item, dict):
+            continue
+
+        file_ref = item.get("file") or item.get("path")
+        if not isinstance(file_ref, str):
+            continue
+        file_ref = file_ref.strip()
+        if not file_ref:
+            continue
+        file_ref = file_ref[:max_file_len]
+
+        line_value = item.get("line")
+        line: int | None = None
+        if isinstance(line_value, int):
+            line = line_value if line_value > 0 else None
+        elif isinstance(line_value, str):
+            stripped = line_value.strip()
+            if stripped.isdigit():
+                parsed = int(stripped)
+                line = parsed if parsed > 0 else None
+
+        symbol_value = (
+            item.get("symbol")
+            or item.get("name")
+            or item.get("function")
+            or item.get("class")
+        )
+        symbol = symbol_value.strip()[:max_symbol_len] if isinstance(symbol_value, str) else ""
+
+        dedupe_key = (file_ref, line, symbol)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        entry = {"file": file_ref}
+        if line is not None:
+            entry["line"] = line
+        if symbol:
+            entry["symbol"] = symbol
+        normalized.append(entry)
+        if len(normalized) >= max_refs:
+            break
+
+    return normalized
+
+
+def format_code_ref(ref: dict) -> str:
+    """Render a normalized code-ref dict as ``file[:line] [symbol]``."""
+    file_ref = ref.get("file", "")
+    line = ref.get("line")
+    symbol = ref.get("symbol", "")
+    label = file_ref
+    if isinstance(line, int) and line > 0:
+        label = f"{label}:{line}"
+    if symbol:
+        label = f"{label} {symbol}".strip()
+    return label.strip()

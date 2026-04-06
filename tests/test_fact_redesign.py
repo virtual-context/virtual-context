@@ -61,9 +61,56 @@ def test_compaction_uses_replace_facts_for_segment():
 
 def test_code_mode_prompt_appended():
     """When code_mode is True, the compactor prompt should include the code mode block."""
-    from virtual_context.core.compactor import CODE_MODE_FACT_PROMPT
-    assert "Do NOT extract intermediary" in CODE_MODE_FACT_PROMPT
-    assert "conclusions, findings, discoveries" in CODE_MODE_FACT_PROMPT
+    from virtual_context.core.compactor import (
+        CODE_FACT_EXTRACTION_PROMPT,
+        CODE_SUMMARY_PROMPT,
+        CODE_TAG_SUMMARY_ROLLUP_PROMPT,
+    )
+    assert "Do NOT extract intermediary" in CODE_FACT_EXTRACTION_PROMPT
+    assert "conclusions, findings, discoveries" in CODE_FACT_EXTRACTION_PROMPT
+    assert "engineering conversation segment" in CODE_SUMMARY_PROMPT
+    assert '"code_refs"' in CODE_SUMMARY_PROMPT
+    assert "rolling up engineering context" in CODE_TAG_SUMMARY_ROLLUP_PROMPT
+
+
+def test_compactor_template_path_appends_code_fact_prompt():
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+
+    from virtual_context.core.compactor import CODE_FACT_EXTRACTION_PROMPT, DomainCompactor
+    from virtual_context.types import Message, TaggedSegment
+
+    captured: dict[str, str] = {}
+
+    llm = MagicMock()
+
+    def _complete(*, system, user, max_tokens):
+        captured["user"] = user
+        return ('{"summary":"ok","entities":[],"key_decisions":[],"action_items":[],"date_references":[],"refined_tags":[],"code_refs":[]}', {})
+
+    llm.complete.side_effect = _complete
+
+    compactor = DomainCompactor(
+        llm_provider=llm,
+        config=CompactorConfig(code_mode=True),
+    )
+
+    seg = TaggedSegment(
+        primary_tag="backend",
+        tags=["backend"],
+        messages=[
+            Message(role="user", content="We changed the request cache boundary in formats.py."),
+            Message(role="assistant", content="It now sits above the mutable VC injection block."),
+        ],
+        token_count=40,
+        start_timestamp=datetime.now(timezone.utc),
+        end_timestamp=datetime.now(timezone.utc),
+        turn_count=1,
+    )
+
+    compactor._compact_one(seg)
+
+    assert CODE_FACT_EXTRACTION_PROMPT.strip() in captured["user"]
 
 
 def test_tag_generator_accepts_code_mode():

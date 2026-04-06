@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from virtual_context.core.assembler import ContextAssembler
+from virtual_context.core.assembler import ContextAssembler, format_tag_section
 from virtual_context.types import (
     AssemblerConfig,
     Message,
@@ -75,6 +75,36 @@ def test_assemble_xml_tags(assembler, retrieval_result):
     assert '<virtual-context tags="court, legal"' in section
     assert "last_updated=" not in section
     assert "</virtual-context>" in section
+
+
+def test_format_tag_section_renders_code_refs():
+    now = datetime.now(timezone.utc)
+    section = format_tag_section(
+        "backend",
+        [
+            StoredSummary(
+                ref="ref-1",
+                primary_tag="backend",
+                tags=["backend"],
+                summary="Request cache boundary moved ahead of the mutable reminder.",
+                summary_tokens=18,
+                full_tokens=50,
+                metadata=SegmentMetadata(
+                    code_refs=[
+                        {"file": "virtual_context/proxy/formats.py", "line": 1312, "symbol": "inject_context"},
+                        {"file": "virtual_context/core/provider_adapters.py", "symbol": "AnthropicAdapter"},
+                    ],
+                ),
+                created_at=now,
+                start_timestamp=now,
+                end_timestamp=now,
+            ),
+        ],
+    )
+
+    assert "[refs:" in section
+    assert "virtual_context/proxy/formats.py:1312 inject_context" in section
+    assert "virtual_context/core/provider_adapters.py AnthropicAdapter" in section
 
 
 def test_trim_conversation(assembler):

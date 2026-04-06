@@ -782,6 +782,7 @@ class SessionStateProvider:
                 timestamp=ts,
                 session_date=d.get("session_date", ""),
                 fact_signals=fs,
+                code_refs=d.get("code_refs", []) or [],
             ))
 
         ws = []
@@ -834,6 +835,7 @@ class SessionStateProvider:
                      "what": getattr(fs, "what", "")}
                     for fs in (e.fact_signals or [])
                 ] if e.fact_signals else [],
+                "code_refs": list(getattr(e, "code_refs", []) or []),
             })
 
         ws = []
