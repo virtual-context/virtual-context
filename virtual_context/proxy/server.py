@@ -1576,8 +1576,17 @@ async def prepare_payload(
     _fill_stage = time.monotonic()
     if state and not _bloat_fallback:
         _fill_enabled = getattr(
-            state.engine.config.monitor, "fill_pass_enabled", True,
+            state.engine.config.monitor, "fill_pass_enabled", False,
         )
+        _defer_enabled = getattr(
+            state.engine.config.monitor, "defer_payload_mutation", False,
+        )
+        if _fill_enabled and _defer_enabled:
+            logger.warning(
+                "CONFIG CONFLICT: fill_pass_enabled=True AND defer_payload_mutation=True — "
+                "fill pass backfills released turns into the payload, breaking the cache prefix "
+                "that defer is trying to preserve. Disable fill_pass_enabled or defer_payload_mutation."
+            )
         if _fill_enabled and outbound_tokens < inbound_tokens:
             from .message_filter import fill_pass
 
