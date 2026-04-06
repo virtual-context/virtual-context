@@ -1605,6 +1605,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
             flushed_through = raw.get("flushed_through", 0)
+            flushed_through_present = "flushed_through" in raw
             last_request_time = raw.get("last_request_time", 0.0)
             tool_tag_counter = raw.get("tool_tag_counter", 0)
             last_compacted_turn = raw.get(
@@ -1629,6 +1630,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             request_captures = []
             provider = ""
             flushed_through = 0
+            flushed_through_present = False
             last_request_time = 0.0
             tool_tag_counter = 0
             last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
@@ -1669,6 +1671,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conversation_id=row["conversation_id"],
             compacted_through=row["compacted_through"],
             flushed_through=flushed_through,
+            flushed_through_present=flushed_through_present,
             last_request_time=last_request_time,
             turn_tag_entries=entries,
             turn_count=row["turn_count"],

@@ -27,6 +27,7 @@ class SessionState:
     """Serializable conversation checkpoint — what goes in Redis."""
     compacted_through: int = 0
     flushed_through: int = 0
+    flushed_through_present: bool = True
     last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
@@ -73,6 +74,7 @@ class SessionState:
         return cls(
             compacted_through=d.get("compacted_through", 0),
             flushed_through=d.get("flushed_through", 0),
+            flushed_through_present=("flushed_through" in d),
             last_request_time=d.get("last_request_time", 0.0),
             last_compacted_turn=d.get("last_compacted_turn", -1),
             last_completed_turn=d.get("last_completed_turn", -1),
@@ -795,6 +797,7 @@ class SessionStateProvider:
             conversation_id=conversation_id,
             compacted_through=state.compacted_through,
             flushed_through=state.flushed_through,
+            flushed_through_present=state.flushed_through_present,
             last_request_time=state.last_request_time,
             turn_tag_entries=entries,
             turn_count=len(entries),
@@ -845,6 +848,7 @@ class SessionStateProvider:
         return SessionState(
             compacted_through=snapshot.compacted_through,
             flushed_through=getattr(snapshot, 'flushed_through', 0),
+            flushed_through_present=getattr(snapshot, 'flushed_through_present', True),
             last_request_time=getattr(snapshot, 'last_request_time', 0.0),
             last_compacted_turn=snapshot.last_compacted_turn,
             last_completed_turn=snapshot.last_completed_turn,

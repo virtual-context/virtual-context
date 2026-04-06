@@ -368,6 +368,7 @@ class EngineStateSnapshot:
     turn_tag_entries: list[TurnTagEntry]
     turn_count: int  # len(conversation_history) // 2
     flushed_through: int = 0
+    flushed_through_present: bool = True
     last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1

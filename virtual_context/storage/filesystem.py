@@ -738,6 +738,7 @@ class FilesystemStore(ContextStore):
             conversation_id=data.get("conversation_id", data.get("session_id", "")),
             compacted_through=data.get("compacted_through", 0),
             flushed_through=data.get("flushed_through", 0),
+            flushed_through_present=("flushed_through" in data),
             last_request_time=data.get("last_request_time", 0.0),
             turn_tag_entries=entries,
             turn_count=data.get("turn_count", 0),

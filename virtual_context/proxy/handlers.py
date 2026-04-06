@@ -46,6 +46,12 @@ from .state import ProxyState
 logger = logging.getLogger(__name__)
 
 
+def _mark_request_observed(state: ProxyState | None) -> None:
+    """Refresh cache-age state after an upstream request completes."""
+    if state and not state.is_conversation_deleted():
+        state.engine._engine_state.last_request_time = time.time()
+
+
 def _extract_usage(msg_usage: dict, target: dict) -> None:
     """Extract token usage from an Anthropic message_start usage dict.
 
@@ -1449,6 +1455,7 @@ async def _handle_streaming(
 
             # Post-stream processing
             assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_stream_usage)
+            _mark_request_observed(state)
             if state and assistant_text and not state.is_conversation_deleted():
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
@@ -1456,7 +1463,6 @@ async def _handle_streaming(
                             raw_content=all_content_blocks if all_content_blocks else None),
                 )
                 state.persist_completed_turn()
-                state.engine._engine_state.last_request_time = time.time()
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
@@ -1591,6 +1597,7 @@ async def _handle_streaming(
                 )
             await upstream.aclose()
             assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
+            _mark_request_observed(state)
             if state and assistant_text and not state.is_conversation_deleted():
                 state.conversation_history.append(
                     Message(role="assistant", content=assistant_text,
@@ -1598,7 +1605,6 @@ async def _handle_streaming(
                             raw_content=np_content_blocks if np_content_blocks else None)
                 )
                 state.persist_completed_turn()
-                state.engine._engine_state.last_request_time = time.time()
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
@@ -1698,6 +1704,7 @@ async def _handle_non_streaming(
 
     # Extract and record assistant text
     assistant_text = _extract_assistant_text(response_body, api_format)
+    _mark_request_observed(state)
     if state and assistant_text and not state.is_conversation_deleted():
         state.conversation_history.append(
             Message(role="assistant", content=assistant_text,
@@ -1705,7 +1712,6 @@ async def _handle_non_streaming(
                     raw_content=_extract_assistant_raw_content(response_body, api_format))
         )
         state.persist_completed_turn()
-        state.engine._engine_state.last_request_time = time.time()
         if not passthrough:
             state.fire_turn_complete(
                 list(state.conversation_history),
@@ -1865,6 +1871,8 @@ async def _handle_vcattach(
             existing = _load(tid)
             if existing:
                 existing.compacted_through = 0
+                existing.flushed_through = 0
+                existing.last_request_time = 0.0
                 existing.last_compacted_turn = -1
                 existing.last_completed_turn = -1
                 existing.last_indexed_turn = -1
@@ -2168,6 +2176,8 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
                 existing = _load(tid)
                 if existing:
                     existing.compacted_through = 0
+                    existing.flushed_through = 0
+                    existing.last_request_time = 0.0
                     existing.last_compacted_turn = -1
                     existing.last_completed_turn = -1
                     existing.last_indexed_turn = -1

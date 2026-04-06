@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
 
-import pytest
-
+from virtual_context.engine import _restored_flushed_through
 from virtual_context.types import EngineState, EngineStateSnapshot, MonitorConfig
 from virtual_context.proxy.session_state import SessionState
 
@@ -110,6 +107,7 @@ class TestSessionStatePersistence:
         restored = SessionState.from_json(serialized)
         assert restored.compacted_through == 10
         assert restored.flushed_through == 7
+        assert restored.flushed_through_present is True
         assert restored.last_request_time == 1234567890.5
 
     def test_backward_compat_missing_fields(self):
@@ -120,8 +118,30 @@ class TestSessionStatePersistence:
         }).encode()
         restored = SessionState.from_json(old_data)
         assert restored.flushed_through == 0
+        assert restored.flushed_through_present is False
         assert restored.last_request_time == 0.0
         assert restored.compacted_through == 5
+
+    def test_zero_flush_roundtrip_stays_present(self):
+        original = SessionState(
+            compacted_through=10,
+            flushed_through=0,
+            last_request_time=123.0,
+        )
+        restored = SessionState.from_json(original.to_json())
+        assert restored.flushed_through == 0
+        assert restored.flushed_through_present is True
+
+
+class TestRestoreFlushedThrough:
+    def test_missing_field_autosyncs_to_compacted(self):
+        assert _restored_flushed_through(10, 0, present=False) == 10
+
+    def test_present_zero_is_preserved(self):
+        assert _restored_flushed_through(10, 0, present=True) == 0
+
+    def test_present_value_is_preserved(self):
+        assert _restored_flushed_through(10, 4, present=True) == 4
 
 
 # ---------------------------------------------------------------------------
