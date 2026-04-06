@@ -15,7 +15,7 @@ from ..types import (
     TagGeneratorConfig,
     TagResult,
 )
-from .llm_utils import normalize_tag, parse_llm_json
+from .llm_utils import normalize_code_refs, normalize_tag, parse_llm_json
 from .telemetry import TelemetryLedger
 from .tag_canonicalizer import TagCanonicalizer
 
@@ -266,8 +266,8 @@ class LLMTagGenerator:
         )
 
         if self._code_mode:
-            from .compactor import CODE_MODE_FACT_PROMPT
-            system += CODE_MODE_FACT_PROMPT
+            from .compactor import CODE_FACT_EXTRACTION_PROMPT
+            system += CODE_FACT_EXTRACTION_PROMPT
         self._note_breakdown(_breakdown, "build_prompt", _prompt_stage)
 
         # Disable thinking mode for models that support it (e.g. qwen3)
@@ -556,6 +556,8 @@ class LLMTagGenerator:
                         what=f.get("what", ""),
                     ))
 
+        code_refs = normalize_code_refs(data.get("code_refs"))
+
         # Update vocabulary
         for tag in tags:
             self._tag_vocabulary[tag] = self._tag_vocabulary.get(tag, 0) + 1
@@ -567,6 +569,7 @@ class LLMTagGenerator:
             temporal=temporal,
             related_tags=related_tags,
             fact_signals=fact_signals,
+            code_refs=code_refs,
         )
 
     def _normalize_tag(self, tag: str) -> str:

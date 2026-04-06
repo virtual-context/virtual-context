@@ -387,6 +387,7 @@ class TaggingPipeline:
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
                 fact_signals=tag_result.fact_signals,
+                code_refs=tag_result.code_refs,
                 sender=sender or "",
                 session_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             ))

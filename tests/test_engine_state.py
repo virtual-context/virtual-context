@@ -28,6 +28,7 @@ def _make_snapshot(
             tags=[f"tag-{i}", "common"],
             primary_tag=f"tag-{i}",
             timestamp=datetime(2026, 1, 15, 10, i, 0, tzinfo=timezone.utc),
+            code_refs=[{"file": f"src/module_{i}.py", "line": i + 1, "symbol": f"func_{i}"}],
         )
         for i in range(turn_count)
     ]
@@ -75,6 +76,7 @@ class TestEngineStateSQLite:
             assert restored.tags == orig.tags
             assert restored.primary_tag == orig.primary_tag
             assert restored.timestamp == orig.timestamp
+            assert restored.code_refs == orig.code_refs
 
     def test_load_empty_store(self, tmp_path):
         """Loading from an empty store returns None."""
@@ -131,6 +133,7 @@ class TestEngineStateFilesystem:
             assert restored.message_hash == orig.message_hash
             assert restored.tags == orig.tags
             assert restored.primary_tag == orig.primary_tag
+            assert restored.code_refs == orig.code_refs
 
     def test_load_empty_store(self, tmp_path):
         """Loading from an empty store returns None."""

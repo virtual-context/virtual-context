@@ -733,6 +733,7 @@ class VirtualContextEngine:
                 sender=entry_dict.get("sender", ""),
                 timestamp=ts,
                 fact_signals=fs or None,
+                code_refs=entry_dict.get("code_refs", []) or [],
             ))
         self._update_checkpoint_markers()
 
@@ -871,6 +872,7 @@ class VirtualContextEngine:
                 timestamp=ts,
                 session_date=entry_dict.get("session_date", ""),
                 fact_signals=fs,
+                code_refs=entry_dict.get("code_refs", []) or [],
             ))
 
         # Working set — uses DepthLevel enum, NOT PagingDepth
@@ -981,6 +983,7 @@ class VirtualContextEngine:
                          "what": getattr(fs, "what", "")}
                         for fs in (e.fact_signals or [])
                     ] if e.fact_signals else [],
+                    "code_refs": list(getattr(e, "code_refs", []) or []),
                 }
                 for e in self._turn_tag_index.entries
             ],
@@ -1123,6 +1126,7 @@ class VirtualContextEngine:
                      "status": fs.status, "fact_type": fs.fact_type, "what": fs.what}
                     for fs in (e.fact_signals or [])
                 ] if e.fact_signals else [],
+                "code_refs": list(getattr(e, "code_refs", []) or []),
             })
 
         telemetry_dict = self._telemetry.to_dict()

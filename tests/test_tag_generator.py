@@ -122,6 +122,27 @@ class TestLLMTagGenerator:
         assert generator._tag_vocabulary["auth"] == 10
         assert generator._tag_vocabulary["database"] == 5
 
+    def test_code_refs_parsed_and_normalized(self):
+        provider = MockLLMProvider(
+            response=(
+                '{"tags": ["backend"], "primary": "backend", '
+                '"code_refs": ['
+                '{"file": " server.py ", "line": "42", "symbol": "handle_request"}, '
+                '{"path": "server.py", "line": 42, "name": "handle_request"}, '
+                '{"file": "retriever.py", "class": "ContextRetriever"}'
+                ']}'
+            )
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(llm_provider=provider, config=config, code_mode=True)
+
+        result = generator.generate_tags("Patch the request path")
+
+        assert result.code_refs == [
+            {"file": "server.py", "line": 42, "symbol": "handle_request"},
+            {"file": "retriever.py", "symbol": "ContextRetriever"},
+        ]
+
     def test_select_relevant_store_tags_reuses_cached_embeddings(self):
         provider = MockLLMProvider(response='{"tags": ["database"], "primary": "database"}')
         cache_loads: list[list[str]] = []
