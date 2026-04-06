@@ -385,20 +385,13 @@ class ProxyMetrics:
             r.get("context_tokens", 0) for r in requests
         )
 
-        # Cache metrics from upstream LLM responses (cumulative)
-        total_cache_creation = sum(
-            r.get("cache_creation_input_tokens", 0) for r in responses
-        )
-        total_cache_read = sum(
-            r.get("cache_read_input_tokens", 0) for r in responses
-        )
-        total_upstream_input = sum(
-            r.get("upstream_input_tokens", 0) for r in responses
-        )
-        # Cache hit ratio: cache_read / (cache_read + cache_creation + uncached)
-        # Total input from upstream = input_tokens (which includes all three components)
-        _cache_denominator = total_upstream_input if total_upstream_input > 0 else 1
-        cache_hit_ratio = round(total_cache_read / _cache_denominator, 3) if total_upstream_input > 0 else 0.0
+        # Cache metrics: last response only (not cumulative)
+        last_resp = responses[-1] if responses else {}
+        last_cache_read = last_resp.get("cache_read_input_tokens", 0)
+        last_cache_creation = last_resp.get("cache_creation_input_tokens", 0)
+        last_upstream_input = last_resp.get("upstream_input_tokens", 0)
+        _cache_denom = last_upstream_input if last_upstream_input > 0 else 1
+        last_cache_hit_ratio = round(last_cache_read / _cache_denom, 3) if last_upstream_input > 0 else 0.0
 
         # Session efficiency: actual vs baseline input tokens
         total_actual_input = sum(
@@ -463,9 +456,10 @@ class ProxyMetrics:
             "total_actual_input": total_actual_input,
             "total_baseline_input": total_baseline_input,
             "baseline_ratio": self.BASELINE_RATIO,
-            "avg_wait_ms": round(statistics.mean(wait_values), 1) if wait_values else 0,
-            "avg_inbound_ms": round(statistics.mean(inbound_values), 1) if inbound_values else 0,
-            "avg_context_tokens": round(statistics.mean(context_values), 1) if context_values else 0,
+            "last_wait_ms": round(wait_values[-1], 1) if wait_values else 0,
+            "last_inbound_ms": round(inbound_values[-1], 1) if inbound_values else 0,
+            "last_context_tokens": round(context_values[-1], 1) if context_values else 0,
+            "last_vc_overhead_ms": round(requests[-1].get("prepare_total_ms", 0), 1) if requests else 0,
             "recent_requests": list(requests[-50:]),
             "compactions": list(compactions),
             "turn_completes": list(turn_completes[-50:]),
@@ -497,10 +491,10 @@ class ProxyMetrics:
             ],
             "compaction_progress": list(compaction_progress),
             "cache": {
-                "total_cache_creation_tokens": total_cache_creation,
-                "total_cache_read_tokens": total_cache_read,
-                "total_upstream_input_tokens": total_upstream_input,
-                "cache_hit_ratio": cache_hit_ratio,
+                "cache_read_tokens": last_cache_read,
+                "cache_creation_tokens": last_cache_creation,
+                "upstream_input_tokens": last_upstream_input,
+                "cache_hit_ratio": last_cache_hit_ratio,
             },
             "telemetry": telemetry,
             "budget_promoted": next(
