@@ -1516,11 +1516,13 @@ class VirtualContextEngine:
         payload_tokens: int | None = None,
         *,
         run_broad_split: bool = True,
+        turn_number: int | None = None,
     ) -> CompactionSignal | None:
         return self._tagging.tag_turn(
             conversation_history,
             payload_tokens,
             run_broad_split=run_broad_split,
+            turn_number=turn_number,
         )
 
     def process_broad_tag_split(

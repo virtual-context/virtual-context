@@ -31,18 +31,28 @@ from virtual_context.types import AssembledContext, EngineState, Message, SplitR
 
 
 class TestProxyState:
-    def test_wait_for_tag_noop_when_no_pending(self):
+    @staticmethod
+    def _make_engine():
         engine = MagicMock()
+        engine._turn_tag_index = TurnTagIndex()
+        engine._engine_state = EngineState()
+        engine.config.monitor.protected_recent_turns = 0
+        engine.config.conversation_id = "conv-123"
+        engine.process_broad_tag_split.return_value = None
+        return engine
+
+    def test_wait_for_tag_noop_when_no_pending(self):
+        engine = self._make_engine()
         state = ProxyState(engine)
         state.wait_for_tag()  # should not raise
 
     def test_wait_for_complete_noop_when_no_pending(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         state = ProxyState(engine)
         state.wait_for_complete()  # should not raise
 
     def test_fire_and_wait_for_tag(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         engine.tag_turn.return_value = None  # no compaction needed
         state = ProxyState(engine)
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
@@ -52,10 +62,11 @@ class TestProxyState:
             history,
             payload_tokens=None,
             run_broad_split=False,
+            turn_number=0,
         )
 
     def test_fire_and_wait_for_complete(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         engine.tag_turn.return_value = None  # no compaction needed
         state = ProxyState(engine)
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
@@ -65,10 +76,11 @@ class TestProxyState:
             history,
             payload_tokens=None,
             run_broad_split=False,
+            turn_number=0,
         )
 
     def test_wait_for_tag_does_not_block_on_deferred_split(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         engine.tag_turn.return_value = None
         release_split = threading.Event()
 
@@ -90,7 +102,7 @@ class TestProxyState:
         state._drain_background_work()
 
     def test_deferred_tag_split_emits_metrics(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         engine.tag_turn.return_value = None
         engine.process_broad_tag_split.return_value = SplitResult(
             tag="troubleshooting",
@@ -112,8 +124,9 @@ class TestProxyState:
         assert split["new_tags"] == ["api-troubleshooting", "db-troubleshooting"]
 
     def test_compaction_fires_in_background(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         signal = MagicMock()  # non-None → compaction needed
+        signal.priority = "soft"
         engine.tag_turn.return_value = signal
         engine.compact_if_needed.return_value = None
         state = ProxyState(engine)
@@ -127,8 +140,9 @@ class TestProxyState:
         assert "progress_callback" in call_args[1]
 
     def test_compaction_progress_phase_name_does_not_crash(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         signal = MagicMock()
+        signal.priority = "soft"
         engine.tag_turn.return_value = signal
         metrics = ProxyMetrics()
 
@@ -165,7 +179,7 @@ class TestProxyState:
         assert snap["status"] == "skipped"
 
     def test_error_in_tag_turn_is_caught(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         engine.tag_turn.side_effect = RuntimeError("boom")
         state = ProxyState(engine)
         history = [Message(role="user", content="hi")]
@@ -173,14 +187,79 @@ class TestProxyState:
         state.wait_for_tag()  # should not raise
 
     def test_error_in_compact_is_caught(self):
-        engine = MagicMock()
+        engine = self._make_engine()
         signal = MagicMock()
+        signal.priority = "soft"
         engine.tag_turn.return_value = signal
         engine.compact_if_needed.side_effect = RuntimeError("compact boom")
         state = ProxyState(engine)
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()  # should not raise
+
+    def test_fire_turn_complete_dedupes_same_completed_turn_while_queued(self):
+        engine = self._make_engine()
+        release = threading.Event()
+
+        def _tag_turn(*args, **kwargs):
+            release.wait(0.5)
+            return None
+
+        engine.tag_turn.side_effect = _tag_turn
+        state = ProxyState(engine)
+        history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
+
+        state.fire_turn_complete(history)
+        state.fire_turn_complete(history)
+        release.set()
+        state.wait_for_tag()
+
+        assert engine.tag_turn.call_count == 1
+
+    def test_compaction_requests_coalesce_to_latest_target(self):
+        engine = self._make_engine()
+        state = ProxyState(engine)
+        signal = MagicMock()
+        signal.priority = "soft"
+        release = threading.Event()
+        calls: list[list[Message]] = []
+
+        def _compact_if_needed(history, compaction_signal, progress_callback=None):
+            calls.append(history)
+            release.wait(0.5)
+            engine._engine_state.compacted_through = max(
+                engine._engine_state.compacted_through,
+                len(history) - (engine.config.monitor.protected_recent_turns * 2),
+            )
+            return None
+
+        engine.compact_if_needed.side_effect = _compact_if_needed
+        history_a = [
+            Message(role="user", content="u1"),
+            Message(role="assistant", content="a1"),
+            Message(role="user", content="u2"),
+            Message(role="assistant", content="a2"),
+            Message(role="user", content="u3"),
+            Message(role="assistant", content="a3"),
+        ]
+        history_b = history_a + [
+            Message(role="user", content="u4"),
+            Message(role="assistant", content="a4"),
+        ]
+        history_c = history_b + [
+            Message(role="user", content="u5"),
+            Message(role="assistant", content="a5"),
+        ]
+
+        state._queue_compaction(history_a, signal, 2)
+        state._queue_compaction(history_b, signal, 3)
+        state._queue_compaction(history_c, signal, 4)
+        release.set()
+        state.wait_for_compact()
+
+        assert engine.compact_if_needed.call_count == 2
+        assert calls[0] == history_a
+        assert calls[1] == history_c
 
 
 class TestResponseTimestamping:
@@ -243,6 +322,12 @@ def mock_engine():
     engine.on_turn_complete.return_value = None
     engine.tag_turn.return_value = None
     engine.compact_if_needed.return_value = None
+    engine.compact_manual.return_value = None
+    engine._turn_tag_index = TurnTagIndex()
+    engine._engine_state = EngineState()
+    engine.config.monitor.context_window = 200000
+    engine.config.monitor.protected_recent_turns = 6
+    engine.config.conversation_id = "conv-test"
     return engine
 
 
@@ -1053,6 +1138,7 @@ class TestCompactionConcurrencyGuard:
             engine.on_message_inbound.return_value = AssembledContext()
             engine.on_turn_complete.return_value = None
             engine.tag_turn.return_value = None
+            engine.compact_manual.return_value = None
             engine._turn_tag_index = MagicMock()
             engine._turn_tag_index.entries = []
             engine._engine_state.compacted_through = 0
