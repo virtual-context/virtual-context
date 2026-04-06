@@ -26,6 +26,8 @@ _MAX_VERSION = 2**53  # tombstone version — higher than any real save
 class SessionState:
     """Serializable conversation checkpoint — what goes in Redis."""
     compacted_through: int = 0
+    flushed_through: int = 0
+    last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
     last_indexed_turn: int = -1
@@ -45,6 +47,8 @@ class SessionState:
     def to_json(self) -> bytes:
         d = {
             "compacted_through": self.compacted_through,
+            "flushed_through": self.flushed_through,
+            "last_request_time": self.last_request_time,
             "last_compacted_turn": self.last_compacted_turn,
             "last_completed_turn": self.last_completed_turn,
             "last_indexed_turn": self.last_indexed_turn,
@@ -68,6 +72,8 @@ class SessionState:
         d = json.loads(data)
         return cls(
             compacted_through=d.get("compacted_through", 0),
+            flushed_through=d.get("flushed_through", 0),
+            last_request_time=d.get("last_request_time", 0.0),
             last_compacted_turn=d.get("last_compacted_turn", -1),
             last_completed_turn=d.get("last_completed_turn", -1),
             last_indexed_turn=d.get("last_indexed_turn", -1),
@@ -780,6 +786,8 @@ class SessionStateProvider:
         return EngineStateSnapshot(
             conversation_id=conversation_id,
             compacted_through=state.compacted_through,
+            flushed_through=state.flushed_through,
+            last_request_time=state.last_request_time,
             turn_tag_entries=entries,
             turn_count=len(entries),
             last_compacted_turn=state.last_compacted_turn,
@@ -828,6 +836,8 @@ class SessionStateProvider:
 
         return SessionState(
             compacted_through=snapshot.compacted_through,
+            flushed_through=getattr(snapshot, 'flushed_through', 0),
+            last_request_time=getattr(snapshot, 'last_request_time', 0.0),
             last_compacted_turn=snapshot.last_compacted_turn,
             last_completed_turn=snapshot.last_completed_turn,
             last_indexed_turn=snapshot.last_indexed_turn,

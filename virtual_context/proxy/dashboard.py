@@ -270,6 +270,7 @@ def register_dashboard_routes(
                             )
                         )
                         snap["compacted_through"] = engine._engine_state.compacted_through
+                        snap["flushed_through"] = engine._engine_state.flushed_through
                         snap["history_len"] = len(active_state.conversation_history)
                         snap["context_window"] = engine.config.monitor.context_window
                         snap["current_conversation_id"] = engine.config.conversation_id
@@ -520,6 +521,7 @@ def register_dashboard_routes(
                     active_state.conversation_history
                 ) // 2
                 snap["compacted_through"] = engine._engine_state.compacted_through
+                snap["flushed_through"] = engine._engine_state.flushed_through
             except Exception as e:
                 logger.error("Export error: %s", e, exc_info=True)
                 snap["_export_error"] = "Failed to export engine state"
@@ -737,6 +739,7 @@ def register_dashboard_routes(
                     "tags": report.tags,
                     "tag_summaries_built": report.tag_summaries_built,
                     "compacted_through": active_state.engine._engine_state.compacted_through,
+                    "flushed_through": active_state.engine._engine_state.flushed_through,
                 })
 
             return JSONResponse({
@@ -1096,6 +1099,7 @@ async def _replay_worker(
                     "budget": assembled.budget_breakdown,
                     "history_len": len(state.conversation_history),
                     "compacted_through": state.engine._engine_state.compacted_through,
+                    "flushed_through": state.engine._engine_state.flushed_through,
                     "wait_ms": wait_ms,
                     "inbound_ms": inbound_ms,
                     "total_turns": total_turns,

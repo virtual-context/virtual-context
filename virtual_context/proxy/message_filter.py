@@ -691,6 +691,7 @@ def drop_compacted_turns(
     *,
     fmt: PayloadFormat | None = None,
     protected_recent_turns: int = 6,
+    drop_boundary: int | None = None,
 ) -> tuple[dict, int]:
     """Drop non-tool turns outside the protected window.
 
@@ -701,6 +702,10 @@ def drop_compacted_turns(
 
     No hash matching — all non-tool history turns are dropped regardless
     of whether they match the turn tag index.
+
+    When *drop_boundary* is set, limit the drop range to
+    ``drop_boundary // 2`` turns (capped by the protected window start).
+    This allows partial flushing when ``flushed_through < compacted_through``.
 
     Returns (modified_body, drop_count).
     """
@@ -739,10 +744,15 @@ def drop_compacted_turns(
     protected = min(protected_recent_turns, total)
     protected_start = total - protected
 
+    # When drop_boundary is set, limit how many turns we drop
+    drop_limit = protected_start
+    if drop_boundary is not None:
+        drop_limit = min(drop_boundary // 2, protected_start)
+
     # Collect indices of non-tool turns outside the protected window
     drop_indices: set[int] = set()
     drop_count = 0
-    for tidx in range(protected_start):
+    for tidx in range(drop_limit):
         turn = history_turns[tidx]
         if turn.has_tool_activity:
             continue  # chain collapse handles these

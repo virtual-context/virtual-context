@@ -1571,6 +1571,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "telemetry_rollup": state.telemetry_rollup,
             "request_captures": state.request_captures,
             "provider": state.provider,
+            "flushed_through": state.flushed_through,
+            "last_request_time": state.last_request_time,
             "tool_tag_counter": state.tool_tag_counter,
             "last_compacted_turn": state.last_compacted_turn,
             "last_completed_turn": state.last_completed_turn,
@@ -1602,6 +1604,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             telemetry_rollup = raw.get("telemetry_rollup", {})
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
+            flushed_through = raw.get("flushed_through", 0)
+            last_request_time = raw.get("last_request_time", 0.0)
             tool_tag_counter = raw.get("tool_tag_counter", 0)
             last_compacted_turn = raw.get(
                 "last_compacted_turn",
@@ -1624,6 +1628,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             telemetry_rollup = {}
             request_captures = []
             provider = ""
+            flushed_through = 0
+            last_request_time = 0.0
             tool_tag_counter = 0
             last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
             last_completed_turn = max(row["turn_count"] - 1, len(entries_raw) - 1)
@@ -1662,6 +1668,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         return EngineStateSnapshot(
             conversation_id=row["conversation_id"],
             compacted_through=row["compacted_through"],
+            flushed_through=flushed_through,
+            last_request_time=last_request_time,
             turn_tag_entries=entries,
             turn_count=row["turn_count"],
             last_compacted_turn=last_compacted_turn,

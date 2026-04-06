@@ -301,6 +301,8 @@ class TurnTagEntry:
 class EngineState:
     """Mutable shared state passed to engine delegates."""
     compacted_through: int = 0
+    flushed_through: int = 0
+    last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
     last_indexed_turn: int = -1
@@ -331,8 +333,9 @@ class EngineState:
         Without *total_turns_indexed* the legacy behaviour is preserved:
         return 0 whenever ``compacted_through >= history_len``.
         """
-        if self.compacted_through < history_len:
-            return self.compacted_through
+        ct = self.compacted_through
+        if ct < history_len:
+            return ct
 
         # compacted_through >= history_len
         if total_turns_indexed is None:
@@ -345,7 +348,7 @@ class EngineState:
         # how many messages from the front should be skipped.
         history_turns = history_len // 2
         first_turn_in_history = total_turns_indexed - history_turns
-        compacted_turn = (self.compacted_through // 2)  # exclusive: turns < this are compacted
+        compacted_turn = (ct // 2)  # exclusive: turns < this are compacted
 
         if compacted_turn <= first_turn_in_history:
             # Watermark is behind the start of the history window —
@@ -364,6 +367,8 @@ class EngineStateSnapshot:
     compacted_through: int
     turn_tag_entries: list[TurnTagEntry]
     turn_count: int  # len(conversation_history) // 2
+    flushed_through: int = 0
+    last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
     last_indexed_turn: int = -1
@@ -747,6 +752,8 @@ class MonitorConfig:
     fill_pass_target: str = "soft"  # "soft", "hard", or float fraction
     fill_pass_summary_ratio: float = 0.60
     store_recovery_threshold: float = 0.70  # trigger store recovery when payload < this fraction of store turns
+    defer_payload_mutation: bool = False
+    flush_ttl_seconds: int = 300
 
 
 @dataclass

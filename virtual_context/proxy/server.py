@@ -92,6 +92,7 @@ logger = logging.getLogger(__name__)
 _PREP_BREAKDOWN_LOG_THRESHOLD_MS = 1_000.0
 _PREP_BREAKDOWN_LOG_THRESHOLD_BYTES = 1_000_000
 _PREP_BREAKDOWN_MAX_STAGES = 8
+_PROTECTED_BREAKDOWN_LOG_THRESHOLD_TOKENS = 50_000
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,57 @@ def _iso_or_none(value) -> str | None:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
+
+
+def _payload_messages(body: dict) -> list[dict]:
+    messages = body.get(
+        "messages",
+        body.get("input", body.get("contents", [])),
+    )
+    return messages if isinstance(messages, list) else []
+
+
+def _compute_protected_turn_stats(
+    body: dict,
+    fmt: PayloadFormat,
+    protected_recent_turns: int,
+) -> dict[str, object]:
+    """Return protected-turn token accounting for the final outbound body.
+
+    This must be computed from the last body mutation we actually send upstream;
+    earlier intermediate bodies can differ substantially after budget
+    enforcement, fill, bloat fallback, or active trim.
+    """
+    if protected_recent_turns <= 0:
+        return {"tokens": 0, "count": 0, "turn_tokens": []}
+
+    messages = _payload_messages(body)
+    if not messages:
+        return {"tokens": 0, "count": 0, "turn_tokens": []}
+
+    turn_groups = fmt.group_into_turns(body)
+    if not turn_groups:
+        return {"tokens": 0, "count": 0, "turn_tokens": []}
+
+    protected_groups = turn_groups[max(0, len(turn_groups) - protected_recent_turns):]
+    turn_tokens: list[int] = []
+    total_tokens = 0
+    seen_indices: set[int] = set()
+    for group in protected_groups:
+        group_total = 0
+        for idx in group.indices:
+            if idx in seen_indices or idx < 0 or idx >= len(messages):
+                continue
+            seen_indices.add(idx)
+            group_total += fmt.estimate_message_tokens(messages[idx])
+        turn_tokens.append(group_total)
+        total_tokens += group_total
+
+    return {
+        "tokens": total_tokens,
+        "count": len(protected_groups),
+        "turn_tokens": turn_tokens,
+    }
 
 
 def _selection_mode(retrieval_meta: dict) -> str:
@@ -857,6 +909,39 @@ async def prepare_payload(
             )
     _note_prep("client_truncation_check", _truncation_stage)
 
+    # ── Flush gate: decide whether to apply payload mutations this request ──
+    _warm_defer = False
+    try:
+        _has_engine = state and getattr(state, 'engine', None) is not None
+        _es = state.engine._engine_state if _has_engine else None
+        _ct = int(getattr(_es, 'compacted_through', 0) or 0)
+        _ft = int(getattr(_es, 'flushed_through', 0) or 0)
+        _defer = bool(getattr(state.engine.config.monitor if _has_engine else None, "defer_payload_mutation", False))
+        _flush_ttl = int(getattr(state.engine.config.monitor if _has_engine else None, "flush_ttl_seconds", 300) or 300)
+        _last_req = float(getattr(_es, 'last_request_time', 0.0) or 0.0)
+
+        if not _defer:
+            # 5a. Legacy auto-track: no deferral — flushed tracks compacted
+            if _has_engine and _ct > _ft:
+                state.engine._engine_state.flushed_through = _ct
+                _ft = _ct
+        else:
+            # 5b. Compute cache age
+            _cache_age = (time.time() - _last_req) if _last_req > 0 else float("inf")
+            _should_flush_cold = _cache_age >= _flush_ttl
+
+            if _should_flush_cold:
+                # 5c. Cold-cache fast path — safe to mutate
+                if _has_engine and _ct > _ft:
+                    state.engine._engine_state.flushed_through = _ct
+                    _ft = _ct
+            else:
+                # 5d. Warm-cache skip — defer payload mutations
+                _flush_pending = _ct > _ft
+                _warm_defer = _flush_pending
+    except (TypeError, ValueError, AttributeError):
+        pass  # Mocked or missing engine state — fall through with _warm_defer=False
+
     # Drop compacted non-tool turns — their content is already in VC segments
     turns_stubbed = 0  # kept for downstream metrics compatibility
     _fill_summaries = 0
@@ -865,14 +950,15 @@ async def prepare_payload(
     _recovery_turns = 0
     _drop_compacted_stage = time.monotonic()
     try:
-        if state and int(state.engine._engine_state.compacted_through) > 0:
+        if not _warm_defer and state and int(state.engine._engine_state.flushed_through) > 0:
             from .message_filter import drop_compacted_turns
             body, turns_stubbed = drop_compacted_turns(
                 body,
                 state.engine._turn_tag_index,
-                state.engine._engine_state.compacted_through,
+                state.engine._engine_state.flushed_through,
                 fmt=fmt,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                drop_boundary=state.engine._engine_state.flushed_through if _defer else None,
             )
             if turns_stubbed:
                 logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", turns_stubbed)
@@ -926,78 +1012,84 @@ async def prepare_payload(
     # Stage gate: post-compaction uses full chain collapse (stage 2),
     # pre-compaction uses position-based tool result stubbing (stage 1).
     _tool_stubs_present = False
-    if state and state.engine.config.tool_output.enabled:
-        _ct = int(state.engine._engine_state.compacted_through)
-        if _ct > 0:
-            # Stage 2: full chain collapse (post-compaction)
-            from .message_filter import collapse_turn_chains
-            _deep_ratio = getattr(
-                state.engine.config.compactor, "deep_compaction_ratio", 0.5,
-            )
-            _collapse_stage = time.monotonic()
-            body, _collapse_count, _chain_refs, _recovery_chains = collapse_turn_chains(
-                body, fmt,
-                pre_filter_body=_pre_filter_body,
-                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-                turn_tag_index=state.engine._turn_tag_index,
-                store=state.engine._store,
-                conversation_id=state.engine.config.conversation_id,
-                deep_compaction_ratio=_deep_ratio,
-                client_truncated=_client_truncated,
-                collapse_runtime_cache=getattr(state, "_chain_snapshot_cache", None),
-            )
-            _note_prep("collapse_turn_chains", _collapse_stage)
-            if _collapse_count:
-                _tool_stubs_present = True
-                logger.info("CHAIN-COLLAPSE: collapsed %d turn chains (%d chain refs)", _collapse_count, len(_chain_refs))
-            # After collapse, stub tool outputs in the protected zone if it's bloated
-            from .message_filter import stub_tool_outputs_by_position
-            _protected_stub_stage = time.monotonic()
-            body, _prot_stub_count, _prot_stub_refs = stub_tool_outputs_by_position(
-                body, fmt,
-                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-                turn_tag_index=state.engine._turn_tag_index,
-                store=state.engine._store,
-                conversation_id=state.engine.config.conversation_id,
-                protected_intrusion_threshold=0.6,
-                context_budget=state.engine.config.monitor.context_window,
-            )
-            _note_prep("protected_tool_stub", _protected_stub_stage)
-            if _prot_stub_count:
-                _tool_stubs_present = True
-                logger.info("PROTECTED-STUB: stubbed %d tool outputs in protected zone", _prot_stub_count)
-        else:
-            # Stage 1: tool result stubbing only (pre-compaction)
-            from .message_filter import stub_tool_outputs_by_position
-            _tool_stub_stage = time.monotonic()
-            body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
-                body, fmt,
-                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-                turn_tag_index=state.engine._turn_tag_index,
-                store=state.engine._store,
-                conversation_id=state.engine.config.conversation_id,
-                protected_intrusion_threshold=0.6,
-                context_budget=state.engine.config.monitor.context_window,
-            )
-            _note_prep("tool_stub_outputs", _tool_stub_stage)
-            if _stub_count:
-                _tool_stubs_present = True
-                logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
+    try:
+        if state and state.engine.config.tool_output.enabled and not _warm_defer:
+            _ct = int(state.engine._engine_state.compacted_through)
+            if _ct > 0:
+                # Stage 2: full chain collapse (post-compaction)
+                from .message_filter import collapse_turn_chains
+                _deep_ratio = getattr(
+                    state.engine.config.compactor, "deep_compaction_ratio", 0.5,
+                )
+                _collapse_stage = time.monotonic()
+                body, _collapse_count, _chain_refs, _recovery_chains = collapse_turn_chains(
+                    body, fmt,
+                    pre_filter_body=_pre_filter_body,
+                    protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                    turn_tag_index=state.engine._turn_tag_index,
+                    store=state.engine._store,
+                    conversation_id=state.engine.config.conversation_id,
+                    deep_compaction_ratio=_deep_ratio,
+                    client_truncated=_client_truncated,
+                    collapse_runtime_cache=getattr(state, "_chain_snapshot_cache", None),
+                )
+                _note_prep("collapse_turn_chains", _collapse_stage)
+                if _collapse_count:
+                    _tool_stubs_present = True
+                    logger.info("CHAIN-COLLAPSE: collapsed %d turn chains (%d chain refs)", _collapse_count, len(_chain_refs))
+                # After collapse, stub tool outputs in the protected zone if it's bloated
+                from .message_filter import stub_tool_outputs_by_position
+                _protected_stub_stage = time.monotonic()
+                body, _prot_stub_count, _prot_stub_refs = stub_tool_outputs_by_position(
+                    body, fmt,
+                    protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                    turn_tag_index=state.engine._turn_tag_index,
+                    store=state.engine._store,
+                    conversation_id=state.engine.config.conversation_id,
+                    protected_intrusion_threshold=0.6,
+                    context_budget=state.engine.config.monitor.context_window,
+                )
+                _note_prep("protected_tool_stub", _protected_stub_stage)
+                if _prot_stub_count:
+                    _tool_stubs_present = True
+                    logger.info("PROTECTED-STUB: stubbed %d tool outputs in protected zone", _prot_stub_count)
+            else:
+                # Stage 1: tool result stubbing only (pre-compaction)
+                from .message_filter import stub_tool_outputs_by_position
+                _tool_stub_stage = time.monotonic()
+                body, _stub_count, _stub_refs = stub_tool_outputs_by_position(
+                    body, fmt,
+                    protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                    turn_tag_index=state.engine._turn_tag_index,
+                    store=state.engine._store,
+                    conversation_id=state.engine.config.conversation_id,
+                    protected_intrusion_threshold=0.6,
+                    context_budget=state.engine.config.monitor.context_window,
+                )
+                _note_prep("tool_stub_outputs", _tool_stub_stage)
+                if _stub_count:
+                    _tool_stubs_present = True
+                    logger.info("TOOL-STUB: stubbed %d tool outputs outside protected window", _stub_count)
+    except (TypeError, ValueError, AttributeError):
+        pass  # Mocked or missing engine state — skip tool stubbing
 
     # Media stubbing — stub images outside protected window
-    if state and state.engine.config.tool_output.enabled:
-        from .media import stub_media_by_position
-        _media_stub_stage = time.monotonic()
-        body, _media_stubbed = stub_media_by_position(
-            body, fmt,
-            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-            protected_intrusion_threshold=0.6,
-            context_budget=state.engine.config.monitor.context_window,
-        )
-        _note_prep("media_stub", _media_stub_stage)
-        if _media_stubbed:
-            _tool_stubs_present = True
-            logger.info("MEDIA-STUB: stubbed %d images outside protected window", _media_stubbed)
+    try:
+        if state and state.engine.config.tool_output.enabled and not _warm_defer:
+            from .media import stub_media_by_position
+            _media_stub_stage = time.monotonic()
+            body, _media_stubbed = stub_media_by_position(
+                body, fmt,
+                protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                protected_intrusion_threshold=0.6,
+                context_budget=state.engine.config.monitor.context_window,
+            )
+            _note_prep("media_stub", _media_stub_stage)
+            if _media_stubbed:
+                _tool_stubs_present = True
+                logger.info("MEDIA-STUB: stubbed %d images outside protected window", _media_stubbed)
+    except (TypeError, ValueError, AttributeError):
+        pass  # Mocked or missing engine state — skip media stubbing
 
     # Drop topic-only stubs — stubs without restore refs are dead weight
     from .message_filter import drop_topic_only_stubs
@@ -1206,34 +1298,9 @@ async def prepare_payload(
                     _think_t, _think_t / _budget * 100, _budget,
                 )
 
-    # Protected zone token accounting — report to dashboard so users can
-    # see how much budget the protected recent turns consume and decide
-    # whether to dial back protected_recent_turns.
     _protected_turn_tokens = 0
     _protected_turn_count = 0
-    _protected_stage = time.monotonic()
-    if state and outbound_tokens > 0:
-        try:
-            _prt = state.engine.config.monitor.protected_recent_turns
-            _turn_groups = fmt.group_into_turns(enriched_body)
-            _prot_start = max(0, len(_turn_groups) - _prt)
-            _prot_groups = _turn_groups[_prot_start:]
-            _protected_turn_count = len(_prot_groups)
-            _msgs = enriched_body.get(
-                "messages", enriched_body.get("input", enriched_body.get("contents", []))
-            )
-            if isinstance(_msgs, list):
-                _prot_indices = set()
-                for g in _prot_groups:
-                    _prot_indices.update(g.indices)
-                _protected_turn_tokens = sum(
-                    fmt.estimate_message_tokens(_msgs[i])
-                    for i in sorted(_prot_indices)
-                    if i < len(_msgs)
-                )
-        except Exception:
-            pass
-    _note_prep("protected_turn_accounting", _protected_stage)
+    _protected_turn_sums: list[int] = []
 
     _bloat_fallback = False
 
@@ -1445,13 +1512,37 @@ async def prepare_payload(
     # Record request event
     turn = len(state.engine._turn_tag_index.entries) if state else 0
     _turn_id = uuid.uuid4().hex[:12]
+    _conversation_id = state.engine.config.conversation_id if state else ""
     _context_tokens_stage = time.monotonic()
     context_tokens = _vc_tokens if state else (fmt._count(prepend_text) if prepend_text else 0)
     _note_prep("context_token_count", _context_tokens_stage)
+    _protected_stage = time.monotonic()
+    if state and outbound_tokens > 0:
+        try:
+            _protected_stats = _compute_protected_turn_stats(
+                enriched_body,
+                fmt,
+                int(state.engine.config.monitor.protected_recent_turns),
+            )
+            _protected_turn_tokens = int(_protected_stats["tokens"])
+            _protected_turn_count = int(_protected_stats["count"])
+            _protected_turn_sums = list(_protected_stats["turn_tokens"])
+        except Exception:
+            logger.debug("protected turn accounting failed", exc_info=True)
+    _note_prep("protected_turn_accounting", _protected_stage)
+    if _protected_turn_tokens >= _PROTECTED_BREAKDOWN_LOG_THRESHOLD_TOKENS:
+        logger.info(
+            "PROTECTED_BREAKDOWN conv=%s turn=%s count=%d total=%dt turn_tokens=%s outbound=%dt",
+            _conversation_id[:12] if _conversation_id else "none",
+            turn,
+            _protected_turn_count,
+            _protected_turn_tokens,
+            _protected_turn_sums,
+            outbound_tokens,
+        )
     total_turns = turn
     _prepare_meta = _prepare_metadata()
     overhead_ms = _prepare_meta["prepare_total_ms"]
-    _conversation_id = state.engine.config.conversation_id if state else ""
     _log_prepare_breakdown(
         total_ms=overhead_ms,
         conversation_id=_conversation_id,
@@ -1471,6 +1562,7 @@ async def prepare_payload(
         "budget": assembled.budget_breakdown if assembled else {},
         "history_len": len(state.conversation_history) if state else 0,
         "compacted_through": state.engine._engine_state.compacted_through if state else 0,
+        "flushed_through": state.engine._engine_state.flushed_through if state else 0,
         "wait_ms": wait_ms,
         "inbound_ms": inbound_ms,
         "overhead_ms": overhead_ms,
