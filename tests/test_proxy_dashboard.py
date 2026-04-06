@@ -69,9 +69,9 @@ class TestProxyMetricsSnapshot:
         assert snap["type"] == "snapshot"
         assert snap["total_requests"] == 0
         assert snap["total_compactions"] == 0
-        assert snap["avg_wait_ms"] == 0
-        assert snap["avg_inbound_ms"] == 0
-        assert snap["avg_context_tokens"] == 0
+        assert snap["last_wait_ms"] == 0
+        assert snap["last_inbound_ms"] == 0
+        assert snap["last_context_tokens"] == 0
         assert snap["recent_requests"] == []
         assert snap["compactions"] == []
         # Cost savings fields
@@ -94,9 +94,9 @@ class TestProxyMetricsSnapshot:
         assert snap["total_requests"] == 2
         assert snap["total_compactions"] == 2
         assert snap["total_tokens_freed"] == 8000
-        assert snap["avg_wait_ms"] == 20.0
-        assert snap["avg_inbound_ms"] == 150.0
-        assert snap["avg_context_tokens"] == 1000.0
+        assert snap["last_wait_ms"] == 30.0
+        assert snap["last_inbound_ms"] == 200.0
+        assert snap["last_context_tokens"] == 1500.0
         assert len(snap["recent_requests"]) == 2
         assert len(snap["compactions"]) == 2
         # Cost savings

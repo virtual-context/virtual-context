@@ -1172,9 +1172,9 @@
     totalContextInjected = data.total_context_injected || 0;
     cumActualInput = data.total_actual_input || 0;
     cumBaselineInput = data.total_baseline_input || 0;
-    waitSum = (data.avg_wait_ms || 0) * totalRequests;
-    inboundSum = (data.avg_inbound_ms || 0) * totalRequests;
-    contextSum = (data.avg_context_tokens || 0) * totalRequests;
+    waitSum = (data.last_wait_ms || 0) * totalRequests;
+    inboundSum = (data.last_inbound_ms || 0) * totalRequests;
+    contextSum = (data.last_context_tokens || 0) * totalRequests;
     compactedThrough = data.compacted_through || 0;
     historyLen = data.history_len || 0;
     contextWindow = data.context_window || 120000;
