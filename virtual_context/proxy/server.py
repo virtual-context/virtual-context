@@ -1043,6 +1043,7 @@ async def prepare_payload(
 
         if not _defer:
             # 5a. Legacy auto-track: no deferral — flushed tracks compacted
+            logger.info("FLUSH_GATE: defer=False (legacy) ct=%d ft=%d", _ct, _ft)
             if _has_engine and _ct > _ft:
                 state.engine._engine_state.flushed_through = _ct
                 _ft = _ct
@@ -1053,6 +1054,10 @@ async def prepare_payload(
 
             if _should_flush_cold:
                 # 5c. Cold-cache fast path — safe to mutate
+                logger.info(
+                    "FLUSH_GATE: defer=True COLD path cache_age=%.1fs ttl=%ds ct=%d ft=%d last_req=%.1f — flushing, mutations ALLOWED",
+                    _cache_age, _flush_ttl, _ct, _ft, _last_req,
+                )
                 if _has_engine and _ct > _ft:
                     state.engine._engine_state.flushed_through = _ct
                     _ft = _ct
@@ -1060,7 +1065,12 @@ async def prepare_payload(
                 # 5d. Warm-cache skip — defer payload mutations
                 _flush_pending = _ct > _ft
                 _warm_defer = _flush_pending
-    except (TypeError, ValueError, AttributeError):
+                logger.info(
+                    "FLUSH_GATE: defer=True WARM path cache_age=%.1fs ttl=%ds ct=%d ft=%d pending=%s warm_defer=%s",
+                    _cache_age, _flush_ttl, _ct, _ft, _flush_pending, _warm_defer,
+                )
+    except (TypeError, ValueError, AttributeError) as _gate_exc:
+        logger.warning("FLUSH_GATE: exception — %s", _gate_exc)
         pass  # Mocked or missing engine state — fall through with _warm_defer=False
 
     # Drop compacted non-tool turns — their content is already in VC segments
