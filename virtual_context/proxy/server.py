@@ -1048,26 +1048,30 @@ async def prepare_payload(
                 state.engine._engine_state.flushed_through = _ct
                 _ft = _ct
         else:
-            # 5b. Compute cache age
-            _cache_age = (time.time() - _last_req) if _last_req > 0 else float("inf")
+            # 5b. Compute cache age — treat unknown (0) as warm, not cold.
+            # After restart last_request_time is 0; assume cache is still
+            # warm to avoid flushing mutations on the very first request.
+            _cache_age = (time.time() - _last_req) if _last_req > 0 else 0.0
             _should_flush_cold = _cache_age >= _flush_ttl
 
             if _should_flush_cold:
                 # 5c. Cold-cache fast path — safe to mutate
                 logger.info(
-                    "FLUSH_GATE: defer=True COLD path cache_age=%.1fs ttl=%ds ct=%d ft=%d last_req=%.1f — flushing, mutations ALLOWED",
+                    "FLUSH_GATE: defer=True COLD cache_age=%.1fs ttl=%ds ct=%d ft=%d last_req=%.1f — mutations ALLOWED",
                     _cache_age, _flush_ttl, _ct, _ft, _last_req,
                 )
                 if _has_engine and _ct > _ft:
                     state.engine._engine_state.flushed_through = _ct
                     _ft = _ct
             else:
-                # 5d. Warm-cache skip — defer payload mutations
-                _flush_pending = _ct > _ft
-                _warm_defer = _flush_pending
+                # 5d. Warm-cache — ALWAYS defer mutations regardless of
+                # whether compacted_through == flushed_through.  The pending
+                # gap only matters for deciding when to advance flushed_through,
+                # not for skipping mutations.
+                _warm_defer = True
                 logger.info(
-                    "FLUSH_GATE: defer=True WARM path cache_age=%.1fs ttl=%ds ct=%d ft=%d pending=%s warm_defer=%s",
-                    _cache_age, _flush_ttl, _ct, _ft, _flush_pending, _warm_defer,
+                    "FLUSH_GATE: defer=True WARM cache_age=%.1fs ttl=%ds ct=%d ft=%d — mutations DEFERRED",
+                    _cache_age, _flush_ttl, _ct, _ft,
                 )
     except (TypeError, ValueError, AttributeError) as _gate_exc:
         logger.warning("FLUSH_GATE: exception — %s", _gate_exc)
