@@ -114,11 +114,22 @@ def test_compactor_template_path_appends_code_fact_prompt():
 
 
 def test_tag_generator_accepts_code_mode():
-    from virtual_context.core.tag_generator import LLMTagGenerator
+    from virtual_context.core.tag_generator import (
+        CODE_TAG_GENERATOR_PROMPT_COMPACT,
+        CODE_TAG_GENERATOR_PROMPT_DETAILED,
+        CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL,
+        LLMTagGenerator,
+    )
     from virtual_context.types import TagGeneratorConfig
     from unittest.mock import MagicMock
     gen = LLMTagGenerator(llm_provider=MagicMock(), config=TagGeneratorConfig(), code_mode=True)
     assert gen._code_mode is True
+    assert "engineering and code conversations" in CODE_TAG_GENERATOR_PROMPT_DETAILED
+    assert "fact_signals" in CODE_TAG_GENERATOR_PROMPT_DETAILED
+    assert "engineering and code conversations" in CODE_TAG_GENERATOR_PROMPT_COMPACT
+    assert "fact_signals" in CODE_TAG_GENERATOR_PROMPT_COMPACT
+    assert "engineering and code conversations" in CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL
+    assert "fact_signals" in CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL
 
 
 def test_build_tag_generator_passes_code_mode():

@@ -230,7 +230,10 @@ CRITICAL:
 - Preserve all numbers exactly: dates, ports, durations, prices, versions, token counts
 - Preserve file paths, symbols, config keys, env vars, and endpoint names verbatim
 
-Extract facts about the resulting codebase state and the user's decisions.
+Extract facts from the RAW CONVERSATION TEXT above (not from your summary).
+The summary may compress or omit details — facts must capture ALL substantive
+codebase changes, decisions, and configuration values from the conversation,
+even details not included in the summary.
 Good subjects are files, functions, services, config keys, or "User" for explicit preferences/decisions.
 Never use "Assistant" as a subject.
 Prefer a stable verb vocabulary when it fits:

@@ -166,11 +166,115 @@ Return JSON only:
 No markdown fences, no extra text.
 """
 
+CODE_TAG_GENERATOR_PROMPT_DETAILED = """\
+You are a semantic tagger for engineering and code conversations. Given a piece of conversation,
+generate {min_tags}-{max_tags} short, lowercase tags that capture the concrete codebase topics.
+
+Rules:
+- Prefer tags for concrete artifacts and systems: files, functions, classes, endpoints,
+  services, caches, config keys, deployment paths, regressions, and bug domains.
+  Good examples: "anthropic-caching", "tenant-auth", "vcattach-alias", "request-counting".
+  Avoid broad process tags like "coding", "debugging", "investigation", or "brainstorming"
+  unless the process itself is the durable topic being discussed.
+- STRONGLY prefer reusing existing tags over creating new ones. Do NOT create variants
+  by appending suffixes like -fixes, -work, -debugging, -investigation, -tools, or -planning
+  when an existing tag already covers the artifact or subsystem.
+- When the text introduces a genuinely NEW code topic not covered by any existing tag,
+  create a new tag. Do NOT force-fit unrelated changes into an existing tag.
+- Set "temporal" to true only when the query references a specific time position in the
+  conversation ("the first thing we changed", "earlier in the refactor", "at the beginning").
+- Generate 2-5 related_tags: alternate technical terms someone might use later for the
+  same code area (for example "prompt-cache", "cache-breakpoint", "anthropic-cache").
+- Ignore channel metadata and request metadata formatting. Tag the engineering content only.
+- Tag the concrete subject being changed or discussed, not the conversational framing.
+  "Why is cache hit rate low?" should tag the relevant cache subsystem, not "analysis".
+- Extract "fact_signals" only for durable engineering state:
+  codebase state, bug status, config decisions, deployments, regressions, chosen approaches,
+  and rejected approaches that materially explain the final state.
+- Do NOT extract intermediary investigative actions that did not change the final state:
+  "looked at logs", "investigated", "checked", "considered", "discussed", "explored",
+  unless the conversation explicitly concluded something durable from them.
+- Frame each fact signal as a fact about the THING, not about the assistant.
+  Prefer a stable verb vocabulary when it fits: changed/modified, has bug/broken, fixed,
+  added/created, removed/deleted, deployed, reverted, uses/configured, selected/decided.
+- Extract a deduplicated "code_refs" list for the concrete artifacts mentioned:
+  file paths, functions, classes, methods, endpoints, config keys. Preserve file paths,
+  symbols, and line numbers exactly when present. Cap the list at 12 refs.
+- Return JSON only:
+  {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false,
+    "related_tags": ["alt1", "alt2"],
+    "fact_signals": [{{"subject": "thing", "verb": "changed", "object": "...", "status": "active|completed|planned|abandoned|recurring", "fact_type": "world", "what": "..."}}],
+    "code_refs": [{{"file": "path.py", "line": 123, "symbol": "function_name"}}]}}
+- No markdown fences, no extra text
+"""
+
+CODE_TAG_GENERATOR_PROMPT_COMPACT = """\
+You are a semantic tagger for engineering and code conversations. Generate {min_tags}-{max_tags}
+short, lowercase tags for the concrete codebase topics.
+
+Rules:
+- Tag concrete artifacts and systems: files, functions, services, endpoints, caches, configs,
+  deployments, regressions, bugs. Avoid generic process tags like "coding" or "debugging".
+- Reuse existing tags whenever they already cover the subsystem or artifact.
+- Set "temporal" to true only for time-positioned queries ("the first thing we changed", "earlier in the refactor").
+- Ignore channel/request metadata. Tag engineering content only.
+- Generate 2-5 related_tags as alternate technical terms for future recall.
+- Extract "fact_signals" only for durable engineering state: code changes, bug status,
+  deployments, config decisions, final chosen/rejected approaches. Do NOT emit exploratory
+  steps unless they produced a durable conclusion.
+- Frame fact signals as facts about the thing, not "Assistant". Prefer verbs like
+  changed/modified, has bug/broken, fixed, added/created, removed/deleted, deployed, reverted.
+- Extract deduplicated "code_refs" for concrete files/functions/classes/config keys, max 12.
+- Return JSON only:
+  {{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1"], "fact_signals": [...], "code_refs": [...]}}
+- No markdown fences, no extra text
+"""
+
+CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL = """\
+You are a semantic tagger for engineering and code conversations.
+
+Task:
+1. Generate {min_tags}-{max_tags} short, lowercase tags for the concrete codebase topics.
+2. Extract durable engineering fact_signals.
+3. Extract concrete code_refs.
+
+=== TAGGING RULES ===
+- Prefer concrete subsystem tags: files, functions, services, endpoints, caches, configs, bugs, deployments.
+- Reuse existing tags when possible. Do NOT create near-synonyms or generic process tags.
+- Set "temporal" to true only when the user asks about a time position in the conversation.
+- Ignore channel/request metadata. Tag engineering content only.
+
+=== FACT SIGNAL RULES ===
+- Extract only durable engineering state: what changed, what is broken, what was fixed,
+  what was added/removed, what was deployed/reverted, and what approach/config was chosen.
+- Do NOT extract investigative actions like looked at logs, explored, checked, discussed,
+  unless they produced a concrete conclusion.
+- Make each fact about the THING, not about the assistant.
+- Use stable verbs when they fit: changed, fixed, added, removed, deployed, reverted, uses, selected.
+
+=== CODE REF RULES ===
+- Extract deduplicated code_refs for files, functions, classes, methods, endpoints, config keys.
+- Preserve file paths, symbols, and line numbers exactly when present.
+- Cap code_refs at 12.
+
+=== OUTPUT ===
+Return JSON only:
+{{"tags": ["tag1", "tag2"], "primary": "tag1", "temporal": false, "related_tags": ["alt1"], "fact_signals": [{{"subject": "thing", "verb": "changed", "object": "...", "status": "active", "fact_type": "world", "what": "..."}}], "code_refs": [{{"file": "path.py", "line": 42, "symbol": "handler"}}]}}
+No markdown fences, no extra text.
+"""
+
 TAG_GENERATOR_PROMPTS = {
     "detailed": TAG_GENERATOR_PROMPT_DETAILED,
     "compact": TAG_GENERATOR_PROMPT_COMPACT,
     "small_model": TAG_GENERATOR_PROMPT_SMALL_MODEL,
     "qwen3": TAG_GENERATOR_PROMPT_SMALL_MODEL,
+}
+
+CODE_TAG_GENERATOR_PROMPTS = {
+    "detailed": CODE_TAG_GENERATOR_PROMPT_DETAILED,
+    "compact": CODE_TAG_GENERATOR_PROMPT_COMPACT,
+    "small_model": CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL,
+    "qwen3": CODE_TAG_GENERATOR_PROMPT_SMALL_MODEL,
 }
 
 
@@ -257,17 +361,19 @@ class LLMTagGenerator:
             breakdown=_breakdown,
         )
 
-        prompt_template = TAG_GENERATOR_PROMPTS.get(
-            self.config.prompt_mode, TAG_GENERATOR_PROMPT_DETAILED
+        prompt_prompts = CODE_TAG_GENERATOR_PROMPTS if self._code_mode else TAG_GENERATOR_PROMPTS
+        default_prompt = (
+            CODE_TAG_GENERATOR_PROMPT_DETAILED
+            if self._code_mode
+            else TAG_GENERATOR_PROMPT_DETAILED
+        )
+        prompt_template = prompt_prompts.get(
+            self.config.prompt_mode, default_prompt
         )
         system = prompt_template.format(
             min_tags=self.config.min_tags,
             max_tags=self.config.max_tags,
         )
-
-        if self._code_mode:
-            from .compactor import CODE_FACT_EXTRACTION_PROMPT
-            system += CODE_FACT_EXTRACTION_PROMPT
         self._note_breakdown(_breakdown, "build_prompt", _prompt_stage)
 
         # Disable thinking mode for models that support it (e.g. qwen3)
@@ -542,7 +648,9 @@ class LLMTagGenerator:
             related_tags = []
 
         # Parse fact signals (D1)
-        raw_facts = data.get("facts", [])
+        raw_facts = data.get("fact_signals")
+        if not isinstance(raw_facts, list):
+            raw_facts = data.get("facts", [])
         fact_signals: list[FactSignal] = []
         if isinstance(raw_facts, list):
             for f in raw_facts:
