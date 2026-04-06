@@ -12,6 +12,7 @@ import pytest
 
 from virtual_context.proxy.server import (
     ProxyState,
+    _compute_protected_turn_stats,
     _build_continuation_request,
     _inject_vc_tools,
     create_app,
@@ -462,6 +463,7 @@ class TestProxyStateIngestion:
         state.ingest_if_needed(pairs)
 
         engine.ingest_history.assert_called_once()
+
 
     def test_different_session_triggers_new_ingestion(self):
         engine = self._make_engine("session-1")

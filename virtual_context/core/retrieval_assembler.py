@@ -497,6 +497,7 @@ class RetrievalAssembler:
         payload = {
             "mode": paging_mode or "default",
             "compacted_through": self._engine_state.compacted_through,
+            "flushed_through": self._engine_state.flushed_through,
             "last_compacted_turn": self._engine_state.last_compacted_turn,
             "generation": self._engine_state.conversation_generation,
             "context_hint_max_tokens": self.config.assembler.context_hint_max_tokens,

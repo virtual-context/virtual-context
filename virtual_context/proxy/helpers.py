@@ -508,6 +508,7 @@ def _dump_session_state(
             "session_state": state._state.value if hasattr(state._state, "value") else str(state._state),  # type: ignore[attr-defined]
             "turn_count": len(state.conversation_history) // 2,  # type: ignore[attr-defined]
             "compacted_through": engine._engine_state.compacted_through,
+            "flushed_through": engine._engine_state.flushed_through,
             "turn_tag_index": entries,
             "tag_counts": dict(sorted(tag_counts.items(), key=lambda x: -x[1])),
             "tag_summaries": tag_summaries,

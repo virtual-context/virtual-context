@@ -1479,6 +1479,8 @@ class PostgresStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint or "",
             "request_captures": state.request_captures,
             "provider": state.provider,
+            "flushed_through": state.flushed_through,
+            "last_request_time": state.last_request_time,
             "tool_tag_counter": state.tool_tag_counter,
             "last_compacted_turn": state.last_compacted_turn,
             "last_completed_turn": state.last_completed_turn,
@@ -1504,6 +1506,8 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
+            flushed_through = 0
+            last_request_time = 0.0
         elif isinstance(raw, dict):
             entries_list = raw.get("entries", raw.get("turn_tag_entries", []))
             split_tags = set(raw.get("split_processed_tags", []))
@@ -1532,6 +1536,8 @@ class PostgresStore(ContextStore):
             fingerprint = raw.get("trailing_fingerprint", "")
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
+            flushed_through = raw.get("flushed_through", 0)
+            last_request_time = raw.get("last_request_time", 0.0)
             tool_tag_counter = raw.get("tool_tag_counter", 0)
             last_compacted_turn = raw.get(
                 "last_compacted_turn",
@@ -1576,6 +1582,8 @@ class PostgresStore(ContextStore):
         return EngineStateSnapshot(
             conversation_id=row["conversation_id"],
             compacted_through=row["compacted_through"],
+            flushed_through=flushed_through,
+            last_request_time=last_request_time,
             turn_count=row["turn_count"],
             turn_tag_entries=entries,
             last_compacted_turn=last_compacted_turn,

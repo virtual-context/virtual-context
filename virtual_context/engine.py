@@ -572,6 +572,10 @@ class VirtualContextEngine:
             return
         self.config.conversation_id = saved.conversation_id
         self._engine_state.compacted_through = saved.compacted_through
+        _ft = getattr(saved, 'flushed_through', 0)
+        # Backward compat: old snapshots lack flushed_through — auto-sync
+        self._engine_state.flushed_through = _ft if _ft > 0 else saved.compacted_through
+        self._engine_state.last_request_time = getattr(saved, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = saved.last_compacted_turn
         self._engine_state.last_completed_turn = saved.last_completed_turn
         self._engine_state.last_indexed_turn = saved.last_indexed_turn
@@ -655,6 +659,10 @@ class VirtualContextEngine:
         # Engine state — compacted_through is 0 in snapshot (history is uncompacted suffix)
         es = cached.get("engine_state", {})
         self._engine_state.compacted_through = es.get("compacted_through", 0)
+        _ft = es.get("flushed_through", 0)
+        # Backward compat: old cache entries lack flushed_through — auto-sync
+        self._engine_state.flushed_through = _ft if _ft > 0 else es.get("compacted_through", 0)
+        self._engine_state.last_request_time = es.get("last_request_time", 0.0)
         self._engine_state.last_compacted_turn = es.get(
             "last_compacted_turn",
             (self._engine_state.compacted_through // 2) - 1 if self._engine_state.compacted_through > 0 else -1,
@@ -791,6 +799,10 @@ class VirtualContextEngine:
         # Engine state markers (including tool_tag_counter for fallback continuity)
         self._engine_state.tool_tag_counter = state.tool_tag_counter
         self._engine_state.compacted_through = state.compacted_through
+        _ft = getattr(state, 'flushed_through', 0)
+        # Backward compat: old session state lacks flushed_through — auto-sync
+        self._engine_state.flushed_through = _ft if _ft > 0 else state.compacted_through
+        self._engine_state.last_request_time = getattr(state, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = state.last_compacted_turn
         self._engine_state.last_completed_turn = state.last_completed_turn
         self._engine_state.last_indexed_turn = state.last_indexed_turn
@@ -910,6 +922,8 @@ class VirtualContextEngine:
 
         return SessionState(
             compacted_through=self._engine_state.compacted_through,
+            flushed_through=self._engine_state.flushed_through,
+            last_request_time=self._engine_state.last_request_time,
             last_compacted_turn=self._engine_state.last_compacted_turn,
             last_completed_turn=self._engine_state.last_completed_turn,
             last_indexed_turn=self._engine_state.last_indexed_turn,
@@ -999,6 +1013,8 @@ class VirtualContextEngine:
             snapshot = EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
                 compacted_through=self._engine_state.compacted_through,
+                flushed_through=self._engine_state.flushed_through,
+                last_request_time=self._engine_state.last_request_time,
                 last_compacted_turn=self._engine_state.last_compacted_turn,
                 last_completed_turn=self._engine_state.last_completed_turn,
                 last_indexed_turn=self._engine_state.last_indexed_turn,
@@ -1107,6 +1123,8 @@ class VirtualContextEngine:
             "turn_tag_entries": entries,
             "engine_state": {
                 "compacted_through": self._engine_state.compacted_through,
+                "flushed_through": self._engine_state.flushed_through,
+                "last_request_time": self._engine_state.last_request_time,
                 "last_compacted_turn": self._engine_state.last_compacted_turn,
                 "last_completed_turn": self._engine_state.last_completed_turn,
                 "last_indexed_turn": self._engine_state.last_indexed_turn,
