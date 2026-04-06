@@ -145,17 +145,19 @@ class RetrievalAssembler:
         # Post-compaction: don't suppress retrieval -- stored summaries are needed
         # since raw turns have been compacted away
         _active_stage = time.monotonic()
-        if self._engine_state.compacted_through > 0:
+        _ft = self._engine_state.flushed_through
+        if _ft > 0:
             active_tags = []
         else:
             active_tags = self._get_active_tags(conversation_history)
         _note("active_tags", _active_stage)
 
-        # Compute current utilization (only count un-compacted history)
+        # Compute current utilization (only count un-flushed history)
         _snapshot_stage = time.monotonic()
         _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
         _offset = self._engine_state.history_offset(
             len(conversation_history), total_turns_indexed=_total_turns,
+            watermark=_ft,
         )
         snapshot = self._monitor.build_snapshot(
             conversation_history[_offset:]
@@ -180,7 +182,7 @@ class RetrievalAssembler:
             message=message,
             current_active_tags=active_tags,
             current_utilization=utilization,
-            post_compaction=(self._engine_state.compacted_through > 0),
+            post_compaction=(_ft > 0),
             context_turns=context,
         )
         _note("retrieve_primary", _retrieve_stage)
@@ -252,7 +254,7 @@ class RetrievalAssembler:
                     message=message,
                     current_active_tags=active_tags,
                     current_utilization=utilization,
-                    post_compaction=(self._engine_state.compacted_through > 0),
+                    post_compaction=(_ft > 0),
                     context_turns=expanded,
                 )
                 _note("retrieve_retry_general", _retry_retrieve_stage)
@@ -418,7 +420,7 @@ class RetrievalAssembler:
             getattr(self.config, "assembler", None),
             "pre_compaction_filtering", "aggressive",
         )
-        watermark = self._engine_state.compacted_through
+        watermark = self._engine_state.flushed_through
         pre_compaction = watermark == 0
 
         # Determine protection window
@@ -525,7 +527,7 @@ class RetrievalAssembler:
         """
         if not self.config.assembler.context_hint_enabled:
             return ""
-        if self._engine_state.compacted_through == 0:
+        if self._engine_state.flushed_through == 0:
             return ""
 
         # Determine paging mode

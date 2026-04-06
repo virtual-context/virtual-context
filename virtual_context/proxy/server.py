@@ -1341,6 +1341,101 @@ async def prepare_payload(
     if state:
         state._last_enriched_payload_kb = round(_outbound_bytes / 1024, 1)
 
+    # ------------------------------------------------------------------
+    # 5e. Two-pass safety valve: if warm-defer produced an oversized payload,
+    # force-flush and re-run all skipped mutations.
+    # ------------------------------------------------------------------
+    if _warm_defer and state and _has_engine:
+        _budget = int(state.engine.config.monitor.context_window)
+        _hard = float(state.engine.config.monitor.hard_threshold)
+        _size_limit = int(_budget * _hard)
+        if outbound_tokens > _size_limit:
+            logger.info(
+                "FLUSH_GATE: SAFETY VALVE — payload %dt exceeds %dt (hard=%.2f * budget=%dt). Forcing flush.",
+                outbound_tokens, _size_limit, _hard, _budget,
+            )
+            # Force flush: advance flushed_through and re-run mutations
+            state.engine._engine_state.flushed_through = state.engine._engine_state.compacted_through
+            _warm_defer = False
+
+            # Re-run drop_compacted_turns
+            try:
+                from .message_filter import drop_compacted_turns
+                enriched_body, _sv_dropped = drop_compacted_turns(
+                    enriched_body,
+                    state.engine._turn_tag_index,
+                    state.engine._engine_state.flushed_through,
+                    fmt=fmt,
+                    drop_boundary=state.engine._engine_state.flushed_through,
+                )
+                if _sv_dropped:
+                    logger.info("SAFETY-VALVE DROP-COMPACTED: removed %d turns", _sv_dropped)
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+            # Re-run tool stubbing (chain collapse + position stubbing)
+            try:
+                if state.engine.config.tool_output.enabled:
+                    _ct = int(state.engine._engine_state.compacted_through)
+                    if _ct > 0:
+                        from .message_filter import collapse_turn_chains, stub_tool_outputs_by_position
+                        _deep_ratio = getattr(state.engine.config.compactor, "deep_compaction_ratio", 0.5)
+                        enriched_body, _sv_collapse, _sv_refs, _sv_chains = collapse_turn_chains(
+                            enriched_body, fmt,
+                            pre_filter_body=_pre_filter_body,
+                            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                            turn_tag_index=state.engine._turn_tag_index,
+                            store=state.engine._store,
+                            conversation_id=state.engine.config.conversation_id,
+                            deep_compaction_ratio=_deep_ratio,
+                            client_truncated=_client_truncated,
+                        )
+                        if _sv_collapse:
+                            _tool_stubs_present = True
+                            logger.info("SAFETY-VALVE CHAIN-COLLAPSE: collapsed %d chains", _sv_collapse)
+                        enriched_body, _sv_stub, _sv_stub_refs = stub_tool_outputs_by_position(
+                            enriched_body, fmt,
+                            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                            turn_tag_index=state.engine._turn_tag_index,
+                            store=state.engine._store,
+                            conversation_id=state.engine.config.conversation_id,
+                            protected_intrusion_threshold=0.6,
+                            context_budget=state.engine.config.monitor.context_window,
+                        )
+                        if _sv_stub:
+                            _tool_stubs_present = True
+                            logger.info("SAFETY-VALVE TOOL-STUB: stubbed %d outputs", _sv_stub)
+                    else:
+                        from .message_filter import stub_tool_outputs_by_position
+                        enriched_body, _sv_stub, _sv_stub_refs = stub_tool_outputs_by_position(
+                            enriched_body, fmt,
+                            protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
+                            turn_tag_index=state.engine._turn_tag_index,
+                            store=state.engine._store,
+                            conversation_id=state.engine.config.conversation_id,
+                            protected_intrusion_threshold=0.6,
+                            context_budget=state.engine.config.monitor.context_window,
+                        )
+                        if _sv_stub:
+                            _tool_stubs_present = True
+                            logger.info("SAFETY-VALVE TOOL-STUB: stubbed %d outputs", _sv_stub)
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+            # Re-serialize to get new outbound size
+            fmt.strip_vc_markers(enriched_body)
+            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+                enriched_body,
+                serialize_stage="serialize_outbound_pass2",
+                count_stage="count_outbound_tokens_pass2",
+                cache_scope="outbound_pass2",
+            )
+            state._last_enriched_payload_kb = round(_outbound_bytes / 1024, 1)
+            logger.info(
+                "SAFETY-VALVE: payload after mutations: %dt (was %dt before)",
+                outbound_tokens, _size_limit,
+            )
+
     # 2-to-llm: exact payload sent to the LLM (after strip — byte-for-byte what goes upstream)
     if log_dir and log_prefix:
         try:
