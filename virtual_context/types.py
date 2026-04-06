@@ -316,7 +316,7 @@ class EngineState:
     last_compact_ms: float = 0.0
     last_split_result: SplitResult | None = None
 
-    def history_offset(self, history_len: int, *, total_turns_indexed: int | None = None) -> int:
+    def history_offset(self, history_len: int, *, total_turns_indexed: int | None = None, watermark: int | None = None) -> int:
         """Effective index into conversation_history for slicing past compacted messages.
 
         When *total_turns_indexed* is provided (the total number of entries in
@@ -332,8 +332,13 @@ class EngineState:
 
         Without *total_turns_indexed* the legacy behaviour is preserved:
         return 0 whenever ``compacted_through >= history_len``.
+
+        When *watermark* is provided, it overrides ``self.compacted_through``
+        as the boundary.  This lets callers pass ``flushed_through`` for
+        payload assembly while compaction/tagging callers keep using
+        ``compacted_through`` implicitly.
         """
-        ct = self.compacted_through
+        ct = watermark if watermark is not None else self.compacted_through
         if ct < history_len:
             return ct
 
