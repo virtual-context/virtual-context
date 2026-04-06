@@ -3,6 +3,7 @@
 import pytest
 
 from virtual_context.core.tag_generator import (
+    CODE_TAG_GENERATOR_PROMPTS,
     KeywordTagGenerator,
     LLMTagGenerator,
     build_tag_generator,
@@ -142,6 +143,43 @@ class TestLLMTagGenerator:
             {"file": "server.py", "line": 42, "symbol": "handle_request"},
             {"file": "retriever.py", "symbol": "ContextRetriever"},
         ]
+
+    @pytest.mark.parametrize("prompt_mode", ["detailed", "compact", "small_model"])
+    def test_code_mode_uses_dedicated_tagger_prompt_family(self, prompt_mode):
+        from virtual_context.core.compactor import CODE_FACT_EXTRACTION_PROMPT
+
+        provider = MockLLMProvider(
+            response='{"tags": ["backend"], "primary": "backend", "fact_signals": [], "code_refs": []}'
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1, prompt_mode=prompt_mode)
+        generator = LLMTagGenerator(llm_provider=provider, config=config, code_mode=True)
+
+        generator.generate_tags("We fixed the cache boundary in server.py.")
+
+        system = provider.calls[0]["system"]
+        assert system == CODE_TAG_GENERATOR_PROMPTS[prompt_mode].format(min_tags=1, max_tags=5)
+        assert "fact_signals" in system
+        assert "code_refs" in system
+        assert CODE_FACT_EXTRACTION_PROMPT.strip() not in system
+
+    def test_fact_signals_parsed_from_code_mode_response(self):
+        provider = MockLLMProvider(
+            response=(
+                '{"tags": ["backend"], "primary": "backend", '
+                '"fact_signals": ['
+                '{"subject": "cache boundary", "verb": "changed", "object": "moved above vc reminder injection", '
+                '"status": "completed", "fact_type": "world", "what": "Cache boundary changed to sit above the VC reminder injection."}'
+                '], "code_refs": []}'
+            )
+        )
+        config = TagGeneratorConfig(type="llm", max_tags=5, min_tags=1)
+        generator = LLMTagGenerator(llm_provider=provider, config=config, code_mode=True)
+
+        result = generator.generate_tags("Patch the cache boundary.")
+
+        assert len(result.fact_signals) == 1
+        assert result.fact_signals[0].subject == "cache boundary"
+        assert result.fact_signals[0].verb == "changed"
 
     def test_select_relevant_store_tags_reuses_cached_embeddings(self):
         provider = MockLLMProvider(response='{"tags": ["database"], "primary": "database"}')
