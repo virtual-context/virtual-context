@@ -177,23 +177,38 @@ class TestAnthropicFormat:
         assert len(self.fmt.get_messages(body)) == 1
 
     def test_inject_context_string_system(self):
-        body = {"system": "Be helpful.", "messages": []}
+        body = {"system": "Be helpful.", "messages": [
+            {"role": "user", "content": "hi"},
+        ]}
         result = self.fmt.inject_context(body, "topic summary")
-        assert "<system-reminder>" in result["system"]
-        assert "topic summary" in result["system"]
-        assert "Be helpful." in result["system"]
+        assert result["system"] == "Be helpful."
+        content = result["messages"][0]["content"]
+        assert isinstance(content, list)
+        assert content[0]["text"] == "hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert content[1]["text"].startswith("<system-reminder>")
+        assert "topic summary" in content[1]["text"]
 
     def test_inject_context_list_system(self):
-        body = {"system": [{"type": "text", "text": "Be helpful."}], "messages": []}
+        body = {"system": [{"type": "text", "text": "Be helpful."}], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ]}
         result = self.fmt.inject_context(body, "topic summary")
         assert isinstance(result["system"], list)
         assert result["system"][0]["text"] == "Be helpful."
-        assert result["system"][-1]["text"].startswith("<system-reminder>")
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert content[-1]["text"].startswith("<system-reminder>")
 
     def test_inject_context_no_system(self):
-        body = {"messages": []}
+        body = {"messages": [{"role": "user", "content": "hi"}]}
         result = self.fmt.inject_context(body, "ctx")
-        assert "<system-reminder>" in result.get("system", "")
+        assert "system" not in result
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert "<system-reminder>" in content[1]["text"]
 
     def test_inject_context_empty_prepend(self):
         body = {"system": "original", "messages": []}
@@ -204,6 +219,22 @@ class TestAnthropicFormat:
         body = {"system": "original", "messages": [{"role": "user", "content": "hi"}]}
         result = self.fmt.inject_context(body, "ctx")
         assert body["system"] == "original"
+
+    def test_inject_context_marks_last_existing_block_as_cache_breakpoint(self):
+        body = {"messages": [{
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"},
+                {"type": "text", "text": "follow-up"},
+            ],
+        }]}
+        result = self.fmt.inject_context(body, "ctx")
+        content = result["messages"][0]["content"]
+        assert content[0]["type"] == "tool_result"
+        assert "cache_control" not in content[0]
+        assert content[1]["text"] == "follow-up"
+        assert content[1]["cache_control"] == {"type": "ephemeral"}
+        assert content[2]["text"].startswith("<system-reminder>")
 
     def test_extract_conversation_id(self):
         body = {"messages": [
@@ -2247,30 +2278,37 @@ class TestInjectContext:
         assert result["messages"][1]["role"] == "user"
 
     def test_anthropic_string_system(self):
-        body = {"system": "Be helpful", "messages": []}
+        body = {"system": "Be helpful", "messages": [
+            {"role": "user", "content": "Hi"},
+        ]}
         result = _inject_context(body, "context here", "anthropic")
-        assert "Be helpful" in result["system"]
-        assert "<system-reminder>" in result["system"]
-        assert "context here" in result["system"]
-        # VC block appended after existing system prompt for cache friendliness
-        assert result["system"].index("Be helpful") < result["system"].index("<system-reminder>")
+        assert result["system"] == "Be helpful"
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "Hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert "context here" in content[1]["text"]
 
     def test_anthropic_no_system(self):
-        body = {"messages": []}
+        body = {"messages": [{"role": "user", "content": "Hi"}]}
         result = _inject_context(body, "context here", "anthropic")
-        assert "<system-reminder>" in result["system"]
-        assert "context here" in result["system"]
+        assert "system" not in result
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "Hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert "context here" in content[1]["text"]
 
     def test_anthropic_list_system(self):
         body = {
             "system": [{"type": "text", "text": "Existing system"}],
-            "messages": [],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
         }
         result = _inject_context(body, "context here", "anthropic")
         assert isinstance(result["system"], list)
         assert result["system"][0]["text"] == "Existing system"
-        assert result["system"][1]["type"] == "text"
-        assert "context here" in result["system"][1]["text"]
+        content = result["messages"][0]["content"]
+        assert content[0]["text"] == "Hi"
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert "context here" in content[1]["text"]
 
     def test_does_not_mutate_original(self):
         body = {"messages": [

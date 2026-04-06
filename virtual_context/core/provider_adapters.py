@@ -138,6 +138,8 @@ class ProviderAdapter(ABC):
 class AnthropicAdapter(ProviderAdapter):
     """Adapter for the Anthropic Messages API."""
 
+    _CACHE_BREAKPOINT = {"type": "ephemeral"}
+
     def __init__(self, api_key: str, api_url: str = ""):
         super().__init__(api_key, api_url or "https://api.anthropic.com/v1/messages")
 
@@ -281,24 +283,49 @@ class AnthropicAdapter(ProviderAdapter):
                             block["text"] = "[Previous reasoning compressed]"
 
     def inject_context(self, body, prepend_text):
-        new_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
+        new_text = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
+
+        def _mark_last_stable_block(blocks: list[dict]) -> None:
+            for idx in range(len(blocks) - 1, -1, -1):
+                block = blocks[idx]
+                if (isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and block.get("text", "").strip()):
+                    updated = dict(block)
+                    updated["cache_control"] = dict(self._CACHE_BREAKPOINT)
+                    blocks[idx] = updated
+                    return
+
         system = body.get("system", "")
         if isinstance(system, str):
-            if _VC_BLOCK_RE.search(system):
-                body["system"] = _VC_BLOCK_RE.sub(lambda m: new_block, system, count=1)
+            cleaned = _VC_BLOCK_RE.sub("", system, count=1).strip()
+            if cleaned:
+                blocks = [{"type": "text", "text": cleaned}]
+                _mark_last_stable_block(blocks)
+                blocks.append({"type": "text", "text": new_text})
+                body["system"] = blocks
             else:
-                body["system"] = f"{new_block}\n\n{system}" if system else new_block
+                body["system"] = new_text
         elif isinstance(system, list):
-            replaced = False
+            blocks: list[dict] = []
             for entry in system:
-                if isinstance(entry, dict) and entry.get("type") == "text":
-                    text = entry.get("text", "")
-                    if _VC_BLOCK_RE.search(text):
-                        entry["text"] = _VC_BLOCK_RE.sub(lambda m: new_block, text, count=1)
-                        replaced = True
-                        break
-            if not replaced:
-                system.insert(0, {"type": "text", "text": new_block})
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") != "text":
+                    blocks.append(copy.deepcopy(entry))
+                    continue
+                text = _VC_BLOCK_RE.sub("", entry.get("text", ""), count=1).strip()
+                if not text:
+                    continue
+                updated = dict(entry)
+                updated["text"] = text
+                updated.pop("cache_control", None)
+                blocks.append(updated)
+            _mark_last_stable_block(blocks)
+            blocks.append({"type": "text", "text": new_text})
+            body["system"] = blocks
+        else:
+            body["system"] = new_text
 
     def strip_tools(self, body):
         body.pop("tools", None)
