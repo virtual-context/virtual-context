@@ -74,6 +74,18 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
+def _restored_flushed_through(
+    compacted_through: int,
+    flushed_through: int | None,
+    *,
+    present: bool,
+) -> int:
+    """Restore the flush watermark while preserving a valid persisted zero."""
+    if not present:
+        return compacted_through
+    return int(flushed_through or 0)
+
+
 from .core.compaction_pipeline import CompactionPipeline
 from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
 from .core.paging_manager import PagingManager
@@ -572,9 +584,11 @@ class VirtualContextEngine:
             return
         self.config.conversation_id = saved.conversation_id
         self._engine_state.compacted_through = saved.compacted_through
-        _ft = getattr(saved, 'flushed_through', 0)
-        # Backward compat: old snapshots lack flushed_through — auto-sync
-        self._engine_state.flushed_through = _ft if _ft > 0 else saved.compacted_through
+        self._engine_state.flushed_through = _restored_flushed_through(
+            saved.compacted_through,
+            getattr(saved, 'flushed_through', 0),
+            present=getattr(saved, 'flushed_through_present', True),
+        )
         self._engine_state.last_request_time = getattr(saved, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = saved.last_compacted_turn
         self._engine_state.last_completed_turn = saved.last_completed_turn
@@ -646,6 +660,8 @@ class VirtualContextEngine:
                             self._engine_state.compacted_through, self.config.conversation_id[:12],
                         )
                         self._engine_state.compacted_through = 0
+                        self._engine_state.flushed_through = 0
+                        self._engine_state.last_request_time = 0.0
             except Exception:
                 pass  # Don't crash on validation failure
 
@@ -659,9 +675,11 @@ class VirtualContextEngine:
         # Engine state — compacted_through is 0 in snapshot (history is uncompacted suffix)
         es = cached.get("engine_state", {})
         self._engine_state.compacted_through = es.get("compacted_through", 0)
-        _ft = es.get("flushed_through", 0)
-        # Backward compat: old cache entries lack flushed_through — auto-sync
-        self._engine_state.flushed_through = _ft if _ft > 0 else es.get("compacted_through", 0)
+        self._engine_state.flushed_through = _restored_flushed_through(
+            es.get("compacted_through", 0),
+            es.get("flushed_through", 0),
+            present=("flushed_through" in es),
+        )
         self._engine_state.last_request_time = es.get("last_request_time", 0.0)
         self._engine_state.last_compacted_turn = es.get(
             "last_compacted_turn",
@@ -799,9 +817,11 @@ class VirtualContextEngine:
         # Engine state markers (including tool_tag_counter for fallback continuity)
         self._engine_state.tool_tag_counter = state.tool_tag_counter
         self._engine_state.compacted_through = state.compacted_through
-        _ft = getattr(state, 'flushed_through', 0)
-        # Backward compat: old session state lacks flushed_through — auto-sync
-        self._engine_state.flushed_through = _ft if _ft > 0 else state.compacted_through
+        self._engine_state.flushed_through = _restored_flushed_through(
+            state.compacted_through,
+            getattr(state, 'flushed_through', 0),
+            present=getattr(state, 'flushed_through_present', True),
+        )
         self._engine_state.last_request_time = getattr(state, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = state.last_compacted_turn
         self._engine_state.last_completed_turn = state.last_completed_turn

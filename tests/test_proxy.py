@@ -21,6 +21,7 @@ from virtual_context.proxy.server import (
 from virtual_context.config import load_config
 from virtual_context.proxy.formats import AnthropicFormat, PayloadTokenCache, PayloadTokenEstimate
 from virtual_context.proxy.metrics import ProxyMetrics
+from virtual_context.proxy.handlers import _handle_non_streaming
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import AssembledContext, EngineState, Message, SplitResult, TagResult, TurnTagEntry
 
@@ -180,6 +181,52 @@ class TestProxyState:
         history = [Message(role="user", content="hi"), Message(role="assistant", content="hey")]
         state.fire_turn_complete(history)
         state.wait_for_complete()  # should not raise
+
+
+class TestResponseTimestamping:
+    def test_non_streaming_tool_only_response_updates_last_request_time(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {}
+        response.json.return_value = {
+            "id": "msg_123",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "lookup",
+                    "input": {"q": "cache"},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+
+        client = MagicMock()
+        client.request = AsyncMock(return_value=response)
+
+        state = MagicMock()
+        state.is_conversation_deleted.return_value = False
+        state.engine._engine_state.last_request_time = 0.0
+        state.engine.config.conversation_id = "conv-123"
+        state._last_enriched_payload_tokens = 0
+        state.conversation_history = []
+
+        asyncio.run(
+            _handle_non_streaming(
+                client,
+                "https://example.com/v1/messages",
+                {},
+                {"model": "claude-sonnet", "messages": []},
+                "anthropic",
+                state,
+                conversation_id="conv-123",
+            )
+        )
+
+        assert state.engine._engine_state.last_request_time > 0.0
+        state.persist_completed_turn.assert_not_called()
+        state.fire_turn_complete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

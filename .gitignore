@@ -22,6 +22,11 @@ build/
 .virtualcontext/
 .virtualcontext-*/
 
+# Local scripts / experiments
+scripts/*
+!scripts/install.ps1
+!scripts/install.sh
+
 # Config files (may contain API keys)
 virtual-context-*.yaml
 !virtual-context.yaml.example
