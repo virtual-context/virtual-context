@@ -170,6 +170,24 @@ def test_payload_token_cache_roundtrip(provider, mock_redis):
     assert loaded == cache
 
 
+def test_payload_token_cache_roundtrip_outbound_scope(provider, mock_redis):
+    cache = PayloadTokenCache(
+        format_name="anthropic",
+        message_key="messages",
+        shell_fingerprint="shell-out",
+        shell_tokens=55,
+        message_fingerprints=["m1"],
+        message_tokens=[18],
+        separator_tokens=0,
+        total_tokens=73,
+    )
+
+    provider.save_payload_token_cache("conv-123", cache, scope="outbound")
+
+    loaded = provider.load_payload_token_cache("conv-123", scope="outbound")
+    assert loaded == cache
+
+
 def test_delete_clears_payload_token_cache(provider, mock_redis):
     provider.save_payload_token_cache(
         "conv-123",
@@ -187,7 +205,8 @@ def test_delete_clears_payload_token_cache(provider, mock_redis):
 
     provider.delete("conv-123")
 
-    assert mock_redis._test_store.get("vc:payload_tokens:conv-123") is None
+    assert mock_redis._test_store.get("vc:payload_tokens:inbound:conv-123") is None
+    assert mock_redis._test_store.get("vc:payload_tokens:outbound:conv-123") is None
 
 
 def test_tag_embedding_cache_roundtrip(provider):

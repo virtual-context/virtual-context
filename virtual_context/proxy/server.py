@@ -42,6 +42,7 @@ from ..types import Fact, Message, PreparedPayload, SplitResult, StoredSummary  
 from .dashboard import register_dashboard_routes
 from .formats import (
     PayloadFormat,  # noqa: F401 — re-exported
+    TurnGroup,
     detect_format,
     get_format,
 )
@@ -135,6 +136,9 @@ def _compute_protected_turn_stats(
     body: dict,
     fmt: PayloadFormat,
     protected_recent_turns: int,
+    *,
+    message_tokens: list[int] | None = None,
+    turn_groups: list[TurnGroup] | None = None,
 ) -> dict[str, object]:
     """Return protected-turn token accounting for the final outbound body.
 
@@ -149,7 +153,7 @@ def _compute_protected_turn_stats(
     if not messages:
         return {"tokens": 0, "count": 0, "turn_tokens": []}
 
-    turn_groups = fmt.group_into_turns(body)
+    turn_groups = turn_groups or fmt.group_into_turns(body)
     if not turn_groups:
         return {"tokens": 0, "count": 0, "turn_tokens": []}
 
@@ -163,7 +167,10 @@ def _compute_protected_turn_stats(
             if idx in seen_indices or idx < 0 or idx >= len(messages):
                 continue
             seen_indices.add(idx)
-            group_total += fmt.estimate_message_tokens(messages[idx])
+            if message_tokens is not None and idx < len(message_tokens):
+                group_total += message_tokens[idx]
+            else:
+                group_total += fmt.estimate_message_tokens(messages[idx])
         turn_tokens.append(group_total)
         total_tokens += group_total
 
@@ -387,17 +394,18 @@ async def prepare_payload(
         *,
         serialize_stage: str,
         count_stage: str,
+        cache_scope: str | None = None,
     ) -> tuple[str, int, int]:
         _serialize_started = time.monotonic()
         payload_json = json.dumps(payload, default=str)
         payload_bytes = len(payload_json.encode("utf-8"))
         _note_prep(serialize_stage, _serialize_started)
-        _count_started = time.monotonic()
-        payload_tokens = fmt.estimate_payload_tokens_from_serialized(
+        payload_tokens = _estimate_payload_tokens_cached(
             payload,
-            payload_json,
+            cache_scope=cache_scope,
+            count_stage=count_stage,
+            serialized_json=payload_json,
         )
-        _note_prep(count_stage, _count_started)
         return payload_json, payload_bytes, payload_tokens
 
     # Measure inbound BEFORE normalization using the media-aware segmented
@@ -412,6 +420,13 @@ async def prepare_payload(
     _inbound_bytes = len(body_bytes)
     _cache_conv_id = state.engine.config.conversation_id if state else ""
     _cache_provider = getattr(state.engine, "_session_state_provider", None) if state else None
+    _outbound_cache = state._outbound_payload_token_cache if state else None
+    _outbound_cache_loaded = _outbound_cache is not None
+    _outbound_token_estimate = None
+    _outbound_turn_groups: list[TurnGroup] | None = None
+    _outbound_turn_groups_signature: tuple[str, ...] | None = None
+    _outbound_floor_signature: tuple[str, str] | None = None
+    _outbound_floor_components = (0, 0)
     _msg_key = "messages" if "messages" in body else "input" if "input" in body else "contents"
     _initial_message_count = len(body[_msg_key]) if _msg_key in body and isinstance(body[_msg_key], list) else 0
     _inbound_stage = time.monotonic()
@@ -464,6 +479,112 @@ async def prepare_payload(
             _inbound_cache_estimate.shell_cache_hit,
             _inbound_tokens,
         )
+
+    def _estimate_payload_tokens_cached(
+        payload: dict,
+        *,
+        cache_scope: str | None = None,
+        count_stage: str | None = None,
+        serialized_json: str | None = None,
+    ) -> int:
+        nonlocal _outbound_cache, _outbound_cache_loaded, _outbound_token_estimate
+
+        _count_started = time.monotonic()
+        if cache_scope == "outbound":
+            if not _outbound_cache_loaded and _cache_provider and _cache_conv_id:
+                _cache_load_stage = time.monotonic()
+                _outbound_cache = _cache_provider.load_payload_token_cache(
+                    _cache_conv_id,
+                    scope="outbound",
+                )
+                _note_prep("outbound_token_cache_load", _cache_load_stage)
+                if _outbound_cache is not None and state:
+                    state._outbound_payload_token_cache = _outbound_cache
+                _outbound_cache_loaded = True
+
+            _estimate = fmt.estimate_payload_tokens_segmented(
+                payload,
+                cache=_outbound_cache,
+            )
+            _outbound_token_estimate = _estimate
+            _outbound_cache = _estimate.cache
+            if state:
+                state._outbound_payload_token_cache = _outbound_cache
+            if _cache_provider and _cache_conv_id:
+                _cache_save_stage = time.monotonic()
+                _cache_provider.save_payload_token_cache(
+                    _cache_conv_id,
+                    _outbound_cache,
+                    scope="outbound",
+                )
+                _note_prep("outbound_token_cache_save", _cache_save_stage)
+            payload_tokens = _estimate.total_tokens
+        else:
+            payload_tokens = fmt.estimate_payload_tokens_from_serialized(
+                payload,
+                serialized_json or json.dumps(payload, default=str),
+            )
+
+        if count_stage:
+            _note_prep(count_stage, _count_started)
+        return payload_tokens
+
+    def _current_outbound_message_tokens(payload: dict) -> list[int]:
+        messages = _payload_messages(payload)
+        if (
+            _outbound_token_estimate is not None
+            and len(_outbound_token_estimate.cache.message_tokens) == len(messages)
+        ):
+            return list(_outbound_token_estimate.cache.message_tokens)
+        return []
+
+    def _current_outbound_turn_groups(payload: dict) -> list[TurnGroup]:
+        nonlocal _outbound_turn_groups, _outbound_turn_groups_signature
+
+        if _outbound_token_estimate is not None:
+            messages = _payload_messages(payload)
+            message_fingerprints = tuple(_outbound_token_estimate.cache.message_fingerprints)
+            if len(message_fingerprints) == len(messages):
+                if (
+                    _outbound_turn_groups is not None
+                    and _outbound_turn_groups_signature == message_fingerprints
+                ):
+                    return _outbound_turn_groups
+                _turn_stage = time.monotonic()
+                _outbound_turn_groups = fmt.group_into_turns(payload)
+                _outbound_turn_groups_signature = message_fingerprints
+                _note_prep("outbound_turn_grouping", _turn_stage)
+                return _outbound_turn_groups
+
+        _turn_stage = time.monotonic()
+        turn_groups = fmt.group_into_turns(payload)
+        _note_prep("outbound_turn_grouping", _turn_stage)
+        return turn_groups
+
+    def _current_outbound_floor_components(payload: dict) -> tuple[int, int]:
+        nonlocal _outbound_floor_signature, _outbound_floor_components
+
+        system_sig = json.dumps(
+            payload.get("system", payload.get("instructions", "")),
+            default=str,
+            sort_keys=True,
+        )
+        tools_sig = json.dumps(
+            payload.get("tools", []),
+            default=str,
+            sort_keys=True,
+        )
+        signature = (system_sig, tools_sig)
+        if _outbound_floor_signature == signature:
+            return _outbound_floor_components
+
+        _floor_component_stage = time.monotonic()
+        system_tokens = fmt._estimate_system_tokens(payload)
+        tools_tokens = fmt.estimate_tools_tokens(payload)
+        _note_prep("estimate_floor_components", _floor_component_stage)
+        _outbound_floor_signature = signature
+        _outbound_floor_components = (system_tokens, tools_tokens)
+        return _outbound_floor_components
 
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
@@ -1201,6 +1322,7 @@ async def prepare_payload(
         enriched_body,
         serialize_stage="serialize_outbound",
         count_stage="count_outbound_tokens",
+        cache_scope="outbound",
     )
     if state:
         state._last_enriched_payload_kb = round(_outbound_bytes / 1024, 1)
@@ -1225,8 +1347,7 @@ async def prepare_payload(
         _budget = state.engine.config.monitor.context_window
         _sanity_msgs = enriched_body.get("messages", enriched_body.get("input", enriched_body.get("contents", [])))
         if isinstance(_sanity_msgs, list):
-            _sys_t = fmt._estimate_system_tokens(enriched_body)
-            _tools_t = fmt.estimate_tools_tokens(enriched_body)
+            _sys_t, _tools_t = _current_outbound_floor_components(enriched_body)
             _nv_floor = _sys_t + _tools_t
             _nv_pct = (_nv_floor / _budget * 100) if _budget else 0
 
@@ -1311,17 +1432,21 @@ async def prepare_payload(
     if state and outbound_tokens > state.engine.config.monitor.context_window:
         from .message_filter import enforce_payload_budget
         _budget_window = state.engine.config.monitor.context_window
+        def _budget_token_estimator(payload: dict) -> int:
+            return _estimate_payload_tokens_cached(payload, cache_scope="outbound")
         enriched_body, _budget_reductions, _budget_freed = enforce_payload_budget(
             enriched_body, fmt, _budget_window,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
             initial_tokens=outbound_tokens,
+            token_estimator=_budget_token_estimator,
         )
         if _budget_reductions > 0:
             _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
                 enriched_body,
                 serialize_stage="serialize_outbound",
                 count_stage="count_outbound_tokens",
+                cache_scope="outbound",
             )
             logger.info(
                 "BUDGET_ENFORCE: %d reductions, %d bytes freed, now %dt/%dt",
@@ -1383,6 +1508,7 @@ async def prepare_payload(
                         enriched_body,
                         serialize_stage="serialize_outbound",
                         count_stage="count_outbound_tokens",
+                        cache_scope="outbound",
                     )
                     # Update prepend_text to reflect fill additions so
                     # context_tokens and persisted metrics are accurate.
@@ -1413,6 +1539,7 @@ async def prepare_payload(
             enriched_body,
             serialize_stage="serialize_outbound",
             count_stage="count_outbound_tokens",
+            cache_scope="outbound",
         )
         prepend_text = ""
         context_tokens = 0
@@ -1444,7 +1571,8 @@ async def prepare_payload(
             _non_virtualizable_floor = fmt._estimate_system_tokens(_pre_filter_body) + fmt.estimate_tools_tokens(_pre_filter_body)
         else:
             _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
-            _non_virtualizable_floor = fmt._estimate_system_tokens(enriched_body) + fmt.estimate_tools_tokens(enriched_body)
+            _sys_t, _tools_t = _current_outbound_floor_components(enriched_body)
+            _non_virtualizable_floor = _sys_t + _tools_t
         state._last_non_virtualizable_floor = _non_virtualizable_floor
         logger.info("Floor: %dt non-virtualizable, %dt VC context, %dt total",
                     _non_virtualizable_floor, _vc_tokens, outbound_tokens)
@@ -1480,6 +1608,7 @@ async def prepare_payload(
                 enriched_body,
                 serialize_stage="serialize_outbound",
                 count_stage="count_outbound_tokens",
+                cache_scope="outbound",
             )
             logger.info(
                 "ACTIVE_TRIM: payload=%dt exceeds upstream=%dt, trimmed %d pairs → %dt",
@@ -1523,6 +1652,8 @@ async def prepare_payload(
                 enriched_body,
                 fmt,
                 int(state.engine.config.monitor.protected_recent_turns),
+                message_tokens=_current_outbound_message_tokens(enriched_body),
+                turn_groups=_current_outbound_turn_groups(enriched_body),
             )
             _protected_turn_tokens = int(_protected_stats["tokens"])
             _protected_turn_count = int(_protected_stats["count"])

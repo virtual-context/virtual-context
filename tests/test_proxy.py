@@ -389,18 +389,37 @@ class TestPreparePayloadInboundTokenCache:
             separator_tokens=1,
             total_tokens=24,
         )
-        provider.load_payload_token_cache.return_value = cached
+        outbound_cache = PayloadTokenCache(
+            format_name="anthropic",
+            message_key="messages",
+            shell_fingerprint="shell-out",
+            shell_tokens=14,
+            message_fingerprints=["m1", "m2"],
+            message_tokens=[7, 8],
+            separator_tokens=1,
+            total_tokens=24,
+        )
+        provider.load_payload_token_cache.side_effect = [cached, None]
         engine._session_state_provider = provider
 
         state = ProxyState(engine)
         fmt = AnthropicFormat()
-        fmt.estimate_payload_tokens_segmented = MagicMock(return_value=PayloadTokenEstimate(
-            total_tokens=24,
-            cache=next_cache,
-            reused_prefix_messages=1,
-            recounted_messages=1,
-            shell_cache_hit=True,
-        ))
+        fmt.estimate_payload_tokens_segmented = MagicMock(side_effect=[
+            PayloadTokenEstimate(
+                total_tokens=24,
+                cache=next_cache,
+                reused_prefix_messages=1,
+                recounted_messages=1,
+                shell_cache_hit=True,
+            ),
+            PayloadTokenEstimate(
+                total_tokens=24,
+                cache=outbound_cache,
+                reused_prefix_messages=0,
+                recounted_messages=1,
+                shell_cache_hit=False,
+            ),
+        ])
         body = {
             "model": "claude-opus-4-6",
             "stream": False,
@@ -418,10 +437,42 @@ class TestPreparePayloadInboundTokenCache:
             )
         )
 
-        provider.load_payload_token_cache.assert_called_once_with("conv-123")
-        provider.save_payload_token_cache.assert_called_once_with("conv-123", next_cache)
-        assert fmt.estimate_payload_tokens_segmented.call_args.kwargs["cache"] == cached
+        assert provider.load_payload_token_cache.call_args_list == [
+            call("conv-123"),
+            call("conv-123", scope="outbound"),
+        ]
+        provider.save_payload_token_cache.assert_any_call("conv-123", next_cache)
+        provider.save_payload_token_cache.assert_any_call("conv-123", outbound_cache, scope="outbound")
+        assert fmt.estimate_payload_tokens_segmented.call_args_list[0].kwargs["cache"] == cached
+        assert fmt.estimate_payload_tokens_segmented.call_args_list[1].kwargs["cache"] is None
         assert state._inbound_payload_token_cache == next_cache
+        assert state._outbound_payload_token_cache == outbound_cache
+
+    def test_compute_protected_turn_stats_uses_precomputed_message_tokens(self):
+        fmt = AnthropicFormat()
+        body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"},
+                {"role": "assistant", "content": "a2"},
+                {"role": "user", "content": "u3"},
+                {"role": "assistant", "content": "a3"},
+            ],
+        }
+        fmt.estimate_message_tokens = MagicMock(side_effect=AssertionError("should not recount"))
+
+        stats = _compute_protected_turn_stats(
+            body,
+            fmt,
+            2,
+            message_tokens=[11, 12, 21, 22, 31, 32],
+        )
+
+        assert stats["count"] == 2
+        assert stats["turn_tokens"] == [43, 63]
+        assert stats["tokens"] == 106
 
 
 # ---------------------------------------------------------------------------

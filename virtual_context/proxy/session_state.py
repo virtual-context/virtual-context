@@ -119,8 +119,8 @@ class SessionStateProvider:
     def _key(self, conversation_id: str) -> str:
         return f"vc:session:{conversation_id}"
 
-    def _payload_token_cache_key(self, conversation_id: str) -> str:
-        return f"vc:payload_tokens:{conversation_id}"
+    def _payload_token_cache_key(self, conversation_id: str, scope: str = "inbound") -> str:
+        return f"vc:payload_tokens:{scope}:{conversation_id}"
 
     def _tag_stats_cache_key(self, conversation_id: str) -> str:
         return f"vc:tag_stats:{conversation_id}"
@@ -279,14 +279,14 @@ class SessionStateProvider:
                            conversation_id[:12], exc_info=True)
             self._degraded = True
 
-    def load_payload_token_cache(self, conversation_id: str):
+    def load_payload_token_cache(self, conversation_id: str, *, scope: str = "inbound"):
         """Load the segmented inbound token cache for a conversation.
 
         This cache is an optional hot-path optimization only. Failures should
         never affect correctness or the primary session-state flow.
         """
         try:
-            raw = self._redis.get(self._payload_token_cache_key(conversation_id))
+            raw = self._redis.get(self._payload_token_cache_key(conversation_id, scope))
             if raw is None:
                 return None
             from .formats import PayloadTokenCache
@@ -358,7 +358,14 @@ class SessionStateProvider:
         except Exception:
             pass
 
-    def save_payload_token_cache(self, conversation_id: str, cache, *, ttl_seconds: int | None = None) -> None:
+    def save_payload_token_cache(
+        self,
+        conversation_id: str,
+        cache,
+        *,
+        scope: str = "inbound",
+        ttl_seconds: int | None = None,
+    ) -> None:
         """Save the segmented inbound token cache for a conversation.
 
         Stored separately from durable session state so it can be updated on
@@ -369,7 +376,7 @@ class SessionStateProvider:
         try:
             payload = asdict(cache) if hasattr(cache, "__dataclass_fields__") else cache
             self._redis.set(
-                self._payload_token_cache_key(conversation_id),
+                self._payload_token_cache_key(conversation_id, scope),
                 json.dumps(payload, default=str).encode("utf-8"),
                 ex=ttl_seconds or self._PAYLOAD_TOKEN_CACHE_TTL_SECONDS,
             )
@@ -380,10 +387,10 @@ class SessionStateProvider:
                 exc_info=True,
             )
 
-    def delete_payload_token_cache(self, conversation_id: str) -> None:
+    def delete_payload_token_cache(self, conversation_id: str, *, scope: str = "inbound") -> None:
         """Best-effort delete for the segmented inbound token cache."""
         try:
-            self._redis.delete(self._payload_token_cache_key(conversation_id))
+            self._redis.delete(self._payload_token_cache_key(conversation_id, scope))
         except Exception:
             pass
 
@@ -608,7 +615,8 @@ class SessionStateProvider:
                 tombstone.to_json(),
                 ex=86400,
             )
-            self.delete_payload_token_cache(conversation_id)
+            self.delete_payload_token_cache(conversation_id, scope="inbound")
+            self.delete_payload_token_cache(conversation_id, scope="outbound")
             self.delete_tag_stats_snapshot(conversation_id)
             self.delete_tag_summary_embedding_snapshot(conversation_id)
             self._degraded = False
