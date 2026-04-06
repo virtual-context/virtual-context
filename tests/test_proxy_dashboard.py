@@ -358,13 +358,14 @@ class TestMetricsIntegration:
         from virtual_context.types import Message
 
         engine = MagicMock()
+        engine.config.conversation_id = "conv-123"
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.entries = []
 
         entry = MagicMock()
         entry.tags = ["auth", "jwt"]
         entry.primary_tag = "auth"
-        engine._turn_tag_index.get_tags_for_turn.return_value = entry
+        engine._turn_tag_index.get_tags_for_turn.side_effect = lambda turn: entry if engine._turn_tag_index.entries else None
         engine._turn_tag_index.get_active_tags.return_value = {"auth", "jwt"}
         engine._store.get_all_tags.return_value = []
 

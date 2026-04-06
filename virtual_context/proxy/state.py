@@ -7,6 +7,7 @@ state machine for non-blocking ingestion and turn-complete processing.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import logging
 import threading
@@ -148,6 +149,11 @@ class ProxyState:
             "recovery_loaded": False,
             "recovery_manifest": [],
         }
+        self._background_state_lock = threading.Lock()
+        self._queued_tag_turns: dict[int, str] = {}
+        self._queued_compaction_request: dict[str, object] | None = None
+        self._active_compaction_target_end = -1
+        self._last_completed_compaction_target_end = -1
         # Live request counter: incremented on each user turn processed through proxy
         self._total_requests: int = 0
         # Upstream context window enforcement
@@ -513,14 +519,142 @@ class ProxyState:
 
     def wait_for_compact(self) -> None:
         """Block until compaction finishes. Tagging should already be complete."""
-        if self._pending_compact is not None:
-            self._pending_compact.result()
-            self._pending_compact = None
+        while True:
+            future = self._pending_compact
+            if future is None:
+                return
+            future.result()
+            if self._pending_compact is future:
+                self._pending_compact = None
+                return
 
     def wait_for_complete(self) -> None:
         """Block until tag + compact both finish."""
         self.wait_for_tag()
         self.wait_for_compact()
+
+    @staticmethod
+    def _completed_turn_signature(
+        history_snapshot: list[Message],
+    ) -> tuple[int, str] | None:
+        """Return the stable completed turn number and hash for a finished pair."""
+        if len(history_snapshot) < 2 or len(history_snapshot) % 2 != 0:
+            return None
+        turn_number = (len(history_snapshot) // 2) - 1
+        latest_pair = history_snapshot[-2:]
+        combined_text = " ".join(msg.content for msg in latest_pair)
+        message_hash = hashlib.sha256(combined_text.encode()).hexdigest()[:16]
+        return turn_number, message_hash
+
+    def _compaction_target_end(self, history: list[Message]) -> int:
+        protected_recent_turns = 0
+        try:
+            protected_recent_turns = int(self.engine.config.monitor.protected_recent_turns)
+        except (AttributeError, TypeError, ValueError):
+            protected_recent_turns = 0
+        protected_count = protected_recent_turns * 2
+        return max(0, len(history) - protected_count)
+
+    def _engine_state_int(self, field_name: str, default: int = 0) -> int:
+        raw = getattr(getattr(self.engine, "_engine_state", None), field_name, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _compaction_priority_rank(priority: str) -> int:
+        return 2 if priority == "hard" else 1
+
+    def _should_replace_compaction_request(
+        self,
+        existing: dict[str, object] | None,
+        *,
+        target_end: int,
+        priority: str,
+    ) -> bool:
+        if existing is None:
+            return True
+        existing_target = int(existing.get("target_end", -1) or -1)
+        if target_end > existing_target:
+            return True
+        if target_end < existing_target:
+            return False
+        existing_priority = str(existing.get("priority", "soft"))
+        return self._compaction_priority_rank(priority) > self._compaction_priority_rank(existing_priority)
+
+    def _submit_compaction_request(
+        self,
+        history: list[Message],
+        signal: object,
+        turn: int,
+        target_end: int,
+    ) -> None:
+        priority = str(getattr(signal, "priority", "soft") or "soft")
+        with self._background_state_lock:
+            self._active_compaction_target_end = target_end
+        self._pending_compact = self._compact_pool.submit(
+            self._run_compact_wrapper,
+            history,
+            signal,
+            turn,
+            target_end,
+        )
+        logger.info(
+            "T%d compaction submitted target_end=%d priority=%s",
+            turn,
+            target_end,
+            priority,
+        )
+
+    def _queue_compaction(
+        self,
+        history: list[Message],
+        signal: object,
+        turn: int,
+    ) -> None:
+        target_end = self._compaction_target_end(history)
+        priority = str(getattr(signal, "priority", "soft") or "soft")
+
+        with self._background_state_lock:
+            pending_future = self._pending_compact
+            if pending_future is not None and not pending_future.done():
+                if target_end <= self._active_compaction_target_end:
+                    logger.info(
+                        "T%d compaction coalesced under active target_end=%d priority=%s",
+                        turn,
+                        self._active_compaction_target_end,
+                        priority,
+                    )
+                    return
+                if self._should_replace_compaction_request(
+                    self._queued_compaction_request,
+                    target_end=target_end,
+                    priority=priority,
+                ):
+                    self._queued_compaction_request = {
+                        "history": history,
+                        "signal": signal,
+                        "turn": turn,
+                        "target_end": target_end,
+                        "priority": priority,
+                    }
+                    logger.info(
+                        "T%d compaction queued behind active run target_end=%d priority=%s",
+                        turn,
+                        target_end,
+                        priority,
+                    )
+                else:
+                    logger.info(
+                        "T%d compaction request dropped as covered by newer queued target_end=%d priority=%s",
+                        turn,
+                        int(self._queued_compaction_request.get("target_end", -1)) if self._queued_compaction_request else -1,
+                        str(self._queued_compaction_request.get("priority", "")) if self._queued_compaction_request else "",
+                    )
+                return
+
+        self._submit_compaction_request(history, signal, turn, target_end)
 
     def fire_turn_complete(
         self,
@@ -546,11 +680,46 @@ class ProxyState:
                 self.engine.config.conversation_id[:12],
             )
             return
+        signature = self._completed_turn_signature(history_snapshot)
+        if signature is None:
+            logger.info("fire_turn_complete skipped (no completed pair)")
+            return
+        reserved_turn, message_hash = signature
+        existing = self.engine._turn_tag_index.get_tags_for_turn(reserved_turn)
+        if existing is not None:
+            if existing.message_hash != message_hash:
+                logger.warning(
+                    "fire_turn_complete skipped divergent duplicate for %s turn=%d indexed=%s new=%s",
+                    self.engine.config.conversation_id[:12],
+                    reserved_turn,
+                    existing.message_hash,
+                    message_hash,
+                )
+            else:
+                logger.info(
+                    "fire_turn_complete deduped for %s turn=%d (already indexed)",
+                    self.engine.config.conversation_id[:12],
+                    reserved_turn,
+                )
+            return
+        with self._background_state_lock:
+            queued_hash = self._queued_tag_turns.get(reserved_turn)
+            if queued_hash == message_hash:
+                logger.info(
+                    "fire_turn_complete deduped for %s turn=%d (already queued)",
+                    self.engine.config.conversation_id[:12],
+                    reserved_turn,
+                )
+                return
+            self._queued_tag_turns[reserved_turn] = message_hash
         try:
             self._pending_tag = self._pool.submit(
-                self._run_tag_turn, history_snapshot, payload_tokens, turn_id,
+                self._run_tag_turn, history_snapshot, payload_tokens, turn_id, reserved_turn, message_hash,
             )
         except RuntimeError:
+            with self._background_state_lock:
+                if self._queued_tag_turns.get(reserved_turn) == message_hash:
+                    self._queued_tag_turns.pop(reserved_turn, None)
             logger.info(
                 "fire_turn_complete suppressed for shut down session %s",
                 self.engine.config.conversation_id[:12],
@@ -561,16 +730,38 @@ class ProxyState:
         history: list[Message],
         payload_tokens: int | None = None,
         turn_id: str = "",
+        reserved_turn: int | None = None,
+        message_hash: str = "",
     ) -> None:
         """Fast path: tag the turn, emit metrics, fire compaction if needed."""
         t0 = time.monotonic()
-        turn = len(self.engine._turn_tag_index.entries)
+        signature = self._completed_turn_signature(history)
+        turn = reserved_turn if reserved_turn is not None else (signature[0] if signature else len(self.engine._turn_tag_index.entries))
+        turn_hash = message_hash or (signature[1] if signature else "")
         conversation_id = self.engine.config.conversation_id
         try:
+            existing = self.engine._turn_tag_index.get_tags_for_turn(turn)
+            if existing is not None:
+                if turn_hash and existing.message_hash != turn_hash:
+                    logger.warning(
+                        "T%d TAG skipped divergent duplicate conversation=%s indexed=%s new=%s",
+                        turn,
+                        conversation_id[:12],
+                        existing.message_hash,
+                        turn_hash,
+                    )
+                else:
+                    logger.info(
+                        "T%d TAG skipped (already indexed) conversation=%s",
+                        turn,
+                        conversation_id[:12],
+                    )
+                return
             signal = self.engine.tag_turn(
                 history,
                 payload_tokens=payload_tokens,
                 run_broad_split=False,
+                turn_number=turn,
             )
             self._last_compact_priority = signal.priority if signal else ""
 
@@ -636,9 +827,7 @@ class ProxyState:
                     logger.info("T%d compaction deferred (ingestion in progress)", turn)
                 else:
                     try:
-                        self._pending_compact = self._compact_pool.submit(
-                            self._run_compact, history, signal, turn,
-                        )
+                        self._queue_compaction(history, signal, turn)
                     except RuntimeError:
                         logger.info(
                             "T%d compaction suppressed for shut down session %s",
@@ -649,6 +838,10 @@ class ProxyState:
 
         except Exception as e:
             logger.error("tag_turn error: %s", e, exc_info=True)
+        finally:
+            with self._background_state_lock:
+                if self._queued_tag_turns.get(turn) == turn_hash:
+                    self._queued_tag_turns.pop(turn, None)
 
     def _record_tag_split_event(
         self,
@@ -921,6 +1114,36 @@ class ProxyState:
         finally:
             self._compaction_lock.release()
 
+    def _run_compact_wrapper(
+        self,
+        history: list[Message],
+        signal: object,
+        turn: int,
+        target_end: int,
+    ) -> None:
+        try:
+            self._run_compact(history, signal, turn)
+        finally:
+            follow_up: dict[str, object] | None = None
+            with self._background_state_lock:
+                self._last_completed_compaction_target_end = max(
+                    self._last_completed_compaction_target_end,
+                    target_end,
+                )
+                self._active_compaction_target_end = -1
+                queued = self._queued_compaction_request
+                self._queued_compaction_request = None
+                current_watermark = self._engine_state_int("compacted_through", 0)
+                if queued is not None and int(queued.get("target_end", -1) or -1) > current_watermark:
+                    follow_up = queued
+            if follow_up is not None:
+                self._submit_compaction_request(
+                    follow_up["history"],
+                    follow_up["signal"],
+                    int(follow_up["turn"]),
+                    int(follow_up["target_end"]),
+                )
+
     def _compact_after_ingestion(self, history: list[Message]) -> None:
         """Compact immediately after ingestion — no threshold check needed.
 
@@ -1106,26 +1329,33 @@ class ProxyState:
             "recovery_loaded": False,
             "recovery_manifest": [],
         }
+        with self._background_state_lock:
+            self._queued_tag_turns = {}
+            self._queued_compaction_request = None
+            self._active_compaction_target_end = -1
+            self._last_completed_compaction_target_end = -1
         self._total_requests = 0
         self._last_model = ""
 
     def _drain_background_work(self) -> None:
         """Wait for queued tag/compaction work without propagating old failures."""
         for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
-            future = getattr(self, attr, None)
-            if future is None:
-                continue
-            try:
-                future.result()
-            except Exception:
-                logger.warning(
-                    "Background task failed while draining %s for conv=%s",
-                    attr,
-                    self.engine.config.conversation_id[:12],
-                    exc_info=True,
-                )
-            finally:
-                setattr(self, attr, None)
+            while True:
+                future = getattr(self, attr, None)
+                if future is None:
+                    break
+                try:
+                    future.result()
+                except Exception:
+                    logger.warning(
+                        "Background task failed while draining %s for conv=%s",
+                        attr,
+                        self.engine.config.conversation_id[:12],
+                        exc_info=True,
+                    )
+                finally:
+                    if getattr(self, attr, None) is future:
+                        setattr(self, attr, None)
 
     def _request_background_stop(self) -> None:
         """Signal queued/running background work to stop without dropping handles."""
@@ -1162,6 +1392,10 @@ class ProxyState:
                 )
             finally:
                 setattr(self, attr, None)
+        with self._background_state_lock:
+            self._queued_tag_turns = {}
+            self._queued_compaction_request = None
+            self._active_compaction_target_end = -1
 
     def _stop_ingestion_thread(
         self,

@@ -284,6 +284,7 @@ class TaggingPipeline:
         payload_tokens: int | None = None,
         *,
         run_broad_split: bool = True,
+        turn_number: int | None = None,
     ) -> CompactionSignal | None:
         """Phase 1 of turn processing: tag the latest turn and check thresholds.
 
@@ -298,7 +299,11 @@ class TaggingPipeline:
         """
         from ..types import TagResult, TurnTagEntry, get_sender_name
 
-        turn_number = len(self._turn_tag_index.entries)
+        turn_number = (
+            int(turn_number)
+            if turn_number is not None
+            else len(self._turn_tag_index.entries)
+        )
         tag_started = time.monotonic()
         breakdown: dict[str, float] = {}
 
@@ -317,7 +322,7 @@ class TaggingPipeline:
                     tag_num = self._engine_state.tool_tag_counter
                 tag_name = f"tool_{tag_num}"
                 self._turn_tag_index.append(TurnTagEntry(
-                    turn_number=len(self._turn_tag_index.entries),
+                    turn_number=turn_number,
                     message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                     tags=[tag_name],
                     primary_tag=tag_name,
@@ -377,7 +382,7 @@ class TaggingPipeline:
 
             t_stage = time.monotonic()
             self._turn_tag_index.append(TurnTagEntry(
-                turn_number=len(self._turn_tag_index.entries),
+                turn_number=turn_number,
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
@@ -408,7 +413,7 @@ class TaggingPipeline:
             self._engine_state.last_compact_ms = 0.0
             # Persist turn message text for post-restart recall
             if latest_pair:
-                turn_num = len(self._turn_tag_index.entries) - 1
+                turn_num = turn_number
                 t_stage = time.monotonic()
                 try:
                     self._store.save_turn_message(
@@ -426,7 +431,7 @@ class TaggingPipeline:
             t_stage = time.monotonic()
             self._save_state_callback(
                 conversation_history,
-                last_indexed_turn=len(self._turn_tag_index.entries) - 1,
+                last_indexed_turn=turn_number,
             )
             self._record_timing(breakdown, "save_state", t_stage)
 
