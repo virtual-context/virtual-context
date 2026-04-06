@@ -1488,13 +1488,15 @@ class PostgresStore(ContextStore):
             "checkpoint_version": state.checkpoint_version,
         }
         conn.execute(
-            """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
-            VALUES (%s,%s,%s,%s,%s)
+            """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at, flushed_through, last_request_time)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (conversation_id) DO UPDATE SET
                 compacted_through=EXCLUDED.compacted_through, turn_count=EXCLUDED.turn_count,
-                turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at""",
+                turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at,
+                flushed_through=EXCLUDED.flushed_through, last_request_time=EXCLUDED.last_request_time""",
             (state.conversation_id, state.compacted_through, state.turn_count,
-             json.dumps(entries_data), _dt_to_str(state.saved_at)),
+             json.dumps(entries_data), _dt_to_str(state.saved_at),
+             state.flushed_through, state.last_request_time),
         )
 
     def _parse_engine_state_row(self, row: dict) -> EngineStateSnapshot:
@@ -1506,9 +1508,9 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
-            flushed_through = 0
-            flushed_through_present = False
-            last_request_time = 0.0
+            flushed_through = row.get("flushed_through") or 0
+            flushed_through_present = bool(row.get("flushed_through"))
+            last_request_time = row.get("last_request_time") or 0.0
             tool_tag_counter = 0
             last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
             last_completed_turn = max(row["turn_count"] - 1, len(entries_list) - 1)
@@ -1563,9 +1565,9 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
-            flushed_through = 0
-            flushed_through_present = False
-            last_request_time = 0.0
+            flushed_through = row.get("flushed_through") or 0
+            flushed_through_present = bool(row.get("flushed_through"))
+            last_request_time = row.get("last_request_time") or 0.0
             tool_tag_counter = 0
             last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
             last_completed_turn = row["turn_count"] - 1
