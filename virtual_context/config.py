@@ -164,6 +164,8 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         soft_threshold=compaction.get("soft_threshold", _mon_defaults.soft_threshold),
         hard_threshold=compaction.get("hard_threshold", _mon_defaults.hard_threshold),
         protected_recent_turns=compaction.get("protected_recent_turns", _mon_defaults.protected_recent_turns),
+        defer_payload_mutation=compaction.get("defer_payload_mutation", _mon_defaults.defer_payload_mutation),
+        flush_ttl_seconds=compaction.get("flush_ttl_seconds", _mon_defaults.flush_ttl_seconds),
     )
     segmenter_config = SegmenterConfig(
         session_gap_minutes=compaction.get("session_gap_minutes", _seg_defaults.session_gap_minutes),
