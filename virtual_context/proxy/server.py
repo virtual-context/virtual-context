@@ -1064,15 +1064,22 @@ async def prepare_payload(
                     state.engine._engine_state.flushed_through = _ct
                     _ft = _ct
             else:
-                # 5d. Warm-cache — ALWAYS defer mutations regardless of
-                # whether compacted_through == flushed_through.  The pending
-                # gap only matters for deciding when to advance flushed_through,
-                # not for skipping mutations.
-                _warm_defer = True
-                logger.info(
-                    "FLUSH_GATE: defer=True WARM cache_age=%.1fs ttl=%ds ct=%d ft=%d — mutations DEFERRED",
-                    _cache_age, _flush_ttl, _ct, _ft,
-                )
+                # 5d. Warm-cache — only defer mutations when there's
+                # pending compaction work (ct > ft).  When ct == ft the
+                # payload already reflects all compaction; mutations must
+                # still run to keep the payload within budget.
+                _flush_pending = _ct > _ft
+                if _flush_pending:
+                    _warm_defer = True
+                    logger.info(
+                        "FLUSH_GATE: defer=True WARM cache_age=%.1fs ttl=%ds ct=%d ft=%d — mutations DEFERRED",
+                        _cache_age, _flush_ttl, _ct, _ft,
+                    )
+                else:
+                    logger.info(
+                        "FLUSH_GATE: defer=True WARM cache_age=%.1fs ttl=%ds ct=%d ft=%d — no pending work, mutations RUN",
+                        _cache_age, _flush_ttl, _ct, _ft,
+                    )
     except (TypeError, ValueError, AttributeError) as _gate_exc:
         logger.warning("FLUSH_GATE: exception — %s", _gate_exc)
         pass  # Mocked or missing engine state — fall through with _warm_defer=False
