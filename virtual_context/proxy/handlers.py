@@ -1862,23 +1862,6 @@ async def _handle_vcattach(
                 except Exception:
                     pass
 
-    def _reset_target(tid):
-        if not _inner:
-            return
-        _load = getattr(_inner, "load_engine_state", None)
-        _save = getattr(_inner, "save_engine_state", None)
-        if callable(_load) and callable(_save):
-            existing = _load(tid)
-            if existing:
-                existing.compacted_through = 0
-                existing.flushed_through = 0
-                existing.last_request_time = 0.0
-                existing.last_compacted_turn = -1
-                existing.last_completed_turn = -1
-                existing.last_indexed_turn = -1
-                existing.turn_tag_entries = []
-                _save(existing)
-
     execute_attach(
         old_id=result.conversation_id,
         target_id=target_id,
@@ -1887,7 +1870,7 @@ async def _handle_vcattach(
         # ensures all workers see the reset state on next request.
         registry_invalidate=registry.remove_conversation if registry else None,
         delete_conversation=_full_delete,
-        reset_engine_state=_reset_target,
+        reset_engine_state=None,
     )
 
     text = f"Conversation attached to {target_label} ({target_id}). History restored."
@@ -1985,11 +1968,12 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     engine = state.engine
     es = engine._engine_state
     tti = engine._turn_tag_index
+    effective_conv_id = getattr(engine.config, "conversation_id", "") or conv_id
 
     label = ""
     if tenant_registry and tenant_id:
         labels = tenant_registry.get_conversation_labels(tenant_id)
-        label = labels.get(conv_id, "")
+        label = labels.get(effective_conv_id, "")
 
     turns = len(tti.entries) if tti else 0
     compacted = getattr(es, "compacted_through", 0)
@@ -2002,7 +1986,7 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         stats = getattr(store, "get_conversation_stats", None)
         if callable(stats):
             for s in stats():
-                if getattr(s, "conversation_id", "") == conv_id:
+                if getattr(s, "conversation_id", "") == effective_conv_id:
                     segments = getattr(s, "segment_count", 0)
                     break
     except Exception:
@@ -2017,7 +2001,7 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     active_tags = sorted(tti.get_active_tags(lookback=6)) if tti else []
 
     lines = [
-        f"Conversation: {conv_id}",
+        f"Conversation: {effective_conv_id}",
     ]
     if label:
         lines.append(f"Label: {label}")
@@ -2169,21 +2153,6 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
         _store = state.engine._store
         _inner = getattr(_store, '_store', _store)
 
-        def _reset_target(tid):
-            _load = getattr(_inner, 'load_engine_state', None)
-            _save = getattr(_inner, 'save_engine_state', None)
-            if callable(_load) and callable(_save):
-                existing = _load(tid)
-                if existing:
-                    existing.compacted_through = 0
-                    existing.flushed_through = 0
-                    existing.last_request_time = 0.0
-                    existing.last_compacted_turn = -1
-                    existing.last_completed_turn = -1
-                    existing.last_indexed_turn = -1
-                    existing.turn_tag_entries = []
-                    _save(existing)
-
         def _invalidate(tid):
             if registry._session_state_provider:
                 try:
@@ -2197,7 +2166,7 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             store=_inner,
             registry_invalidate=_invalidate,
             delete_conversation=lambda cid: registry.delete_conversation(tenant_id, cid),
-            reset_engine_state=_reset_target,
+            reset_engine_state=None,
         )
 
         marker = f"\n<!-- vc:conversation={target_id} -->"

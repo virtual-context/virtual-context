@@ -3,6 +3,8 @@
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+import asyncio
+
 import pytest
 
 
@@ -119,3 +121,91 @@ def test_build_fake_response_openai():
     assert "choices" in resp
     assert "Test response" in resp["choices"][0]["message"]["content"]
     assert "vc:conversation=conv-123" in resp["choices"][0]["message"]["content"]
+
+
+def test_vcstatus_uses_effective_engine_conversation_id():
+    from types import SimpleNamespace
+    from virtual_context.proxy.handlers import _handle_vcstatus
+
+    class _TurnTagIndex:
+        entries = [1, 2, 3]
+
+        def get_active_tags(self, lookback=6):
+            return {"alpha", "beta"}
+
+    class _Store:
+        def get_conversation_stats(self):
+            return [
+                SimpleNamespace(conversation_id="alias-conv", segment_count=1),
+                SimpleNamespace(conversation_id="target-conv", segment_count=7),
+            ]
+
+    state = SimpleNamespace(
+        engine=SimpleNamespace(
+            config=SimpleNamespace(conversation_id="target-conv"),
+            _engine_state=SimpleNamespace(compacted_through=4, conversation_generation=9),
+            _turn_tag_index=_TurnTagIndex(),
+            _store=_Store(),
+            _paging=SimpleNamespace(working_set={}),
+        )
+    )
+
+    text = _handle_vcstatus("alias-conv", state, tenant_registry=None, tenant_id=None)
+
+    assert "Conversation: target-conv" in text
+    assert "Segments: 7" in text
+
+
+def test_vcattach_preserves_target_engine_state():
+    from types import SimpleNamespace
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    class _InnerStore:
+        def __init__(self):
+            self.aliases = []
+            self.load_called = False
+            self.save_called = False
+            self.deleted = []
+
+        def save_conversation_alias(self, alias_id, target_id):
+            self.aliases.append((alias_id, target_id))
+
+        def load_engine_state(self, conversation_id):
+            self.load_called = True
+            return {"conversation_id": conversation_id}
+
+        def save_engine_state(self, snapshot):
+            self.save_called = True
+
+        def delete_conversation(self, conversation_id):
+            self.deleted.append(conversation_id)
+
+    inner = _InnerStore()
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+    registry = SimpleNamespace(remove_conversation=lambda cid: None)
+    result = SimpleNamespace(
+        vcattach_label="Cloud Claude",
+        conversation_id="old-shell-conv",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH Cloud Claude"}],
+    })
+
+    response = asyncio.run(
+        _handle_vcattach(
+            result,
+            fmt,
+            state,
+            registry,
+            labels={"target-conv": "Cloud Claude"},
+            conv_ids=["old-shell-conv", "target-conv"],
+        )
+    )
+
+    assert response.status_code == 200
+    assert inner.aliases == [("old-shell-conv", "target-conv")]
+    assert inner.load_called is False
+    assert inner.save_called is False
