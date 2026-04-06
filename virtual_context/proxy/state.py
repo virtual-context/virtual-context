@@ -141,6 +141,7 @@ class ProxyState:
         self._last_enriched_payload_tokens: int = 0
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         self._inbound_payload_token_cache = None
+        self._outbound_payload_token_cache = None
         self._chain_snapshot_cache: dict[str, object] = {
             "loaded": False,
             "refs_by_turn": {},
@@ -1098,6 +1099,7 @@ class ProxyState:
         self._last_enriched_payload_tokens = 0
         self._last_non_virtualizable_floor = 0
         self._inbound_payload_token_cache = None
+        self._outbound_payload_token_cache = None
         self._chain_snapshot_cache = {
             "loaded": False,
             "refs_by_turn": {},
