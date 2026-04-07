@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -557,19 +558,58 @@ class PayloadFormat(ABC):
                 return MediaBlock(b64, mt)
         return None
 
+    def _iter_nested_dicts(self, value: object) -> Iterator[dict]:
+        """Yield every nested dict inside *value* depth-first."""
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from self._iter_nested_dicts(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from self._iter_nested_dicts(child)
+
+    def _collect_media_from_value(self, value: object) -> list[MediaBlock]:
+        """Return all media blocks reachable within *value*."""
+        results: list[MediaBlock] = []
+        for block in self._iter_nested_dicts(value):
+            media = self._extract_media_from_block(block)
+            if media:
+                results.append(media)
+        return results
+
+    def _blank_non_token_fields_in_value(self, value: object) -> list[tuple[dict, str, str]]:
+        """Blank fields that should not be counted as prompt text."""
+        saved: list[tuple[dict, str, str]] = []
+        for block in self._iter_nested_dicts(value):
+            source = block.get("source")
+            if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
+                saved.append((source, "data", source["data"]))
+                source["data"] = ""
+            elif block.get("type") == "image_url":
+                url = block.get("image_url", {}).get("url", "")
+                if isinstance(url, str) and ";base64," in url:
+                    saved.append((block["image_url"], "url", url))
+                    block["image_url"]["url"] = url.split(";base64,")[0] + ";base64,"
+            elif "inline_data" in block:
+                inline = block.get("inline_data")
+                if isinstance(inline, dict) and inline.get("data"):
+                    saved.append((inline, "data", inline["data"]))
+                    inline["data"] = ""
+            elif block.get("type") == "input_image":
+                url = block.get("image_url", "")
+                if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                    saved.append((block, "image_url", url))
+                    block["image_url"] = url.split(";base64,")[0] + ";base64,"
+            if block.get("type") == "thinking" and isinstance(block.get("signature"), str) and block.get("signature"):
+                saved.append((block, "signature", block["signature"]))
+                block["signature"] = ""
+        return saved
+
     def _collect_media(self, body: dict) -> list[MediaBlock]:
         """Return all base64 media blocks found in the payload."""
         results: list[MediaBlock] = []
         for msg in self.get_messages(body):
-            content = msg.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                media = self._extract_media_from_block(block)
-                if media:
-                    results.append(media)
+            results.extend(self._collect_media_from_value(msg))
         return results
 
     # -- Payload token estimation --------------------------------------------
@@ -609,14 +649,12 @@ class PayloadFormat(ABC):
         *,
         serialized_json: str | None = None,
     ) -> int:
-        if not media_list:
+        saved = self._blank_media_data(body)
+        if not media_list and not saved:
             if serialized_json is None:
                 serialized_json = json.dumps(body, default=str)
             return self._count(serialized_json)
 
-        # Blank base64 in the source dicts, serialize, count, restore.
-        # O(n) serialization instead of O(n*m) str.replace on the JSON string.
-        saved = self._blank_media_data(body)
         stripped_json = json.dumps(body, default=str)
         self._restore_media_data(body, saved)
 
@@ -731,24 +769,14 @@ class PayloadFormat(ABC):
         )
 
     def _blank_media_data(self, body: dict) -> list[tuple[dict, str, str]]:
-        """Blank base64 data in all media source dicts. Returns save list for restore."""
+        """Blank non-token payload fields before estimation.
+
+        This strips raw base64 media and Anthropic thinking signatures anywhere
+        inside message payloads, including nested tool_result content.
+        """
         saved = []
         for msg in self.get_messages(body):
-            content = msg.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                source = block.get("source")
-                if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
-                    saved.append((source, "data", source["data"]))
-                    source["data"] = ""
-                elif block.get("type") == "image_url":
-                    url = block.get("image_url", {}).get("url", "")
-                    if isinstance(url, str) and ";base64," in url:
-                        saved.append((block["image_url"], "url", url))
-                        block["image_url"]["url"] = url.split(";base64,")[0] + ";base64,"
+            saved.extend(self._blank_non_token_fields_in_value(msg))
         return saved
 
     @staticmethod
@@ -759,35 +787,11 @@ class PayloadFormat(ABC):
 
     def estimate_message_tokens(self, msg: dict) -> int:
         """Count tokens for a single message/item, using media formulas for base64 blocks."""
-        content = msg.get("content", "")
-        if not isinstance(content, list):
-            return self._count(json.dumps(msg, default=str))
-
-        media_list = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            media = self._extract_media_from_block(block)
-            if media:
-                media_list.append(media)
-
-        if not media_list:
-            return self._count(json.dumps(msg, default=str))
-
-        # Blank base64 in source dicts, serialize, count, restore
-        saved = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            source = block.get("source")
-            if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
-                saved.append((source, "data", source["data"]))
-                source["data"] = ""
-            elif block.get("type") == "image_url":
-                url = block.get("image_url", {}).get("url", "")
-                if isinstance(url, str) and ";base64," in url:
-                    saved.append((block["image_url"], "url", url))
-                    block["image_url"]["url"] = url.split(";base64,")[0] + ";base64,"
+        raw_json = json.dumps(msg, default=str)
+        media_list = self._collect_media_from_value(msg)
+        saved = self._blank_non_token_fields_in_value(msg)
+        if not media_list and not saved:
+            return self._count(raw_json)
         stripped_json = json.dumps(msg, default=str)
         for container, key, original in saved:
             container[key] = original
@@ -1072,6 +1076,16 @@ class PayloadFormat(ABC):
 class AnthropicFormat(PayloadFormat):
     """Anthropic Messages API format."""
 
+    _SYSTEM_SCALE = 1.032
+    _TOOLS_SCALE = 1.08
+    _USER_TEXT_SCALE = 1.05
+    _ASSISTANT_TEXT_SCALE = 1.33
+    _TOOL_NAME_SCALE = 1.10
+    _TOOL_USE_INPUT_SCALE = 1.255
+    _TOOL_RESULT_TEXT_SCALE = 1.055
+    _THINKING_SIGNATURE_SCALE = 0.226
+    _TOOL_CALL_ID_TOKENS = 22
+    _IMAGE_MEDIA_SCALE = 0.85
     _CACHE_BREAKPOINT = {"type": "ephemeral"}
 
     @property
@@ -1481,16 +1495,168 @@ class AnthropicFormat(PayloadFormat):
         content = response_body.get("content", [])
         return _last_text_block(content)
 
+    @staticmethod
+    def _scale_tokens(tokens: int, factor: float) -> int:
+        if tokens <= 0:
+            return 0
+        return max(1, int(math.ceil(tokens * factor)))
+
+    def _estimate_scaled_text(self, text: str, factor: float) -> int:
+        if not isinstance(text, str) or not text:
+            return 0
+        return self._scale_tokens(self._count(text), factor)
+
+    def _estimate_signature_tokens(self, signature: str) -> int:
+        if not isinstance(signature, str) or not signature:
+            return 0
+        return self._scale_tokens(self._count(signature), self._THINKING_SIGNATURE_SCALE)
+
+    def _role_text_scale(self, role: str | None) -> float:
+        if role == "assistant":
+            return self._ASSISTANT_TEXT_SCALE
+        if role == "user":
+            return self._USER_TEXT_SCALE
+        return 1.0
+
+    def _estimate_media_tokens(self, media: MediaBlock) -> int:
+        base = _estimate_media_tokens(media)
+        if media.media_type.lower().startswith("image/"):
+            return self._scale_tokens(base, self._IMAGE_MEDIA_SCALE)
+        return base
+
     def _estimate_system_tokens(self, body: dict) -> int:
         sys_raw = body.get("system", "")
         if isinstance(sys_raw, str):
-            return self._count(sys_raw)
+            return self._estimate_scaled_text(sys_raw, self._SYSTEM_SCALE)
         if isinstance(sys_raw, list):
             return sum(
-                self._count(b.get("text", ""))
+                self._estimate_scaled_text(b.get("text", ""), self._SYSTEM_SCALE)
                 for b in sys_raw if isinstance(b, dict)
             )
         return 0
+
+    def _estimate_content_value_tokens(
+        self,
+        value: object,
+        *,
+        role: str | None = None,
+        in_tool_result: bool = False,
+    ) -> int:
+        """Count Anthropic-visible semantic content, not wrapper JSON."""
+        if isinstance(value, str):
+            factor = self._TOOL_RESULT_TEXT_SCALE if in_tool_result else self._role_text_scale(role)
+            return self._estimate_scaled_text(value, factor)
+        if isinstance(value, list):
+            total = 0
+            for item in value:
+                if isinstance(item, dict):
+                    total += self._estimate_content_block_tokens(
+                        item,
+                        role=role,
+                        in_tool_result=in_tool_result,
+                    )
+                elif isinstance(item, str):
+                    factor = self._TOOL_RESULT_TEXT_SCALE if in_tool_result else self._role_text_scale(role)
+                    total += self._estimate_scaled_text(item, factor)
+            return total
+        if isinstance(value, dict):
+            return self._estimate_content_block_tokens(
+                value,
+                role=role,
+                in_tool_result=in_tool_result,
+            )
+        return 0
+
+    def _estimate_content_block_tokens(
+        self,
+        block: dict,
+        *,
+        role: str | None = None,
+        in_tool_result: bool = False,
+    ) -> int:
+        """Count semantic payload fields for one Anthropic content block."""
+        btype = block.get("type")
+        if btype == "text":
+            factor = self._TOOL_RESULT_TEXT_SCALE if in_tool_result else self._role_text_scale(role)
+            return self._estimate_scaled_text(block.get("text", ""), factor)
+        if btype == "thinking":
+            return (
+                self._estimate_scaled_text(block.get("text", ""), self._ASSISTANT_TEXT_SCALE)
+                + self._estimate_scaled_text(block.get("thinking", ""), self._ASSISTANT_TEXT_SCALE)
+                + self._estimate_signature_tokens(block.get("signature", ""))
+            )
+        if btype == "tool_use":
+            total = 0
+            if isinstance(block.get("id"), str):
+                total += self._TOOL_CALL_ID_TOKENS
+            if isinstance(block.get("name"), str):
+                total += self._estimate_scaled_text(block["name"], self._TOOL_NAME_SCALE)
+            if "input" in block:
+                total += self._scale_tokens(
+                    self._count(json.dumps(block.get("input"), sort_keys=True, default=str)),
+                    self._TOOL_USE_INPUT_SCALE,
+                )
+            return total
+        if btype == "tool_result":
+            total = 0
+            if isinstance(block.get("tool_use_id"), str):
+                total += self._TOOL_CALL_ID_TOKENS
+            total += self._estimate_content_value_tokens(
+                block.get("content", ""),
+                role=role,
+                in_tool_result=True,
+            )
+            return total
+
+        total = 0
+        if isinstance(block.get("text"), str):
+            factor = self._TOOL_RESULT_TEXT_SCALE if in_tool_result else self._role_text_scale(role)
+            total += self._estimate_scaled_text(block["text"], factor)
+        if "content" in block:
+            total += self._estimate_content_value_tokens(
+                block.get("content"),
+                role=role,
+                in_tool_result=in_tool_result,
+            )
+        if "input" in block:
+            total += self._scale_tokens(
+                self._count(json.dumps(block.get("input"), sort_keys=True, default=str)),
+                self._TOOL_USE_INPUT_SCALE,
+            )
+        return total
+
+    def estimate_message_tokens(self, msg: dict) -> int:
+        """Anthropic tokens track semantic content more closely than request JSON wrappers."""
+        content = msg.get("content", "")
+        text_tokens = self._estimate_content_value_tokens(content, role=msg.get("role"))
+        media_tokens = sum(self._estimate_media_tokens(m) for m in self._collect_media_from_value(msg))
+        return max(1, text_tokens + media_tokens)
+
+    def estimate_tools_tokens(self, body: dict) -> int:
+        tools = body.get("tools", [])
+        if not tools:
+            return 0
+        return self._scale_tokens(self._count(json.dumps(tools)), self._TOOLS_SCALE)
+
+    def estimate_payload_tokens(self, body: dict) -> int:
+        """Anthropic payload counting should follow visible system/tools/messages, not JSON scaffolding."""
+        messages = self.get_messages(body)
+        message_tokens = sum(self.estimate_message_tokens(msg) for msg in messages)
+        separator_tokens = self._count("," * max(0, len(messages) - 1))
+        return (
+            self._estimate_system_tokens(body)
+            + self.estimate_tools_tokens(body)
+            + message_tokens
+            + separator_tokens
+        )
+
+    def estimate_payload_tokens_from_serialized(
+        self,
+        body: dict,
+        serialized_json: str,
+    ) -> int:
+        """Serialized JSON wrappers are not a good proxy for Anthropic prompt tokens."""
+        return self.estimate_payload_tokens(body)
 
     @property
     def supports_tool_interception(self) -> bool:
@@ -2126,45 +2292,15 @@ class GeminiFormat(PayloadFormat):
         return None
 
     def _collect_media(self, body: dict) -> list[MediaBlock]:
-        """Gemini: iterate parts for inline_data blocks."""
+        """Gemini: recurse through parts for inline_data blocks."""
         results: list[MediaBlock] = []
         for msg in self.get_messages(body):
-            parts = msg.get("parts", [])
-            if not isinstance(parts, list):
-                continue
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                media = self._extract_media_from_block(part)
-                if media:
-                    results.append(media)
+            results.extend(self._collect_media_from_value(msg))
         return results
 
     def estimate_message_tokens(self, msg: dict) -> int:
-        """Gemini: check parts for inline_data blocks."""
-        raw_json = json.dumps(msg, default=str)
-        parts = msg.get("parts", [])
-        if not isinstance(parts, list):
-            return self._count(raw_json)
-
-        media_list = []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            media = self._extract_media_from_block(part)
-            if media:
-                media_list.append(media)
-
-        if not media_list:
-            return self._count(raw_json)
-
-        stripped_json = raw_json
-        for media in media_list:
-            stripped_json = stripped_json.replace(media.b64_data, "", 1)
-
-        text_tokens = self._count(stripped_json)
-        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
-        return max(1, text_tokens + media_tokens)
+        """Gemini: recurse through parts for media-aware token counting."""
+        return super().estimate_message_tokens(msg)
 
     # -- Context injection --
 
@@ -2922,66 +3058,15 @@ class OpenAIResponsesFormat(PayloadFormat):
         return super()._extract_media_from_block(block)
 
     def _collect_media(self, body: dict) -> list[MediaBlock]:
-        """Responses: check both content arrays and bare input_image items."""
+        """Responses: recurse through items for media blocks."""
         results: list[MediaBlock] = []
         for item in self.get_messages(body):
-            if not isinstance(item, dict):
-                continue
-            # Bare input_image items
-            if item.get("type") == "input_image":
-                url = item.get("image_url", "")
-                if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                    header, b64 = url.split(";base64,", 1)
-                    mt = header.replace("data:", "") or "image/unknown"
-                    results.append(MediaBlock(b64, mt))
-                continue
-            # Items with content arrays
-            content = item.get("content", "")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                media = self._extract_media_from_block(block)
-                if media:
-                    results.append(media)
+            results.extend(self._collect_media_from_value(item))
         return results
 
     def estimate_message_tokens(self, msg: dict) -> int:
-        """Responses: handle bare input_image items and content arrays."""
-        raw_json = json.dumps(msg, default=str)
-        if not isinstance(msg, dict):
-            return self._count(raw_json)
-
-        media_list = []
-
-        # Bare input_image item
-        if msg.get("type") == "input_image":
-            url = msg.get("image_url", "")
-            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                header, b64 = url.split(";base64,", 1)
-                mt = header.replace("data:", "") or "image/unknown"
-                media_list.append(MediaBlock(b64, mt))
-        else:
-            # Content array
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    media = self._extract_media_from_block(block)
-                    if media:
-                        media_list.append(media)
-
-        if not media_list:
-            return self._count(raw_json)
-
-        stripped_json = raw_json
-        for media in media_list:
-            stripped_json = stripped_json.replace(media.b64_data, "", 1)
-        text_tokens = self._count(stripped_json)
-        media_tokens = sum(_estimate_media_tokens(m) for m in media_list)
-        return max(1, text_tokens + media_tokens)
+        """Responses: recurse through content for media-aware token counting."""
+        return super().estimate_message_tokens(msg)
 
     # -- Fingerprinting --
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ from virtual_context.proxy.formats import (
     OpenAIFormat,
     OpenAIResponsesFormat,
     GeminiFormat,
+    _estimate_media_tokens,
     detect_format,
     get_format,
 )
@@ -28,6 +30,10 @@ from virtual_context.proxy.server import (
     _last_text_block,
     _strip_envelope,
     _strip_vc_prompt,
+)
+
+_ONE_BY_ONE_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a4sAAAAASUVORK5CYII="
 )
 
 
@@ -235,6 +241,125 @@ class TestAnthropicFormat:
         assert content[1]["text"] == "follow-up"
         assert content[1]["cache_control"] == {"type": "ephemeral"}
         assert content[2]["text"].startswith("<system-reminder>")
+
+    def test_estimate_message_tokens_counts_calibrated_tool_result_image_and_signature(self):
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [
+                        {"type": "text", "text": "Screenshot captured"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _ONE_BY_ONE_PNG_B64,
+                            },
+                        },
+                    ],
+                },
+                {"type": "thinking", "text": "Working", "signature": "sig" * 1000},
+            ],
+        }
+        original = copy.deepcopy(msg)
+        estimate = self.fmt.estimate_message_tokens(msg)
+
+        media_tokens = sum(self.fmt._estimate_media_tokens(m) for m in self.fmt._collect_media_from_value(msg))
+        expected = (
+            self.fmt._TOOL_CALL_ID_TOKENS
+            + math.ceil(self.fmt._count("Screenshot captured") * self.fmt._TOOL_RESULT_TEXT_SCALE)
+            + math.ceil(self.fmt._count("Working") * self.fmt._ASSISTANT_TEXT_SCALE)
+            + math.ceil(self.fmt._count("sig" * 1000) * self.fmt._THINKING_SIGNATURE_SCALE)
+            + media_tokens
+        )
+
+        assert estimate == expected
+        assert msg == original
+
+    def test_estimate_payload_tokens_from_serialized_ignores_nested_tool_result_image(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": [
+                                {"type": "text", "text": "Screenshot captured"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _ONE_BY_ONE_PNG_B64,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "system": "You are helpful.",
+        }
+        serialized = json.dumps(body, default=str)
+        estimate = self.fmt.estimate_payload_tokens_from_serialized(body, serialized)
+
+        media_tokens = sum(self.fmt._estimate_media_tokens(m) for m in self.fmt._collect_media(body))
+        expected = (
+            math.ceil(self.fmt._count("You are helpful.") * self.fmt._SYSTEM_SCALE)
+            + self.fmt._TOOL_CALL_ID_TOKENS
+            + math.ceil(self.fmt._count("Screenshot captured") * self.fmt._TOOL_RESULT_TEXT_SCALE)
+            + media_tokens
+        )
+        assert estimate == expected
+
+    def test_estimate_message_tokens_counts_tool_use_semantics_not_wrapper_json(self):
+        fmt = AnthropicFormat()
+        fmt.set_token_counter(lambda text: len(text) if text else 0)
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "probe_tool",
+                    "input": {"path": "/tmp/demo.txt", "limit": 5},
+                }
+            ],
+        }
+        expected = (
+            fmt._TOOL_CALL_ID_TOKENS
+            + math.ceil(len("probe_tool") * fmt._TOOL_NAME_SCALE)
+            + math.ceil(
+                len(json.dumps({"path": "/tmp/demo.txt", "limit": 5}, sort_keys=True))
+                * fmt._TOOL_USE_INPUT_SCALE
+            )
+        )
+        assert fmt.estimate_message_tokens(msg) == expected
+
+    def test_estimate_message_tokens_tool_id_length_does_not_change_estimate(self):
+        fmt = AnthropicFormat()
+        fmt.set_token_counter(lambda text: len(text) if text else 0)
+        short = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "probe_tool", "input": {"path": "/tmp/demo.txt"}}],
+        }
+        long = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_0123456789abcdef", "name": "probe_tool", "input": {"path": "/tmp/demo.txt"}}],
+        }
+        assert fmt.estimate_message_tokens(short) == fmt.estimate_message_tokens(long)
+
+    def test_estimate_tools_tokens_scales_anthropic_tools(self):
+        fmt = AnthropicFormat()
+        fmt.set_token_counter(lambda text: len(text) if text else 0)
+        body = {"tools": [{"name": "probe_tool", "description": "Expand topic", "input_schema": {"type": "object"}}]}
+        raw = len(json.dumps(body["tools"]))
+        assert fmt.estimate_tools_tokens(body) == math.ceil(raw * fmt._TOOLS_SCALE)
 
     def test_extract_conversation_id(self):
         body = {"messages": [
@@ -460,6 +585,34 @@ class TestGeminiFormat:
     def test_get_messages(self):
         body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
         assert len(self.fmt.get_messages(body)) == 1
+
+    def test_estimate_message_tokens_recurse_nested_inline_data(self):
+        msg = {
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "name": "chrome",
+                        "response": {
+                            "content": [
+                                {"text": "screenshot"},
+                                {
+                                    "inline_data": {
+                                        "mime_type": "image/png",
+                                        "data": _ONE_BY_ONE_PNG_B64,
+                                    }
+                                },
+                            ]
+                        },
+                    }
+                }
+            ],
+        }
+        estimate = self.fmt.estimate_message_tokens(msg)
+        blanked = copy.deepcopy(msg)
+        blanked["parts"][0]["functionResponse"]["response"]["content"][1]["inline_data"]["data"] = ""
+        expected = self.fmt._count(json.dumps(blanked, default=str)) + 1
+        assert estimate == expected
 
     def test_inject_context(self):
         body = {"contents": [
