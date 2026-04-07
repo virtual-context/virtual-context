@@ -1724,8 +1724,9 @@ async def prepare_payload(
     # Upstream context enforcement — trim if enriched payload exceeds upstream limit
     _upstream_trimmed = 0
     _pre_trim_tokens = outbound_tokens
+    _prompt_limit = _upstream_limit - body.get("max_tokens", 4096)
     _upstream_trim_stage = time.monotonic()
-    if outbound_tokens > _upstream_limit - body.get("max_tokens", 4096):
+    if outbound_tokens > _prompt_limit:
         from .message_filter import trim_to_upstream_limit
         enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
         if _upstream_trimmed:
@@ -1748,6 +1749,25 @@ async def prepare_payload(
                 "final_tokens": outbound_tokens,
             })
     _note_prep("upstream_trim", _upstream_trim_stage)
+    if outbound_tokens > _prompt_limit:
+        _overflow = outbound_tokens - _prompt_limit
+        logger.error(
+            "UPSTREAM_LIMIT_EXCEEDED: payload=%dt still exceeds prompt_limit=%dt by %dt after trim "
+            "(trimmed_pairs=%d, context_window=%dt). Continuing with oversized payload.",
+            outbound_tokens,
+            _prompt_limit,
+            _overflow,
+            _upstream_trimmed,
+            _upstream_limit,
+        )
+        metrics.record({
+            "type": "upstream_limit_exceeded",
+            "final_tokens": outbound_tokens,
+            "prompt_limit": _prompt_limit,
+            "upstream_limit": _upstream_limit,
+            "overflow": _overflow,
+            "pairs_trimmed": _upstream_trimmed,
+        })
 
     # PROXY-025: Over-budget alert
     if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
