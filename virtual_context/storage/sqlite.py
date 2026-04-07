@@ -401,25 +401,32 @@ class SQLiteStore(ContextStore):
             pk_names = [row[1] for row in sorted(cols, key=lambda row: row[5]) if row[5] > 0]
             if col_names and (
                 "conversation_id" not in col_names
-                or pk_names != ["conversation_id", "turn"]
+                or "turn_id" not in col_names
+                or pk_names != ["conversation_id", "turn", "turn_id"]
             ):
+                select_cols = ["turn", "ts", "recorded_at", "data_json"]
+                if "turn_id" in col_names:
+                    select_cols.append("turn_id")
                 legacy_rows = conn.execute(
-                    "SELECT turn, ts, recorded_at, data_json FROM request_captures"
+                    f"SELECT {', '.join(select_cols)} FROM request_captures"
                 ).fetchall()
-                migrated_rows: list[tuple[str, int, str, float, str]] = []
+                migrated_rows: list[tuple[str, int, str, str, float, str]] = []
                 for row in legacy_rows:
                     data_json = row["data_json"]
                     conversation_id = ""
                     turn = row["turn"]
+                    turn_id = row["turn_id"] if "turn_id" in row.keys() else ""
                     try:
                         payload = json.loads(data_json)
                         conversation_id = payload.get("conversation_id", "") or ""
                         turn = int(payload.get("turn", turn))
+                        turn_id = payload.get("turn_id", turn_id) or ""
                     except (json.JSONDecodeError, TypeError, ValueError):
                         pass
                     migrated_rows.append((
                         conversation_id,
                         turn,
+                        turn_id,
                         row["ts"],
                         row["recorded_at"],
                         data_json,
@@ -429,10 +436,11 @@ class SQLiteStore(ContextStore):
                     CREATE TABLE request_captures_new (
                         conversation_id TEXT NOT NULL DEFAULT '',
                         turn INTEGER NOT NULL,
+                        turn_id TEXT NOT NULL DEFAULT '',
                         ts TEXT NOT NULL,
                         recorded_at REAL NOT NULL,
                         data_json TEXT NOT NULL,
-                        PRIMARY KEY (conversation_id, turn)
+                        PRIMARY KEY (conversation_id, turn, turn_id)
                     );
                     DROP TABLE request_captures;
                     ALTER TABLE request_captures_new RENAME TO request_captures;
@@ -440,8 +448,8 @@ class SQLiteStore(ContextStore):
                 if migrated_rows:
                     conn.executemany(
                         """INSERT OR REPLACE INTO request_captures
-                        (conversation_id, turn, ts, recorded_at, data_json)
-                        VALUES (?, ?, ?, ?, ?)""",
+                        (conversation_id, turn, turn_id, ts, recorded_at, data_json)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
                         migrated_rows,
                     )
         except sqlite3.OperationalError:
@@ -607,10 +615,11 @@ class SQLiteStore(ContextStore):
 CREATE TABLE IF NOT EXISTS request_captures (
     conversation_id TEXT NOT NULL DEFAULT '',
     turn INTEGER NOT NULL,
+    turn_id TEXT NOT NULL DEFAULT '',
     ts TEXT NOT NULL,
     recorded_at REAL NOT NULL,
     data_json TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, turn)
+    PRIMARY KEY (conversation_id, turn, turn_id)
 );
         """)
         # Tag summary FTS for BM25 retrieval scoring
@@ -2682,13 +2691,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         import time as _time
         conversation_id = capture.get("conversation_id", "") or ""
+        turn_id = capture.get("turn_id", "") or ""
         conn.execute(
             """INSERT OR REPLACE INTO request_captures
-            (conversation_id, turn, ts, recorded_at, data_json)
-            VALUES (?, ?, ?, ?, ?)""",
+            (conversation_id, turn, turn_id, ts, recorded_at, data_json)
+            VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 conversation_id,
                 capture["turn"],
+                turn_id,
                 capture.get("ts", ""),
                 _time.time(),
                 json.dumps(capture),
@@ -2697,8 +2708,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.execute(
             """DELETE FROM request_captures
             WHERE conversation_id = ?
-              AND (conversation_id, turn) NOT IN (
-                SELECT conversation_id, turn
+              AND (conversation_id, turn, turn_id) NOT IN (
+                SELECT conversation_id, turn, turn_id
                 FROM request_captures
                 WHERE conversation_id = ?
                 ORDER BY recorded_at DESC LIMIT 50

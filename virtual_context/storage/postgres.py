@@ -174,10 +174,11 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
 CREATE TABLE IF NOT EXISTS request_captures (
     conversation_id TEXT NOT NULL DEFAULT '',
     turn INTEGER NOT NULL,
+    turn_id TEXT NOT NULL DEFAULT '',
     ts TEXT NOT NULL,
     recorded_at DOUBLE PRECISION NOT NULL,
     data_json TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, turn)
+    PRIMARY KEY (conversation_id, turn, turn_id)
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -491,6 +492,16 @@ class PostgresStore(ContextStore):
                             SET conversation_id = COALESCE(data_json::jsonb->>'conversation_id', '');
                         END IF;
 
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='request_captures' AND column_name='turn_id'
+                        ) THEN
+                            ALTER TABLE request_captures
+                                ADD COLUMN turn_id TEXT NOT NULL DEFAULT '';
+                            UPDATE request_captures
+                            SET turn_id = COALESCE(data_json::jsonb->>'turn_id', '');
+                        END IF;
+
                         SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
                         INTO pk_cols
                         FROM information_schema.table_constraints tc
@@ -501,7 +512,7 @@ class PostgresStore(ContextStore):
                         WHERE tc.table_name = 'request_captures'
                           AND tc.constraint_type = 'PRIMARY KEY';
 
-                        IF pk_cols IS NULL OR pk_cols <> ARRAY['conversation_id', 'turn'] THEN
+                        IF pk_cols IS NULL OR pk_cols <> ARRAY['conversation_id', 'turn', 'turn_id'] THEN
                             IF EXISTS (
                                 SELECT 1 FROM information_schema.table_constraints
                                 WHERE table_name='request_captures'
@@ -510,7 +521,7 @@ class PostgresStore(ContextStore):
                                 ALTER TABLE request_captures DROP CONSTRAINT request_captures_pkey;
                             END IF;
                             ALTER TABLE request_captures
-                                ADD PRIMARY KEY (conversation_id, turn);
+                                ADD PRIMARY KEY (conversation_id, turn, turn_id);
                         END IF;
                     END IF;
                 END $$;
@@ -1405,17 +1416,19 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         import time as _time
         conversation_id = capture.get("conversation_id", "") or ""
+        turn_id = capture.get("turn_id", "") or ""
         conn.execute(
             """INSERT INTO request_captures
-            (conversation_id, turn, ts, recorded_at, data_json)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (conversation_id, turn) DO UPDATE SET
+            (conversation_id, turn, turn_id, ts, recorded_at, data_json)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (conversation_id, turn, turn_id) DO UPDATE SET
                 ts=EXCLUDED.ts,
                 recorded_at=EXCLUDED.recorded_at,
                 data_json=EXCLUDED.data_json""",
             (
                 conversation_id,
                 capture["turn"],
+                turn_id,
                 capture.get("ts", ""),
                 _time.time(),
                 json.dumps(capture),
@@ -1424,8 +1437,8 @@ class PostgresStore(ContextStore):
         conn.execute(
             """DELETE FROM request_captures
             WHERE conversation_id = %s
-              AND (conversation_id, turn) NOT IN (
-                SELECT conversation_id, turn
+              AND (conversation_id, turn, turn_id) NOT IN (
+                SELECT conversation_id, turn, turn_id
                 FROM request_captures
                 WHERE conversation_id = %s
                 ORDER BY recorded_at DESC LIMIT 50

@@ -799,6 +799,7 @@ class ProxyState:
                 self.metrics.update_request_tags(
                     turn, response_tags=response_tags,
                     conversation_id=conversation_id,
+                    turn_id=turn_id,
                 )
                 self.metrics.record({
                     "type": "turn_complete",
