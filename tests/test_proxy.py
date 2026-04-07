@@ -965,6 +965,47 @@ class TestRequestCapture:
         m = ProxyMetrics()
         m.update_request_tags(99, response_tags=["x"])  # should not raise
 
+    def test_same_turn_different_turn_ids_do_not_collide(self):
+        m = ProxyMetrics()
+        m.capture_request(
+            7,
+            {"messages": []},
+            "anthropic",
+            conversation_id="conv-1",
+            turn_id="req-a",
+            inbound_tags=["first"],
+        )
+        m.capture_request(
+            7,
+            {"messages": []},
+            "anthropic",
+            conversation_id="conv-1",
+            turn_id="req-b",
+            inbound_tags=["second"],
+        )
+        m.capture_response(
+            7,
+            {"content": "a"},
+            conversation_id="conv-1",
+            turn_id="req-a",
+            upstream_input_tokens=100,
+        )
+        m.capture_response(
+            7,
+            {"content": "b"},
+            conversation_id="conv-1",
+            turn_id="req-b",
+            upstream_input_tokens=200,
+        )
+
+        req_a = m.get_captured_request(7, conversation_id="conv-1", turn_id="req-a")
+        req_b = m.get_captured_request(7, conversation_id="conv-1", turn_id="req-b")
+
+        assert req_a["inbound_tags"] == ["first"]
+        assert req_a["upstream_input_tokens"] == 100
+        assert req_b["inbound_tags"] == ["second"]
+        assert req_b["upstream_input_tokens"] == 200
+
 
 # ---------------------------------------------------------------------------
 # Request event model field

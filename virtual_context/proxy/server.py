@@ -857,6 +857,7 @@ async def prepare_payload(
 
             metrics.capture_request(
                 turn, body, api_format,
+                turn_id=_turn_id,
                 conversation_id=_conversation_id,
                 passthrough=True,
                 inbound_tokens=_inbound_tokens,
@@ -1961,6 +1962,7 @@ async def prepare_payload(
     # Capture pre-filter request body for dashboard inspection
     metrics.capture_request(
         turn, _pre_filter_body, api_format,
+        turn_id=_turn_id,
         inbound_tags=assembled.matched_tags if assembled else [],
         conversation_id=_conversation_id,
         inbound_tokens=inbound_tokens,
@@ -1988,6 +1990,7 @@ async def prepare_payload(
         turn,
         enriched_body,
         conversation_id=_conversation_id,
+        turn_id=_turn_id,
     )
 
     return PreparedPayload(

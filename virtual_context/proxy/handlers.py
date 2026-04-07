@@ -624,6 +624,7 @@ async def _handle_streaming(
                 cache_creation_input_tokens=_usage.get("cache_creation_input_tokens", 0),
                 cache_read_input_tokens=_usage.get("cache_read_input_tokens", 0),
                 conversation_id=conversation_id,
+                turn_id=turn_id,
             )
         # Log upstream LLM call to telemetry ledger
         if state and hasattr(state.engine, '_telemetry'):
@@ -1700,6 +1701,7 @@ async def _handle_non_streaming(
             cache_creation_input_tokens=_ns_usage.get("cache_creation_input_tokens", 0),
             cache_read_input_tokens=_ns_usage.get("cache_read_input_tokens", 0),
             conversation_id=conversation_id,
+            turn_id=turn_id,
         )
 
     # Extract and record assistant text

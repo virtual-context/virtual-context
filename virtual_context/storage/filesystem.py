@@ -1175,13 +1175,19 @@ class FilesystemStore(ContextStore):
                 except (json.JSONDecodeError, OSError):
                     existing = []
             conv_id = capture.get("conversation_id", "") or ""
-            # Upsert by (conversation_id, turn)
+            turn_id = capture.get("turn_id", "") or ""
+
+            def _capture_key(item: dict) -> tuple[str, int | str, str]:
+                return (
+                    (item.get("conversation_id", "") or ""),
+                    item.get("turn"),
+                    (item.get("turn_id", "") or ""),
+                )
+
+            # Upsert by (conversation_id, turn, turn_id)
             existing = [
                 c for c in existing
-                if not (
-                    c.get("turn") == capture.get("turn")
-                    and (c.get("conversation_id", "") or "") == conv_id
-                )
+                if _capture_key(c) != (conv_id, capture.get("turn"), turn_id)
             ]
             existing.append(capture)
             if conv_id:
@@ -1191,12 +1197,12 @@ class FilesystemStore(ContextStore):
                 ]
                 scoped.sort(key=lambda c: c.get("ts", ""))
                 keep = {
-                    ((c.get("conversation_id", "") or ""), c.get("turn"))
+                    _capture_key(c)
                     for c in scoped[-50:]
                 }
                 existing = [
                     c for c in existing
-                    if ((c.get("conversation_id", "") or ""), c.get("turn")) in keep
+                    if _capture_key(c) in keep
                     or (c.get("conversation_id", "") or "") != conv_id
                 ]
             captures_path.write_text(json.dumps(existing, indent=2))

@@ -175,6 +175,40 @@ class TestRequestCapturesPersistence:
         assert [c["model"] for c in store.load_request_captures(conversation_id="c1")] == ["model-a"]
         assert [c["model"] for c in store.load_request_captures(conversation_id="c2")] == ["model-b"]
 
+    def test_same_turns_are_isolated_by_turn_id(self, tmp_path):
+        store = SQLiteStore(tmp_path / "test.db")
+        for turn_id, model in (("req-a", "model-a"), ("req-b", "model-b")):
+            store.save_request_capture({
+                "turn": 7,
+                "turn_id": turn_id,
+                "ts": "2026-03-20T10:00:00+00:00",
+                "api_format": "anthropic",
+                "model": model,
+                "stream": False,
+                "message_count": 1,
+                "conversation_id": "c1",
+                "inbound_tags": [],
+                "response_tags": [],
+                "passthrough": False,
+                "inbound_tokens": 0,
+                "outbound_tokens": 0,
+                "inbound_bytes": 0,
+                "outbound_bytes": 0,
+                "context_tokens": 0,
+                "overhead_ms": 0,
+                "turns_dropped": 0,
+                "turns_stubbed": 0,
+                "message_preview": "",
+                "upstream_input_tokens": 0,
+                "upstream_output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            })
+
+        loaded = store.load_request_captures(conversation_id="c1")
+        assert len(loaded) == 2
+        assert sorted(c["turn_id"] for c in loaded) == ["req-a", "req-b"]
+
     def test_prune_turn_messages_keeps_suffix(self, tmp_path):
         store = SQLiteStore(tmp_path / "test.db")
         for turn in range(6):
@@ -287,6 +321,46 @@ class TestProxyMetricsStoreIntegration:
         loaded = store.load_request_captures()
         assert loaded[0]["upstream_input_tokens"] == 100
         assert loaded[0]["upstream_output_tokens"] == 50
+
+    def test_capture_response_uses_turn_id_when_turn_collides(self, tmp_path):
+        from virtual_context.proxy.metrics import ProxyMetrics
+
+        store = self._make_store(tmp_path)
+        m = ProxyMetrics(store=store)
+        m.capture_request(
+            turn=1,
+            body={"model": "test-a", "messages": []},
+            api_format="anthropic",
+            conversation_id="c1",
+            turn_id="req-a",
+        )
+        m.capture_request(
+            turn=1,
+            body={"model": "test-b", "messages": []},
+            api_format="anthropic",
+            conversation_id="c1",
+            turn_id="req-b",
+        )
+        m.capture_response(
+            turn=1,
+            body={"content": "hello-a"},
+            upstream_input_tokens=100,
+            conversation_id="c1",
+            turn_id="req-a",
+        )
+        m.capture_response(
+            turn=1,
+            body={"content": "hello-b"},
+            upstream_input_tokens=200,
+            conversation_id="c1",
+            turn_id="req-b",
+        )
+
+        loaded = sorted(
+            store.load_request_captures(conversation_id="c1"),
+            key=lambda capture: capture["turn_id"],
+        )
+        assert [capture["upstream_input_tokens"] for capture in loaded] == [100, 200]
 
     def test_update_tags_persists(self, tmp_path):
         from virtual_context.proxy.metrics import ProxyMetrics
