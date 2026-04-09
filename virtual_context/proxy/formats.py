@@ -1378,9 +1378,8 @@ class AnthropicFormat(PayloadFormat):
         return body
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        # Search FORWARD — the first marker is the original conversation.
-        # Later markers may be from orphan sessions that injected their own IDs.
-        for msg in body.get("messages", []):
+        # Search BACKWARD — the most recent assistant marker is authoritative.
+        for msg in reversed(body.get("messages", [])):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
@@ -1938,9 +1937,8 @@ class OpenAIFormat(PayloadFormat):
         return body
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        # Search FORWARD — the first marker is the original conversation.
-        # Later markers may be from orphan sessions that injected their own IDs.
-        for msg in body.get("messages", []):
+        # Search BACKWARD — the most recent assistant marker is authoritative.
+        for msg in reversed(body.get("messages", [])):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
@@ -2330,8 +2328,8 @@ class GeminiFormat(PayloadFormat):
     # -- Conversation markers --
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        # Search FORWARD — first marker is the original conversation.
-        for msg in body.get("contents", []):
+        # Search BACKWARD — the most recent model marker is authoritative.
+        for msg in reversed(body.get("contents", [])):
             if msg.get("role") != "model":
                 continue
             parts = msg.get("parts", [])
@@ -2905,11 +2903,11 @@ class OpenAIResponsesFormat(PayloadFormat):
     # -- Conversation markers --
 
     def extract_conversation_id(self, body: dict) -> str | None:
-        # Search FORWARD — first marker is the original conversation.
+        # Search BACKWARD — the most recent assistant marker is authoritative.
         items = body.get("input", [])
         if not isinstance(items, list):
             return None
-        for item in items:
+        for item in reversed(items):
             if not isinstance(item, dict) or item.get("role") != "assistant":
                 continue
             content = item.get("content", "")
