@@ -624,7 +624,7 @@ async def prepare_payload(
         return PreparedPayload(
             body=body,
             enriched_body=body,
-            conversation_id=state.engine.config.conversation_id if state else "",
+            conversation_id=state.engine.config.conversation_id if state else (inbound_conversation_id or ""),
             is_passthrough=False,
             turn=0,
             turn_id="",

@@ -1802,6 +1802,8 @@ async def _handle_vcattach(
     *,
     labels: dict | None = None,
     conv_ids: list | None = None,
+    tenant_registry=None,
+    tenant_id: str | None = None,
 ):
     """Handle VCATTACH command — resolve target, execute attach, return fake response."""
     from starlette.responses import StreamingResponse, JSONResponse
@@ -1840,6 +1842,15 @@ async def _handle_vcattach(
     _inner = getattr(_store, '_store', _store) if _store else None
 
     def _full_delete(cid):
+        if tenant_registry and tenant_id:
+            if registry:
+                try:
+                    registry.remove_conversation(cid)
+                except Exception:
+                    pass
+            tenant_registry.delete_conversation(tenant_id, cid, store=_inner)
+            return
+
         if _inner:
             begin = getattr(_inner, "begin_conversation_deletion", None)
             if callable(begin):
@@ -1909,6 +1920,7 @@ async def _handle_vc_command(
         return await _handle_vcattach(
             result, fmt, state, registry,
             labels=labels, conv_ids=conv_ids,
+            tenant_registry=tenant_registry, tenant_id=tenant_id,
         )
 
     if cmd == "label":
@@ -1965,7 +1977,15 @@ def _handle_vclabel(label: str, conv_id: str, state, tenant_registry, tenant_id)
 def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     """Return conversation status summary."""
     if not state:
-        return "No active conversation."
+        lines = [
+            f"Conversation: {conv_id or ''}",
+            "Turns: 0 (compacted through 0)",
+            "Segments: 0",
+            "Generation: 0",
+            "Working set: 0 tags, 0 tokens",
+            "Active tags: none",
+        ]
+        return "\n".join(lines)
 
     engine = state.engine
     es = engine._engine_state
