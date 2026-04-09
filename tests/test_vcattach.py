@@ -4,6 +4,8 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -124,7 +126,6 @@ def test_build_fake_response_openai():
 
 
 def test_vcstatus_uses_effective_engine_conversation_id():
-    from types import SimpleNamespace
     from virtual_context.proxy.handlers import _handle_vcstatus
 
     class _TurnTagIndex:
@@ -156,8 +157,22 @@ def test_vcstatus_uses_effective_engine_conversation_id():
     assert "Segments: 7" in text
 
 
+def test_vcstatus_without_state_reports_shell_status():
+    from virtual_context.proxy.handlers import _handle_vcstatus
+
+    text = _handle_vcstatus(
+        "56315149-9812-9cf5-21a7-ade5a2279ad8",
+        None,
+        tenant_registry=None,
+        tenant_id=None,
+    )
+
+    assert "Conversation: 56315149-9812-9cf5-21a7-ade5a2279ad8" in text
+    assert "Turns: 0 (compacted through 0)" in text
+    assert "Segments: 0" in text
+
+
 def test_vcattach_preserves_target_engine_state():
-    from types import SimpleNamespace
     from virtual_context.proxy.handlers import _handle_vcattach
     from virtual_context.proxy.formats import detect_format
 
@@ -209,3 +224,41 @@ def test_vcattach_preserves_target_engine_state():
     assert inner.aliases == [("old-shell-conv", "target-conv")]
     assert inner.load_called is False
     assert inner.save_called is False
+
+
+def test_vcattach_uses_tenant_registry_delete_in_cloud_mode():
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    inner = MagicMock()
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+    registry = MagicMock()
+    tenant_registry = MagicMock()
+    result = SimpleNamespace(
+        vcattach_label="d4f83259-4ffc-fa3f-5914-a266d0a4577c",
+        conversation_id="56315149-9812-9cf5-21a7-ade5a2279ad8",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH d4f83259-4ffc-fa3f-5914-a266d0a4577c"}],
+    })
+
+    response = asyncio.run(
+        _handle_vcattach(
+            result,
+            fmt,
+            state,
+            registry,
+            conv_ids=["d4f83259-4ffc-fa3f-5914-a266d0a4577c"],
+            tenant_registry=tenant_registry,
+            tenant_id="tenant-123",
+        )
+    )
+
+    assert response.status_code == 200
+    tenant_registry.delete_conversation.assert_called_once_with(
+        "tenant-123",
+        "56315149-9812-9cf5-21a7-ade5a2279ad8",
+        store=inner,
+    )
