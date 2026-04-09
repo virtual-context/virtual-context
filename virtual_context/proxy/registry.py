@@ -186,6 +186,32 @@ class SessionRegistry:
         if h:
             self._last_msg_hashes[h] = conversation_id
 
+    def _conversation_exists(self, conversation_id: str) -> bool:
+        """Return True when *conversation_id* already refers to a real session.
+
+        This guards against stale VCATTACH alias rows on conversations that now
+        exist as real persisted/live sessions. Explicitly targeting such a
+        conversation should not chain through an old alias.
+        """
+        if not conversation_id:
+            return False
+        if conversation_id in self._conversations:
+            return True
+        if not self._store:
+            return False
+        loader = getattr(self._store, "load_engine_state", None)
+        if not callable(loader):
+            return False
+        try:
+            return loader(conversation_id) is not None
+        except Exception:
+            logger.warning(
+                "VCATTACH existence lookup failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return False
+
     def get_or_create(
         self,
         conversation_id: str | None,
@@ -205,7 +231,7 @@ class SessionRegistry:
         # --- Alias resolution: follow redirects from VCATTACH ---
         # Use the registry's own durable store handle (self._store), not a
         # session's store — sessions may be empty after VCATTACH eviction.
-        if conversation_id and self._store:
+        if conversation_id and self._store and not self._conversation_exists(conversation_id):
             _alias_resolve = getattr(self._store, "resolve_conversation_alias", None)
             if callable(_alias_resolve):
                 _redirected = _alias_resolve(conversation_id)

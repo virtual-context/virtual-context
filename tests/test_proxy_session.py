@@ -640,6 +640,30 @@ class TestContentFingerprintRouting:
         assert is_new is False
         assert result is state
 
+    def test_marker_prefers_live_conversation_over_stale_alias(self):
+        """Explicit session ids should not chain through stale VCATTACH aliases."""
+        metrics = ProxyMetrics()
+        store = MagicMock()
+        store.resolve_conversation_alias.return_value = "wrong-session"
+        registry = SessionRegistry(
+            config_path=None,
+            upstream="http://fake:9999",
+            metrics=metrics,
+            store=store,
+        )
+
+        engine = MagicMock()
+        engine.config.conversation_id = "target-session"
+        state = ProxyState(engine, metrics=metrics)
+        registry._conversations["target-session"] = state
+
+        body = self._make_body(["hello"])
+        result, is_new = registry.get_or_create("target-session", body=body)
+
+        assert is_new is False
+        assert result is state
+        store.resolve_conversation_alias.assert_not_called()
+
     def test_cold_start_marker_restores_persisted_session(self, tmp_path):
         """A marker referencing a persisted-but-not-loaded session should restore it, not create a new random one."""
         from virtual_context.engine import VirtualContextEngine
@@ -674,6 +698,37 @@ class TestContentFingerprintRouting:
         # Should have restored the persisted session, not created a random new one
         assert result.engine.config.conversation_id == saved_id
         assert len(result.engine._turn_tag_index.entries) > 0
+
+    def test_cold_start_marker_prefers_persisted_session_over_stale_alias(self, tmp_path):
+        """Persisted sessions should not redirect through older alias rows."""
+        from virtual_context.engine import VirtualContextEngine
+
+        config_path = tmp_path / "vc.yaml"
+        config_path.write_text("storage:\n  backend: sqlite\n  sqlite:\n    path: " + str(tmp_path / "store.db") + "\n")
+        engine1 = VirtualContextEngine(config_path=str(config_path))
+        saved_id = engine1.config.conversation_id
+        engine1._save_state([
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="hi"),
+        ])
+        engine1.close()
+
+        from virtual_context.storage.sqlite import SQLiteStore
+        SQLiteStore(str(tmp_path / "store.db")).save_conversation_alias(saved_id, "wrong-session")
+
+        metrics = ProxyMetrics()
+        registry = SessionRegistry(
+            config_path=str(config_path),
+            upstream="http://fake:9999",
+            metrics=metrics,
+            store=SQLiteStore(str(tmp_path / "store.db")),
+        )
+
+        body = self._make_body(["new message"])
+        result, is_new = registry.get_or_create(saved_id, body=body)
+
+        assert result.engine.config.conversation_id == saved_id
+        assert is_new is True
 
 
 # ---------------------------------------------------------------------------
