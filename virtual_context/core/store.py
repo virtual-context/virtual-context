@@ -58,6 +58,15 @@ class ContextStore(ABC):
     def get_conversation_stats(self) -> list[ConversationStats]:
         """Return aggregate statistics grouped by conversation_id, newest first."""
 
+    def get_all_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[StoredSegment]:
+        """Return full stored segments, newest first when supported."""
+        return []
+
     @abstractmethod
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]: ...
 

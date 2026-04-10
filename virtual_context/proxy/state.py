@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import inspect
 import json
 import logging
 import threading
@@ -589,6 +590,7 @@ class ProxyState:
         signal: object,
         turn: int,
         target_end: int,
+        turn_id: str = "",
     ) -> None:
         priority = str(getattr(signal, "priority", "soft") or "soft")
         with self._background_state_lock:
@@ -599,6 +601,7 @@ class ProxyState:
             signal,
             turn,
             target_end,
+            turn_id,
         )
         logger.info(
             "T%d compaction submitted target_end=%d priority=%s",
@@ -612,6 +615,7 @@ class ProxyState:
         history: list[Message],
         signal: object,
         turn: int,
+        turn_id: str = "",
     ) -> None:
         target_end = self._compaction_target_end(history)
         priority = str(getattr(signal, "priority", "soft") or "soft")
@@ -636,6 +640,7 @@ class ProxyState:
                         "history": history,
                         "signal": signal,
                         "turn": turn,
+                        "turn_id": turn_id,
                         "target_end": target_end,
                         "priority": priority,
                     }
@@ -654,7 +659,7 @@ class ProxyState:
                     )
                 return
 
-        self._submit_compaction_request(history, signal, turn, target_end)
+        self._submit_compaction_request(history, signal, turn, target_end, turn_id=turn_id)
 
     def fire_turn_complete(
         self,
@@ -828,7 +833,7 @@ class ProxyState:
                     logger.info("T%d compaction deferred (ingestion in progress)", turn)
                 else:
                     try:
-                        self._queue_compaction(history, signal, turn)
+                        self._queue_compaction(history, signal, turn, turn_id=turn_id)
                     except RuntimeError:
                         logger.info(
                             "T%d compaction suppressed for shut down session %s",
@@ -926,6 +931,7 @@ class ProxyState:
         history: list[Message],
         signal: object,
         turn: int,
+        turn_id: str = "",
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request."""
         conversation_id = self.engine.config.conversation_id
@@ -1017,9 +1023,31 @@ class ProxyState:
                 phase_detail="starting compaction",
             )
             try:
-                report = self.engine.compact_if_needed(
-                    history, signal, progress_callback=_compact_progress,
-                )
+                compact_if_needed = self.engine.compact_if_needed
+                compact_target = getattr(compact_if_needed, "side_effect", None)
+                if not callable(compact_target):
+                    compact_target = compact_if_needed
+                supports_turn_id = True
+                try:
+                    signature = inspect.signature(compact_target)
+                    supports_turn_id = (
+                        "turn_id" in signature.parameters
+                        or any(
+                            param.kind == inspect.Parameter.VAR_KEYWORD
+                            for param in signature.parameters.values()
+                        )
+                    )
+                except (TypeError, ValueError):
+                    supports_turn_id = True
+
+                if supports_turn_id:
+                    report = compact_if_needed(
+                        history, signal, progress_callback=_compact_progress, turn_id=turn_id,
+                    )
+                else:
+                    report = self.engine.compact_if_needed(
+                        history, signal, progress_callback=_compact_progress,
+                    )
                 compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
                 if report is not None:
@@ -1121,9 +1149,10 @@ class ProxyState:
         signal: object,
         turn: int,
         target_end: int,
+        turn_id: str = "",
     ) -> None:
         try:
-            self._run_compact(history, signal, turn)
+            self._run_compact(history, signal, turn, turn_id=turn_id)
         finally:
             follow_up: dict[str, object] | None = None
             with self._background_state_lock:
@@ -1143,6 +1172,7 @@ class ProxyState:
                     follow_up["signal"],
                     int(follow_up["turn"]),
                     int(follow_up["target_end"]),
+                    turn_id=str(follow_up.get("turn_id", "") or ""),
                 )
 
     def _compact_after_ingestion(self, history: list[Message]) -> None:

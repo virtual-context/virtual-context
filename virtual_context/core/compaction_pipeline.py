@@ -92,6 +92,7 @@ class CompactionPipeline:
         conversation_history: list[Message],
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
+        turn_id: str = "",
     ) -> CompactionReport | None:
         """Phase 2 of turn processing: run compaction.
 
@@ -146,7 +147,12 @@ class CompactionPipeline:
             len(compact_messages), offset, self._engine_state.compacted_through,
             len(conversation_history), protected_turns, _total_turns,
         )
-        report = self._run_compaction(conversation_history, compact_messages, progress_callback=progress_callback)
+        report = self._run_compaction(
+            conversation_history,
+            compact_messages,
+            progress_callback=progress_callback,
+            generated_by_turn_id=turn_id,
+        )
 
         self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
         self._commit_compaction_state(conversation_history)
@@ -155,6 +161,7 @@ class CompactionPipeline:
     def compact_manual(
         self,
         conversation_history: list[Message],
+        turn_id: str = "",
     ) -> CompactionReport | None:
         """Trigger manual compaction regardless of thresholds.
 
@@ -186,7 +193,11 @@ class CompactionPipeline:
         if not compact_messages:
             return None
 
-        report = self._run_compaction(conversation_history, compact_messages)
+        report = self._run_compaction(
+            conversation_history,
+            compact_messages,
+            generated_by_turn_id=turn_id,
+        )
 
         self._commit_compaction_state(conversation_history)
         return report
@@ -221,6 +232,7 @@ class CompactionPipeline:
         conversation_history: list[Message],
         compact_messages: list[Message],
         progress_callback: Callable[..., None] | None = None,
+        generated_by_turn_id: str = "",
     ) -> CompactionReport:
         """Shared compaction core: segment, compact, store, build tag summaries.
 
@@ -361,6 +373,7 @@ class CompactionPipeline:
                         tag_to_turns=tag_to_turns,
                         existing_tag_summaries=existing_tag_summaries,
                         max_turn=max_turn,
+                        generated_by_turn_id=generated_by_turn_id,
                     )
 
                     for ts_i, ts in enumerate(new_tag_summaries):
@@ -538,6 +551,7 @@ class CompactionPipeline:
         segment_signals: dict[str, list[FactSignal]] = {}
         segment_code_refs: dict[str, list[dict]] = {}
         segment_turn_ranges: dict[str, tuple[int, int]] = {}  # seg.id -> (start, end_exclusive)
+        merged_existing_exact_ranges: dict[str, tuple[int, int] | None] = {}
         for seg in segments:
             seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
             segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
@@ -603,6 +617,7 @@ class CompactionPipeline:
             text = " ".join(m.content for m in seg.messages)
             if _is_stub_content_fn(text):
                 text = text.strip()
+                turn_range = segment_turn_ranges.get(seg.id)
                 logger.info(
                     "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s",
                     seg.id[:8], seg.token_count, seg.primary_tag,
@@ -619,6 +634,9 @@ class CompactionPipeline:
                     metadata=SegmentMetadata(
                         code_refs=segment_code_refs.get(seg.id, []),
                         turn_count=seg.turn_count,
+                        start_turn_number=turn_range[0] if turn_range else -1,
+                        end_turn_number=(turn_range[1] - 1) if turn_range and turn_range[1] > turn_range[0] else -1,
+                        generated_by_turn_id=generated_by_turn_id,
                         session_date=getattr(seg, "session_date", ""),
                     ),
                     compression_ratio=1.0,
@@ -705,6 +723,13 @@ class CompactionPipeline:
                     old_tc = best_candidate.metadata.turn_count if best_candidate.metadata else len(best_candidate.messages) // 2
                     seg.turn_count += old_tc
                     seg.tags = list(set(best_candidate.tags) | seg_tags)
+                    old_start = getattr(best_candidate.metadata, "start_turn_number", -1)
+                    old_end = getattr(best_candidate.metadata, "end_turn_number", -1)
+                    merged_existing_exact_ranges[seg.id] = (
+                        (old_start, old_end)
+                        if old_start >= 0 and old_end >= old_start
+                        else None
+                    )
                     logger.info(
                         "MERGE PREP: segment '%s' (%s) merging with stored %s "
                         "(%s, %d existing turns, relatedness=%.2f)",
@@ -768,6 +793,23 @@ class CompactionPipeline:
 
         for seg_idx, result in enumerate(results):
             seg = compactable[seg_idx]
+            new_turn_range = segment_turn_ranges.get(seg.id)
+            exact_start = -1
+            exact_end = -1
+            if new_turn_range and new_turn_range[1] > new_turn_range[0]:
+                new_start = new_turn_range[0]
+                new_end = new_turn_range[1] - 1
+                if seg.merge_ref:
+                    existing_range = merged_existing_exact_ranges.get(seg.id)
+                    if existing_range is not None:
+                        exact_start = min(existing_range[0], new_start)
+                        exact_end = max(existing_range[1], new_end)
+                else:
+                    exact_start = new_start
+                    exact_end = new_end
+            result.metadata.start_turn_number = exact_start
+            result.metadata.end_turn_number = exact_end
+            result.metadata.generated_by_turn_id = generated_by_turn_id
 
             # Store or update
             if seg.merge_ref:

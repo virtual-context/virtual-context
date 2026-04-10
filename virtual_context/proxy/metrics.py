@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import statistics
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,12 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "model": ...,
     "stream": False,
     "message_count": ...,
+    "client_payload_message_count": 0,
+    "client_payload_pair_count": 0,
+    "client_payload_user_prompt_count": 0,
+    "client_payload_timestamped_message_count": 0,
+    "client_payload_earliest_timestamp": "",
+    "client_payload_latest_timestamp": "",
     "conversation_id": "",
     "inbound_tags": [],
     "response_tags": [],
@@ -59,6 +66,121 @@ def _extract_summary(req: dict) -> dict:
         else:
             out[key] = req.get(key, default)
     return out
+
+
+_PAYLOAD_TIMESTAMP_RE = re.compile(
+    r'(?i)(?:"timestamp"|timestamp)\s*[:=]\s*(["\']?)([^"\',\n\r][^\n\r]*?)\1(?=\s*(?:[,}\]\n\r]|$))'
+)
+_PAYLOAD_TIMEZONE_OFFSETS = {
+    "UTC": timezone.utc,
+    "GMT": timezone.utc,
+    "EDT": timezone(timedelta(hours=-4)),
+    "EST": timezone(timedelta(hours=-5)),
+    "CDT": timezone(timedelta(hours=-5)),
+    "CST": timezone(timedelta(hours=-6)),
+    "MDT": timezone(timedelta(hours=-6)),
+    "MST": timezone(timedelta(hours=-7)),
+    "PDT": timezone(timedelta(hours=-7)),
+    "PST": timezone(timedelta(hours=-8)),
+}
+_PAYLOAD_TIMESTAMP_FORMATS = (
+    "%a %Y-%m-%d %H:%M:%S",
+    "%a %Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+)
+
+
+def _iter_text_blocks(value) -> list[str]:
+    texts: list[str] = []
+    if isinstance(value, str):
+        if value:
+            texts.append(value)
+        return texts
+    if isinstance(value, list):
+        for item in value:
+            texts.extend(_iter_text_blocks(item))
+        return texts
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+        nested = value.get("content")
+        if nested is not None:
+            texts.extend(_iter_text_blocks(nested))
+    return texts
+
+
+def _message_has_direct_user_text(content) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            return True
+    return False
+
+
+def _parse_payload_timestamp(raw: str) -> datetime | None:
+    candidate = raw.strip().strip('"').strip("'").rstrip(",")
+    if not candidate:
+        return None
+    normalized = candidate.replace("Z", "+00:00") if candidate.endswith("Z") else candidate
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    tzinfo = timezone.utc
+    without_tz = candidate
+    for tz_name, offset in _PAYLOAD_TIMEZONE_OFFSETS.items():
+        suffix = f" {tz_name}"
+        if candidate.endswith(suffix):
+            tzinfo = offset
+            without_tz = candidate[: -len(suffix)]
+            break
+
+    for fmt in _PAYLOAD_TIMESTAMP_FORMATS:
+        try:
+            return datetime.strptime(without_tz, fmt).replace(tzinfo=tzinfo).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _summarize_client_payload(messages: list[dict]) -> dict[str, object]:
+    user_prompt_count = 0
+    payload_timestamps: list[datetime] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not _message_has_direct_user_text(content):
+            continue
+        user_prompt_count += 1
+        for text in _iter_text_blocks(content):
+            for _, raw in _PAYLOAD_TIMESTAMP_RE.findall(text):
+                parsed = _parse_payload_timestamp(raw)
+                if parsed is not None:
+                    payload_timestamps.append(parsed)
+
+    return {
+        "client_payload_message_count": len(messages),
+        "client_payload_pair_count": len(messages) // 2,
+        "client_payload_user_prompt_count": user_prompt_count,
+        "client_payload_timestamped_message_count": len(payload_timestamps),
+        "client_payload_earliest_timestamp": min(payload_timestamps).isoformat() if payload_timestamps else "",
+        "client_payload_latest_timestamp": max(payload_timestamps).isoformat() if payload_timestamps else "",
+    }
 
 
 class ProxyMetrics:
@@ -554,6 +676,8 @@ class ProxyMetrics:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
         with self._lock:
             conv_id = self._capture_conversation_id(conversation_id)
+            messages = body.get("messages", [])
+            payload_span = _summarize_client_payload(messages if isinstance(messages, list) else [])
             payload = {
                 "turn": turn,
                 "turn_id": turn_id,
@@ -562,8 +686,8 @@ class ProxyMetrics:
                 "model": body.get("model"),
                 "stream": body.get("stream", False),
                 "system": body.get("system"),
-                "messages": body.get("messages", []),
-                "message_count": len(body.get("messages", [])),
+                "messages": messages if isinstance(messages, list) else [],
+                "message_count": len(messages) if isinstance(messages, list) else 0,
                 "inbound_tags": inbound_tags or [],
                 "response_tags": [],
                 "conversation_id": conversation_id,
@@ -585,6 +709,7 @@ class ProxyMetrics:
                 "system_tokens": system_tokens,
                 "protected_turn_tokens": protected_turn_tokens,
                 "protected_turn_count": protected_turn_count,
+                **payload_span,
             }
             existing = self._find_capture(
                 turn,
