@@ -208,6 +208,22 @@ class TestSQLiteStore:
         assert retrieved.metadata.action_items == ["File by Jan 30"]
         assert retrieved.metadata.turn_count == 3
 
+    def test_exact_turn_range_metadata_round_trip(self, store):
+        seg = _make_segment()
+        seg.metadata = SegmentMetadata(
+            turn_count=4,
+            start_turn_number=120,
+            end_turn_number=123,
+            generated_by_turn_id="req-abc123",
+        )
+        store.store_segment(seg)
+
+        retrieved = store.get_segment("test-ref-1")
+        assert retrieved is not None
+        assert retrieved.metadata.start_turn_number == 120
+        assert retrieved.metadata.end_turn_number == 123
+        assert retrieved.metadata.generated_by_turn_id == "req-abc123"
+
     def test_tag_summary_crud(self, store):
         now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
         ts = TagSummary(
@@ -255,6 +271,23 @@ class TestSQLiteStore:
         assert len(all_ts) == 2
         tags = {ts.tag for ts in all_ts}
         assert tags == {"legal", "medical"}
+
+    def test_tag_summary_generated_by_turn_id_round_trip(self, store):
+        now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+        store.save_tag_summary(
+            TagSummary(
+                tag="legal",
+                summary="Legal rollup",
+                summary_tokens=11,
+                generated_by_turn_id="turn-123",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+        retrieved = store.get_tag_summary("legal")
+        assert retrieved is not None
+        assert retrieved.generated_by_turn_id == "turn-123"
 
 
 class TestTagSummaryDescriptionSQLite:

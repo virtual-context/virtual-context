@@ -17,6 +17,7 @@ class TestProtocolsExist:
         assert hasattr(SegmentStore, 'get_summaries_by_tags')
         assert hasattr(SegmentStore, 'search')
         assert hasattr(SegmentStore, 'get_all_tags')
+        assert hasattr(SegmentStore, 'get_all_segments')
         assert hasattr(SegmentStore, 'save_tag_summary')
         assert hasattr(SegmentStore, 'get_tag_summary')
         assert hasattr(SegmentStore, 'get_all_tag_summaries')

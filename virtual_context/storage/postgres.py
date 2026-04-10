@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
+    generated_by_turn_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (tag, conversation_id)
@@ -376,6 +377,9 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            start_turn_number=metadata_raw.get("start_turn_number", -1),
+            end_turn_number=metadata_raw.get("end_turn_number", -1),
+            generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
         ),
         created_at=_str_to_dt(row["created_at"]),
@@ -402,6 +406,9 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            start_turn_number=metadata_raw.get("start_turn_number", -1),
+            end_turn_number=metadata_raw.get("end_turn_number", -1),
+            generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
         ),
         created_at=_str_to_dt(row["created_at"]),
@@ -468,6 +475,10 @@ class PostgresStore(ContextStore):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                                    WHERE table_name='tag_summaries' AND column_name='code_refs') THEN
                         ALTER TABLE tag_summaries ADD COLUMN code_refs TEXT NOT NULL DEFAULT '[]';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='tag_summaries' AND column_name='generated_by_turn_id') THEN
+                        ALTER TABLE tag_summaries ADD COLUMN generated_by_turn_id TEXT NOT NULL DEFAULT '';
                     END IF;
                 END $$;
             """)
@@ -627,6 +638,9 @@ class PostgresStore(ContextStore):
             "date_references": segment.metadata.date_references,
             "code_refs": getattr(segment.metadata, "code_refs", []),
             "turn_count": segment.metadata.turn_count,
+            "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
+            "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
+            "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
         }
         if segment.metadata.session_date:
             metadata_dict["session_date"] = segment.metadata.session_date
@@ -686,6 +700,36 @@ class PostgresStore(ContextStore):
         if not row:
             return None
         return _row_to_summary(row, self._get_tags_for_ref(ref))
+
+    def get_all_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[StoredSegment]:
+        conn = self._get_conn()
+        if conversation_id is not None and limit is not None and limit > 0:
+            rows = conn.execute(
+                "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC LIMIT %s",
+                (conversation_id, limit),
+            ).fetchall()
+        elif conversation_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC",
+                (conversation_id,),
+            ).fetchall()
+        elif limit is not None and limit > 0:
+            rows = conn.execute(
+                "SELECT * FROM segments ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM segments ORDER BY created_at DESC").fetchall()
+        if not rows:
+            return []
+        refs = [row["ref"] for row in rows]
+        tags_map = self._get_tags_for_refs(refs)
+        return [_row_to_segment(row, tags_map.get(row["ref"], [])) for row in rows]
 
     def get_summaries_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 10,
@@ -1000,19 +1044,21 @@ class PostgresStore(ContextStore):
         conn.execute(
             """INSERT INTO tag_summaries
             (tag, conversation_id, summary, description, code_refs, summary_tokens, source_segment_refs, source_turn_numbers,
-             covers_through_turn, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             covers_through_turn, generated_by_turn_id, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (tag, conversation_id) DO UPDATE SET
                 summary=EXCLUDED.summary, description=EXCLUDED.description, code_refs=EXCLUDED.code_refs,
                 summary_tokens=EXCLUDED.summary_tokens,
                 source_segment_refs=EXCLUDED.source_segment_refs,
                 source_turn_numbers=EXCLUDED.source_turn_numbers,
                 covers_through_turn=EXCLUDED.covers_through_turn,
+                generated_by_turn_id=EXCLUDED.generated_by_turn_id,
                 updated_at=EXCLUDED.updated_at""",
             (tag_summary.tag, conversation_id, tag_summary.summary, getattr(tag_summary, "description", ""),
              json.dumps(getattr(tag_summary, "code_refs", []) or []),
              tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
              json.dumps(tag_summary.source_turn_numbers), tag_summary.covers_through_turn,
+             getattr(tag_summary, "generated_by_turn_id", "") or "",
              _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
         )
 
@@ -1029,6 +1075,7 @@ class PostgresStore(ContextStore):
             source_segment_refs=json.loads(row["source_segment_refs"]),
             source_turn_numbers=json.loads(row["source_turn_numbers"]),
             covers_through_turn=row["covers_through_turn"],
+            generated_by_turn_id=row.get("generated_by_turn_id", ""),
             created_at=_str_to_dt(row["created_at"]),
             updated_at=_str_to_dt(row["updated_at"]),
         )
@@ -1051,6 +1098,7 @@ class PostgresStore(ContextStore):
                 source_segment_refs=json.loads(row["source_segment_refs"]),
                 source_turn_numbers=json.loads(row["source_turn_numbers"]),
                 covers_through_turn=row["covers_through_turn"],
+                generated_by_turn_id=row.get("generated_by_turn_id", ""),
                 created_at=_str_to_dt(row["created_at"]),
                 updated_at=_str_to_dt(row["updated_at"]),
             )

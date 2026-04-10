@@ -89,6 +89,17 @@ class CompositeStore:
     def get_conversation_stats(self) -> list[ConversationStats]:
         return self._segments.get_conversation_stats()
 
+    def get_all_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[StoredSegment]:
+        return self._segments.get_all_segments(
+            conversation_id=conversation_id,
+            limit=limit,
+        )
+
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
         return self._segments.get_tag_aliases(conversation_id=conversation_id)
 
