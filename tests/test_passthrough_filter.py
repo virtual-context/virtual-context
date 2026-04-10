@@ -180,7 +180,12 @@ class TestPassthroughFilter:
 
         mock_compactor = MagicMock()
 
-        def _fake_compact(segments, fact_signals_by_segment=None, progress_callback=None):
+        def _fake_compact(
+            segments,
+            fact_signals_by_segment=None,
+            code_refs_by_segment=None,
+            progress_callback=None,
+        ):
             assert progress_callback is not None
             progress_callback(0, len(segments), None, phase="segment_compacting", phase_name="compactor")
             progress_callback(1, len(segments), result, phase="segment_compacting", phase_name="compactor")
@@ -211,3 +216,61 @@ class TestPassthroughFilter:
         assert results[0].primary_tag == "testing"
         assert progress_events
         assert any(evt["phase"] == "segment_compacting" for evt in progress_events)
+
+    def test_compactor_threads_generated_by_turn_id_into_segment_metadata(self, tmp_path):
+        """LLM compaction results should keep the generating request turn_id."""
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+        from virtual_context.types import CompactionResult, Message, SegmentMetadata, TaggedSegment
+
+        now = datetime.now(timezone.utc)
+        seg = TaggedSegment(
+            id="seg-turn-id",
+            primary_tag="testing",
+            tags=["testing"],
+            messages=[
+                Message(role="user", content="Keep provenance with this summary."),
+                Message(role="assistant", content="Provenance should be stored on the segment metadata."),
+            ],
+            token_count=18,
+            start_timestamp=now,
+            end_timestamp=now,
+            turn_count=1,
+        )
+
+        cfg = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine = VirtualContextEngine(config=cfg)
+
+        result = CompactionResult(
+            segment_id="seg-turn-id",
+            primary_tag="testing",
+            tags=["testing"],
+            summary="Summary keeps request provenance.",
+            summary_tokens=6,
+            full_text="Keep provenance with this summary. Provenance should be stored on the segment metadata.",
+            original_tokens=18,
+            messages=[{"role": "user", "content": "Keep provenance with this summary."}],
+            metadata=SegmentMetadata(turn_count=1, session_date=""),
+            compression_ratio=0.33,
+            timestamp=now,
+            facts=[],
+        )
+
+        mock_compactor = MagicMock()
+        mock_compactor.compact.return_value = [result]
+        mock_compactor.model_name = "test-model"
+        engine._compaction._compactor = mock_compactor
+        engine._tagging._compactor = mock_compactor
+
+        results = engine._compaction._compact_and_store(
+            [seg],
+            2,
+            generated_by_turn_id="turn-xyz",
+        )
+
+        assert len(results) == 1
+        assert results[0].metadata.generated_by_turn_id == "turn-xyz"
