@@ -312,7 +312,12 @@ class CompactionPipeline:
         )
 
         # Phase 2+3: Compact + Store (25-75%)
-        results = self._compact_and_store(segments, len(compact_messages), progress_callback=progress_callback)
+        results = self._compact_and_store(
+            segments,
+            len(compact_messages),
+            progress_callback=progress_callback,
+            generated_by_turn_id=generated_by_turn_id,
+        )
 
         # Advance watermark past compacted messages
         self._engine_state.compacted_through += len(compact_messages)
@@ -501,6 +506,7 @@ class CompactionPipeline:
     def _compact_and_store(
         self, segments: list, compact_messages_len: int,
         progress_callback: Callable[..., None] | None = None,
+        generated_by_turn_id: str = "",
     ) -> list[CompactionResult]:
         """Two-pass compact and store.
 
