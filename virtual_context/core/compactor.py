@@ -244,6 +244,21 @@ Prefer a stable verb vocabulary when it fits:
 - removed / deleted
 - deployed
 - reverted
+For each fact, also populate:
+- "who": ALL people involved (populate when present, empty string if n/a).
+  Resolve pronouns. "We" means the speaker + someone — use context to determine who.
+- "when": the calendar date this event occurred, resolved from context.
+  DATE RULES — use SESSION DATE ({session_date}) as your reference point:
+  "today" / "this morning" / "just now" → use {session_date}.
+  "yesterday" → the day before {session_date}.
+  "last Saturday" → the most recent Saturday before {session_date}.
+  "last week" → approximately 7 days before {session_date}.
+  "next month" → the month after {session_date}.
+  "last year" → the year before {session_date}.
+  Always write the RESOLVED calendar date (e.g. "2024-05-20"), NOT the relative term.
+  If no temporal reference is present → use "".
+- "where": location (populate when present, empty string if n/a)
+- "why": context or significance (populate when present, empty string if n/a)
 
 Also extract "code_refs": a deduplicated list of the files/functions/classes materially discussed or changed.
 Each ref should be an object like {{"file": "path/to/file.py", "line": 123, "symbol": "function_name"}}.
@@ -263,7 +278,7 @@ Respond with JSON:
   "date_references": ["..."],
   "refined_tags": ["tag1", "tag2"],
   "related_tags": ["alternate-term1", "alternate-term2"],
-  "facts": [{{"subject": "...", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "..."}}],
+  "facts": [{{"subject": "...", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "...", "who": "...", "when": "...", "where": "...", "why": "..."}}],
   "code_refs": [{{"file": "...", "line": 123, "symbol": "..."}}]
 }}
 
@@ -876,6 +891,7 @@ class DomainCompactor:
         tag_to_turns: dict[str, list[int]],
         existing_tag_summaries: dict[str, TagSummary],
         max_turn: int,
+        generated_by_turn_id: str = "",
     ) -> list[TagSummary]:
         """Build or update tag summaries for cover tags.
 
@@ -903,6 +919,7 @@ class DomainCompactor:
                     tag_to_summaries.get(tag, []),
                     tag_to_turns.get(tag, []),
                     max_turn,
+                    generated_by_turn_id=generated_by_turn_id,
                 )
                 for tag in tags_to_build
             ]
@@ -924,6 +941,7 @@ class DomainCompactor:
                     tag_to_summaries.get(tag, []),
                     tag_to_turns.get(tag, []),
                     max_turn,
+                    generated_by_turn_id,
                 ): i
                 for i, tag in enumerate(tags_to_build)
             }
@@ -961,6 +979,7 @@ class DomainCompactor:
                             *[getattr(s.metadata, "code_refs", []) for s in summaries]
                         ),
                         covers_through_turn=max_turn,
+                        generated_by_turn_id=generated_by_turn_id,
                     )
 
         _sys.stderr.write("\n")
@@ -973,6 +992,7 @@ class DomainCompactor:
         summaries: list[StoredSummary],
         turn_numbers: list[int],
         max_turn: int,
+        generated_by_turn_id: str = "",
     ) -> TagSummary:
         combined = "\n\n---\n\n".join(
             (
@@ -1038,4 +1058,5 @@ class DomainCompactor:
             source_turn_numbers=sorted(set(turn_numbers)),
             code_refs=code_refs,
             covers_through_turn=max_turn,
+            generated_by_turn_id=generated_by_turn_id,
         )

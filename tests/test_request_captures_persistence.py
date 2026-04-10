@@ -287,6 +287,54 @@ class TestProxyMetricsStoreIntegration:
         assert loaded[0]["turn"] == 1
         assert loaded[0]["inbound_tags"] == ["python"]
 
+    def test_capture_persists_payload_span_stats(self, tmp_path):
+        from virtual_context.proxy.metrics import ProxyMetrics
+
+        store = self._make_store(tmp_path)
+        m = ProxyMetrics(store=store)
+        m.capture_request(
+            turn=1,
+            body={
+                "model": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": 'message_id: 1\ntimestamp: Sun 2026-03-15 12:10 EDT\nhello',
+                            }
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "content": [{"type": "text", "text": "tool output"}]}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": 'timestamp: Mon 2026-03-16 14:12 EDT\nsecond',
+                            }
+                        ],
+                    },
+                ],
+            },
+            api_format="anthropic",
+            conversation_id="c1",
+        )
+
+        loaded = store.load_request_captures(conversation_id="c1")
+        assert len(loaded) == 1
+        assert loaded[0]["client_payload_message_count"] == 4
+        assert loaded[0]["client_payload_pair_count"] == 2
+        assert loaded[0]["client_payload_user_prompt_count"] == 2
+        assert loaded[0]["client_payload_timestamped_message_count"] == 2
+        assert loaded[0]["client_payload_earliest_timestamp"] == "2026-03-15T16:10:00+00:00"
+        assert loaded[0]["client_payload_latest_timestamp"] == "2026-03-16T18:12:00+00:00"
+
     def test_capture_enriched_persists_to_store(self, tmp_path):
         from virtual_context.proxy.metrics import ProxyMetrics
         from unittest.mock import patch

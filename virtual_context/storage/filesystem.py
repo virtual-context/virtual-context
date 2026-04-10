@@ -51,6 +51,9 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
         "date_references": seg.metadata.date_references,
         "code_refs": getattr(seg.metadata, "code_refs", []),
         "turn_count": seg.metadata.turn_count,
+        "start_turn_number": getattr(seg.metadata, "start_turn_number", -1),
+        "end_turn_number": getattr(seg.metadata, "end_turn_number", -1),
+        "generated_by_turn_id": getattr(seg.metadata, "generated_by_turn_id", ""),
     }
     if seg.metadata.session_date:
         frontmatter["session_date"] = seg.metadata.session_date
@@ -133,6 +136,9 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
         date_references=fm.get("date_references", []),
         code_refs=fm.get("code_refs", []),
         turn_count=fm.get("turn_count", 0),
+        start_turn_number=fm.get("start_turn_number", -1),
+        end_turn_number=fm.get("end_turn_number", -1),
+        generated_by_turn_id=fm.get("generated_by_turn_id", ""),
         session_date=fm.get("session_date", ""),
     )
 
@@ -484,6 +490,28 @@ class FilesystemStore(ContextStore):
             reverse=True,
         )
 
+    def get_all_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[StoredSegment]:
+        entries = list(self._index.values())
+        if conversation_id is not None:
+            entries = [
+                entry for entry in entries
+                if entry.get("conversation_id", entry.get("session_id", "")) == conversation_id
+            ]
+        entries.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+        if limit is not None and limit > 0:
+            entries = entries[:limit]
+        results: list[StoredSegment] = []
+        for entry in entries:
+            seg = self.get_segment(entry["ref"], conversation_id=conversation_id)
+            if seg is not None:
+                results.append(seg)
+        return results
+
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
         aliases = dict(self._aliases)
         if conversation_id:
@@ -556,6 +584,7 @@ class FilesystemStore(ContextStore):
             "source_segment_refs": tag_summary.source_segment_refs,
             "source_turn_numbers": tag_summary.source_turn_numbers,
             "covers_through_turn": tag_summary.covers_through_turn,
+            "generated_by_turn_id": getattr(tag_summary, "generated_by_turn_id", "") or "",
             "created_at": _dt_to_str(tag_summary.created_at),
             "updated_at": _dt_to_str(tag_summary.updated_at),
         }
@@ -579,6 +608,7 @@ class FilesystemStore(ContextStore):
             source_segment_refs=data.get("source_segment_refs", []),
             source_turn_numbers=data.get("source_turn_numbers", []),
             covers_through_turn=data.get("covers_through_turn", -1),
+            generated_by_turn_id=data.get("generated_by_turn_id", ""),
             created_at=_str_to_dt(data["created_at"]) if "created_at" in data else datetime.now(timezone.utc),
             updated_at=_str_to_dt(data["updated_at"]) if "updated_at" in data else datetime.now(timezone.utc),
         )

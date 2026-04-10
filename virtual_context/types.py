@@ -462,6 +462,9 @@ class SegmentMetadata:
     date_references: list[str] = field(default_factory=list)
     code_refs: list[dict] = field(default_factory=list)
     turn_count: int = 0
+    start_turn_number: int = -1
+    end_turn_number: int = -1
+    generated_by_turn_id: str = ""
     time_span: tuple[datetime, datetime] | None = None
     session_date: str = ""         # propagated from constituent turns
 
@@ -569,6 +572,7 @@ class TagSummary:
     source_turn_numbers: list[int] = field(default_factory=list)
     code_refs: list[dict] = field(default_factory=list)
     covers_through_turn: int = -1  # highest turn number covered; -1 = never built
+    generated_by_turn_id: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -596,6 +600,39 @@ class ConversationStats:
     newest_segment: datetime | None = None
     compaction_model: str = ""
     provider: str = ""
+
+
+@dataclass
+class PayloadSpanStats:
+    """Persisted span metadata for one captured client payload."""
+    turn: int = -1
+    turn_id: str = ""
+    captured_at: datetime | None = None
+    message_count: int = 0
+    pair_count: int = 0
+    user_prompt_count: int = 0
+    timestamped_message_count: int = 0
+    earliest_timestamp: str = ""
+    latest_timestamp: str = ""
+
+
+@dataclass
+class ConversationCoverageReport:
+    """Read-only summary of payload span and durable summary coverage."""
+    conversation_id: str
+    latest_payload: PayloadSpanStats = field(default_factory=PayloadSpanStats)
+    segment_count: int = 0
+    summarized_turn_occurrences: int = 0
+    exact_range_segment_count: int = 0
+    exact_unique_turn_count: int = 0
+    exact_start_turn_number: int = -1
+    exact_end_turn_number: int = -1
+    tag_summary_count: int = 0
+    max_tag_summary_turn: int = -1
+    oldest_segment_created_at: datetime | None = None
+    newest_segment_created_at: datetime | None = None
+    oldest_tag_summary_created_at: datetime | None = None
+    newest_tag_summary_created_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

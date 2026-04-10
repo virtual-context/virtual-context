@@ -1545,8 +1545,14 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
+        turn_id: str = "",
     ) -> CompactionReport | None:
-        return self._compaction.compact_if_needed(conversation_history, signal, progress_callback)
+        return self._compaction.compact_if_needed(
+            conversation_history,
+            signal,
+            progress_callback,
+            turn_id=turn_id,
+        )
 
     def on_turn_complete(
         self,
@@ -1582,8 +1588,9 @@ class VirtualContextEngine:
     def compact_manual(
         self,
         conversation_history: list[Message],
+        turn_id: str = "",
     ) -> CompactionReport | None:
-        return self._compaction.compact_manual(conversation_history)
+        return self._compaction.compact_manual(conversation_history, turn_id=turn_id)
 
     def ingest_history(
         self,
