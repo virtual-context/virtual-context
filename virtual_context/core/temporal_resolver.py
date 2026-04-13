@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from calendar import monthrange
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from math import floor
 from types import SimpleNamespace
@@ -121,6 +122,15 @@ class TemporalResolver:
         config:         a VirtualContextConfig instance
     """
 
+    # Bounded LRU cap on the summary-embedding cache. Sized to cover a large
+    # segment set against a reasonable number of distinct query texts without
+    # letting a long-lived conversation engine grow the cache without bound.
+    # TODO: consider persisting summary embeddings at compaction time (like
+    # full_text_chunks does for turn text) and dropping this in-memory cache
+    # entirely. That would make retrieval hits warm across engine restarts
+    # instead of re-embedding per process.
+    _CACHE_MAX_SIZE = 2000
+
     def __init__(
         self,
         store: ContextStore,
@@ -133,7 +143,22 @@ class TemporalResolver:
         self._semantic = semantic
         self._config = config
         self.reference_date: date | None = None
-        self._summary_embedding_cache: dict[tuple[str, str, str], list[float]] = {}
+        self._summary_embedding_cache: "OrderedDict[tuple[str, str, str], list[float]]" = OrderedDict()
+
+    def _cache_get(self, key: tuple[str, str, str]) -> list[float] | None:
+        val = self._summary_embedding_cache.get(key)
+        if val is not None:
+            self._summary_embedding_cache.move_to_end(key)
+        return val
+
+    def _cache_set(self, key: tuple[str, str, str], val: list[float]) -> None:
+        self._summary_embedding_cache[key] = val
+        self._summary_embedding_cache.move_to_end(key)
+        while len(self._summary_embedding_cache) > self._CACHE_MAX_SIZE:
+            self._summary_embedding_cache.popitem(last=False)
+
+    def _cache_contains(self, key: tuple[str, str, str]) -> bool:
+        return key in self._summary_embedding_cache
 
     # ------------------------------------------------------------------
     # Public API
@@ -633,7 +658,7 @@ class TemporalResolver:
                 semantic_text,
             )
             segment_rows.append((seg, parsed, summary_text, semantic_text, cache_key))
-            if cache_key not in self._summary_embedding_cache:
+            if not self._cache_contains(cache_key):
                 uncached_keys.append(cache_key)
                 uncached_texts.append(semantic_text[:2000])
 
@@ -647,7 +672,7 @@ class TemporalResolver:
                 logger.warning("remember_when semantic summary embedding failed: %s", exc)
                 return
             for key, embedding in zip(uncached_keys, embeddings):
-                self._summary_embedding_cache[key] = list(embedding)
+                self._cache_set(key, list(embedding))
 
         try:
             query_embeddings = [list(vec) for vec in embed_fn([text[:2000] for text in semantic_queries])]
@@ -662,7 +687,7 @@ class TemporalResolver:
         }
         ranked: list[tuple[float, StoredSegment, date, str]] = []
         for seg, parsed, summary_text, semantic_text, cache_key in segment_rows:
-            segment_vec = self._summary_embedding_cache.get(cache_key)
+            segment_vec = self._cache_get(cache_key)
             if not segment_vec:
                 continue
             similarity = max(
@@ -1023,7 +1048,7 @@ class TemporalResolver:
                 semantic_text,
             )
             segment_rows.append((seg, date_key, summary_text, semantic_text, cache_key))
-            if embed_fn and cache_key not in self._summary_embedding_cache:
+            if embed_fn and not self._cache_contains(cache_key):
                 uncached_keys.append(cache_key)
                 uncached_texts.append(semantic_text[:2000])
 
@@ -1037,7 +1062,7 @@ class TemporalResolver:
                 logger.warning("remember_when date expansion segment embedding failed: %s", exc)
                 embeddings = []
             for key, embedding in zip(uncached_keys, embeddings):
-                self._summary_embedding_cache[key] = list(embedding)
+                self._cache_set(key, list(embedding))
 
         candidates_by_date: dict[str, list[tuple[float, dict]]] = {}
         for seg, date_key, summary_text, semantic_text, cache_key in segment_rows:
@@ -1060,7 +1085,7 @@ class TemporalResolver:
             }
             similarity = 0.0
             if query_embeddings:
-                segment_vec = self._summary_embedding_cache.get(cache_key)
+                segment_vec = self._cache_get(cache_key)
                 if segment_vec:
                     similarity = max(
                         cosine_similarity(query_vec, segment_vec)
