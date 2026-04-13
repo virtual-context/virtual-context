@@ -140,40 +140,54 @@ def recall_all() -> str:
 
 
 @mcp.tool()
-def remember_when(query: str, time_range: dict, max_results: int = 5) -> str:
+def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str = "auto") -> str:
     """Find memory by topic within a time window.
 
     Prefer relative presets in ``time_range``; the backend resolves exact dates.
     """
     engine = _get_engine()
-    result = engine.remember_when(query=query, time_range=time_range, max_results=max_results)
+    result = engine.remember_when(
+        query=query,
+        time_range=time_range,
+        max_results=max_results,
+        mode=mode,
+    )
     return json.dumps(result)
 
 
 @mcp.tool()
-def find_quote(query: str) -> str:
-    """Search the full original conversation text for a specific word, phrase, or detail.
+def find_quote(query: str, mode: str = "lookup") -> str:
+    """Find direct quote-like evidence from raw conversation turns.
 
-    Use this as your first tool when the user asks about a specific fact — a
-    name, number, dosage, recommendation, date, or decision — especially when
-    no topic summary mentions it or you don't know which topic it falls under.
-    Bypasses tags entirely and searches raw text, so it finds content even
-    when it's filed under an unexpected topic.
-
-    Uses exact-word FTS first. If no exact match is found, falls back to
-    semantic (embedding) search to catch vocabulary mismatches (e.g.
-    "received" vs "arrived"). Semantic results include match_type and
-    similarity score.
+    Use this when you need the literal place something was said: names,
+    numbers, dates, versions, recommendations, or short factual details.
+    This tool is turn-first and returns raw turn excerpts before falling back
+    to older segment-backed evidence.
 
     Args:
         query: Word or phrase to search for. Use distinctive terms, e.g.
             'magnesium glycinate' not 'supplement'.
+        mode: Retrieval mode. Use 'lookup' for normal quote search. Use
+            'exact_value' only when one excerpt should contain the answer
+            verbatim as an explicit number/version/date/count.
     Returns:
-        JSON with matching excerpts, their topics, and segment references.
+        JSON with matching excerpts and quote provenance.
     """
     engine = _get_engine()
     # Keep MCP behavior aligned with proxy tool loop: always return top 20.
-    result = engine.find_quote(query, max_results=20)
+    result = engine.find_quote(query, max_results=20, mode=mode)
+    return json.dumps(result)
+
+
+@mcp.tool()
+def search_summaries(query: str, mode: str = "lookup") -> str:
+    """Search summaries, segment text, and related stored context.
+
+    Use this when you need broader topic recall rather than one literal quote,
+    especially for cross-topic aggregation or coverage questions.
+    """
+    engine = _get_engine()
+    result = engine.search_summaries(query, max_results=20, mode=mode)
     return json.dumps(result)
 
 

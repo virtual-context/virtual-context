@@ -17,6 +17,7 @@ from .core.model_catalog import ModelCatalog
 from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
+from .core.semantic_search import persist_turn_with_embeddings
 from .core.segmenter import TopicSegmenter
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
@@ -256,7 +257,10 @@ class VirtualContextEngine:
         )
         from .core.temporal_resolver import TemporalResolver
         self._temporal = TemporalResolver(
-            store=self._store, search_engine=self._search, config=self.config,
+            store=self._store,
+            search_engine=self._search,
+            config=self.config,
+            semantic=self._semantic,
         )
         from .core.tool_query import ToolQueryRunner
         self._tool_query = ToolQueryRunner(engine=self, config=self.config)
@@ -1175,14 +1179,23 @@ class VirtualContextEngine:
         turn_number = (len(conversation_history) // 2) - 1
         user_msg = conversation_history[-2]
         assistant_msg = conversation_history[-1]
+        entry = self._turn_tag_index.get_tags_for_turn(turn_number)
         try:
-            self._store.save_turn_message(
-                self.config.conversation_id,
-                turn_number,
-                user_msg.content,
-                assistant_msg.content,
+            persist_turn_with_embeddings(
+                self._store,
+                self._semantic,
+                conversation_id=self.config.conversation_id,
+                turn_number=turn_number,
+                user_content=user_msg.content,
+                assistant_content=assistant_msg.content,
                 user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
                 assistant_raw_content=json.dumps(assistant_msg.raw_content) if assistant_msg.raw_content else None,
+                primary_tag=entry.primary_tag if entry else "_general",
+                tags=list(entry.tags) if entry else [],
+                session_date=entry.session_date if entry else "",
+                sender=entry.sender if entry else "",
+                fact_signals=list(entry.fact_signals) if entry else [],
+                code_refs=list(entry.code_refs) if entry else [],
             )
         except StaleConversationWriteError as exc:
             logger.info(
@@ -1715,8 +1728,22 @@ class VirtualContextEngine:
         )
         new_count = 0
         for turn_num, (u, a) in enumerate(pairs):
+            entry = self._turn_tag_index.get_tags_for_turn(turn_num)
             try:
-                store.save_turn_message(conv_id, turn_num, u, a)
+                persist_turn_with_embeddings(
+                    store,
+                    self._semantic,
+                    conversation_id=conv_id,
+                    turn_number=turn_num,
+                    user_content=u,
+                    assistant_content=a,
+                    primary_tag=entry.primary_tag if entry else "_general",
+                    tags=list(entry.tags) if entry else [],
+                    session_date=entry.session_date if entry else "",
+                    sender=entry.sender if entry else "",
+                    fact_signals=list(entry.fact_signals) if entry else [],
+                    code_refs=list(entry.code_refs) if entry else [],
+                )
                 if turn_num not in stored_nums:
                     new_count += 1
             except Exception as exc:
@@ -1731,8 +1758,15 @@ class VirtualContextEngine:
         max_results: int | None = None,
         intent_context: str = "",
         session_filter: str = "",
+        mode: str = "lookup",
     ) -> dict:
-        return self._search.find_quote(query, max_results, intent_context=intent_context, session_filter=session_filter)
+        return self._search.find_quote(
+            query,
+            max_results,
+            intent_context=intent_context,
+            session_filter=session_filter,
+            mode=mode,
+        )
 
     def get_turns_by_tag(
         self,
@@ -1740,6 +1774,22 @@ class VirtualContextEngine:
         conversation_history: list[Message] | None = None,
     ) -> dict:
         return self._search.get_turns_by_tag(tag, conversation_history)
+
+    def search_summaries(
+        self,
+        query: str,
+        max_results: int | None = None,
+        intent_context: str = "",
+        session_filter: str = "",
+        mode: str = "lookup",
+    ) -> dict:
+        return self._search.search_summaries(
+            query,
+            max_results,
+            intent_context=intent_context,
+            session_filter=session_filter,
+            mode=mode,
+        )
 
     def _parse_session_date(self, raw: str) -> date | None:
         return self._temporal._parse_session_date(raw)
@@ -1755,8 +1805,16 @@ class VirtualContextEngine:
         query: str,
         time_range: dict,
         max_results: int | None = None,
+        mode: str = "auto",
+        intent_context: str = "",
     ) -> dict:
-        return self._temporal.remember_when(query, time_range, max_results)
+        return self._temporal.remember_when(
+            query,
+            time_range,
+            max_results,
+            mode=mode,
+            intent_context=intent_context,
+        )
 
     # ------------------------------------------------------------------
     # query_with_tools: sync tool loop for non-proxy callers

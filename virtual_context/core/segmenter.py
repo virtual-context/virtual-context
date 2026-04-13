@@ -47,6 +47,50 @@ def _earliest_timestamp(pair: TurnPair) -> datetime | None:
     return min(timestamps) if timestamps else None
 
 
+def split_session_boundary_messages(messages: list[Message]) -> list[Message]:
+    """Split messages that contain a mid-content ``[Session from ...]`` header."""
+    out: list[Message] = []
+    for msg in messages:
+        parts = _SESSION_RE.split(msg.content, maxsplit=1)
+        if len(parts) == 3 and parts[0].strip():
+            out.append(Message(
+                role=msg.role,
+                content=parts[0].strip(),
+                timestamp=msg.timestamp,
+            ))
+            out.append(Message(
+                role=msg.role,
+                content=f"[Session from {parts[1]}]{parts[2]}",
+                timestamp=msg.timestamp,
+            ))
+        else:
+            out.append(msg)
+    return out
+
+
+def pair_messages_into_turns(messages: list[Message]) -> list[TurnPair]:
+    """Canonical user/assistant turn pairing shared by segmentation and backfill."""
+    pairs: list[TurnPair] = []
+    current_pair: list[Message] = []
+
+    for msg in messages:
+        if msg.role == "user":
+            if current_pair:
+                pairs.append(TurnPair(messages=current_pair))
+            current_pair = [msg]
+        elif msg.role == "assistant":
+            current_pair.append(msg)
+            pairs.append(TurnPair(messages=current_pair))
+            current_pair = []
+        else:
+            current_pair.append(msg)
+
+    if current_pair:
+        pairs.append(TurnPair(messages=current_pair))
+
+    return pairs
+
+
 class TopicSegmenter:
     """Groups messages into turn pairs, tags each, groups contiguous same-tag pairs."""
 
@@ -407,24 +451,7 @@ class TopicSegmenter:
         boundary falls between messages so the turn-pairer and segmenter can
         detect it.
         """
-        out: list[Message] = []
-        for msg in messages:
-            parts = _SESSION_RE.split(msg.content, maxsplit=1)
-            if len(parts) == 3 and parts[0].strip():
-                # parts = [before, captured_date, after]
-                out.append(Message(
-                    role=msg.role,
-                    content=parts[0].strip(),
-                    timestamp=msg.timestamp,
-                ))
-                out.append(Message(
-                    role=msg.role,
-                    content=f"[Session from {parts[1]}]{parts[2]}",
-                    timestamp=msg.timestamp,
-                ))
-            else:
-                out.append(msg)
-        return out
+        return split_session_boundary_messages(messages)
 
     def _pair_turns(self, messages: list[Message]) -> list[TurnPair]:
         """Group messages into (user, assistant) pairs.
@@ -433,26 +460,7 @@ class TopicSegmenter:
         Messages with mid-content session boundaries are split first.
         """
         messages = self._split_session_boundaries(messages)
-        pairs: list[TurnPair] = []
-        current_pair: list[Message] = []
-
-        for msg in messages:
-            if msg.role == "user":
-                if current_pair:
-                    pairs.append(TurnPair(messages=current_pair))
-                current_pair = [msg]
-            elif msg.role == "assistant":
-                current_pair.append(msg)
-                pairs.append(TurnPair(messages=current_pair))
-                current_pair = []
-            else:
-                # system/tool: attach to current pair
-                current_pair.append(msg)
-
-        if current_pair:
-            pairs.append(TurnPair(messages=current_pair))
-
-        return pairs
+        return pair_messages_into_turns(messages)
 
     def _build_segment(
         self, group: list[tuple[TurnPair, TagResult]], session_date: str = "",

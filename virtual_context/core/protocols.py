@@ -11,6 +11,9 @@ from ..types import (
     EngineStateSnapshot,
     Fact,
     FactLink,
+    FactSignal,
+    FullTextChunkEmbedding,
+    FullTextRow,
     LinkedFact,
     QuoteResult,
     StoredSegment,
@@ -61,6 +64,37 @@ class SegmentStore(Protocol):
     def get_turn_messages(self, conversation_id: str, turn_numbers: list[int]) -> dict[int, tuple[str, str, str | None, str | None]]: ...
     def load_recent_turn_messages(self, conversation_id: str, limit: int = 100) -> list[tuple[int, str, str]]: ...
     def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int: ...
+    def save_full_text(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+        primary_tag: str = "_general",
+        tags: list[str] | None = None,
+        session_date: str = "",
+        sender: str = "",
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None: ...
+    def get_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, FullTextRow]: ...
+    def get_all_full_text_rows(
+        self,
+        conversation_id: str,
+    ) -> list[FullTextRow]: ...
+    def delete_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int: ...
     def search_tag_summaries_fts(self, query: str, limit: int = 20, conversation_id: str | None = None) -> list[tuple[str, float]]: ...
     def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float]) -> None: ...
     def load_tag_summary_embeddings(self, conversation_id: str | None = None) -> dict[str, list[float]]: ...
@@ -127,8 +161,30 @@ class SearchStore(Protocol):
     """Full-text search and embedding storage."""
 
     def search_full_text(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list[QuoteResult]: ...
+    def search_canonical_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]: ...
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None: ...
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]: ...
+    def store_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        side: str,
+        chunks: list[FullTextChunkEmbedding],
+    ) -> None: ...
+    def get_all_full_text_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[FullTextChunkEmbedding]: ...
+    def delete_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int: ...
     def store_tool_output(self, ref: str, conversation_id: str, tool_name: str, command: str, turn: int, content: str, original_bytes: int) -> None: ...
     def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list: ...
     def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None: ...

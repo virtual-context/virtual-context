@@ -10,6 +10,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from .quote_search import find_quote as _find_quote
+from .quote_search import search_summaries as _search_summaries
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
 
@@ -48,6 +49,7 @@ class SearchEngine:
         max_results: int | None = None,
         intent_context: str = "",
         session_filter: str = "",
+        mode: str = "lookup",
     ) -> dict:
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
@@ -58,6 +60,7 @@ class SearchEngine:
             max_results,
             intent_context=intent_context,
             session_filter=session_filter,
+            mode=mode,
             conversation_id=self._config.conversation_id,
         )
 
@@ -123,19 +126,19 @@ class SearchEngine:
                 missing_turn_numbers.append(entry.turn_number)
                 live_entries.append(entry)
 
-        # Fall back to persisted turn_messages for restored turns
+        # Fall back to canonical full_text for restored turns
         if missing_turn_numbers:
-            persisted = self._store.get_turn_messages(
+            persisted = self._store.get_full_text_rows(
                 self._config.conversation_id, missing_turn_numbers,
             )
             for entry in live_entries:
                 pair = persisted.get(entry.turn_number)
                 messages = []
                 if pair:
-                    if pair[0]:
-                        messages.append({"role": "user", "content": pair[0]})
-                    if pair[1]:
-                        messages.append({"role": "assistant", "content": pair[1]})
+                    if pair.user_content:
+                        messages.append({"role": "user", "content": pair.user_content})
+                    if pair.assistant_content:
+                        messages.append({"role": "assistant", "content": pair.assistant_content})
                 result["live_turns"].append({
                     "turn_number": entry.turn_number,
                     "tags": entry.tags,
@@ -145,3 +148,24 @@ class SearchEngine:
 
         result["total_turns"] = len(result["stored_turns"]) + len(result["live_turns"])
         return result
+
+    def search_summaries(
+        self,
+        query: str,
+        max_results: int | None = None,
+        intent_context: str = "",
+        session_filter: str = "",
+        mode: str = "lookup",
+    ) -> dict:
+        if max_results is None:
+            max_results = self._config.search.find_quote_default_results
+        return _search_summaries(
+            self._store,
+            self._semantic,
+            query,
+            max_results,
+            intent_context=intent_context,
+            session_filter=session_filter,
+            mode=mode,
+            conversation_id=self._config.conversation_id,
+        )

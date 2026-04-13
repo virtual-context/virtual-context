@@ -18,6 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
+from ..core.semantic_search import persist_turn_with_embeddings
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import EngineState, Message, SplitResult
@@ -267,16 +268,26 @@ class ProxyState:
             persist(list(self.conversation_history))
             return
         turn_number = (len(self.conversation_history) // 2) - 1
+        entry = getattr(self.engine, "_turn_tag_index", None)
+        entry = entry.get_tags_for_turn(turn_number) if entry is not None else None
         try:
-            self.engine._store.save_turn_message(
-                self.engine.config.conversation_id,
-                turn_number,
-                self.conversation_history[-2].content,
-                self.conversation_history[-1].content,
+            persist_turn_with_embeddings(
+                self.engine._store,
+                self.engine._semantic,
+                conversation_id=self.engine.config.conversation_id,
+                turn_number=turn_number,
+                user_content=self.conversation_history[-2].content,
+                assistant_content=self.conversation_history[-1].content,
                 user_raw_content=json.dumps(self.conversation_history[-2].raw_content)
                 if self.conversation_history[-2].raw_content else None,
                 assistant_raw_content=json.dumps(self.conversation_history[-1].raw_content)
                 if self.conversation_history[-1].raw_content else None,
+                primary_tag=entry.primary_tag if entry else "_general",
+                tags=list(entry.tags) if entry else [],
+                session_date=entry.session_date if entry else "",
+                sender=entry.sender if entry else "",
+                fact_signals=list(entry.fact_signals) if entry else [],
+                code_refs=list(entry.code_refs) if entry else [],
             )
             self.engine._engine_state.last_completed_turn = max(
                 getattr(self.engine._engine_state, "last_completed_turn", -1),

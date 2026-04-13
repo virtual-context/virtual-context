@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -18,6 +19,8 @@ from ..types import (
     Fact,
     FactLink,
     FactSignal,
+    FullTextChunkEmbedding,
+    FullTextRow,
     LinkedFact,
     QuoteResult,
     SegmentMetadata,
@@ -107,6 +110,24 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     PRIMARY KEY (conversation_id, turn_number)
 );
 
+CREATE TABLE IF NOT EXISTS full_text (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    user_content TEXT NOT NULL DEFAULT '',
+    assistant_content TEXT NOT NULL DEFAULT '',
+    user_raw_content TEXT,
+    assistant_raw_content TEXT,
+    primary_tag TEXT NOT NULL DEFAULT '_general',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    session_date TEXT NOT NULL DEFAULT '',
+    sender TEXT NOT NULL DEFAULT '',
+    fact_signals_json TEXT NOT NULL DEFAULT '[]',
+    code_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (conversation_id, turn_number)
+);
+
 CREATE TABLE IF NOT EXISTS conversation_aliases (
     alias_id TEXT PRIMARY KEY,
     target_id TEXT NOT NULL
@@ -118,6 +139,16 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     text TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
     PRIMARY KEY (segment_ref, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS full_text_chunks (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    side TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, turn_number, side, chunk_index)
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -302,12 +333,22 @@ DO $$ BEGIN
                    WHERE table_name='tool_outputs' AND column_name='content_tsv') THEN
         ALTER TABLE tool_outputs ADD COLUMN content_tsv tsvector;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='turn_messages' AND column_name='turn_tsv') THEN
+        ALTER TABLE turn_messages ADD COLUMN turn_tsv tsvector;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='full_text' AND column_name='full_text_tsv') THEN
+        ALTER TABLE full_text ADD COLUMN full_text_tsv tsvector;
+    END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_segments_summary_tsv ON segments USING gin(summary_tsv);
 CREATE INDEX IF NOT EXISTS idx_segments_full_text_tsv ON segments USING gin(full_text_tsv);
 CREATE INDEX IF NOT EXISTS idx_facts_tsv ON facts USING gin(facts_tsv);
 CREATE INDEX IF NOT EXISTS idx_tool_outputs_tsv ON tool_outputs USING gin(content_tsv);
+CREATE INDEX IF NOT EXISTS idx_turn_messages_tsv ON turn_messages USING gin(turn_tsv);
+CREATE INDEX IF NOT EXISTS idx_full_text_tsv ON full_text USING gin(full_text_tsv);
 
 -- Triggers to keep tsvector columns in sync
 CREATE OR REPLACE FUNCTION segments_summary_tsv_trigger() RETURNS trigger AS $$
@@ -336,6 +377,24 @@ BEGIN
     RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION turn_messages_tsv_trigger() RETURNS trigger AS $$
+BEGIN
+    NEW.turn_tsv := to_tsvector(
+        'english',
+        COALESCE(NEW.user_content, '') || ' ' || COALESCE(NEW.assistant_content, '')
+    );
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION canonical_full_text_tsv_trigger() RETURNS trigger AS $$
+BEGIN
+    NEW.full_text_tsv := to_tsvector(
+        'english',
+        COALESCE(NEW.user_content, '') || ' ' || COALESCE(NEW.assistant_content, '')
+    );
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
 DROP TRIGGER IF EXISTS trg_segments_summary_tsv ON segments;
 CREATE TRIGGER trg_segments_summary_tsv BEFORE INSERT OR UPDATE ON segments
     FOR EACH ROW EXECUTE FUNCTION segments_summary_tsv_trigger();
@@ -351,11 +410,74 @@ CREATE TRIGGER trg_facts_tsv BEFORE INSERT OR UPDATE ON facts
 DROP TRIGGER IF EXISTS trg_tool_outputs_tsv ON tool_outputs;
 CREATE TRIGGER trg_tool_outputs_tsv BEFORE INSERT OR UPDATE ON tool_outputs
     FOR EACH ROW EXECUTE FUNCTION tool_outputs_tsv_trigger();
+
+DROP TRIGGER IF EXISTS trg_turn_messages_tsv ON turn_messages;
+CREATE TRIGGER trg_turn_messages_tsv BEFORE INSERT OR UPDATE ON turn_messages
+    FOR EACH ROW EXECUTE FUNCTION turn_messages_tsv_trigger();
+
+DROP TRIGGER IF EXISTS trg_canonical_full_text_tsv ON full_text;
+CREATE TRIGGER trg_canonical_full_text_tsv BEFORE INSERT OR UPDATE ON full_text
+    FOR EACH ROW EXECUTE FUNCTION canonical_full_text_tsv_trigger();
 """
 
 
 def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _turn_query_terms(query: str) -> list[str]:
+    return [term.lower() for term in re.findall(r"[a-zA-Z0-9_.%-]+", query or "") if len(term) >= 2]
+
+
+def _text_term_hits(text: str, terms: list[str]) -> int:
+    lowered = (text or "").lower()
+    if not lowered or not terms:
+        return 0
+    return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", lowered))
+
+
+def _matched_turn_side(query: str, user_text: str, assistant_text: str) -> str:
+    query_lower = (query or "").strip().lower()
+    user_lower = (user_text or "").lower()
+    assistant_lower = (assistant_text or "").lower()
+    user_hits = 0
+    assistant_hits = 0
+    if query_lower:
+        if query_lower in user_lower:
+            user_hits += 2
+        if query_lower in assistant_lower:
+            assistant_hits += 2
+    terms = _turn_query_terms(query)
+    user_hits += _text_term_hits(user_text, terms)
+    assistant_hits += _text_term_hits(assistant_text, terms)
+    if user_hits and assistant_hits:
+        return "both"
+    if user_hits:
+        return "user"
+    if assistant_hits:
+        return "assistant"
+    return "unknown"
+
+
+def _build_turn_excerpt(
+    query: str,
+    user_text: str,
+    assistant_text: str,
+    matched_side: str,
+    *,
+    context_chars: int = 200,
+) -> str:
+    if matched_side == "user":
+        return f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}"
+    if matched_side == "assistant":
+        return f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
+    if matched_side == "both":
+        return (
+            f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}\n\n"
+            f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
+        )
+    combined = f"User: {user_text or ''}\n\nAssistant: {assistant_text or ''}".strip()
+    return _extract_excerpt(combined, query, context_chars=context_chars)
 
 
 def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
@@ -417,6 +539,49 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
     )
 
 
+def _row_to_full_text(row: dict) -> FullTextRow:
+    try:
+        tags = json.loads(row.get("tags_json", "[]") or "[]")
+    except Exception:
+        tags = []
+    try:
+        code_refs = json.loads(row.get("code_refs_json", "[]") or "[]")
+    except Exception:
+        code_refs = []
+    fact_signals: list[FactSignal] = []
+    try:
+        for item in json.loads(row.get("fact_signals_json", "[]") or "[]"):
+            if isinstance(item, dict):
+                fact_signals.append(
+                    FactSignal(
+                        subject=item.get("subject", ""),
+                        verb=item.get("verb", ""),
+                        object=item.get("object", ""),
+                        status=item.get("status", ""),
+                        fact_type=item.get("fact_type", ""),
+                        what=item.get("what", ""),
+                    )
+                )
+    except Exception:
+        fact_signals = []
+    return FullTextRow(
+        conversation_id=row["conversation_id"],
+        turn_number=row["turn_number"],
+        user_content=row["user_content"] or "",
+        assistant_content=row["assistant_content"] or "",
+        user_raw_content=row["user_raw_content"],
+        assistant_raw_content=row["assistant_raw_content"],
+        primary_tag=row.get("primary_tag", "_general") or "_general",
+        tags=list(tags or []),
+        session_date=row.get("session_date", "") or "",
+        sender=row.get("sender", "") or "",
+        fact_signals=fact_signals,
+        code_refs=list(code_refs or []),
+        created_at=row.get("created_at", "") or "",
+        updated_at=row.get("updated_at", "") or "",
+    )
+
+
 class PostgresStore(ContextStore):
     """PostgreSQL storage backend with tsvector FTS and full protocol support."""
 
@@ -451,6 +616,8 @@ class PostgresStore(ContextStore):
             conn.execute("UPDATE segments SET summary_tsv = to_tsvector('english', COALESCE(summary, '')) WHERE summary_tsv IS NULL")
             conn.execute("UPDATE segments SET full_text_tsv = to_tsvector('english', COALESCE(full_text, '')) WHERE full_text_tsv IS NULL")
             conn.execute("UPDATE facts SET facts_tsv = to_tsvector('english', COALESCE(subject,'') || ' ' || COALESCE(verb,'') || ' ' || COALESCE(object,'') || ' ' || COALESCE(what,'')) WHERE facts_tsv IS NULL")
+            conn.execute("UPDATE turn_messages SET turn_tsv = to_tsvector('english', COALESCE(user_content,'') || ' ' || COALESCE(assistant_content,'')) WHERE turn_tsv IS NULL")
+            conn.execute("UPDATE full_text SET full_text_tsv = to_tsvector('english', COALESCE(user_content,'') || ' ' || COALESCE(assistant_content,'')) WHERE full_text_tsv IS NULL")
         except Exception:
             pass
         # Migration: add raw_content columns to turn_messages
@@ -467,6 +634,43 @@ class PostgresStore(ContextStore):
                     END IF;
                 END $$;
             """)
+        except Exception:
+            pass
+        try:
+            conn.execute("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='primary_tag') THEN
+                        ALTER TABLE full_text ADD COLUMN primary_tag TEXT NOT NULL DEFAULT '_general';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='tags_json') THEN
+                        ALTER TABLE full_text ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='session_date') THEN
+                        ALTER TABLE full_text ADD COLUMN session_date TEXT NOT NULL DEFAULT '';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='sender') THEN
+                        ALTER TABLE full_text ADD COLUMN sender TEXT NOT NULL DEFAULT '';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='fact_signals_json') THEN
+                        ALTER TABLE full_text ADD COLUMN fact_signals_json TEXT NOT NULL DEFAULT '[]';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='full_text' AND column_name='code_refs_json') THEN
+                        ALTER TABLE full_text ADD COLUMN code_refs_json TEXT NOT NULL DEFAULT '[]';
+                    END IF;
+                END $$;
+            """)
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_full_text_chunks_conversation ON full_text_chunks(conversation_id, turn_number, side)"
+            )
         except Exception:
             pass
         try:
@@ -1014,6 +1218,8 @@ class PostgresStore(ContextStore):
             for table in (
                 "engine_state",
                 "facts",
+                "full_text",
+                "full_text_chunks",
                 "turn_messages",
                 "tag_summaries",
                 "tag_aliases",
@@ -1193,6 +1399,75 @@ class PostgresStore(ContextStore):
             ))
         return results
 
+    def search_canonical_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]:
+        conn = self._get_conn()
+        rows = []
+        try:
+            sql = """SELECT turn_number, user_content, assistant_content, created_at,
+                            primary_tag, tags_json, session_date
+                     FROM full_text
+                     WHERE full_text_tsv @@ plainto_tsquery('english', %s)"""
+            params: list[object] = [query]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY ts_rank(full_text_tsv, plainto_tsquery('english', %s)) DESC, turn_number DESC LIMIT %s"
+            params.extend([query, limit])
+            rows = conn.execute(sql, params).fetchall()
+        except Exception:
+            pattern = f"%{query}%"
+            sql = """SELECT turn_number, user_content, assistant_content, created_at,
+                            primary_tag, tags_json, session_date
+                     FROM full_text
+                     WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
+            params = [pattern, pattern]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY turn_number DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        _sc = getattr(self, "search_config", None)
+        _ctx = _sc.excerpt_context_chars if _sc else 200
+        for row in rows:
+            turn = row["turn_number"]
+            u = row["user_content"] or ""
+            a = row["assistant_content"] or ""
+            primary_tag = row.get("primary_tag", "_general") or "_general"
+            try:
+                tags = json.loads(row.get("tags_json", "[]") or "[]")
+            except Exception:
+                tags = []
+            session_date = row.get("session_date", "") or ""
+            matched_side = _matched_turn_side(query, u, a)
+            excerpt = _build_turn_excerpt(
+                query,
+                u,
+                a,
+                matched_side,
+                context_chars=_ctx,
+            )
+            results.append(QuoteResult(
+                text=excerpt,
+                tag=primary_tag,
+                segment_ref=f"turn_{turn}",
+                tags=list(tags or []),
+                match_type="full_text_search",
+                session_date=session_date,
+                source_scope="turn",
+                turn_number=turn,
+                matched_side=matched_side,
+                created_at=row.get("created_at", "") or "",
+            ))
+        return results
+
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
         conn = self._get_conn()
         with conn.transaction():
@@ -1215,6 +1490,83 @@ class PostgresStore(ContextStore):
             )
             for row in rows
         ]
+
+    def store_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        side: str,
+        chunks: list[FullTextChunkEmbedding],
+    ) -> None:
+        conn = self._get_conn()
+        with conn.transaction():
+            conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = %s AND turn_number = %s AND side = %s",
+                (conversation_id, turn_number, side),
+            )
+            for chunk in chunks:
+                conn.execute(
+                    """INSERT INTO full_text_chunks
+                    (conversation_id, turn_number, side, chunk_index, text, embedding_json)
+                    VALUES (%s,%s,%s,%s,%s,%s)""",
+                    (
+                        chunk.conversation_id,
+                        chunk.turn_number,
+                        chunk.side,
+                        chunk.chunk_index,
+                        chunk.text,
+                        json.dumps(chunk.embedding),
+                    ),
+                )
+
+    def get_all_full_text_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[FullTextChunkEmbedding]:
+        conn = self._get_conn()
+        if conversation_id is None:
+            rows = conn.execute(
+                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
+                FROM full_text_chunks
+                ORDER BY conversation_id, turn_number, side, chunk_index"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
+                FROM full_text_chunks
+                WHERE conversation_id = %s
+                ORDER BY turn_number, side, chunk_index""",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            FullTextChunkEmbedding(
+                conversation_id=row["conversation_id"],
+                turn_number=row["turn_number"],
+                side=row["side"],
+                chunk_index=row["chunk_index"],
+                text=row["text"],
+                embedding=json.loads(row["embedding_json"]),
+            )
+            for row in rows
+        ]
+
+    def delete_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        if turn_number is None:
+            cur = conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = %s",
+                (conversation_id,),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = %s AND turn_number = %s",
+                (conversation_id, turn_number),
+            )
+        return int(cur.rowcount or 0)
 
     def store_tool_output(self, ref: str, conversation_id: str, tool_name: str, command: str, turn: int, content: str, original_bytes: int) -> None:
         conn = self._get_conn()
@@ -1246,7 +1598,14 @@ class PostgresStore(ContextStore):
         except Exception:
             return []
         return [
-            QuoteResult(text=row["excerpt"], tag=row["tool_name"], segment_ref=row["ref"], session_date="", match_type="tool_output")
+            QuoteResult(
+                text=row["excerpt"],
+                tag=row["tool_name"],
+                segment_ref=row["ref"],
+                session_date="",
+                match_type="tool_output",
+                source_scope="tool_output",
+            )
             for row in rows
         ]
 
@@ -1752,44 +2111,55 @@ class PostgresStore(ContextStore):
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list["QuoteResult"]:
-        """Search raw turn_messages for a phrase (ILIKE). Returns QuoteResult list.
-
-        Covers uncompacted turns that haven't been indexed into segments yet.
-        """
-        from ..types import QuoteResult
+        """Search raw turn_messages with tsvector search and turn-backed excerpts."""
         conn = self._get_conn()
-        pattern = f"%{query}%"
-        sql = """SELECT turn_number, user_content, assistant_content
-                 FROM turn_messages
-                 WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
-        params: list = [pattern, pattern]
-        if conversation_id is not None:
-            sql += " AND conversation_id = %s"
-            params.append(conversation_id)
-        sql += " ORDER BY turn_number DESC LIMIT %s"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+        rows = []
+        try:
+            sql = """SELECT turn_number, user_content, assistant_content
+                     FROM turn_messages
+                     WHERE turn_tsv @@ plainto_tsquery('english', %s)"""
+            params: list[object] = [query]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY ts_rank(turn_tsv, plainto_tsquery('english', %s)) DESC, turn_number DESC LIMIT %s"
+            params.extend([query, limit])
+            rows = conn.execute(sql, params).fetchall()
+        except Exception:
+            pattern = f"%{query}%"
+            sql = """SELECT turn_number, user_content, assistant_content
+                     FROM turn_messages
+                     WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
+            params = [pattern, pattern]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY turn_number DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         results = []
+        _sc = getattr(self, "search_config", None)
+        _ctx = _sc.excerpt_context_chars if _sc else 200
         for row in rows:
             turn = row["turn_number"]
             u = row["user_content"] or ""
             a = row["assistant_content"] or ""
-            # Build excerpt showing the matching turn
-            combined = f"User: {u}\n\nAssistant: {a}"
-            # Extract a window around the match
-            q_lower = query.lower()
-            idx = combined.lower().find(q_lower)
-            if idx >= 0:
-                start = max(0, idx - 100)
-                end = min(len(combined), idx + len(query) + 200)
-                excerpt = combined[start:end]
-            else:
-                excerpt = combined[:300]
+            matched_side = _matched_turn_side(query, u, a)
+            excerpt = _build_turn_excerpt(
+                query,
+                u,
+                a,
+                matched_side,
+                context_chars=_ctx,
+            )
             results.append(QuoteResult(
                 text=excerpt,
                 tag="uncompacted",
                 segment_ref=f"turn_{turn}",
                 match_type="turn_search",
+                source_scope="turn",
+                turn_number=turn,
+                matched_side=matched_side,
             ))
         return results
 
@@ -1859,6 +2229,132 @@ class PostgresStore(ContextStore):
             WHERE conversation_id = %s AND turn_number < %s""",
             (conversation_id, keep_from_turn),
         )
+        return int(cur.rowcount or 0)
+
+    def save_full_text(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+        primary_tag: str = "_general",
+        tags: list[str] | None = None,
+        session_date: str = "",
+        sender: str = "",
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        now = _dt_to_str(datetime.now(timezone.utc))
+        created = created_at or now
+        updated = updated_at or now
+        fact_signal_payload = [
+            {
+                "subject": fs.subject,
+                "verb": fs.verb,
+                "object": fs.object,
+                "status": fs.status,
+                "fact_type": getattr(fs, "fact_type", ""),
+                "what": getattr(fs, "what", ""),
+            }
+            for fs in (fact_signals or [])
+        ]
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO full_text
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content, primary_tag, tags_json,
+             session_date, sender, fact_signals_json, code_refs_json, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (conversation_id, turn_number) DO UPDATE SET
+                user_content=EXCLUDED.user_content,
+                assistant_content=EXCLUDED.assistant_content,
+                user_raw_content=EXCLUDED.user_raw_content,
+                assistant_raw_content=EXCLUDED.assistant_raw_content,
+                primary_tag=EXCLUDED.primary_tag,
+                tags_json=EXCLUDED.tags_json,
+                session_date=EXCLUDED.session_date,
+                sender=EXCLUDED.sender,
+                fact_signals_json=EXCLUDED.fact_signals_json,
+                code_refs_json=EXCLUDED.code_refs_json,
+                updated_at=EXCLUDED.updated_at""",
+            (
+                conversation_id,
+                turn_number,
+                user_content,
+                assistant_content,
+                user_raw_content,
+                assistant_raw_content,
+                primary_tag or "_general",
+                json.dumps(list(tags or [])),
+                session_date or "",
+                sender or "",
+                json.dumps(fact_signal_payload),
+                json.dumps(list(code_refs or [])),
+                created,
+                updated,
+            ),
+        )
+
+    def get_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, FullTextRow]:
+        if not turn_numbers:
+            return {}
+        conn = self._get_conn()
+        placeholders = ",".join("%s" for _ in turn_numbers)
+        rows = conn.execute(
+            f"""SELECT conversation_id, turn_number, user_content, assistant_content,
+                       user_raw_content, assistant_raw_content, primary_tag, tags_json,
+                       session_date, sender, fact_signals_json, code_refs_json,
+                       created_at, updated_at
+            FROM full_text
+            WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
+            [conversation_id] + turn_numbers,
+        ).fetchall()
+        return {
+            row["turn_number"]: _row_to_full_text(row)
+            for row in rows
+        }
+
+    def get_all_full_text_rows(
+        self,
+        conversation_id: str,
+    ) -> list[FullTextRow]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT conversation_id, turn_number, user_content, assistant_content,
+                      user_raw_content, assistant_raw_content, primary_tag, tags_json,
+                      session_date, sender, fact_signals_json, code_refs_json,
+                      created_at, updated_at
+               FROM full_text
+               WHERE conversation_id = %s
+               ORDER BY turn_number""",
+            (conversation_id,),
+        ).fetchall()
+        return [_row_to_full_text(row) for row in rows]
+
+    def delete_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        if turn_number is None:
+            cur = conn.execute(
+                "DELETE FROM full_text WHERE conversation_id = %s",
+                (conversation_id,),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM full_text WHERE conversation_id = %s AND turn_number = %s",
+                (conversation_id, turn_number),
+            )
         return int(cur.rowcount or 0)
 
     def search_tag_summaries_fts(
@@ -2122,14 +2618,12 @@ class PostgresStore(ContextStore):
     ) -> list[Fact]:
         conn = self._get_conn()
         sql = """SELECT * FROM facts
-                 WHERE fact_type = 'experience'
-                   AND status = 'completed'
-                   AND session_date >= %s AND session_date <= %s"""
+                 WHERE when_date >= %s AND when_date <= %s"""
         params: list = [start_date, end_date + "~"]
         if conversation_id:
             sql += " AND conversation_id = %s"
             params.append(conversation_id)
-        sql += " ORDER BY session_date ASC LIMIT %s"
+        sql += " ORDER BY when_date ASC LIMIT %s"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
         return [self._row_to_fact(row) for row in rows]

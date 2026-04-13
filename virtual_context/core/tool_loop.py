@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -34,6 +35,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 VC_FIND_QUOTE_MAX_RESULTS = 20
+_INTENT_CONTEXT_MAX_CHARS = 2000
+_REMINDER_CONTEXT_MAX_CHARS = 400
+_CONTEXT_BLOCK_RE = re.compile(
+    r"<(?:virtual-context|system-reminder)\b[^>]*>.*?</(?:virtual-context|system-reminder)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DATE_LIKE_RE = re.compile(
+    r"\b(?:\d{4}-\d{2}-\d{2}|[A-Z][a-z]+-\d{2}-\d{4}|[A-Z][a-z]+ \d{1,2}, \d{4})\b",
+)
+_NUMERIC_LIKE_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?%?\b")
 
 
 @runtime_checkable
@@ -54,6 +65,7 @@ VC_TOOL_NAMES: frozenset[str] = frozenset({
     "vc_expand_topic",
     "vc_find_quote",
     "vc_find_session",
+    "vc_search_summaries",
     "vc_query_facts",
     "vc_recall_all",
     "vc_remember_when",
@@ -110,16 +122,19 @@ def vc_tool_definitions() -> list[dict]:
         {
             "name": "vc_find_quote",
             "description": (
-                "Search the full original conversation text and truncated tool "
-                "outputs for a specific word, phrase, or detail. Use this when "
-                "you see '... N bytes truncated — call vc_find_quote(query) ...' "
-                "in a tool result, or when the user asks about a specific fact — "
-                "a name, number, dosage, recommendation, date, or decision — "
-                "especially when no topic summary mentions it or you don't know "
-                "which topic it falls under. This bypasses tags entirely and "
-                "searches raw text, so it finds content even when it's filed "
-                "under an unexpected topic. Returns short excerpts — use "
-                "vc_expand_topic on a matching tag if you need more context."
+                "Find direct quote-like evidence from raw conversation turns. "
+                "This tool is turn-first: use it when you need the literal "
+                "place something was said, especially for names, numbers, "
+                "dosages, versions, dates, and short factual details. It "
+                "returns turn-backed excerpts first, then falls back to older "
+                "segment-backed evidence only when the turn search is "
+                "insufficient. Use mode='lookup' for normal pinpoint search. "
+                "Use mode='exact_value' only when one excerpt should contain "
+                "the answer verbatim as an explicit number, percentage, "
+                "version, date, or count. Do not use vc_find_quote for "
+                "aggregate totals or coverage across multiple components; use "
+                "vc_search_summaries for that. If the question is anchored to "
+                "a specific date or date range, use vc_remember_when first."
             ),
             "input_schema": {
                 "type": "object",
@@ -132,8 +147,68 @@ def vc_tool_definitions() -> list[dict]:
                             "'supplement', or 'reservation 7pm' rather than 'dinner'."
                         ),
                     },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lookup", "exact_value"],
+                        "description": (
+                            "Retrieval mode. Use 'lookup' for a standard search. "
+                            "Use 'exact_value' only when one excerpt should contain "
+                            "the answer verbatim as an explicit number, percentage, "
+                            "version, date, or count. Do not use this tool when "
+                            "you must combine multiple components or search broad "
+                            "summaries across older compacted memory."
+                        ),
+                    },
                 },
-                "required": ["query"],
+                "required": ["query", "mode"],
+            },
+        },
+        {
+            "name": "vc_search_summaries",
+            "description": (
+                "Search compacted summaries, segment text, descriptions, and "
+                "related stored context when you need broader topic recall "
+                "rather than one literal quote. Use this for cross-topic "
+                "aggregation, coverage across multiple named components, or "
+                "when you know the answer may live in older compacted memory. "
+                "Use mode='lookup' for a normal segment-first summary search. "
+                "Use mode='aggregate_total' when the answer is one total "
+                "computed from multiple named components and no single excerpt "
+                "is expected to state the final total verbatim. Use mode="
+                "'coverage' when the answer requires multiple complementary "
+                "pieces of evidence that should be combined or compared but not "
+                "arithmetically summed. If the question asks for one target or "
+                "throughput across several efforts or systems, prefer "
+                "'coverage' even if it says 'combined'."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The summary/topic search query. Use the key entities, "
+                            "technologies, or goals you want to recover."
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lookup", "aggregate_total", "coverage"],
+                        "description": (
+                            "Summary-search mode. Use 'lookup' for standard "
+                            "summary/segment search. Use 'aggregate_total' for "
+                            "questions like 'in total when combining X and Y' "
+                            "where you truly need to sum different component "
+                            "values. Use 'coverage' for questions like "
+                            "'one target across sharding, load balancing, and "
+                            "partitioning' where the answer is a shared target "
+                            "or one combined goal rather than an arithmetic sum. "
+                            "Use 'coverage' when multiple sides of the answer must "
+                            "be covered without summing them."
+                        ),
+                    },
+                },
+                "required": ["query", "mode"],
             },
         },
         {
@@ -199,11 +274,20 @@ def vc_tool_definitions() -> list[dict]:
                 "Best tool for time-based questions. Retrieves conversations "
                 "and facts from a specific date range. Use FIRST when the "
                 "question mentions a time period ('past three months', "
-                "'last week', 'in March', 'between June and July'). "
+                "'last week', 'in March', 'between June and July'). Also use "
+                "FIRST when the question asks what was true on a specific "
+                "date or within a date window, even if the final answer is "
+                "numeric. "
                 "Returns both conversation excerpts and structured facts "
                 "within the window. Use relative presets when they match, "
                 "or between_dates with explicit YYYY-MM-DD dates for "
-                "custom ranges."
+                "custom ranges. Use mode='lookup' for narrow fact lookups "
+                "within the window, mode='state_at_time' for the state on a "
+                "specific date or short date window, mode='change_over_time' "
+                "for chronology/evidence retrieval across the window, and "
+                "mode='summarize_over_time' for broad temporal synthesis "
+                "questions: how something evolved, changed, progressed, "
+                "developed, or unfolded across the window."
             ),
             "input_schema": {
                 "type": "object",
@@ -217,7 +301,7 @@ def vc_tool_definitions() -> list[dict]:
                         "properties": {
                             "kind": {"type": "string", "enum": ["relative", "between_dates"]},
                             "preset": {"type": "string", "enum": [
-                                "last_7_days", "last_30_days", "last_90_days",
+                                "last_7_days", "last_30_days", "last_90_days", "last_180_days",
                                 "last_week", "last_month",
                                 "this_week", "this_month",
                             ]},
@@ -228,7 +312,21 @@ def vc_tool_definitions() -> list[dict]:
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum results to return (default 5).",
+                        "description": "Maximum results to return (default 12).",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "lookup", "change_over_time", "summarize_over_time", "state_at_time"],
+                        "description": (
+                            "Retrieval mode. Use 'lookup' for narrow fact retrieval, "
+                            "'state_at_time' when the question asks what was true "
+                            "on a specific date or short date window, "
+                            "'change_over_time' for chronology/evidence retrieval "
+                            "with multiple dated items across the range, and "
+                            "'summarize_over_time' for broad temporal synthesis, "
+                            "progression, and shifts across the date range. "
+                            "Default is 'auto'."
+                        ),
                     },
                 },
                 "required": ["query", "time_range"],
@@ -400,6 +498,94 @@ def _extract_last_user_text(original_request: dict) -> str:
                 return text.strip()
 
     return ""
+
+
+def _sanitize_intent_context(text: str, *, max_chars: int = _INTENT_CONTEXT_MAX_CHARS) -> str:
+    """Return the user intent without injected VC context wrappers."""
+    cleaned = _CONTEXT_BLOCK_RE.sub("", (text or "")).strip()
+    if not cleaned:
+        cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    lines = [line.strip() for line in cleaned.splitlines()]
+    for idx, line in enumerate(lines):
+        if not re.match(r"(?i)^question\s*:", line):
+            continue
+        question_parts = [line.split(":", 1)[1].strip()]
+        for extra in lines[idx + 1:]:
+            if not extra:
+                break
+            if re.match(r"(?i)^answer\s*:", extra):
+                break
+            question_parts.append(extra)
+        cleaned = " ".join(part for part in question_parts if part).strip()
+        break
+
+    cleaned = re.sub(r"(?i)\s*answer\s*:\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    truncated = cleaned[: max_chars - 3].rstrip()
+    if " " in truncated:
+        truncated = truncated.rsplit(" ", 1)[0]
+    return truncated.rstrip() + "..."
+
+
+def _extract_last_user_intent_text(original_request: dict) -> str:
+    """Extract the last user message and strip injected VC prompt scaffolding."""
+    return _sanitize_intent_context(_extract_last_user_text(original_request))
+
+
+def _truncate_reminder_text(text: str, *, max_chars: int = _REMINDER_CONTEXT_MAX_CHARS) -> str:
+    """Keep reminder text short even when the original question is verbose."""
+    return _sanitize_intent_context(text, max_chars=max_chars)
+
+
+def _tool_result_has_dates_or_numeric_values(raw_result: str) -> bool:
+    """Whether a tool-result payload contains date/numeric evidence.
+
+    This is intentionally evidence-based rather than question-based so we can
+    nudge arithmetic verification without a separate classifier step.
+    """
+
+    try:
+        payload = json.loads(raw_result)
+    except Exception:
+        payload = raw_result
+
+    def _walk(value: object) -> bool:
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                key_lower = str(key).lower()
+                if "date" in key_lower and inner:
+                    return True
+                if key_lower in {
+                    "value",
+                    "values",
+                    "chosen_exact_value_candidate",
+                    "exact_value_candidates",
+                    "coverage_value_candidates",
+                    "shared_value_candidates",
+                    "aggregate_total_candidates",
+                    "chosen_aggregate_total",
+                    "competing_aggregate_totals",
+                } and inner:
+                    return True
+                if _walk(inner):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(_walk(item) for item in value)
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, str):
+            return bool(_DATE_LIKE_RE.search(value) or _NUMERIC_LIKE_RE.search(value))
+        return False
+
+    return _walk(payload)
 
 
 def _attach_related_facts(
@@ -652,6 +838,9 @@ def execute_vc_tool(
             "found": found,
             "results": sanitized_results,
         }
+        mode = raw.get("mode")
+        if isinstance(mode, str) and mode.strip():
+            trimmed["mode"] = mode
         if raw.get("current_state_multi_session") is True:
             trimmed["current_state_multi_session"] = True
         priority_label = raw.get("priority_label")
@@ -663,6 +852,116 @@ def execute_vc_tool(
         message = raw.get("message")
         if isinstance(message, str) and message.strip() and not found:
             trimmed["message"] = message
+        value_candidates = raw.get("value_candidates")
+        if isinstance(value_candidates, list) and value_candidates:
+            trimmed["value_candidates"] = value_candidates
+        exact_value_candidates = raw.get("exact_value_candidates")
+        if isinstance(exact_value_candidates, list) and exact_value_candidates:
+            trimmed["exact_value_candidates"] = exact_value_candidates
+        chosen_exact_value_candidate = raw.get("chosen_exact_value_candidate")
+        if isinstance(chosen_exact_value_candidate, dict) and chosen_exact_value_candidate:
+            trimmed["chosen_exact_value_candidate"] = chosen_exact_value_candidate
+        conflicting_exact_value_candidates = raw.get("conflicting_exact_value_candidates")
+        if isinstance(conflicting_exact_value_candidates, list) and conflicting_exact_value_candidates:
+            trimmed["conflicting_exact_value_candidates"] = conflicting_exact_value_candidates
+        coverage_summary = raw.get("coverage_summary")
+        if isinstance(coverage_summary, dict) and coverage_summary:
+            trimmed["coverage_summary"] = coverage_summary
+        coverage_value_candidates = raw.get("coverage_value_candidates")
+        if isinstance(coverage_value_candidates, list) and coverage_value_candidates:
+            trimmed["coverage_value_candidates"] = coverage_value_candidates
+        chosen_preference_anchor = raw.get("chosen_preference_anchor")
+        if isinstance(chosen_preference_anchor, dict) and chosen_preference_anchor:
+            trimmed["chosen_preference_anchor"] = chosen_preference_anchor
+        anchor_example_calculation = raw.get("anchor_example_calculation")
+        if isinstance(anchor_example_calculation, dict) and anchor_example_calculation:
+            trimmed["anchor_example_calculation"] = anchor_example_calculation
+        shared_value_candidates = raw.get("shared_value_candidates")
+        if isinstance(shared_value_candidates, list) and shared_value_candidates:
+            trimmed["shared_value_candidates"] = shared_value_candidates
+        aggregate_total_candidates = raw.get("aggregate_total_candidates")
+        if isinstance(aggregate_total_candidates, list) and aggregate_total_candidates:
+            trimmed["aggregate_total_candidates"] = aggregate_total_candidates
+        if raw.get("ambiguity_detected") is True:
+            trimmed["ambiguity_detected"] = True
+        ambiguity_reason = raw.get("ambiguity_reason")
+        if isinstance(ambiguity_reason, str) and ambiguity_reason.strip():
+            trimmed["ambiguity_reason"] = ambiguity_reason
+        competing_aggregate_totals = raw.get("competing_aggregate_totals")
+        if isinstance(competing_aggregate_totals, list) and competing_aggregate_totals:
+            trimmed["competing_aggregate_totals"] = competing_aggregate_totals
+        chosen_aggregate_total = raw.get("chosen_aggregate_total")
+        if isinstance(chosen_aggregate_total, dict) and chosen_aggregate_total:
+            trimmed["chosen_aggregate_total"] = chosen_aggregate_total
+        return trimmed
+
+    def _trim_remember_when_payload(raw: object) -> object:
+        """Return only model-relevant remember_when fields for tool output."""
+        if not isinstance(raw, dict):
+            return raw
+        if "error" in raw or raw.get("is_error") is True:
+            return raw
+
+        mode = raw.get("mode")
+        trimmed: dict[str, object] = {}
+        if isinstance(mode, str) and mode.strip():
+            trimmed["mode"] = mode
+
+        found = raw.get("found")
+        if isinstance(found, bool):
+            trimmed["found"] = found
+
+        range_payload = raw.get("range")
+        if isinstance(range_payload, dict) and range_payload:
+            trimmed["range"] = range_payload
+
+        message = raw.get("message")
+        if isinstance(message, str) and message.strip():
+            trimmed["message"] = message
+
+        if mode == "summarize_over_time":
+            ordered_milestones = raw.get("ordered_milestones")
+            if isinstance(ordered_milestones, list) and ordered_milestones:
+                trimmed["ordered_milestones"] = ordered_milestones
+                trimmed["reader_hint"] = (
+                    "Use ordered_milestones as the primary chronological evidence. "
+                    "Do not combine extra themes from separate milestones."
+                )
+                return trimmed
+        if mode == "change_over_time":
+            date_buckets = raw.get("date_buckets")
+            if isinstance(date_buckets, list) and date_buckets:
+                trimmed["date_buckets"] = date_buckets
+                trimmed["reader_hint"] = (
+                    "Use date_buckets as the primary chronological evidence. "
+                    "Prefer directly matching results and facts from each date. "
+                    "Do not infer missing themes that are not present."
+                )
+                return trimmed
+
+        results = raw.get("results")
+        if isinstance(results, list):
+            trimmed["results"] = results
+        facts_in_window = raw.get("facts_in_window")
+        if isinstance(facts_in_window, list):
+            trimmed["facts_in_window"] = facts_in_window
+
+        ordered_milestones = raw.get("ordered_milestones")
+        if isinstance(ordered_milestones, list) and ordered_milestones:
+            trimmed["ordered_milestones"] = ordered_milestones
+
+        target_date = raw.get("target_date")
+        if isinstance(target_date, str) and target_date.strip():
+            trimmed["target_date"] = target_date
+        chosen_state = raw.get("chosen_state")
+        if isinstance(chosen_state, dict) and chosen_state:
+            trimmed["chosen_state"] = chosen_state
+        conflicting_candidates = raw.get("conflicting_candidates")
+        if isinstance(conflicting_candidates, list) and conflicting_candidates:
+            trimmed["conflicting_candidates"] = conflicting_candidates
+        state_anchor = raw.get("state_anchor")
+        if isinstance(state_anchor, dict) and state_anchor:
+            trimmed["state_anchor"] = state_anchor
         return trimmed
 
     try:
@@ -721,22 +1020,38 @@ def execute_vc_tool(
 
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
+            fq_mode = tool_input.get("mode", "lookup")
             _fq_max = engine.config.search.find_quote_max_results
             result = engine.find_quote(
                 query=fq_query,
                 max_results=_fq_max,
                 intent_context=intent_context,
+                mode=fq_mode,
+            )
+            result = _suppress_presented_segments(result, presented_segment_refs)
+            result = _trim_find_quote_payload(result)
+            result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
+        elif name == "vc_search_summaries":
+            fq_query = tool_input.get("query", "")
+            fq_mode = tool_input.get("mode", "lookup")
+            _fq_max = engine.config.search.find_quote_max_results
+            result = engine.search_summaries(
+                query=fq_query,
+                max_results=_fq_max,
+                intent_context=intent_context,
+                mode=fq_mode,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
             result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
         elif name == "vc_find_session":
             _fq_max = engine.config.search.find_quote_max_results
-            result = engine.find_quote(
+            result = engine.search_summaries(
                 query=tool_input.get("query", ""),
                 max_results=_fq_max,
                 intent_context=intent_context,
                 session_filter=tool_input.get("session", ""),
+                mode="lookup",
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
@@ -809,11 +1124,15 @@ def execute_vc_tool(
                     for lf in meta["linked_facts"]
                 ]
         elif name == "vc_remember_when":
+            max_results = tool_input.get("max_results")
             result = engine.remember_when(
                 query=tool_input.get("query", ""),
                 time_range=tool_input.get("time_range", {}),
-                max_results=tool_input.get("max_results", engine.config.search.remember_when_max_results),
+                max_results=max_results,
+                mode=tool_input.get("mode", "auto"),
+                intent_context=intent_context,
             )
+            result = _trim_remember_when_payload(result)
         elif name == "vc_restore_tool":
             ref = tool_input.get("ref", "")
             if not _runtime_supports_restore(tool_runtime):
@@ -852,6 +1171,17 @@ def _is_empty_result(result_json: str) -> bool:
     return False
 
 
+def _tool_result_grounding_hint(tool_name: str, tool_input: dict) -> str:
+    """Return an evidence-grounding reminder for tool results when helpful."""
+    if tool_name == "vc_find_quote" and tool_input.get("mode", "lookup") == "lookup":
+        return (
+            "\n\n[REMINDER] Answer from the most directly matching quoted evidence "
+            "in these tool results. Prefer exact quoted statements over broader "
+            "paraphrase, and do not combine details from separate events or sessions."
+        )
+    return ""
+
+
 _STRATEGY_HINTS: dict[str, str] = {
     "vc_query_facts": (
         "[HINT] vc_query_facts has returned no results {n} times in a row. "
@@ -861,9 +1191,15 @@ _STRATEGY_HINTS: dict[str, str] = {
     ),
     "vc_find_quote": (
         "[HINT] vc_find_quote has returned no results {n} times in a row. "
-        "Try a different approach: use vc_query_facts to search structured "
-        "facts, vc_expand_topic(tag) to browse a topic, or try broader/"
-        "different search terms."
+        "Try a different approach: use vc_search_summaries for broader "
+        "compacted-memory search, vc_query_facts to search structured facts, "
+        "or try different search terms."
+    ),
+    "vc_search_summaries": (
+        "[HINT] vc_search_summaries has returned no results {n} times in a "
+        "row. Try a different approach: use vc_find_quote(query) for raw "
+        "turn-level evidence, vc_query_facts for structured facts, or "
+        "broaden the topic search."
     ),
     "vc_remember_when": (
         "[HINT] vc_remember_when has returned no results {n} times in a row. "
@@ -1139,17 +1475,8 @@ def run_tool_loop(
         headers.update(extra_headers)
     cont_body: dict | None = None
     current_response = initial_response
-    intent_context = _extract_last_user_text(original_request)
+    intent_context = _extract_last_user_intent_text(original_request)
     _find_session_injected = False
-
-    # Short reminder appended to each tool result so the model
-    # doesn't lose sight of the original question during long loops.
-    _question_reminder = (
-        f"\n\n[REMINDER] If you have enough information to answer this "
-        f"user question: \"{intent_context}\" — stop calling tools and respond."
-        if intent_context else ""
-    )
-
     with httpx.Client(timeout=300.0) as client:
         for loop_i in range(max_loops):
             # Execute VC tools
@@ -1187,10 +1514,19 @@ def run_tool_loop(
                         tpl = _STRATEGY_HINTS.get(tc["name"], _DEFAULT_STRATEGY_HINT)
                         strategy_hint = "\n\n" + tpl.format(n=streak)
 
+                verification_hint = ""
+                if _tool_result_has_dates_or_numeric_values(result_str):
+                    verification_hint = (
+                        "\n\n[REMINDER] If your answer depends on dates or numbers in "
+                        "these tool results, verify the arithmetic and units directly "
+                        "from the evidence before responding."
+                    )
+                grounding_hint = _tool_result_grounding_hint(tc["name"], tc["input"])
+
                 tool_results.append(
                     adapter.build_tool_result(
                         tc["id"], tc["name"],
-                        result_str + strategy_hint + _question_reminder,
+                        result_str + strategy_hint + verification_hint + grounding_hint,
                     )
                 )
 

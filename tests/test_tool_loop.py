@@ -20,6 +20,7 @@ def _mock_engine(**overrides):
 
 from virtual_context.core.tool_loop import (
     VC_TOOL_NAMES,
+    _tool_result_has_dates_or_numeric_values,
     AnthropicAdapter,
     GeminiAdapter,
     OpenAIAdapter,
@@ -41,9 +42,9 @@ from virtual_context.core.tool_query import ToolQueryRunner
 class TestVCToolDefinitions:
     """Tests for vc_tool_definitions()."""
 
-    def test_returns_six_tools(self):
+    def test_returns_seven_tools(self):
         defs = vc_tool_definitions()
-        assert len(defs) == 6
+        assert len(defs) == 7
 
     def test_tool_names_have_vc_prefix(self):
         defs = vc_tool_definitions()
@@ -51,6 +52,7 @@ class TestVCToolDefinitions:
         assert names == {
             "vc_expand_topic",
             "vc_find_quote",
+            "vc_search_summaries",
             "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",
@@ -224,6 +226,7 @@ class TestExecuteVCTool:
             query="test",
             max_results=20,
             intent_context="",
+            mode="lookup",
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
@@ -232,9 +235,121 @@ class TestExecuteVCTool:
         assert "segment_ref" not in parsed["results"][0]
         assert "segment_refs" not in parsed["results"][0]
 
-    def test_find_session_calls_engine_with_session_filter(self):
+
+class TestToolResultVerificationHint:
+    def test_detects_dates_or_numeric_values_in_tool_payload(self):
+        payload = json.dumps(
+            {
+                "found": True,
+                "results": [
+                    {
+                        "excerpt": "User: [Session from December-16-2024] I'm starting to work on the query rewriting pipelines.",
+                        "session_date_normalized": "2024-12-16",
+                    }
+                ],
+            }
+        )
+        assert _tool_result_has_dates_or_numeric_values(payload) is True
+
+    def test_ignores_plain_text_payload_without_dates_or_numbers(self):
+        payload = json.dumps(
+            {
+                "found": True,
+                "results": [
+                    {
+                        "excerpt": "User: I need help organizing the module structure.",
+                        "topic": "module-organization",
+                    }
+                ],
+            }
+        )
+        assert _tool_result_has_dates_or_numeric_values(payload) is False
+
+    def test_find_quote_preserves_shared_value_candidates(self):
         engine = _mock_engine()
         engine.find_quote.return_value = {
+            "query": "queries per second sharding load balancing partitioning",
+            "mode": "exact_value",
+            "found": True,
+            "results": [
+                {
+                    "excerpt": "User: support 5,000 queries/sec with load balancing and sharding.",
+                    "topic": "api-rate-limiting",
+                    "segment_ref": "turn_6718",
+                }
+            ],
+            "reader_hint": "Prefer shared_value_candidates when present.",
+            "chosen_exact_value_candidate": {
+                "values": ["99.9%", "5,000 queries"],
+            },
+            "shared_value_candidates": [
+                {
+                    "value": "5,000 queries/second",
+                    "unit": "second",
+                    "occurrences": 2,
+                    "matched_components": [
+                        "sharding",
+                        "load balancing",
+                        "partitioning",
+                    ],
+                }
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_find_quote",
+            {
+                "query": "queries per second sharding load balancing partitioning",
+                "mode": "exact_value",
+            },
+        )
+
+        parsed = json.loads(result)
+        assert parsed["shared_value_candidates"][0]["value"] == "5,000 queries/second"
+        assert parsed["results"][0]["excerpt"].startswith("User: support 5,000 queries/sec")
+
+    def test_search_summaries_preserves_preference_anchor_fields(self):
+        engine = _mock_engine()
+        engine.search_summaries.return_value = {
+            "mode": "lookup",
+            "found": True,
+            "results": [
+                {
+                    "excerpt": (
+                        "User specified initial requirement of 500 EC2 instances "
+                        "at $0.11/hour."
+                    ),
+                    "topic": "cost-analysis",
+                    "segment_ref": "seg-anchor",
+                }
+            ],
+            "reader_hint": "Use chosen_preference_anchor as the concrete example.",
+            "chosen_preference_anchor": {
+                "provider": "AWS EC2",
+                "hourly_rate": "$0.11/hour",
+                "instance_count": "500",
+            },
+            "anchor_example_calculation": {
+                "formula": "$0.11/hour * 500 instances = $55/hour",
+                "hourly_compute_total": "$55/hour",
+            },
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "cloud cost estimation", "mode": "lookup"},
+        )
+
+        parsed = json.loads(result)
+        assert parsed["chosen_preference_anchor"]["hourly_rate"] == "$0.11/hour"
+        assert parsed["anchor_example_calculation"]["hourly_compute_total"] == "$55/hour"
+        assert parsed["results"][0]["excerpt"].startswith("User specified initial requirement")
+
+    def test_find_session_calls_engine_with_session_filter(self):
+        engine = _mock_engine()
+        engine.search_summaries.return_value = {
             "found": True,
             "results": [{"excerpt": "found it", "topic": "sneakers"}],
         }
@@ -242,11 +357,12 @@ class TestExecuteVCTool:
             engine, "vc_find_session",
             {"query": "shoe rack", "session": "2023/05/29"},
         )
-        engine.find_quote.assert_called_once_with(
+        engine.search_summaries.assert_called_once_with(
             query="shoe rack",
             max_results=20,
             intent_context="",
             session_filter="2023/05/29",
+            mode="lookup",
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
@@ -269,14 +385,124 @@ class TestExecuteVCTool:
                 "query": "auth",
                 "time_range": {"kind": "relative", "preset": "last_7_days"},
             },
+            intent_context="What auth issues came up recently?",
         )
         engine.remember_when.assert_called_once_with(
             query="auth",
             time_range={"kind": "relative", "preset": "last_7_days"},
-            max_results=5,
+            max_results=None,
+            mode="auto",
+            intent_context="What auth issues came up recently?",
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
+
+    def test_remember_when_summarize_over_time_prefers_ordered_milestones_payload(self):
+        engine = _mock_engine()
+        engine.remember_when.return_value = {
+            "query": "error types handling challenges",
+            "mode": "summarize_over_time",
+            "found": True,
+            "range": {
+                "kind": "between_dates",
+                "start": "2024-11-01",
+                "end": "2025-01-21",
+            },
+            "results": [
+                {
+                    "excerpt": "Verbose summary blob that should not be sent through.",
+                    "topic": "cache-invalidation",
+                }
+            ],
+            "facts_in_window": [
+                {
+                    "what": "Verbose fact blob that should not be sent through.",
+                    "when": "2024-11-21",
+                }
+            ],
+            "ordered_milestones": [
+                {
+                    "date": "2024-11-01",
+                    "theme": "context handling challenges",
+                    "point": "Custom exception class InvalidTokenTypeError defined to handle cases where tokens are not strings",
+                    "source": "fact",
+                },
+                {
+                    "date": "2024-11-13",
+                    "theme": "indexing error tracking",
+                    "point": "User reported IndexScoringError affecting 11% of sparse updates",
+                    "source": "segment",
+                },
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "error types handling challenges",
+                "time_range": {"kind": "between_dates", "start": "2024-11-01", "end": "2025-01-21"},
+                "mode": "summarize_over_time",
+            },
+        )
+
+        parsed = json.loads(result)
+        assert parsed["mode"] == "summarize_over_time"
+        assert parsed["ordered_milestones"][0]["theme"] == "context handling challenges"
+        assert "results" not in parsed
+        assert "facts_in_window" not in parsed
+        assert "reader_hint" in parsed
+
+    def test_remember_when_change_over_time_prefers_date_buckets_payload(self):
+        engine = _mock_engine()
+        engine.remember_when.return_value = {
+            "query": "error types handling challenges",
+            "mode": "change_over_time",
+            "found": True,
+            "range": {
+                "kind": "between_dates",
+                "start": "2024-11-01",
+                "end": "2025-01-21",
+            },
+            "results": [
+                {"excerpt": "Context window mismatch discussion", "topic": "adaptive-window-sizing"}
+            ],
+            "facts_in_window": [
+                {"what": "IndexScoringError affected sparse updates", "when": "2024-11-13"}
+            ],
+            "date_buckets": [
+                {
+                    "date": "2024-11-05",
+                    "results": [
+                        {
+                            "topic": "adaptive-window-sizing",
+                            "excerpt": "Context window mismatch discussion",
+                            "matched_terms": ["mismatch"],
+                            "segment_ref": "seg-1",
+                            "match_type": "summary",
+                        }
+                    ],
+                    "facts": [],
+                }
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "error types handling challenges",
+                "time_range": {"kind": "between_dates", "start": "2024-11-01", "end": "2025-01-21"},
+                "mode": "change_over_time",
+            },
+        )
+
+        parsed = json.loads(result)
+        assert parsed["mode"] == "change_over_time"
+        assert parsed["date_buckets"][0]["date"] == "2024-11-05"
+        assert "results" not in parsed
+        assert "facts_in_window" not in parsed
+        assert "reader_hint" in parsed
 
     def test_unknown_tool_returns_error(self):
         engine = MagicMock()
@@ -810,6 +1036,7 @@ class TestRunToolLoop:
             query="x",
             max_results=20,
             intent_context="test",
+            mode="lookup",
         )
 
     def test_passes_last_user_text_as_intent_context(self):
@@ -846,7 +1073,163 @@ class TestRunToolLoop:
             query="shoe rack",
             max_results=20,
             intent_context="Where do I currently keep my old sneakers?",
+            mode="lookup",
         )
+
+    def test_strips_injected_context_from_intent_context_and_adds_lookup_grounding_hint(self):
+        engine = _mock_engine()
+        engine.find_quote.return_value = {"found": True, "results": []}
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "vc_find_quote",
+                "input": {"query": "context window management module"},
+            },
+        ], stop_reason="tool_use")
+        continuation = _make_response([{"type": "text", "text": "45 days"}])
+
+        question = (
+            "How many days passed between when I started working on the "
+            "context window management module and when I began developing "
+            "the query rewriting pipelines for our RAG system?"
+        )
+        original_request = {
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Based on the conversation history, answer the following question. "
+                                "Only provide the answer without any explanations.\n\n"
+                                f"Question: {question}"
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "<system-reminder>\n"
+                                "Conversation History:\n\n"
+                                "<virtual-context tags=\"demo\" segments=\"1\">\n"
+                                "[1/1] [January-01-2025]\n"
+                                "Large injected context that should never be echoed back inside "
+                                "tool reminders.\n"
+                                "</virtual-context>\n"
+                                "</system-reminder>"
+                            ),
+                        },
+                    ],
+                },
+            ],
+        }
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = _MockHTTPResponse(continuation)
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = run_tool_loop(engine, initial, original_request, _anthropic_adapter())
+
+        assert result.text == "45 days"
+        engine.find_quote.assert_called_once_with(
+            query="context window management module",
+            max_results=20,
+            intent_context=question,
+            mode="lookup",
+        )
+
+        sent_body = mock_client.post.call_args[1]["json"]
+        tool_result = sent_body["messages"][2]["content"][0]["content"]
+        assert (
+            "Answer from the most directly matching quoted evidence in these "
+            "tool results" in tool_result
+        )
+        assert "<system-reminder>" not in tool_result
+        assert "Large injected context that should never be echoed back" not in tool_result
+        assert question not in tool_result
+
+    def test_adds_numeric_verification_hint_when_tool_result_has_date_or_number(self):
+        engine = _mock_engine()
+        engine.find_quote.return_value = {
+            "found": True,
+            "results": [
+                {
+                    "excerpt": "User: [Session from December-16-2024] I'm starting to work on the query rewriting pipelines and targeting 95% detection.",
+                    "session_date_normalized": "2024-12-16",
+                }
+            ],
+        }
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "vc_find_quote",
+                "input": {"query": "query rewriting pipelines"},
+            },
+        ], stop_reason="tool_use")
+        continuation = _make_response([{"type": "text", "text": "45 days"}])
+
+        original_request = {
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "When did I start query rewriting work?"}],
+        }
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = _MockHTTPResponse(continuation)
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            run_tool_loop(engine, initial, original_request, _anthropic_adapter())
+
+        sent_body = mock_client.post.call_args[1]["json"]
+        tool_result = sent_body["messages"][2]["content"][0]["content"]
+        assert "verify the arithmetic and units directly from the evidence" in tool_result
+
+    def test_does_not_add_lookup_grounding_hint_for_exact_value(self):
+        engine = _mock_engine()
+        engine.find_quote.return_value = {"found": True, "results": []}
+        engine.reassemble_context.return_value = ""
+
+        initial = _make_response([
+            {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "vc_find_quote",
+                "input": {"query": "Milvus version", "mode": "exact_value"},
+            },
+        ], stop_reason="tool_use")
+        continuation = _make_response([{"type": "text", "text": "Milvus 2.3.1"}])
+
+        with patch("virtual_context.core.tool_loop.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.post.return_value = _MockHTTPResponse(continuation)
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            run_tool_loop(
+                engine,
+                initial,
+                {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "What version?"}]},
+                _anthropic_adapter(),
+            )
+
+        sent_body = mock_client.post.call_args[1]["json"]
+        tool_result = sent_body["messages"][2]["content"][0]["content"]
+        assert "Answer from the most directly matching quoted evidence" not in tool_result
 
     def test_multi_tool_single_loop(self):
         engine = MagicMock()
@@ -1268,6 +1651,7 @@ class TestVCToolNames:
             "vc_expand_topic",
             "vc_find_quote",
             "vc_find_session",
+            "vc_search_summaries",
             "vc_query_facts",
             "vc_recall_all",
             "vc_remember_when",

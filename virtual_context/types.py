@@ -550,6 +550,9 @@ class QuoteResult:
     similarity: float = 0.0  # cosine similarity (semantic matches only)
     session_date: str = ""   # session date from segment metadata
     created_at: str = ""     # segment created_at timestamp for chronological ordering
+    source_scope: str = "segment"  # "turn", "segment", or "tool_output"
+    turn_number: int | None = None
+    matched_side: str = ""   # "user", "assistant", "both", or "unknown"
 
 
 @dataclass
@@ -559,6 +562,40 @@ class ChunkEmbedding:
     chunk_index: int
     text: str
     embedding: list[float]
+
+
+@dataclass
+class FullTextRow:
+    """Canonical archived user/assistant turn text."""
+    conversation_id: str
+    turn_number: int
+    user_content: str = ""
+    assistant_content: str = ""
+    user_raw_content: str | None = None
+    assistant_raw_content: str | None = None
+    primary_tag: str = "_general"
+    tags: list[str] = field(default_factory=list)
+    session_date: str = ""
+    sender: str = ""
+    fact_signals: list[FactSignal] = field(default_factory=list)
+    code_refs: list[dict] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class FullTextChunkEmbedding:
+    """A chunk of canonical full_text with its embedding vector."""
+    conversation_id: str
+    turn_number: int
+    side: str
+    chunk_index: int
+    text: str
+    embedding: list[float]
+
+
+# Backward-compatible alias while callers migrate to the canonical name.
+TurnChunkEmbedding = FullTextChunkEmbedding
 
 
 @dataclass
@@ -895,7 +932,7 @@ class SearchConfig:
     # Result limits
     find_quote_max_results: int = 20       # max results from vc_find_quote tool calls
     find_quote_default_results: int = 5    # default max_results for engine.find_quote()
-    remember_when_max_results: int = 5     # default max_results for vc_remember_when
+    remember_when_max_results: int = 12    # default max_results for vc_remember_when
     semantic_search_max_results: int = 5   # max results from embedding-based search
     query_facts_default_limit: int = 50    # default limit for query_facts()
     search_facts_max_results: int = 10     # max results from FTS fact search

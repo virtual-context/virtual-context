@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ..types import ChunkEmbedding, QuoteResult, StoredSegment, VirtualContextConfig
+from ..types import ChunkEmbedding, FactSignal, FullTextChunkEmbedding, QuoteResult, StoredSegment, VirtualContextConfig
 from .math_utils import cosine_similarity
 from .store import ContextStore
 
@@ -67,6 +67,19 @@ def chunk_segment_text(full_text: str, max_words: int = 250, min_words: int = 20
 
     # Filter fragments that are too small
     return [c for c in chunks if len(c.split()) >= min_words]
+
+
+def chunk_turn_text(text: str, max_words: int = 180, min_words: int = 3) -> list[str]:
+    """Split turn text into smaller embedding chunks.
+
+    Turn text is usually shorter than segment text, so the minimum word
+    threshold is lower and we preserve a single short chunk when needed.
+    """
+    chunks = chunk_segment_text(text, max_words=max_words, min_words=min_words)
+    if chunks:
+        return chunks
+    stripped = (text or "").strip()
+    return [stripped] if stripped else []
 
 
 class SemanticSearchManager:
@@ -156,6 +169,148 @@ class SemanticSearchManager:
         ]
         self._store.store_chunk_embeddings(stored.ref, chunk_embeddings)
         logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
+
+    def embed_and_store_turn(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        *,
+        user_text: str = "",
+        assistant_text: str = "",
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+    ) -> None:
+        embed_fn = self.get_embed_fn()
+        if embed_fn is None:
+            return
+
+        self._store.delete_full_text_chunk_embeddings(
+            conversation_id,
+            turn_number=turn_number,
+        )
+
+        sides = [
+            ("user", (user_raw_content or user_text or "")),
+            ("assistant", (assistant_raw_content or assistant_text or "")),
+        ]
+        for side, text in sides:
+            chunks = chunk_turn_text(text)
+            if not chunks:
+                continue
+            try:
+                vectors = embed_fn(chunks)
+            except Exception:
+                logger.debug(
+                    "Failed to embed %s turn chunks for %s:%d",
+                    side,
+                    conversation_id,
+                    turn_number,
+                    exc_info=True,
+                )
+                continue
+            chunk_embeddings = [
+                FullTextChunkEmbedding(
+                    conversation_id=conversation_id,
+                    turn_number=turn_number,
+                    side=side,
+                    chunk_index=i,
+                    text=chunk_text,
+                    embedding=vec,
+                )
+                for i, (chunk_text, vec) in enumerate(zip(chunks, vectors))
+            ]
+            self._store.store_full_text_chunk_embeddings(
+                conversation_id,
+                turn_number,
+                side,
+                chunk_embeddings,
+            )
+
+    def semantic_full_text_search(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]:
+        embed_fn = self.get_embed_fn()
+        if embed_fn is None:
+            return []
+
+        get_full_text_chunks = getattr(self._store, "get_all_full_text_chunk_embeddings", None)
+        if not callable(get_full_text_chunks):
+            return []
+        all_chunks = get_full_text_chunks(conversation_id=conversation_id)
+        if not all_chunks:
+            return []
+
+        try:
+            query_vec = embed_fn([query])[0]
+        except Exception:
+            logger.debug("Failed to embed query for semantic turn search")
+            return []
+
+        scored: list[tuple[float, FullTextChunkEmbedding]] = []
+        for chunk in all_chunks:
+            sim = cosine_similarity(query_vec, chunk.embedding)
+            if sim >= 0.25:
+                scored.append((sim, chunk))
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        grouped: list[QuoteResult] = []
+        seen_turn_sides: set[tuple[int, str]] = set()
+        for sim, chunk in scored:
+            identity = (chunk.turn_number, chunk.side)
+            if identity in seen_turn_sides:
+                continue
+            seen_turn_sides.add(identity)
+            row = self._store.get_full_text_rows(
+                conversation_id or "",
+                [chunk.turn_number],
+            ).get(chunk.turn_number)
+            if row is None:
+                if chunk.side == "user":
+                    excerpt = f"User: {chunk.text or ''}".strip()
+                    matched_side = "user"
+                elif chunk.side == "assistant":
+                    excerpt = f"Assistant: {chunk.text or ''}".strip()
+                    matched_side = "assistant"
+                else:
+                    excerpt = (chunk.text or "").strip()
+                    matched_side = "unknown"
+            else:
+                user_text = row.user_content or ""
+                assistant_text = row.assistant_content or ""
+                if chunk.side == "user":
+                    excerpt = f"User: {user_text or ''}".strip()
+                    matched_side = "user"
+                elif chunk.side == "assistant":
+                    excerpt = f"Assistant: {assistant_text or ''}".strip()
+                    matched_side = "assistant"
+                else:
+                    excerpt = (
+                        f"User: {user_text or ''}\n\n"
+                        f"Assistant: {assistant_text or ''}"
+                    ).strip()
+                    matched_side = "unknown"
+            grouped.append(
+                QuoteResult(
+                    text=excerpt,
+                    tag=(row.primary_tag if row is not None else "_general"),
+                    segment_ref=f"turn_{chunk.turn_number}",
+                    tags=list(row.tags if row is not None else []),
+                    match_type="full_text_semantic",
+                    similarity=round(sim, 3),
+                    session_date=(row.session_date if row is not None else ""),
+                    created_at=(row.created_at if row is not None else ""),
+                    source_scope="turn",
+                    turn_number=chunk.turn_number,
+                    matched_side=matched_side,
+                )
+            )
+            if len(grouped) >= max_results:
+                break
+        return grouped
 
     def semantic_search(
         self, query: str, max_results: int = 5,
@@ -290,3 +445,53 @@ class SemanticSearchManager:
 
         logger.debug("Context bleed gate: sim=%.3f threshold=%.3f", sim, threshold)
         return sim >= threshold, sim
+
+
+def persist_turn_with_embeddings(
+    store: ContextStore,
+    semantic: SemanticSearchManager,
+    *,
+    conversation_id: str,
+    turn_number: int,
+    user_content: str,
+    assistant_content: str,
+    user_raw_content: str | None = None,
+    assistant_raw_content: str | None = None,
+    primary_tag: str = "_general",
+    tags: list[str] | None = None,
+    session_date: str = "",
+    sender: str = "",
+    fact_signals: list[FactSignal] | None = None,
+    code_refs: list[dict] | None = None,
+) -> None:
+    """Persist a turn pair to the operational buffer and canonical archive."""
+    store.save_turn_message(
+        conversation_id,
+        turn_number,
+        user_content,
+        assistant_content,
+        user_raw_content=user_raw_content,
+        assistant_raw_content=assistant_raw_content,
+    )
+    store.save_full_text(
+        conversation_id,
+        turn_number,
+        user_content,
+        assistant_content,
+        user_raw_content=user_raw_content,
+        assistant_raw_content=assistant_raw_content,
+        primary_tag=primary_tag,
+        tags=tags,
+        session_date=session_date,
+        sender=sender,
+        fact_signals=fact_signals,
+        code_refs=code_refs,
+    )
+    semantic.embed_and_store_turn(
+        conversation_id,
+        turn_number,
+        user_text=user_content,
+        assistant_text=assistant_content,
+        user_raw_content=user_raw_content,
+        assistant_raw_content=assistant_raw_content,
+    )

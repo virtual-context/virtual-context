@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from virtual_context.engine import VirtualContextEngine
-from virtual_context.core.semantic_search import chunk_segment_text as _chunk_segment_text
+from virtual_context.core.semantic_search import (
+    chunk_segment_text as _chunk_segment_text,
+    persist_turn_with_embeddings,
+)
 from virtual_context.types import (
     ChunkEmbedding,
     PagingConfig,
@@ -62,6 +65,20 @@ def _make_engine(tmp_path):
         paging=PagingConfig(enabled=False),
     )
     return VirtualContextEngine(config=cfg)
+
+
+def _store_canonical_turn(engine, *, turn_number: int = 0):
+    persist_turn_with_embeddings(
+        engine._store,
+        engine._semantic,
+        conversation_id=engine.config.conversation_id,
+        turn_number=turn_number,
+        user_content="Can you review my remote shutter release setup?",
+        assistant_content=(
+            "It arrived on February 10th, a wireless model compatible with "
+            "their Canon R5."
+        ),
+    )
 
 
 def _fake_embed_fn(texts: list[str]) -> list[list[float]]:
@@ -220,57 +237,60 @@ class TestFindQuoteSemanticFallback:
     def test_fts_full_no_semantic(self, tmp_path):
         """When FTS fills max_results, semantic search is NOT called."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
+        _store_canonical_turn(engine)
 
-        # Mock semantic_search to verify it's not called when FTS fills quota
-        engine._semantic.semantic_search = MagicMock(return_value=[])
+        # Mock semantic search to verify it's not called when lexical full_text search fills quota
+        engine._semantic.semantic_full_text_search = MagicMock(return_value=[])
 
         # max_results=1 so FTS finding 1 result fills the quota
         result = engine.find_quote("arrived", max_results=1)
         assert result["found"] is True
-        engine._semantic.semantic_search.assert_not_called()
+        engine._semantic.semantic_full_text_search.assert_not_called()
 
     def test_fts_hit_still_supplements_with_semantic(self, tmp_path):
         """When FTS finds matches but has remaining slots, semantic supplements."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
+        _store_canonical_turn(engine)
 
-        engine._semantic.semantic_search = MagicMock(return_value=[])
+        engine._semantic.semantic_full_text_search = MagicMock(return_value=[])
 
         # FTS finds 1 result, max_results=5, so semantic runs for remaining 4
         result = engine.find_quote("arrived", max_results=5)
         assert result["found"] is True
-        engine._semantic.semantic_search.assert_called_once_with(
+        engine._semantic.semantic_full_text_search.assert_called_once_with(
             "arrived", max_results=4, conversation_id=engine.config.conversation_id,
         )
 
     def test_semantic_fallback_on_fts_miss(self, tmp_path):
         """FTS misses vocabulary mismatch, semantic finds it."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        _store_canonical_turn(engine)
 
-        # "received" won't match FTS (text says "arrived")
+        # "shipping confirmation" won't match lexical full_text search
         # but we mock semantic search to return a match
         semantic_result = QuoteResult(
-            text="It arrived on February 10th, a wireless model compatible with their Canon R5.",
-            tag="photography",
-            segment_ref="seg-1",
-            tags=["photography"],
-            match_type="semantic",
+            text="Assistant: It arrived on February 10th, a wireless model compatible with their Canon R5.",
+            tag="full_text",
+            segment_ref="turn_0",
+            tags=["full_text"],
+            match_type="full_text_semantic",
             similarity=0.87,
+            source_scope="turn",
+            turn_number=0,
+            matched_side="assistant",
         )
-        engine._semantic.semantic_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_full_text_search = MagicMock(return_value=[semantic_result])
 
-        result = engine.find_quote("remote shutter release received")
+        result = engine.find_quote("shipping confirmation")
         assert result["found"] is True
-        assert result["results"][0]["match_type"] == "semantic"
+        assert result["results"][0]["match_type"] == "full_text_semantic"
         assert result["results"][0]["similarity"] == 0.87
-        engine._semantic.semantic_search.assert_called_once()
+        engine._semantic.semantic_full_text_search.assert_called_once()
 
     def test_no_embeddings_graceful(self, tmp_path):
         """No sentence-transformers → no crash, just returns not found."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        _store_canonical_turn(engine)
         # Ensure embed_fn returns None (no sentence-transformers)
         engine._semantic._embed_fn = None
 
@@ -280,28 +300,31 @@ class TestFindQuoteSemanticFallback:
     def test_semantic_results_annotated(self, tmp_path):
         """Semantic results have match_type and similarity in output."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment())
+        _store_canonical_turn(engine)
 
         semantic_result = QuoteResult(
             text="test excerpt",
-            tag="photography",
-            segment_ref="seg-1",
-            tags=["photography"],
-            match_type="semantic",
+            tag="full_text",
+            segment_ref="turn_0",
+            tags=["full_text"],
+            match_type="full_text_semantic",
             similarity=0.75,
+            source_scope="turn",
+            turn_number=0,
+            matched_side="assistant",
         )
-        engine._semantic.semantic_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_full_text_search = MagicMock(return_value=[semantic_result])
 
         result = engine.find_quote("nonexistent_fts_term")
         assert result["found"] is True
         entry = result["results"][0]
-        assert entry["match_type"] == "semantic"
+        assert entry["match_type"] == "full_text_semantic"
         assert entry["similarity"] == 0.75
 
     def test_fts_results_no_match_type_key(self, tmp_path):
         """FTS results do NOT include match_type in output (clean output)."""
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
+        _store_canonical_turn(engine)
 
         result = engine.find_quote("arrived")
         assert result["found"] is True
