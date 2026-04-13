@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, FullTextChunkEmbedding, FullTextRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -115,6 +115,14 @@ class ContextStore(ABC):
         Returns QuoteResult objects with excerpts (~200 chars context around match).
         """
 
+    def search_canonical_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]:
+        return []
+
     @abstractmethod
     def get_segments_by_tags(
         self,
@@ -129,6 +137,28 @@ class ContextStore(ABC):
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return []
+
+    def store_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        side: str,
+        chunks: list[FullTextChunkEmbedding],
+    ) -> None:
+        """Idempotent: replaces any existing full_text chunks for this turn side."""
+
+    def get_all_full_text_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[FullTextChunkEmbedding]:
+        return []
+
+    def delete_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        return 0
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         """Upsert by conversation_id."""
@@ -204,6 +234,49 @@ class ContextStore(ABC):
 
     def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
         """Delete persisted turn messages older than ``keep_from_turn``."""
+        return 0
+
+    # ------------------------------------------------------------------
+    # Canonical archived full_text (permanent quote-search source of truth)
+    # ------------------------------------------------------------------
+
+    def save_full_text(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+        primary_tag: str = "_general",
+        tags: list[str] | None = None,
+        session_date: str = "",
+        sender: str = "",
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        """Upsert canonical archived text by (conversation_id, turn_number)."""
+
+    def get_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, FullTextRow]:
+        return {}
+
+    def get_all_full_text_rows(
+        self,
+        conversation_id: str,
+    ) -> list[FullTextRow]:
+        return []
+
+    def delete_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
         return 0
 
     # ------------------------------------------------------------------
@@ -342,11 +415,11 @@ class ContextStore(ABC):
         limit: int = 50,
         conversation_id: str | None = None,
     ) -> list[Fact]:
-        """Return completed experience facts within a session_date range.
+        """Return facts within a when_date range.
 
-        *start_date* and *end_date* are ``YYYY/MM/DD`` strings compared
-        lexicographically against the ``session_date`` column.  Returns
-        facts ordered by session_date ASC.
+        *start_date* and *end_date* are ``YYYY-MM-DD`` ISO strings compared
+        lexicographically against the ``when_date`` column.  Returns
+        facts ordered by when_date ASC.
         """
         return []
 

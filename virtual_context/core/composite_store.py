@@ -11,6 +11,9 @@ from ..types import (
     EngineStateSnapshot,
     Fact,
     FactLink,
+    FactSignal,
+    FullTextChunkEmbedding,
+    FullTextRow,
     LinkedFact,
     QuoteResult,
     StoredSegment,
@@ -203,13 +206,64 @@ class CompositeStore:
     def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
         return self._segments.prune_turn_messages(conversation_id, keep_from_turn)
 
-    def search_turn_messages(
-        self, query: str, limit: int = 5, conversation_id: str | None = None,
-    ) -> list:
-        _search = getattr(self._segments, "search_turn_messages", None)
-        if callable(_search):
-            return _search(query, limit=limit, conversation_id=conversation_id)
-        return []
+    def save_full_text(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+        primary_tag: str = "_general",
+        tags: list[str] | None = None,
+        session_date: str = "",
+        sender: str = "",
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        return self._segments.save_full_text(
+            conversation_id,
+            turn_number,
+            user_content,
+            assistant_content,
+            user_raw_content=user_raw_content,
+            assistant_raw_content=assistant_raw_content,
+            primary_tag=primary_tag,
+            tags=tags,
+            session_date=session_date,
+            sender=sender,
+            fact_signals=fact_signals,
+            code_refs=code_refs,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def get_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, FullTextRow]:
+        return self._segments.get_full_text_rows(conversation_id, turn_numbers)
+
+    def get_all_full_text_rows(
+        self,
+        conversation_id: str,
+    ) -> list[FullTextRow]:
+        return self._segments.get_all_full_text_rows(conversation_id)
+
+    def delete_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        return int(
+            self._segments.delete_full_text_rows(
+                conversation_id,
+                turn_number=turn_number,
+            ) or 0
+        )
 
     def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
         self._segments.save_conversation_alias(alias_id, target_id)
@@ -255,6 +309,17 @@ class CompositeStore:
 
     def get_actionable_fact_tags(self, tags: list[str], conversation_id: str | None = None) -> set[str]:
         return self._facts.get_actionable_fact_tags(tags, conversation_id=conversation_id)
+
+    def query_experience_facts_by_date(
+        self,
+        start_date: str,
+        end_date: str,
+        limit: int = 50,
+        conversation_id: str | None = None,
+    ) -> list[Fact]:
+        return self._facts.query_experience_facts_by_date(
+            start_date=start_date, end_date=end_date, limit=limit, conversation_id=conversation_id,
+        )
 
     # ------------------------------------------------------------------
     # FactLinkStore
@@ -336,6 +401,9 @@ class CompositeStore:
     def search_full_text(self, *args, **kwargs) -> list[QuoteResult]:
         return self._search.search_full_text(*args, **kwargs)
 
+    def search_canonical_full_text(self, *args, **kwargs) -> list[QuoteResult]:
+        return self._search.search_canonical_full_text(*args, **kwargs)
+
     def store_chunk_embeddings(
         self, segment_ref: str, chunks: list[ChunkEmbedding],
     ) -> None:
@@ -343,6 +411,40 @@ class CompositeStore:
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return self._search.get_all_chunk_embeddings()
+
+    def store_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        side: str,
+        chunks: list[FullTextChunkEmbedding],
+    ) -> None:
+        return self._search.store_full_text_chunk_embeddings(
+            conversation_id,
+            turn_number,
+            side,
+            chunks,
+        )
+
+    def get_all_full_text_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[FullTextChunkEmbedding]:
+        return self._search.get_all_full_text_chunk_embeddings(
+            conversation_id=conversation_id,
+        )
+
+    def delete_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        return int(
+            self._search.delete_full_text_chunk_embeddings(
+                conversation_id,
+                turn_number=turn_number,
+            ) or 0
+        )
 
     def store_tool_output(
         self,
