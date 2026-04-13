@@ -33,8 +33,10 @@ from virtual_context.core.quote_search import (
     _parse_session_date,
     _union_spans,
     find_quote as core_find_quote,
+    search_summaries as core_search_summaries,
     supplement_from_descriptions,
 )
+from virtual_context.core.semantic_search import persist_turn_with_embeddings
 from virtual_context.storage.sqlite import SQLiteStore, _extract_excerpt
 from virtual_context.storage.filesystem import FilesystemStore
 from virtual_context.storage.filesystem import _extract_excerpt as fs_extract_excerpt
@@ -51,6 +53,7 @@ def _make_segment(
     summary: str = "Discussed supplements",
     full_text: str = "User asked about magnesium glycinate 400mg for sleep. Assistant recommended taking it before bed.",
     conversation_id: str = "session-1",
+    session_date: str = "",
 ) -> StoredSegment:
     return StoredSegment(
         ref=ref,
@@ -62,7 +65,7 @@ def _make_segment(
         full_text=full_text,
         full_tokens=100,
         messages=[{"role": "user", "content": "test"}],
-        metadata=SegmentMetadata(turn_count=1),
+        metadata=SegmentMetadata(turn_count=1, session_date=session_date),
         created_at=datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
         start_timestamp=datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
         end_timestamp=datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc),
@@ -79,6 +82,17 @@ def _make_engine(tmp_path, paging_enabled=False):
         paging=PagingConfig(enabled=paging_enabled),
     )
     return VirtualContextEngine(config=cfg)
+
+
+def _persist_find_quote_turn(engine, *, turn_number: int = 0, user_content: str | None = None, assistant_content: str | None = None):
+    persist_turn_with_embeddings(
+        engine._store,
+        engine._semantic,
+        conversation_id=engine.config.conversation_id,
+        turn_number=turn_number,
+        user_content=user_content or "I take magnesium glycinate 400mg for sleep.",
+        assistant_content=assistant_content or "That magnesium glycinate routine sounds sensible.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +278,15 @@ class TestFilesystemSearchFullText:
 class TestEngineFindQuote:
     def test_find_quote_hit(self, tmp_path):
         engine = _make_engine(tmp_path)
-        engine._store.store_segment(_make_segment(tags=["health", "supplements"], conversation_id=engine.config.conversation_id))
+        _persist_find_quote_turn(engine)
 
         result = engine.find_quote("magnesium glycinate")
         assert result["found"] is True
-        assert len(result["results"]) == 1
-        assert result["results"][0]["topic"] == "health"
+        assert len(result["results"]) >= 1
+        assert result["results"][0]["topic"] == "_general"
+        assert result["results"][0]["source_scope"] == "turn"
         assert "tags" not in result["results"][0]  # tags removed to avoid sub-tag noise
-        assert "magnesium" in result["results"][0]["excerpt"].lower()
+        assert any("magnesium" in row["excerpt"].lower() for row in result["results"])
 
     def test_find_quote_miss(self, tmp_path):
         engine = _make_engine(tmp_path)
@@ -295,7 +310,7 @@ class TestEngineFindQuote:
     def test_find_quote_works_without_paging_enabled(self, tmp_path):
         """find_quote works even when paging is disabled."""
         engine = _make_engine(tmp_path, paging_enabled=False)
-        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
+        _persist_find_quote_turn(engine)
 
         result = engine.find_quote("magnesium")
         assert result["found"] is True
@@ -303,26 +318,22 @@ class TestEngineFindQuote:
     def test_find_quote_works_with_paging_enabled(self, tmp_path):
         """find_quote also works when paging is enabled."""
         engine = _make_engine(tmp_path, paging_enabled=True)
-        engine._store.store_segment(_make_segment(conversation_id=engine.config.conversation_id))
+        _persist_find_quote_turn(engine)
 
         result = engine.find_quote("magnesium")
         assert result["found"] is True
 
     def test_find_quote_cross_tag(self, tmp_path):
-        """find_quote finds content regardless of tag — the core use case."""
+        """find_quote searches canonical full_text instead of relying on segment tags."""
         engine = _make_engine(tmp_path)
-        # Content about health stored under ai-memory tag (the bug scenario)
-        engine._store.store_segment(_make_segment(
-            ref="seg-wrong-tag",
-            primary_tag="ai-memory-systems",
-            tags=["ai-memory-systems"],
-            full_text="magnesium glycinate 400mg recommended for sleep quality",
-            conversation_id=engine.config.conversation_id,
-        ))
+        _persist_find_quote_turn(
+            engine,
+            assistant_content="magnesium glycinate 400mg recommended for sleep quality",
+        )
 
         result = engine.find_quote("magnesium glycinate")
         assert result["found"] is True
-        assert result["results"][0]["topic"] == "ai-memory-systems"
+        assert result["results"][0]["topic"] == "_general"
 
 
 # ---------------------------------------------------------------------------
@@ -343,16 +354,29 @@ class TestProxyFindQuoteTool:
         tools = vc_tool_definitions()
         names = [t["name"] for t in tools]
         assert "vc_find_quote" in names
+        assert "vc_search_summaries" in names
         assert "vc_remember_when" in names
-        assert len(tools) == 6  # shared VC catalogue also includes vc_restore_tool
+        assert len(tools) == 7  # shared VC catalogue also includes vc_restore_tool
 
     def test_find_quote_tool_schema(self):
         from virtual_context.core.tool_loop import vc_tool_definitions
         tools = vc_tool_definitions()
         fq = next(t for t in tools if t["name"] == "vc_find_quote")
         assert "query" in fq["input_schema"]["properties"]
+        assert "mode" in fq["input_schema"]["properties"]
+        assert fq["input_schema"]["properties"]["mode"]["enum"] == ["lookup", "exact_value"]
         assert "max_results" not in fq["input_schema"]["properties"]
-        assert fq["input_schema"]["required"] == ["query"]
+        assert fq["input_schema"]["required"] == ["query", "mode"]
+
+    def test_search_summaries_tool_schema(self):
+        from virtual_context.core.tool_loop import vc_tool_definitions
+        tools = vc_tool_definitions()
+        tool = next(t for t in tools if t["name"] == "vc_search_summaries")
+        assert tool["input_schema"]["properties"]["mode"]["enum"] == [
+            "lookup",
+            "aggregate_total",
+            "coverage",
+        ]
 
     def test_execute_vc_tool_dispatches_find_quote(self):
         from virtual_context.core.tool_loop import execute_vc_tool
@@ -374,6 +398,7 @@ class TestProxyFindQuoteTool:
             query="magnesium",
             max_results=20,
             intent_context="",
+            mode="lookup",
         )
         result = json.loads(result_str)
         assert result["found"] is True
@@ -392,6 +417,20 @@ class TestProxyFindQuoteTool:
             query="test",
             max_results=20,
             intent_context="",
+            mode="lookup",
+        )
+
+    def test_execute_vc_tool_dispatches_find_quote_with_explicit_mode(self):
+        from virtual_context.core.tool_loop import execute_vc_tool
+        engine = _mock_engine()
+        engine.find_quote.return_value = {"found": False, "results": [], "mode": "exact_value"}
+
+        execute_vc_tool(engine, "vc_find_quote", {"query": "test", "mode": "exact_value"})
+        engine.find_quote.assert_called_once_with(
+            query="test",
+            max_results=20,
+            intent_context="",
+            mode="exact_value",
         )
 
 
@@ -404,6 +443,7 @@ class TestContextHintMentionsFindQuote:
         engine = _make_engine(tmp_path, paging_enabled=True)
         # Simulate post-compaction state
         engine._engine_state.compacted_through = 10
+        engine._engine_state.flushed_through = 10
         # Store a tag summary so hint is non-empty
         engine._store.save_tag_summary(TagSummary(
             tag="health",
@@ -428,6 +468,601 @@ class TestContextHintMentionsFindQuote:
         assert "vc_find_quote" in hint
 
 
+class TestCoverageMode:
+    def test_find_quote_coverage_extracts_named_components(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-sharding",
+            primary_tag="sharding",
+            tags=["sharding"],
+            full_text=(
+                "User is scaling sharding to support 5000 queries per second "
+                "with balanced routing."
+            ),
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-load-balancing",
+            primary_tag="load-balancing",
+            tags=["load-balancing"],
+            full_text=(
+                "Load balancing configuration is being updated for 5000 queries "
+                "per second with health checks."
+            ),
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-partitioning",
+            primary_tag="partitioning",
+            tags=["partitioning"],
+            full_text=(
+                "Partitioning work now targets 5000 queries per second with "
+                "consistent shard distribution."
+            ),
+            conversation_id=conv_id,
+        ))
+
+        result = engine.search_summaries(
+            "queries per second sharding load balancing partitioning",
+            max_results=5,
+            intent_context=(
+                "How many queries per second am I aiming to support across "
+                "sharding, load balancing, and partitioning efforts combined?"
+            ),
+            mode="coverage",
+        )
+
+        assert result["found"] is True
+        summary = result["coverage_summary"]
+        assert summary["requested_components"] == [
+            "sharding",
+            "load balancing",
+            "partitioning",
+        ]
+        assert set(summary["covered_components"]) == {
+            "sharding",
+            "load balancing",
+            "partitioning",
+        }
+        assert summary["missing_components"] == []
+        assert result["coverage_value_candidates"][0]["value"] == "5000 queries/second"
+        matched = {
+            component
+            for row in result["results"]
+            for component in row.get("matched_components", [])
+        }
+        assert {"sharding", "load balancing", "partitioning"} <= matched
+
+    def test_find_quote_coverage_extracts_combining_projects(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            full_text=(
+                "Elasticsearch project planning currently targets 1 million "
+                "documents with 98% uptime."
+            ),
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr",
+            primary_tag="solr",
+            tags=["solr"],
+            full_text=(
+                "Solr optimization work focuses on 800K documents with index "
+                "size tuning."
+            ),
+            conversation_id=conv_id,
+        ))
+
+        result = engine.search_summaries(
+            "documents planning Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="coverage",
+        )
+
+        assert result["found"] is True
+        summary = result["coverage_summary"]
+        assert summary["requested_components"] == ["elasticsearch", "solr"]
+        assert set(summary["covered_components"]) == {"elasticsearch", "solr"}
+        assert summary["missing_components"] == []
+        matched = {
+            component
+            for row in result["results"]
+            for component in row.get("matched_components", [])
+        }
+        assert {"elasticsearch", "solr"} <= matched
+
+    def test_find_quote_aggregate_total_computes_total(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-total",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            full_text=(
+                "I am evaluating Elasticsearch 8.8.0 for 1 million documents "
+                "with 98% uptime."
+            ),
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-total",
+            primary_tag="solr",
+            tags=["solr"],
+            full_text=(
+                "I am optimizing Solr 9.2.0 for 800K documents with lower "
+                "search latency."
+            ),
+            conversation_id=conv_id,
+        ))
+
+        result = engine.search_summaries(
+            "documents planning Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["mode"] == "aggregate_total"
+        assert result["coverage_summary"]["requested_components"] == [
+            "elasticsearch",
+            "solr",
+        ]
+        assert result["chosen_aggregate_total"]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["covered_components"] == [
+            "elasticsearch",
+            "solr",
+        ]
+        assert "AGGREGATE-TOTAL MODE" in result["reader_hint"]
+        assert "ambiguity_detected" not in result
+
+    def test_find_quote_aggregate_total_prefers_component_specific_summary_values(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-summary",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            summary=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents."
+            ),
+            full_text="This Elasticsearch project focuses on uptime tuning.",
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-summary",
+            primary_tag="solr",
+            tags=["solr"],
+            summary=(
+                "User reported 300ms delays on a Solr 9.2.0 deployment "
+                "handling 800K documents and asked how to optimize it."
+            ),
+            full_text="This Solr project focuses on search-query optimization.",
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-shared-comparison",
+            primary_tag="comparison",
+            tags=["comparison", "elasticsearch", "solr"],
+            summary=(
+                "Comparison notes that Solr can handle 1M documents while "
+                "Elasticsearch remains an alternative under evaluation."
+            ),
+            full_text=(
+                "Stakeholder comparison mentions both Solr and Elasticsearch. "
+                "The Solr option can handle 1M documents."
+            ),
+            conversation_id=conv_id,
+        ))
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["chosen_aggregate_total"]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["value"] == "1.8 million documents"
+        component_values = result["aggregate_total_candidates"][0]["component_values"]
+        assert [(item["component"], item["value"]) for item in component_values] == [
+            ("elasticsearch", "1 million documents"),
+            ("solr", "800K documents"),
+        ]
+
+    def test_find_quote_aggregate_total_scans_all_summaries_for_older_components(
+        self, tmp_path, monkeypatch,
+    ):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-older",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            summary=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents."
+            ),
+            full_text="This Elasticsearch project focuses on uptime tuning.",
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-older",
+            primary_tag="solr",
+            tags=["solr"],
+            summary=(
+                "User reported 300ms delays on a Solr 9.2.0 deployment "
+                "handling 800K documents and asked how to optimize it."
+            ),
+            full_text="This Solr project focuses on search-query optimization.",
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-filler",
+            primary_tag="comparison",
+            tags=["comparison"],
+            summary="Comparison notes mention 1M documents but not the target projects.",
+            full_text="This is only filler and should not determine the aggregate total.",
+            conversation_id=conv_id,
+        ))
+
+        original_get_all_segments = engine._store.get_all_segments
+        observed_limits: list[int | None] = []
+
+        def spy_get_all_segments(*, conversation_id=None, limit=None):
+            observed_limits.append(limit)
+            if limit is not None:
+                return [
+                    segment
+                    for segment in original_get_all_segments(
+                        conversation_id=conversation_id, limit=None,
+                    )
+                    if segment.ref == "seg-filler"
+                ][:limit]
+            return original_get_all_segments(conversation_id=conversation_id, limit=limit)
+
+        monkeypatch.setattr(engine._store, "get_all_segments", spy_get_all_segments)
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["chosen_aggregate_total"]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["value"] == "1.8 million documents"
+        assert observed_limits == [None]
+
+    def test_find_quote_aggregate_total_ignores_far_single_component_quantity(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-near",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            summary=(
+                "User evaluated Elasticsearch 8.8.0 for 1 million documents "
+                "with 98% uptime."
+            ),
+            full_text="Direct Elasticsearch capacity planning for 1 million documents.",
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-far",
+            primary_tag="comparison",
+            tags=["comparison", "elasticsearch"],
+            summary=(
+                "The team discussed Elasticsearch experience and migration tradeoffs. "
+                "Additional operational notes covered batching, alerts, dashboards, "
+                "runbooks, and incident reviews across multiple services before the "
+                "document ingestion pipeline target reached 2 million documents."
+            ),
+            full_text=(
+                "Elasticsearch came up early in the conversation, but the later "
+                "2 million documents figure refers to a separate ingestion pipeline."
+            ),
+            conversation_id=conv_id,
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-near",
+            primary_tag="solr",
+            tags=["solr"],
+            summary=(
+                "User planned Solr 9.2.0 scalability work for 800K documents."
+            ),
+            full_text="Direct Solr capacity planning for 800K documents.",
+            conversation_id=conv_id,
+        ))
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["chosen_aggregate_total"]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["value"] == "1.8 million documents"
+
+    def test_find_quote_aggregate_total_prefers_clean_component_anchors_over_recent_smaller_pairs(
+        self, tmp_path,
+    ):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-intended",
+            primary_tag="agile-methodologies",
+            tags=["agile-methodologies", "elasticsearch"],
+            summary=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents for a search project."
+            ),
+            full_text=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents for a search project."
+            ),
+            conversation_id=conv_id,
+            session_date="July-16-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-intended",
+            primary_tag="solr-clustering",
+            tags=["solr-clustering", "solr"],
+            summary=(
+                "User planned Solr 9.2.0 scalability work for 800K "
+                "documents with lower search latency."
+            ),
+            full_text=(
+                "User planned Solr 9.2.0 scalability work for 800K "
+                "documents with lower search latency."
+            ),
+            conversation_id=conv_id,
+            session_date="July-18-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-recent-small",
+            primary_tag="elasticsearch-integration",
+            tags=["elasticsearch-integration", "elasticsearch"],
+            summary=(
+                "User is implementing an Apache Lucene indexing system "
+                "integrated with Elasticsearch for handling 100K documents "
+                "with compliance and deployment planning."
+            ),
+            full_text=(
+                "User is implementing an Apache Lucene indexing system "
+                "integrated with Elasticsearch for handling 100K documents "
+                "with compliance and deployment planning."
+            ),
+            conversation_id=conv_id,
+            session_date="August-21-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-recent-small",
+            primary_tag="kafka-error-handling",
+            tags=["kafka-error-handling", "solr"],
+            summary=(
+                "The conversation covers NiFi tuning and later Solr 9.3.0 "
+                "search latency optimization for 150K documents."
+            ),
+            full_text=(
+                "The conversation covers NiFi tuning and later Solr 9.3.0 "
+                "search latency optimization for 150K documents."
+            ),
+            conversation_id=conv_id,
+            session_date="August-21-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-recent-medium",
+            primary_tag="oauth-authentication",
+            tags=["oauth-authentication", "elasticsearch"],
+            summary=(
+                "User requested authentication logging improvements that "
+                "send events to Elasticsearch while handling 200K documents."
+            ),
+            full_text=(
+                "User requested authentication logging improvements that "
+                "send events to Elasticsearch while handling 200K documents."
+            ),
+            conversation_id=conv_id,
+            session_date="August-29-2024",
+        ))
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["chosen_aggregate_total"]["value"] == "1.8 million documents"
+        assert result["aggregate_total_candidates"][0]["value"] == "1.8 million documents"
+        component_values = result["aggregate_total_candidates"][0]["component_values"]
+        assert [(item["component"], item["value"]) for item in component_values] == [
+            ("elasticsearch", "1 million documents"),
+            ("solr", "800K documents"),
+        ]
+
+    def test_find_quote_aggregate_total_surfaces_ambiguity_when_pairs_tie(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-2m",
+            primary_tag="elasticsearch",
+            tags=["elasticsearch"],
+            summary=(
+                "User planned an Elasticsearch project sized for 2 million "
+                "documents with operational tuning."
+            ),
+            full_text="Elasticsearch planning for 2 million documents.",
+            conversation_id=conv_id,
+            session_date="August-01-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-800k",
+            primary_tag="solr",
+            tags=["solr"],
+            summary=(
+                "User planned a Solr project sized for 800K documents with "
+                "index optimization."
+            ),
+            full_text="Solr planning for 800K documents.",
+            conversation_id=conv_id,
+            session_date="July-18-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-1m",
+            primary_tag="solr",
+            tags=["solr"],
+            summary=(
+                "User planned another Solr project sized for 1,000,000 "
+                "documents with clustering work."
+            ),
+            full_text="Solr planning for 1,000,000 documents.",
+            conversation_id=conv_id,
+            session_date="July-11-2024",
+        ))
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["ambiguity_detected"] is True
+        assert "chosen_aggregate_total" not in result
+        competing_values = [
+            candidate["value"]
+            for candidate in result["competing_aggregate_totals"]
+        ]
+        assert "2.8 million documents" in competing_values
+        assert "3 million documents" in competing_values
+        assert "Do not choose one confidently" in result["reader_hint"]
+
+    def test_find_quote_aggregate_total_ambiguity_lists_full_top_anchor_matrix(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        conv_id = engine.config.conversation_id
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-18m",
+            primary_tag="elasticsearch-indexing",
+            tags=["elasticsearch-indexing", "elasticsearch"],
+            summary=(
+                "User is optimizing Elasticsearch for sparse retrieval on "
+                "1.8 million documents with cluster tuning."
+            ),
+            full_text=(
+                "User is optimizing Elasticsearch for sparse retrieval on "
+                "1.8 million documents with cluster tuning."
+            ),
+            conversation_id=conv_id,
+            session_date="August-21-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-elasticsearch-1m",
+            primary_tag="agile-methodologies",
+            tags=["agile-methodologies", "elasticsearch"],
+            summary=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents."
+            ),
+            full_text=(
+                "User evaluated Elasticsearch 8.8.0 performance targeting "
+                "98% uptime on 1 million documents."
+            ),
+            conversation_id=conv_id,
+            session_date="July-16-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-1m",
+            primary_tag="latency-optimization",
+            tags=["latency-optimization", "solr"],
+            summary=(
+                "User is designing a Solr architecture that handles 1M "
+                "documents with low search latency."
+            ),
+            full_text=(
+                "User is designing a Solr architecture that handles 1M "
+                "documents with low search latency."
+            ),
+            conversation_id=conv_id,
+            session_date="July-11-2024",
+        ))
+        engine._store.store_segment(_make_segment(
+            ref="seg-solr-800k",
+            primary_tag="solr-clustering",
+            tags=["solr-clustering", "solr"],
+            summary=(
+                "User planned Solr 9.2.0 scalability work for 800K "
+                "documents with lower search latency."
+            ),
+            full_text=(
+                "User planned Solr 9.2.0 scalability work for 800K "
+                "documents with lower search latency."
+            ),
+            conversation_id=conv_id,
+            session_date="July-18-2024",
+        ))
+
+        result = engine.search_summaries(
+            "documents total combining Elasticsearch Solr projects",
+            max_results=5,
+            intent_context=(
+                "How many documents am I planning to handle in total when "
+                "combining my Elasticsearch and Solr projects?"
+            ),
+            mode="aggregate_total",
+        )
+
+        assert result["found"] is True
+        assert result["ambiguity_detected"] is True
+        competing_values = [
+            candidate["value"]
+            for candidate in result["competing_aggregate_totals"]
+        ]
+        assert set(competing_values) == {
+            "2.8 million documents",
+            "2 million documents",
+            "2.6 million documents",
+            "1.8 million documents",
+        }
+        assert "supported possibility" in result["reader_hint"]
+
+
 class TestRememberWhenTool:
     def test_execute_vc_tool_dispatches_remember_when(self):
         from virtual_context.core.tool_loop import execute_vc_tool
@@ -445,11 +1080,14 @@ class TestRememberWhenTool:
                 "query": "auth",
                 "time_range": {"kind": "relative", "preset": "last_7_days"},
             },
+            intent_context="What auth issues came up recently?",
         )
         engine.remember_when.assert_called_once_with(
             query="auth",
             time_range={"kind": "relative", "preset": "last_7_days"},
-            max_results=5,
+            max_results=None,
+            mode="auto",
+            intent_context="What auth issues came up recently?",
         )
         result = json.loads(result_str)
         assert result["found"] is True
@@ -732,7 +1370,7 @@ class TestFindQuoteIntentAndRecency:
         semantic = MagicMock()
         semantic.semantic_search.return_value = []
 
-        out = core_find_quote(
+        out = core_search_summaries(
             store=store,
             semantic=semantic,
             query="what is the latest status now",
@@ -751,7 +1389,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_default_queries_keep_original_session_order(self):
         store = MagicMock()
-        store.search_full_text.return_value = [
+        store.search_canonical_full_text.return_value = [
             QuoteResult(
                 text="older result",
                 tag="status",
@@ -771,7 +1409,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_search.return_value = []
+        semantic.semantic_full_text_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -808,7 +1446,7 @@ class TestFindQuoteIntentAndRecency:
         semantic = MagicMock()
         semantic.semantic_search.return_value = []
 
-        out = core_find_quote(
+        out = core_search_summaries(
             store=store,
             semantic=semantic,
             query="shoe rack",
@@ -820,6 +1458,641 @@ class TestFindQuoteIntentAndRecency:
         sessions = [row["session"] for row in out["results"]]
         assert sessions == ["2026/02/20", "2025/12/01"]
 
+    def test_search_summaries_lookup_returns_intact_segment_summaries(self):
+        store = MagicMock()
+        store.search_full_text.return_value = []
+        store.get_all_tag_summaries.return_value = []
+        store.search_tool_outputs.return_value = []
+        store.get_segment.side_effect = lambda ref, conversation_id=None: {
+            "seg-anchor": _make_segment(
+                ref="seg-anchor",
+                primary_tag="cost-analysis",
+                tags=["cost-analysis"],
+                summary=(
+                    "User specified an initial requirement of 500 EC2 instances "
+                    "at $0.11/hour and asked for a cost estimation tool across providers."
+                ),
+                full_text="generic chunk body",
+                session_date="July-13-2024",
+            ),
+            "seg-support": _make_segment(
+                ref="seg-support",
+                primary_tag="cost-modeling",
+                tags=["cost-modeling"],
+                summary=(
+                    "The tool should also support instance type selection, "
+                    "region selection, and cost optimization."
+                ),
+                full_text="generic support body",
+                session_date="July-13-2024",
+            ),
+        }.get(ref)
+        semantic = MagicMock()
+        semantic.semantic_search.return_value = [
+            QuoteResult(
+                text="2. Calculate Total Cost ... generic chunk",
+                tag="cost-analysis",
+                segment_ref="seg-anchor",
+                tags=["cost-analysis"],
+                match_type="semantic",
+                similarity=0.76,
+                session_date="July-13-2024",
+            ),
+            QuoteResult(
+                text="Optimize resource utilization ... generic chunk",
+                tag="cost-modeling",
+                segment_ref="seg-support",
+                tags=["cost-modeling"],
+                match_type="semantic",
+                similarity=0.66,
+                session_date="July-13-2024",
+            ),
+        ]
+
+        out = core_search_summaries(
+            store=store,
+            semantic=semantic,
+            query="cost estimation cloud instances multiple providers",
+            max_results=5,
+            mode="lookup",
+            conversation_id="beam-10M_1",
+        )
+
+        assert out["found"] is True
+        assert len(out["results"]) == 2
+        assert out["results"][0]["topic"] == "cost-analysis"
+        assert "$0.11/hour" in out["results"][0]["excerpt"]
+        assert "500 EC2 instances" in out["results"][0]["excerpt"]
+        assert "merged_count" not in out["results"][0]
+        assert out["results"][1]["topic"] == "cost-modeling"
+        assert out["chosen_preference_anchor"]["provider"] == "AWS EC2"
+        assert out["chosen_preference_anchor"]["hourly_rate"] == "$0.11/hour"
+        assert out["chosen_preference_anchor"]["instance_count"] == "500"
+        assert out["anchor_example_calculation"]["formula"] == "$0.11/hour * 500 instances = $55/hour"
+        assert "Do not substitute alternate illustrative rates or counts" in out["reader_hint"]
+
+    def test_exact_value_mode_prioritizes_explicit_value_hits(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "The pipeline targeted 96% detection across 3,000 query "
+                    "simulations for QueryResponseError."
+                ),
+                tag="testing",
+                segment_ref="seg-approx",
+                tags=["testing"],
+                match_type="semantic",
+                similarity=0.81,
+                session_date="2025-02-16",
+            ),
+            QuoteResult(
+                text=(
+                    "The logging setup targeted 98% detection across 10,000 "
+                    "test records for IngestionParseError."
+                ),
+                tag="ingestion-error-handling",
+                segment_ref="seg-exact",
+                tags=["ingestion-error-handling"],
+                match_type="fts",
+                session_date="2025-02-15",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="detection rate total number test records",
+            max_results=2,
+            intent_context=(
+                "What detection rate and total number of test records did I "
+                "mention when setting up logs to catch that specific error?"
+            ),
+            mode="exact_value",
+        )
+
+        assert out["mode"] == "exact_value"
+        assert out["results"][0]["topic"] == "ingestion-error-handling"
+        assert out["value_candidates"][0]["values"][:2] == [
+            "98%",
+            "10,000 test records",
+        ]
+        assert out["chosen_exact_value_candidate"]["values"][:2] == [
+            "98%",
+            "10,000 test records",
+        ]
+        assert out["chosen_exact_value_candidate"]["topic"] == "ingestion-error-handling"
+        assert "chosen_exact_value_candidate" in out["reader_hint"]
+        assert len(out["results"]) == 1
+        assert "10,000 test records" in out["results"][0]["excerpt"]
+
+    def test_exact_value_mode_prioritizes_clean_version_candidates(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "Assistant: For indexing over 1 million documents, Milvus "
+                    "2.2.0 is a solid option and integrates well with the "
+                    "rest of the retrieval stack."
+                ),
+                tag="search-infra",
+                segment_ref="seg-noisy",
+                tags=["search-infra"],
+                match_type="fts",
+                session_date="2025-02-21",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I'm evaluating Milvus 2.3.1 for the vector "
+                    "database cluster setup and indexing over 1 million "
+                    "vectors."
+                ),
+                tag="milvus-cluster-setup",
+                segment_ref="seg-version",
+                tags=["milvus-cluster-setup"],
+                match_type="semantic",
+                similarity=0.79,
+                session_date="2025-02-20",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="Milvus version evaluating indexing 1 million documents",
+            max_results=2,
+            intent_context=(
+                "What version of the vector database am I evaluating for "
+                "indexing over 1 million documents?"
+            ),
+            mode="exact_value",
+        )
+
+        assert out["mode"] == "exact_value"
+        assert out["chosen_exact_value_candidate"]["values"][0] == "2.3.1"
+        assert out["chosen_exact_value_candidate"]["version_values"] == ["2.3.1"]
+        assert out["chosen_exact_value_candidate"]["topic"] == "milvus-cluster-setup"
+        assert out["chosen_exact_value_candidate"]["user_statement"] is True
+        assert "exact_value_candidates" not in out
+        assert len(out["results"]) == 1
+        assert "2.3.1" in out["results"][0]["excerpt"]
+
+    def test_exact_value_mode_surfaces_shared_rate_candidates_for_quote_evidence(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm trying to implement a system that can handle "
+                    "2,500 queries/sec with 99.9% uptime using parallel "
+                    "processing."
+                ),
+                tag="terraform-iac",
+                segment_ref="seg-2500",
+                tags=["terraform-iac"],
+                match_type="fts",
+                session_date="2024-09-06",
+                source_scope="turn",
+                turn_number=3022,
+                matched_side="both",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I'm trying to implement the partitioning logic to "
+                    "handle 1,500 queries/sec across 4 replicated zones."
+                ),
+                tag="query-parallelization",
+                segment_ref="seg-1500",
+                tags=["query-parallelization"],
+                match_type="fts",
+                session_date="2025-02-10",
+                source_scope="turn",
+                turn_number=6227,
+                matched_side="both",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I've been working on designing a distributed "
+                    "system architecture to support 5,000 queries/sec with "
+                    "99.9% uptime, using a combination of load balancing "
+                    "and sharding to distribute the queries across nodes.\n\n"
+                    "Assistant: Certainly! Designing a distributed system to "
+                    "handle 5,000 queries per second with 99.9% uptime "
+                    "requires careful consideration of load balancing, "
+                    "sharding, and fault tolerance."
+                ),
+                tag="api-rate-limiting",
+                segment_ref="seg-5000",
+                tags=["api-rate-limiting"],
+                match_type="fts",
+                session_date="2025-02-25",
+                source_scope="turn",
+                turn_number=6718,
+                matched_side="both",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I need to design a distributed system "
+                    "architecture to handle 3,000 queries per second with "
+                    "99.9% uptime, using load balancing and sharding."
+                ),
+                tag="effort-estimation",
+                segment_ref="seg-3000",
+                tags=["effort-estimation"],
+                match_type="fts",
+                session_date="2025-02-10",
+                source_scope="turn",
+                turn_number=6271,
+                matched_side="both",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="queries per second sharding load balancing partitioning",
+            max_results=4,
+            intent_context=(
+                "How many queries per second am I aiming to support across "
+                "sharding, load balancing, and partitioning efforts combined?"
+            ),
+            mode="exact_value",
+        )
+
+        assert out["chosen_exact_value_candidate"]["values"][:2] == [
+            "99.9%",
+            "5,000 queries",
+        ]
+        assert "exact_value_candidates" not in out
+        assert out["shared_value_candidates"][0]["value"] == "5,000 queries/second"
+        assert out["shared_value_candidates"][0]["occurrences"] == 2
+        assert out["shared_value_candidates"][0]["matched_components"] == [
+            "sharding",
+            "load balancing",
+            "partitioning",
+        ]
+        assert "shared_value_candidates" in out["reader_hint"]
+        assert len(out["results"]) == 1
+        assert "5,000 queries/sec" in out["results"][0]["excerpt"]
+
+    def test_exact_value_mode_prefers_latest_user_version_self_report(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm evaluating Milvus 2.2.0 for indexing over "
+                    "1 million documents."
+                ),
+                tag="vector-database-evaluation",
+                segment_ref="seg-older",
+                tags=["vector-database-evaluation"],
+                match_type="fts",
+                session_date="2024-07-18",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I'm evaluating Milvus 2.3.1 for the vector "
+                    "database cluster setup and indexing over 1 million "
+                    "vectors."
+                ),
+                tag="milvus-cluster-setup",
+                segment_ref="seg-newer",
+                tags=["milvus-cluster-setup"],
+                match_type="fts",
+                session_date="2024-08-17",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="vector database version indexing 1 million documents",
+            max_results=2,
+            intent_context=(
+                "What version of the vector database am I evaluating for "
+                "indexing over 1 million documents?"
+            ),
+            mode="exact_value",
+        )
+
+        assert out["chosen_exact_value_candidate"]["values"][0] == "2.3.1"
+        assert out["chosen_exact_value_candidate"]["session_date_normalized"] == "2024-08-17"
+
+    def test_lookup_mode_adds_reader_hint_for_conflicting_user_self_state_quotes(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm setting up diagnostic logs to capture shard "
+                    "distribution errors, targeting 98% detection across "
+                    "100,000 test vectors."
+                ),
+                tag="sharding-logs",
+                segment_ref="seg-yes",
+                tags=["sharding-logs"],
+                match_type="fts",
+                session_date="2025-02-12",
+                source_scope="turn",
+                turn_number=6401,
+                matched_side="user",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I've never set up diagnostic logs to capture "
+                    "shard distribution errors, and I'm worried this might "
+                    "impact my ability to debug issues."
+                ),
+                tag="sharding-logs",
+                segment_ref="seg-no",
+                tags=["sharding-logs"],
+                match_type="fts",
+                session_date="2025-02-14",
+                source_scope="turn",
+                turn_number=6409,
+                matched_side="user",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="diagnostic logs capture shard distribution errors",
+            max_results=4,
+            intent_context=(
+                "Have I set up diagnostic logs to capture shard distribution "
+                "errors in my sharding implementation?"
+            ),
+            mode="lookup",
+        )
+
+        assert out["mode"] == "lookup"
+        assert "CONTRADICTION CHECK" in out["reader_hint"]
+        assert "ask which is correct" in out["reader_hint"].lower()
+        assert len(out["results"]) == 2
+
+    def test_lookup_mode_adds_soft_compare_hint_for_non_conflicting_quotes(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm working with Johnny on securing tuning logic "
+                    "for a 25% protection boost."
+                ),
+                tag="secure-tuning-logic",
+                segment_ref="seg-1",
+                tags=["secure-tuning-logic"],
+                match_type="fts",
+                session_date="2024-08-10",
+                source_scope="turn",
+                turn_number=2101,
+                matched_side="user",
+            )
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="Johnny code review tuning logic qualifications expertise",
+            max_results=3,
+            mode="lookup",
+        )
+
+        assert out["mode"] == "lookup"
+        assert "Compare the returned quotes before answering" in out["reader_hint"]
+        assert "If the evidence does not conflict, answer directly" in out["reader_hint"]
+        assert len(out["results"]) == 1
+
+    def test_lookup_mode_reranks_raw_turns_by_distinct_query_phrase_coverage(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I've been getting some issues with vector lookups "
+                    "during dense search integration, but I've never "
+                    "actually logged any errors for this, so I'm not sure "
+                    "where to start debugging."
+                ),
+                tag="elasticsearch-indexing",
+                segment_ref="turn_2552",
+                tags=["elasticsearch-indexing"],
+                match_type="full_text_search",
+                session_date="August-21-2024",
+                source_scope="turn",
+                turn_number=2552,
+                matched_side="user",
+            ),
+            QuoteResult(
+                text=(
+                    "User: I'm working on a project that involves "
+                    "integrating dense vector search with approximate nearest "
+                    "neighbors using FAISS 1.7.4. I've been experiencing "
+                    "some issues with the integration."
+                ),
+                tag="pipeline-routing-optimization",
+                segment_ref="turn_3372",
+                tags=["pipeline-routing-optimization"],
+                match_type="full_text_search",
+                session_date="September-28-2024",
+                source_scope="turn",
+                turn_number=3372,
+                matched_side="user",
+            ),
+            QuoteResult(
+                text=(
+                    "User: Always provide detailed error codes when I ask "
+                    "about debugging strategies."
+                ),
+                tag="query-throughput-optimization",
+                segment_ref="turn_6127",
+                tags=["query-throughput-optimization"],
+                match_type="full_text_search",
+                session_date="February-07-2025",
+                source_scope="turn",
+                turn_number=6127,
+                matched_side="user",
+            ),
+            QuoteResult(
+                text=(
+                    "User: Always include exact error messages when I ask "
+                    "about debugging strategies."
+                ),
+                tag="hybrid-retrieval",
+                segment_ref="turn_3329",
+                tags=["hybrid-retrieval"],
+                match_type="full_text_search",
+                session_date="September-28-2024",
+                source_scope="turn",
+                turn_number=3329,
+                matched_side="user",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="exact error messages debugging strategies vector lookups dense search integration",
+            max_results=4,
+            mode="lookup",
+        )
+
+        assert [row["turn_number"] for row in out["results"][:2]] == [2552, 3329]
+
+    def test_exact_value_mode_reserves_semantic_budget_when_lexical_is_full(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm evaluating Elasticsearch 8.9.0 for sparse "
+                    "retrieval and indexing 1.8 million documents."
+                ),
+                tag="fastapi-integration",
+                segment_ref=f"turn_{idx}",
+                tags=["fastapi-integration"],
+                match_type="full_text_search",
+                session_date="2024-08-25",
+                turn_number=idx,
+                source_scope="turn",
+                matched_side="user",
+            )
+            for idx in range(1, 21)
+        ]
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = [
+            QuoteResult(
+                text=(
+                    "User: I'm trying to optimize the performance of my "
+                    "Milvus 2.3.1 vector database for dense result retrieval."
+                ),
+                tag="elasticsearch-8-9-0",
+                segment_ref="turn_999",
+                tags=["elasticsearch-8-9-0"],
+                match_type="full_text_semantic",
+                session_date="2024-10-02",
+                turn_number=999,
+                source_scope="turn",
+                matched_side="user",
+                similarity=0.69,
+            )
+        ]
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="vector database evaluation indexing 1 million documents",
+            max_results=5,
+            intent_context=(
+                "What version of the vector database am I evaluating for "
+                "indexing over 1 million documents?"
+            ),
+            mode="exact_value",
+        )
+
+        semantic.semantic_full_text_search.assert_called_once()
+        assert out["chosen_exact_value_candidate"]["values"][0] == "2.3.1"
+        assert "2.3.1" in out["results"][0]["excerpt"]
+
+    def test_find_quote_uses_canonical_turn_context_without_segment_join(self):
+        store = MagicMock()
+        store.search_canonical_full_text.return_value = [
+            QuoteResult(
+                text="User: I'm setting up logs to catch IngestionParseError.",
+                tag="ingestion-error-handling",
+                segment_ref="turn_42",
+                tags=["ingestion-error-handling", "logging"],
+                match_type="full_text_search",
+                session_date="February-17-2025",
+                source_scope="turn",
+                turn_number=42,
+                matched_side="user",
+            )
+        ]
+        store.get_all_segments.side_effect = AssertionError("segment join should not be used")
+        store.get_all_tag_summaries.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_full_text_search.return_value = []
+
+        out = core_find_quote(
+            store=store,
+            semantic=semantic,
+            query="IngestionParseError logs",
+            max_results=1,
+            mode="lookup",
+            conversation_id="beam-10M_1",
+        )
+
+        assert out["results"][0]["topic"] == "ingestion-error-handling"
+        assert out["results"][0]["segment_ref"] == "turn_42"
+        assert out["results"][0]["session"] == "February-17-2025"
+        assert out["results"][0]["session_date_normalized"] == "2025-02-17"
+
+    def test_coverage_mode_diversifies_across_sessions(self):
+        store = MagicMock()
+        store.search_full_text.return_value = [
+            QuoteResult(
+                text="System A handled 5,000 queries per hour with sharding.",
+                tag="sharding",
+                segment_ref="seg-a-1",
+                tags=["sharding"],
+                match_type="fts",
+                session_date="2024-07-18",
+            ),
+            QuoteResult(
+                text="Load balancing details for the same sharding project.",
+                tag="sharding",
+                segment_ref="seg-a-2",
+                tags=["sharding"],
+                match_type="fts",
+                session_date="2024-07-18",
+            ),
+            QuoteResult(
+                text="Partitioning work targeted 6,000 queries per hour.",
+                tag="partitioning",
+                segment_ref="seg-b-1",
+                tags=["partitioning"],
+                match_type="fts",
+                session_date="2024-08-02",
+            ),
+        ]
+        store.get_all_tag_summaries.return_value = []
+        store.search_tool_outputs.return_value = []
+        semantic = MagicMock()
+        semantic.semantic_search.return_value = []
+
+        out = core_search_summaries(
+            store=store,
+            semantic=semantic,
+            query="queries per second sharding load balancing partitioning",
+            max_results=2,
+            mode="coverage",
+        )
+
+        sessions = [row["session"] for row in out["results"]]
+        assert len(set(sessions)) == 2
+        assert out["mode"] == "coverage"
+        assert out["coverage_summary"]["distinct_sessions"] == 2
+        assert "COVERAGE MODE" in out["reader_hint"]
+
     @pytest.mark.regression("BUG-031")
     def test_weak_semantic_newest_session_does_not_suppress(self):
         """An unrelated newest session matched via weak semantic similarity
@@ -828,7 +2101,7 @@ class TestFindQuoteIntentAndRecency:
         keyboard session (sim=0.26) suppressed shoe-storage sessions."""
         store = MagicMock()
         # FTS returns the topically relevant older sessions
-        store.search_full_text.return_value = [
+        store.search_canonical_full_text.return_value = [
             QuoteResult(
                 text="I keep my old sneakers under my bed",
                 tag="sneaker-care",
@@ -849,7 +2122,7 @@ class TestFindQuoteIntentAndRecency:
         store.get_all_tag_summaries.return_value = []
         # Semantic search returns a weak, unrelated match from a newer session
         semantic = MagicMock()
-        semantic.semantic_search.return_value = [
+        semantic.semantic_full_text_search.return_value = [
             QuoteResult(
                 text="I got a new cherry-mx-brown keyboard",
                 tag="cherry-mx-brown",

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs, get_recent_context
+from .semantic_search import persist_turn_with_embeddings
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
 
@@ -415,15 +416,24 @@ class TaggingPipeline:
             # Persist turn message text for post-restart recall
             if latest_pair:
                 turn_num = turn_number
+                entry = self._turn_tag_index.get_tags_for_turn(turn_num)
                 t_stage = time.monotonic()
                 try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        turn_num,
-                        latest_pair[0].content if len(latest_pair) > 0 else "",
-                        latest_pair[1].content if len(latest_pair) > 1 else "",
+                    persist_turn_with_embeddings(
+                        self._store,
+                        self._semantic,
+                        conversation_id=self.config.conversation_id,
+                        turn_number=turn_num,
+                        user_content=latest_pair[0].content if len(latest_pair) > 0 else "",
+                        assistant_content=latest_pair[1].content if len(latest_pair) > 1 else "",
                         user_raw_content=json.dumps(latest_pair[0].raw_content) if len(latest_pair) > 0 and latest_pair[0].raw_content else None,
                         assistant_raw_content=json.dumps(latest_pair[1].raw_content) if len(latest_pair) > 1 and latest_pair[1].raw_content else None,
+                        primary_tag=entry.primary_tag if entry else "_general",
+                        tags=list(entry.tags) if entry else [],
+                        session_date=entry.session_date if entry else "",
+                        sender=entry.sender if entry else "",
+                        fact_signals=list(entry.fact_signals) if entry else [],
+                        code_refs=list(entry.code_refs) if entry else [],
                     )
                 except Exception:
                     pass  # never block tagging for message persistence
@@ -649,13 +659,19 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
+                    persist_turn_with_embeddings(
+                        self._store,
+                        self._semantic,
+                        conversation_id=self.config.conversation_id,
+                        turn_number=entry.turn_number,
+                        user_content=user_msg.content,
+                        assistant_content=asst_msg.content,
                         user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
                         assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                        primary_tag=entry.primary_tag,
+                        tags=list(entry.tags),
+                        session_date=entry.session_date,
+                        sender=entry.sender,
                     )
                 except Exception:
                     pass
@@ -689,11 +705,17 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    self._store.save_turn_message(
-                        self.config.conversation_id,
-                        entry.turn_number,
-                        user_msg.content,
-                        asst_msg.content,
+                    persist_turn_with_embeddings(
+                        self._store,
+                        self._semantic,
+                        conversation_id=self.config.conversation_id,
+                        turn_number=entry.turn_number,
+                        user_content=user_msg.content,
+                        assistant_content=asst_msg.content,
+                        primary_tag=entry.primary_tag,
+                        tags=list(entry.tags),
+                        session_date=entry.session_date,
+                        sender=entry.sender,
                     )
                 except Exception:
                     pass
@@ -816,18 +838,28 @@ class TaggingPipeline:
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
+                fact_signals=tag_result.fact_signals,
+                code_refs=tag_result.code_refs,
                 sender=sender or "",
                 session_date=running_session_date,
             )
             self._turn_tag_index.append(entry)
             try:
-                self._store.save_turn_message(
-                    self.config.conversation_id,
-                    entry.turn_number,
-                    user_msg.content,
-                    asst_msg.content,
+                persist_turn_with_embeddings(
+                    self._store,
+                    self._semantic,
+                    conversation_id=self.config.conversation_id,
+                    turn_number=entry.turn_number,
+                    user_content=user_msg.content,
+                    assistant_content=asst_msg.content,
                     user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
                     assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                    primary_tag=entry.primary_tag,
+                    tags=list(entry.tags),
+                    session_date=entry.session_date,
+                    sender=entry.sender,
+                    fact_signals=list(entry.fact_signals),
+                    code_refs=list(entry.code_refs),
                 )
             except Exception:
                 pass

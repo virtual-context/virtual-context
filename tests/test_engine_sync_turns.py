@@ -67,16 +67,16 @@ def engine(tmp_path):
 
 
 def _search_via_store(engine, query):
-    """Search turn_messages through the CompositeStore delegate (Task 1).
+    """Search canonical full_text through the CompositeStore delegate.
 
-    Validates that the CompositeStore.search_turn_messages delegation works,
+    Validates that the CompositeStore.search_canonical_full_text delegation works,
     not just the raw concrete store method.
     """
     store = engine._store
-    _search = getattr(store, "search_turn_messages", None)
+    _search = getattr(store, "search_canonical_full_text", None)
     assert _search is not None, (
-        "search_turn_messages not reachable through store chain — "
-        "CompositeStore delegation missing (Task 1)")
+        "search_canonical_full_text not reachable through store chain — "
+        "CompositeStore delegation missing")
     return _search(query, conversation_id="test-conv-sync")
 
 

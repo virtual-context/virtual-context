@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, FullTextChunkEmbedding, FullTextRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
@@ -106,6 +107,34 @@ CREATE TABLE IF NOT EXISTS turn_messages (
     PRIMARY KEY (conversation_id, turn_number)
 );
 
+CREATE TABLE IF NOT EXISTS full_text (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    user_content TEXT NOT NULL DEFAULT '',
+    assistant_content TEXT NOT NULL DEFAULT '',
+    user_raw_content TEXT,
+    assistant_raw_content TEXT,
+    primary_tag TEXT NOT NULL DEFAULT '_general',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    session_date TEXT NOT NULL DEFAULT '',
+    sender TEXT NOT NULL DEFAULT '',
+    fact_signals_json TEXT NOT NULL DEFAULT '[]',
+    code_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (conversation_id, turn_number)
+);
+
+CREATE TABLE IF NOT EXISTS full_text_chunks (
+    conversation_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    side TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, turn_number, side, chunk_index)
+);
+
 CREATE TABLE IF NOT EXISTS conversation_aliases (
     alias_id TEXT PRIMARY KEY,
     target_id TEXT NOT NULL
@@ -158,6 +187,164 @@ END;
 CREATE TRIGGER IF NOT EXISTS segments_ft_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_fts_full(segments_fts_full, rowid, ref, full_text) VALUES('delete', old.rowid, old.ref, old.full_text);
     INSERT INTO segments_fts_full(rowid, ref, full_text) VALUES (new.rowid, new.ref, new.full_text);
+END;
+"""
+
+TURN_FTS_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_messages_fts USING fts5(
+    conversation_id UNINDEXED,
+    turn_number UNINDEXED,
+    user_content,
+    assistant_content,
+    combined_text,
+    content='turn_messages',
+    content_rowid='rowid'
+);
+"""
+
+TURN_FTS_TRIGGER_SQL = """\
+CREATE TRIGGER IF NOT EXISTS turn_messages_ai AFTER INSERT ON turn_messages BEGIN
+    INSERT INTO turn_messages_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES (
+        new.rowid,
+        new.conversation_id,
+        new.turn_number,
+        new.user_content,
+        new.assistant_content,
+        CASE
+            WHEN new.user_content != '' AND new.assistant_content != ''
+                THEN 'User: ' || new.user_content || char(10) || char(10) || 'Assistant: ' || new.assistant_content
+            WHEN new.user_content != ''
+                THEN 'User: ' || new.user_content
+            WHEN new.assistant_content != ''
+                THEN 'Assistant: ' || new.assistant_content
+            ELSE ''
+        END
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS turn_messages_ad AFTER DELETE ON turn_messages BEGIN
+    INSERT INTO turn_messages_fts(turn_messages_fts, rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES('delete', old.rowid, old.conversation_id, old.turn_number, old.user_content, old.assistant_content,
+        CASE
+            WHEN old.user_content != '' AND old.assistant_content != ''
+                THEN 'User: ' || old.user_content || char(10) || char(10) || 'Assistant: ' || old.assistant_content
+            WHEN old.user_content != ''
+                THEN 'User: ' || old.user_content
+            WHEN old.assistant_content != ''
+                THEN 'Assistant: ' || old.assistant_content
+            ELSE ''
+        END
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS turn_messages_au AFTER UPDATE ON turn_messages BEGIN
+    INSERT INTO turn_messages_fts(turn_messages_fts, rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES('delete', old.rowid, old.conversation_id, old.turn_number, old.user_content, old.assistant_content,
+        CASE
+            WHEN old.user_content != '' AND old.assistant_content != ''
+                THEN 'User: ' || old.user_content || char(10) || char(10) || 'Assistant: ' || old.assistant_content
+            WHEN old.user_content != ''
+                THEN 'User: ' || old.user_content
+            WHEN old.assistant_content != ''
+                THEN 'Assistant: ' || old.assistant_content
+            ELSE ''
+        END
+    );
+    INSERT INTO turn_messages_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES (
+        new.rowid,
+        new.conversation_id,
+        new.turn_number,
+        new.user_content,
+        new.assistant_content,
+        CASE
+            WHEN new.user_content != '' AND new.assistant_content != ''
+                THEN 'User: ' || new.user_content || char(10) || char(10) || 'Assistant: ' || new.assistant_content
+            WHEN new.user_content != ''
+                THEN 'User: ' || new.user_content
+            WHEN new.assistant_content != ''
+                THEN 'Assistant: ' || new.assistant_content
+            ELSE ''
+        END
+    );
+END;
+"""
+
+FULL_TEXT_ARCHIVE_FTS_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS full_text_fts USING fts5(
+    conversation_id UNINDEXED,
+    turn_number UNINDEXED,
+    user_content,
+    assistant_content,
+    combined_text,
+    content='full_text',
+    content_rowid='rowid'
+);
+"""
+
+FULL_TEXT_ARCHIVE_FTS_TRIGGER_SQL = """\
+CREATE TRIGGER IF NOT EXISTS full_text_ai AFTER INSERT ON full_text BEGIN
+    INSERT INTO full_text_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES (
+        new.rowid,
+        new.conversation_id,
+        new.turn_number,
+        new.user_content,
+        new.assistant_content,
+        CASE
+            WHEN new.user_content != '' AND new.assistant_content != ''
+                THEN 'User: ' || new.user_content || char(10) || char(10) || 'Assistant: ' || new.assistant_content
+            WHEN new.user_content != ''
+                THEN 'User: ' || new.user_content
+            WHEN new.assistant_content != ''
+                THEN 'Assistant: ' || new.assistant_content
+            ELSE ''
+        END
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS full_text_ad AFTER DELETE ON full_text BEGIN
+    INSERT INTO full_text_fts(full_text_fts, rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES('delete', old.rowid, old.conversation_id, old.turn_number, old.user_content, old.assistant_content,
+        CASE
+            WHEN old.user_content != '' AND old.assistant_content != ''
+                THEN 'User: ' || old.user_content || char(10) || char(10) || 'Assistant: ' || old.assistant_content
+            WHEN old.user_content != ''
+                THEN 'User: ' || old.user_content
+            WHEN old.assistant_content != ''
+                THEN 'Assistant: ' || old.assistant_content
+            ELSE ''
+        END
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS full_text_au AFTER UPDATE ON full_text BEGIN
+    INSERT INTO full_text_fts(full_text_fts, rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES('delete', old.rowid, old.conversation_id, old.turn_number, old.user_content, old.assistant_content,
+        CASE
+            WHEN old.user_content != '' AND old.assistant_content != ''
+                THEN 'User: ' || old.user_content || char(10) || char(10) || 'Assistant: ' || old.assistant_content
+            WHEN old.user_content != ''
+                THEN 'User: ' || old.user_content
+            WHEN old.assistant_content != ''
+                THEN 'Assistant: ' || old.assistant_content
+            ELSE ''
+        END
+    );
+    INSERT INTO full_text_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+    VALUES (
+        new.rowid,
+        new.conversation_id,
+        new.turn_number,
+        new.user_content,
+        new.assistant_content,
+        CASE
+            WHEN new.user_content != '' AND new.assistant_content != ''
+                THEN 'User: ' || new.user_content || char(10) || char(10) || 'Assistant: ' || new.assistant_content
+            WHEN new.user_content != ''
+                THEN 'User: ' || new.user_content
+            WHEN new.assistant_content != ''
+                THEN 'Assistant: ' || new.assistant_content
+            ELSE ''
+        END
+    );
 END;
 """
 
@@ -225,6 +412,61 @@ def _sanitize_fts_query_terms(query: str) -> str:
     return " OR ".join(terms)
 
 
+def _turn_query_terms(query: str) -> list[str]:
+    return [term.lower() for term in re.findall(r"[a-zA-Z0-9_.%-]+", query or "") if len(term) >= 2]
+
+
+def _text_term_hits(text: str, terms: list[str]) -> int:
+    lowered = (text or "").lower()
+    if not lowered or not terms:
+        return 0
+    return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", lowered))
+
+
+def _matched_turn_side(query: str, user_text: str, assistant_text: str) -> str:
+    query_lower = (query or "").strip().lower()
+    user_lower = (user_text or "").lower()
+    assistant_lower = (assistant_text or "").lower()
+    user_hits = 0
+    assistant_hits = 0
+    if query_lower:
+        if query_lower in user_lower:
+            user_hits += 2
+        if query_lower in assistant_lower:
+            assistant_hits += 2
+    terms = _turn_query_terms(query)
+    user_hits += _text_term_hits(user_text, terms)
+    assistant_hits += _text_term_hits(assistant_text, terms)
+    if user_hits and assistant_hits:
+        return "both"
+    if user_hits:
+        return "user"
+    if assistant_hits:
+        return "assistant"
+    return "unknown"
+
+
+def _build_turn_excerpt(
+    query: str,
+    user_text: str,
+    assistant_text: str,
+    matched_side: str,
+    *,
+    context_chars: int = 200,
+) -> str:
+    if matched_side == "user":
+        return f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}"
+    if matched_side == "assistant":
+        return f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
+    if matched_side == "both":
+        return (
+            f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}\n\n"
+            f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
+        )
+    combined = f"User: {user_text or ''}\n\nAssistant: {assistant_text or ''}".strip()
+    return _extract_excerpt(combined, query, context_chars=context_chars)
+
+
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
     return StoredSegment(
@@ -284,6 +526,52 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
     )
 
 
+def _row_to_full_text(row: sqlite3.Row) -> FullTextRow:
+    tags_raw = row["tags_json"] if "tags_json" in row.keys() else "[]"
+    fact_signals_raw = row["fact_signals_json"] if "fact_signals_json" in row.keys() else "[]"
+    code_refs_raw = row["code_refs_json"] if "code_refs_json" in row.keys() else "[]"
+    try:
+        tags = json.loads(tags_raw or "[]")
+    except Exception:
+        tags = []
+    try:
+        code_refs = json.loads(code_refs_raw or "[]")
+    except Exception:
+        code_refs = []
+    fact_signals: list[FactSignal] = []
+    try:
+        for item in json.loads(fact_signals_raw or "[]"):
+            if isinstance(item, dict):
+                fact_signals.append(
+                    FactSignal(
+                        subject=item.get("subject", ""),
+                        verb=item.get("verb", ""),
+                        object=item.get("object", ""),
+                        status=item.get("status", ""),
+                        fact_type=item.get("fact_type", ""),
+                        what=item.get("what", ""),
+                    )
+                )
+    except Exception:
+        fact_signals = []
+    return FullTextRow(
+        conversation_id=row["conversation_id"],
+        turn_number=row["turn_number"],
+        user_content=row["user_content"] or "",
+        assistant_content=row["assistant_content"] or "",
+        user_raw_content=row["user_raw_content"],
+        assistant_raw_content=row["assistant_raw_content"],
+        primary_tag=(row["primary_tag"] if "primary_tag" in row.keys() else "_general") or "_general",
+        tags=list(tags or []),
+        session_date=(row["session_date"] if "session_date" in row.keys() else "") or "",
+        sender=(row["sender"] if "sender" in row.keys() else "") or "",
+        fact_signals=fact_signals,
+        code_refs=list(code_refs or []),
+        created_at=row["created_at"] or "",
+        updated_at=row["updated_at"] or "",
+    )
+
+
 class SQLiteStore(ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
@@ -339,6 +627,58 @@ class SQLiteStore(ContextStore):
                 """)
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.executescript(TURN_FTS_SQL)
+            conn.executescript(TURN_FTS_TRIGGER_SQL)
+            count = conn.execute("SELECT COUNT(*) FROM turn_messages_fts").fetchone()[0]
+            if count == 0:
+                conn.execute("""
+                    INSERT INTO turn_messages_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+                    SELECT
+                        rowid,
+                        conversation_id,
+                        turn_number,
+                        user_content,
+                        assistant_content,
+                        CASE
+                            WHEN user_content != '' AND assistant_content != ''
+                                THEN 'User: ' || user_content || char(10) || char(10) || 'Assistant: ' || assistant_content
+                            WHEN user_content != ''
+                                THEN 'User: ' || user_content
+                            WHEN assistant_content != ''
+                                THEN 'Assistant: ' || assistant_content
+                            ELSE ''
+                        END
+                    FROM turn_messages
+                """)
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.executescript(FULL_TEXT_ARCHIVE_FTS_SQL)
+            conn.executescript(FULL_TEXT_ARCHIVE_FTS_TRIGGER_SQL)
+            count = conn.execute("SELECT COUNT(*) FROM full_text_fts").fetchone()[0]
+            if count == 0:
+                conn.execute("""
+                    INSERT INTO full_text_fts(rowid, conversation_id, turn_number, user_content, assistant_content, combined_text)
+                    SELECT
+                        rowid,
+                        conversation_id,
+                        turn_number,
+                        user_content,
+                        assistant_content,
+                        CASE
+                            WHEN user_content != '' AND assistant_content != ''
+                                THEN 'User: ' || user_content || char(10) || char(10) || 'Assistant: ' || assistant_content
+                            WHEN user_content != ''
+                                THEN 'User: ' || user_content
+                            WHEN assistant_content != ''
+                                THEN 'Assistant: ' || assistant_content
+                            ELSE ''
+                        END
+                    FROM full_text
+                """)
+        except sqlite3.OperationalError:
+            pass
         # Cascade delete chunk embeddings when parent segment is deleted
         try:
             conn.execute("""
@@ -346,6 +686,12 @@ class SQLiteStore(ContextStore):
                     DELETE FROM segment_chunks WHERE segment_ref = old.ref;
                 END;
             """)
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_full_text_chunks_conversation ON full_text_chunks(conversation_id, turn_number, side)"
+            )
         except sqlite3.OperationalError:
             pass
         # Migrations: add columns that didn't exist in earlier schema versions
@@ -369,6 +715,18 @@ class SQLiteStore(ContextStore):
             conn.execute("ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT")
         except Exception:
             pass
+        for stmt in (
+            "ALTER TABLE full_text ADD COLUMN primary_tag TEXT NOT NULL DEFAULT '_general'",
+            "ALTER TABLE full_text ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE full_text ADD COLUMN session_date TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE full_text ADD COLUMN sender TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE full_text ADD COLUMN fact_signals_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE full_text ADD COLUMN code_refs_json TEXT NOT NULL DEFAULT '[]'",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
         try:
             cur = conn.execute("PRAGMA table_info(tag_aliases)")
             cols = cur.fetchall()
@@ -1124,6 +1482,81 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ))
         return results
 
+    def search_canonical_full_text(
+        self,
+        query: str,
+        limit: int = 5,
+        conversation_id: str | None = None,
+    ) -> list[QuoteResult]:
+        conn = self._get_conn()
+        rows = []
+        try:
+            fts_query = _sanitize_fts_query_terms(query) or _sanitize_fts_query(query)
+            sql = """
+                SELECT ft.turn_number, ft.user_content, ft.assistant_content, ft.created_at,
+                       ft.primary_tag, ft.tags_json, ft.session_date
+                FROM full_text_fts fts
+                JOIN full_text ft ON ft.rowid = fts.rowid
+                WHERE full_text_fts MATCH ?
+            """
+            params: list[object] = [fts_query]
+            if conversation_id is not None:
+                sql += " AND ft.conversation_id = ?"
+                params.append(conversation_id)
+            sql += " ORDER BY bm25(full_text_fts, 5.0, 5.0, 1.0) LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            pattern = f"%{query}%"
+            sql = """SELECT turn_number, user_content, assistant_content, created_at,
+                            primary_tag, tags_json, session_date
+                     FROM full_text
+                     WHERE (user_content LIKE ? OR assistant_content LIKE ?)"""
+            params = [pattern, pattern]
+            if conversation_id is not None:
+                sql += " AND conversation_id = ?"
+                params.append(conversation_id)
+            sql += " ORDER BY turn_number DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        _sc = getattr(self, "search_config", None)
+        _ctx = _sc.excerpt_context_chars if _sc else 200
+        for row in rows:
+            turn = row["turn_number"] if isinstance(row, sqlite3.Row) else row[0]
+            u = (row["user_content"] if isinstance(row, sqlite3.Row) else row[1]) or ""
+            a = (row["assistant_content"] if isinstance(row, sqlite3.Row) else row[2]) or ""
+            created_at = (row["created_at"] if isinstance(row, sqlite3.Row) else row[3]) or ""
+            primary_tag = (row["primary_tag"] if isinstance(row, sqlite3.Row) else row[4]) or "_general"
+            tags_json = (row["tags_json"] if isinstance(row, sqlite3.Row) else row[5]) or "[]"
+            session_date = (row["session_date"] if isinstance(row, sqlite3.Row) else row[6]) or ""
+            try:
+                tags = json.loads(tags_json or "[]")
+            except Exception:
+                tags = []
+            matched_side = _matched_turn_side(query, u, a)
+            excerpt = _build_turn_excerpt(
+                query,
+                u,
+                a,
+                matched_side,
+                context_chars=_ctx,
+            )
+            results.append(QuoteResult(
+                text=excerpt,
+                tag=primary_tag,
+                segment_ref=f"turn_{turn}",
+                tags=list(tags or []),
+                match_type="full_text_search",
+                session_date=session_date,
+                source_scope="turn",
+                turn_number=turn,
+                matched_side=matched_side,
+                created_at=created_at,
+            ))
+        return results
+
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
         conn = self._get_conn()
         if conversation_id is not None:
@@ -1407,6 +1840,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         for table in (
             "engine_state",
             "facts",
+            "full_text",
+            "full_text_chunks",
             "turn_messages",
             "tag_summaries",
             "tag_aliases",
@@ -1613,6 +2048,89 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             for row in rows
         ]
+
+    def store_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        side: str,
+        chunks: list[FullTextChunkEmbedding],
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = ? AND turn_number = ? AND side = ?",
+                (conversation_id, turn_number, side),
+            )
+            for chunk in chunks:
+                conn.execute(
+                    """INSERT INTO full_text_chunks
+                    (conversation_id, turn_number, side, chunk_index, text, embedding_json)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        chunk.conversation_id,
+                        chunk.turn_number,
+                        chunk.side,
+                        chunk.chunk_index,
+                        chunk.text,
+                        json.dumps(chunk.embedding),
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def get_all_full_text_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[FullTextChunkEmbedding]:
+        conn = self._get_conn()
+        if conversation_id is None:
+            rows = conn.execute(
+                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
+                FROM full_text_chunks
+                ORDER BY conversation_id, turn_number, side, chunk_index"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
+                FROM full_text_chunks
+                WHERE conversation_id = ?
+                ORDER BY turn_number, side, chunk_index""",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            FullTextChunkEmbedding(
+                conversation_id=row["conversation_id"],
+                turn_number=row["turn_number"],
+                side=row["side"],
+                chunk_index=row["chunk_index"],
+                text=row["text"],
+                embedding=json.loads(row["embedding_json"]),
+            )
+            for row in rows
+        ]
+
+    def delete_full_text_chunk_embeddings(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        if turn_number is None:
+            cur = conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM full_text_chunks WHERE conversation_id = ? AND turn_number = ?",
+                (conversation_id, turn_number),
+            )
+        conn.commit()
+        return int(cur.rowcount or 0)
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         conn = self._get_conn()
@@ -1834,39 +2352,59 @@ CREATE TABLE IF NOT EXISTS request_captures (
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list:
-        """Search raw turn_messages for a phrase (LIKE). Returns QuoteResult list."""
-        from ..types import QuoteResult
+        """Search raw turn_messages using FTS when available."""
         conn = self._get_conn()
-        pattern = f"%{query}%"
-        sql = """SELECT turn_number, user_content, assistant_content
-                 FROM turn_messages
-                 WHERE (user_content LIKE ? OR assistant_content LIKE ?)"""
-        params: list = [pattern, pattern]
-        if conversation_id is not None:
-            sql += " AND conversation_id = ?"
-            params.append(conversation_id)
-        sql += " ORDER BY turn_number DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+        rows = []
+        try:
+            fts_query = _sanitize_fts_query_terms(query) or _sanitize_fts_query(query)
+            sql = """
+                SELECT tm.turn_number, tm.user_content, tm.assistant_content
+                FROM turn_messages_fts fts
+                JOIN turn_messages tm ON tm.rowid = fts.rowid
+                WHERE turn_messages_fts MATCH ?
+            """
+            params: list[object] = [fts_query]
+            if conversation_id is not None:
+                sql += " AND tm.conversation_id = ?"
+                params.append(conversation_id)
+            sql += " ORDER BY bm25(turn_messages_fts, 5.0, 5.0, 1.0) LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            pattern = f"%{query}%"
+            sql = """SELECT turn_number, user_content, assistant_content
+                     FROM turn_messages
+                     WHERE (user_content LIKE ? OR assistant_content LIKE ?)"""
+            params = [pattern, pattern]
+            if conversation_id is not None:
+                sql += " AND conversation_id = ?"
+                params.append(conversation_id)
+            sql += " ORDER BY turn_number DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         results = []
+        _sc = getattr(self, "search_config", None)
+        _ctx = _sc.excerpt_context_chars if _sc else 200
         for row in rows:
-            turn = row[0]
-            u = row[1] or ""
-            a = row[2] or ""
-            combined = f"User: {u}\n\nAssistant: {a}"
-            q_lower = query.lower()
-            idx = combined.lower().find(q_lower)
-            if idx >= 0:
-                start = max(0, idx - 100)
-                end = min(len(combined), idx + len(query) + 200)
-                excerpt = combined[start:end]
-            else:
-                excerpt = combined[:300]
+            turn = row["turn_number"] if isinstance(row, sqlite3.Row) else row[0]
+            u = (row["user_content"] if isinstance(row, sqlite3.Row) else row[1]) or ""
+            a = (row["assistant_content"] if isinstance(row, sqlite3.Row) else row[2]) or ""
+            matched_side = _matched_turn_side(query, u, a)
+            excerpt = _build_turn_excerpt(
+                query,
+                u,
+                a,
+                matched_side,
+                context_chars=_ctx,
+            )
             results.append(QuoteResult(
                 text=excerpt,
                 tag="uncompacted",
                 segment_ref=f"turn_{turn}",
                 match_type="turn_search",
+                source_scope="turn",
+                turn_number=turn,
+                matched_side=matched_side,
             ))
         return results
 
@@ -1936,6 +2474,134 @@ CREATE TABLE IF NOT EXISTS request_captures (
             WHERE conversation_id = ? AND turn_number < ?""",
             (conversation_id, keep_from_turn),
         )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+    def save_full_text(
+        self,
+        conversation_id: str,
+        turn_number: int,
+        user_content: str,
+        assistant_content: str,
+        user_raw_content: str | None = None,
+        assistant_raw_content: str | None = None,
+        primary_tag: str = "_general",
+        tags: list[str] | None = None,
+        session_date: str = "",
+        sender: str = "",
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        now = _dt_to_str(datetime.now(timezone.utc))
+        created = created_at or now
+        updated = updated_at or now
+        fact_signal_payload = [
+            {
+                "subject": fs.subject,
+                "verb": fs.verb,
+                "object": fs.object,
+                "status": fs.status,
+                "fact_type": getattr(fs, "fact_type", ""),
+                "what": getattr(fs, "what", ""),
+            }
+            for fs in (fact_signals or [])
+        ]
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO full_text
+            (conversation_id, turn_number, user_content, assistant_content,
+             user_raw_content, assistant_raw_content, primary_tag, tags_json,
+             session_date, sender, fact_signals_json, code_refs_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id, turn_number) DO UPDATE SET
+                user_content=excluded.user_content,
+                assistant_content=excluded.assistant_content,
+                user_raw_content=excluded.user_raw_content,
+                assistant_raw_content=excluded.assistant_raw_content,
+                primary_tag=excluded.primary_tag,
+                tags_json=excluded.tags_json,
+                session_date=excluded.session_date,
+                sender=excluded.sender,
+                fact_signals_json=excluded.fact_signals_json,
+                code_refs_json=excluded.code_refs_json,
+                updated_at=excluded.updated_at""",
+            (
+                conversation_id,
+                turn_number,
+                user_content,
+                assistant_content,
+                user_raw_content,
+                assistant_raw_content,
+                primary_tag or "_general",
+                json.dumps(list(tags or [])),
+                session_date or "",
+                sender or "",
+                json.dumps(fact_signal_payload),
+                json.dumps(list(code_refs or [])),
+                created,
+                updated,
+            ),
+        )
+        conn.commit()
+
+    def get_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_numbers: list[int],
+    ) -> dict[int, FullTextRow]:
+        if not turn_numbers:
+            return {}
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in turn_numbers)
+        rows = conn.execute(
+            f"""SELECT conversation_id, turn_number, user_content, assistant_content,
+                       user_raw_content, assistant_raw_content, primary_tag, tags_json,
+                       session_date, sender, fact_signals_json, code_refs_json,
+                       created_at, updated_at
+            FROM full_text
+            WHERE conversation_id = ? AND turn_number IN ({placeholders})""",
+            [conversation_id] + turn_numbers,
+        ).fetchall()
+        return {
+            row["turn_number"]: _row_to_full_text(row)
+            for row in rows
+        }
+
+    def get_all_full_text_rows(
+        self,
+        conversation_id: str,
+    ) -> list[FullTextRow]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT conversation_id, turn_number, user_content, assistant_content,
+                      user_raw_content, assistant_raw_content, primary_tag, tags_json,
+                      session_date, sender, fact_signals_json, code_refs_json,
+                      created_at, updated_at
+               FROM full_text
+               WHERE conversation_id = ?
+               ORDER BY turn_number""",
+            (conversation_id,),
+        ).fetchall()
+        return [_row_to_full_text(row) for row in rows]
+
+    def delete_full_text_rows(
+        self,
+        conversation_id: str,
+        turn_number: int | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        if turn_number is None:
+            cur = conn.execute(
+                "DELETE FROM full_text WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM full_text WHERE conversation_id = ? AND turn_number = ?",
+                (conversation_id, turn_number),
+            )
         conn.commit()
         return int(cur.rowcount or 0)
 
@@ -2247,14 +2913,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[Fact]:
         conn = self._get_conn()
         sql = """SELECT * FROM facts
-                 WHERE fact_type = 'experience'
-                   AND status = 'completed'
-                   AND session_date >= ? AND session_date <= ?"""
+                 WHERE when_date >= ? AND when_date <= ?"""
         params: list = [start_date, end_date + "~"]
         if conversation_id:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
-        sql += " ORDER BY session_date ASC LIMIT ?"
+        sql += " ORDER BY when_date ASC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
         return [self._row_to_fact(row) for row in rows]
@@ -2554,6 +3218,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 tag=row["tool_name"],
                 segment_ref=row["ref"],
                 match_type="tool_output",
+                source_scope="tool_output",
             )
             for row in rows
         ]
