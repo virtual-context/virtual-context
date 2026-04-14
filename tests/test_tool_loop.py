@@ -485,6 +485,22 @@ class TestToolResultVerificationHint:
                     "facts": [],
                 }
             ],
+            "ordered_milestones": [
+                {
+                    "date": "2024-11-05",
+                    "theme": "context window mismatch",
+                    "point": "Window size mismatch error handling was discussed.",
+                    "source": "segment",
+                }
+            ],
+            "phase_milestones": [
+                {
+                    "start_date": "2024-11-05",
+                    "end_date": "2024-11-05",
+                    "focus": "context window mismatch",
+                    "points": ["Window size mismatch error handling was discussed."],
+                }
+            ],
         }
 
         result = execute_vc_tool(
@@ -499,6 +515,8 @@ class TestToolResultVerificationHint:
 
         parsed = json.loads(result)
         assert parsed["mode"] == "change_over_time"
+        assert "phase_milestones" in parsed
+        assert "ordered_milestones" in parsed
         assert parsed["date_buckets"][0]["date"] == "2024-11-05"
         assert "results" not in parsed
         assert "facts_in_window" not in parsed
