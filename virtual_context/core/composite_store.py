@@ -271,6 +271,9 @@ class CompositeStore:
     def resolve_conversation_alias(self, alias_id: str) -> str | None:
         return self._segments.resolve_conversation_alias(alias_id)
 
+    def delete_conversation_alias(self, alias_id: str) -> None:
+        self._segments.delete_conversation_alias(alias_id)
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------

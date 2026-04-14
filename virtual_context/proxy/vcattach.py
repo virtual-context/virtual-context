@@ -58,31 +58,42 @@ def execute_attach(
     target_id: str,
     store,
     registry_invalidate=None,
-    delete_conversation=None,
     reset_engine_state=None,
 ) -> None:
-    """Execute the attach: alias, delete old, reset target, invalidate.
+    """Execute the attach: clear any reverse alias, register new alias, invalidate.
+
+    Old conversations are **preserved** — VCATTACH is a durable redirect, not a
+    merge. The alias row in storage is the single source of truth: future
+    requests with *old_id* route to *target_id* via the resolver, regardless of
+    whether *old_id* still has its own stored conversation row. This means a
+    user can VCATTACH away from a labeled conversation and later return to it
+    via VCATTACH <that label> without losing history.
+
+    To support "return to" flows, any existing alias with alias_id == target_id
+    is cleared before saving the new alias. Example: if alias A -> B exists and
+    the user types VCATTACH A, we remove A -> B so A can resolve to itself.
 
     Args:
-        old_id: conversation being abandoned
+        old_id: conversation being abandoned (its alias row is updated)
         target_id: conversation being attached to
         store: unwrapped store (composite or concrete) for alias persistence
         registry_invalidate: callable(conversation_id) to evict + Redis invalidate
-        delete_conversation: callable(old_id) to delete the old conversation
         reset_engine_state: callable(target_id) to reset target checkpoints
     """
-    # 1. Register alias
+    # 1. Clear any alias FROM target_id so target_id resolves to itself again.
+    #    This unlocks "return to A" flows where A was previously aliased to B.
+    delete_alias = getattr(store, "delete_conversation_alias", None)
+    if callable(delete_alias):
+        try:
+            delete_alias(target_id)
+        except Exception:
+            logger.warning("VCATTACH: failed to clear existing alias for %s", target_id[:12])
+
+    # 2. Register new alias old_id -> target_id
     store.save_conversation_alias(old_id, target_id)
     logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
 
-    # 2. Delete old conversation
-    if callable(delete_conversation):
-        try:
-            delete_conversation(old_id)
-        except Exception:
-            logger.warning("VCATTACH: failed to delete old conversation %s", old_id[:12])
-
-    # 3. Reset target checkpoint state
+    # 3. Reset target checkpoint state (opt-in via caller)
     if callable(reset_engine_state):
         try:
             reset_engine_state(target_id)

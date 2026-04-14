@@ -1837,43 +1837,11 @@ async def _handle_vcattach(
             )
         return JSONResponse(fmt.build_fake_response(error, result.conversation_id))
 
-    # Execute attach with full authoritative delete
+    # VCATTACH is a durable redirect, not a merge. The old conversation is
+    # preserved; only the alias row is written and caches are invalidated so
+    # the next request sees the new routing.
     _store = state.engine._store if state else None
     _inner = getattr(_store, '_store', _store) if _store else None
-
-    def _full_delete(cid):
-        if tenant_registry and tenant_id:
-            if registry:
-                try:
-                    registry.remove_conversation(cid)
-                except Exception:
-                    pass
-            tenant_registry.delete_conversation(tenant_id, cid, store=_inner)
-            return
-
-        if _inner:
-            begin = getattr(_inner, "begin_conversation_deletion", None)
-            if callable(begin):
-                begin(cid)
-        target_state = registry.remove_conversation(cid) if registry else None
-        if target_state is not None:
-            try:
-                target_state.reset_for_conversation_deletion(cid, authoritative=True)
-            except Exception:
-                pass
-            try:
-                target_state.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        if _inner and hasattr(_inner, "delete_conversation"):
-            _inner.delete_conversation(cid)
-        if target_state and hasattr(target_state.engine, "_session_cache"):
-            cache = target_state.engine._session_cache
-            if cache:
-                try:
-                    cache.delete_conversation(cid)
-                except Exception:
-                    pass
 
     execute_attach(
         old_id=result.conversation_id,
@@ -1882,7 +1850,6 @@ async def _handle_vcattach(
         # Core proxy: local eviction only. Cloud path: per-request Redis hydration
         # ensures all workers see the reset state on next request.
         registry_invalidate=registry.remove_conversation if registry else None,
-        delete_conversation=_full_delete,
         reset_engine_state=None,
     )
 
@@ -2187,7 +2154,6 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             target_id=target_id,
             store=_inner,
             registry_invalidate=_invalidate,
-            delete_conversation=lambda cid: registry.delete_conversation(tenant_id, cid),
             reset_engine_state=None,
         )
 

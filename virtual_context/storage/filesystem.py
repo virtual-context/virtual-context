@@ -1046,6 +1046,11 @@ class FilesystemStore(ContextStore):
     def resolve_conversation_alias(self, alias_id: str) -> str | None:
         return self._vcattach_aliases.get(alias_id)
 
+    def delete_conversation_alias(self, alias_id: str) -> None:
+        if alias_id in self._vcattach_aliases:
+            del self._vcattach_aliases[alias_id]
+            self._save_vcattach_aliases()
+
     # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------
