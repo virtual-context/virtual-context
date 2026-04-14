@@ -504,6 +504,64 @@ class TestToolResultVerificationHint:
         assert "facts_in_window" not in parsed
         assert "reader_hint" in parsed
 
+    def test_remember_when_window_overview_prefers_date_buckets_payload(self):
+        engine = _mock_engine()
+        engine.remember_when.return_value = {
+            "query": "",
+            "mode": "window_overview",
+            "found": True,
+            "range": {
+                "kind": "between_dates",
+                "start": "2026-04-13",
+                "end": "2026-04-13",
+            },
+            "results": [
+                {"excerpt": "Configured nginx reverse proxy", "topic": "nginx-proxy"}
+            ],
+            "facts_in_window": [
+                {"what": "Set up nginx proxy routing", "when": "2026-04-13"}
+            ],
+            "date_buckets": [
+                {
+                    "date": "2026-04-13",
+                    "results": [
+                        {
+                            "topic": "nginx-proxy",
+                            "excerpt": "Configured nginx reverse proxy",
+                            "matched_terms": [],
+                            "segment_ref": "seg-1",
+                            "match_type": "summary_window",
+                        }
+                    ],
+                    "facts": [
+                        {
+                            "what": "Set up nginx proxy routing",
+                            "tags": ["nginx-proxy"],
+                            "matched_terms": [],
+                            "segment_ref": "seg-1",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "",
+                "time_range": {"kind": "between_dates", "start": "2026-04-13", "end": "2026-04-13"},
+                "mode": "window_overview",
+            },
+        )
+
+        parsed = json.loads(result)
+        assert parsed["mode"] == "window_overview"
+        assert parsed["date_buckets"][0]["date"] == "2026-04-13"
+        assert "results" not in parsed
+        assert "facts_in_window" not in parsed
+        assert "reader_hint" in parsed
+
     def test_unknown_tool_returns_error(self):
         engine = MagicMock()
         result = execute_vc_tool(engine, "vc_unknown", {})
