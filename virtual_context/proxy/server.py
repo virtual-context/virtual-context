@@ -45,6 +45,8 @@ from .formats import (
     TurnGroup,
     detect_format,
     get_format,
+    summarize_payload_accounting,
+    summarize_raw_payload_entries,
 )
 from .helpers import (  # noqa: F401 — re-exported for tests
     _VC_PROMPT_MARKER,
@@ -589,10 +591,17 @@ async def prepare_payload(
     # Normalize non-standard message formats (e.g. OpenClaw toolResult/toolCall)
     # before any pipeline processing. Runs for both proxy and REST paths.
     from .formats import normalize_messages
+    _raw_payload_accounting: dict | None = None
     _normalize_stage = time.monotonic()
     if _msg_key in body and isinstance(body[_msg_key], list):
+        _raw_payload_accounting = summarize_raw_payload_entries(body[_msg_key])
         normalize_messages(body[_msg_key])
     _note_prep("normalize_messages", _normalize_stage)
+    _payload_accounting = summarize_payload_accounting(
+        body,
+        fmt,
+        raw_summary=_raw_payload_accounting,
+    )
 
     api_format = fmt.name
     _extract_user_stage = time.monotonic()
@@ -812,6 +821,7 @@ async def prepare_payload(
                 state._last_non_virtualizable_floor = _pt_floor
 
             _prepare_meta = _prepare_metadata()
+            _prepare_meta["payload_accounting"] = dict(_payload_accounting)
             _prepare_total_ms = _prepare_meta["prepare_total_ms"]
             _conversation_id = state.engine.config.conversation_id
             _log_prepare_breakdown(
@@ -873,6 +883,7 @@ async def prepare_payload(
                 system_tokens=_pt_system_tokens,
                 protected_turn_tokens=0,
                 protected_turn_count=0,
+                payload_accounting=_payload_accounting,
             )
 
             # 2-to-llm: log passthrough body sent to the LLM (after trim)
@@ -1819,6 +1830,7 @@ async def prepare_payload(
         )
     total_turns = turn
     _prepare_meta = _prepare_metadata()
+    _prepare_meta["payload_accounting"] = dict(_payload_accounting)
     overhead_ms = _prepare_meta["prepare_total_ms"]
     _log_prepare_breakdown(
         total_ms=overhead_ms,
@@ -1984,6 +1996,7 @@ async def prepare_payload(
         system_tokens=system_tokens,
         protected_turn_tokens=_protected_turn_tokens,
         protected_turn_count=_protected_turn_count,
+        payload_accounting=_payload_accounting,
     )
     # Capture enriched body (what we actually send to the LLM)
     metrics.capture_enriched(

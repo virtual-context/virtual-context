@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -587,14 +588,25 @@ class PostgresStore(ContextStore):
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self._conn: psycopg.Connection | None = None
+        self._conn_local = threading.local()
+        self._conn_lock = threading.Lock()
+        self._connections: dict[int, psycopg.Connection] = {}
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
 
     def _get_conn(self) -> psycopg.Connection:
-        if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
-        return self._conn
+        conn = getattr(self._conn_local, "conn", None)
+        if conn is not None and not conn.closed:
+            return conn
+
+        thread_id = threading.get_ident()
+        with self._conn_lock:
+            conn = self._connections.get(thread_id)
+            if conn is None or conn.closed:
+                conn = psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
+                self._connections[thread_id] = conn
+            self._conn_local.conn = conn
+            return conn
 
     def _ensure_schema(self) -> None:
         conn = self._get_conn()
@@ -2873,9 +2885,13 @@ class PostgresStore(ContextStore):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        if self._conn and not self._conn.closed:
-            self._conn.close()
-            self._conn = None
+        with self._conn_lock:
+            conns = list(self._connections.values())
+            self._connections.clear()
+        for conn in conns:
+            if not conn.closed:
+                conn.close()
+        self._conn_local.conn = None
 
     def __del__(self) -> None:
         try:

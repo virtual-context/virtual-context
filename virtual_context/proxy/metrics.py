@@ -24,6 +24,12 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "model": ...,
     "stream": False,
     "message_count": ...,
+    "raw_payload_entry_count": 0,
+    "normalized_payload_entry_count": 0,
+    "normalized_chat_entry_count": 0,
+    "normalized_non_chat_entry_count": 0,
+    "extracted_history_message_count": 0,
+    "extracted_history_pair_count": 0,
     "client_payload_message_count": 0,
     "client_payload_pair_count": 0,
     "client_payload_user_prompt_count": 0,
@@ -55,6 +61,7 @@ _SUMMARY_FIELDS_DEFAULTS: dict[str, object] = {
     "system_tokens": 0,
     "protected_turn_tokens": 0,
     "protected_turn_count": 0,
+    "payload_accounting": {},
 }
 
 
@@ -671,6 +678,7 @@ class ProxyMetrics:
         system_tokens: int = 0,
         protected_turn_tokens: int = 0,
         protected_turn_count: int = 0,
+        payload_accounting: dict | None = None,
         turn_id: str = "",
     ) -> None:
         """Capture raw request body for inspection (thread-safe, ring buffer)."""
@@ -709,6 +717,13 @@ class ProxyMetrics:
                 "system_tokens": system_tokens,
                 "protected_turn_tokens": protected_turn_tokens,
                 "protected_turn_count": protected_turn_count,
+                "raw_payload_entry_count": int((payload_accounting or {}).get("raw_payload_entry_count", 0) or 0),
+                "normalized_payload_entry_count": int((payload_accounting or {}).get("normalized_payload_entry_count", 0) or 0),
+                "normalized_chat_entry_count": int((payload_accounting or {}).get("normalized_chat_entry_count", 0) or 0),
+                "normalized_non_chat_entry_count": int((payload_accounting or {}).get("normalized_non_chat_entry_count", 0) or 0),
+                "extracted_history_message_count": int((payload_accounting or {}).get("extracted_history_message_count", 0) or 0),
+                "extracted_history_pair_count": int((payload_accounting or {}).get("extracted_history_pair_count", 0) or 0),
+                "payload_accounting": dict(payload_accounting or {}),
                 **payload_span,
             }
             existing = self._find_capture(
