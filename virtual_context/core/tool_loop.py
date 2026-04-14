@@ -281,20 +281,25 @@ def vc_tool_definitions() -> list[dict]:
                 "Returns both conversation excerpts and structured facts "
                 "within the window. Use relative presets when they match, "
                 "or between_dates with explicit YYYY-MM-DD dates for "
-                "custom ranges. Use mode='lookup' for narrow fact lookups "
-                "within the window, mode='state_at_time' for the state on a "
-                "specific date or short date window, mode='change_over_time' "
-                "for chronology/evidence retrieval across the window, and "
-                "mode='summarize_over_time' for broad temporal synthesis "
-                "questions: how something evolved, changed, progressed, "
-                "developed, or unfolded across the window."
+                "custom ranges. Date filtering is primary; query terms only "
+                "refine and rank results inside the requested window. Use "
+                "mode='lookup' for narrow fact lookups within the window, "
+                "mode='state_at_time' for the state on a specific date or "
+                "short date window, mode='change_over_time' for chronology/"
+                "evidence retrieval across the window, mode='summarize_over_time' "
+                "for broad temporal synthesis questions, and mode='window_overview' "
+                "for query-agnostic browse questions like what we worked on "
+                "during a specific day or week."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Topic/fact query to search for within a time window.",
+                        "description": (
+                            "Topic/fact query to rank evidence inside the time window. "
+                            "For mode='window_overview', this may be an empty string."
+                        ),
                     },
                     "time_range": {
                         "type": "object",
@@ -316,7 +321,7 @@ def vc_tool_definitions() -> list[dict]:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["auto", "lookup", "change_over_time", "summarize_over_time", "state_at_time"],
+                        "enum": ["auto", "lookup", "change_over_time", "summarize_over_time", "state_at_time", "window_overview"],
                         "description": (
                             "Retrieval mode. Use 'lookup' for narrow fact retrieval, "
                             "'state_at_time' when the question asks what was true "
@@ -324,7 +329,9 @@ def vc_tool_definitions() -> list[dict]:
                             "'change_over_time' for chronology/evidence retrieval "
                             "with multiple dated items across the range, and "
                             "'summarize_over_time' for broad temporal synthesis, "
-                            "progression, and shifts across the date range. "
+                            "progression, and shifts across the date range. Use "
+                            "'window_overview' when the goal is to browse what "
+                            "happened in the window even without a strong topic query. "
                             "Default is 'auto'."
                         ),
                     },
@@ -928,15 +935,22 @@ def execute_vc_tool(
                     "Do not combine extra themes from separate milestones."
                 )
                 return trimmed
-        if mode == "change_over_time":
+        if mode in {"change_over_time", "window_overview"}:
             date_buckets = raw.get("date_buckets")
             if isinstance(date_buckets, list) and date_buckets:
                 trimmed["date_buckets"] = date_buckets
-                trimmed["reader_hint"] = (
-                    "Use date_buckets as the primary chronological evidence. "
-                    "Prefer directly matching results and facts from each date. "
-                    "Do not infer missing themes that are not present."
-                )
+                if mode == "window_overview":
+                    trimmed["reader_hint"] = (
+                        "Use date_buckets as the primary window evidence. "
+                        "Summarize only the work, topics, and facts present in the returned dates. "
+                        "Do not invent missing topics."
+                    )
+                else:
+                    trimmed["reader_hint"] = (
+                        "Use date_buckets as the primary chronological evidence. "
+                        "Prefer directly matching results and facts from each date. "
+                        "Do not infer missing themes that are not present."
+                    )
                 return trimmed
 
         results = raw.get("results")

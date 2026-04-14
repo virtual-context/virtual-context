@@ -369,7 +369,7 @@ def test_change_over_time_supplements_fact_backed_empty_dates() -> None:
     assert supplemented[0]["match_type"] == "summary_date_expand"
 
 
-def test_remember_when_uses_query_matched_facts_before_date_fallback():
+def test_remember_when_uses_query_matched_facts_after_date_window_scan():
     store = FakeStore()
     search = FakeSearch()
     resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
@@ -394,9 +394,86 @@ def test_remember_when_uses_query_matched_facts_before_date_fallback():
     )
 
     fact_dates = [item["when"] for item in result["facts_in_window"]]
-    assert store.fallback_called is False
+    assert store.fallback_called is True
     assert "2024-07-29" in fact_dates
     assert any("microservices" in item["what"].lower() for item in result["facts_in_window"])
+
+
+def test_remember_when_lookup_scans_window_even_for_weak_query() -> None:
+    store = FakeStore()
+    search = FakeSearch()
+    resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
+
+    store.segments["seg-day-1"] = _make_segment(
+        "seg-day-1",
+        "nginx-proxy",
+        "April-13-2026",
+        "Configured nginx reverse proxy for the internal dashboard on port 5757.",
+    )
+    store.segments["seg-day-2"] = _make_segment(
+        "seg-day-2",
+        "dashboard-auth",
+        "April-13-2026",
+        "Worked on dashboard authentication flow and access restrictions.",
+    )
+    store.segments["seg-other"] = _make_segment(
+        "seg-other",
+        "other-day",
+        "April-12-2026",
+        "Worked on an unrelated caching task.",
+    )
+
+    result = resolver.remember_when(
+        query="what did we work on on april 13th",
+        time_range={"kind": "between_dates", "start": "2026-04-13", "end": "2026-04-13"},
+        max_results=4,
+        mode="lookup",
+    )
+
+    assert result["found"] is True
+    assert {item["segment_ref"] for item in result["results"]} == {"seg-day-1", "seg-day-2"}
+    assert all(item["session_date_normalized"] == "2026-04-13" for item in result["results"])
+
+
+def test_remember_when_window_overview_allows_blank_query() -> None:
+    store = FakeStore()
+    search = FakeSearch()
+    resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
+
+    store.segments["seg-day-1"] = _make_segment(
+        "seg-day-1",
+        "nginx-proxy",
+        "April-13-2026",
+        "Configured nginx reverse proxy for the internal dashboard on port 5757.",
+    )
+    store.segments["seg-day-2"] = _make_segment(
+        "seg-day-2",
+        "dashboard-auth",
+        "April-13-2026",
+        "Worked on dashboard authentication flow and access restrictions.",
+    )
+    store.fallback_facts = [
+        _make_fact(
+            "fact-day-1",
+            "2026-04-13",
+            "Set up nginx proxy routing for the dashboard service",
+            tags=["nginx-proxy", "dashboard"],
+            segment_ref="seg-day-1",
+        ),
+    ]
+
+    result = resolver.remember_when(
+        query="",
+        time_range={"kind": "between_dates", "start": "2026-04-13", "end": "2026-04-13"},
+        max_results=4,
+        mode="window_overview",
+    )
+
+    assert result["mode"] == "window_overview"
+    assert result["found"] is True
+    assert {item["segment_ref"] for item in result["results"]} == {"seg-day-1", "seg-day-2"}
+    assert any(item["what"].startswith("Set up nginx proxy routing") for item in result["facts_in_window"])
+    assert result["date_buckets"][0]["date"] == "2026-04-13"
 
 
 def test_remember_when_change_over_time_mode_merges_broad_window_facts():
