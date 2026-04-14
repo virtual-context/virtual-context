@@ -1,7 +1,11 @@
 """Tests for tool_result filtering in extract_history_pairs — assistant responses
 after tool_result must not be skipped."""
 
-from virtual_context.proxy.formats import AnthropicFormat
+from virtual_context.proxy.formats import (
+    AnthropicFormat,
+    summarize_payload_accounting,
+    summarize_raw_payload_entries,
+)
 
 
 class TestToolResultFilterPreservesAssistantResponse:
@@ -106,3 +110,37 @@ class TestToolResultFilterPreservesAssistantResponse:
         all_content = " ".join(p.content for p in pairs)
 
         assert "48MP" in all_content, "Final assistant synthesis was dropped"
+
+    def test_payload_accounting_explains_tool_fold_and_pair_counts(self):
+        fmt = AnthropicFormat()
+        body = {
+            "messages": [
+                {"role": "user", "content": "Tell me about rare beauty ingredients"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"q": "rare beauty"}},
+                    {"type": "tool_use", "id": "t2", "name": "web_search", "input": {"q": "revolution"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Rare Beauty uses..."},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "Revolution uses..."},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Comparing the two..."},
+                    {"type": "text", "text": "Same Caprylic/Capric Triglyceride for lightweight moisture"},
+                ]},
+                {"role": "user", "content": "Why do you think I have medium skin tone?"},
+                {"role": "assistant", "content": "Based on the shade recommendations..."},
+            ]
+        }
+
+        raw = summarize_raw_payload_entries(body["messages"])
+        accounting = summarize_payload_accounting(body, fmt, raw_summary=raw)
+
+        assert accounting["raw_payload_entry_count"] == 6
+        assert accounting["raw_tool_use_blocks"] == 2
+        assert accounting["raw_tool_result_only_user_entries"] == 1
+        assert accounting["assistant_tool_only_entries_folded"] == 1
+        assert accounting["tool_result_user_entries_folded"] == 1
+        assert accounting["tool_followup_pairs"] == 1
+        assert accounting["extracted_history_message_count"] == 4
+        assert accounting["extracted_history_pair_count"] == 2

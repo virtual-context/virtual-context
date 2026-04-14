@@ -335,6 +335,34 @@ class TestProxyMetricsStoreIntegration:
         assert loaded[0]["client_payload_earliest_timestamp"] == "2026-03-15T16:10:00+00:00"
         assert loaded[0]["client_payload_latest_timestamp"] == "2026-03-16T18:12:00+00:00"
 
+    def test_capture_persists_payload_accounting(self, tmp_path):
+        from virtual_context.proxy.metrics import ProxyMetrics
+
+        store = self._make_store(tmp_path)
+        m = ProxyMetrics(store=store)
+        m.capture_request(
+            turn=1,
+            body={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            api_format="anthropic",
+            conversation_id="c1",
+            payload_accounting={
+                "raw_payload_entry_count": 4624,
+                "normalized_payload_entry_count": 986,
+                "normalized_chat_entry_count": 986,
+                "normalized_non_chat_entry_count": 3638,
+                "extracted_history_message_count": 986,
+                "extracted_history_pair_count": 493,
+                "tool_result_user_entries_folded": 1770,
+            },
+        )
+
+        loaded = store.load_request_captures(conversation_id="c1")
+        assert len(loaded) == 1
+        assert loaded[0]["raw_payload_entry_count"] == 4624
+        assert loaded[0]["normalized_payload_entry_count"] == 986
+        assert loaded[0]["extracted_history_pair_count"] == 493
+        assert loaded[0]["payload_accounting"]["tool_result_user_entries_folded"] == 1770
+
     def test_capture_enriched_persists_to_store(self, tmp_path):
         from virtual_context.proxy.metrics import ProxyMetrics
         from unittest.mock import patch
@@ -347,7 +375,9 @@ class TestProxyMetricsStoreIntegration:
         # Verify _persist_capture is called by capture_enriched
         with patch.object(m, '_persist_capture', wraps=m._persist_capture) as mock_persist:
             m.capture_enriched(turn=1, body={"model": "test", "messages": [], "system": "ctx"})
-            mock_persist.assert_called_once_with(1)
+            mock_persist.assert_called_once()
+            assert mock_persist.call_args.args == (1,)
+            assert mock_persist.call_args.kwargs == {"turn_id": None}
         # The store should still have the capture (enriched body excluded from summary)
         loaded = store.load_request_captures()
         assert len(loaded) == 1
