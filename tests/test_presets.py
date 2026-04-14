@@ -74,9 +74,9 @@ def test_architecture_highest_priority():
     assert arch_rule["priority"] == 10
 
 
-def test_debugging_short_ttl():
-    debug_rule = next(r for r in CODING_TAG_RULES if r["match"] == "debugging*")
-    assert debug_rule["ttl_days"] == 7
+def test_coding_rules_do_not_define_ttl():
+    for rule in CODING_TAG_RULES:
+        assert "ttl_days" not in rule
 
 
 def test_catch_all_rule_exists():

@@ -52,7 +52,8 @@ class TestLoadConfig:
         assert len(config.tag_rules) == 2
         assert config.tag_rules[0].match == "architecture*"
         assert config.tag_rules[0].priority == 10
-        assert config.tag_rules[1].ttl_days == 7
+        assert config.tag_rules[1].match == "debug*"
+        assert config.tag_rules[1].priority == 7
 
     def test_load_strategy_config(self):
         config = load_config(config_dict={
