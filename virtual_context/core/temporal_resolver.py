@@ -12,7 +12,7 @@ import re
 from calendar import monthrange
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from math import floor
+from math import ceil, floor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -303,7 +303,7 @@ class TemporalResolver:
             "facts_in_window": fact_results,
             "message": message,
         }
-        if resolved_mode in _REMEMBER_WHEN_SUMMARY_MODES:
+        if resolved_mode in (_REMEMBER_WHEN_SUMMARY_MODES | _REMEMBER_WHEN_CHANGE_MODES):
             ordered_milestones = self._build_ordered_milestones(
                 query=query,
                 results=filtered,
@@ -312,6 +312,11 @@ class TemporalResolver:
             )
             if ordered_milestones:
                 result["ordered_milestones"] = ordered_milestones
+                phase_milestones = self._build_phase_milestones(
+                    ordered_milestones=ordered_milestones,
+                )
+                if phase_milestones:
+                    result["phase_milestones"] = phase_milestones
         if resolved_mode in _REMEMBER_WHEN_DATE_BUCKET_MODES:
             date_buckets = self._build_change_date_buckets(
                 results=filtered,
@@ -1932,6 +1937,61 @@ class TemporalResolver:
             spaced_indices = self._evenly_spaced_indices(len(selected), max_results)
             selected = [selected[idx] for idx in spaced_indices]
         return selected[:max_results]
+
+    def _build_phase_milestones(
+        self,
+        *,
+        ordered_milestones: list[dict],
+    ) -> list[dict]:
+        if len(ordered_milestones) < 6:
+            return []
+
+        phase_count = min(6, max(3, ceil(len(ordered_milestones) / 4)))
+        chunk_size = max(1, ceil(len(ordered_milestones) / phase_count))
+        phases: list[dict] = []
+
+        for start_idx in range(0, len(ordered_milestones), chunk_size):
+            chunk = ordered_milestones[start_idx:start_idx + chunk_size]
+            if not chunk:
+                continue
+
+            seen_themes: set[str] = set()
+            focus_parts: list[str] = []
+            points: list[str] = []
+            for item in chunk:
+                theme = str(item.get("theme", "") or "").strip()
+                if theme and theme not in seen_themes and len(focus_parts) < 3:
+                    seen_themes.add(theme)
+                    focus_parts.append(theme)
+
+                point = str(item.get("point", "") or "").strip()
+                if point:
+                    points.append(point)
+                supporting = str(item.get("supporting_point", "") or "").strip()
+                if supporting and supporting != point:
+                    points.append(supporting)
+
+            deduped_points: list[str] = []
+            seen_points: set[str] = set()
+            for point in points:
+                normalized = point.lower()
+                if normalized in seen_points:
+                    continue
+                seen_points.add(normalized)
+                deduped_points.append(self._trim_state_text(point, limit=180))
+                if len(deduped_points) >= 3:
+                    break
+
+            phases.append(
+                {
+                    "start_date": chunk[0]["date"],
+                    "end_date": chunk[-1]["date"],
+                    "focus": ", ".join(focus_parts) if focus_parts else "timeline evolution",
+                    "points": deduped_points,
+                }
+            )
+
+        return phases
 
     def _select_change_candidates(
         self,

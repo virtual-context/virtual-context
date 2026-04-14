@@ -935,6 +935,42 @@ def execute_vc_tool(
                     "Do not combine extra themes from separate milestones."
                 )
                 return trimmed
+        if mode == "change_over_time":
+            phase_milestones = raw.get("phase_milestones")
+            ordered_milestones = raw.get("ordered_milestones")
+            date_buckets = raw.get("date_buckets")
+            if (
+                isinstance(phase_milestones, list)
+                and phase_milestones
+                and isinstance(ordered_milestones, list)
+                and ordered_milestones
+                and isinstance(date_buckets, list)
+                and date_buckets
+            ):
+                trimmed["phase_milestones"] = phase_milestones
+                trimmed["ordered_milestones"] = ordered_milestones
+                trimmed["date_buckets"] = date_buckets
+                trimmed["reader_hint"] = (
+                    "Use phase_milestones as the primary high-level evolution evidence. "
+                    "Use ordered_milestones for the key chronological steps. "
+                    "Use date_buckets for exact dates and supporting details. "
+                    "Do not infer missing themes that are not present."
+                )
+                return trimmed
+            if (
+                isinstance(ordered_milestones, list)
+                and ordered_milestones
+                and isinstance(date_buckets, list)
+                and date_buckets
+            ):
+                trimmed["ordered_milestones"] = ordered_milestones
+                trimmed["date_buckets"] = date_buckets
+                trimmed["reader_hint"] = (
+                    "Use ordered_milestones as the primary high-level evolution evidence. "
+                    "Use date_buckets for exact dates and supporting details. "
+                    "Do not infer missing themes that are not present."
+                )
+                return trimmed
         if mode in {"change_over_time", "window_overview"}:
             date_buckets = raw.get("date_buckets")
             if isinstance(date_buckets, list) and date_buckets:

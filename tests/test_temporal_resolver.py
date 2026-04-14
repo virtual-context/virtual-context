@@ -760,6 +760,66 @@ def test_remember_when_summarize_over_time_emits_ordered_milestones():
     assert "deploy stages" in milestones[3]["point"].lower()
 
 
+def test_remember_when_change_over_time_also_emits_ordered_milestones():
+    store = FakeStore()
+    search = FakeSearch()
+    resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
+
+    store.segment_hits["architecture"] = [
+        _make_quote("seg-1", "architecture", "July-03-2024", "architecture anchor"),
+    ]
+    store.segments["seg-1"] = _make_segment("seg-1", "architecture", "July-03-2024", "July 3 summary")
+
+    store.fact_hits["architecture"] = [
+        _make_fact(
+            "fact-anchor",
+            "2024-07-03",
+            "Architecture updated to support higher throughput and availability",
+            tags=["architecture", "performance-optimization"],
+            segment_ref="seg-1",
+        ),
+    ]
+    store.fallback_facts = [
+        _make_fact(
+            "fact-health",
+            "2024-07-09",
+            "Weighted round robin load balancing with health checks for unhealthy servers",
+            tags=["load-balancing", "high-availability"],
+        ),
+        _make_fact(
+            "fact-redis",
+            "2024-07-11",
+            "Redis caching tier added for repeated query traffic",
+            tags=["distributed-caching", "performance-optimization"],
+        ),
+        _make_fact(
+            "fact-cicd",
+            "2024-07-24",
+            "GitLab CI/CD pipeline added build, test, and deploy stages for the rollout",
+            tags=["deployment", "ci-cd"],
+        ),
+    ]
+
+    result = resolver.remember_when(
+        query="system architecture performance optimization plans",
+        time_range={"kind": "between_dates", "start": "2024-07-01", "end": "2024-07-29"},
+        max_results=4,
+        mode="change_over_time",
+    )
+
+    milestones = result["ordered_milestones"]
+
+    assert [item["date"] for item in milestones] == [
+        "2024-07-03",
+        "2024-07-09",
+        "2024-07-11",
+        "2024-07-24",
+    ]
+    assert "health checks" in milestones[1]["point"].lower()
+    assert "redis caching" in milestones[2]["point"].lower()
+    assert "deploy stages" in milestones[3]["point"].lower()
+
+
 def test_ordered_milestones_prefer_segment_summary_for_shared_date():
     resolver = TemporalResolver(store=FakeStore(), search_engine=FakeSearch(), config=_make_config())
 
