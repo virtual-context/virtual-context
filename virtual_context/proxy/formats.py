@@ -303,6 +303,162 @@ def _has_real_content(msg: dict) -> bool:
     return False
 
 
+def _count_message_roles(messages: list) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in messages:
+        if isinstance(item, dict):
+            key = str(item.get("role") or item.get("type") or "_unknown")
+        else:
+            key = type(item).__name__
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def summarize_raw_payload_entries(messages: list) -> dict[str, object]:
+    """Capture raw payload structure before VC normalization mutates it."""
+    summary = {
+        "raw_payload_entry_count": len(messages),
+        "raw_role_counts": _count_message_roles(messages),
+        "raw_tool_result_entries": 0,
+        "raw_tool_call_blocks": 0,
+        "raw_tool_use_blocks": 0,
+        "raw_tool_result_only_user_entries": 0,
+        "raw_assistant_tool_only_entries": 0,
+        "raw_error_assistant_entries": 0,
+    }
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "toolResult":
+            summary["raw_tool_result_entries"] += 1
+        if role == "assistant" and msg.get("stopReason") == "error":
+            summary["raw_error_assistant_entries"] += 1
+        if role == "user" and isinstance(content, list):
+            ctypes = {b.get("type") for b in content if isinstance(b, dict)}
+            if ctypes and ctypes <= {"tool_result"}:
+                summary["raw_tool_result_only_user_entries"] += 1
+        if role == "assistant" and isinstance(content, list):
+            has_text = False
+            has_tool_only = False
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "toolCall":
+                    summary["raw_tool_call_blocks"] += 1
+                    has_tool_only = True
+                if block.get("type") == "tool_use":
+                    summary["raw_tool_use_blocks"] += 1
+                    has_tool_only = True
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    has_text = True
+            if has_tool_only and not has_text:
+                summary["raw_assistant_tool_only_entries"] += 1
+    return summary
+
+
+def _assistant_roles_for_format(fmt: "PayloadFormat") -> set[str]:
+    return {"model"} if fmt.name == "gemini" else {"assistant"}
+
+
+def _filtered_chat_messages(messages: list[dict], fmt: "PayloadFormat") -> list[dict]:
+    assistant_roles = _assistant_roles_for_format(fmt)
+    if fmt.name == "openai_responses":
+        return [
+            m for m in messages
+            if isinstance(m, dict)
+            and m.get("role") in ({"user"} | assistant_roles)
+            and not getattr(fmt, "_is_bare_item")(m)
+        ]
+    return [
+        m for m in messages
+        if isinstance(m, dict)
+        and m.get("role") in ({"user"} | assistant_roles)
+    ]
+
+
+def summarize_payload_accounting(
+    body: dict,
+    fmt: "PayloadFormat",
+    *,
+    raw_summary: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Summarize how raw payload entries become normalized conversational history."""
+    messages = fmt.get_messages(body)
+    chat_msgs = _filtered_chat_messages(messages, fmt)
+    assistant_roles = _assistant_roles_for_format(fmt)
+    trailing_user_entries_dropped = 0
+    if chat_msgs and chat_msgs[-1].get("role") == "user":
+        chat_msgs = chat_msgs[:-1]
+        trailing_user_entries_dropped = 1
+
+    tool_result_user_entries_folded = 0
+    assistant_tool_only_entries_folded = 0
+    tool_followup_pairs = 0
+
+    last_real_user: bool = False
+    i = 0
+    while i + 1 < len(chat_msgs):
+        current = chat_msgs[i]
+        nxt = chat_msgs[i + 1]
+        if current.get("role") == "user" and nxt.get("role") in assistant_roles:
+            current_content = current.get("content", "")
+            is_tool_result_user = False
+            if isinstance(current_content, list):
+                ctypes = {b.get("type") for b in current_content if isinstance(b, dict)}
+                is_tool_result_user = bool(ctypes and ctypes <= {"tool_result"})
+
+            assistant_text = fmt.extract_message_text(nxt).strip()
+            if is_tool_result_user:
+                tool_result_user_entries_folded += 1
+                if assistant_text and last_real_user:
+                    tool_followup_pairs += 1
+                    last_real_user = False
+                i += 2
+                continue
+
+            if assistant_text:
+                assistant_content = nxt.get("content", "")
+                has_tool_use = False
+                if isinstance(assistant_content, list):
+                    has_tool_use = any(
+                        isinstance(block, dict) and block.get("type") == "tool_use"
+                        for block in assistant_content
+                    )
+                last_real_user = has_tool_use
+            else:
+                assistant_tool_only_entries_folded += 1
+                last_real_user = True
+            i += 2
+            continue
+        i += 1
+
+    extracted_history_messages = len(fmt.extract_history_pairs(body))
+    extracted_history_pairs = extracted_history_messages // 2
+
+    summary = {
+        "normalized_payload_entry_count": len(messages),
+        "normalized_role_counts": _count_message_roles(messages),
+        "normalized_chat_entry_count": len(chat_msgs) + trailing_user_entries_dropped,
+        "normalized_non_chat_entry_count": len(messages) - (len(chat_msgs) + trailing_user_entries_dropped),
+        "trailing_user_entries_dropped": trailing_user_entries_dropped,
+        "tool_result_user_entries_folded": tool_result_user_entries_folded,
+        "assistant_tool_only_entries_folded": assistant_tool_only_entries_folded,
+        "tool_followup_pairs": tool_followup_pairs,
+        "extracted_history_message_count": extracted_history_messages,
+        "extracted_history_pair_count": extracted_history_pairs,
+    }
+    if raw_summary:
+        summary.update(raw_summary)
+    else:
+        summary.setdefault("raw_payload_entry_count", len(messages))
+        summary.setdefault("raw_role_counts", _count_message_roles(messages))
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------
