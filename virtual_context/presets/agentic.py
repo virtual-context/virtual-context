@@ -39,10 +39,10 @@ AGENTIC_CONFIG: dict = {
         },
     },
     "tag_rules": [
-        {"match": "legal*", "priority": 9, "ttl_days": None},
-        {"match": "medical*", "priority": 8, "ttl_days": 90},
-        {"match": "debug*", "priority": 7, "ttl_days": 7},
-        {"match": "*", "priority": 5, "ttl_days": 30},
+        {"match": "legal*", "priority": 9},
+        {"match": "medical*", "priority": 8},
+        {"match": "debug*", "priority": 7},
+        {"match": "*", "priority": 5},
     ],
     "compaction": {
         "soft_threshold": 0.70,
@@ -152,16 +152,12 @@ tag_generator:
 tag_rules:
   - match: "legal*"
     priority: 9
-    ttl_days: null
   - match: "medical*"
     priority: 8
-    ttl_days: 90
   - match: "debug*"
     priority: 7
-    ttl_days: 7
   - match: "*"
     priority: 5
-    ttl_days: 30
 
 compaction:
   soft_threshold: 0.70

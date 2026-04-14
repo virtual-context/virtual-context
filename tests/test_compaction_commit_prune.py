@@ -70,3 +70,18 @@ def test_compaction_skips_prune_when_committed_checkpoint_lags_expected():
     pipeline._commit_compaction_state([])
 
     store.prune_turn_messages.assert_not_called()
+
+
+def test_run_compaction_never_triggers_store_cleanup_from_tag_rules():
+    pipeline, store = _make_pipeline(save_ok=True, committed_turn=4)
+    pipeline._segmenter.segment = MagicMock(return_value=[])
+    pipeline._compact_and_store = MagicMock(return_value=[])
+    pipeline._refresh_shared_retrieval_snapshots = MagicMock()
+    pipeline._config = SimpleNamespace(
+        conversation_id="conv-1",
+        tag_rules=[SimpleNamespace(match="debug*", priority=7)],
+    )
+
+    pipeline._run_compaction([], [], generated_by_turn_id="turn-123")
+
+    store.cleanup.assert_not_called()

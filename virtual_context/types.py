@@ -394,9 +394,8 @@ class EngineStateSnapshot:
 
 @dataclass
 class TagPromptRule:
-    """Per-tag rules for priority, TTL, and custom summary prompts."""
+    """Per-tag rules for priority and custom summary prompts."""
     match: str  # fnmatch pattern, e.g. "architecture*", "debug*"
-    ttl_days: int | None = None
     priority: int = 5
     summary_prompt: str | None = None
 
