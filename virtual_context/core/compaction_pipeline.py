@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs
@@ -415,15 +414,6 @@ class CompactionPipeline:
             tag_summaries_built=tag_summaries_built,
             cover_tags=cover_tags,
         )
-
-        # Enforce TTL from tag rules
-        if self._config.tag_rules:
-            min_ttl = min(
-                (r.ttl_days for r in self._config.tag_rules if r.ttl_days is not None),
-                default=None,
-            )
-            if min_ttl is not None:
-                self._store.cleanup(max_age=timedelta(days=min_ttl))
 
         self._refresh_shared_retrieval_snapshots()
 

@@ -86,19 +86,18 @@ CODING_TAG_RULES: list[dict] = [
     {
         "match": "architecture*",
         "priority": 10,
-        "ttl_days": None,
         "summary_prompt": (
             "Summarize architectural decisions, design patterns, and tradeoffs. "
             "Preserve ADR numbers, component names, and rationale."
         ),
     },
-    {"match": "database*", "priority": 8, "ttl_days": None},
+    {"match": "database*", "priority": 8},
     {"match": "auth*", "priority": 8},
     {"match": "backend*", "priority": 7},
     {"match": "frontend*", "priority": 7},
-    {"match": "debugging*", "priority": 7, "ttl_days": 7},
+    {"match": "debugging*", "priority": 7},
     {"match": "infrastructure*", "priority": 6},
-    {"match": "*", "priority": 5, "ttl_days": 30},
+    {"match": "*", "priority": 5},
 ]
 
 # ---------------------------------------------------------------------------
@@ -312,14 +311,12 @@ tag_generator:
 tag_rules:
   - match: "architecture*"
     priority: 10
-    ttl_days: null
     summary_prompt: |
       Summarize architectural decisions, design patterns, and tradeoffs.
       Preserve ADR numbers, component names, and rationale.
 
   - match: "database*"
     priority: 8
-    ttl_days: null
 
   - match: "auth*"
     priority: 8
@@ -332,14 +329,12 @@ tag_rules:
 
   - match: "debugging*"
     priority: 7
-    ttl_days: 7
 
   - match: "infrastructure*"
     priority: 6
 
   - match: "*"
     priority: 5
-    ttl_days: 30
 
 # Compaction — more aggressive than defaults for coding sessions
 compaction:

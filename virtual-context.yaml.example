@@ -122,43 +122,36 @@ tag_generator:
         - "\\bclass \\w+[:(]"
 
 # =====================================================================================
-# TAG RULES — per-tag priority, TTL, and custom summarization prompts
+# TAG RULES — per-tag priority and custom summarization prompts
 # =====================================================================================
 # match: fnmatch pattern against tag names
 # priority: 1-10 scale, higher = assembled first when budget is tight
-# ttl_days: auto-delete stored segments after N days (null = never expire)
 # summary_prompt: custom LLM prompt for summarizing this tag's segments
 
 tag_rules:
   - match: "architecture*"
     priority: 10
-    ttl_days: null
     summary_prompt: |
       Summarize architectural decisions, design patterns, and tradeoffs.
       Preserve ADR numbers, component names, and rationale.
 
   - match: "database*"
     priority: 8
-    ttl_days: null
 
   - match: "debug*"
     priority: 7
-    ttl_days: 7
 
   - match: "legal*"
     priority: 9
-    ttl_days: null
     summary_prompt: |
       Summarize legal discussion. Preserve case names, filing deadlines,
       court orders, legal strategies, and opposing counsel positions.
 
   - match: "medical*"
     priority: 8
-    ttl_days: 90
 
   - match: "*"
     priority: 5
-    ttl_days: 30
 
 # =====================================================================================
 # COMPACTION — when and how old conversation turns are compressed

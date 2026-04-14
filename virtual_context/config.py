@@ -119,7 +119,6 @@ def _parse_tag_rules(raw_list: list[dict[str, Any]]) -> list[TagPromptRule]:
     for entry in raw_list:
         rules.append(TagPromptRule(
             match=entry.get("match", "*"),
-            ttl_days=entry.get("ttl_days"),
             priority=entry.get("priority", 5),
             summary_prompt=entry.get("summary_prompt"),
         ))
