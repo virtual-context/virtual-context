@@ -649,6 +649,27 @@ class SessionStateProvider:
                 + "; ".join(errors)
             )
 
+    def undelete(self, conversation_id: str) -> None:
+        """Clear a Redis tombstone so the same conversation id can be reused.
+
+        DELETE is still authoritative for existing persisted data. This only
+        removes the session-state tombstone fence so a subsequent fresh client
+        request can recreate the conversation under the same id.
+        """
+        self._tag_stats_runtime_cache.pop(conversation_id, None)
+        self._tag_summary_embedding_snapshot_runtime_cache.pop(conversation_id, None)
+        try:
+            raw = self._redis.get(self._key(conversation_id))
+            if raw is None:
+                return
+            current = SessionState.from_json(raw)
+            if current.deleted:
+                self._redis.delete(self._key(conversation_id))
+            self._degraded = False
+        except Exception:
+            logger.warning("Redis undelete failed for %s", conversation_id[:12], exc_info=True)
+            self._degraded = True
+
     def exists(self, conversation_id: str) -> bool:
         """Check if conversation exists and is not tombstoned."""
         state = self.load(conversation_id)
