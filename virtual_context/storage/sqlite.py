@@ -2424,6 +2424,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchone()
         return row[0] if row else None
 
+    def delete_conversation_alias(self, alias_id: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM conversation_aliases WHERE alias_id = ?",
+            (alias_id,),
+        )
+        conn.commit()
+
     def get_turn_messages(
         self,
         conversation_id: str,
