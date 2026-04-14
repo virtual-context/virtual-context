@@ -2180,6 +2180,13 @@ class PostgresStore(ContextStore):
         ).fetchone()
         return row["target_id"] if row else None
 
+    def delete_conversation_alias(self, alias_id: str) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM conversation_aliases WHERE alias_id = %s",
+            (alias_id,),
+        )
+
     def get_turn_messages(
         self,
         conversation_id: str,

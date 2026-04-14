@@ -640,11 +640,15 @@ class TestContentFingerprintRouting:
         assert is_new is False
         assert result is state
 
-    def test_marker_prefers_live_conversation_over_stale_alias(self):
-        """Explicit session ids should not chain through stale VCATTACH aliases."""
+    def test_alias_wins_even_when_live_conversation_exists(self):
+        """VCATTACH aliases are authoritative — they redirect even when the
+        source conversation still has a live session. VCATTACH no longer
+        deletes the old conversation, so the alias table is the single
+        source of truth for routing.
+        """
         metrics = ProxyMetrics()
         store = MagicMock()
-        store.resolve_conversation_alias.return_value = "wrong-session"
+        store.resolve_conversation_alias.return_value = "redirected-target"
         registry = SessionRegistry(
             config_path=None,
             upstream="http://fake:9999",
@@ -652,17 +656,23 @@ class TestContentFingerprintRouting:
             store=store,
         )
 
-        engine = MagicMock()
-        engine.config.conversation_id = "target-session"
-        state = ProxyState(engine, metrics=metrics)
-        registry._conversations["target-session"] = state
+        live_engine = MagicMock()
+        live_engine.config.conversation_id = "original-session"
+        live_state = ProxyState(live_engine, metrics=metrics)
+        registry._conversations["original-session"] = live_state
+
+        target_engine = MagicMock()
+        target_engine.config.conversation_id = "redirected-target"
+        target_state = ProxyState(target_engine, metrics=metrics)
+        registry._conversations["redirected-target"] = target_state
 
         body = self._make_body(["hello"])
-        result, is_new = registry.get_or_create("target-session", body=body)
+        result, is_new = registry.get_or_create("original-session", body=body)
 
+        # Alias redirects to the target even though original-session is live.
         assert is_new is False
-        assert result is state
-        store.resolve_conversation_alias.assert_not_called()
+        assert result is target_state
+        store.resolve_conversation_alias.assert_called_once_with("original-session")
 
     def test_cold_start_marker_restores_persisted_session(self, tmp_path):
         """A marker referencing a persisted-but-not-loaded session should restore it, not create a new random one."""
@@ -699,8 +709,13 @@ class TestContentFingerprintRouting:
         assert result.engine.config.conversation_id == saved_id
         assert len(result.engine._turn_tag_index.entries) > 0
 
-    def test_cold_start_marker_prefers_persisted_session_over_stale_alias(self, tmp_path):
-        """Persisted sessions should not redirect through older alias rows."""
+    def test_cold_start_alias_redirects_even_when_persisted_source_exists(self, tmp_path):
+        """VCATTACH aliases persistently redirect: when a client sends the old
+        id after a VCATTACH, the alias routes to the target even though the
+        original conversation still has persisted data. VCATTACH no longer
+        deletes the old conversation, so the alias is the only signal that
+        a redirect is intended.
+        """
         from virtual_context.engine import VirtualContextEngine
 
         config_path = tmp_path / "vc.yaml"
@@ -714,7 +729,7 @@ class TestContentFingerprintRouting:
         engine1.close()
 
         from virtual_context.storage.sqlite import SQLiteStore
-        SQLiteStore(str(tmp_path / "store.db")).save_conversation_alias(saved_id, "wrong-session")
+        SQLiteStore(str(tmp_path / "store.db")).save_conversation_alias(saved_id, "target-session")
 
         metrics = ProxyMetrics()
         registry = SessionRegistry(
@@ -727,7 +742,9 @@ class TestContentFingerprintRouting:
         body = self._make_body(["new message"])
         result, is_new = registry.get_or_create(saved_id, body=body)
 
-        assert result.engine.config.conversation_id == saved_id
+        # Alias redirects saved_id -> "target-session", producing a new
+        # session for target-session (there's no persisted target yet).
+        assert result.engine.config.conversation_id == "target-session"
         assert is_new is True
 
 

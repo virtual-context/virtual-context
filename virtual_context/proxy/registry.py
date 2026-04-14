@@ -229,9 +229,11 @@ class SessionRegistry:
         4. Create new session
         """
         # --- Alias resolution: follow redirects from VCATTACH ---
-        # Use the registry's own durable store handle (self._store), not a
-        # session's store — sessions may be empty after VCATTACH eviction.
-        if conversation_id and self._store and not self._conversation_exists(conversation_id):
+        # The alias table is the authoritative routing answer for VCATTACH.
+        # Check it before the existence gate: a durable VCATTACH still
+        # redirects even when the old conversation row is preserved in the
+        # store (VCATTACH no longer deletes the old conversation).
+        if conversation_id and self._store:
             _alias_resolve = getattr(self._store, "resolve_conversation_alias", None)
             if callable(_alias_resolve):
                 _redirected = _alias_resolve(conversation_id)

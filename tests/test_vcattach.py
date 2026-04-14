@@ -226,7 +226,8 @@ def test_vcattach_preserves_target_engine_state():
     assert inner.save_called is False
 
 
-def test_vcattach_uses_tenant_registry_delete_in_cloud_mode():
+def test_vcattach_does_not_delete_old_conversation_in_cloud_mode():
+    """VCATTACH is a durable redirect — the old conversation is preserved."""
     from virtual_context.proxy.handlers import _handle_vcattach
     from virtual_context.proxy.formats import detect_format
 
@@ -257,8 +258,55 @@ def test_vcattach_uses_tenant_registry_delete_in_cloud_mode():
     )
 
     assert response.status_code == 200
-    tenant_registry.delete_conversation.assert_called_once_with(
-        "tenant-123",
+    # Old conversation must NOT be deleted via tenant registry
+    tenant_registry.delete_conversation.assert_not_called()
+    # Alias must be written old -> target
+    inner.save_conversation_alias.assert_called_once_with(
         "56315149-9812-9cf5-21a7-ade5a2279ad8",
-        store=inner,
+        "d4f83259-4ffc-fa3f-5914-a266d0a4577c",
     )
+    # Any dangling alias FROM target must be cleared (self-attach unlock)
+    inner.delete_conversation_alias.assert_called_once_with(
+        "d4f83259-4ffc-fa3f-5914-a266d0a4577c",
+    )
+
+
+def test_execute_attach_clears_reverse_alias():
+    """If alias A -> B exists and user VCATTACHes to A, the A -> B alias is cleared."""
+    from virtual_context.proxy.vcattach import execute_attach
+
+    store = MagicMock()
+    execute_attach(
+        old_id="current-shell-id",
+        target_id="conversation-A",
+        store=store,
+    )
+
+    store.delete_conversation_alias.assert_called_once_with("conversation-A")
+    store.save_conversation_alias.assert_called_once_with(
+        "current-shell-id",
+        "conversation-A",
+    )
+
+
+def test_execute_attach_no_longer_accepts_delete_conversation():
+    """Old delete_conversation parameter has been removed."""
+    import inspect
+    from virtual_context.proxy.vcattach import execute_attach
+
+    sig = inspect.signature(execute_attach)
+    assert "delete_conversation" not in sig.parameters
+
+
+def test_delete_conversation_alias_sqlite_roundtrip(sqlite_store):
+    """delete_conversation_alias removes the row so resolve returns None."""
+    sqlite_store.save_conversation_alias("a", "b")
+    assert sqlite_store.resolve_conversation_alias("a") == "b"
+    sqlite_store.delete_conversation_alias("a")
+    assert sqlite_store.resolve_conversation_alias("a") is None
+
+
+def test_delete_conversation_alias_missing_is_noop(sqlite_store):
+    """Deleting an alias that doesn't exist must not error."""
+    sqlite_store.delete_conversation_alias("never-existed")
+    assert sqlite_store.resolve_conversation_alias("never-existed") is None
