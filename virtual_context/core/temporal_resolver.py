@@ -61,6 +61,8 @@ _REMEMBER_WHEN_MODE_ALIASES = {
     "changes": "change_over_time",
     "change": "change_over_time",
     "state": "state_at_time",
+    "overview": "window_overview",
+    "window": "window_overview",
 }
 _REMEMBER_WHEN_VALID_MODES = {
     "auto",
@@ -68,11 +70,14 @@ _REMEMBER_WHEN_VALID_MODES = {
     "change_over_time",
     "summarize_over_time",
     "state_at_time",
+    "window_overview",
 }
-_REMEMBER_WHEN_TIMELINE_MODES = {"change_over_time", "summarize_over_time"}
-_REMEMBER_WHEN_BROAD_FACT_MODES = {"change_over_time", "summarize_over_time"}
+_REMEMBER_WHEN_TIMELINE_MODES = {"change_over_time", "summarize_over_time", "window_overview"}
+_REMEMBER_WHEN_BROAD_FACT_MODES = {"change_over_time", "summarize_over_time", "window_overview"}
 _REMEMBER_WHEN_SUMMARY_MODES = {"summarize_over_time"}
 _REMEMBER_WHEN_CHANGE_MODES = {"change_over_time"}
+_REMEMBER_WHEN_WINDOW_OVERVIEW_MODES = {"window_overview"}
+_REMEMBER_WHEN_DATE_BUCKET_MODES = {"change_over_time", "window_overview"}
 _REMEMBER_WHEN_CHANGE_MIN_RESULTS = 22
 _REMEMBER_WHEN_CHANGE_RESULTS_PER_DATE = 4
 _REMEMBER_WHEN_CHANGE_FACTS_PER_DATE = 3
@@ -176,7 +181,8 @@ class TemporalResolver:
         resolved_mode = self._normalize_remember_when_mode(mode)
         if max_results is None:
             max_results = self._default_remember_when_max_results(resolved_mode)
-        if not query.strip():
+        query = str(query or "").strip()
+        if not query and resolved_mode not in _REMEMBER_WHEN_WINDOW_OVERVIEW_MODES:
             return {"error": "empty query"}
 
         try:
@@ -185,7 +191,7 @@ class TemporalResolver:
             return {"error": str(exc)}
 
         state_target_date = self._state_target_date(start, end, resolved_mode)
-        all_search_variants = self._build_search_variants(query)
+        all_search_variants = self._build_search_variants(query) if query else []
         search_variants = all_search_variants
         if resolved_mode in _REMEMBER_WHEN_CHANGE_MODES:
             search_variants = self._prune_change_search_variants(all_search_variants)
@@ -265,7 +271,7 @@ class TemporalResolver:
             )
 
         message = ""
-        if not filtered and not fact_results:
+        if not filtered and not fact_results and query:
             raw = self._search.find_quote(query=query, max_results=max(max_results * 4, 20))
             if raw.get("found"):
                 fallback_results: list[dict] = []
@@ -281,6 +287,8 @@ class TemporalResolver:
                 filtered = fallback_results
             if not filtered:
                 message = raw.get("message", f"No matches for '{query}' in the requested time window.")
+        elif not filtered and not fact_results:
+            message = "No remembered activity in the requested time window."
 
         result = {
             "query": query,
@@ -304,7 +312,7 @@ class TemporalResolver:
             )
             if ordered_milestones:
                 result["ordered_milestones"] = ordered_milestones
-        if resolved_mode in _REMEMBER_WHEN_CHANGE_MODES:
+        if resolved_mode in _REMEMBER_WHEN_DATE_BUCKET_MODES:
             date_buckets = self._build_change_date_buckets(
                 results=filtered,
                 facts=fact_results,
@@ -337,7 +345,7 @@ class TemporalResolver:
 
     def _default_remember_when_max_results(self, resolved_mode: str) -> int:
         base = self._config.search.remember_when_max_results
-        if resolved_mode in _REMEMBER_WHEN_CHANGE_MODES:
+        if resolved_mode in _REMEMBER_WHEN_CHANGE_MODES | _REMEMBER_WHEN_WINDOW_OVERVIEW_MODES:
             return max(base, _REMEMBER_WHEN_CHANGE_MIN_RESULTS)
         return base
 
@@ -398,6 +406,105 @@ class TemporalResolver:
 
         return variants
 
+    def _window_query_terms(
+        self,
+        query: str,
+        search_variants: list[tuple[str, float, set[str]]],
+    ) -> set[str]:
+        terms = set(_query_priority_terms(query, drop_generic=False))
+        if terms:
+            return terms
+        return self._query_terms_from_variants(search_variants)
+
+    def _segment_search_text(self, segment) -> str:
+        return " ".join(
+            part
+            for part in [
+                str(segment.primary_tag or "").strip(),
+                " ".join(str(tag).strip() for tag in (segment.tags or []) if str(tag).strip()),
+                str(segment.summary or "").strip(),
+                str(segment.full_text or "").strip()[:2000],
+            ]
+            if part
+        ).lower()
+
+    def _seed_segment_candidates_from_window(
+        self,
+        *,
+        query: str,
+        search_variants: list[tuple[str, float, set[str]]],
+        start: date,
+        end: date,
+        conversation_id: str | None,
+    ) -> dict[str, dict]:
+        try:
+            segments = self._store.get_all_segments(conversation_id=conversation_id)
+        except Exception as exc:
+            logger.warning("remember_when window segment scan failed: %s", exc)
+            return {}
+
+        query_terms = self._window_query_terms(query, search_variants)
+        candidates: dict[str, dict] = {}
+        for seg in segments:
+            parsed = self._parse_session_date(seg.metadata.session_date)
+            if parsed is None or not (start <= parsed <= end):
+                continue
+            segment_ref = str(seg.ref or "").strip()
+            if not segment_ref:
+                continue
+            summary_text = str(seg.summary or "").strip()
+            excerpt = summary_text or str(seg.full_text or "").strip()
+            if not excerpt:
+                continue
+            search_text = self._segment_search_text(seg)
+            overlap = {term for term in query_terms if term in search_text}
+            base_score = 0.15 if summary_text else 0.05
+            base_score += min(0.25, 0.03 * len([tag for tag in (seg.tags or []) if str(tag).strip()]))
+            base_score += 0.55 * len(overlap)
+            candidates[segment_ref] = {
+                "quote": SimpleNamespace(
+                    segment_ref=segment_ref,
+                    tag=str(seg.primary_tag or ""),
+                    tags=list(seg.tags or []),
+                    text=excerpt,
+                    match_type="summary_window" if summary_text else "window_full_text",
+                    session_date=str(seg.metadata.session_date or ""),
+                    created_at=str(seg.created_at or ""),
+                ),
+                "date": parsed,
+                "score": base_score,
+                "matched_terms": set(),
+                "soft_terms": set(overlap),
+                "summary_text": summary_text or None,
+                "sources": {"window_scan"},
+            }
+        return candidates
+
+    def _segment_candidate_has_query_signal(self, item: dict) -> bool:
+        if item.get("matched_terms"):
+            return True
+        return any(source != "window_scan" for source in item.get("sources", set()))
+
+    def _fact_candidate_has_query_signal(self, item: dict) -> bool:
+        if item.get("matched_terms"):
+            return True
+        return any(source != "window_scan" for source in item.get("sources", set()))
+
+    def _should_prune_window_only_candidates(
+        self,
+        *,
+        query_terms: set[str],
+        mode: str,
+        signaled_count: int,
+    ) -> bool:
+        if mode in _REMEMBER_WHEN_WINDOW_OVERVIEW_MODES:
+            return False
+        if not query_terms:
+            return False
+        if mode == "lookup":
+            return signaled_count >= 1
+        return signaled_count >= 4
+
     def _prefer_timeline_coverage(
         self,
         query: str,
@@ -429,7 +536,14 @@ class TemporalResolver:
     ) -> list[dict]:
         conversation_id = self._config.conversation_id or None
         per_variant_limit = min(max(max_results * 10, 50), 200)
-        candidates: dict[str, dict] = {}
+        candidates = self._seed_segment_candidates_from_window(
+            query=query,
+            search_variants=search_variants,
+            start=start,
+            end=end,
+            conversation_id=conversation_id,
+        )
+        query_terms = self._window_query_terms(query, search_variants)
         prefer_summary_hits = mode in _REMEMBER_WHEN_TIMELINE_MODES
         summary_search = getattr(self._store, "search", None)
 
@@ -473,6 +587,7 @@ class TemporalResolver:
                             "matched_terms": set(),
                         },
                     )
+                    bucket.setdefault("sources", set()).add("query_match")
                     bucket["matched_terms"].update(matched_terms)
                     summary_match_text = " ".join([tag, summary_text]).lower()
                     overlap_bonus = sum(1 for term in matched_terms if term in summary_match_text)
@@ -513,8 +628,10 @@ class TemporalResolver:
                         "date": parsed,
                         "score": 0.0,
                         "matched_terms": set(),
+                        "sources": set(),
                     },
                 )
+                bucket.setdefault("sources", set()).add("query_match")
                 bucket["matched_terms"].update(matched_terms)
                 text = " ".join([hit.tag or "", hit.text or ""]).lower()
                 overlap_bonus = sum(1 for term in matched_terms if term in text)
@@ -534,7 +651,19 @@ class TemporalResolver:
         if not candidates:
             return []
 
-        for bucket in candidates.values():
+        candidate_items = list(candidates.values())
+        signaled_candidates = [
+            item for item in candidate_items
+            if self._segment_candidate_has_query_signal(item)
+        ]
+        if self._should_prune_window_only_candidates(
+            query_terms=query_terms,
+            mode=mode,
+            signaled_count=len(signaled_candidates),
+        ):
+            candidate_items = signaled_candidates
+
+        for bucket in candidate_items:
             bucket["score"] += len(bucket["matched_terms"]) * 0.75
             if mode in _REMEMBER_WHEN_STATE_MODES:
                 quote = bucket["quote"]
@@ -547,18 +676,26 @@ class TemporalResolver:
 
         if mode in _REMEMBER_WHEN_STATE_MODES and target_date is not None:
             selected = self._select_state_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=max_results,
                 target_date=target_date,
             )
         elif mode in _REMEMBER_WHEN_CHANGE_MODES:
             selected = self._select_change_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=max_results,
+            )
+        elif mode in _REMEMBER_WHEN_WINDOW_OVERVIEW_MODES:
+            selected = self._select_time_diverse_candidates(
+                candidate_items,
+                max_results=max_results,
+                prefer_timeline=True,
+                day_depth=2,
+                prefer_concept_diversity=True,
             )
         else:
             selected = self._select_time_diverse_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=max_results,
                 prefer_timeline=prefer_timeline,
             )
@@ -776,9 +913,55 @@ class TemporalResolver:
         fact_limit = max(max_results * 4, 25)
         per_variant_limit = min(max(max_results * 8, 25), 100)
         candidates: dict[str, dict] = {}
-        query_terms = self._query_terms_from_variants(search_variants)
+        query_terms = self._window_query_terms(query, search_variants)
         broad_fact_mode = mode in _REMEMBER_WHEN_BROAD_FACT_MODES
         state_mode = mode in _REMEMBER_WHEN_STATE_MODES
+
+        try:
+            raw_facts = self._store.query_experience_facts_by_date(
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                limit=self._window_fact_scan_limit(
+                    max_results,
+                    broad_mode=broad_fact_mode,
+                    state_mode=state_mode,
+                ),
+                conversation_id=conversation_id,
+            )
+        except Exception as exc:
+            logger.warning("remember_when fact fallback failed: %s", exc)
+            raw_facts = []
+
+        segment_refs = {
+            str(item.get("segment_ref", "")).strip()
+            for item in (segment_results or [])
+            if str(item.get("segment_ref", "")).strip()
+        }
+        segment_dates = {
+            str(item.get("session_date_normalized", "")).strip()
+            for item in (segment_results or [])
+            if str(item.get("session_date_normalized", "")).strip()
+        }
+        for fact in raw_facts:
+            parsed = self._parse_fact_date(fact.when_date or fact.session_date)
+            if parsed is None:
+                continue
+            text = self._fact_search_text(fact)
+            overlap = {term for term in query_terms if term in text}
+            segment_ref_bonus = 2.0 if fact.segment_ref and fact.segment_ref in segment_refs else 0.0
+            segment_date_bonus = 0.75 if parsed.isoformat() in segment_dates else 0.0
+            state_value_bonus = 0.0
+            if state_mode and target_date is not None:
+                state_value_bonus = self._value_signal_bonus(text) * 0.35
+            self._add_fact_candidate(
+                candidates,
+                fact=fact,
+                parsed=parsed,
+                matched_terms=set(),
+                soft_terms=overlap,
+                score_delta=float(len(overlap)) + segment_ref_bonus + segment_date_bonus + state_value_bonus,
+                source="window_scan",
+            )
 
         for variant, base_weight, matched_terms in search_variants:
             try:
@@ -802,63 +985,9 @@ class TemporalResolver:
                     fact=fact,
                     parsed=parsed,
                     matched_terms=matched_terms,
+                    soft_terms=set(),
                     score_delta=base_weight + overlap_bonus * 0.5,
                     source="query_match",
-                )
-
-        should_scan_window_facts = broad_fact_mode or state_mode or not candidates
-        if should_scan_window_facts:
-            try:
-                raw_facts = self._store.query_experience_facts_by_date(
-                    start_date=start.isoformat(),
-                    end_date=end.isoformat(),
-                    limit=self._window_fact_scan_limit(
-                        max_results,
-                        broad_mode=broad_fact_mode,
-                        state_mode=state_mode,
-                    ),
-                    conversation_id=conversation_id,
-                )
-            except Exception as exc:
-                logger.warning("remember_when fact fallback failed: %s", exc)
-                raw_facts = []
-
-            segment_refs = {
-                str(item.get("segment_ref", "")).strip()
-                for item in (segment_results or [])
-                if str(item.get("segment_ref", "")).strip()
-            }
-            segment_dates = {
-                str(item.get("session_date_normalized", "")).strip()
-                for item in (segment_results or [])
-                if str(item.get("session_date_normalized", "")).strip()
-            }
-            for fact in raw_facts:
-                parsed = self._parse_fact_date(fact.when_date or fact.session_date)
-                if parsed is None:
-                    continue
-                text = self._fact_search_text(fact)
-                overlap = {term for term in query_terms if term in text}
-                segment_ref_bonus = 2.0 if fact.segment_ref and fact.segment_ref in segment_refs else 0.0
-                segment_date_bonus = 0.75 if parsed.isoformat() in segment_dates else 0.0
-                state_value_bonus = 0.0
-                if state_mode and target_date is not None:
-                    state_value_bonus = self._value_signal_bonus(text) * 0.35
-                if (
-                    query_terms
-                    and not overlap
-                    and segment_ref_bonus <= 0.0
-                    and segment_date_bonus <= 0.0
-                    and state_value_bonus <= 0.0
-                ):
-                    continue
-                self._add_fact_candidate(
-                    candidates,
-                    fact=fact,
-                    parsed=parsed,
-                    matched_terms=overlap,
-                    score_delta=float(len(overlap)) + segment_ref_bonus + segment_date_bonus + state_value_bonus,
-                    source="window_scan",
                 )
 
         if broad_fact_mode or state_mode:
@@ -876,32 +1005,67 @@ class TemporalResolver:
         if not candidates:
             return []
 
+        candidate_items = list(candidates.values())
+        signaled_candidates = [
+            item for item in candidate_items
+            if self._fact_candidate_has_query_signal(item)
+        ]
+        if self._should_prune_window_only_candidates(
+            query_terms=query_terms,
+            mode=mode,
+            signaled_count=len(signaled_candidates),
+        ):
+            candidate_items = signaled_candidates
+
+        if state_mode:
+            date_signal_counts: dict[date, int] = {}
+            for item in candidate_items:
+                soft_terms = set(item.get("soft_terms", set()) or set())
+                if (
+                    item.get("matched_terms")
+                    or soft_terms
+                    or self._value_signal_bonus(self._candidate_text(item)) > 0.0
+                ):
+                    date_signal_counts[item["date"]] = date_signal_counts.get(item["date"], 0) + 1
+            for item in candidate_items:
+                bundle_count = date_signal_counts.get(item["date"], 0)
+                if bundle_count > 1:
+                    item["score"] += 2.5 * (bundle_count - 1)
+
         if state_mode and segment_results:
             anchor_excerpt = str(segment_results[0].get("excerpt", "") or "")
             anchor_date = str(segment_results[0].get("session_date_normalized", "") or "")
-            for bucket in candidates.values():
+            for bucket in candidate_items:
                 fact_text = self._candidate_text(bucket)
                 bucket["score"] += self._anchor_text_bonus(fact_text, anchor_excerpt)
                 if anchor_date and bucket["date"].isoformat() == anchor_date:
                     bucket["score"] += 0.75
 
-        for bucket in candidates.values():
+        for bucket in candidate_items:
             bucket["score"] += len(bucket["matched_terms"]) * 0.75
 
         if state_mode and target_date is not None:
             selected = self._select_state_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=fact_limit,
                 target_date=target_date,
             )
         elif mode in _REMEMBER_WHEN_CHANGE_MODES:
             selected = self._select_change_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=max(max_results * 4, 24),
+            )
+        elif mode in _REMEMBER_WHEN_WINDOW_OVERVIEW_MODES:
+            selected = self._select_time_diverse_candidates(
+                candidate_items,
+                max_results=fact_limit,
+                prefer_timeline=True,
+                day_depth=2,
+                prefer_concept_diversity=True,
             )
         else:
             selected = self._select_time_diverse_candidates(
-                list(candidates.values()),
+                candidate_items,
                 max_results=fact_limit,
                 prefer_timeline=prefer_timeline,
                 day_depth=2 if broad_fact_mode else 1,
@@ -1290,6 +1454,7 @@ class TemporalResolver:
         fact,
         parsed: date,
         matched_terms: set[str],
+        soft_terms: set[str] | None = None,
         score_delta: float,
         source: str,
     ) -> None:
@@ -1300,10 +1465,13 @@ class TemporalResolver:
                 "date": parsed,
                 "score": 0.0,
                 "matched_terms": set(),
+                "soft_terms": set(),
                 "sources": set(),
             },
         )
         bucket["matched_terms"].update(matched_terms)
+        if soft_terms:
+            bucket["soft_terms"].update(soft_terms)
         bucket["score"] += score_delta
         if source:
             bucket["sources"].add(source)
@@ -1388,6 +1556,7 @@ class TemporalResolver:
                     fact=fact,
                     parsed=parsed,
                     matched_terms=overlap,
+                    soft_terms=set(),
                     score_delta=float(len(overlap)) + 2.25 + tag_bonus + date_bonus,
                     source="segment_neighbor",
                 )
@@ -1423,6 +1592,7 @@ class TemporalResolver:
                 fact=fact,
                 parsed=parsed,
                 matched_terms=overlap,
+                soft_terms=set(),
                 score_delta=float(len(overlap)) + 1.0 + confidence + same_segment_bonus + tag_bonus + date_bonus,
                 source="linked_fact",
             )
@@ -2257,6 +2427,17 @@ class TemporalResolver:
             for term in item.get("matched_terms", []) or []
             if str(term).strip()
         }
+        item_terms.update(
+            str(term).strip().lower()
+            for term in item.get("soft_terms", []) or []
+            if str(term).strip()
+        )
+        text_terms = {
+            token
+            for token in _QUERY_TOKEN_RE.findall(text.lower())
+            if len(token) >= 4 and token not in _QUERY_STOPWORDS
+        }
+        item_terms.update(text_terms & anchor_terms)
         item_values = self._normalized_value_tokens(text)
         anchor_value_kinds = self._value_kinds(anchor_values)
         item_value_kinds = self._value_kinds(item_values)
