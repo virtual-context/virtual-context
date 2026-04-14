@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -154,7 +155,7 @@ def test_vcstatus_uses_effective_engine_conversation_id():
     text = _handle_vcstatus("alias-conv", state, tenant_registry=None, tenant_id=None)
 
     assert "Conversation: target-conv" in text
-    assert "Segments: 7" in text
+    assert "Stored: 7 segments, 0 tag summaries" in text
 
 
 def test_vcstatus_without_state_reports_shell_status():
@@ -168,8 +169,97 @@ def test_vcstatus_without_state_reports_shell_status():
     )
 
     assert "Conversation: 56315149-9812-9cf5-21a7-ade5a2279ad8" in text
-    assert "Turns: 0 (compacted through 0)" in text
-    assert "Segments: 0" in text
+    assert "Status: ready" in text
+    assert "Ingestion: 0 / 0 (0.0%)" in text
+    assert "Turn state: 0 turns, 0 live history messages" in text
+    assert "Stored: 0 segments, 0 tag summaries" in text
+
+
+def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
+    from virtual_context.proxy.handlers import _handle_vcstatus
+
+    class _TurnTagIndex:
+        entries = [1, 2, 3]
+
+        def get_active_tags(self, lookback=6):
+            return {"alpha", "beta"}
+
+    class _Store:
+        def get_conversation_stats(self):
+            return [
+                SimpleNamespace(conversation_id="target-conv", segment_count=7),
+            ]
+
+        def get_all_segments(self, *, conversation_id=None, limit=None):
+            return []
+
+        def get_all_tag_summaries(self, *, conversation_id=None):
+            return [SimpleNamespace(created_at=datetime.now(timezone.utc), covers_through_turn=12)]
+
+        def load_request_captures(self, limit=50, conversation_id=None):
+            return [
+                {
+                    "turn": 12,
+                    "turn_id": "t12",
+                    "ts": "2026-04-14T21:15:16.642392+00:00",
+                    "client_payload_message_count": 989,
+                    "client_payload_pair_count": 494,
+                    "client_payload_user_prompt_count": 300,
+                    "client_payload_timestamped_message_count": 290,
+                    "client_payload_earliest_timestamp": "2026-03-15T16:10:00+00:00",
+                    "client_payload_latest_timestamp": "2026-04-14T21:15:00+00:00",
+                    "raw_payload_entry_count": 4632,
+                    "extracted_history_pair_count": 494,
+                    "upstream_input_tokens": 100000,
+                    "cache_read_input_tokens": 82000,
+                }
+            ]
+
+    class _Metrics:
+        def get_captured_requests_summary(self, conversation_id=None):
+            return [
+                {
+                    "raw_payload_entry_count": 4632,
+                    "extracted_history_pair_count": 494,
+                    "upstream_input_tokens": 100000,
+                    "cache_read_input_tokens": 82000,
+                }
+            ]
+
+    state = SimpleNamespace(
+        session_state=SimpleNamespace(value="ingesting"),
+        _ingestion_progress=(99, 494),
+        _last_payload_kb=22550.3,
+        _last_payload_tokens=12331759,
+        conversation_history=[SimpleNamespace(content="x")] * 989,
+        metrics=_Metrics(),
+        compaction_snapshot=lambda: {},
+        engine=SimpleNamespace(
+            config=SimpleNamespace(
+                conversation_id="target-conv",
+                monitor=SimpleNamespace(soft_threshold=80000, hard_threshold=120000),
+            ),
+            _engine_state=SimpleNamespace(
+                compacted_through=986,
+                flushed_through=983,
+                conversation_generation=15,
+            ),
+            _turn_tag_index=_TurnTagIndex(),
+            _store=_Store(),
+            _paging=SimpleNamespace(working_set={}),
+        ),
+    )
+
+    text = _handle_vcstatus("target-conv", state, tenant_registry=None, tenant_id=None)
+
+    assert "Status: ingesting" in text
+    assert "Ingestion: 99 / 494 (20.0%)" in text
+    assert "Turn state: 494 turns, 989 live history messages" in text
+    assert "Stored: 7 segments, 1 tag summaries" in text
+    assert "Thresholds: soft 80,000 / hard 120,000" in text
+    assert "Last payload: 22.022 MB, 494 turns, 12,331,759 tokens" in text
+    assert "Last raw payload: 4,632 entries" in text
+    assert "Cache hit (last 5): 82% (avg 82.0%)" in text
 
 
 def test_vcattach_preserves_target_engine_state():

@@ -16,6 +16,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from ..core.coverage_report import build_conversation_coverage_report
 from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
@@ -1946,11 +1947,13 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     if not state:
         lines = [
             f"Conversation: {conv_id or ''}",
-            "Turns: 0 (compacted through 0)",
-            "Segments: 0",
-            "Generation: 0",
-            "Working set: 0 tags, 0 tokens",
-            "Active tags: none",
+            "Status: ready",
+            "Ingestion: 0 / 0 (0.0%)",
+            "Turn state: 0 turns, 0 live history messages",
+            "Stored: 0 segments, 0 tag summaries",
+            "Thresholds: soft 0 / hard 0",
+            "Last payload: 0.000 MB, 0 turns, 0 tokens",
+            "Cache hit (last 5): n/a",
         ]
         return "\n".join(lines)
 
@@ -1964,14 +1967,36 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         labels = tenant_registry.get_conversation_labels(tenant_id)
         label = labels.get(effective_conv_id, "")
 
-    turns = len(tti.entries) if tti else 0
+    turns = len(getattr(state, "conversation_history", []) or []) // 2
     compacted = getattr(es, "compacted_through", 0)
+    flushed = getattr(es, "flushed_through", 0)
     generation = getattr(es, "conversation_generation", 0)
+    history_messages = len(getattr(state, "conversation_history", []) or [])
 
     # Segment count from store
     segments = 0
+    tag_summary_count = 0
+    latest_payload_turns = 0
+    latest_raw_entries = 0
+    stored_turns_hint = 0
+    store = getattr(engine, "_store", None)
+    if store is not None:
+        try:
+            coverage = build_conversation_coverage_report(store, effective_conv_id)
+            tag_summary_count = coverage.tag_summary_count
+            latest_payload_turns = max(
+                0,
+                getattr(coverage.latest_payload, "pair_count", 0) or 0,
+            )
+            stored_turns_hint = max(
+                0,
+                int(getattr(coverage, "exact_end_turn_number", -1) or -1) + 1,
+                int(getattr(coverage, "max_tag_summary_turn", -1) or -1) + 1,
+            )
+            segments = max(segments, int(getattr(coverage, "segment_count", 0) or 0))
+        except Exception:
+            pass
     try:
-        store = engine._store
         stats = getattr(store, "get_conversation_stats", None)
         if callable(stats):
             for s in stats():
@@ -1980,6 +2005,64 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
                     break
     except Exception:
         pass
+
+    # Current live status
+    compaction = {}
+    try:
+        compaction = state.compaction_snapshot() or {}
+    except Exception:
+        compaction = {}
+
+    raw_session_state = getattr(getattr(state, "session_state", None), "value", None)
+    if not isinstance(raw_session_state, str):
+        raw_session_state = str(getattr(state, "session_state", "") or "").lower()
+    status = "ready"
+    if compaction.get("status") in {"queued", "running"}:
+        status = "compacting"
+    elif raw_session_state == "ingesting":
+        status = "ingesting"
+    elif raw_session_state == "passthrough":
+        status = "passthrough"
+
+    done, total = getattr(state, "_ingestion_progress", (0, 0))
+    pct = (done / total * 100.0) if total else 0.0
+
+    # Thresholds
+    monitor = getattr(engine.config, "monitor", None)
+    soft_threshold = int(getattr(monitor, "soft_threshold", 0) or 0)
+    hard_threshold = int(getattr(monitor, "hard_threshold", 0) or 0)
+
+    # Payload and cache/accountability details from recent captures
+    last_payload_tokens = int(getattr(state, "_last_payload_tokens", 0) or 0)
+    last_payload_kb = float(getattr(state, "_last_payload_kb", 0.0) or 0.0)
+    cache_line = "n/a"
+    try:
+        captures = state.metrics.get_captured_requests_summary(conversation_id=effective_conv_id) if getattr(state, "metrics", None) else []
+    except Exception:
+        captures = []
+    if captures:
+        latest_capture = captures[-1]
+        latest_payload_turns = int(
+            latest_capture.get("extracted_history_pair_count", 0)
+            or latest_capture.get("client_payload_pair_count", latest_payload_turns)
+            or 0
+        )
+        latest_raw_entries = int(latest_capture.get("raw_payload_entry_count", 0) or 0)
+        recent_cache = []
+        for cap in reversed(captures):
+            upstream = int(cap.get("upstream_input_tokens", 0) or 0)
+            if upstream <= 0:
+                continue
+            cache_read = int(cap.get("cache_read_input_tokens", 0) or 0)
+            recent_cache.append(round(cache_read / upstream * 100))
+            if len(recent_cache) == 5:
+                break
+        if recent_cache:
+            recent_cache = list(reversed(recent_cache))
+            avg_cache = sum(recent_cache) / len(recent_cache)
+            cache_line = f"{', '.join(f'{v}%' for v in recent_cache)} (avg {avg_cache:.1f}%)"
+
+    turns = max(turns, stored_turns_hint, latest_payload_turns, int(done or 0), int(total or 0))
 
     # Working set
     ws = getattr(engine, "_paging", None)
@@ -1995,10 +2078,20 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     if label:
         lines.append(f"Label: {label}")
     lines.extend([
-        f"Turns: {turns} (compacted through {compacted})",
-        f"Segments: {segments}",
-        f"Generation: {generation}",
+        f"Status: {status}",
+        f"Ingestion: {done} / {total} ({pct:.1f}%)",
+        f"Turn state: {turns} turns, {history_messages} live history messages",
+        f"Watermarks: compacted {compacted}, flushed {flushed}",
+        f"Stored: {segments} segments, {tag_summary_count} tag summaries",
+        f"Thresholds: soft {soft_threshold:,} / hard {hard_threshold:,}",
+        (
+            f"Last payload: {last_payload_kb / 1024:.3f} MB, "
+            f"{latest_payload_turns:,} turns, {last_payload_tokens:,} tokens"
+        ),
+        f"Last raw payload: {latest_raw_entries:,} entries" if latest_raw_entries else "Last raw payload: n/a",
+        f"Cache hit (last 5): {cache_line}",
         f"Working set: {len(ws_entries)} tags, {ws_tokens:,} tokens",
+        f"Generation: {generation}",
         f"Active tags: {', '.join(active_tags[:15]) if active_tags else 'none'}",
     ])
     return "\n".join(lines)
