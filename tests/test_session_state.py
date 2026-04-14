@@ -136,6 +136,21 @@ def test_save_rejected_after_tombstone(provider, mock_redis):
     assert blob["deleted"] is True
 
 
+def test_undelete_allows_reuse_of_same_conversation_id(provider, mock_redis):
+    provider.delete("conv-123")
+
+    provider.undelete("conv-123")
+
+    state = SessionState()
+    state.last_indexed_turn = 7
+    provider.save("conv-123", state)
+
+    loaded = provider.load("conv-123")
+    assert loaded is not None
+    assert loaded.deleted is False
+    assert loaded.last_indexed_turn == 7
+
+
 def test_turn_tag_entries_roundtrip(provider, mock_redis):
     state = SessionState()
     state.turn_tag_entries = [
