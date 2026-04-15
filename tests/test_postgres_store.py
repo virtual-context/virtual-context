@@ -21,11 +21,6 @@ class _FakeConn:
     def fetchone(self):
         return None
 
-    def executemany(self, sql: str, params_seq):
-        for params in params_seq:
-            self.executed.append((sql, params))
-        return self
-
     class _Txn:
         def __enter__(self_inner):
             return self_inner
@@ -121,3 +116,62 @@ def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
     assert len(segments) == 1
     assert segments[0].ref == "seg-1"
     assert segments[0].tags == ["tag-a", "tag-b"]
+
+
+def test_normalize_request_turn_sequences_works_without_executemany(monkeypatch):
+    from virtual_context.storage import postgres as pg
+
+    class _NormalizeConn(_FakeConn):
+        def execute(self, sql: str, params=None):
+            self.executed.append((sql, params))
+            if "SELECT id, conversation_id, request_turn, timestamp FROM request_context" in sql:
+                return _FakeRowsResult([
+                    {
+                        "id": 10,
+                        "conversation_id": "conv-1",
+                        "request_turn": 494,
+                        "timestamp": "2026-04-14T22:11:59.177648+00:00",
+                    },
+                    {
+                        "id": 11,
+                        "conversation_id": "conv-1",
+                        "request_turn": 37,
+                        "timestamp": "2026-04-15T04:42:18.486891+00:00",
+                    },
+                ])
+            if "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls" in sql:
+                return _FakeRowsResult([
+                    {
+                        "id": 20,
+                        "conversation_id": "conv-1",
+                        "request_turn": 999,
+                        "timestamp": "2026-04-15T04:50:00+00:00",
+                    }
+                ])
+            return _FakeRowsResult([])
+
+    conn = _NormalizeConn("conn-0")
+    monkeypatch.setattr(pg.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    store = pg.PostgresStore("postgresql://example")
+    conn.executed.clear()
+
+    store._normalize_request_turn_sequences()
+
+    assert (
+        "UPDATE request_context SET request_turn = %s WHERE id = %s",
+        (1, 10),
+    ) in conn.executed
+    assert (
+        "UPDATE request_context SET request_turn = %s WHERE id = %s",
+        (2, 11),
+    ) in conn.executed
+    assert (
+        "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
+        (2, 20),
+    ) in conn.executed
+    assert any(
+        sql.startswith("INSERT INTO request_turn_counters")
+        and params == ("conv-1", 2)
+        for sql, params in conn.executed
+    )

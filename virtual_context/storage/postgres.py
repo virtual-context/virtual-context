@@ -2853,10 +2853,11 @@ class PostgresStore(ContextStore):
                     context_updates.append((seq, int(row["id"])))
 
             if context_updates:
-                conn.executemany(
-                    "UPDATE request_context SET request_turn = %s WHERE id = %s",
-                    context_updates,
-                )
+                for params in context_updates:
+                    conn.execute(
+                        "UPDATE request_context SET request_turn = %s WHERE id = %s",
+                        params,
+                    )
 
             tool_rows = conn.execute(
                 "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
@@ -2883,10 +2884,11 @@ class PostgresStore(ContextStore):
                     tool_updates.append((assigned_turn, int(row["id"])))
 
             if tool_updates:
-                conn.executemany(
-                    "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
-                    tool_updates,
-                )
+                for params in tool_updates:
+                    conn.execute(
+                        "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
+                        params,
+                    )
 
             counter_rows = [
                 (conversation_id, contexts[-1]["request_turn"])
@@ -2894,17 +2896,18 @@ class PostgresStore(ContextStore):
                 if contexts
             ]
             if counter_rows:
-                conn.executemany(
-                    """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
-                       VALUES (%s, %s)
-                       ON CONFLICT (conversation_id)
-                       DO UPDATE
-                       SET next_request_turn = GREATEST(
-                           request_turn_counters.next_request_turn,
-                           EXCLUDED.next_request_turn
-                       )""",
-                    counter_rows,
-                )
+                for params in counter_rows:
+                    conn.execute(
+                        """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
+                           VALUES (%s, %s)
+                           ON CONFLICT (conversation_id)
+                           DO UPDATE
+                           SET next_request_turn = GREATEST(
+                               request_turn_counters.next_request_turn,
+                               EXCLUDED.next_request_turn
+                           )""",
+                        params,
+                    )
 
     # ------------------------------------------------------------------
     # Tool calls
