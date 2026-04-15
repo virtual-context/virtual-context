@@ -145,6 +145,8 @@ class ProxyState:
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         self._inbound_payload_token_cache = None
         self._outbound_payload_token_cache = None
+        self._restore_readiness_pending: bool = False
+        self._restore_readiness_signature: tuple[int, int, int, int] | None = None
         self._chain_snapshot_cache: dict[str, object] = {
             "loaded": False,
             "refs_by_turn": {},
@@ -208,6 +210,8 @@ class ProxyState:
             _source = "Redis" if engine._restored_conversation_history and isinstance(engine._restored_conversation_history[0], dict) else "store"
             logger.info("Restored conversation_history: %d messages from %s", _count, _source)
             engine._restored_conversation_history = []
+        if engine._restored_from_checkpoint:
+            self.note_engine_restore(force=True)
 
     @property
     def turn_offset(self) -> int:
@@ -257,6 +261,95 @@ class ProxyState:
 
     def has_pending_indexing(self) -> bool:
         return self._completed_turn_count() > self._indexed_turn_count()
+
+    def _restore_signature(self) -> tuple[int, int, int, int]:
+        try:
+            compacted = int(getattr(self.engine._engine_state, "compacted_through", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            compacted = 0
+        return (
+            self._indexed_turn_count(),
+            self._completed_turn_count(),
+            compacted,
+            len(self.conversation_history) // 2 if self.conversation_history else 0,
+        )
+
+    def _can_activate_from_persisted_state(
+        self,
+        history_pairs: list[Message] | None = None,
+    ) -> bool:
+        existing_turns = self._indexed_turn_count()
+        if existing_turns <= 0:
+            return False
+        if self.has_pending_indexing():
+            return False
+        needed_turns = len(history_pairs) // 2 if history_pairs else 0
+        if needed_turns > 0 and existing_turns < needed_turns:
+            return False
+        return True
+
+    def note_engine_restore(self, *, force: bool = False) -> bool:
+        """Mark that routing readiness must be revalidated after an engine hydrate.
+
+        Returns True when persisted state looks ready enough to re-check against
+        the next inbound history window.
+        """
+        signature = self._restore_signature()
+        if not force and signature == self._restore_readiness_signature:
+            return self._restore_readiness_pending
+        self._restore_readiness_signature = signature
+        conversation_id = self.engine.config.conversation_id
+        ready_candidate = self._can_activate_from_persisted_state()
+        self._restore_readiness_pending = ready_candidate
+        if not ready_candidate:
+            self._ingested_conversations.discard(conversation_id)
+        return ready_candidate
+
+    def resolve_prepare_state(
+        self,
+        history_pairs: list[Message],
+    ) -> tuple[SessionState, str | None]:
+        """Return the routing state for the current request.
+
+        This keeps legitimate passthrough intact while preventing restored,
+        durably-ready conversations from falling back into passthrough solely
+        because a worker-local ingested marker was lost.
+        """
+        conversation_id = self.engine.config.conversation_id
+        if self._manual_passthrough:
+            return SessionState.PASSTHROUGH, "manual_override"
+
+        if self.has_pending_indexing():
+            return SessionState.INGESTING, "pending_indexing"
+
+        if not history_pairs:
+            self._ingested_conversations.add(conversation_id)
+            self._restore_readiness_pending = False
+            self._ingested_turn_count[conversation_id] = 0
+            return SessionState.ACTIVE, None
+
+        if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
+            widened = self._check_history_widening(history_pairs, conversation_id)
+            if widened:
+                return SessionState.PASSTHROUGH, "history_widening"
+            return SessionState.ACTIVE, None
+
+        if self._can_activate_from_persisted_state(history_pairs):
+            self._ingested_conversations.add(conversation_id)
+            self._restore_readiness_pending = False
+            if history_pairs:
+                self._record_ingestion_watermark(history_pairs, conversation_id)
+            return SessionState.ACTIVE, None
+
+        self._restore_readiness_pending = False
+        if conversation_id in self._ingested_conversations:
+            widened = self._check_history_widening(history_pairs, conversation_id)
+            if widened:
+                return SessionState.PASSTHROUGH, "history_widening"
+
+        reason = "initial_ingest" if self._indexed_turn_count() <= 0 else "restore_not_ready"
+        self._ingested_conversations.discard(conversation_id)
+        return SessionState.PASSTHROUGH, reason
 
     def persist_completed_turn(self) -> None:
         if self.is_conversation_deleted():
@@ -1229,17 +1322,16 @@ class ProxyState:
     def reconcile_history_bootstrap(self, history_pairs: list[Message]) -> bool:
         """Finalize a restored session once the first post-restart history arrives."""
         conversation_id = self.engine.config.conversation_id
-        if conversation_id in self._ingested_conversations:
+        if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
             return True
         if self.has_pending_indexing():
+            self._restore_readiness_pending = False
             return False
-        existing_turns = self._indexed_turn_count()
-        needed_turns = len(history_pairs) // 2
-        if existing_turns <= 0:
-            return False
-        if history_pairs and existing_turns < needed_turns:
+        if not self._can_activate_from_persisted_state(history_pairs):
+            self._restore_readiness_pending = False
             return False
         self._ingested_conversations.add(conversation_id)
+        self._restore_readiness_pending = False
         if history_pairs:
             self._record_ingestion_watermark(history_pairs, conversation_id)
         return True
@@ -1365,6 +1457,8 @@ class ProxyState:
         self._last_non_virtualizable_floor = 0
         self._inbound_payload_token_cache = None
         self._outbound_payload_token_cache = None
+        self._restore_readiness_pending = False
+        self._restore_readiness_signature = None
         self._chain_snapshot_cache = {
             "loaded": False,
             "refs_by_turn": {},

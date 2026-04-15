@@ -325,8 +325,21 @@ def mock_engine():
     engine.compact_manual.return_value = None
     engine._turn_tag_index = TurnTagIndex()
     engine._engine_state = EngineState()
+    engine._store = MagicMock()
+    engine._session_state_provider = None
+    engine.config.context_window = 200000
     engine.config.monitor.context_window = 200000
     engine.config.monitor.protected_recent_turns = 6
+    engine.config.monitor.store_recovery_threshold = 0.70
+    engine.config.monitor.defer_payload_mutation = False
+    engine.config.monitor.fill_pass_enabled = False
+    engine.config.monitor.flush_ttl_seconds = 300
+    engine.config.monitor.hard_threshold = 0.85
+    engine.config.proxy.upstream_context_limit = 200000
+    engine.config.proxy.passthrough_trim_ratio = 0.40
+    engine.config.proxy.history_widening_threshold = 0.10
+    engine.config.tool_output.enabled = False
+    engine.config.paging.enabled = False
     engine.config.conversation_id = "conv-test"
     return engine
 
@@ -712,6 +725,77 @@ class TestProxyStateIngestion:
 
         assert len(state.conversation_history) == 4
         assert state.conversation_history[0].content == "Q1"
+
+
+class TestPrepareRouting:
+    def _make_state(self):
+        engine = MagicMock()
+        engine._turn_tag_index = TurnTagIndex()
+        engine._engine_state = EngineState()
+        engine._store = MagicMock()
+        engine._store.get_all_tags.return_value = []
+        engine.config.conversation_id = "conv-123"
+        engine.config.context_window = 120_000
+        engine.config.monitor.context_window = 120_000
+        engine.config.monitor.protected_recent_turns = 0
+        engine.config.monitor.store_recovery_threshold = 0.70
+        engine.config.monitor.defer_payload_mutation = False
+        engine.config.monitor.flush_ttl_seconds = 300
+        engine.config.monitor.fill_pass_enabled = False
+        engine.config.proxy.passthrough_trim_ratio = 0.40
+        engine.config.proxy.upstream_context_limit = 120_000
+        engine.config.proxy.enable_tool_output_compression = False
+        engine.config.proxy.max_output_media_bytes = 0
+        engine.config.proxy.history_widening_threshold = 0.10
+        engine.config.tag_generator.context_lookback_pairs = 3
+        engine.config.tag_generator.context_bleed_threshold = 0
+        engine.config.tool_output.enabled = False
+        engine.process_broad_tag_split.return_value = None
+        engine.on_message_inbound.return_value = AssembledContext()
+        metrics = ProxyMetrics()
+        return ProxyState(engine, metrics=metrics), metrics
+
+    def test_prepare_payload_restored_ready_conversation_stays_active(self):
+        state, metrics = self._make_state()
+        for i in range(2):
+            state.engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=[f"tag-{i}"],
+                primary_tag=f"tag-{i}",
+            ))
+        state.engine._engine_state.last_indexed_turn = 1
+        state.engine._engine_state.last_completed_turn = 1
+        state.note_engine_restore(force=True)
+        state._ingested_conversations.clear()
+
+        fmt = AnthropicFormat()
+        body = {
+            "model": "claude-opus-4-6",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+            ],
+        }
+
+        prepared = asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                fmt,
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert prepared.is_passthrough is False
+        assert state._history_ingested() is True
+        captured = metrics.get_captured_requests_summary(conversation_id="conv-123")
+        assert captured
+        assert captured[-1]["passthrough"] is False
 
 
 # ---------------------------------------------------------------------------

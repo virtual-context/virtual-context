@@ -718,40 +718,77 @@ async def prepare_payload(
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
     # ---------------------------------------------------------------
+    _dispatch_history_pairs: list[Message] | None = None
+    _passthrough_reason: str | None = None
+    _dispatch_existing_turns = 0
+    _dispatch_needed_turns = 0
+    _dispatch_completed_turns = -1
+    _dispatch_indexed_turns = -1
+    _dispatch_compacted_through = 0
+    _dispatch_pending_indexing = False
+    _dispatch_manual_passthrough = False
     if state:
         _dispatch_stage = time.monotonic()
         state._total_requests += 1
         current_state = state.session_state
+        _dispatch_completed_turns = state._completed_turn_count()
+        _dispatch_indexed_turns = state._indexed_turn_count()
+        _dispatch_existing_turns = _dispatch_indexed_turns
+        _dispatch_pending_indexing = state.has_pending_indexing()
+        _dispatch_manual_passthrough = bool(getattr(state, "_manual_passthrough", False))
+        _dispatch_compacted_through = int(
+            getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_through", 0) or 0
+        )
+        if _dispatch_manual_passthrough:
+            _passthrough_reason = "manual_override"
+        elif current_state == SessionState.INGESTING:
+            _passthrough_reason = "pending_indexing"
 
         # Fresh session starts ACTIVE but may need ingestion — check and
         # redirect to passthrough path if there's history to ingest.
-        if (
-            current_state == SessionState.ACTIVE
-            and state.engine.config.conversation_id not in state._ingested_conversations
-        ):
-            history_pairs = _extract_history_pairs(body)
-            needed = len(history_pairs) // 2
-            existing = state._indexed_turn_count()
-            if state.reconcile_history_bootstrap(history_pairs):
-                current_state = SessionState.ACTIVE
-            elif state.has_pending_indexing():
+        if current_state == SessionState.ACTIVE:
+            _dispatch_history_pairs = _extract_history_pairs(body)
+            _dispatch_needed_turns = len(_dispatch_history_pairs) // 2
+            current_state, _passthrough_reason = state.resolve_prepare_state(_dispatch_history_pairs)
+            _dispatch_completed_turns = state._completed_turn_count()
+            _dispatch_indexed_turns = state._indexed_turn_count()
+            _dispatch_existing_turns = _dispatch_indexed_turns
+            _dispatch_pending_indexing = state.has_pending_indexing()
+            _dispatch_compacted_through = int(
+                getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_through", 0) or 0
+            )
+            if _passthrough_reason == "pending_indexing":
                 state.resume_pending_ingestion_if_needed()
                 current_state = state.session_state
-            elif needed > 0 and existing < needed:
-                current_state = SessionState.PASSTHROUGH
         _note_prep("session_state_dispatch", _dispatch_stage)
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):
+            if not _passthrough_reason:
+                _passthrough_reason = "pending_indexing" if current_state == SessionState.INGESTING else "restore_not_ready"
+            logger.info(
+                "PASSTHROUGH_DECISION conversation=%s reason=%s existing_turns=%d needed_turns=%d "
+                "last_completed_turn=%d last_indexed_turn=%d compacted_through=%d "
+                "pending_indexing=%s manual_passthrough=%s",
+                state.engine.config.conversation_id[:12],
+                _passthrough_reason,
+                _dispatch_existing_turns,
+                _dispatch_needed_turns,
+                _dispatch_completed_turns - 1,
+                _dispatch_indexed_turns - 1,
+                _dispatch_compacted_through,
+                _dispatch_pending_indexing,
+                _dispatch_manual_passthrough,
+            )
             # Store latest body for catch-up loop
             state._latest_body = body
 
             # On first request: kick off non-blocking ingestion
             if not state._history_ingested():
-                history_pairs = _extract_history_pairs(body)
-                if history_pairs and not state.is_conversation_deleted():
-                    state.conversation_history = list(history_pairs)
+                _dispatch_history_pairs = _dispatch_history_pairs or _extract_history_pairs(body)
+                if _dispatch_history_pairs and not state.is_conversation_deleted():
+                    state.conversation_history = list(_dispatch_history_pairs)
                 await asyncio.to_thread(
-                    state.start_ingestion_if_needed, history_pairs,
+                    state.start_ingestion_if_needed, _dispatch_history_pairs,
                 )
 
             if not state.is_conversation_deleted():
@@ -864,6 +901,7 @@ async def prepare_payload(
                 "passthrough_trim_limit": _pt_limit,
                 "conversation_id": _conversation_id,
                 "passthrough": True,
+                "passthrough_reason": _passthrough_reason,
             })
 
             metrics.capture_request(
@@ -871,6 +909,7 @@ async def prepare_payload(
                 turn_id=_turn_id,
                 conversation_id=_conversation_id,
                 passthrough=True,
+                passthrough_reason=_passthrough_reason or "",
                 inbound_tokens=_inbound_tokens,
                 outbound_tokens=_outbound_tokens,
                 inbound_bytes=_inbound_bytes,
@@ -896,8 +935,9 @@ async def prepare_payload(
                     logger.debug("passthrough to-llm log write failed", exc_info=True)
 
             logger.info(
-                "T%d PASSTHROUGH %s stream=%s state=%s in=%dt out=%dt | %s",
+                "T%d PASSTHROUGH %s stream=%s state=%s reason=%s in=%dt out=%dt | %s",
                 turn, api_format, is_streaming, current_state.value,
+                _passthrough_reason,
                 _inbound_tokens, _outbound_tokens, user_message[:60],
             )
 
