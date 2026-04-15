@@ -944,7 +944,7 @@ class PostgresStore(ContextStore):
         if not rows:
             return []
         refs = [row["ref"] for row in rows]
-        tags_map = self._get_tags_for_refs(refs)
+        tags_map = self._batch_get_tags(refs)
         return [_row_to_segment(row, tags_map.get(row["ref"], [])) for row in rows]
 
     def get_summaries_by_tags(
