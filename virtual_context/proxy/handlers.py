@@ -522,6 +522,7 @@ async def _handle_streaming(
     *,
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
+    request_turn: int = 0,
     turn_id: str = "",
     overhead_ms: float = 0.0,
     conversation_id: str = "",
@@ -1105,7 +1106,7 @@ async def _handle_streaming(
                         try:
                             state.engine._store.save_tool_call({
                                 "conversation_id": conversation_id,
-                                "request_turn": turn,
+                                "request_turn": request_turn or turn,
                                 "round": loop_i + 1,
                                 "group_id": _group_id,
                                 "tool_name": tool_name,
@@ -1658,6 +1659,7 @@ async def _handle_non_streaming(
     *,
     metrics: ProxyMetrics | None = None,
     turn: int = 0,
+    request_turn: int = 0,
     turn_id: str = "",
     overhead_ms: float = 0.0,
     conversation_id: str = "",

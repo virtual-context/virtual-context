@@ -527,7 +527,7 @@ class CompositeStore:
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         return self._search.get_tool_names_for_segment(conversation_id, segment_ref)
 
-    def save_request_context(self, context: dict) -> None:
+    def save_request_context(self, context: dict) -> int:
         return self._search.save_request_context(context)
 
     def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
