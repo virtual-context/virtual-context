@@ -19,6 +19,14 @@ class _FakeConn:
         self.closed = True
 
 
+class _FakeRowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
 def test_postgres_store_uses_thread_local_connections(monkeypatch):
     from virtual_context.storage import postgres as pg
 
@@ -51,3 +59,44 @@ def test_postgres_store_uses_thread_local_connections(monkeypatch):
     store.close()
 
     assert all(conn.closed for conn in created)
+
+
+def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
+    from virtual_context.storage import postgres as pg
+
+    class _RowsConn(_FakeConn):
+        def execute(self, sql: str, params=None):
+            self.executed.append((sql, params))
+            if "FROM segments" in sql:
+                return _FakeRowsResult([
+                    {
+                        "ref": "seg-1",
+                        "conversation_id": "conv-1",
+                        "primary_tag": "tag-a",
+                        "summary": "summary",
+                        "summary_tokens": 3,
+                        "full_text": "full text",
+                        "full_tokens": 6,
+                        "messages_json": "[]",
+                        "metadata_json": "{\"turn_count\": 2}",
+                        "created_at": "2026-04-14T00:00:00+00:00",
+                        "start_timestamp": "2026-04-14T00:00:00+00:00",
+                        "end_timestamp": "2026-04-14T00:01:00+00:00",
+                        "compaction_model": "test-model",
+                        "compression_ratio": 0.5,
+                    }
+                ])
+            return _FakeRowsResult([])
+
+    conn = _RowsConn("conn-0")
+
+    monkeypatch.setattr(pg.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    store = pg.PostgresStore("postgresql://example")
+    monkeypatch.setattr(store, "_batch_get_tags", lambda refs: {"seg-1": ["tag-a", "tag-b"]})
+
+    segments = store.get_all_segments(conversation_id="conv-1")
+
+    assert len(segments) == 1
+    assert segments[0].ref == "seg-1"
+    assert segments[0].tags == ["tag-a", "tag-b"]
