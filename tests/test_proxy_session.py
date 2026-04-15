@@ -36,6 +36,24 @@ def mock_engine():
     engine.on_turn_complete.return_value = None
     engine.tag_turn.return_value = None
     engine.compact_if_needed.return_value = None
+    engine._turn_tag_index = TurnTagIndex()
+    engine._engine_state = EngineState()
+    engine._store = MagicMock()
+    engine._session_state_provider = None
+    engine.config.context_window = 200000
+    engine.config.monitor.context_window = 200000
+    engine.config.monitor.protected_recent_turns = 6
+    engine.config.monitor.store_recovery_threshold = 0.70
+    engine.config.monitor.defer_payload_mutation = False
+    engine.config.monitor.fill_pass_enabled = False
+    engine.config.monitor.flush_ttl_seconds = 300
+    engine.config.monitor.hard_threshold = 0.85
+    engine.config.proxy.upstream_context_limit = 200000
+    engine.config.proxy.passthrough_trim_ratio = 0.40
+    engine.config.proxy.history_widening_threshold = 0.10
+    engine.config.tool_output.enabled = False
+    engine.config.paging.enabled = False
+    engine.config.conversation_id = "conv-test"
     return engine
 
 
@@ -457,6 +475,26 @@ class TestRequestEventSessionId:
 
         req = m.get_captured_request(0)
         assert req["conversation_id"] == "sess-xyz"
+
+    def test_captured_request_includes_passthrough_reason(self):
+        """Passthrough request summaries should preserve the routing reason."""
+        m = ProxyMetrics()
+        m.capture_request(
+            0,
+            {"messages": []},
+            "anthropic",
+            conversation_id="sess-xyz",
+            passthrough=True,
+            passthrough_reason="restore_not_ready",
+        )
+
+        summaries = m.get_captured_requests_summary()
+        assert len(summaries) == 1
+        assert summaries[0]["passthrough"] is True
+        assert summaries[0]["passthrough_reason"] == "restore_not_ready"
+
+        req = m.get_captured_request(0)
+        assert req["passthrough_reason"] == "restore_not_ready"
 
 
 # ---------------------------------------------------------------------------
@@ -928,6 +966,7 @@ class TestSessionStateMachine:
         engine._engine_state = EngineState()
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
+        engine.config.proxy.history_widening_threshold = 0.10
         engine.config.tag_generator.context_lookback_pairs = 3
         engine.config.tag_generator.context_bleed_threshold = 0
         if metrics is None:
@@ -1017,6 +1056,147 @@ class TestSessionStateMachine:
         assert state.session_state == SessionState.ACTIVE
         assert state._history_ingested() is True
         state.engine.ingest_history.assert_not_called()
+
+    def test_restored_durable_state_stays_active(self):
+        state = self._make_state()
+        for i in range(3):
+            state.engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=[f"tag-{i}"],
+                primary_tag=f"tag-{i}",
+            ))
+        state.engine._engine_state.last_indexed_turn = 2
+        state.engine._engine_state.last_completed_turn = 2
+
+        assert state.note_engine_restore(force=True) is True
+        assert state._restore_readiness_pending is True
+
+        pairs = [
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+            Message(role="user", content="Q2"),
+            Message(role="assistant", content="A2"),
+        ]
+        session_state, reason = state.resolve_prepare_state(pairs)
+
+        assert session_state == SessionState.ACTIVE
+        assert reason is None
+        assert state._history_ingested() is True
+        assert state._restore_readiness_pending is False
+
+    def test_fresh_conversation_still_uses_initial_ingest(self):
+        state = self._make_state()
+        pairs = [
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+        ]
+
+        session_state, reason = state.resolve_prepare_state(pairs)
+
+        assert session_state == SessionState.PASSTHROUGH
+        assert reason == "initial_ingest"
+        assert state._history_ingested() is False
+
+    def test_pending_indexing_keeps_ingesting_state(self):
+        state = self._make_state()
+        for i in range(2):
+            state.engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=[f"tag-{i}"],
+                primary_tag=f"tag-{i}",
+            ))
+        state.engine._engine_state.last_indexed_turn = 1
+        state.engine._engine_state.last_completed_turn = 2
+
+        pairs = [
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+            Message(role="user", content="Q2"),
+            Message(role="assistant", content="A2"),
+        ]
+        session_state, reason = state.resolve_prepare_state(pairs)
+
+        assert session_state == SessionState.INGESTING
+        assert reason == "pending_indexing"
+        assert state._history_ingested() is False
+
+    def test_widened_history_reenters_passthrough(self):
+        state = self._make_state()
+        for i in range(2):
+            state.engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=[f"tag-{i}"],
+                primary_tag=f"tag-{i}",
+            ))
+        state.engine._engine_state.last_indexed_turn = 1
+        state.engine._engine_state.last_completed_turn = 1
+        conversation_id = state.engine.config.conversation_id
+
+        original_pairs = [
+            Message(role="user", content="Original first"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+        ]
+        state._ingested_conversations.add(conversation_id)
+        state._record_ingestion_watermark(original_pairs, conversation_id)
+
+        widened_pairs = [
+            Message(role="user", content="Different first"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+            Message(role="user", content="Q2"),
+            Message(role="assistant", content="A2"),
+        ]
+        session_state, reason = state.resolve_prepare_state(widened_pairs)
+
+        assert session_state == SessionState.PASSTHROUGH
+        assert reason == "history_widening"
+        assert conversation_id not in state._ingested_conversations
+
+    def test_manual_passthrough_wins_in_resolve_prepare_state(self):
+        state = self._make_state()
+        state.set_manual_passthrough(True)
+
+        session_state, reason = state.resolve_prepare_state([
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+        ])
+
+        assert session_state == SessionState.PASSTHROUGH
+        assert reason == "manual_override"
+
+    def test_clear_runtime_state_resets_restore_readiness_cache(self):
+        state = self._make_state()
+        conversation_id = state.engine.config.conversation_id
+        state._ingested_conversations.add(conversation_id)
+        state._ingested_first_hash[conversation_id] = "abc"
+        state._ingested_turn_count[conversation_id] = 3
+        state._restore_readiness_pending = True
+        state._restore_readiness_signature = (3, 3, 6, 3)
+
+        state._clear_runtime_state(conversation_id)
+
+        assert conversation_id not in state._ingested_conversations
+        assert conversation_id not in state._ingested_first_hash
+        assert conversation_id not in state._ingested_turn_count
+        assert state._restore_readiness_pending is False
+        assert state._restore_readiness_signature is None
+
+        session_state, reason = state.resolve_prepare_state([
+            Message(role="user", content="Q0"),
+            Message(role="assistant", content="A0"),
+        ])
+        assert session_state == SessionState.PASSTHROUGH
+        assert reason == "initial_ingest"
 
     def test_resume_pending_ingestion_from_store_gap(self):
         import time
