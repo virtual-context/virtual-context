@@ -15,6 +15,27 @@ class _FakeConn:
         self.executed.append((sql, params))
         return self
 
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+    def executemany(self, sql: str, params_seq):
+        for params in params_seq:
+            self.executed.append((sql, params))
+        return self
+
+    class _Txn:
+        def __enter__(self_inner):
+            return self_inner
+
+        def __exit__(self_inner, exc_type, exc, tb):
+            return False
+
+    def transaction(self):
+        return self._Txn()
+
     def close(self) -> None:
         self.closed = True
 

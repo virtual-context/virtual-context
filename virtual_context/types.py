@@ -1013,6 +1013,7 @@ class PreparedPayload:
     conversation_id: str
     is_passthrough: bool
     turn: int
+    request_turn: int
     turn_id: str
     api_format: str
     user_message: str

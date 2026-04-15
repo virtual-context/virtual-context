@@ -38,6 +38,15 @@ from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_e
 logger = logging.getLogger(__name__)
 
 
+def _parse_sequence_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
     ref TEXT PRIMARY KEY,
@@ -212,6 +221,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
     recorded_at DOUBLE PRECISION NOT NULL,
     data_json TEXT NOT NULL,
     PRIMARY KEY (conversation_id, turn, turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS request_turn_counters (
+    conversation_id TEXT PRIMARY KEY,
+    next_request_turn INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -798,6 +812,17 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             pass
+        try:
+            self._normalize_request_turn_sequences()
+        except Exception:
+            logger.warning("request turn normalization failed", exc_info=True)
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_request_context_conv_turn_unique "
+                "ON request_context(conversation_id, request_turn)"
+            )
+        except Exception:
+            logger.warning("request_context unique index setup failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1239,6 +1264,7 @@ class PostgresStore(ContextStore):
                 "tool_outputs",
                 "tool_calls",
                 "request_context",
+                "request_turn_counters",
                 "tag_summary_embeddings",
                 "turn_tool_outputs",
                 "segment_tool_outputs",
@@ -2773,6 +2799,113 @@ class PostgresStore(ContextStore):
             count += 1
         return count
 
+    def _allocate_request_turn(self, conn: psycopg.Connection, conversation_id: str) -> int:
+        row = conn.execute(
+            """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
+               VALUES (%s, 1)
+               ON CONFLICT (conversation_id)
+               DO UPDATE SET next_request_turn = request_turn_counters.next_request_turn + 1
+               RETURNING next_request_turn""",
+            (conversation_id,),
+        ).fetchone()
+        return int((row or {}).get("next_request_turn", 0) or 0)
+
+    def _bump_request_turn_counter(
+        self,
+        conn: psycopg.Connection,
+        conversation_id: str,
+        request_turn: int,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
+               VALUES (%s, %s)
+               ON CONFLICT (conversation_id)
+               DO UPDATE
+               SET next_request_turn = GREATEST(
+                   request_turn_counters.next_request_turn,
+                   EXCLUDED.next_request_turn
+               )""",
+            (conversation_id, int(request_turn)),
+        )
+
+    def _normalize_request_turn_sequences(self) -> None:
+        conn = self._get_conn()
+        with conn.transaction():
+            context_rows = conn.execute(
+                "SELECT id, conversation_id, request_turn, timestamp FROM request_context "
+                "ORDER BY conversation_id, id"
+            ).fetchall()
+            if not context_rows:
+                return
+
+            grouped_contexts: dict[str, list[dict]] = {}
+            context_updates: list[tuple[int, int]] = []
+            for row in context_rows:
+                conversation_id = row["conversation_id"]
+                seq = len(grouped_contexts.setdefault(conversation_id, [])) + 1
+                timestamp = _parse_sequence_timestamp(row.get("timestamp"))
+                grouped_contexts[conversation_id].append({
+                    "id": int(row["id"]),
+                    "request_turn": seq,
+                    "timestamp": timestamp,
+                })
+                if int(row.get("request_turn", 0) or 0) != seq:
+                    context_updates.append((seq, int(row["id"])))
+
+            if context_updates:
+                conn.executemany(
+                    "UPDATE request_context SET request_turn = %s WHERE id = %s",
+                    context_updates,
+                )
+
+            tool_rows = conn.execute(
+                "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
+                "ORDER BY conversation_id, id"
+            ).fetchall()
+            tool_updates: list[tuple[int, int]] = []
+            for row in tool_rows:
+                conversation_id = row["conversation_id"]
+                contexts = grouped_contexts.get(conversation_id)
+                if not contexts:
+                    continue
+                tool_ts = _parse_sequence_timestamp(row.get("timestamp"))
+                assigned_turn = contexts[0]["request_turn"]
+                if tool_ts is not None:
+                    for ctx in contexts:
+                        ctx_ts = ctx["timestamp"]
+                        if ctx_ts is None or ctx_ts <= tool_ts:
+                            assigned_turn = ctx["request_turn"]
+                        else:
+                            break
+                else:
+                    assigned_turn = contexts[-1]["request_turn"]
+                if int(row.get("request_turn", 0) or 0) != assigned_turn:
+                    tool_updates.append((assigned_turn, int(row["id"])))
+
+            if tool_updates:
+                conn.executemany(
+                    "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
+                    tool_updates,
+                )
+
+            counter_rows = [
+                (conversation_id, contexts[-1]["request_turn"])
+                for conversation_id, contexts in grouped_contexts.items()
+                if contexts
+            ]
+            if counter_rows:
+                conn.executemany(
+                    """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
+                       VALUES (%s, %s)
+                       ON CONFLICT (conversation_id)
+                       DO UPDATE
+                       SET next_request_turn = GREATEST(
+                           request_turn_counters.next_request_turn,
+                           EXCLUDED.next_request_turn
+                       )""",
+                    counter_rows,
+                )
+
     # ------------------------------------------------------------------
     # Tool calls
     # ------------------------------------------------------------------
@@ -2824,49 +2957,66 @@ class PostgresStore(ContextStore):
     # Request context persistence (dashboard recall page)
     # ------------------------------------------------------------------
 
-    def save_request_context(self, context: dict) -> None:
+    def save_request_context(self, context: dict) -> int:
         conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO request_context
-            (conversation_id, request_turn, timestamp, user_message, inbound_tags,
-             retrieval_method, candidates_found, candidates_selected,
-             segments_injected, facts_injected, facts_count, facts_tags,
-             pool_used, pool_budget, total_context_tokens,
-             non_virtualizable_floor, tool_call_count)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                context.get("conversation_id", ""),
-                context.get("request_turn", 0),
-                context.get("timestamp", ""),
-                context.get("user_message", ""),
-                json.dumps(context.get("inbound_tags", [])),
-                context.get("retrieval_method", ""),
-                context.get("candidates_found", 0),
-                context.get("candidates_selected", 0),
-                json.dumps(context.get("segments_injected", [])),
-                json.dumps(context.get("facts_injected", [])),
-                context.get("facts_count", 0),
-                json.dumps(context.get("facts_tags", [])),
-                context.get("pool_used", 0),
-                context.get("pool_budget", 0),
-                context.get("total_context_tokens", 0),
-                context.get("non_virtualizable_floor", 0),
-                context.get("tool_call_count", 0),
-            ),
-        )
         conv_id = context.get("conversation_id", "")
-        conn.execute(
-            """DELETE FROM request_context WHERE id NOT IN (
-                SELECT id FROM request_context WHERE conversation_id = %s
-                ORDER BY id DESC LIMIT 50
-            ) AND conversation_id = %s""",
-            (conv_id, conv_id),
-        )
+        explicit_turn = int(context.get("request_turn", 0) or 0)
+        with conn.transaction():
+            request_turn = explicit_turn or self._allocate_request_turn(conn, conv_id)
+            if explicit_turn:
+                self._bump_request_turn_counter(conn, conv_id, request_turn)
+            conn.execute(
+                """INSERT INTO request_context
+                (conversation_id, request_turn, timestamp, user_message, inbound_tags,
+                 retrieval_method, candidates_found, candidates_selected,
+                 segments_injected, facts_injected, facts_count, facts_tags,
+                 pool_used, pool_budget, total_context_tokens,
+                 non_virtualizable_floor, tool_call_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    conv_id,
+                    request_turn,
+                    context.get("timestamp", ""),
+                    context.get("user_message", ""),
+                    json.dumps(context.get("inbound_tags", [])),
+                    context.get("retrieval_method", ""),
+                    context.get("candidates_found", 0),
+                    context.get("candidates_selected", 0),
+                    json.dumps(context.get("segments_injected", [])),
+                    json.dumps(context.get("facts_injected", [])),
+                    context.get("facts_count", 0),
+                    json.dumps(context.get("facts_tags", [])),
+                    context.get("pool_used", 0),
+                    context.get("pool_budget", 0),
+                    context.get("total_context_tokens", 0),
+                    context.get("non_virtualizable_floor", 0),
+                    context.get("tool_call_count", 0),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM request_context WHERE id NOT IN (
+                    SELECT id FROM request_context WHERE conversation_id = %s
+                    ORDER BY id DESC LIMIT 50
+                ) AND conversation_id = %s""",
+                (conv_id, conv_id),
+            )
+        return request_turn
 
     def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM request_context WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
+            """SELECT * FROM (
+                SELECT
+                    rc.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY rc.conversation_id
+                        ORDER BY rc.id
+                    ) AS sequence_number
+                FROM request_context rc
+                WHERE rc.conversation_id = %s
+            ) ranked
+            ORDER BY id DESC
+            LIMIT %s""",
             (conversation_id, limit),
         ).fetchall()
         result = []
