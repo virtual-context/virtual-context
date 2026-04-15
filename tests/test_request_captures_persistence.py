@@ -1,5 +1,6 @@
 """Tests for request capture persistence through ContextStore."""
 from datetime import datetime, timezone
+import threading
 
 from virtual_context.storage.sqlite import SQLiteStore
 
@@ -221,6 +222,110 @@ class TestRequestCapturesPersistence:
             (4, "user-4", "assistant-4"),
             (5, "user-5", "assistant-5"),
         ]
+
+    def test_request_context_assigns_monotonic_request_turns_concurrently(self, tmp_path):
+        store = SQLiteStore(tmp_path / "test.db")
+        total = 12
+        barrier = threading.Barrier(total)
+        assigned: list[int] = []
+        lock = threading.Lock()
+
+        def _worker(i: int) -> None:
+            barrier.wait()
+            request_turn = store.save_request_context({
+                "conversation_id": "conv-1",
+                "timestamp": f"2026-03-20T10:00:{i:02d}+00:00",
+                "user_message": f"hello {i}",
+                "inbound_tags": [],
+                "retrieval_method": "default",
+                "candidates_found": 0,
+                "candidates_selected": 0,
+                "segments_injected": [],
+                "facts_injected": [],
+                "facts_count": 0,
+                "facts_tags": [],
+                "pool_used": 0,
+                "pool_budget": 0,
+                "total_context_tokens": 0,
+                "non_virtualizable_floor": 0,
+                "tool_call_count": 0,
+            })
+            with lock:
+                assigned.append(request_turn)
+
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert sorted(assigned) == list(range(1, total + 1))
+        contexts = store.load_request_contexts("conv-1", limit=50)
+        assert [ctx["request_turn"] for ctx in contexts] == list(range(1, total + 1))
+        assert [ctx["sequence_number"] for ctx in contexts] == list(range(1, total + 1))
+
+    def test_request_context_backfill_renumbers_duplicate_turns_on_restart(self, tmp_path):
+        db = tmp_path / "test.db"
+        store = SQLiteStore(db)
+        store.save_request_context({
+            "conversation_id": "conv-1",
+            "request_turn": 494,
+            "timestamp": "2026-04-14T22:11:59.177648+00:00",
+            "user_message": "first",
+            "inbound_tags": [],
+            "retrieval_method": "default",
+            "candidates_found": 0,
+            "candidates_selected": 0,
+            "segments_injected": [],
+            "facts_injected": [],
+            "facts_count": 0,
+            "facts_tags": [],
+            "pool_used": 0,
+            "pool_budget": 0,
+            "total_context_tokens": 0,
+            "non_virtualizable_floor": 0,
+            "tool_call_count": 0,
+        })
+        store.save_request_context({
+            "conversation_id": "conv-1",
+            "request_turn": 37,
+            "timestamp": "2026-04-15T04:42:18.486891+00:00",
+            "user_message": "second",
+            "inbound_tags": [],
+            "retrieval_method": "default",
+            "candidates_found": 0,
+            "candidates_selected": 0,
+            "segments_injected": [],
+            "facts_injected": [],
+            "facts_count": 0,
+            "facts_tags": [],
+            "pool_used": 0,
+            "pool_budget": 0,
+            "total_context_tokens": 0,
+            "non_virtualizable_floor": 0,
+            "tool_call_count": 0,
+        })
+        store.save_tool_call({
+            "conversation_id": "conv-1",
+            "request_turn": 37,
+            "round": 1,
+            "group_id": "g-1",
+            "tool_name": "vc_find_quote",
+            "tool_input": {"query": "second"},
+            "tool_result": "{}",
+            "result_length": 2,
+            "duration_ms": 1.0,
+            "found": True,
+            "timestamp": "2026-04-15T04:42:19.000000+00:00",
+        })
+        store.close()
+
+        reopened = SQLiteStore(db)
+        contexts = reopened.load_request_contexts("conv-1", limit=50)
+        assert [ctx["request_turn"] for ctx in contexts] == [1, 2]
+        assert [ctx["sequence_number"] for ctx in contexts] == [1, 2]
+        tool_calls = reopened.load_tool_calls("conv-1", limit=50)
+        assert [call["request_turn"] for call in tool_calls] == [2]
 
 
 class TestFilesystemRequestCaptures:

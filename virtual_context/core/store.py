@@ -608,9 +608,15 @@ class ContextStore(ABC):
         """Load a single tool call by ID."""
         return None
 
-    def save_request_context(self, context: dict) -> None:
-        """Persist retrieval/assembly context for a request."""
-        pass
+    def save_request_context(self, context: dict) -> int:
+        """Persist retrieval/assembly context for a request.
+
+        Returns the durable per-conversation request sequence assigned to this
+        context. Implementations may honor an explicit ``request_turn`` value
+        when provided for migrations/backfills, but live request handling
+        should rely on the returned value rather than supplying its own.
+        """
+        return int(context.get("request_turn", 0) or 0)
 
     def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
         """Load recent request contexts for a conversation."""

@@ -636,6 +636,7 @@ async def prepare_payload(
             conversation_id=state.engine.config.conversation_id if state else (inbound_conversation_id or ""),
             is_passthrough=False,
             turn=0,
+            request_turn=0,
             turn_id="",
             api_format=api_format,
             user_message=user_message,
@@ -906,6 +907,7 @@ async def prepare_payload(
                 conversation_id=_conversation_id,
                 is_passthrough=True,
                 turn=turn,
+                request_turn=0,
                 turn_id=_turn_id,
                 api_format=api_format,
                 user_message=user_message,
@@ -1877,6 +1879,7 @@ async def prepare_payload(
     })
 
     # Persist request context for dashboard recall page
+    _request_turn = 0
     if state and assembled:
         try:
             _retrieval_meta = assembled.retrieval_metadata or {}
@@ -1931,9 +1934,9 @@ async def prepare_payload(
                 _serialize_recall_fact(fact, retrieval_meta=_retrieval_meta)
                 for fact in (assembled.selected_facts or [])
             ]
-            state.engine._store.save_request_context({
+            _request_turn = int(state.engine._store.save_request_context({
                 "conversation_id": _conversation_id,
-                "request_turn": turn,
+                "request_turn": 0,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "user_message": user_message[:500],
                 "inbound_tags": assembled.matched_tags or [],
@@ -1949,7 +1952,7 @@ async def prepare_payload(
                 "total_context_tokens": context_tokens,
                 "non_virtualizable_floor": state._last_non_virtualizable_floor,
                 "tool_call_count": 0,
-            })
+            }))
         except Exception as e:
             import logging as _log
             _log.getLogger(__name__).debug("Failed to save request context: %s", e)
@@ -2012,6 +2015,7 @@ async def prepare_payload(
         conversation_id=_conversation_id,
         is_passthrough=_bloat_fallback,
         turn=turn,
+        request_turn=_request_turn,
         turn_id=_turn_id,
         api_format=api_format,
         user_message=user_message,
@@ -2387,7 +2391,7 @@ def create_app(
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
+                    metrics=metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
@@ -2395,7 +2399,7 @@ def create_app(
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=_skip_turn, turn_id=_skip_turn_id,
+                    metrics=metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
@@ -2425,7 +2429,7 @@ def create_app(
             if result.is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, result.body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     conversation_id=result.conversation_id,
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
@@ -2435,7 +2439,7 @@ def create_app(
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, result.body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     conversation_id=result.conversation_id,
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
@@ -2448,7 +2452,7 @@ def create_app(
             if result.is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, result.enriched_body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     overhead_ms=result.overhead_ms,
                     conversation_id=result.conversation_id,
                     response_log_path=_response_log_path,
@@ -2461,7 +2465,7 @@ def create_app(
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, result.enriched_body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, turn_id=result.turn_id,
+                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     overhead_ms=result.overhead_ms,
                     conversation_id=result.conversation_id,
                     response_log_path=_response_log_path,
