@@ -306,7 +306,6 @@ class SemanticSearchManager:
                     match_type="full_text_semantic",
                     similarity=round(sim, 3),
                     session_date=(row.session_date if row is not None else ""),
-                    created_at=(row.created_at if row is not None else ""),
                     source_scope="turn",
                     turn_number=chunk.turn_number,
                     matched_side=matched_side,

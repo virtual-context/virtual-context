@@ -549,8 +549,7 @@ class QuoteResult:
     score: float = 0.0 # FTS5 rank or match quality
     match_type: str = "fts"  # "fts", "like", or "semantic"
     similarity: float = 0.0  # cosine similarity (semantic matches only)
-    session_date: str = ""   # session date from segment metadata
-    created_at: str = ""     # segment created_at timestamp for chronological ordering
+    session_date: str = ""   # session date from segment metadata or canonical turn
     source_scope: str = "segment"  # "turn", "segment", or "tool_output"
     turn_number: int | None = None
     matched_side: str = ""   # "user", "assistant", "both", or "unknown"

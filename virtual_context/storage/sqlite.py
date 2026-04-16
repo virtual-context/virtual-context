@@ -1721,7 +1721,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     tags=fts_tags_map[row[0]],
                     match_type="fts",
                     session_date=meta.get("session_date", ""),
-                    created_at=row[4] or "",
                 ))
             return results
         except sqlite3.OperationalError:
@@ -1755,7 +1754,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 tags=like_tags_map[row[0]],
                 match_type="like",
                 session_date=meta.get("session_date", ""),
-                created_at=row[4] or "",
             ))
         return results
 
@@ -1786,7 +1784,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
             turn = row["turn_number"] if isinstance(row, sqlite3.Row) else row[0]
             u = (row["user_content"] if isinstance(row, sqlite3.Row) else row[1]) or ""
             a = (row["assistant_content"] if isinstance(row, sqlite3.Row) else row[2]) or ""
-            created_at = (row["created_at"] if isinstance(row, sqlite3.Row) else row[3]) or ""
             primary_tag = (row["primary_tag"] if isinstance(row, sqlite3.Row) else row[4]) or "_general"
             tags_json = (row["tags_json"] if isinstance(row, sqlite3.Row) else row[5]) or "[]"
             session_date = (row["session_date"] if isinstance(row, sqlite3.Row) else row[6]) or ""
@@ -1812,7 +1809,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 source_scope="turn",
                 turn_number=turn,
                 matched_side=matched_side,
-                created_at=created_at,
             ))
         return results
 

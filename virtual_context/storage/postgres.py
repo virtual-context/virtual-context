@@ -1733,7 +1733,6 @@ class PostgresStore(ContextStore):
                 source_scope="turn",
                 turn_number=turn,
                 matched_side=matched_side,
-                created_at=row.get("created_at", "") or "",
             ))
         return results
 
