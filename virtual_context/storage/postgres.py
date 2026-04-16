@@ -153,6 +153,10 @@ ON canonical_turns (conversation_id, sort_key);
 CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_hash
 ON canonical_turns (conversation_id, turn_hash);
 
+CREATE INDEX IF NOT EXISTS idx_canonical_turns_compaction_queue
+ON canonical_turns (conversation_id, sort_key)
+WHERE compacted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS canonical_turn_anchors (
     conversation_id TEXT NOT NULL,
     anchor_hash TEXT NOT NULL,
@@ -2477,6 +2481,57 @@ class PostgresStore(ContextStore):
                 (conversation_id, canonical_turn_id),
             )
         return int(cur.rowcount or 0)
+
+    def replace_canonical_turn_anchors(
+        self,
+        conversation_id: str,
+        anchors: list[tuple[int, str, str]],
+    ) -> int:
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM canonical_turn_anchors WHERE conversation_id = %s",
+            (conversation_id,),
+        )
+        rows = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in anchors
+            if anchor_hash and start_turn_id
+        ]
+        if not rows:
+            return 0
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO canonical_turn_anchors
+                   (conversation_id, anchor_hash, start_turn_id, window_size)
+                   VALUES (%s, %s, %s, %s)""",
+                rows,
+            )
+        return len(rows)
+
+    def get_canonical_turn_anchor_positions(
+        self,
+        conversation_id: str,
+        window_size: int,
+    ) -> dict[str, list[int]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT cta.anchor_hash, cto.turn_number
+               FROM canonical_turn_anchors cta
+               JOIN canonical_turns_ordinal cto
+                 ON cto.conversation_id = cta.conversation_id
+                AND cto.canonical_turn_id = cta.start_turn_id
+               WHERE cta.conversation_id = %s
+                 AND cta.window_size = %s
+               ORDER BY cto.turn_number""",
+            (conversation_id, int(window_size)),
+        ).fetchall()
+        anchors: dict[str, list[int]] = {}
+        for row in rows:
+            digest = str(row["anchor_hash"] or "")
+            if not digest:
+                continue
+            anchors.setdefault(digest, []).append(int(row["turn_number"]))
+        return anchors
 
     def search_tag_summaries_fts(
         self, query: str, limit: int = 20, conversation_id: str | None = None,

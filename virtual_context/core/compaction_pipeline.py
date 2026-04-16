@@ -559,7 +559,18 @@ class CompactionPipeline:
             for row in seg_rows:
                 entry = self._turn_tag_index.get_tags_for_canonical_turn(row.canonical_turn_id)
                 if entry is None:
-                    entry = self._turn_tag_index.get_tags_for_turn(row.turn_number)
+                    entry = self._turn_tag_index.bind_canonical_turn_id(
+                        row.turn_number,
+                        row.canonical_turn_id,
+                    )
+                if entry is None:
+                    logger.debug(
+                        "Missing canonical turn tag entry during compaction for conv=%s turn=%d canonical=%s",
+                        self._config.conversation_id[:12],
+                        row.turn_number,
+                        row.canonical_turn_id[:12] if row.canonical_turn_id else "",
+                    )
+                    continue
                 if entry and entry.fact_signals:
                     signals.extend(entry.fact_signals)
                 if entry and getattr(entry, "code_refs", None):

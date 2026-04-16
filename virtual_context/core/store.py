@@ -269,6 +269,20 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
+    def replace_canonical_turn_anchors(
+        self,
+        conversation_id: str,
+        anchors: list[tuple[int, str, str]],
+    ) -> int:
+        return 0
+
+    def get_canonical_turn_anchor_positions(
+        self,
+        conversation_id: str,
+        window_size: int,
+    ) -> dict[str, list[int]]:
+        return {}
+
     def save_ingest_batch(self, batch: dict) -> str:
         return str(batch.get("batch_id", "") or "")
 

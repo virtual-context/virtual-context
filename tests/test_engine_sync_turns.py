@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
@@ -82,6 +83,11 @@ def _search_via_store(engine, query):
     return _search(query, conversation_id="test-conv-sync")
 
 
+def _inner_store(engine):
+    store = engine._store
+    return getattr(store, "_store", store)
+
+
 def test_sync_persists_tool_chain_text(engine):
     body = _make_anthropic_messages()
     fmt = detect_format(body)
@@ -102,8 +108,11 @@ def test_sync_idempotent(engine):
 
     first = engine.sync_turns_from_payload(body, fmt)
     assert first >= 2
+    first_ids = [row.canonical_turn_id for row in engine._store.get_all_canonical_turns("test-conv-sync")]
     second = engine.sync_turns_from_payload(body, fmt)
     assert second == 0  # already stored
+    second_ids = [row.canonical_turn_id for row in engine._store.get_all_canonical_turns("test-conv-sync")]
+    assert second_ids == first_ids
 
 
 def test_sync_incremental(engine):
@@ -260,6 +269,175 @@ def test_sync_no_overlap_append_preserves_existing_rows(engine):
         "Gamma user",
         "Delta user",
     ]
+
+
+def test_sync_interior_overlap_reuses_existing_canonical_ids(engine):
+    initial = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "A user"},
+            {"role": "assistant", "content": "A assistant"},
+            {"role": "user", "content": "B user"},
+            {"role": "assistant", "content": "B assistant"},
+            {"role": "user", "content": "C user"},
+            {"role": "assistant", "content": "C assistant"},
+            {"role": "user", "content": "D user"},
+            {"role": "assistant", "content": "D assistant"},
+            {"role": "user", "content": "E user"},
+            {"role": "assistant", "content": "E assistant"},
+            {"role": "user", "content": "F user"},
+            {"role": "assistant", "content": "F assistant"},
+        ],
+    }
+    overlap = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "X user"},
+            {"role": "assistant", "content": "X assistant"},
+            {"role": "user", "content": "C user"},
+            {"role": "assistant", "content": "C assistant"},
+            {"role": "user", "content": "D user"},
+            {"role": "assistant", "content": "D assistant"},
+            {"role": "user", "content": "E user"},
+            {"role": "assistant", "content": "E assistant"},
+            {"role": "user", "content": "Y user"},
+            {"role": "assistant", "content": "Y assistant"},
+        ],
+    }
+
+    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 6
+    initial_rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    overlap_ids = {
+        row.user_content: row.canonical_turn_id
+        for row in initial_rows
+        if row.user_content in {"C user", "D user", "E user"}
+    }
+
+    assert engine.sync_turns_from_payload(overlap, detect_format(overlap)) == 2
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert [row.user_content for row in rows] == [
+        "A user",
+        "B user",
+        "X user",
+        "C user",
+        "D user",
+        "E user",
+        "Y user",
+        "F user",
+    ]
+    assert {
+        row.user_content: row.canonical_turn_id
+        for row in rows
+        if row.user_content in {"C user", "D user", "E user"}
+    } == overlap_ids
+
+
+def test_sync_repeated_common_turns_do_not_collapse(engine):
+    repeated = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "yes"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "yes"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "yes"},
+            {"role": "assistant", "content": "ok"},
+        ],
+    }
+
+    assert engine.sync_turns_from_payload(repeated, detect_format(repeated)) == 3
+    first_rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert len(first_rows) == 3
+    assert len({row.canonical_turn_id for row in first_rows}) == 3
+
+    assert engine.sync_turns_from_payload(repeated, detect_format(repeated)) == 0
+    second_rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert [row.canonical_turn_id for row in second_rows] == [
+        row.canonical_turn_id for row in first_rows
+    ]
+
+
+def test_sync_empty_payload_logs(engine, caplog):
+    body = {"model": "gpt-4o", "input": "What is virtual context?"}
+    fmt = detect_format(body)
+
+    with caplog.at_level("INFO"):
+        assert engine.sync_turns_from_payload(body, fmt) == 0
+
+    assert "INGEST_EMPTY_PAYLOAD" in caplog.text
+
+
+def test_ingest_single_retry_dedups_recent_turn(engine):
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    reconciler = IngestReconciler(_inner_store(engine), engine._semantic)
+
+    first = reconciler.ingest_single(
+        "test-conv-sync",
+        user_content="Retry user",
+        assistant_content="Retry assistant",
+    )
+    second = reconciler.ingest_single(
+        "test-conv-sync",
+        user_content="Retry user",
+        assistant_content="Retry assistant",
+    )
+
+    assert first.turns_written == 1
+    assert second.merge_mode == "exact_resend"
+    assert second.turns_written == 0
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert len(rows) == 1
+
+
+def test_ingest_single_invalid_timestamp_disables_dedup_with_warning(engine, caplog):
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    store = _inner_store(engine)
+    store.save_canonical_turn(
+        "test-conv-sync",
+        0,
+        "Retry user",
+        "Retry assistant",
+        last_seen_at="not-a-time",
+    )
+    reconciler = IngestReconciler(store, engine._semantic)
+
+    with caplog.at_level("WARNING"):
+        result = reconciler.ingest_single(
+            "test-conv-sync",
+            user_content="Retry user",
+            assistant_content="Retry assistant",
+        )
+
+    assert result.turns_written == 1
+    assert "CANONICAL_TURN_DEDUP_TIMESTAMP_INVALID" in caplog.text
+    assert len(engine._store.get_all_canonical_turns("test-conv-sync")) == 2
+
+
+def test_sync_concurrent_writers_do_not_duplicate_rows(engine, monkeypatch):
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Concurrent user 1"},
+            {"role": "assistant", "content": "Concurrent assistant 1"},
+            {"role": "user", "content": "Concurrent user 2"},
+            {"role": "assistant", "content": "Concurrent assistant 2"},
+        ],
+    }
+    fmt = detect_format(body)
+    monkeypatch.setattr(engine._semantic, "embed_and_store_turn", lambda *args, **kwargs: None)
+
+    def _run_once():
+        return engine.sync_turns_from_payload(body, fmt)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = sorted(pool.map(lambda _: _run_once(), range(2)))
+
+    assert results == [0, 2]
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert len(rows) == 2
+    assert len({row.canonical_turn_id for row in rows}) == 2
 
 
 def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
