@@ -423,6 +423,65 @@ def test_sync_empty_payload_logs(engine, caplog):
     assert "INGEST_EMPTY_PAYLOAD" in caplog.text
 
 
+def test_ingest_resync_preserves_stored_session_date_against_empty(engine):
+    # Regression: a re-ingest batch that does not carry session_date must not
+    # clobber the value the original ingestion extracted from payload headers.
+    # Content-hash alignment means the same turn will re-enter the overlap or
+    # exact_resend path on re-ingest; without the preserve policy, the naive
+    # overwrite would wipe a populated session_date back to "".
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    reconciler = IngestReconciler(_inner_store(engine), engine._semantic)
+
+    reconciler.ingest_single(
+        "test-conv-preserve",
+        user_content="Hello there",
+        assistant_content="Hi, how can I help?",
+        session_date="2026-03-20T15:49:00",
+    )
+
+    # Re-ingest same content without session_date (simulates a resync batch
+    # built from stripped history that no longer includes the header line).
+    reconciler.ingest_single(
+        "test-conv-preserve",
+        user_content="Hello there",
+        assistant_content="Hi, how can I help?",
+        session_date="",
+    )
+
+    rows = engine._store.get_all_canonical_turns("test-conv-preserve")
+    assert len(rows) == 2
+    assert all(r.session_date == "2026-03-20T15:49:00" for r in rows), (
+        f"expected stored session_date to survive empty re-ingest, got {[r.session_date for r in rows]}"
+    )
+
+
+def test_ingest_resync_allows_upgrade_from_empty_to_populated(engine):
+    # Symmetric to the preserve test: if the original ingestion had no
+    # session_date (e.g. a live proxy write where the header wasn't present)
+    # and a later resync DOES carry one, the populated value should win.
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    reconciler = IngestReconciler(_inner_store(engine), engine._semantic)
+
+    reconciler.ingest_single(
+        "test-conv-upgrade",
+        user_content="Hello there",
+        assistant_content="Hi, how can I help?",
+        session_date="",
+    )
+    reconciler.ingest_single(
+        "test-conv-upgrade",
+        user_content="Hello there",
+        assistant_content="Hi, how can I help?",
+        session_date="2026-03-20T15:49:00",
+    )
+
+    rows = engine._store.get_all_canonical_turns("test-conv-upgrade")
+    assert len(rows) == 2
+    assert all(r.session_date == "2026-03-20T15:49:00" for r in rows)
+
+
 def test_ingest_single_retry_dedups_recent_turn(engine):
     from virtual_context.core.ingest_reconciler import IngestReconciler
 
