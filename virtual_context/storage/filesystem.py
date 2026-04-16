@@ -718,6 +718,7 @@ class FilesystemStore(ContextStore):
             "turn_tag_entries": [
                 {
                     "turn_number": e.turn_number,
+                    "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
                     "message_hash": e.message_hash,
                     "tags": e.tags,
                     "primary_tag": e.primary_tag,
@@ -751,6 +752,7 @@ class FilesystemStore(ContextStore):
         entries = [
             TurnTagEntry(
                 turn_number=e["turn_number"],
+                canonical_turn_id=e.get("canonical_turn_id", "") or "",
                 message_hash=e["message_hash"],
                 tags=e["tags"],
                 primary_tag=e["primary_tag"],
@@ -906,120 +908,6 @@ class FilesystemStore(ContextStore):
         )
 
     # ------------------------------------------------------------------
-    # Turn messages
-    # ------------------------------------------------------------------
-
-    def _turn_messages_path(self, conversation_id: str) -> Path:
-        safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
-        return self.root / "_turn_messages" / f"{safe_id}.json"
-
-    def save_turn_message(
-        self,
-        conversation_id: str,
-        turn_number: int,
-        user_content: str,
-        assistant_content: str,
-        user_raw_content: str | None = None,
-        assistant_raw_content: str | None = None,
-    ) -> None:
-        path = self._turn_messages_path(conversation_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing: dict = {}
-        if path.is_file():
-            try:
-                existing = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-        entry = {
-            "user_content": user_content,
-            "assistant_content": assistant_content,
-        }
-        if user_raw_content is not None:
-            entry["user_raw_content"] = user_raw_content
-        if assistant_raw_content is not None:
-            entry["assistant_raw_content"] = assistant_raw_content
-        existing[str(turn_number)] = entry
-        path.write_text(json.dumps(existing, indent=2))
-
-    def get_turn_messages(
-        self,
-        conversation_id: str,
-        turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str, str | None, str | None]]:
-        if not turn_numbers:
-            return {}
-        path = self._turn_messages_path(conversation_id)
-        if not path.is_file():
-            return {}
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-        result: dict[int, tuple[str, str, str | None, str | None]] = {}
-        for tn in turn_numbers:
-            entry = data.get(str(tn))
-            if entry:
-                result[tn] = (
-                    entry.get("user_content", ""),
-                    entry.get("assistant_content", ""),
-                    entry.get("user_raw_content"),
-                    entry.get("assistant_raw_content"),
-                )
-        return result
-
-    def load_recent_turn_messages(
-        self,
-        conversation_id: str,
-        limit: int = 100,
-    ) -> list[tuple[int, str, str]]:
-        path = self._turn_messages_path(conversation_id)
-        if not path.is_file():
-            return []
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-        rows: list[tuple[int, str, str]] = []
-        for key, entry in data.items():
-            try:
-                turn_number = int(key)
-            except (TypeError, ValueError):
-                continue
-            rows.append((
-                turn_number,
-                entry.get("user_content", ""),
-                entry.get("assistant_content", ""),
-            ))
-        rows.sort(key=lambda item: item[0])
-        if limit > 0:
-            rows = rows[-limit:]
-        return rows
-
-    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
-        path = self._turn_messages_path(conversation_id)
-        if not path.is_file():
-            return 0
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return 0
-        removed = 0
-        kept: dict[str, dict] = {}
-        for key, entry in data.items():
-            try:
-                turn_number = int(key)
-            except (TypeError, ValueError):
-                kept[key] = entry
-                continue
-            if turn_number < keep_from_turn:
-                removed += 1
-                continue
-            kept[key] = entry
-        if removed:
-            path.write_text(json.dumps(kept, indent=2))
-        return removed
-
-    # ------------------------------------------------------------------
     # Conversation aliases (VCATTACH)
     # ------------------------------------------------------------------
 
@@ -1074,10 +962,6 @@ class FilesystemStore(ContextStore):
             state_path = self.root / "_engine_state" / f"{safe_id}.json"
             if state_path.is_file():
                 state_path.unlink()
-
-            turn_messages_path = self._turn_messages_path(conversation_id)
-            if turn_messages_path.is_file():
-                turn_messages_path.unlink()
 
             captures_path = self.root / "_request_captures.json"
             if captures_path.is_file():

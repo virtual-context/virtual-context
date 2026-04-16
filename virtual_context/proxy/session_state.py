@@ -796,6 +796,7 @@ class SessionStateProvider:
 
             entries.append(TurnTagEntry(
                 turn_number=d.get("turn_number", 0),
+                canonical_turn_id=d.get("canonical_turn_id", "") or "",
                 tags=d.get("tags", []),
                 primary_tag=d.get("primary_tag", ""),
                 message_hash=d.get("message_hash", ""),
@@ -843,6 +844,7 @@ class SessionStateProvider:
         for e in snapshot.turn_tag_entries:
             entries.append({
                 "turn_number": e.turn_number,
+                "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
                 "tags": e.tags,
                 "primary_tag": e.primary_tag,
                 "message_hash": e.message_hash,

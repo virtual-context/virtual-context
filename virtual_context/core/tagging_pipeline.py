@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs, get_recent_context
-from .semantic_search import persist_turn_with_embeddings
+from .canonical_turns import HASH_VERSION, compute_turn_hash_from_raw, utcnow_iso
+from .ingest_reconciler import IngestReconciler
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
 
@@ -167,6 +168,67 @@ class TaggingPipeline:
                 return [history[i-1], history[i]]
         return None
 
+    def _persist_canonical_turn(
+        self,
+        entry: "TurnTagEntry",
+        user_msg: "Message",
+        asst_msg: "Message",
+    ) -> None:
+        existing = self._store.get_canonical_turn_rows(
+            self.config.conversation_id,
+            [entry.turn_number],
+        ).get(entry.turn_number)
+        if existing is not None:
+            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+                user_msg.content,
+                asst_msg.content,
+                version=HASH_VERSION,
+            )
+            self._store.save_canonical_turn(
+                self.config.conversation_id,
+                entry.turn_number,
+                user_msg.content,
+                asst_msg.content,
+                user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                primary_tag=entry.primary_tag,
+                tags=list(entry.tags),
+                session_date=entry.session_date,
+                sender=entry.sender,
+                fact_signals=list(entry.fact_signals),
+                code_refs=list(entry.code_refs),
+                canonical_turn_id=existing.canonical_turn_id,
+                sort_key=existing.sort_key,
+                turn_hash=turn_hash,
+                hash_version=HASH_VERSION,
+                normalized_user_text=normalized_user_text,
+                normalized_assistant_text=normalized_assistant_text,
+                tagged_at=utcnow_iso(),
+                compacted_at=existing.compacted_at,
+                first_seen_at=existing.first_seen_at,
+                last_seen_at=existing.last_seen_at or utcnow_iso(),
+                source_batch_id=existing.source_batch_id,
+                created_at=existing.created_at,
+                updated_at=utcnow_iso(),
+            )
+            entry.canonical_turn_id = existing.canonical_turn_id or entry.canonical_turn_id
+            return
+        result = IngestReconciler(self._store, self._semantic).ingest_single(
+            conversation_id=self.config.conversation_id,
+            user_content=user_msg.content,
+            assistant_content=asst_msg.content,
+            user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+            assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+            primary_tag=entry.primary_tag,
+            tags=list(entry.tags),
+            session_date=entry.session_date,
+            sender=entry.sender,
+            fact_signals=list(entry.fact_signals),
+            code_refs=list(entry.code_refs),
+        )
+        if result.rows:
+            entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
+
     def _get_recent_context(
         self, history: list[Message], n_pairs: int, exclude_last: int = 2,
         current_text: str | None = None,
@@ -206,6 +268,7 @@ class TaggingPipeline:
         pairs = extract_turn_pairs(history)
         texts = []
         turn_numbers = []
+        canonical_turn_ids: list[str] = []
         for entry in self._turn_tag_index.entries:
             if tag in entry.tags:
                 if entry.turn_number < len(pairs):
@@ -215,6 +278,8 @@ class TaggingPipeline:
                         f"Assistant: {assistant_text[:300]}"
                     )
                     turn_numbers.append(entry.turn_number)
+                    if entry.canonical_turn_id:
+                        canonical_turn_ids.append(entry.canonical_turn_id)
 
         if not texts:
             return
@@ -232,6 +297,7 @@ class TaggingPipeline:
             cover_tags=[tag],
             tag_to_summaries={tag: synthetic},
             tag_to_turns={tag: turn_numbers},
+            tag_to_canonical_turn_ids={tag: canonical_turn_ids},
             existing_tag_summaries={},
             max_turn=max_turn,
         )
@@ -419,22 +485,8 @@ class TaggingPipeline:
                 entry = self._turn_tag_index.get_tags_for_turn(turn_num)
                 t_stage = time.monotonic()
                 try:
-                    persist_turn_with_embeddings(
-                        self._store,
-                        self._semantic,
-                        conversation_id=self.config.conversation_id,
-                        turn_number=turn_num,
-                        user_content=latest_pair[0].content if len(latest_pair) > 0 else "",
-                        assistant_content=latest_pair[1].content if len(latest_pair) > 1 else "",
-                        user_raw_content=json.dumps(latest_pair[0].raw_content) if len(latest_pair) > 0 and latest_pair[0].raw_content else None,
-                        assistant_raw_content=json.dumps(latest_pair[1].raw_content) if len(latest_pair) > 1 and latest_pair[1].raw_content else None,
-                        primary_tag=entry.primary_tag if entry else "_general",
-                        tags=list(entry.tags) if entry else [],
-                        session_date=entry.session_date if entry else "",
-                        sender=entry.sender if entry else "",
-                        fact_signals=list(entry.fact_signals) if entry else [],
-                        code_refs=list(entry.code_refs) if entry else [],
-                    )
+                    if entry is not None:
+                        self._persist_canonical_turn(entry, latest_pair[0], latest_pair[1])
                 except Exception:
                     pass  # never block tagging for message persistence
                 self._link_turn_tool_outputs(turn_num)
@@ -659,20 +711,7 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    persist_turn_with_embeddings(
-                        self._store,
-                        self._semantic,
-                        conversation_id=self.config.conversation_id,
-                        turn_number=entry.turn_number,
-                        user_content=user_msg.content,
-                        assistant_content=asst_msg.content,
-                        user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                        assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                        primary_tag=entry.primary_tag,
-                        tags=list(entry.tags),
-                        session_date=entry.session_date,
-                        sender=entry.sender,
-                    )
+                    self._persist_canonical_turn(entry, user_msg, asst_msg)
                 except Exception:
                     pass
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
@@ -705,18 +744,7 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    persist_turn_with_embeddings(
-                        self._store,
-                        self._semantic,
-                        conversation_id=self.config.conversation_id,
-                        turn_number=entry.turn_number,
-                        user_content=user_msg.content,
-                        assistant_content=asst_msg.content,
-                        primary_tag=entry.primary_tag,
-                        tags=list(entry.tags),
-                        session_date=entry.session_date,
-                        sender=entry.sender,
-                    )
+                    self._persist_canonical_turn(entry, user_msg, asst_msg)
                 except Exception:
                     pass
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
@@ -845,22 +873,7 @@ class TaggingPipeline:
             )
             self._turn_tag_index.append(entry)
             try:
-                persist_turn_with_embeddings(
-                    self._store,
-                    self._semantic,
-                    conversation_id=self.config.conversation_id,
-                    turn_number=entry.turn_number,
-                    user_content=user_msg.content,
-                    assistant_content=asst_msg.content,
-                    user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                    assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
-                    primary_tag=entry.primary_tag,
-                    tags=list(entry.tags),
-                    session_date=entry.session_date,
-                    sender=entry.sender,
-                    fact_signals=list(entry.fact_signals),
-                    code_refs=list(entry.code_refs),
-                )
+                self._persist_canonical_turn(entry, user_msg, asst_msg)
             except Exception:
                 pass
             self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)

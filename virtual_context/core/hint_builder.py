@@ -169,18 +169,17 @@ def build_autonomous_hint(
 
     hint = _assemble(expanded_lines, available_entries)
 
-    # Truncate: drop available entries first, then expanded lines
+    # Truncate: prefer compact boilerplate before dropping any tag entries.
+    compact_mode = False
     if token_counter(hint) > max_hint_tokens:
-        while available_entries and token_counter(hint) > max_hint_tokens:
-            available_entries.pop()
-            hint = _assemble(expanded_lines, available_entries)
-        # If expanded lines still don't fit, switch to compact boilerplate
-        # before dropping any expanded lines — tags are more valuable than rules.
-        if expanded_lines and token_counter(hint) > max_hint_tokens:
-            hint = _assemble(expanded_lines, available_entries, compact=True)
-        while expanded_lines and token_counter(hint) > max_hint_tokens:
-            expanded_lines.pop()
-            hint = _assemble(expanded_lines, available_entries, compact=True)
+        compact_mode = True
+        hint = _assemble(expanded_lines, available_entries, compact=True)
+    while available_entries and token_counter(hint) > max_hint_tokens:
+        available_entries.pop()
+        hint = _assemble(expanded_lines, available_entries, compact=compact_mode)
+    while expanded_lines and token_counter(hint) > max_hint_tokens:
+        expanded_lines.pop()
+        hint = _assemble(expanded_lines, available_entries, compact=True)
 
     return hint
 

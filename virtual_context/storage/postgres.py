@@ -6,12 +6,19 @@ import json
 import logging
 import re
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg.rows import dict_row
 
 from ..core.store import ContextStore
+from ..core.canonical_turns import (
+    HASH_VERSION,
+    compute_turn_hash_from_raw,
+    generate_canonical_turn_id,
+    utcnow_iso,
+)
 from ..types import (
     ChunkEmbedding,
     ConversationStats,
@@ -20,8 +27,8 @@ from ..types import (
     Fact,
     FactLink,
     FactSignal,
-    FullTextChunkEmbedding,
-    FullTextRow,
+    CanonicalTurnChunkEmbedding,
+    CanonicalTurnRow,
     LinkedFact,
     QuoteResult,
     SegmentMetadata,
@@ -88,7 +95,9 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     summary_tokens INTEGER NOT NULL DEFAULT 0,
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
+    source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
+    covers_through_canonical_turn_id TEXT NOT NULL DEFAULT '',
     generated_by_turn_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -110,19 +119,14 @@ CREATE TABLE IF NOT EXISTS conversation_lifecycle (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS turn_messages (
+CREATE TABLE IF NOT EXISTS canonical_turns (
+    canonical_turn_id UUID PRIMARY KEY,
     conversation_id TEXT NOT NULL,
-    turn_number INTEGER NOT NULL,
-    user_content TEXT NOT NULL DEFAULT '',
-    assistant_content TEXT NOT NULL DEFAULT '',
-    user_raw_content TEXT,
-    assistant_raw_content TEXT,
-    PRIMARY KEY (conversation_id, turn_number)
-);
-
-CREATE TABLE IF NOT EXISTS full_text (
-    conversation_id TEXT NOT NULL,
-    turn_number INTEGER NOT NULL,
+    sort_key DOUBLE PRECISION NOT NULL,
+    turn_hash TEXT NOT NULL,
+    hash_version SMALLINT NOT NULL DEFAULT 1,
+    normalized_user_text TEXT NOT NULL DEFAULT '',
+    normalized_assistant_text TEXT NOT NULL DEFAULT '',
     user_content TEXT NOT NULL DEFAULT '',
     assistant_content TEXT NOT NULL DEFAULT '',
     user_raw_content TEXT,
@@ -133,9 +137,44 @@ CREATE TABLE IF NOT EXISTS full_text (
     sender TEXT NOT NULL DEFAULT '',
     fact_signals_json TEXT NOT NULL DEFAULT '[]',
     code_refs_json TEXT NOT NULL DEFAULT '[]',
+    tagged_at TEXT,
+    compacted_at TEXT,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    source_batch_id UUID,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (conversation_id, turn_number)
+    UNIQUE (conversation_id, sort_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_order
+ON canonical_turns (conversation_id, sort_key);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_hash
+ON canonical_turns (conversation_id, turn_hash);
+
+CREATE TABLE IF NOT EXISTS canonical_turn_anchors (
+    conversation_id TEXT NOT NULL,
+    anchor_hash TEXT NOT NULL,
+    start_turn_id UUID NOT NULL,
+    window_size INTEGER NOT NULL DEFAULT 3
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_turn_anchors_lookup
+ON canonical_turn_anchors (conversation_id, window_size, anchor_hash);
+
+CREATE TABLE IF NOT EXISTS ingest_batches (
+    batch_id UUID PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT '',
+    raw_turn_count INTEGER NOT NULL DEFAULT 0,
+    merge_mode TEXT NOT NULL DEFAULT '',
+    turns_matched INTEGER NOT NULL DEFAULT 0,
+    turns_appended INTEGER NOT NULL DEFAULT 0,
+    turns_prepended INTEGER NOT NULL DEFAULT 0,
+    turns_inserted INTEGER NOT NULL DEFAULT 0,
+    first_turn_hash TEXT NOT NULL DEFAULT '',
+    last_turn_hash TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS conversation_aliases (
@@ -151,14 +190,14 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     PRIMARY KEY (segment_ref, chunk_index)
 );
 
-CREATE TABLE IF NOT EXISTS full_text_chunks (
+CREATE TABLE IF NOT EXISTS canonical_turn_chunks (
     conversation_id TEXT NOT NULL,
-    turn_number INTEGER NOT NULL,
+    canonical_turn_id UUID NOT NULL,
     side TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, turn_number, side, chunk_index)
+    PRIMARY KEY (conversation_id, canonical_turn_id, side, chunk_index)
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -348,22 +387,12 @@ DO $$ BEGIN
                    WHERE table_name='tool_outputs' AND column_name='content_tsv') THEN
         ALTER TABLE tool_outputs ADD COLUMN content_tsv tsvector;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='turn_messages' AND column_name='turn_tsv') THEN
-        ALTER TABLE turn_messages ADD COLUMN turn_tsv tsvector;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='full_text' AND column_name='full_text_tsv') THEN
-        ALTER TABLE full_text ADD COLUMN full_text_tsv tsvector;
-    END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_segments_summary_tsv ON segments USING gin(summary_tsv);
 CREATE INDEX IF NOT EXISTS idx_segments_full_text_tsv ON segments USING gin(full_text_tsv);
 CREATE INDEX IF NOT EXISTS idx_facts_tsv ON facts USING gin(facts_tsv);
 CREATE INDEX IF NOT EXISTS idx_tool_outputs_tsv ON tool_outputs USING gin(content_tsv);
-CREATE INDEX IF NOT EXISTS idx_turn_messages_tsv ON turn_messages USING gin(turn_tsv);
-CREATE INDEX IF NOT EXISTS idx_full_text_tsv ON full_text USING gin(full_text_tsv);
 
 -- Triggers to keep tsvector columns in sync
 CREATE OR REPLACE FUNCTION segments_summary_tsv_trigger() RETURNS trigger AS $$
@@ -392,24 +421,6 @@ BEGIN
     RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION turn_messages_tsv_trigger() RETURNS trigger AS $$
-BEGIN
-    NEW.turn_tsv := to_tsvector(
-        'english',
-        COALESCE(NEW.user_content, '') || ' ' || COALESCE(NEW.assistant_content, '')
-    );
-    RETURN NEW;
-END $$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION canonical_full_text_tsv_trigger() RETURNS trigger AS $$
-BEGIN
-    NEW.full_text_tsv := to_tsvector(
-        'english',
-        COALESCE(NEW.user_content, '') || ' ' || COALESCE(NEW.assistant_content, '')
-    );
-    RETURN NEW;
-END $$ LANGUAGE plpgsql;
-
 DROP TRIGGER IF EXISTS trg_segments_summary_tsv ON segments;
 CREATE TRIGGER trg_segments_summary_tsv BEFORE INSERT OR UPDATE ON segments
     FOR EACH ROW EXECUTE FUNCTION segments_summary_tsv_trigger();
@@ -426,13 +437,6 @@ DROP TRIGGER IF EXISTS trg_tool_outputs_tsv ON tool_outputs;
 CREATE TRIGGER trg_tool_outputs_tsv BEFORE INSERT OR UPDATE ON tool_outputs
     FOR EACH ROW EXECUTE FUNCTION tool_outputs_tsv_trigger();
 
-DROP TRIGGER IF EXISTS trg_turn_messages_tsv ON turn_messages;
-CREATE TRIGGER trg_turn_messages_tsv BEFORE INSERT OR UPDATE ON turn_messages
-    FOR EACH ROW EXECUTE FUNCTION turn_messages_tsv_trigger();
-
-DROP TRIGGER IF EXISTS trg_canonical_full_text_tsv ON full_text;
-CREATE TRIGGER trg_canonical_full_text_tsv BEFORE INSERT OR UPDATE ON full_text
-    FOR EACH ROW EXECUTE FUNCTION canonical_full_text_tsv_trigger();
 """
 
 
@@ -514,6 +518,7 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
@@ -543,6 +548,7 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
+            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
@@ -554,7 +560,7 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
     )
 
 
-def _row_to_full_text(row: dict) -> FullTextRow:
+def _row_to_canonical_turn(row: dict) -> CanonicalTurnRow:
     try:
         tags = json.loads(row.get("tags_json", "[]") or "[]")
     except Exception:
@@ -579,9 +585,15 @@ def _row_to_full_text(row: dict) -> FullTextRow:
                 )
     except Exception:
         fact_signals = []
-    return FullTextRow(
+    return CanonicalTurnRow(
         conversation_id=row["conversation_id"],
-        turn_number=row["turn_number"],
+        canonical_turn_id=str(row.get("canonical_turn_id", "") or ""),
+        turn_number=int(row.get("turn_number", -1) or -1),
+        sort_key=float(row.get("sort_key", 0.0) or 0.0),
+        turn_hash=row.get("turn_hash", "") or "",
+        hash_version=int(row.get("hash_version", 0) or 0),
+        normalized_user_text=row.get("normalized_user_text", "") or "",
+        normalized_assistant_text=row.get("normalized_assistant_text", "") or "",
         user_content=row["user_content"] or "",
         assistant_content=row["assistant_content"] or "",
         user_raw_content=row["user_raw_content"],
@@ -592,6 +604,11 @@ def _row_to_full_text(row: dict) -> FullTextRow:
         sender=row.get("sender", "") or "",
         fact_signals=fact_signals,
         code_refs=list(code_refs or []),
+        tagged_at=row.get("tagged_at") or None,
+        compacted_at=row.get("compacted_at") or None,
+        first_seen_at=row.get("first_seen_at") or None,
+        last_seen_at=row.get("last_seen_at") or None,
+        source_batch_id=str(row.get("source_batch_id", "") or "") or None,
         created_at=row.get("created_at", "") or "",
         updated_at=row.get("updated_at", "") or "",
     )
@@ -622,6 +639,23 @@ class PostgresStore(ContextStore):
             self._conn_local.conn = conn
             return conn
 
+    @contextmanager
+    def conversation_reconcile(self, conversation_id: str):
+        conn = self._get_conn()
+        now = _dt_to_str(datetime.now(timezone.utc))
+        with conn.transaction():
+            conn.execute(
+                """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+                VALUES (%s, 0, FALSE, %s)
+                ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
+                (conversation_id, now),
+            )
+            conn.execute(
+                "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
+                (conversation_id,),
+            ).fetchone()
+            yield
+
     def _ensure_schema(self) -> None:
         conn = self._get_conn()
         # Split SCHEMA_SQL by statements and execute individually
@@ -642,61 +676,6 @@ class PostgresStore(ContextStore):
             conn.execute("UPDATE segments SET summary_tsv = to_tsvector('english', COALESCE(summary, '')) WHERE summary_tsv IS NULL")
             conn.execute("UPDATE segments SET full_text_tsv = to_tsvector('english', COALESCE(full_text, '')) WHERE full_text_tsv IS NULL")
             conn.execute("UPDATE facts SET facts_tsv = to_tsvector('english', COALESCE(subject,'') || ' ' || COALESCE(verb,'') || ' ' || COALESCE(object,'') || ' ' || COALESCE(what,'')) WHERE facts_tsv IS NULL")
-            conn.execute("UPDATE turn_messages SET turn_tsv = to_tsvector('english', COALESCE(user_content,'') || ' ' || COALESCE(assistant_content,'')) WHERE turn_tsv IS NULL")
-            conn.execute("UPDATE full_text SET full_text_tsv = to_tsvector('english', COALESCE(user_content,'') || ' ' || COALESCE(assistant_content,'')) WHERE full_text_tsv IS NULL")
-        except Exception:
-            pass
-        # Migration: add raw_content columns to turn_messages
-        try:
-            conn.execute("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='turn_messages' AND column_name='user_raw_content') THEN
-                        ALTER TABLE turn_messages ADD COLUMN user_raw_content TEXT;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='turn_messages' AND column_name='assistant_raw_content') THEN
-                        ALTER TABLE turn_messages ADD COLUMN assistant_raw_content TEXT;
-                    END IF;
-                END $$;
-            """)
-        except Exception:
-            pass
-        try:
-            conn.execute("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='primary_tag') THEN
-                        ALTER TABLE full_text ADD COLUMN primary_tag TEXT NOT NULL DEFAULT '_general';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='tags_json') THEN
-                        ALTER TABLE full_text ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='session_date') THEN
-                        ALTER TABLE full_text ADD COLUMN session_date TEXT NOT NULL DEFAULT '';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='sender') THEN
-                        ALTER TABLE full_text ADD COLUMN sender TEXT NOT NULL DEFAULT '';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='fact_signals_json') THEN
-                        ALTER TABLE full_text ADD COLUMN fact_signals_json TEXT NOT NULL DEFAULT '[]';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='full_text' AND column_name='code_refs_json') THEN
-                        ALTER TABLE full_text ADD COLUMN code_refs_json TEXT NOT NULL DEFAULT '[]';
-                    END IF;
-                END $$;
-            """)
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_full_text_chunks_conversation ON full_text_chunks(conversation_id, turn_number, side)"
-            )
         except Exception:
             pass
         try:
@@ -823,10 +802,67 @@ class PostgresStore(ContextStore):
             )
         except Exception:
             logger.warning("request_context unique index setup failed", exc_info=True)
+        try:
+            self._ensure_canonical_turn_schema()
+            self._ensure_tag_summary_schema()
+            self._ensure_canonical_turn_views()
+        except Exception:
+            logger.warning("canonical turn bootstrap failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _ensure_canonical_turn_views(self) -> None:
+        conn = self._get_conn()
+        conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
+        conn.execute(
+            """CREATE VIEW canonical_turns_ordinal AS
+               SELECT
+                   ct.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ct.conversation_id
+                       ORDER BY ct.sort_key, ct.first_seen_at, ct.canonical_turn_id
+                   ) - 1 AS turn_number
+               FROM canonical_turns ct"""
+        )
+
+    def _ensure_canonical_turn_schema(self) -> None:
+        conn = self._get_conn()
+        for column in ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at"):
+            try:
+                conn.execute(
+                    f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP NOT NULL"
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP DEFAULT"
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    f"UPDATE canonical_turns SET {column} = NULL WHERE {column} = ''"
+                )
+            except Exception:
+                pass
+
+    def _ensure_tag_summary_schema(self) -> None:
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "ALTER TABLE tag_summaries ADD COLUMN source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
         conn = self._get_conn()
@@ -834,6 +870,41 @@ class PostgresStore(ContextStore):
             "SELECT tag FROM segment_tags WHERE segment_ref = %s ORDER BY tag", (ref,)
         ).fetchall()
         return [r["tag"] for r in rows]
+
+    def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT canonical_turn_id
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = %s AND turn_number = %s""",
+            (conversation_id, turn_number),
+        ).fetchone()
+        return str(row["canonical_turn_id"]) if row else None
+
+    def _lookup_ordinal_for_canonical_turn_id(self, conversation_id: str, canonical_turn_id: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT turn_number
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = %s AND canonical_turn_id = %s""",
+            (conversation_id, canonical_turn_id),
+        ).fetchone()
+        return int(row["turn_number"]) if row else -1
+
+    def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
+                      normalized_user_text, normalized_assistant_text, user_content, assistant_content,
+                      user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
+                      sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
+                      last_seen_at, source_batch_id, created_at, updated_at
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = %s
+               ORDER BY sort_key, canonical_turn_id""",
+            (conversation_id,),
+        ).fetchall()
+        return [_row_to_canonical_turn(row) for row in rows]
 
     def _batch_get_tags(self, refs: list[str]) -> dict[str, list[str]]:
         if not refs:
@@ -879,6 +950,7 @@ class PostgresStore(ContextStore):
             "date_references": segment.metadata.date_references,
             "code_refs": getattr(segment.metadata, "code_refs", []),
             "turn_count": segment.metadata.turn_count,
+            "canonical_turn_ids": getattr(segment.metadata, "canonical_turn_ids", []),
             "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
             "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
             "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
@@ -1255,9 +1327,10 @@ class PostgresStore(ContextStore):
             for table in (
                 "engine_state",
                 "facts",
-                "full_text",
-                "full_text_chunks",
-                "turn_messages",
+                "canonical_turns",
+                "canonical_turn_chunks",
+                "canonical_turn_anchors",
+                "ingest_batches",
                 "tag_summaries",
                 "tag_aliases",
                 "request_captures",
@@ -1288,20 +1361,25 @@ class PostgresStore(ContextStore):
         conn.execute(
             """INSERT INTO tag_summaries
             (tag, conversation_id, summary, description, code_refs, summary_tokens, source_segment_refs, source_turn_numbers,
-             covers_through_turn, generated_by_turn_id, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             source_canonical_turn_ids, covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (tag, conversation_id) DO UPDATE SET
                 summary=EXCLUDED.summary, description=EXCLUDED.description, code_refs=EXCLUDED.code_refs,
                 summary_tokens=EXCLUDED.summary_tokens,
                 source_segment_refs=EXCLUDED.source_segment_refs,
                 source_turn_numbers=EXCLUDED.source_turn_numbers,
+                source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
                 covers_through_turn=EXCLUDED.covers_through_turn,
+                covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
                 generated_by_turn_id=EXCLUDED.generated_by_turn_id,
                 updated_at=EXCLUDED.updated_at""",
             (tag_summary.tag, conversation_id, tag_summary.summary, getattr(tag_summary, "description", ""),
              json.dumps(getattr(tag_summary, "code_refs", []) or []),
              tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
-             json.dumps(tag_summary.source_turn_numbers), tag_summary.covers_through_turn,
+             json.dumps(tag_summary.source_turn_numbers),
+             json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+             tag_summary.covers_through_turn,
+             getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
              getattr(tag_summary, "generated_by_turn_id", "") or "",
              _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
         )
@@ -1318,7 +1396,9 @@ class PostgresStore(ContextStore):
             summary_tokens=row["summary_tokens"],
             source_segment_refs=json.loads(row["source_segment_refs"]),
             source_turn_numbers=json.loads(row["source_turn_numbers"]),
+            source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
             covers_through_turn=row["covers_through_turn"],
+            covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
             generated_by_turn_id=row.get("generated_by_turn_id", ""),
             created_at=_str_to_dt(row["created_at"]),
             updated_at=_str_to_dt(row["updated_at"]),
@@ -1341,7 +1421,9 @@ class PostgresStore(ContextStore):
                 summary_tokens=row["summary_tokens"],
                 source_segment_refs=json.loads(row["source_segment_refs"]),
                 source_turn_numbers=json.loads(row["source_turn_numbers"]),
+                source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
                 covers_through_turn=row["covers_through_turn"],
+                covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
                 generated_by_turn_id=row.get("generated_by_turn_id", ""),
                 created_at=_str_to_dt(row["created_at"]),
                 updated_at=_str_to_dt(row["updated_at"]),
@@ -1437,39 +1519,25 @@ class PostgresStore(ContextStore):
             ))
         return results
 
-    def search_canonical_full_text(
+    def search_canonical_turn_text(
         self,
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list[QuoteResult]:
         conn = self._get_conn()
-        rows = []
-        try:
-            sql = """SELECT turn_number, user_content, assistant_content, created_at,
-                            primary_tag, tags_json, session_date
-                     FROM full_text
-                     WHERE full_text_tsv @@ plainto_tsquery('english', %s)"""
-            params: list[object] = [query]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY ts_rank(full_text_tsv, plainto_tsquery('english', %s)) DESC, turn_number DESC LIMIT %s"
-            params.extend([query, limit])
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            pattern = f"%{query}%"
-            sql = """SELECT turn_number, user_content, assistant_content, created_at,
-                            primary_tag, tags_json, session_date
-                     FROM full_text
-                     WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
-            params = [pattern, pattern]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY turn_number DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
+        pattern = f"%{query}%"
+        sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
+                        primary_tag, tags_json, session_date
+                 FROM canonical_turns_ordinal
+                 WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
+        params: list[object] = [pattern, pattern]
+        if conversation_id is not None:
+            sql += " AND conversation_id = %s"
+            params.append(conversation_id)
+        sql += " ORDER BY sort_key DESC LIMIT %s"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
 
         results = []
         _sc = getattr(self, "search_config", None)
@@ -1495,7 +1563,7 @@ class PostgresStore(ContextStore):
             results.append(QuoteResult(
                 text=excerpt,
                 tag=primary_tag,
-                segment_ref=f"turn_{turn}",
+                segment_ref=f"canonical_turn_{row.get('canonical_turn_id', '') or turn}",
                 tags=list(tags or []),
                 match_type="full_text_search",
                 session_date=session_date,
@@ -1529,27 +1597,31 @@ class PostgresStore(ContextStore):
             for row in rows
         ]
 
-    def store_full_text_chunk_embeddings(
+    def store_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int,
         side: str,
-        chunks: list[FullTextChunkEmbedding],
+        chunks: list[CanonicalTurnChunkEmbedding],
+        canonical_turn_id: str | None = None,
     ) -> None:
         conn = self._get_conn()
+        canonical_turn_id = canonical_turn_id or self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+        if canonical_turn_id is None:
+            return
         with conn.transaction():
             conn.execute(
-                "DELETE FROM full_text_chunks WHERE conversation_id = %s AND turn_number = %s AND side = %s",
-                (conversation_id, turn_number, side),
+                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s AND side = %s",
+                (conversation_id, canonical_turn_id, side),
             )
             for chunk in chunks:
                 conn.execute(
-                    """INSERT INTO full_text_chunks
-                    (conversation_id, turn_number, side, chunk_index, text, embedding_json)
+                    """INSERT INTO canonical_turn_chunks
+                    (conversation_id, canonical_turn_id, side, chunk_index, text, embedding_json)
                     VALUES (%s,%s,%s,%s,%s,%s)""",
                     (
                         chunk.conversation_id,
-                        chunk.turn_number,
+                        canonical_turn_id,
                         chunk.side,
                         chunk.chunk_index,
                         chunk.text,
@@ -1557,28 +1629,35 @@ class PostgresStore(ContextStore):
                     ),
                 )
 
-    def get_all_full_text_chunk_embeddings(
+    def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
-    ) -> list[FullTextChunkEmbedding]:
+    ) -> list[CanonicalTurnChunkEmbedding]:
         conn = self._get_conn()
         if conversation_id is None:
             rows = conn.execute(
-                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
-                FROM full_text_chunks
-                ORDER BY conversation_id, turn_number, side, chunk_index"""
+                """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
+                FROM canonical_turn_chunks ctc
+                JOIN canonical_turns_ordinal cto
+                  ON cto.conversation_id = ctc.conversation_id
+                 AND cto.canonical_turn_id = ctc.canonical_turn_id
+                ORDER BY ctc.conversation_id, cto.turn_number, ctc.side, ctc.chunk_index"""
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT conversation_id, turn_number, side, chunk_index, text, embedding_json
-                FROM full_text_chunks
-                WHERE conversation_id = %s
-                ORDER BY turn_number, side, chunk_index""",
+                """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
+                FROM canonical_turn_chunks ctc
+                JOIN canonical_turns_ordinal cto
+                  ON cto.conversation_id = ctc.conversation_id
+                 AND cto.canonical_turn_id = ctc.canonical_turn_id
+                WHERE ctc.conversation_id = %s
+                ORDER BY cto.turn_number, ctc.side, ctc.chunk_index""",
                 (conversation_id,),
             ).fetchall()
         return [
-            FullTextChunkEmbedding(
+            CanonicalTurnChunkEmbedding(
                 conversation_id=row["conversation_id"],
+                canonical_turn_id=str(row.get("canonical_turn_id", "") or ""),
                 turn_number=row["turn_number"],
                 side=row["side"],
                 chunk_index=row["chunk_index"],
@@ -1588,21 +1667,26 @@ class PostgresStore(ContextStore):
             for row in rows
         ]
 
-    def delete_full_text_chunk_embeddings(
+    def delete_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int | None = None,
+        canonical_turn_id: str | None = None,
     ) -> int:
         conn = self._get_conn()
-        if turn_number is None:
+        if canonical_turn_id is None and turn_number is not None:
+            canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+        if turn_number is None and canonical_turn_id is None:
             cur = conn.execute(
-                "DELETE FROM full_text_chunks WHERE conversation_id = %s",
+                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s",
                 (conversation_id,),
             )
         else:
+            if canonical_turn_id is None:
+                return 0
             cur = conn.execute(
-                "DELETE FROM full_text_chunks WHERE conversation_id = %s AND turn_number = %s",
-                (conversation_id, turn_number),
+                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s",
+                (conversation_id, canonical_turn_id),
             )
         return int(cur.rowcount or 0)
 
@@ -1930,6 +2014,7 @@ class PostgresStore(ContextStore):
             "entries": [
                 {
                     "turn_number": e.turn_number,
+                    "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
                     "tags": e.tags,
                     "primary_tag": e.primary_tag,
                     "message_hash": e.message_hash,
@@ -2062,6 +2147,7 @@ class PostgresStore(ContextStore):
                 ))
             entries.append(TurnTagEntry(
                 turn_number=e["turn_number"], tags=e["tags"],
+                canonical_turn_id=e.get("canonical_turn_id", "") or "",
                 primary_tag=e.get("primary_tag", e["tags"][0] if e["tags"] else "_general"),
                 message_hash=e.get("message_hash", ""),
                 fact_signals=signals if signals else None,
@@ -2116,91 +2202,6 @@ class PostgresStore(ContextStore):
         return result
 
     # ------------------------------------------------------------------
-    # Turn messages
-    # ------------------------------------------------------------------
-
-    def save_turn_message(
-        self,
-        conversation_id: str,
-        turn_number: int,
-        user_content: str,
-        assistant_content: str,
-        user_raw_content: str | None = None,
-        assistant_raw_content: str | None = None,
-    ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO turn_messages
-            (conversation_id, turn_number, user_content, assistant_content,
-             user_raw_content, assistant_raw_content)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (conversation_id, turn_number) DO UPDATE SET
-                user_content=EXCLUDED.user_content,
-                assistant_content=EXCLUDED.assistant_content,
-                user_raw_content=EXCLUDED.user_raw_content,
-                assistant_raw_content=EXCLUDED.assistant_raw_content""",
-            (conversation_id, turn_number, user_content, assistant_content,
-             user_raw_content, assistant_raw_content),
-        )
-
-    def search_turn_messages(
-        self,
-        query: str,
-        limit: int = 5,
-        conversation_id: str | None = None,
-    ) -> list["QuoteResult"]:
-        """Search raw turn_messages with tsvector search and turn-backed excerpts."""
-        conn = self._get_conn()
-        rows = []
-        try:
-            sql = """SELECT turn_number, user_content, assistant_content
-                     FROM turn_messages
-                     WHERE turn_tsv @@ plainto_tsquery('english', %s)"""
-            params: list[object] = [query]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY ts_rank(turn_tsv, plainto_tsquery('english', %s)) DESC, turn_number DESC LIMIT %s"
-            params.extend([query, limit])
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            pattern = f"%{query}%"
-            sql = """SELECT turn_number, user_content, assistant_content
-                     FROM turn_messages
-                     WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
-            params = [pattern, pattern]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY turn_number DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-        results = []
-        _sc = getattr(self, "search_config", None)
-        _ctx = _sc.excerpt_context_chars if _sc else 200
-        for row in rows:
-            turn = row["turn_number"]
-            u = row["user_content"] or ""
-            a = row["assistant_content"] or ""
-            matched_side = _matched_turn_side(query, u, a)
-            excerpt = _build_turn_excerpt(
-                query,
-                u,
-                a,
-                matched_side,
-                context_chars=_ctx,
-            )
-            results.append(QuoteResult(
-                text=excerpt,
-                tag="uncompacted",
-                segment_ref=f"turn_{turn}",
-                match_type="turn_search",
-                source_scope="turn",
-                turn_number=turn,
-                matched_side=matched_side,
-            ))
-        return results
-
     def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
         conn = self._get_conn()
         conn.execute(
@@ -2225,58 +2226,7 @@ class PostgresStore(ContextStore):
             (alias_id,),
         )
 
-    def get_turn_messages(
-        self,
-        conversation_id: str,
-        turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str, str | None, str | None]]:
-        if not turn_numbers:
-            return {}
-        conn = self._get_conn()
-        placeholders = ",".join("%s" for _ in turn_numbers)
-        rows = conn.execute(
-            f"""SELECT turn_number, user_content, assistant_content,
-                       user_raw_content, assistant_raw_content
-            FROM turn_messages
-            WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
-            [conversation_id] + turn_numbers,
-        ).fetchall()
-        return {
-            row["turn_number"]: (
-                row["user_content"],
-                row["assistant_content"],
-                row["user_raw_content"],
-                row["assistant_raw_content"],
-            )
-            for row in rows
-        }
-
-    def load_recent_turn_messages(
-        self,
-        conversation_id: str,
-        limit: int = 100,
-    ) -> list[tuple[int, str, str]]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT turn_number, user_content, assistant_content
-            FROM turn_messages
-            WHERE conversation_id = %s
-            ORDER BY turn_number DESC
-            LIMIT %s""",
-            (conversation_id, limit),
-        ).fetchall()
-        return [(r["turn_number"], r["user_content"], r["assistant_content"]) for r in reversed(rows)]
-
-    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
-        conn = self._get_conn()
-        cur = conn.execute(
-            """DELETE FROM turn_messages
-            WHERE conversation_id = %s AND turn_number < %s""",
-            (conversation_id, keep_from_turn),
-        )
-        return int(cur.rowcount or 0)
-
-    def save_full_text(
+    def save_canonical_turn(
         self,
         conversation_id: str,
         turn_number: int,
@@ -2292,10 +2242,31 @@ class PostgresStore(ContextStore):
         code_refs: list[dict] | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
+        canonical_turn_id: str | None = None,
+        sort_key: float | None = None,
+        turn_hash: str = "",
+        hash_version: int = 0,
+        normalized_user_text: str = "",
+        normalized_assistant_text: str = "",
+        tagged_at: str | None = None,
+        compacted_at: str | None = None,
+        first_seen_at: str | None = None,
+        last_seen_at: str | None = None,
+        source_batch_id: str | None = None,
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
         updated = updated_at or now
+        first_seen = first_seen_at or created
+        last_seen = last_seen_at or updated
+        if not turn_hash:
+            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+                user_content,
+                assistant_content,
+                version=hash_version or HASH_VERSION,
+            )
+        if not hash_version:
+            hash_version = HASH_VERSION
         fact_signal_payload = [
             {
                 "subject": fs.subject,
@@ -2308,13 +2279,47 @@ class PostgresStore(ContextStore):
             for fs in (fact_signals or [])
         ]
         conn = self._get_conn()
+        if canonical_turn_id is None and turn_number >= 0:
+            slot_row = conn.execute(
+                "SELECT canonical_turn_id FROM canonical_turns WHERE conversation_id = %s AND sort_key = %s",
+                (conversation_id, float((turn_number + 1) * 1000.0)),
+            ).fetchone()
+            canonical_turn_id = str(slot_row["canonical_turn_id"]) if slot_row else None
+        existing_sort_key = None
+        if canonical_turn_id:
+            existing = conn.execute(
+                "SELECT sort_key FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
+                (conversation_id, canonical_turn_id),
+            ).fetchone()
+            if existing:
+                existing_sort_key = float(existing["sort_key"])
+        if canonical_turn_id is None:
+            canonical_turn_id = generate_canonical_turn_id()
+        if sort_key is None:
+            if existing_sort_key is not None:
+                sort_key = existing_sort_key
+            elif turn_number >= 0:
+                sort_key = float((turn_number + 1) * 1000.0)
+            else:
+                tail = conn.execute(
+                    "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key FROM canonical_turns WHERE conversation_id = %s",
+                    (conversation_id,),
+                ).fetchone()
+                sort_key = float((tail["max_sort_key"] or 0.0) + 1000.0)
         conn.execute(
-            """INSERT INTO full_text
-            (conversation_id, turn_number, user_content, assistant_content,
-             user_raw_content, assistant_raw_content, primary_tag, tags_json,
-             session_date, sender, fact_signals_json, code_refs_json, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (conversation_id, turn_number) DO UPDATE SET
+            """INSERT INTO canonical_turns
+            (canonical_turn_id, conversation_id, sort_key, turn_hash, hash_version,
+             normalized_user_text, normalized_assistant_text, user_content, assistant_content,
+             user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
+             fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
+             source_batch_id, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (canonical_turn_id) DO UPDATE SET
+                sort_key=EXCLUDED.sort_key,
+                turn_hash=EXCLUDED.turn_hash,
+                hash_version=EXCLUDED.hash_version,
+                normalized_user_text=EXCLUDED.normalized_user_text,
+                normalized_assistant_text=EXCLUDED.normalized_assistant_text,
                 user_content=EXCLUDED.user_content,
                 assistant_content=EXCLUDED.assistant_content,
                 user_raw_content=EXCLUDED.user_raw_content,
@@ -2325,10 +2330,19 @@ class PostgresStore(ContextStore):
                 sender=EXCLUDED.sender,
                 fact_signals_json=EXCLUDED.fact_signals_json,
                 code_refs_json=EXCLUDED.code_refs_json,
+                tagged_at=EXCLUDED.tagged_at,
+                compacted_at=EXCLUDED.compacted_at,
+                last_seen_at=EXCLUDED.last_seen_at,
+                source_batch_id=EXCLUDED.source_batch_id,
                 updated_at=EXCLUDED.updated_at""",
             (
+                canonical_turn_id,
                 conversation_id,
-                turn_number,
+                sort_key,
+                turn_hash,
+                hash_version,
+                normalized_user_text,
+                normalized_assistant_text,
                 user_content,
                 assistant_content,
                 user_raw_content,
@@ -2339,52 +2353,111 @@ class PostgresStore(ContextStore):
                 sender or "",
                 json.dumps(fact_signal_payload),
                 json.dumps(list(code_refs or [])),
+                tagged_at,
+                compacted_at,
+                first_seen,
+                last_seen,
+                source_batch_id,
                 created,
                 updated,
             ),
         )
 
-    def get_full_text_rows(
+    def get_canonical_turn_rows(
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, FullTextRow]:
+    ) -> dict[int, CanonicalTurnRow]:
         if not turn_numbers:
             return {}
         conn = self._get_conn()
         placeholders = ",".join("%s" for _ in turn_numbers)
         rows = conn.execute(
-            f"""SELECT conversation_id, turn_number, user_content, assistant_content,
+            f"""SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
+                       normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                        user_raw_content, assistant_raw_content, primary_tag, tags_json,
                        session_date, sender, fact_signals_json, code_refs_json,
+                       tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id,
                        created_at, updated_at
-            FROM full_text
+            FROM canonical_turns_ordinal
             WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
             [conversation_id] + turn_numbers,
         ).fetchall()
         return {
-            row["turn_number"]: _row_to_full_text(row)
+            row["turn_number"]: _row_to_canonical_turn(row)
             for row in rows
         }
 
-    def get_all_full_text_rows(
+    def get_all_canonical_turns(
         self,
         conversation_id: str,
-    ) -> list[FullTextRow]:
+    ) -> list[CanonicalTurnRow]:
+        return self._load_canonical_turn_rows(conversation_id)
+
+    def get_uncompacted_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        protected_recent_turns: int = 0,
+    ) -> list[CanonicalTurnRow]:
         conn = self._get_conn()
         rows = conn.execute(
-            """SELECT conversation_id, turn_number, user_content, assistant_content,
+            """SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
+                      normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                       user_raw_content, assistant_raw_content, primary_tag, tags_json,
                       session_date, sender, fact_signals_json, code_refs_json,
+                      tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id,
                       created_at, updated_at
-               FROM full_text
-               WHERE conversation_id = %s
-               ORDER BY turn_number""",
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = %s AND compacted_at IS NULL
+               ORDER BY sort_key, canonical_turn_id""",
             (conversation_id,),
         ).fetchall()
-        return [_row_to_full_text(row) for row in rows]
+        if protected_recent_turns > 0 and len(rows) > protected_recent_turns:
+            rows = rows[:-protected_recent_turns]
+        elif protected_recent_turns > 0:
+            rows = []
+        return [_row_to_canonical_turn(row) for row in rows]
 
-    def delete_full_text_rows(
+    def mark_canonical_turns_tagged(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        tagged_at: str | None = None,
+    ) -> int:
+        if not canonical_turn_ids:
+            return 0
+        conn = self._get_conn()
+        timestamp = tagged_at or _dt_to_str(datetime.now(timezone.utc))
+        rows = conn.execute(
+            """UPDATE canonical_turns
+               SET tagged_at = %s, updated_at = %s
+               WHERE conversation_id = %s AND canonical_turn_id = ANY(%s)""",
+            (timestamp, timestamp, conversation_id, canonical_turn_ids),
+        )
+        return int(rows.rowcount or 0)
+
+    def mark_canonical_turns_compacted(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        compacted_at: str | None = None,
+    ) -> int:
+        if not canonical_turn_ids:
+            return 0
+        conn = self._get_conn()
+        timestamp = compacted_at or _dt_to_str(datetime.now(timezone.utc))
+        rows = conn.execute(
+            """UPDATE canonical_turns
+               SET compacted_at = %s, updated_at = %s
+               WHERE conversation_id = %s AND canonical_turn_id = ANY(%s)""",
+            (timestamp, timestamp, conversation_id, canonical_turn_ids),
+        )
+        return int(rows.rowcount or 0)
+
+    def delete_canonical_turns(
         self,
         conversation_id: str,
         turn_number: int | None = None,
@@ -2392,13 +2465,16 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         if turn_number is None:
             cur = conn.execute(
-                "DELETE FROM full_text WHERE conversation_id = %s",
+                "DELETE FROM canonical_turns WHERE conversation_id = %s",
                 (conversation_id,),
             )
         else:
+            canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+            if canonical_turn_id is None:
+                return 0
             cur = conn.execute(
-                "DELETE FROM full_text WHERE conversation_id = %s AND turn_number = %s",
-                (conversation_id, turn_number),
+                "DELETE FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
+                (conversation_id, canonical_turn_id),
             )
         return int(cur.rowcount or 0)
 
@@ -3032,6 +3108,39 @@ class PostgresStore(ContextStore):
                     d[json_field] = []
             result.append(d)
         return result
+
+    def save_ingest_batch(self, batch: dict) -> str:
+        conn = self._get_conn()
+        batch_id = str(batch.get("batch_id", "") or generate_canonical_turn_id())
+        conn.execute(
+            """INSERT INTO ingest_batches
+            (batch_id, conversation_id, received_at, raw_turn_count, merge_mode,
+             turns_matched, turns_appended, turns_prepended, turns_inserted,
+             first_turn_hash, last_turn_hash)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (batch_id) DO UPDATE SET
+                merge_mode = EXCLUDED.merge_mode,
+                turns_matched = EXCLUDED.turns_matched,
+                turns_appended = EXCLUDED.turns_appended,
+                turns_prepended = EXCLUDED.turns_prepended,
+                turns_inserted = EXCLUDED.turns_inserted,
+                first_turn_hash = EXCLUDED.first_turn_hash,
+                last_turn_hash = EXCLUDED.last_turn_hash""",
+            (
+                batch_id,
+                batch.get("conversation_id", ""),
+                batch.get("received_at", "") or utcnow_iso(),
+                int(batch.get("raw_turn_count", 0) or 0),
+                batch.get("merge_mode", "") or "",
+                int(batch.get("turns_matched", 0) or 0),
+                int(batch.get("turns_appended", 0) or 0),
+                int(batch.get("turns_prepended", 0) or 0),
+                int(batch.get("turns_inserted", 0) or 0),
+                batch.get("first_turn_hash", "") or "",
+                batch.get("last_turn_hash", "") or "",
+            ),
+        )
+        return batch_id
 
     # ------------------------------------------------------------------
     # Lifecycle

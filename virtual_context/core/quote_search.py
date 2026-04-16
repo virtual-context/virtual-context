@@ -1105,10 +1105,10 @@ def _search_find_quote_candidates(
         semantic_limit = max(1, min(limit // 3, 8))
         lexical_limit = max(1, limit - semantic_limit)
 
-    search_full_text = getattr(store, "search_canonical_full_text", None)
-    if callable(search_full_text):
+    search_turn_text = getattr(store, "search_canonical_turn_text", None)
+    if callable(search_turn_text):
         results.extend(
-            search_full_text(
+            search_turn_text(
                 query,
                 limit=lexical_limit,
                 conversation_id=conversation_id,
@@ -1120,7 +1120,7 @@ def _search_find_quote_candidates(
 
     if semantic_limit > 0:
         results.extend(
-            semantic.semantic_full_text_search(
+            semantic.semantic_canonical_turn_search(
                 query,
                 max_results=semantic_limit,
                 conversation_id=conversation_id,
@@ -2963,7 +2963,7 @@ def find_quote(
     mode: str = "lookup",
     conversation_id: str | None = None,
 ) -> dict:
-    """Search canonical archived full_text only."""
+    """Search canonical archived turns only."""
     if not query.strip():
         return {"error": "empty query"}
 
