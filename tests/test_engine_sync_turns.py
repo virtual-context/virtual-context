@@ -519,6 +519,59 @@ def test_sync_concurrent_writers_do_not_duplicate_rows(engine, monkeypatch):
     assert len({row.canonical_turn_id for row in rows}) == 4
 
 
+def test_proxy_single_ingest_vs_rest_batch_concurrent(engine, monkeypatch):
+    # Two writers hit the same conversation at once: a proxy-style single
+    # ingest and a REST-style batch sync covering overlapping turns.
+    # conversation_reconcile serializes them per conversation, so the result
+    # should be duplicate-free with unique canonical_turn_ids and distinct
+    # turn_group_numbers per turn-group.
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    monkeypatch.setattr(engine._semantic, "embed_and_store_turn", lambda *args, **kwargs: None)
+
+    rest_body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Shared user 1"},
+            {"role": "assistant", "content": "Shared assistant 1"},
+            {"role": "user", "content": "Shared user 2"},
+            {"role": "assistant", "content": "Shared assistant 2"},
+        ],
+    }
+    fmt = detect_format(rest_body)
+
+    def _proxy_writer():
+        reconciler = IngestReconciler(_inner_store(engine), engine._semantic)
+        return reconciler.ingest_single(
+            "test-conv-sync",
+            user_content="Shared user 1",
+            assistant_content="Shared assistant 1",
+        )
+
+    def _rest_writer():
+        return engine.sync_turns_from_payload(rest_body, fmt)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_proxy = pool.submit(_proxy_writer)
+        future_rest = pool.submit(_rest_writer)
+        future_proxy.result()
+        future_rest.result()
+
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert len(rows) == 4
+    assert len({row.canonical_turn_id for row in rows}) == 4
+
+    # turn_group_number should pair user+assistant into 2 groups. Each group
+    # gets a unique non-negative number; proxy path writes a single row with
+    # both user_content and assistant_content populated (its own group).
+    group_numbers = {row.turn_group_number for row in rows}
+    assert -1 not in group_numbers, "legacy placeholder should not leak from concurrent writes"
+    assert len(group_numbers) >= 2, f"expected multiple distinct turn_group_numbers, got {group_numbers}"
+
+    # Watermark invariant: flushed <= compacted at every hydration.
+    assert engine._engine_state.flushed_prefix_messages <= engine._engine_state.compacted_prefix_messages
+
+
 def test_sync_logs_embedding_failures_without_aborting_ingest(engine, monkeypatch, caplog):
     body = {
         "model": "gpt-4o",

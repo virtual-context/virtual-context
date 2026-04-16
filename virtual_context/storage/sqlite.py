@@ -1269,7 +1269,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchone()
         return int(row["turn_number"]) if row else -1
 
-    def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
+    def _load_canonical_turn_rows_raw(self, conversation_id: str) -> list[CanonicalTurnRow]:
         conn = self._get_conn()
         rows = conn.execute(
             """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
@@ -1283,6 +1283,25 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (conversation_id,),
         ).fetchall()
         return [_row_to_canonical_turn(row) for row in rows]
+
+    def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
+        # Lazy backfill: conversations ingested before turn_group_number was
+        # introduced sit at -1 on every row and rely on the content-heuristic
+        # fallback in _merge_canonical_turn_rows forever. Detect the all-legacy
+        # case at read time and trigger a one-shot recompute so subsequent
+        # reads use explicit groups (faster, deterministic under edits).
+        rows = self._load_canonical_turn_rows_raw(conversation_id)
+        if rows and all(r.turn_group_number < 0 for r in rows):
+            try:
+                self.recompute_canonical_turn_groups(conversation_id)
+                rows = self._load_canonical_turn_rows_raw(conversation_id)
+            except Exception:
+                logger.warning(
+                    "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+        return rows
 
     def _repair_fts_if_needed(self, conn: sqlite3.Connection) -> None:
         """Check FTS indexes and rebuild only if corrupted.
@@ -2769,7 +2788,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         self,
         conversation_id: str,
     ) -> int:
-        rows = self.get_all_canonical_turns(conversation_id)
+        # Use the raw loader to avoid recursion: the non-raw loader triggers
+        # this method on legacy (all -1) conversations.
+        rows = self._load_canonical_turn_rows_raw(conversation_id)
         if not rows:
             return 0
 
