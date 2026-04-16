@@ -385,76 +385,149 @@ def _filtered_chat_messages(messages: list[dict], fmt: "PayloadFormat") -> list[
     ]
 
 
+def extract_ingestible_messages(
+    body: dict,
+    fmt: "PayloadFormat",
+) -> tuple[list["Message"], dict[str, int]]:
+    """Return the normalized chat entries that should become canonical rows.
+
+    This is the single ingest contract for both REST and proxy-facing payload
+    accounting. Only explicit transport/tool scaffolding is skipped:
+
+    - non-chat entries (tool messages, bare function items, etc.)
+    - tool_result carrier user entries
+    - assistant/model entries with no textual payload
+    - empty user entries
+    """
+    from ..types import Message
+
+    raw_input = body.get("input")
+    if isinstance(raw_input, str) and raw_input.strip():
+        return [], {
+            "normalized_payload_entry_count": 0,
+            "normalized_chat_entry_count": 0,
+            "normalized_non_chat_entry_count": 0,
+            "ingestible_entry_count": 0,
+            "skipped_non_chat_entry_count": 0,
+            "skipped_tool_result_entry_count": 0,
+            "skipped_assistant_tool_only_entry_count": 0,
+            "skipped_empty_chat_entry_count": 0,
+        }
+
+    messages = fmt.get_messages(body)
+    assistant_roles = _assistant_roles_for_format(fmt)
+    stats = {
+        "normalized_payload_entry_count": len(messages),
+        "normalized_chat_entry_count": 0,
+        "normalized_non_chat_entry_count": 0,
+        "ingestible_entry_count": 0,
+        "skipped_non_chat_entry_count": 0,
+        "skipped_tool_result_entry_count": 0,
+        "skipped_assistant_tool_only_entry_count": 0,
+        "skipped_empty_chat_entry_count": 0,
+    }
+    ingestible: list[Message] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            stats["normalized_non_chat_entry_count"] += 1
+            stats["skipped_non_chat_entry_count"] += 1
+            continue
+
+        role = str(msg.get("role") or "")
+        if fmt.name == "openai_responses" and hasattr(fmt, "_is_bare_item"):
+            try:
+                if getattr(fmt, "_is_bare_item")(msg):
+                    stats["normalized_non_chat_entry_count"] += 1
+                    stats["skipped_non_chat_entry_count"] += 1
+                    continue
+            except Exception:
+                pass
+
+        normalized_role = ""
+        if role == "user":
+            normalized_role = "user"
+        elif role in assistant_roles:
+            normalized_role = "assistant"
+        elif role == "model":
+            normalized_role = "assistant"
+        else:
+            stats["normalized_non_chat_entry_count"] += 1
+            stats["skipped_non_chat_entry_count"] += 1
+            continue
+
+        stats["normalized_chat_entry_count"] += 1
+
+        content = msg.get("content", "")
+        if normalized_role == "user" and isinstance(content, list):
+            has_tool_result = any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
+            if has_tool_result:
+                stats["skipped_tool_result_entry_count"] += 1
+                continue
+
+        text = fmt.extract_message_text(msg)
+        meta = {}
+        extract_with_meta = getattr(fmt, "extract_message_text_with_meta", None)
+        if callable(extract_with_meta):
+            try:
+                meta_text, meta = extract_with_meta(msg)
+                if meta_text.strip():
+                    text = meta_text
+            except Exception:
+                meta = {}
+        text = _strip_envelope(text)
+        if not text.strip():
+            if normalized_role == "assistant":
+                stats["skipped_assistant_tool_only_entry_count"] += 1
+            else:
+                stats["skipped_empty_chat_entry_count"] += 1
+            continue
+
+        timestamp = extract_timestamp_from_metadata(meta) if meta else None
+        raw_content = content if isinstance(content, list) else None
+        ingestible.append(
+            Message(
+                role=normalized_role,
+                content=text,
+                timestamp=timestamp,
+                metadata=meta or None,
+                raw_content=raw_content,
+            )
+        )
+
+    stats["ingestible_entry_count"] = len(ingestible)
+    return ingestible, stats
+
+
 def summarize_payload_accounting(
     body: dict,
     fmt: "PayloadFormat",
     *,
     raw_summary: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Summarize how raw payload entries become normalized conversational history."""
+    """Summarize how raw payload entries become normalized ingestible entries."""
     messages = fmt.get_messages(body)
-    chat_msgs = _filtered_chat_messages(messages, fmt)
-    assistant_roles = _assistant_roles_for_format(fmt)
-    trailing_user_entries_dropped = 0
-    if chat_msgs and chat_msgs[-1].get("role") == "user":
-        chat_msgs = chat_msgs[:-1]
-        trailing_user_entries_dropped = 1
-
-    tool_result_user_entries_folded = 0
-    assistant_tool_only_entries_folded = 0
-    tool_followup_pairs = 0
-
-    last_real_user: bool = False
-    i = 0
-    while i + 1 < len(chat_msgs):
-        current = chat_msgs[i]
-        nxt = chat_msgs[i + 1]
-        if current.get("role") == "user" and nxt.get("role") in assistant_roles:
-            current_content = current.get("content", "")
-            is_tool_result_user = False
-            if isinstance(current_content, list):
-                ctypes = {b.get("type") for b in current_content if isinstance(b, dict)}
-                is_tool_result_user = bool(ctypes and ctypes <= {"tool_result"})
-
-            assistant_text = fmt.extract_message_text(nxt).strip()
-            if is_tool_result_user:
-                tool_result_user_entries_folded += 1
-                if assistant_text and last_real_user:
-                    tool_followup_pairs += 1
-                    last_real_user = False
-                i += 2
-                continue
-
-            if assistant_text:
-                assistant_content = nxt.get("content", "")
-                has_tool_use = False
-                if isinstance(assistant_content, list):
-                    has_tool_use = any(
-                        isinstance(block, dict) and block.get("type") == "tool_use"
-                        for block in assistant_content
-                    )
-                last_real_user = has_tool_use
-            else:
-                assistant_tool_only_entries_folded += 1
-                last_real_user = True
-            i += 2
-            continue
-        i += 1
-
-    extracted_history_messages = len(fmt.extract_history_pairs(body))
-    extracted_history_pairs = extracted_history_messages // 2
+    _, ingest_stats = extract_ingestible_messages(body, fmt)
 
     summary = {
         "normalized_payload_entry_count": len(messages),
         "normalized_role_counts": _count_message_roles(messages),
-        "normalized_chat_entry_count": len(chat_msgs) + trailing_user_entries_dropped,
-        "normalized_non_chat_entry_count": len(messages) - (len(chat_msgs) + trailing_user_entries_dropped),
-        "trailing_user_entries_dropped": trailing_user_entries_dropped,
-        "tool_result_user_entries_folded": tool_result_user_entries_folded,
-        "assistant_tool_only_entries_folded": assistant_tool_only_entries_folded,
-        "tool_followup_pairs": tool_followup_pairs,
-        "extracted_history_message_count": extracted_history_messages,
-        "extracted_history_pair_count": extracted_history_pairs,
+        "normalized_chat_entry_count": ingest_stats["normalized_chat_entry_count"],
+        "normalized_non_chat_entry_count": ingest_stats["normalized_non_chat_entry_count"],
+        "ingestible_entry_count": ingest_stats["ingestible_entry_count"],
+        "skipped_non_chat_entry_count": ingest_stats["skipped_non_chat_entry_count"],
+        "skipped_tool_result_entry_count": ingest_stats["skipped_tool_result_entry_count"],
+        "skipped_assistant_tool_only_entry_count": ingest_stats["skipped_assistant_tool_only_entry_count"],
+        "skipped_empty_chat_entry_count": ingest_stats["skipped_empty_chat_entry_count"],
+        "skipped_scaffolding_entry_count": (
+            ingest_stats["skipped_non_chat_entry_count"]
+            + ingest_stats["skipped_tool_result_entry_count"]
+            + ingest_stats["skipped_assistant_tool_only_entry_count"]
+            + ingest_stats["skipped_empty_chat_entry_count"]
+        ),
     }
     if raw_summary:
         summary.update(raw_summary)

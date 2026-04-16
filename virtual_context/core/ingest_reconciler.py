@@ -59,54 +59,65 @@ class IngestReconciler:
     ) -> CanonicalIngestResult:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
-            prepared = self._prepare_turn(
-                conversation_id,
-                0,
-                user_content,
-                assistant_content,
-                user_raw_content=user_raw_content,
-                assistant_raw_content=assistant_raw_content,
-                primary_tag=primary_tag,
-                tags=tags,
-                session_date=session_date,
-                sender=sender,
-                fact_signals=fact_signals,
-                code_refs=code_refs,
-            )
-
-            for row in reversed(existing[-5:]):
-                if row.turn_hash != prepared.turn_hash:
-                    continue
-                if self._seen_recently(row.last_seen_at):
-                    self._write_turn(
-                        row,
-                        turn_number=self._ordinal_for_row(existing, row.canonical_turn_id),
-                        first_seen_at=row.first_seen_at or prepared.first_seen_at,
-                        last_seen_at=prepared.last_seen_at,
-                    )
+            prepared = [
+                self._prepare_message_row(
+                    conversation_id,
+                    role="user",
+                    content=user_content,
+                    raw_content=user_raw_content,
+                    primary_tag=primary_tag,
+                    tags=tags,
+                    session_date=session_date,
+                    sender=sender,
+                    fact_signals=fact_signals,
+                    code_refs=code_refs,
+                ),
+                self._prepare_message_row(
+                    conversation_id,
+                    role="assistant",
+                    content=assistant_content,
+                    raw_content=assistant_raw_content,
+                    primary_tag=primary_tag,
+                    tags=tags,
+                    session_date=session_date,
+                    sender=sender,
+                    fact_signals=fact_signals,
+                    code_refs=code_refs,
+                ),
+            ]
+            if len(existing) >= len(prepared):
+                recent = existing[-len(prepared):]
+                if (
+                    [row.turn_hash for row in recent] == [row.turn_hash for row in prepared]
+                    and all(self._seen_recently(row.last_seen_at or "") for row in recent)
+                ):
+                    for idx, row in enumerate(prepared):
+                        existing_row = recent[idx]
+                        row.canonical_turn_id = existing_row.canonical_turn_id
+                        row.sort_key = existing_row.sort_key
+                        row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
+                        row.last_seen_at = utcnow_iso()
+                        self._write_turn(
+                            row,
+                            turn_number=self._ordinal_for_row(existing, existing_row.canonical_turn_id),
+                            first_seen_at=row.first_seen_at,
+                            last_seen_at=row.last_seen_at,
+                        )
                     self._refresh_persisted_anchors(conversation_id)
                     return CanonicalIngestResult(
                         merge_mode="exact_resend",
                         turns_written=0,
-                        turns_matched=1,
+                        turns_matched=len(prepared),
                         turns_appended=0,
                         turns_prepended=0,
                         turns_inserted=0,
-                        rows=[row],
+                        rows=recent,
                     )
-
-            prepared.canonical_turn_id = generate_canonical_turn_id()
-            prepared.sort_key = default_sort_key(existing)
-            self._write_turn(prepared, turn_number=len(existing))
-            self._refresh_persisted_anchors(conversation_id)
-            return CanonicalIngestResult(
-                merge_mode="tail_append",
-                turns_written=1,
-                turns_matched=0,
-                turns_appended=1,
-                turns_prepended=0,
-                turns_inserted=0,
-                rows=[prepared],
+            return self._ingest_prepared_turns_locked(
+                conversation_id,
+                prepared_turns=prepared,
+                raw_turn_count=len(prepared),
+                existing=existing,
             )
 
     def ingest_batch(
@@ -115,18 +126,18 @@ class IngestReconciler:
         *,
         body: dict,
         fmt: Any,
-        turn_entries: Any = None,
     ) -> CanonicalIngestResult:
-        pairs = self._extract_pairs_from_payload(body, fmt)
+        from ..proxy.formats import extract_ingestible_messages
+
+        entries, _stats = extract_ingestible_messages(body, fmt)
         prepared = [
-            self._prepare_turn(
+            self._prepare_message_row(
                 conversation_id,
-                idx,
-                user_text,
-                assistant_text,
-                entry=self._resolve_entry(turn_entries, idx),
+                role=message.role,
+                content=message.content,
+                raw_content=message.raw_content,
             )
-            for idx, (user_text, assistant_text) in enumerate(pairs)
+            for message in entries
         ]
         return self.ingest_prepared_turns(
             conversation_id,
@@ -143,174 +154,154 @@ class IngestReconciler:
     ) -> CanonicalIngestResult:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
-            if not prepared_turns:
-                logger.info(
-                    "INGEST_EMPTY_PAYLOAD: conv=%s raw_turn_count=%d",
-                    conversation_id[:12],
-                    raw_turn_count,
-                )
-                batch = self._save_batch(
-                    conversation_id,
-                    raw_turn_count=0,
-                    merge_mode="empty_payload",
-                    first_turn_hash="",
-                    last_turn_hash="",
-                    turns_matched=0,
-                    turns_appended=0,
-                    turns_prepended=0,
-                    turns_inserted=0,
-                )
-                return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
-
-            alignment = self._find_alignment(conversation_id, existing, prepared_turns)
-            merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
-            turns_written = 0
-            turns_matched = 0
-            turns_appended = 0
-            turns_prepended = 0
-            turns_inserted = 0
-            batch_id = generate_canonical_turn_id()
-            now = utcnow_iso()
-            rows_touched: list[CanonicalTurnRow] = []
-
-            if not existing:
-                merge_mode = "no_overlap_append"
-                for idx, row in enumerate(prepared_turns):
-                    row.canonical_turn_id = generate_canonical_turn_id()
-                    row.sort_key = float((idx + 1) * 1000.0)
-                    row.source_batch_id = batch_id
-                    row.last_seen_at = now
-                    self._write_turn(row, turn_number=idx)
-                    rows_touched.append(row)
-                    turns_written += 1
-                    turns_appended += 1
-            elif alignment is None:
-                start_key = default_sort_key(existing)
-                for idx, row in enumerate(prepared_turns):
-                    row.canonical_turn_id = generate_canonical_turn_id()
-                    row.sort_key = start_key + (1000.0 * idx)
-                    row.source_batch_id = batch_id
-                    row.last_seen_at = now
-                    self._write_turn(row, turn_number=len(existing) + idx)
-                    rows_touched.append(row)
-                    turns_written += 1
-                    turns_appended += 1
-            else:
-                overlap_existing = existing[alignment.existing_start:alignment.existing_start + alignment.overlap_len]
-                overlap_incoming = prepared_turns[alignment.incoming_start:alignment.incoming_start + alignment.overlap_len]
-                for offset, row in enumerate(overlap_incoming):
-                    existing_row = overlap_existing[offset]
-                    row.canonical_turn_id = existing_row.canonical_turn_id
-                    row.sort_key = existing_row.sort_key
-                    row.source_batch_id = batch_id
-                    row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
-                    row.last_seen_at = now
-                    self._write_turn(row, turn_number=alignment.existing_start + offset)
-                    rows_touched.append(row)
-                    turns_matched += 1
-
-                prefix = prepared_turns[:alignment.incoming_start]
-                if prefix:
-                    left_key = existing[alignment.existing_start - 1].sort_key if alignment.existing_start > 0 else None
-                    right_key = existing[alignment.existing_start].sort_key
-                    for row, key in zip(prefix, self._allocate_sort_keys(left_key, right_key, len(prefix))):
-                        row.canonical_turn_id = generate_canonical_turn_id()
-                        row.sort_key = key
-                        row.source_batch_id = batch_id
-                        row.last_seen_at = now
-                        self._write_turn(row, turn_number=-1)
-                        rows_touched.append(row)
-                        turns_written += 1
-                        if merge_mode == "prefix_widening":
-                            turns_prepended += 1
-                        else:
-                            turns_inserted += 1
-
-                suffix = prepared_turns[alignment.incoming_start + alignment.overlap_len:]
-                if suffix:
-                    left_idx = alignment.existing_start + alignment.overlap_len - 1
-                    left_key = existing[left_idx].sort_key if left_idx >= 0 else None
-                    next_existing_idx = alignment.existing_start + alignment.overlap_len
-                    right_key = existing[next_existing_idx].sort_key if next_existing_idx < len(existing) else None
-                    for row, key in zip(suffix, self._allocate_sort_keys(left_key, right_key, len(suffix))):
-                        row.canonical_turn_id = generate_canonical_turn_id()
-                        row.sort_key = key
-                        row.source_batch_id = batch_id
-                        row.last_seen_at = now
-                        self._write_turn(row, turn_number=-1)
-                        rows_touched.append(row)
-                        turns_written += 1
-                        if merge_mode == "tail_append":
-                            turns_appended += 1
-                        else:
-                            turns_inserted += 1
-
-            batch = self._save_batch(
+            return self._ingest_prepared_turns_locked(
                 conversation_id,
+                prepared_turns=prepared_turns,
                 raw_turn_count=raw_turn_count,
-                merge_mode=merge_mode,
-                first_turn_hash=prepared_turns[0].turn_hash,
-                last_turn_hash=prepared_turns[-1].turn_hash,
-                turns_matched=turns_matched,
-                turns_appended=turns_appended,
-                turns_prepended=turns_prepended,
-                turns_inserted=turns_inserted,
-                batch_id=batch_id,
-            )
-            self._refresh_persisted_anchors(conversation_id)
-            return CanonicalIngestResult(
-                merge_mode=merge_mode,
-                turns_written=turns_written,
-                turns_matched=turns_matched,
-                turns_appended=turns_appended,
-                turns_prepended=turns_prepended,
-                turns_inserted=turns_inserted,
-                batch=batch,
-                rows=rows_touched,
+                existing=existing,
             )
 
-    def _extract_pairs_from_payload(self, body: dict, fmt: Any) -> list[tuple[str, str]]:
-        messages = fmt.get_messages(body)
-        if not messages:
-            return []
-        raw_input = body.get("input")
-        if isinstance(raw_input, str) and raw_input.strip():
-            return []
-        turns = fmt.group_into_turns(body)
-        assistant_roles = {"assistant", "model"}
-        pairs: list[tuple[str, str]] = []
-        for turn in turns:
-            user_parts: list[str] = []
-            assistant_parts: list[str] = []
-            for idx in turn.indices:
-                if idx >= len(messages):
-                    continue
-                msg = messages[idx]
-                if not isinstance(msg, dict):
-                    continue
-                text = fmt.extract_message_text(msg)
-                if not text:
-                    continue
-                role = msg.get("role", "")
-                if role == "user":
-                    user_parts.append(text)
-                elif role in assistant_roles:
-                    assistant_parts.append(text)
-            user_text = "\n".join(user_parts)
-            assistant_text = "\n".join(assistant_parts)
-            if user_text or assistant_text:
-                pairs.append((user_text, assistant_text))
-        return pairs
-
-    def _prepare_turn(
+    def _ingest_prepared_turns_locked(
         self,
         conversation_id: str,
-        turn_number: int,
-        user_content: str,
-        assistant_content: str,
         *,
-        user_raw_content: str | None = None,
-        assistant_raw_content: str | None = None,
+        prepared_turns: list[CanonicalTurnRow],
+        raw_turn_count: int,
+        existing: list[CanonicalTurnRow],
+    ) -> CanonicalIngestResult:
+        if not prepared_turns:
+            logger.info(
+                "INGEST_EMPTY_PAYLOAD: conv=%s raw_turn_count=%d",
+                conversation_id[:12],
+                raw_turn_count,
+            )
+            batch = self._save_batch(
+                conversation_id,
+                raw_turn_count=0,
+                merge_mode="empty_payload",
+                first_turn_hash="",
+                last_turn_hash="",
+                turns_matched=0,
+                turns_appended=0,
+                turns_prepended=0,
+                turns_inserted=0,
+            )
+            return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
+
+        alignment = self._find_alignment(conversation_id, existing, prepared_turns)
+        merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
+        turns_written = 0
+        turns_matched = 0
+        turns_appended = 0
+        turns_prepended = 0
+        turns_inserted = 0
+        batch_id = generate_canonical_turn_id()
+        now = utcnow_iso()
+        rows_touched: list[CanonicalTurnRow] = []
+
+        if not existing:
+            merge_mode = "no_overlap_append"
+            for idx, row in enumerate(prepared_turns):
+                row.canonical_turn_id = generate_canonical_turn_id()
+                row.sort_key = float((idx + 1) * 1000.0)
+                row.source_batch_id = batch_id
+                row.last_seen_at = now
+                self._write_turn(row, turn_number=idx)
+                rows_touched.append(row)
+                turns_written += 1
+                turns_appended += 1
+        elif alignment is None:
+            start_key = default_sort_key(existing)
+            for idx, row in enumerate(prepared_turns):
+                row.canonical_turn_id = generate_canonical_turn_id()
+                row.sort_key = start_key + (1000.0 * idx)
+                row.source_batch_id = batch_id
+                row.last_seen_at = now
+                self._write_turn(row, turn_number=len(existing) + idx)
+                rows_touched.append(row)
+                turns_written += 1
+                turns_appended += 1
+        else:
+            overlap_existing = existing[alignment.existing_start:alignment.existing_start + alignment.overlap_len]
+            overlap_incoming = prepared_turns[alignment.incoming_start:alignment.incoming_start + alignment.overlap_len]
+            for offset, row in enumerate(overlap_incoming):
+                existing_row = overlap_existing[offset]
+                row.canonical_turn_id = existing_row.canonical_turn_id
+                row.sort_key = existing_row.sort_key
+                row.source_batch_id = batch_id
+                row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
+                row.last_seen_at = now
+                self._write_turn(row, turn_number=alignment.existing_start + offset)
+                rows_touched.append(row)
+                turns_matched += 1
+
+            prefix = prepared_turns[:alignment.incoming_start]
+            if prefix:
+                left_key = existing[alignment.existing_start - 1].sort_key if alignment.existing_start > 0 else None
+                right_key = existing[alignment.existing_start].sort_key
+                for row, key in zip(prefix, self._allocate_sort_keys(left_key, right_key, len(prefix))):
+                    row.canonical_turn_id = generate_canonical_turn_id()
+                    row.sort_key = key
+                    row.source_batch_id = batch_id
+                    row.last_seen_at = now
+                    self._write_turn(row, turn_number=-1)
+                    rows_touched.append(row)
+                    turns_written += 1
+                    if merge_mode == "prefix_widening":
+                        turns_prepended += 1
+                    else:
+                        turns_inserted += 1
+
+            suffix = prepared_turns[alignment.incoming_start + alignment.overlap_len:]
+            if suffix:
+                left_idx = alignment.existing_start + alignment.overlap_len - 1
+                left_key = existing[left_idx].sort_key if left_idx >= 0 else None
+                next_existing_idx = alignment.existing_start + alignment.overlap_len
+                right_key = existing[next_existing_idx].sort_key if next_existing_idx < len(existing) else None
+                for row, key in zip(suffix, self._allocate_sort_keys(left_key, right_key, len(suffix))):
+                    row.canonical_turn_id = generate_canonical_turn_id()
+                    row.sort_key = key
+                    row.source_batch_id = batch_id
+                    row.last_seen_at = now
+                    self._write_turn(row, turn_number=-1)
+                    rows_touched.append(row)
+                    turns_written += 1
+                    if merge_mode == "tail_append":
+                        turns_appended += 1
+                    else:
+                        turns_inserted += 1
+
+        batch = self._save_batch(
+            conversation_id,
+            raw_turn_count=raw_turn_count,
+            merge_mode=merge_mode,
+            first_turn_hash=prepared_turns[0].turn_hash,
+            last_turn_hash=prepared_turns[-1].turn_hash,
+            turns_matched=turns_matched,
+            turns_appended=turns_appended,
+            turns_prepended=turns_prepended,
+            turns_inserted=turns_inserted,
+            batch_id=batch_id,
+        )
+        self._refresh_persisted_anchors(conversation_id)
+        return CanonicalIngestResult(
+            merge_mode=merge_mode,
+            turns_written=turns_written,
+            turns_matched=turns_matched,
+            turns_appended=turns_appended,
+            turns_prepended=turns_prepended,
+            turns_inserted=turns_inserted,
+            batch=batch,
+            rows=rows_touched,
+        )
+
+    def _prepare_message_row(
+        self,
+        conversation_id: str,
+        *,
+        role: str,
+        content: str,
+        raw_content: str | list[dict] | None = None,
         primary_tag: str = "_general",
         tags: list[str] | None = None,
         session_date: str = "",
@@ -319,11 +310,19 @@ class IngestReconciler:
         code_refs: list[dict] | None = None,
         entry: TurnTagEntry | None = None,
     ) -> CanonicalTurnRow:
-        turn_hash, norm_user, norm_asst = compute_turn_hash_from_raw(
-            user_content,
-            assistant_content,
-            version=HASH_VERSION,
-        )
+        if role == "assistant":
+            user_content = ""
+            assistant_content = content
+        else:
+            user_content = content
+            assistant_content = ""
+        turn_hash, norm_user, norm_asst = compute_turn_hash_from_raw(user_content, assistant_content, version=HASH_VERSION)
+        if isinstance(raw_content, list):
+            import json
+
+            raw_payload = json.dumps(raw_content)
+        else:
+            raw_payload = raw_content
         now = utcnow_iso()
         if entry is not None:
             primary_tag = entry.primary_tag or primary_tag
@@ -343,7 +342,7 @@ class IngestReconciler:
         ) else None
         return CanonicalTurnRow(
             conversation_id=conversation_id,
-            turn_number=turn_number,
+            turn_number=-1,
             sort_key=0.0,
             turn_hash=turn_hash,
             hash_version=HASH_VERSION,
@@ -351,8 +350,8 @@ class IngestReconciler:
             normalized_assistant_text=norm_asst,
             user_content=user_content,
             assistant_content=assistant_content,
-            user_raw_content=user_raw_content,
-            assistant_raw_content=assistant_raw_content,
+            user_raw_content=raw_payload if role == "user" else None,
+            assistant_raw_content=raw_payload if role == "assistant" else None,
             primary_tag=primary_tag or "_general",
             tags=list(tags or []),
             session_date=session_date or "",
@@ -365,19 +364,6 @@ class IngestReconciler:
             created_at=now,
             updated_at=now,
         )
-
-    def _resolve_entry(self, turn_entries: Any, idx: int) -> TurnTagEntry | None:
-        if turn_entries is None:
-            return None
-        getter = getattr(turn_entries, "get_tags_for_turn", None)
-        if callable(getter):
-            return getter(idx)
-        if isinstance(turn_entries, dict):
-            return turn_entries.get(idx)
-        if isinstance(turn_entries, list) and 0 <= idx < len(turn_entries):
-            item = turn_entries[idx]
-            return item if isinstance(item, TurnTagEntry) else None
-        return None
 
     def _find_alignment(
         self,

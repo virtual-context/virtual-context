@@ -99,7 +99,6 @@ def test_build_conversation_coverage_report_uses_latest_payload_and_exact_ranges
             "stream": False,
             "message_count": 6,
             "client_payload_message_count": 6,
-            "client_payload_pair_count": 3,
             "client_payload_user_prompt_count": 3,
             "client_payload_timestamped_message_count": 3,
             "client_payload_earliest_timestamp": "2026-03-15T16:10:00+00:00",
@@ -130,7 +129,6 @@ def test_build_conversation_coverage_report_uses_latest_payload_and_exact_ranges
     assert report.latest_payload.turn == 9
     assert report.latest_payload.turn_id == "req-latest"
     assert report.latest_payload.message_count == 6
-    assert report.latest_payload.pair_count == 3
     assert report.latest_payload.user_prompt_count == 3
     assert report.latest_payload.timestamped_message_count == 3
     assert report.latest_payload.earliest_timestamp == "2026-03-15T16:10:00+00:00"
@@ -159,13 +157,11 @@ def test_build_conversation_coverage_report_prefers_extracted_history_counts(tmp
             "stream": False,
             "message_count": 29,
             "client_payload_message_count": 29,
-            "client_payload_pair_count": 14,
             "client_payload_user_prompt_count": 12,
             "client_payload_timestamped_message_count": 10,
             "client_payload_earliest_timestamp": "2026-04-11T15:05:00+00:00",
             "client_payload_latest_timestamp": "2026-04-16T14:07:00+00:00",
-            "extracted_history_message_count": 998,
-            "extracted_history_pair_count": 499,
+            "ingestible_entry_count": 998,
             "conversation_id": conversation_id,
             "inbound_tags": [],
             "response_tags": [],
@@ -189,4 +185,3 @@ def test_build_conversation_coverage_report_prefers_extracted_history_counts(tmp
     report = build_conversation_coverage_report(store, conversation_id)
 
     assert report.latest_payload.message_count == 998
-    assert report.latest_payload.pair_count == 499

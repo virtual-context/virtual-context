@@ -670,7 +670,6 @@ class PayloadSpanStats:
     turn_id: str = ""
     captured_at: datetime | None = None
     message_count: int = 0
-    pair_count: int = 0
     user_prompt_count: int = 0
     timestamped_message_count: int = 0
     earliest_timestamp: str = ""

@@ -421,7 +421,6 @@ class TestProxyMetricsStoreIntegration:
         loaded = store.load_request_captures(conversation_id="c1")
         assert len(loaded) == 1
         assert loaded[0]["client_payload_message_count"] == 4
-        assert loaded[0]["client_payload_pair_count"] == 2
         assert loaded[0]["client_payload_user_prompt_count"] == 2
         assert loaded[0]["client_payload_timestamped_message_count"] == 2
         assert loaded[0]["client_payload_earliest_timestamp"] == "2026-03-15T16:10:00+00:00"
@@ -442,9 +441,9 @@ class TestProxyMetricsStoreIntegration:
                 "normalized_payload_entry_count": 986,
                 "normalized_chat_entry_count": 986,
                 "normalized_non_chat_entry_count": 3638,
-                "extracted_history_message_count": 986,
-                "extracted_history_pair_count": 493,
-                "tool_result_user_entries_folded": 1770,
+                "ingestible_entry_count": 986,
+                "skipped_scaffolding_entry_count": 3638,
+                "skipped_tool_result_entry_count": 1770,
             },
         )
 
@@ -452,8 +451,8 @@ class TestProxyMetricsStoreIntegration:
         assert len(loaded) == 1
         assert loaded[0]["raw_payload_entry_count"] == 4624
         assert loaded[0]["normalized_payload_entry_count"] == 986
-        assert loaded[0]["extracted_history_pair_count"] == 493
-        assert loaded[0]["payload_accounting"]["tool_result_user_entries_folded"] == 1770
+        assert loaded[0]["ingestible_entry_count"] == 986
+        assert loaded[0]["payload_accounting"]["skipped_tool_result_entry_count"] == 1770
 
     def test_capture_enriched_persists_to_store(self, tmp_path):
         from virtual_context.proxy.metrics import ProxyMetrics

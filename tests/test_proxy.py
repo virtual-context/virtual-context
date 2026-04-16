@@ -703,7 +703,7 @@ class TestProxyStateIngestion:
         assert ingested[2]["turn"] == 2
         evt = [e for e in events if e["type"] == "history_ingestion"][0]
         assert evt["turns_ingested"] == 3
-        assert evt["pairs_received"] == 3
+        assert evt["turns_received"] == 3
         assert evt["conversation_id"] == "test-session"
         assert "elapsed_ms" in evt
 

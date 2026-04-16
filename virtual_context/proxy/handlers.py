@@ -1969,16 +1969,16 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         labels = tenant_registry.get_conversation_labels(tenant_id)
         label = labels.get(effective_conv_id, "")
 
-    turns = len(getattr(state, "conversation_history", []) or []) // 2
+    turns = int(getattr(state, "_ingestible_entry_count", 0) or 0)
     compacted = getattr(es, "compacted_through", 0)
     flushed = getattr(es, "flushed_through", 0)
     generation = getattr(es, "conversation_generation", 0)
-    history_messages = len(getattr(state, "conversation_history", []) or [])
+    history_messages = int(getattr(state, "_raw_payload_entry_count", 0) or 0)
 
     # Segment count from store
     segments = 0
     tag_summary_count = 0
-    latest_payload_turns = 0
+    latest_payload_entries = 0
     latest_raw_entries = 0
     stored_turns_hint = 0
     store = getattr(engine, "_store", None)
@@ -1986,9 +1986,9 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         try:
             coverage = build_conversation_coverage_report(store, effective_conv_id)
             tag_summary_count = coverage.tag_summary_count
-            latest_payload_turns = max(
+            latest_payload_entries = max(
                 0,
-                getattr(coverage.latest_payload, "pair_count", 0) or 0,
+                getattr(coverage.latest_payload, "message_count", 0) or 0,
             )
             stored_turns_hint = max(
                 0,
@@ -2026,7 +2026,7 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     elif raw_session_state == "passthrough":
         status = "passthrough"
 
-    done, total = getattr(state, "_ingestion_progress", (0, 0))
+    done, total = getattr(state, "_payload_ingestion_progress", getattr(state, "_ingestion_progress", (0, 0)))
     pct = (done / total * 100.0) if total else 0.0
 
     # Thresholds
@@ -2037,6 +2037,7 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     # Payload and cache/accountability details from recent captures
     last_payload_tokens = int(getattr(state, "_last_payload_tokens", 0) or 0)
     last_payload_kb = float(getattr(state, "_last_payload_kb", 0.0) or 0.0)
+    skipped_payload_entries = int(getattr(state, "_skipped_payload_entry_count", 0) or 0)
     cache_line = "n/a"
     try:
         captures = state.metrics.get_captured_requests_summary(conversation_id=effective_conv_id) if getattr(state, "metrics", None) else []
@@ -2044,9 +2045,9 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         captures = []
     if captures:
         latest_capture = captures[-1]
-        latest_payload_turns = int(
-            latest_capture.get("extracted_history_pair_count", 0)
-            or latest_capture.get("client_payload_pair_count", latest_payload_turns)
+        latest_payload_entries = int(
+            latest_capture.get("ingestible_entry_count", 0)
+            or latest_capture.get("normalized_chat_entry_count", latest_payload_entries)
             or 0
         )
         latest_raw_entries = int(latest_capture.get("raw_payload_entry_count", 0) or 0)
@@ -2064,7 +2065,8 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
             avg_cache = sum(recent_cache) / len(recent_cache)
             cache_line = f"{', '.join(f'{v}%' for v in recent_cache)} (avg {avg_cache:.1f}%)"
 
-    turns = max(turns, stored_turns_hint, latest_payload_turns, int(done or 0), int(total or 0))
+    turns = max(turns, stored_turns_hint, latest_payload_entries, int(done or 0), int(total or 0))
+    history_messages = max(history_messages, latest_raw_entries)
 
     # Working set
     ws = getattr(engine, "_paging", None)
@@ -2082,15 +2084,16 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     lines.extend([
         f"Status: {status}",
         f"Ingestion: {done} / {total} ({pct:.1f}%)",
-        f"Turn state: {turns} turns, {history_messages} live history messages",
+        f"Turn state: {turns} canonical chat entries, {history_messages} raw payload entries",
         f"Watermarks: compacted {compacted}, flushed {flushed}",
         f"Stored: {segments} segments, {tag_summary_count} tag summaries",
         f"Thresholds: soft {soft_threshold:,} / hard {hard_threshold:,}",
         (
             f"Last payload: {last_payload_kb / 1024:.3f} MB, "
-            f"{latest_payload_turns:,} turns, {last_payload_tokens:,} tokens"
+            f"{latest_payload_entries:,} ingestible entries, {last_payload_tokens:,} tokens"
         ),
         f"Last raw payload: {latest_raw_entries:,} entries" if latest_raw_entries else "Last raw payload: n/a",
+        f"Skipped payload scaffolding: {skipped_payload_entries:,} entries",
         f"Cache hit (last 5): {cache_line}",
         f"Working set: {len(ws_entries)} tags, {ws_tokens:,} tokens",
         f"Generation: {generation}",
