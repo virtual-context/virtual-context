@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING
 from .engine_utils import extract_turn_pairs, get_recent_context
 from .canonical_turns import HASH_VERSION, compute_turn_hash_from_raw, utcnow_iso
 from .ingest_reconciler import IngestReconciler
+from .segmenter import pair_messages_into_turns
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
+from ..types import Message
 
 if TYPE_CHECKING:
     from .compactor import DomainCompactor
@@ -130,6 +132,38 @@ class TaggingPipeline:
                 break
         return has_tool_block
 
+    @staticmethod
+    def _merge_role_messages(messages: list[Message], role: str) -> Message:
+        selected = [msg for msg in messages if msg.role == role]
+        if not selected:
+            return Message(role=role, content="")
+        raw_blocks: list[dict] = []
+        for msg in selected:
+            if msg.raw_content:
+                raw_blocks.extend(msg.raw_content)
+        return Message(
+            role=role,
+            content="\n".join(msg.content for msg in selected),
+            timestamp=selected[-1].timestamp,
+            metadata=selected[-1].metadata,
+            raw_content=raw_blocks or selected[-1].raw_content,
+        )
+
+    @classmethod
+    def _split_pair_messages(cls, messages: list[Message]) -> tuple[Message, Message]:
+        return (
+            cls._merge_role_messages(messages, "user"),
+            cls._merge_role_messages(messages, "assistant"),
+        )
+
+    @classmethod
+    def _flatten_context_pairs(cls, pairs: list) -> list[str] | None:
+        flattened: list[str] = []
+        for pair in pairs:
+            user_msg, asst_msg = cls._split_pair_messages(pair.messages)
+            flattened.extend([user_msg.content, asst_msg.content])
+        return flattened if flattened else None
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -160,12 +194,13 @@ class TaggingPipeline:
             pass  # non-critical
 
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
-        """Extract the most recent user+assistant pair."""
-        if len(history) < 2:
+        """Extract the most recent completed user/assistant turn."""
+        pairs = pair_messages_into_turns(list(history))
+        if not pairs:
             return None
-        for i in range(len(history) - 1, 0, -1):
-            if history[i].role == "assistant" and history[i-1].role == "user":
-                return [history[i-1], history[i]]
+        latest = pairs[-1].messages
+        if any(msg.role == "assistant" for msg in latest):
+            return latest
         return None
 
     def _persist_canonical_turn(
@@ -174,22 +209,67 @@ class TaggingPipeline:
         user_msg: "Message",
         asst_msg: "Message",
     ) -> None:
-        existing = self._store.get_canonical_turn_rows(
-            self.config.conversation_id,
-            [entry.turn_number],
-        ).get(entry.turn_number)
-        if existing is not None:
-            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
-                user_msg.content,
-                asst_msg.content,
-                version=HASH_VERSION,
-            )
+        user_hash, user_norm, _ = compute_turn_hash_from_raw(
+            user_msg.content,
+            "",
+            version=HASH_VERSION,
+        )
+        assistant_hash, _, assistant_norm = compute_turn_hash_from_raw(
+            "",
+            asst_msg.content,
+            version=HASH_VERSION,
+        )
+        rows = list(self._store.get_all_canonical_turns(self.config.conversation_id))
+        matched_pair: tuple[object, object] | None = None
+        search_order: list[int] = []
+        approx_idx = max(0, entry.turn_number * 2)
+        for idx in range(max(0, approx_idx - 4), min(len(rows) - 1, approx_idx + 4) + 1):
+            search_order.append(idx)
+        for idx in range(0, len(rows) - 1):
+            if idx not in search_order:
+                search_order.append(idx)
+        for idx in search_order:
+            first = rows[idx]
+            second = rows[idx + 1]
+            if first.turn_hash == user_hash and second.turn_hash == assistant_hash:
+                matched_pair = (first, second)
+                break
+        if matched_pair is not None:
+            user_row, assistant_row = matched_pair
+            tagged_at = utcnow_iso()
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
                 user_msg.content,
-                asst_msg.content,
+                "",
                 user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                assistant_raw_content=None,
+                primary_tag=entry.primary_tag,
+                tags=list(entry.tags),
+                session_date=entry.session_date,
+                sender=entry.sender,
+                fact_signals=list(entry.fact_signals),
+                code_refs=list(entry.code_refs),
+                canonical_turn_id=user_row.canonical_turn_id,
+                sort_key=user_row.sort_key,
+                turn_hash=user_hash,
+                hash_version=HASH_VERSION,
+                normalized_user_text=user_norm,
+                normalized_assistant_text="",
+                tagged_at=tagged_at,
+                compacted_at=user_row.compacted_at,
+                first_seen_at=user_row.first_seen_at,
+                last_seen_at=user_row.last_seen_at or tagged_at,
+                source_batch_id=user_row.source_batch_id,
+                created_at=user_row.created_at,
+                updated_at=tagged_at,
+            )
+            self._store.save_canonical_turn(
+                self.config.conversation_id,
+                entry.turn_number + 1,
+                "",
+                asst_msg.content,
+                user_raw_content=None,
                 assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags),
@@ -197,21 +277,21 @@ class TaggingPipeline:
                 sender=entry.sender,
                 fact_signals=list(entry.fact_signals),
                 code_refs=list(entry.code_refs),
-                canonical_turn_id=existing.canonical_turn_id,
-                sort_key=existing.sort_key,
-                turn_hash=turn_hash,
+                canonical_turn_id=assistant_row.canonical_turn_id,
+                sort_key=assistant_row.sort_key,
+                turn_hash=assistant_hash,
                 hash_version=HASH_VERSION,
-                normalized_user_text=normalized_user_text,
-                normalized_assistant_text=normalized_assistant_text,
-                tagged_at=utcnow_iso(),
-                compacted_at=existing.compacted_at,
-                first_seen_at=existing.first_seen_at,
-                last_seen_at=existing.last_seen_at or utcnow_iso(),
-                source_batch_id=existing.source_batch_id,
-                created_at=existing.created_at,
-                updated_at=utcnow_iso(),
+                normalized_user_text="",
+                normalized_assistant_text=assistant_norm,
+                tagged_at=tagged_at,
+                compacted_at=assistant_row.compacted_at,
+                first_seen_at=assistant_row.first_seen_at,
+                last_seen_at=assistant_row.last_seen_at or tagged_at,
+                source_batch_id=assistant_row.source_batch_id,
+                created_at=assistant_row.created_at,
+                updated_at=tagged_at,
             )
-            entry.canonical_turn_id = existing.canonical_turn_id or entry.canonical_turn_id
+            entry.canonical_turn_id = user_row.canonical_turn_id or entry.canonical_turn_id
             return
         result = IngestReconciler(self._store, self._semantic).ingest_single(
             conversation_id=self.config.conversation_id,
@@ -643,21 +723,22 @@ class TaggingPipeline:
 
     def ingest_history(
         self,
-        history_pairs: list[Message],
+        history_messages: list[Message],
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
-        Tags each user+assistant pair and appends entries to the live index.
+        Groups the message stream into local turns and appends tagged entries
+        to the live index.
         Does NOT trigger compaction — the next on_turn_complete() handles that.
 
         Args:
-            history_pairs: Flat list [user_0, asst_0, user_1, asst_1, ...].
+            history_messages: Ingestible message stream for the conversation.
             progress_callback: Optional ``(done, total, entry)`` called after
                 each turn is ingested.  Used by the proxy for live progress.
-            turn_offset: Global turn number of the first pair. Used by catch-up
+            turn_offset: Global turn number of the first turn. Used by catch-up
                 ingestion to prevent TurnTagIndex overwrites when multiple
                 batches are ingested sequentially.
             tool_output_refs_by_turn: Mapping of batch-local turn index to
@@ -677,32 +758,36 @@ class TaggingPipeline:
 
         store_tags = [ts.tag for ts in self._store.get_all_tags(conversation_id=self.config.conversation_id)]
         ingested = 0
-        _total_turns = len(history_pairs) // 2
+        history_turns = pair_messages_into_turns(list(history_messages))
+        _total_turns = len(history_turns)
         n_context = self.config.tag_generator.context_lookback_pairs
         running_session_date = ""
 
-        for i in range(0, len(history_pairs) - 1, 2):
-            user_msg = history_pairs[i]
-            asst_msg = history_pairs[i + 1]
-            batch_turn = i // 2
+        for batch_turn, pair in enumerate(history_turns):
+            user_msg, asst_msg = self._split_pair_messages(pair.messages)
             turn_tool_refs = None
             if tool_output_refs_by_turn is not None:
                 turn_tool_refs = tool_output_refs_by_turn.get(batch_turn, [])
 
-            sender = get_sender_name(user_msg.metadata) if user_msg.metadata else ""
+            sender = ""
+            for pair_msg in pair.messages:
+                sender = get_sender_name(pair_msg.metadata) if pair_msg.metadata else ""
+                if sender:
+                    break
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
-            if self._is_tool_turn([user_msg, asst_msg]):
+            if self._is_tool_turn(pair.messages):
                 if self._next_tool_tag is not None:
                     tag_num = self._next_tool_tag()
                 else:
                     self._engine_state.tool_tag_counter += 1
                     tag_num = self._engine_state.tool_tag_counter
                 tag_name = f"tool_{tag_num}"
+                combined_text = " ".join(msg.content for msg in pair.messages)
                 entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
+                    turn_number=turn_offset + batch_turn,
                     message_hash=hashlib.sha256(
-                        f"{user_msg.content} {asst_msg.content}".encode()
+                        combined_text.encode()
                     ).hexdigest()[:16],
                     tags=[tag_name],
                     primary_tag=tag_name,
@@ -720,7 +805,7 @@ class TaggingPipeline:
 
             # BUG-013: Skip empty turns with no tool blocks
             if not user_msg.content.strip() and not asst_msg.content.strip():
-                logger.debug("Skipping empty turn at pair index %d", i // 2)
+                logger.debug("Skipping empty turn at turn index %d", batch_turn)
                 continue
 
             # Track running session date BEFORE stub/tagger — stubs need timestamps too
@@ -735,7 +820,7 @@ class TaggingPipeline:
             combined_for_stub = f"{user_msg.content} {asst_msg.content}"
             if _is_stub_content_fn(combined_for_stub):
                 entry = TurnTagEntry(
-                    turn_number=turn_offset + (i // 2),
+                    turn_number=turn_offset + batch_turn,
                     message_hash=hashlib.sha256(combined_for_stub.encode()).hexdigest()[:16],
                     tags=["_stub"],
                     primary_tag="_stub",
@@ -751,16 +836,15 @@ class TaggingPipeline:
                 ingested += 1
                 logger.info(
                     "TAGGER turn=%d STUB content_len=%d preview=\"%s\"",
-                    turn_offset + (i // 2), len(combined_for_stub),
+                    turn_offset + batch_turn, len(combined_for_stub),
                     combined_for_stub[:60].replace("\n", " "),
                 )
                 if progress_callback:
-                    total = len(history_pairs) // 2
-                    progress_callback(ingested, total, entry)
+                    progress_callback(ingested, _total_turns, entry)
                 continue
 
             combined_text = f"{user_msg.content} {asst_msg.content}"
-            _turn_num = turn_offset + (i // 2)  # global turn number
+            _turn_num = turn_offset + batch_turn  # global turn number
             _content_preview = combined_text[:60].replace("\n", " ")
 
             # Flag short content that may be dominated by context
@@ -772,14 +856,9 @@ class TaggingPipeline:
 
             # Build context from preceding pairs in the flat history
             context: list[str] | None = None
-            if i >= 2:
-                ctx_pairs: list[str] = []
-                start = max(0, i - n_context * 2)
-                for j in range(start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        ctx_pairs.append(history_pairs[j].content)
-                        ctx_pairs.append(history_pairs[j + 1].content)
-                context = ctx_pairs if ctx_pairs else None
+            if batch_turn > 0:
+                start = max(0, batch_turn - n_context)
+                context = self._flatten_context_pairs(history_turns[start:batch_turn])
 
             # Context bleed gate (BUG-010): skip stale context on topic shift
             _bleed_gate = "no_context"
@@ -815,13 +894,9 @@ class TaggingPipeline:
             )
 
             # Retry with expanded context on _general
-            if tag_result.tags == ["_general"] and i >= 2:
-                expanded_start = max(0, i - n_context * 4)
-                expanded_ctx: list[str] = []
-                for j in range(expanded_start, i, 2):
-                    if j + 1 < len(history_pairs):
-                        expanded_ctx.append(history_pairs[j].content)
-                        expanded_ctx.append(history_pairs[j + 1].content)
+            if tag_result.tags == ["_general"] and batch_turn > 0:
+                expanded_start = max(0, batch_turn - (n_context * 2))
+                expanded_ctx = self._flatten_context_pairs(history_turns[expanded_start:batch_turn]) or []
                 # Gate expanded context too
                 _expanded_gate = "no_context"
                 if (
@@ -862,7 +937,7 @@ class TaggingPipeline:
                     )
 
             entry = TurnTagEntry(
-                turn_number=turn_offset + (i // 2),
+                turn_number=turn_offset + batch_turn,
                 message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
                 tags=tag_result.tags,
                 primary_tag=tag_result.primary,
@@ -891,8 +966,7 @@ class TaggingPipeline:
                 _sys.stderr.flush()
 
             if progress_callback:
-                total = len(history_pairs) // 2
-                progress_callback(ingested, total, entry)
+                progress_callback(ingested, _total_turns, entry)
 
             # Refresh store tags every 10 turns so new tags influence later tagging
             if ingested % 10 == 0:
@@ -902,7 +976,7 @@ class TaggingPipeline:
             if ingested % 20 == 0:
                 checkpoint_turn = turn_offset + ingested - 1
                 self._save_state_callback(
-                    history_pairs,
+                    history_messages,
                     last_completed_turn=checkpoint_turn,
                     last_indexed_turn=checkpoint_turn,
                 )
@@ -910,7 +984,7 @@ class TaggingPipeline:
         # Final save after all turns ingested
         final_turn = turn_offset + ingested - 1
         self._save_state_callback(
-            history_pairs,
+            history_messages,
             last_completed_turn=final_turn,
             last_indexed_turn=final_turn,
         )

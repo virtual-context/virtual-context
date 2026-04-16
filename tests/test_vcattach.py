@@ -203,13 +203,12 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
                     "turn_id": "t12",
                     "ts": "2026-04-14T21:15:16.642392+00:00",
                     "client_payload_message_count": 989,
-                    "client_payload_pair_count": 494,
                     "client_payload_user_prompt_count": 300,
                     "client_payload_timestamped_message_count": 290,
                     "client_payload_earliest_timestamp": "2026-03-15T16:10:00+00:00",
                     "client_payload_latest_timestamp": "2026-04-14T21:15:00+00:00",
                     "raw_payload_entry_count": 4632,
-                    "extracted_history_pair_count": 494,
+                    "ingestible_entry_count": 989,
                     "upstream_input_tokens": 100000,
                     "cache_read_input_tokens": 82000,
                 }
@@ -220,7 +219,7 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
             return [
                 {
                     "raw_payload_entry_count": 4632,
-                    "extracted_history_pair_count": 494,
+                    "ingestible_entry_count": 989,
                     "upstream_input_tokens": 100000,
                     "cache_read_input_tokens": 82000,
                 }
@@ -229,6 +228,9 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
     state = SimpleNamespace(
         session_state=SimpleNamespace(value="ingesting"),
         _ingestion_progress=(99, 494),
+        _payload_ingestion_progress=(989, 989),
+        _ingestible_entry_count=989,
+        _raw_payload_entry_count=4632,
         _last_payload_kb=22550.3,
         _last_payload_tokens=12331759,
         conversation_history=[SimpleNamespace(content="x")] * 989,
@@ -253,11 +255,11 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
     text = _handle_vcstatus("target-conv", state, tenant_registry=None, tenant_id=None)
 
     assert "Status: ingesting" in text
-    assert "Ingestion: 99 / 494 (20.0%)" in text
-    assert "Turn state: 494 turns, 989 live history messages" in text
+    assert "Ingestion: 989 / 989 (100.0%)" in text
+    assert "Turn state: 989 canonical chat entries, 4632 raw payload entries" in text
     assert "Stored: 7 segments, 1 tag summaries" in text
     assert "Thresholds: soft 80,000 / hard 120,000" in text
-    assert "Last payload: 22.022 MB, 494 turns, 12,331,759 tokens" in text
+    assert "Last payload: 22.022 MB, 989 ingestible entries, 12,331,759 tokens" in text
     assert "Last raw payload: 4,632 entries" in text
     assert "Cache hit (last 5): 82% (avg 82.0%)" in text
 

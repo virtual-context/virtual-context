@@ -88,12 +88,22 @@ def _inner_store(engine):
     return getattr(store, "_store", store)
 
 
+def _entry_texts(rows):
+    payload = []
+    for row in rows:
+        if row.user_content:
+            payload.append(("user", row.user_content))
+        elif row.assistant_content:
+            payload.append(("assistant", row.assistant_content))
+    return payload
+
+
 def test_sync_persists_tool_chain_text(engine):
     body = _make_anthropic_messages()
     fmt = detect_format(body)
 
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced >= 2
+    assert synced >= 5
 
     # The key test: 'consortium staffing' must be searchable
     # through the full store chain (guarded → composite → concrete)
@@ -107,7 +117,7 @@ def test_sync_idempotent(engine):
     fmt = detect_format(body)
 
     first = engine.sync_turns_from_payload(body, fmt)
-    assert first >= 2
+    assert first >= 5
     first_ids = [row.canonical_turn_id for row in engine._store.get_all_canonical_turns("test-conv-sync")]
     second = engine.sync_turns_from_payload(body, fmt)
     assert second == 0  # already stored
@@ -128,7 +138,7 @@ def test_sync_incremental(engine):
         ]},
     ])
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced == 1
+    assert synced == 2
 
 
 def test_sync_gemini_format(engine):
@@ -136,7 +146,7 @@ def test_sync_gemini_format(engine):
     fmt = detect_format(body)
 
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced == 1
+    assert synced == 2
 
     results = _search_via_store(engine, "virtual context")
     assert len(results) >= 1
@@ -155,7 +165,7 @@ def test_sync_openai_chat_format(engine):
     }
     fmt = detect_format(body)
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced == 2
+    assert synced == 4
 
     results = _search_via_store(engine, "paging")
     assert len(results) >= 1
@@ -176,7 +186,7 @@ def test_sync_openai_responses_format(engine):
     }
     fmt = detect_format(body)
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced == 1
+    assert synced == 2
 
     results = _search_via_store(engine, "context compression")
     assert len(results) >= 1
@@ -203,7 +213,7 @@ def test_sync_single_turn(engine):
     }
     fmt = detect_format(body)
     synced = engine.sync_turns_from_payload(body, fmt)
-    assert synced == 1
+    assert synced == 2
 
 
 def test_sync_prefix_widening_prepends_older_turns(engine):
@@ -228,14 +238,17 @@ def test_sync_prefix_widening_prepends_older_turns(engine):
         ],
     }
 
-    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 2
-    assert engine.sync_turns_from_payload(widened, detect_format(widened)) == 1
+    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 4
+    assert engine.sync_turns_from_payload(widened, detect_format(widened)) == 2
 
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert [row.user_content for row in rows] == [
-        "Turn 1 user",
-        "Turn 2 user",
-        "Turn 3 user",
+    assert _entry_texts(rows) == [
+        ("user", "Turn 1 user"),
+        ("assistant", "Turn 1 assistant"),
+        ("user", "Turn 2 user"),
+        ("assistant", "Turn 2 assistant"),
+        ("user", "Turn 3 user"),
+        ("assistant", "Turn 3 assistant"),
     ]
 
 
@@ -259,15 +272,19 @@ def test_sync_no_overlap_append_preserves_existing_rows(engine):
         ],
     }
 
-    assert engine.sync_turns_from_payload(first_window, detect_format(first_window)) == 2
-    assert engine.sync_turns_from_payload(second_window, detect_format(second_window)) == 2
+    assert engine.sync_turns_from_payload(first_window, detect_format(first_window)) == 4
+    assert engine.sync_turns_from_payload(second_window, detect_format(second_window)) == 4
 
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert [row.user_content for row in rows] == [
-        "Alpha user",
-        "Beta user",
-        "Gamma user",
-        "Delta user",
+    assert _entry_texts(rows) == [
+        ("user", "Alpha user"),
+        ("assistant", "Alpha assistant"),
+        ("user", "Beta user"),
+        ("assistant", "Beta assistant"),
+        ("user", "Gamma user"),
+        ("assistant", "Gamma assistant"),
+        ("user", "Delta user"),
+        ("assistant", "Delta assistant"),
     ]
 
 
@@ -305,30 +322,46 @@ def test_sync_interior_overlap_reuses_existing_canonical_ids(engine):
         ],
     }
 
-    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 6
+    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 12
     initial_rows = engine._store.get_all_canonical_turns("test-conv-sync")
     overlap_ids = {
-        row.user_content: row.canonical_turn_id
+        row.user_content or row.assistant_content: row.canonical_turn_id
         for row in initial_rows
-        if row.user_content in {"C user", "D user", "E user"}
+        if (row.user_content or row.assistant_content) in {
+            "C user", "C assistant",
+            "D user", "D assistant",
+            "E user", "E assistant",
+        }
     }
 
-    assert engine.sync_turns_from_payload(overlap, detect_format(overlap)) == 2
+    assert engine.sync_turns_from_payload(overlap, detect_format(overlap)) == 4
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert [row.user_content for row in rows] == [
-        "A user",
-        "B user",
-        "X user",
-        "C user",
-        "D user",
-        "E user",
-        "Y user",
-        "F user",
+    assert _entry_texts(rows) == [
+        ("user", "A user"),
+        ("assistant", "A assistant"),
+        ("user", "B user"),
+        ("assistant", "B assistant"),
+        ("user", "X user"),
+        ("assistant", "X assistant"),
+        ("user", "C user"),
+        ("assistant", "C assistant"),
+        ("user", "D user"),
+        ("assistant", "D assistant"),
+        ("user", "E user"),
+        ("assistant", "E assistant"),
+        ("user", "Y user"),
+        ("assistant", "Y assistant"),
+        ("user", "F user"),
+        ("assistant", "F assistant"),
     ]
     assert {
-        row.user_content: row.canonical_turn_id
+        row.user_content or row.assistant_content: row.canonical_turn_id
         for row in rows
-        if row.user_content in {"C user", "D user", "E user"}
+        if (row.user_content or row.assistant_content) in {
+            "C user", "C assistant",
+            "D user", "D assistant",
+            "E user", "E assistant",
+        }
     } == overlap_ids
 
 
@@ -345,10 +378,10 @@ def test_sync_repeated_common_turns_do_not_collapse(engine):
         ],
     }
 
-    assert engine.sync_turns_from_payload(repeated, detect_format(repeated)) == 3
+    assert engine.sync_turns_from_payload(repeated, detect_format(repeated)) == 6
     first_rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert len(first_rows) == 3
-    assert len({row.canonical_turn_id for row in first_rows}) == 3
+    assert len(first_rows) == 6
+    assert len({row.canonical_turn_id for row in first_rows}) == 6
 
     assert engine.sync_turns_from_payload(repeated, detect_format(repeated)) == 0
     second_rows = engine._store.get_all_canonical_turns("test-conv-sync")
@@ -383,24 +416,19 @@ def test_ingest_single_retry_dedups_recent_turn(engine):
         assistant_content="Retry assistant",
     )
 
-    assert first.turns_written == 1
+    assert first.turns_written == 2
     assert second.merge_mode == "exact_resend"
     assert second.turns_written == 0
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert len(rows) == 1
+    assert len(rows) == 2
 
 
 def test_ingest_single_invalid_timestamp_disables_dedup_with_warning(engine, caplog):
     from virtual_context.core.ingest_reconciler import IngestReconciler
 
     store = _inner_store(engine)
-    store.save_canonical_turn(
-        "test-conv-sync",
-        0,
-        "Retry user",
-        "Retry assistant",
-        last_seen_at="not-a-time",
-    )
+    store.save_canonical_turn("test-conv-sync", 0, "Retry user", "", last_seen_at="not-a-time")
+    store.save_canonical_turn("test-conv-sync", 1, "", "Retry assistant", last_seen_at="not-a-time")
     reconciler = IngestReconciler(store, engine._semantic)
 
     with caplog.at_level("WARNING"):
@@ -410,7 +438,7 @@ def test_ingest_single_invalid_timestamp_disables_dedup_with_warning(engine, cap
             assistant_content="Retry assistant",
         )
 
-    assert result.turns_written == 1
+    assert result.turns_written == 0
     assert "CANONICAL_TURN_DEDUP_TIMESTAMP_INVALID" in caplog.text
     assert len(engine._store.get_all_canonical_turns("test-conv-sync")) == 2
 
@@ -434,10 +462,10 @@ def test_sync_concurrent_writers_do_not_duplicate_rows(engine, monkeypatch):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = sorted(pool.map(lambda _: _run_once(), range(2)))
 
-    assert results == [0, 2]
+    assert results == [0, 4]
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
-    assert len(rows) == 2
-    assert len({row.canonical_turn_id for row in rows}) == 2
+    assert len(rows) == 4
+    assert len({row.canonical_turn_id for row in rows}) == 4
 
 
 def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
@@ -460,7 +488,7 @@ def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
 
     monkeypatch.setattr(engine._store, "conversation_reconcile", _lock)
 
-    assert engine.sync_turns_from_payload(body, detect_format(body)) == 1
+    assert engine.sync_turns_from_payload(body, detect_format(body)) == 2
     assert calls == [
         ("enter", "test-conv-sync"),
         ("exit", "test-conv-sync"),

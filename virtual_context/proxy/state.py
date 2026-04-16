@@ -19,13 +19,14 @@ from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
 from ..core.semantic_search import persist_turn_with_embeddings
+from ..core.segmenter import pair_messages_into_turns
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import EngineState, Message, SplitResult, TurnTagEntry
 
 from .helpers import (
     _strip_envelope,
-    _extract_history_pairs,
+    _extract_ingestible_messages,
 )
 from .metrics import ProxyMetrics
 
@@ -142,6 +143,10 @@ class ProxyState:
         self._initial_payload_tokens: int | None = None
         self._last_payload_tokens: int = 0
         self._last_enriched_payload_tokens: int = 0
+        self._raw_payload_entry_count: int = 0
+        self._ingestible_entry_count: int = 0
+        self._skipped_payload_entry_count: int = 0
+        self._payload_ingestion_progress: tuple[int, int] = (0, 0)
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         self._last_shared_state_save: float = 0.0
         self._shared_live_turn_count: int = 0
@@ -249,6 +254,12 @@ class ProxyState:
         done = max(0, _int_attr("ingestion_done"))
         total = max(done, _int_attr("ingestion_total"))
         self._ingestion_progress = (done, total)
+        payload_done = max(0, _int_attr("payload_ingestion_done"))
+        payload_total = max(payload_done, _int_attr("payload_ingestion_total"))
+        self._payload_ingestion_progress = (payload_done, payload_total)
+        self._raw_payload_entry_count = max(0, _int_attr("raw_payload_entry_count"))
+        self._ingestible_entry_count = max(0, _int_attr("ingestible_entry_count"))
+        self._skipped_payload_entry_count = max(0, _int_attr("skipped_payload_entry_count"))
         self._last_payload_kb = max(0.0, _float_attr("last_payload_kb"))
         self._last_payload_tokens = max(0, _int_attr("last_payload_tokens"))
         self.note_engine_restore(force=True)
@@ -293,10 +304,52 @@ class ProxyState:
             entries_len = 0
         return max(entries_len, marker + 1)
 
+    @staticmethod
+    def _group_history_messages(messages: list[Message] | None) -> list:
+        if not messages:
+            return []
+        return pair_messages_into_turns(list(messages))
+
+    @staticmethod
+    def _is_completed_turn(turn) -> bool:
+        return any(msg.role == "assistant" for msg in getattr(turn, "messages", []))
+
+    def _completed_history_groups(self, messages: list[Message] | None = None) -> list:
+        grouped = self._group_history_messages(self.conversation_history if messages is None else messages)
+        if grouped and not self._is_completed_turn(grouped[-1]):
+            return grouped[:-1]
+        return grouped
+
+    def _completed_history_messages(self, messages: list[Message] | None = None) -> list[Message]:
+        completed_messages: list[Message] = []
+        for pair in self._completed_history_groups(messages):
+            completed_messages.extend(pair.messages)
+        return completed_messages
+
+    def _history_turn_count(self, messages: list[Message] | None = None) -> int:
+        return len(self._completed_history_groups(messages))
+
+    def _slice_messages_from_turn(self, messages: list[Message], turn_offset: int) -> list[Message]:
+        if turn_offset <= 0:
+            return self._completed_history_messages(messages)
+        grouped = self._completed_history_groups(messages)
+        if turn_offset >= len(grouped):
+            return []
+        sliced: list[Message] = []
+        for pair in grouped[turn_offset:]:
+            sliced.extend(pair.messages)
+        return sliced
+
+    def _combined_turn_text(self, messages: list[Message], turn_index: int) -> str:
+        grouped = self._completed_history_groups(messages)
+        if turn_index < 0 or turn_index >= len(grouped):
+            return ""
+        return " ".join(msg.content for msg in grouped[turn_index].messages)
+
     def _completed_turn_count(self) -> int:
         raw = getattr(getattr(self.engine, "_engine_state", None), "last_completed_turn", -1)
         marker = raw if isinstance(raw, int) else -1
-        history_turns = len(self.conversation_history) // 2 if self.conversation_history else 0
+        history_turns = self._history_turn_count()
         return max(history_turns, marker + 1)
 
     def has_pending_indexing(self) -> bool:
@@ -311,19 +364,19 @@ class ProxyState:
             self._indexed_turn_count(),
             self._completed_turn_count(),
             compacted,
-            len(self.conversation_history) // 2 if self.conversation_history else 0,
+            self._history_turn_count(),
         )
 
     def _can_activate_from_persisted_state(
         self,
-        history_pairs: list[Message] | None = None,
+        history_messages: list[Message] | None = None,
     ) -> bool:
         existing_turns = self._indexed_turn_count()
         if existing_turns <= 0:
             return False
         if self.has_pending_indexing():
             return False
-        needed_turns = len(history_pairs) // 2 if history_pairs else 0
+        needed_turns = self._history_turn_count(history_messages)
         if needed_turns > 0 and existing_turns < needed_turns:
             return False
         return True
@@ -347,7 +400,7 @@ class ProxyState:
 
     def resolve_prepare_state(
         self,
-        history_pairs: list[Message],
+        history_messages: list[Message],
     ) -> tuple[SessionState, str | None]:
         """Return the routing state for the current request.
 
@@ -362,28 +415,28 @@ class ProxyState:
         if self.has_pending_indexing():
             return SessionState.INGESTING, "pending_indexing"
 
-        if not history_pairs:
+        if not history_messages:
             self._ingested_conversations.add(conversation_id)
             self._restore_readiness_pending = False
             self._ingested_turn_count[conversation_id] = 0
             return SessionState.ACTIVE, None
 
         if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
-            widened = self._check_history_widening(history_pairs, conversation_id)
+            widened = self._check_history_widening(history_messages, conversation_id)
             if widened:
                 return SessionState.PASSTHROUGH, "history_widening"
             return SessionState.ACTIVE, None
 
-        if self._can_activate_from_persisted_state(history_pairs):
+        if self._can_activate_from_persisted_state(history_messages):
             self._ingested_conversations.add(conversation_id)
             self._restore_readiness_pending = False
-            if history_pairs:
-                self._record_ingestion_watermark(history_pairs, conversation_id)
+            if history_messages:
+                self._record_ingestion_watermark(history_messages, conversation_id)
             return SessionState.ACTIVE, None
 
         self._restore_readiness_pending = False
         if conversation_id in self._ingested_conversations:
-            widened = self._check_history_widening(history_pairs, conversation_id)
+            widened = self._check_history_widening(history_messages, conversation_id)
             if widened:
                 return SessionState.PASSTHROUGH, "history_widening"
 
@@ -394,13 +447,23 @@ class ProxyState:
     def persist_completed_turn(self) -> None:
         if self.is_conversation_deleted():
             return
-        if len(self.conversation_history) < 2 or len(self.conversation_history) % 2 != 0:
+        grouped = self._group_history_messages(self.conversation_history)
+        if not grouped or not any(msg.role == "assistant" for msg in grouped[-1].messages):
             return
         persist = getattr(self.engine, "persist_completed_turn", None)
         if callable(persist):
             persist(list(self.conversation_history))
+            if self._ingestible_entry_count > 0:
+                self._payload_ingestion_progress = (
+                    self._ingestible_entry_count,
+                    self._ingestible_entry_count,
+                )
+                self._persist_shared_session_state()
             return
-        turn_number = (len(self.conversation_history) // 2) - 1
+        turn_number = len(grouped) - 1
+        latest_turn = grouped[-1]
+        user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
+        assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
         entry = getattr(self.engine, "_turn_tag_index", None)
         entry = entry.get_tags_for_turn(turn_number) if entry is not None else None
         try:
@@ -409,12 +472,12 @@ class ProxyState:
                 self.engine._semantic,
                 conversation_id=self.engine.config.conversation_id,
                 turn_number=turn_number,
-                user_content=self.conversation_history[-2].content,
-                assistant_content=self.conversation_history[-1].content,
-                user_raw_content=json.dumps(self.conversation_history[-2].raw_content)
-                if self.conversation_history[-2].raw_content else None,
-                assistant_raw_content=json.dumps(self.conversation_history[-1].raw_content)
-                if self.conversation_history[-1].raw_content else None,
+                user_content="\n".join(msg.content for msg in user_messages),
+                assistant_content="\n".join(msg.content for msg in assistant_messages),
+                user_raw_content=json.dumps(user_messages[-1].raw_content)
+                if user_messages and user_messages[-1].raw_content else None,
+                assistant_raw_content=json.dumps(assistant_messages[-1].raw_content)
+                if assistant_messages and assistant_messages[-1].raw_content else None,
                 primary_tag=entry.primary_tag if entry else "_general",
                 tags=list(entry.tags) if entry else [],
                 session_date=entry.session_date if entry else "",
@@ -426,6 +489,12 @@ class ProxyState:
                 getattr(self.engine._engine_state, "last_completed_turn", -1),
                 turn_number,
             )
+            if self._ingestible_entry_count > 0:
+                self._payload_ingestion_progress = (
+                    self._ingestible_entry_count,
+                    self._ingestible_entry_count,
+                )
+                self._persist_shared_session_state()
         except Exception:
             logger.warning("Failed to persist completed turn", exc_info=True)
 
@@ -469,7 +538,7 @@ class ProxyState:
             if not pending_rows:
                 return False
 
-            pairs: list[Message] = []
+            messages: list[Message] = []
             expected_turn = baseline
             for row in sorted(pending_rows, key=lambda item: item[0]):
                 turn_number, user_content, assistant_content, *_rest = row
@@ -483,22 +552,25 @@ class ProxyState:
                         turn_number - 1,
                     )
                     break
-                pairs.append(Message(role="user", content=user_content))
-                pairs.append(Message(role="assistant", content=assistant_content))
+                messages.append(Message(role="user", content=user_content))
+                messages.append(Message(role="assistant", content=assistant_content))
                 expected_turn += 1
 
-            if not pairs:
+            if not messages:
                 return False
 
             if self.metrics:
                 self.metrics.clear_ingestion_events(conversation_id)
 
             self.engine._restored_pending_turns = []
-            self._ingestion_progress = (baseline, max(total, baseline + (len(pairs) // 2)))
+            self._ingestion_progress = (
+                baseline,
+                max(total, baseline + self._history_turn_count(messages)),
+            )
             self._transition_to(SessionState.INGESTING)
             self._ingestion_thread = threading.Thread(
                 target=self._run_ingestion_with_catchup,
-                args=(pairs, baseline, total),
+                args=(messages, baseline, total),
                 daemon=True,
                 name="vc-ingest-resume",
             )
@@ -531,18 +603,16 @@ class ProxyState:
         """Return the shared session snapshot, including UI-facing runtime fields."""
         snapshot = self.engine.extract_session_state()
         live_turn_count = max(
-            len(self.conversation_history) // 2,
+            self._ingestible_entry_count,
             self._shared_live_turn_count,
-            len(getattr(self.engine._turn_tag_index, "entries", [])),
-            int(getattr(self.engine._engine_state, "last_completed_turn", -1) or -1) + 1,
-            int(getattr(self.engine._engine_state, "last_indexed_turn", -1) or -1) + 1,
+            len(getattr(self.engine._store, "get_all_canonical_turns", lambda *_: [])(self.engine.config.conversation_id)),
         )
         history_message_count = max(
-            len(self.conversation_history),
+            self._raw_payload_entry_count,
             self._shared_history_message_count,
-            live_turn_count * 2,
+            live_turn_count,
         )
-        done, total = self._ingestion_progress
+        done, total = self._payload_ingestion_progress
         snapshot.session_state = self.session_state.value
         snapshot.live_turn_count = live_turn_count
         snapshot.history_message_count = history_message_count
@@ -550,6 +620,11 @@ class ProxyState:
         snapshot.ingestion_total = int(total or 0)
         snapshot.last_payload_kb = float(self._last_payload_kb or 0.0)
         snapshot.last_payload_tokens = int(self._last_payload_tokens or 0)
+        snapshot.raw_payload_entry_count = int(self._raw_payload_entry_count or 0)
+        snapshot.ingestible_entry_count = int(self._ingestible_entry_count or 0)
+        snapshot.skipped_payload_entry_count = int(self._skipped_payload_entry_count or 0)
+        snapshot.payload_ingestion_done = int(done or 0)
+        snapshot.payload_ingestion_total = int(total or 0)
         return snapshot
 
     def _persist_shared_session_state(self, *, force: bool = False) -> None:
@@ -571,6 +646,43 @@ class ProxyState:
                 self.engine.config.conversation_id[:12],
                 exc_info=True,
             )
+
+    def note_payload_accounting(
+        self,
+        payload_accounting: dict | None,
+        *,
+        done: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        accounting = dict(payload_accounting or {})
+        self._raw_payload_entry_count = max(
+            0,
+            int(accounting.get("raw_payload_entry_count", 0) or 0),
+        )
+        self._ingestible_entry_count = max(
+            0,
+            int(
+                accounting.get(
+                    "ingestible_entry_count",
+                    accounting.get("normalized_chat_entry_count", 0),
+                )
+                or 0
+            ),
+        )
+        self._skipped_payload_entry_count = max(
+            0,
+            int(
+                accounting.get(
+                    "skipped_scaffolding_entry_count",
+                    self._raw_payload_entry_count - self._ingestible_entry_count,
+                )
+                or 0
+            ),
+        )
+        payload_done = self._ingestible_entry_count if done is None else max(0, int(done or 0))
+        payload_total = self._ingestible_entry_count if total is None else max(payload_done, int(total or 0))
+        self._payload_ingestion_progress = (payload_done, payload_total)
+        self._persist_shared_session_state()
 
     def _update_compaction_state(
         self,
@@ -680,10 +792,9 @@ class ProxyState:
         snap = {
             "conversation_id": engine.config.conversation_id,
             "turn_count": max(
-                len(self.conversation_history) // 2,
+                self._ingestible_entry_count,
                 self._shared_live_turn_count,
-                self._completed_turn_count(),
-                self._indexed_turn_count(),
+                len(getattr(engine._store, "get_all_canonical_turns", lambda *_: [])(engine.config.conversation_id)),
             ),
             "total_requests": self._total_requests,
             "compacted_through": engine._engine_state.compacted_through,
@@ -691,7 +802,10 @@ class ProxyState:
             "distinct_tags": len(all_tags),
             "active_tags": list(idx.get_active_tags(lookback=6)),
             "session_state": self.session_state.value,
-            "ingestion_progress": list(self._ingestion_progress),
+            "ingestion_progress": list(self._payload_ingestion_progress),
+            "raw_payload_entry_count": self._raw_payload_entry_count,
+            "ingestible_entry_count": self._ingestible_entry_count,
+            "skipped_payload_entry_count": self._skipped_payload_entry_count,
             "manual_passthrough": self._manual_passthrough,
             "context_window": context_window,
             "history_tokens": history_tokens,
@@ -739,11 +853,14 @@ class ProxyState:
         history_snapshot: list[Message],
     ) -> tuple[int, str] | None:
         """Return the stable completed turn number and hash for a finished pair."""
-        if len(history_snapshot) < 2 or len(history_snapshot) % 2 != 0:
+        grouped = pair_messages_into_turns(list(history_snapshot))
+        if not grouped:
             return None
-        turn_number = (len(history_snapshot) // 2) - 1
-        latest_pair = history_snapshot[-2:]
-        combined_text = " ".join(msg.content for msg in latest_pair)
+        latest_turn = grouped[-1]
+        if not any(msg.role == "assistant" for msg in latest_turn.messages):
+            return None
+        turn_number = len(grouped) - 1
+        combined_text = " ".join(msg.content for msg in latest_turn.messages)
         message_hash = hashlib.sha256(combined_text.encode()).hexdigest()[:16]
         return turn_number, message_hash
 
@@ -1417,7 +1534,7 @@ class ProxyState:
             and not self.has_pending_indexing()
         )
 
-    def reconcile_history_bootstrap(self, history_pairs: list[Message]) -> bool:
+    def reconcile_history_bootstrap(self, history_messages: list[Message]) -> bool:
         """Finalize a restored session once the first post-restart history arrives."""
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
@@ -1425,30 +1542,33 @@ class ProxyState:
         if self.has_pending_indexing():
             self._restore_readiness_pending = False
             return False
-        if not self._can_activate_from_persisted_state(history_pairs):
+        if not self._can_activate_from_persisted_state(history_messages):
             self._restore_readiness_pending = False
             return False
         self._ingested_conversations.add(conversation_id)
         self._restore_readiness_pending = False
-        if history_pairs:
-            self._record_ingestion_watermark(history_pairs, conversation_id)
+        if history_messages:
+            self._record_ingestion_watermark(history_messages, conversation_id)
         return True
 
-    def _check_history_widening(self, history_pairs: list[Message], conversation_id: str) -> bool:
+    def _check_history_widening(self, history_messages: list[Message], conversation_id: str) -> bool:
         """Detect if history prefix shifted (widening) and trigger full re-ingest.
 
         Returns True if widening was detected and state was cleared for re-ingestion.
         """
         import hashlib
-        if not history_pairs or conversation_id not in self._ingested_first_hash:
+        if not history_messages or conversation_id not in self._ingested_first_hash:
             return False
 
-        new_first_hash = hashlib.sha256(history_pairs[0].content.encode()).hexdigest()[:16]
+        first_turn_text = self._combined_turn_text(history_messages, 0)
+        if not first_turn_text:
+            return False
+        new_first_hash = hashlib.sha256(first_turn_text.encode()).hexdigest()[:16]
         old_first_hash = self._ingested_first_hash.get(conversation_id, "")
         if new_first_hash == old_first_hash:
             return False
 
-        new_turns = len(history_pairs) // 2
+        new_turns = self._history_turn_count(history_messages)
         old_turns = self._ingested_turn_count.get(conversation_id, 0)
         threshold = getattr(self.engine.config.proxy, "history_widening_threshold", 0.10)
 
@@ -1552,6 +1672,10 @@ class ProxyState:
         self._initial_payload_tokens = None
         self._last_payload_tokens = 0
         self._last_enriched_payload_tokens = 0
+        self._raw_payload_entry_count = 0
+        self._ingestible_entry_count = 0
+        self._skipped_payload_entry_count = 0
+        self._payload_ingestion_progress = (0, 0)
         self._last_non_virtualizable_floor = 0
         self._shared_live_turn_count = 0
         self._shared_history_message_count = 0
@@ -1708,17 +1832,17 @@ class ProxyState:
                     self.engine.config.conversation_id,
                 )
             )
-            compacted_rows = [row for row in rows if getattr(row, "compacted_at", None)]
-            new_wm = ((compacted_rows[-1].turn_number + 1) * 2) if compacted_rows else 0
+            paired_rows = self.engine._group_canonical_rows_into_pairs(rows)
+            new_wm, _ = self.engine._canonical_prefix_watermark(paired_rows)
             old_wm = int(self.engine._engine_state.compacted_through)
             if new_wm != old_wm:
                 self.engine._engine_state.compacted_through = new_wm
                 logger.info(
                     "Compaction watermark refreshed from canonical rows: %d -> %d "
-                    "(compacted_turns=%d)",
+                    "(paired_turns=%d)",
                     old_wm,
                     new_wm,
-                    len(compacted_rows),
+                    len(paired_rows),
                 )
             self.engine._engine_state.flushed_through = min(
                 int(self.engine._engine_state.flushed_through or 0),
@@ -1727,17 +1851,18 @@ class ProxyState:
         except (TypeError, ValueError, AttributeError):
             pass
 
-    def _record_ingestion_watermark(self, history_pairs: list[Message], conversation_id: str) -> None:
-        import hashlib
-        if history_pairs:
-            self._ingested_first_hash[conversation_id] = (
-                hashlib.sha256(history_pairs[0].content.encode()).hexdigest()[:16]
-            )
-        self._ingested_turn_count[conversation_id] = len(history_pairs) // 2
+    def _record_ingestion_watermark(self, history_messages: list[Message], conversation_id: str) -> None:
+        if history_messages:
+            first_turn_text = self._combined_turn_text(history_messages, 0)
+            if first_turn_text:
+                self._ingested_first_hash[conversation_id] = (
+                    hashlib.sha256(first_turn_text.encode()).hexdigest()[:16]
+                )
+        self._ingested_turn_count[conversation_id] = self._history_turn_count(history_messages)
 
     def ingest_if_needed(
         self,
-        history_pairs: list[Message],
+        history_messages: list[Message],
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
         """Bootstrap TurnTagIndex from pre-existing history (once per session).
@@ -1747,7 +1872,7 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
-            self._check_history_widening(history_pairs, conversation_id)
+            self._check_history_widening(history_messages, conversation_id)
             if conversation_id in self._ingested_conversations:
                 return  # No widening detected
         with self._ingestion_lock:
@@ -1755,16 +1880,16 @@ class ProxyState:
                 return
             t0 = time.monotonic()
             if tool_output_refs_by_turn is None:
-                turns = self.engine.ingest_history(history_pairs)
+                turns = self.engine.ingest_history(history_messages)
             else:
                 turns = self.engine.ingest_history(
-                    history_pairs,
+                    history_messages,
                     tool_output_refs_by_turn=tool_output_refs_by_turn,
                 )
             elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
             self._ingested_conversations.add(conversation_id)
             self._advance_compaction_watermark()
-            self._record_ingestion_watermark(history_pairs, conversation_id)
+            self._record_ingestion_watermark(history_messages, conversation_id)
 
             logger.info(
                 "INGEST %d turns in %dms (conversation=%s)",
@@ -1774,16 +1899,17 @@ class ProxyState:
             if self.metrics:
                 # Emit per-turn events so the dashboard grid shows history
                 baseline_history_tokens = 0
-                for i in range(0, len(history_pairs) - 1, 2):
-                    turn_num = i // 2
+                grouped = self._group_history_messages(history_messages)
+                for turn_num, pair in enumerate(grouped):
                     entry = self.engine._turn_tag_index.get_tags_for_turn(
                         turn_num,
                     )
-                    raw_content = history_pairs[i].content
+                    if not pair.messages:
+                        continue
+                    raw_content = pair.messages[0].content
                     preview = _strip_envelope(raw_content)[:200]
-                    # Estimate turn pair tokens for baseline calculation
-                    pair_chars = len(history_pairs[i].content) + len(history_pairs[i + 1].content)
-                    tpt = pair_chars // 4
+                    turn_chars = sum(len(msg.content) for msg in pair.messages)
+                    tpt = turn_chars // 4
                     baseline_history_tokens += tpt
                     self.metrics.record({
                         "type": "ingested_turn",
@@ -1797,7 +1923,7 @@ class ProxyState:
                 self.metrics.record({
                     "type": "history_ingestion",
                     "turns_ingested": turns,
-                    "pairs_received": len(history_pairs) // 2,
+                    "turns_received": len(grouped),
                     "elapsed_ms": elapsed_ms,
                     "conversation_id": conversation_id,
                     "baseline_history_tokens": baseline_history_tokens,
@@ -1809,7 +1935,7 @@ class ProxyState:
 
     def start_ingestion_if_needed(
         self,
-        history_pairs: list[Message],
+        history_messages: list[Message],
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
         """Start non-blocking history ingestion in a background thread.
@@ -1822,16 +1948,17 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
-            self._check_history_widening(history_pairs, conversation_id)
+            self._check_history_widening(history_messages, conversation_id)
             if conversation_id in self._ingested_conversations:
                 return
         with self._ingestion_lock:
             if conversation_id in self._ingested_conversations:
                 return
 
+            needed_turns = self._history_turn_count(history_messages)
             logger.info(
-                "INGEST_ENTRY conversation=%s pairs=%d index_size=%d thread_alive=%s",
-                conversation_id[:12], len(history_pairs) // 2,
+                "INGEST_ENTRY conversation=%s turns=%d index_size=%d thread_alive=%s",
+                conversation_id[:12], needed_turns,
                 self._indexed_turn_count(),
                 self._ingestion_thread is not None and self._ingestion_thread.is_alive(),
             )
@@ -1841,13 +1968,12 @@ class ProxyState:
             if self.metrics:
                 self.metrics.clear_ingestion_events(conversation_id)
 
-            if not history_pairs:
+            if not history_messages:
                 self._ingested_conversations.add(conversation_id)
                 return
 
             # Skip if persisted TurnTagIndex already covers history
             existing_turns = self._indexed_turn_count()
-            needed_turns = len(history_pairs) // 2
             if existing_turns >= needed_turns:
                 self._ingested_conversations.add(conversation_id)
                 self._advance_compaction_watermark()
@@ -1869,14 +1995,14 @@ class ProxyState:
                     "Slicing history past %d existing turns (needed=%d)",
                     existing_turns, needed_turns,
                 )
-                history_pairs = list(history_pairs[existing_turns * 2:])
+                history_messages = self._slice_messages_from_turn(history_messages, existing_turns)
                 if tool_output_refs_by_turn is not None:
                     tool_output_refs_by_turn = {
                         turn_idx - existing_turns: refs
                         for turn_idx, refs in tool_output_refs_by_turn.items()
                         if turn_idx >= existing_turns
                     }
-                if not history_pairs:
+                if not history_messages:
                     self._ingested_conversations.add(conversation_id)
                     self._advance_compaction_watermark()
                     return
@@ -1889,7 +2015,7 @@ class ProxyState:
                 done, total = self._ingestion_progress
                 logger.info(
                     "Cancelling running ingestion at turn %d/%d "
-                    "(new request has %d pairs)",
+                    "(new request has %d turns)",
                     done, total, needed_turns,
                 )
                 self._ingestion_cancel.set()
@@ -1910,22 +2036,22 @@ class ProxyState:
                 )
 
                 # Verify hash at handoff point
-                self._verify_handoff_hash(history_pairs, existing_turns)
+                self._verify_handoff_hash(history_messages, existing_turns)
 
-                # Slice to remaining pairs only
-                history_pairs = list(history_pairs[existing_turns * 2:])
+                # Slice to remaining turns only
+                history_messages = self._slice_messages_from_turn(history_messages, existing_turns)
                 if tool_output_refs_by_turn is not None:
                     tool_output_refs_by_turn = {
                         turn_idx - existing_turns: refs
                         for turn_idx, refs in tool_output_refs_by_turn.items()
                         if turn_idx >= existing_turns
                     }
-                if not history_pairs:
+                if not history_messages:
                     self._ingested_conversations.add(conversation_id)
                     self._advance_compaction_watermark()
                     self._transition_to(SessionState.ACTIVE)
                     return
-                needed_turns = len(history_pairs) // 2 + existing_turns
+                needed_turns = self._history_turn_count(history_messages) + existing_turns
 
             total = needed_turns
             self._ingestion_progress = (existing_turns, total)
@@ -1941,14 +2067,14 @@ class ProxyState:
             # can use the pool once we transition to ACTIVE.
             self._ingestion_thread = threading.Thread(
                 target=self._run_ingestion_with_catchup,
-                args=(list(history_pairs), existing_turns, total, tool_output_refs_by_turn),
+                args=(list(history_messages), existing_turns, total, tool_output_refs_by_turn),
                 daemon=True,
                 name="vc-ingest",
             )
             self._ingestion_thread.start()
 
     def _verify_handoff_hash(
-        self, new_pairs: list[Message], handoff_turn: int,
+        self, new_messages: list[Message], handoff_turn: int,
     ) -> None:
         """Verify the last tagged turn matches the same content in new history.
 
@@ -1962,15 +2088,15 @@ class ProxyState:
         entry = self.engine._turn_tag_index.get_tags_for_turn(prev_turn)
         if entry is None:
             return
-        pair_idx = prev_turn * 2
-        if pair_idx + 1 >= len(new_pairs):
+        grouped = self._group_history_messages(new_messages)
+        if prev_turn >= len(grouped):
             logger.warning(
                 "Handoff verification: turn %d not in new history "
-                "(new history has %d pairs) — potential data loss",
-                prev_turn, len(new_pairs) // 2,
+                "(new history has %d turns) — potential data loss",
+                prev_turn, len(grouped),
             )
             return
-        combined = f"{new_pairs[pair_idx].content} {new_pairs[pair_idx + 1].content}"
+        combined = " ".join(msg.content for msg in grouped[prev_turn].messages)
         new_hash = _hl.sha256(combined.encode()).hexdigest()[:16]
         if new_hash != entry.message_hash:
             logger.warning(
@@ -1990,18 +2116,18 @@ class ProxyState:
 
     def _run_ingestion_with_catchup(
         self,
-        initial_pairs: list[Message],
+        initial_messages: list[Message],
         baseline: int = 0,
         cumulative_total: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
-        """Background thread: ingest initial pairs, then catch up any gap."""
+        """Background thread: ingest initial message history, then catch up any gap."""
         conversation_id = self.engine.config.conversation_id
         cancelled = False
         try:
             # Tag all initial history
-            self._ingest_pairs_with_progress(
-                initial_pairs,
+            self._ingest_messages_with_progress(
+                initial_messages,
                 baseline=baseline,
                 cumulative_total=cumulative_total or None,
                 tool_output_refs_by_turn=tool_output_refs_by_turn,
@@ -2014,21 +2140,21 @@ class ProxyState:
                 latest = self._latest_body
                 if latest is None:
                     break
-                latest_pairs = _extract_history_pairs(latest)
-                needed = len(latest_pairs) // 2
+                latest_messages = self._completed_history_messages(_extract_ingestible_messages(latest))
+                needed = self._history_turn_count(latest_messages)
                 have = len(self.engine._turn_tag_index.entries)
                 if needed <= have:
                     break
                 # Tag the gap
-                gap_pairs = latest_pairs[have * 2:]
-                if not gap_pairs:
+                gap_messages = self._slice_messages_from_turn(latest_messages, have)
+                if not gap_messages:
                     break
                 logger.info(
                     "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
-                    len(gap_pairs) // 2, have, needed,
+                    self._history_turn_count(gap_messages), have, needed,
                 )
                 self._ingestion_progress = (have, needed)
-                self._ingest_pairs_with_progress(gap_pairs, baseline=have, cumulative_total=needed)
+                self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
 
         except _IngestionCancelled as e:
             # New request is taking over — exit cleanly without
@@ -2053,17 +2179,17 @@ class ProxyState:
                 # Record watermark for history widening detection
                 latest = self._latest_body
                 if latest:
-                    _pairs = _extract_history_pairs(latest)
-                    self._record_ingestion_watermark(_pairs, conversation_id)
+                    _messages = self._completed_history_messages(_extract_ingestible_messages(latest))
+                    self._record_ingestion_watermark(_messages, conversation_id)
                 # After ingestion, check if compaction is needed immediately.
                 # Without this, the payload stays over-budget and upstream
                 # rejects every request — a deadlock.
-                self._compact_after_ingestion(initial_pairs)
+                self._compact_after_ingestion(initial_messages)
                 self._transition_to(SessionState.ACTIVE)
 
-    def _ingest_pairs_with_progress(
+    def _ingest_messages_with_progress(
         self,
-        pairs: list[Message],
+        messages: list[Message],
         baseline: int = 0,
         cumulative_total: int | None = None,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
@@ -2071,7 +2197,7 @@ class ProxyState:
         """Call engine.ingest_history with a progress callback that emits events.
 
         Args:
-            pairs: Message pairs to ingest.
+            messages: Ingestible message stream to ingest.
             baseline: Already-ingested turns before this batch (for cumulative progress).
             cumulative_total: Total turns across all batches. Defaults to baseline + batch size.
 
@@ -2080,10 +2206,11 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         t0 = time.monotonic()
         baseline_history_tokens = 0
-        _total = cumulative_total if cumulative_total is not None else baseline + len(pairs) // 2
+        grouped = self._group_history_messages(messages)
+        _total = cumulative_total if cumulative_total is not None else baseline + len(grouped)
         logger.info(
-            "INGEST_BATCH baseline=%d cumulative_total=%s pairs=%d index_size=%d conversation=%s",
-            baseline, _total, len(pairs) // 2,
+            "INGEST_BATCH baseline=%d cumulative_total=%s turns=%d index_size=%d conversation=%s",
+            baseline, _total, len(grouped),
             len(self.engine._turn_tag_index.entries),
             conversation_id[:12],
         )
@@ -2096,18 +2223,16 @@ class ProxyState:
                 raise _IngestionCancelled(cum_done, _total)
             self._ingestion_progress = (cum_done, _total)
             if self.metrics:
-                # Find the pair for this turn to compute preview + tokens
                 turn_num = entry.turn_number
-                pair_idx = turn_num * 2
+                local_turn = turn_num - baseline
                 preview = ""
                 tpt = 0
-                if pair_idx < len(pairs):
-                    raw_content = pairs[pair_idx].content
-                    preview = _strip_envelope(raw_content)[:200]
-                    if pair_idx + 1 < len(pairs):
-                        pair_chars = len(pairs[pair_idx].content) + len(pairs[pair_idx + 1].content)
-                        tpt = pair_chars // 4
-                        baseline_history_tokens += tpt
+                if 0 <= local_turn < len(grouped):
+                    turn_messages = grouped[local_turn].messages
+                    if turn_messages:
+                        preview = _strip_envelope(turn_messages[0].content)[:200]
+                    tpt = sum(len(msg.content) for msg in turn_messages) // 4
+                    baseline_history_tokens += tpt
                 self.metrics.record({
                     "type": "ingested_turn",
                     "turn": turn_num,
@@ -2127,7 +2252,7 @@ class ProxyState:
         }
         if tool_output_refs_by_turn is not None:
             ingest_kwargs["tool_output_refs_by_turn"] = tool_output_refs_by_turn
-        turns = self.engine.ingest_history(pairs, **ingest_kwargs)
+        turns = self.engine.ingest_history(messages, **ingest_kwargs)
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
         logger.info(
@@ -2139,7 +2264,7 @@ class ProxyState:
             self.metrics.record({
                 "type": "history_ingestion",
                 "turns_ingested": turns,
-                "pairs_received": len(pairs) // 2,
+                "turns_received": len(grouped),
                 "elapsed_ms": elapsed_ms,
                 "conversation_id": conversation_id,
                 "baseline_history_tokens": baseline_history_tokens,

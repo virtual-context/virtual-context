@@ -1,5 +1,4 @@
-"""Tests for tool_result filtering in extract_history_pairs — assistant responses
-after tool_result must not be skipped."""
+"""Tests for tool-result scaffolding handling in normalized payload accounting."""
 
 from virtual_context.proxy.formats import (
     AnthropicFormat,
@@ -111,7 +110,7 @@ class TestToolResultFilterPreservesAssistantResponse:
 
         assert "48MP" in all_content, "Final assistant synthesis was dropped"
 
-    def test_payload_accounting_explains_tool_fold_and_pair_counts(self):
+    def test_payload_accounting_explains_tool_fold_and_entry_counts(self):
         fmt = AnthropicFormat()
         body = {
             "messages": [
@@ -139,8 +138,8 @@ class TestToolResultFilterPreservesAssistantResponse:
         assert accounting["raw_payload_entry_count"] == 6
         assert accounting["raw_tool_use_blocks"] == 2
         assert accounting["raw_tool_result_only_user_entries"] == 1
-        assert accounting["assistant_tool_only_entries_folded"] == 1
-        assert accounting["tool_result_user_entries_folded"] == 1
-        assert accounting["tool_followup_pairs"] == 1
-        assert accounting["extracted_history_message_count"] == 4
-        assert accounting["extracted_history_pair_count"] == 2
+        assert accounting["normalized_chat_entry_count"] == 6
+        assert accounting["ingestible_entry_count"] == 4
+        assert accounting["skipped_tool_result_entry_count"] == 1
+        assert accounting["skipped_assistant_tool_only_entry_count"] == 1
+        assert accounting["skipped_scaffolding_entry_count"] == 2

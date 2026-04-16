@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import hashlib
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -18,7 +19,7 @@ from .core.model_catalog import ModelCatalog
 from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
-from .core.segmenter import TopicSegmenter
+from .core.segmenter import TopicSegmenter, pair_messages_into_turns
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
 from .core.turn_tag_index import TurnTagIndex
@@ -570,16 +571,66 @@ class VirtualContextEngine:
         return datetime.now(timezone.utc)
 
     @staticmethod
-    def _canonical_prefix_watermark(rows: list[object]) -> tuple[int, int]:
-        last_prefix_turn = -1
+    def _group_canonical_rows_into_pairs(rows: list[object]) -> list[tuple[int, list[object]]]:
+        grouped: list[tuple[int, list[object]]] = []
+        pending: list[object] = []
+
+        def _flush_pending() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            grouped.append((len(grouped), list(pending)))
+            pending = []
+
         for row in rows:
-            if getattr(row, "compacted_at", None):
-                last_prefix_turn = int(getattr(row, "turn_number", -1))
+            has_user = bool(getattr(row, "user_content", ""))
+            has_assistant = bool(getattr(row, "assistant_content", ""))
+            if has_user and has_assistant:
+                _flush_pending()
+                grouped.append((len(grouped), [row]))
+                continue
+            if has_user:
+                _flush_pending()
+                pending = [row]
+                continue
+            if has_assistant:
+                if pending:
+                    pending.append(row)
+                    _flush_pending()
+                else:
+                    grouped.append((len(grouped), [row]))
+                continue
+            _flush_pending()
+
+        _flush_pending()
+        return grouped
+
+    @staticmethod
+    def _canonical_prefix_watermark(paired_rows: list[tuple[int, list[object]]]) -> tuple[int, int]:
+        last_prefix_turn = -1
+        for turn_number, rows in paired_rows:
+            if rows and all(getattr(row, "compacted_at", None) for row in rows):
+                last_prefix_turn = turn_number
                 continue
             break
         if last_prefix_turn < 0:
             return 0, -1
         return ((last_prefix_turn + 1) * 2), last_prefix_turn
+
+    @staticmethod
+    def _pair_payload_from_rows(rows: list[object]) -> tuple[str, str, str | None, str | None]:
+        user_content = ""
+        assistant_content = ""
+        user_raw_content = None
+        assistant_raw_content = None
+        for row in rows:
+            if not user_content and getattr(row, "user_content", ""):
+                user_content = str(getattr(row, "user_content", "") or "")
+                user_raw_content = getattr(row, "user_raw_content", None)
+            if not assistant_content and getattr(row, "assistant_content", ""):
+                assistant_content = str(getattr(row, "assistant_content", "") or "")
+                assistant_raw_content = getattr(row, "assistant_raw_content", None)
+        return user_content, assistant_content, user_raw_content, assistant_raw_content
 
     def _restore_from_canonical_rows(self, conversation_id: str) -> bool:
         try:
@@ -594,57 +645,100 @@ class VirtualContextEngine:
         if not rows:
             return False
 
-        tagged_rows = [row for row in rows if row.tagged_at]
+        paired_rows = self._group_canonical_rows_into_pairs(rows)
+        tagged_pairs = [
+            (turn_number, pair_rows)
+            for turn_number, pair_rows in paired_rows
+            if pair_rows and all(getattr(row, "tagged_at", None) for row in pair_rows)
+        ]
         self._turn_tag_index = TurnTagIndex()
-        for row in tagged_rows:
+        for turn_number, pair_rows in tagged_pairs:
+            user_content, assistant_content, *_ = self._pair_payload_from_rows(pair_rows)
+            primary_tag = "_general"
+            sender = ""
+            session_date = ""
+            canonical_turn_id = ""
+            tags: list[str] = []
+            fact_signals = []
+            code_refs = []
+            timestamp_values: list[str | None] = []
+            for row in pair_rows:
+                if not canonical_turn_id:
+                    canonical_turn_id = getattr(row, "canonical_turn_id", "") or ""
+                if getattr(row, "primary_tag", "") not in ("", "_general"):
+                    primary_tag = row.primary_tag
+                elif primary_tag == "_general":
+                    primary_tag = getattr(row, "primary_tag", "_general") or "_general"
+                if not sender:
+                    sender = getattr(row, "sender", "") or ""
+                if not session_date:
+                    session_date = getattr(row, "session_date", "") or ""
+                tags.extend(list(getattr(row, "tags", []) or []))
+                fact_signals.extend(list(getattr(row, "fact_signals", []) or []))
+                code_refs.extend(list(getattr(row, "code_refs", []) or []))
+                timestamp_values.extend(
+                    [
+                        getattr(row, "last_seen_at", None),
+                        getattr(row, "first_seen_at", None),
+                        getattr(row, "updated_at", None),
+                        getattr(row, "created_at", None),
+                    ]
+                )
             self._turn_tag_index.append(TurnTagEntry(
-                turn_number=row.turn_number,
-                canonical_turn_id=row.canonical_turn_id or "",
-                message_hash=row.turn_hash[:16] if row.turn_hash else "",
-                tags=list(row.tags or []),
-                primary_tag=row.primary_tag or "_general",
-                timestamp=self._parse_turn_timestamp(
-                    row.last_seen_at, row.first_seen_at, row.updated_at, row.created_at,
-                ),
-                session_date=row.session_date or "",
-                fact_signals=list(row.fact_signals or []),
-                sender=row.sender or "",
-                code_refs=list(row.code_refs or []),
+                turn_number=turn_number,
+                canonical_turn_id=canonical_turn_id,
+                message_hash=hashlib.sha256(f"{user_content} {assistant_content}".encode()).hexdigest()[:16],
+                tags=list(dict.fromkeys(tags)) or [primary_tag],
+                primary_tag=primary_tag,
+                timestamp=self._parse_turn_timestamp(*timestamp_values),
+                session_date=session_date,
+                fact_signals=fact_signals,
+                sender=sender,
+                code_refs=code_refs,
             ))
 
-        compacted_rows = [row for row in rows if row.compacted_at]
-        live_rows = [row for row in tagged_rows if not row.compacted_at]
-        pending_rows = [row for row in rows if not row.tagged_at]
-        compacted_through, last_compacted_turn = self._canonical_prefix_watermark(rows)
+        compacted_pairs = [
+            (turn_number, pair_rows)
+            for turn_number, pair_rows in paired_rows
+            if pair_rows and all(getattr(row, "compacted_at", None) for row in pair_rows)
+        ]
+        live_pairs = [
+            (turn_number, pair_rows)
+            for turn_number, pair_rows in tagged_pairs
+            if not all(getattr(row, "compacted_at", None) for row in pair_rows)
+        ]
+        pending_pairs = [
+            (turn_number, pair_rows)
+            for turn_number, pair_rows in paired_rows
+            if not pair_rows or not all(getattr(row, "tagged_at", None) for row in pair_rows)
+        ]
+        compacted_through, last_compacted_turn = self._canonical_prefix_watermark(paired_rows)
         self._engine_state.compacted_through = compacted_through
         self._engine_state.flushed_through = self._engine_state.compacted_through
         self._engine_state.last_compacted_turn = last_compacted_turn
-        last_completed_turn = rows[-1].turn_number if rows else -1
-        last_indexed_turn = tagged_rows[-1].turn_number if tagged_rows else -1
+        last_completed_turn = paired_rows[-1][0] if paired_rows else -1
+        last_indexed_turn = tagged_pairs[-1][0] if tagged_pairs else -1
         self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, last_completed_turn)
         self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, last_indexed_turn)
         self._engine_state.checkpoint_version = max(self._engine_state.checkpoint_version, 2)
         self._restored_conversation_history = [
-            (row.turn_number, row.user_content, row.assistant_content)
-            for row in live_rows
+            (turn_number, *self._pair_payload_from_rows(pair_rows)[:2])
+            for turn_number, pair_rows in live_pairs
         ]
         self._restored_pending_turns = [
             (
-                row.turn_number,
-                row.user_content,
-                row.assistant_content,
-                row.user_raw_content,
-                row.assistant_raw_content,
+                turn_number,
+                *self._pair_payload_from_rows(pair_rows),
             )
-            for row in pending_rows
+            for turn_number, pair_rows in pending_pairs
         ]
         logger.info(
             "Canonical restore loaded %d turns (%d indexed, %d compacted, %d live, %d pending) for conversation %s",
-            len(rows),
-            len(tagged_rows),
-            len(compacted_rows),
-            len(live_rows),
-            len(pending_rows),
+            len(paired_rows),
+            len(tagged_pairs),
+            len(compacted_pairs),
+            len(live_pairs),
+            len(pending_pairs),
             conversation_id[:12],
         )
         return True
@@ -1122,7 +1216,7 @@ class VirtualContextEngine:
                 conversation_generation=self._engine_state.conversation_generation,
                 turn_tag_entries=list(self._turn_tag_index.entries),
                 turn_count=max(
-                    (len(conversation_history) // 2) if conversation_history else 0,
+                    len(pair_messages_into_turns(list(conversation_history))) if conversation_history else 0,
                     self._engine_state.last_completed_turn + 1,
                     self._engine_state.last_indexed_turn + 1,
                 ),
@@ -1139,7 +1233,7 @@ class VirtualContextEngine:
             # Write-through to Redis cache
             if self._session_cache:
                 try:
-                    history_turns = (len(conversation_history) // 2) if conversation_history else 0
+                    history_turns = len(pair_messages_into_turns(list(conversation_history))) if conversation_history else 0
                     if conversation_history and history_turns >= self._engine_state.last_completed_turn + 1:
                         cache_snapshot = self._build_cache_snapshot(
                             conversation_history,
@@ -1248,11 +1342,29 @@ class VirtualContextEngine:
 
     def persist_completed_turn(self, conversation_history: list[Message]) -> None:
         """Durably record the latest completed user/assistant pair before indexing catches up."""
-        if len(conversation_history) < 2 or len(conversation_history) % 2 != 0:
+        grouped = pair_messages_into_turns(list(conversation_history))
+        if not grouped:
             return
-        turn_number = (len(conversation_history) // 2) - 1
-        user_msg = conversation_history[-2]
-        assistant_msg = conversation_history[-1]
+        latest_turn = grouped[-1]
+        assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
+        if not assistant_messages:
+            return
+        user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
+        turn_number = len(grouped) - 1
+        user_msg = Message(
+            role="user",
+            content="\n".join(msg.content for msg in user_messages),
+            timestamp=user_messages[-1].timestamp if user_messages else None,
+            metadata=user_messages[-1].metadata if user_messages else None,
+            raw_content=user_messages[-1].raw_content if user_messages else None,
+        )
+        assistant_msg = Message(
+            role="assistant",
+            content="\n".join(msg.content for msg in assistant_messages),
+            timestamp=assistant_messages[-1].timestamp if assistant_messages else None,
+            metadata=assistant_messages[-1].metadata if assistant_messages else None,
+            raw_content=assistant_messages[-1].raw_content if assistant_messages else None,
+        )
         entry = self._turn_tag_index.get_tags_for_turn(turn_number)
         try:
             result = IngestReconciler(
@@ -1322,8 +1434,11 @@ class VirtualContextEngine:
         self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, indexed)
 
         completed = -1
-        if conversation_history and len(conversation_history) >= 2 and len(conversation_history) % 2 == 0:
-            completed = (len(conversation_history) // 2) - 1
+        grouped = pair_messages_into_turns(list(conversation_history)) if conversation_history else []
+        if grouped:
+            latest_turn = grouped[-1]
+            if any(msg.role == "assistant" for msg in latest_turn.messages):
+                completed = len(grouped) - 1
         if last_completed_turn is not None:
             completed = max(completed, last_completed_turn)
         completed = max(completed, self._engine_state.last_indexed_turn)
@@ -1594,13 +1709,13 @@ class VirtualContextEngine:
 
     def ingest_history(
         self,
-        history_pairs: list[Message],
+        history_messages: list[Message],
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> int:
         return self._tagging.ingest_history(
-            history_pairs,
+            history_messages,
             progress_callback,
             turn_offset,
             tool_output_refs_by_turn=tool_output_refs_by_turn,
@@ -1637,15 +1752,15 @@ class VirtualContextEngine:
         fmt: "PayloadFormat",
         conversation_id: str | None = None,
     ) -> int:
-        """Persist turn text from a client request body to the durable store.
+        """Persist normalized ingestible chat entries from a client payload.
 
-        Uses fmt.group_into_turns(body) for format-agnostic grouping across
-        Anthropic, OpenAI Chat, OpenAI Responses, and Gemini. Extracts
-        user + assistant/model text per turn group and reconciles them into
-        the canonical turn ledger. Re-sends update existing canonical turns
-        instead of creating duplicate transcript rows.
+        Uses the shared normalized-entry extractor across Anthropic, OpenAI
+        Chat, OpenAI Responses, and Gemini. Explicit scaffolding-only entries
+        are skipped, and each remaining chat entry is reconciled into the
+        canonical transcript ledger.
 
-        Returns the number of genuinely new turns persisted (0 if all existed).
+        Returns the number of genuinely new canonical entries persisted
+        (0 if all already existed).
         """
         conv_id = conversation_id or self.config.conversation_id
         store = self._store
@@ -1656,10 +1771,9 @@ class VirtualContextEngine:
             conv_id,
             body=body,
             fmt=fmt,
-            turn_entries=self._turn_tag_index,
         )
         logger.info(
-            "SYNC_TURNS_CANONICAL: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",
+            "SYNC_CANONICAL_ENTRIES: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",
             conv_id[:12],
             result.merge_mode,
             result.turns_written,
