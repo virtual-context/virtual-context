@@ -143,3 +143,50 @@ def test_build_conversation_coverage_report_uses_latest_payload_and_exact_ranges
     assert report.exact_end_turn_number == 4
     assert report.tag_summary_count == 1
     assert report.max_tag_summary_turn == 8
+
+
+def test_build_conversation_coverage_report_prefers_extracted_history_counts(tmp_path):
+    store = SQLiteStore(tmp_path / "test.db")
+    conversation_id = "conv-extracted"
+
+    store.save_request_capture(
+        {
+            "turn": 0,
+            "turn_id": "req-large",
+            "ts": "2026-04-16T14:08:05+00:00",
+            "api_format": "openai",
+            "model": "test",
+            "stream": False,
+            "message_count": 29,
+            "client_payload_message_count": 29,
+            "client_payload_pair_count": 14,
+            "client_payload_user_prompt_count": 12,
+            "client_payload_timestamped_message_count": 10,
+            "client_payload_earliest_timestamp": "2026-04-11T15:05:00+00:00",
+            "client_payload_latest_timestamp": "2026-04-16T14:07:00+00:00",
+            "extracted_history_message_count": 998,
+            "extracted_history_pair_count": 499,
+            "conversation_id": conversation_id,
+            "inbound_tags": [],
+            "response_tags": [],
+            "passthrough": True,
+            "inbound_tokens": 0,
+            "outbound_tokens": 0,
+            "inbound_bytes": 0,
+            "outbound_bytes": 0,
+            "context_tokens": 0,
+            "overhead_ms": 0,
+            "turns_dropped": 0,
+            "turns_stubbed": 0,
+            "message_preview": "",
+            "upstream_input_tokens": 0,
+            "upstream_output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+    )
+
+    report = build_conversation_coverage_report(store, conversation_id)
+
+    assert report.latest_payload.message_count == 998
+    assert report.latest_payload.pair_count == 499

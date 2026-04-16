@@ -68,6 +68,13 @@ def test_save_and_load_roundtrip(provider, mock_redis):
     state = SessionState()
     state.compacted_through = 42
     state.last_indexed_turn = 10
+    state.session_state = "ingesting"
+    state.live_turn_count = 500
+    state.history_message_count = 1000
+    state.ingestion_done = 20
+    state.ingestion_total = 499
+    state.last_payload_kb = 23062.4
+    state.last_payload_tokens = 12541785
 
     provider.save("conv-123", state)
 
@@ -75,6 +82,13 @@ def test_save_and_load_roundtrip(provider, mock_redis):
     assert loaded is not None
     assert loaded.compacted_through == 42
     assert loaded.last_indexed_turn == 10
+    assert loaded.session_state == "ingesting"
+    assert loaded.live_turn_count == 500
+    assert loaded.history_message_count == 1000
+    assert loaded.ingestion_done == 20
+    assert loaded.ingestion_total == 499
+    assert loaded.last_payload_kb == 23062.4
+    assert loaded.last_payload_tokens == 12541785
     assert loaded.version == 1  # incremented on save
 
 

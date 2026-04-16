@@ -38,6 +38,13 @@ class SessionState:
     split_processed_tags: set[str] = field(default_factory=set)
     trailing_fingerprint: str = ""
     provider: str = ""
+    session_state: str = ""
+    live_turn_count: int = 0
+    history_message_count: int = 0
+    ingestion_done: int = 0
+    ingestion_total: int = 0
+    last_payload_kb: float = 0.0
+    last_payload_tokens: int = 0
     turn_tag_entries: list[dict] = field(default_factory=list)
     working_set: list[dict] = field(default_factory=list)
     telemetry_rollup: dict = field(default_factory=dict)
@@ -59,6 +66,13 @@ class SessionState:
             "split_processed_tags": sorted(self.split_processed_tags),
             "trailing_fingerprint": self.trailing_fingerprint,
             "provider": self.provider,
+            "session_state": self.session_state,
+            "live_turn_count": self.live_turn_count,
+            "history_message_count": self.history_message_count,
+            "ingestion_done": self.ingestion_done,
+            "ingestion_total": self.ingestion_total,
+            "last_payload_kb": self.last_payload_kb,
+            "last_payload_tokens": self.last_payload_tokens,
             "turn_tag_entries": self.turn_tag_entries,
             "working_set": self.working_set,
             "telemetry_rollup": self.telemetry_rollup,
@@ -85,6 +99,13 @@ class SessionState:
             split_processed_tags=set(d.get("split_processed_tags", [])),
             trailing_fingerprint=d.get("trailing_fingerprint", ""),
             provider=d.get("provider", ""),
+            session_state=d.get("session_state", ""),
+            live_turn_count=d.get("live_turn_count", 0),
+            history_message_count=d.get("history_message_count", 0),
+            ingestion_done=d.get("ingestion_done", 0),
+            ingestion_total=d.get("ingestion_total", 0),
+            last_payload_kb=d.get("last_payload_kb", 0.0),
+            last_payload_tokens=d.get("last_payload_tokens", 0),
             turn_tag_entries=d.get("turn_tag_entries", []),
             working_set=d.get("working_set", []),
             telemetry_rollup=d.get("telemetry_rollup", {}),
