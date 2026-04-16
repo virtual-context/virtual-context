@@ -49,12 +49,31 @@ def build_conversation_coverage_report(
     captures = store.load_request_captures(limit=50, conversation_id=conversation_id)
 
     latest_capture = captures[-1] if captures else {}
+    extracted_message_count = _int_or_default(
+        latest_capture.get("extracted_history_message_count", 0),
+        0,
+    )
+    extracted_pair_count = _int_or_default(
+        latest_capture.get("extracted_history_pair_count", 0),
+        0,
+    )
+    client_message_count = _int_or_default(
+        latest_capture.get(
+            "client_payload_message_count",
+            latest_capture.get("message_count", 0),
+        ),
+        0,
+    )
+    client_pair_count = _int_or_default(
+        latest_capture.get("client_payload_pair_count", 0),
+        0,
+    )
     latest_payload = PayloadSpanStats(
         turn=_int_or_default(latest_capture.get("turn", -1)),
         turn_id=(latest_capture.get("turn_id", "") or ""),
         captured_at=_parse_capture_timestamp(str(latest_capture.get("ts", "") or "")),
-        message_count=_int_or_default(latest_capture.get("client_payload_message_count", latest_capture.get("message_count", 0)), 0),
-        pair_count=_int_or_default(latest_capture.get("client_payload_pair_count", 0), 0),
+        message_count=max(extracted_message_count, client_message_count),
+        pair_count=max(extracted_pair_count, client_pair_count),
         user_prompt_count=_int_or_default(latest_capture.get("client_payload_user_prompt_count", 0), 0),
         timestamped_message_count=_int_or_default(latest_capture.get("client_payload_timestamped_message_count", 0), 0),
         earliest_timestamp=str(latest_capture.get("client_payload_earliest_timestamp", "") or ""),
