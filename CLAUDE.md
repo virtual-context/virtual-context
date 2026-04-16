@@ -1,5 +1,8 @@
 # Virtual Context
 
+## WORKFLOW: ONE ISSUE AT A TIME
+Work through benchmark issues one at a time. Do not move on from an issue without an explicit directive from the user. Never suggest moving on to the next issue. The user will decide when to move on.
+
 ## Environment
 
 Always run tests with `.venv/bin/pytest`. Always use `.venv/bin/python` for any Python commands. The project venv must be used for all operations.

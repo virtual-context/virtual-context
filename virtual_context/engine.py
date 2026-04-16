@@ -629,6 +629,27 @@ class VirtualContextEngine:
             return 0, -1
         return ((last_prefix_turn + 1) * 2), last_prefix_turn
 
+    def _derive_compacted_prefix_messages_from_rows(
+        self, conversation_id: str,
+    ) -> tuple[int, int] | None:
+        # Canonical rows are authoritative for compaction progress across
+        # workers: any worker's commit of compacted_at is SQL-visible to all
+        # others, so deriving from them at hydration time eliminates drift
+        # against stale checkpoint and session-state caches. Returns None when
+        # canonical rows cannot be loaded, letting the caller keep the cached
+        # value it already has.
+        try:
+            rows = list(self._store.get_all_canonical_turns(conversation_id))
+        except Exception:
+            logger.warning(
+                "Failed to derive compaction watermark from canonical rows for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+        paired_rows = self._group_canonical_rows_into_pairs(rows)
+        return self._canonical_prefix_watermark(paired_rows)
+
     @staticmethod
     def _pair_payload_from_rows(rows: list[object]) -> tuple[str, str, str | None, str | None]:
         user_content = ""
@@ -726,7 +747,14 @@ class VirtualContextEngine:
         ]
         compacted_prefix_messages, last_compacted_turn = self._canonical_prefix_watermark(paired_rows)
         self._engine_state.compacted_prefix_messages = compacted_prefix_messages
-        self._engine_state.flushed_prefix_messages = self._engine_state.compacted_prefix_messages
+        # flushed_prefix_messages is session-scoped; preserve whatever was
+        # restored from checkpoint/session state but clamp it to the derived
+        # compacted watermark so stale caches cannot claim progress beyond
+        # what canonical rows confirm was compacted.
+        self._engine_state.flushed_prefix_messages = min(
+            int(self._engine_state.flushed_prefix_messages or 0),
+            compacted_prefix_messages,
+        )
         self._engine_state.last_compacted_turn = last_compacted_turn
         last_completed_turn = paired_rows[-1][0] if paired_rows else -1
         last_indexed_turn = tagged_pairs[-1][0] if tagged_pairs else -1
@@ -821,29 +849,31 @@ class VirtualContextEngine:
             len(self._restored_pending_turns),
         )
 
-        # Validate watermark against actual stored segments.
-        # If the store has no segments for this conversation (e.g., user deleted
-        # the conversation or segments were purged), reset the watermark so
-        # ingested history can be compacted fresh.
+        # Canonical rows are the authoritative source for compaction progress,
+        # so derivation above has already reconciled the in-memory watermark.
+        # We still sanity-check that segments exist to back the derived value;
+        # if not, log a warning so operators can investigate. We intentionally
+        # do NOT zero the watermark here — canonical rows would just re-derive
+        # it on the next ingest via _advance_compaction_watermark(), so a reset
+        # would not stick. Fixing the inconsistency requires clearing
+        # compacted_at on the affected canonical rows, which is out of scope
+        # for the restore path.
         if self._engine_state.compacted_prefix_messages > 0:
             try:
                 segs = self._store.get_segments_by_tags(
                     tags=["_general"], min_overlap=0, limit=1,
                     conversation_id=self.config.conversation_id,
                 )
-                # Also check if ANY tag has segments
                 if not segs:
                     tags = self._store.get_all_tags(conversation_id=self.config.conversation_id)
                     if not tags:
                         logger.warning(
-                            "Watermark=%d but store has no segments for conversation %s — resetting to 0",
-                            self._engine_state.compacted_prefix_messages, self.config.conversation_id[:12],
+                            "Canonical rows say compacted_prefix_messages=%d for conversation %s but no segments exist — inconsistent state, investigate",
+                            self._engine_state.compacted_prefix_messages,
+                            self.config.conversation_id[:12],
                         )
-                        self._engine_state.compacted_prefix_messages = 0
-                        self._engine_state.flushed_prefix_messages = 0
-                        self._engine_state.last_request_time = 0.0
             except Exception:
-                pass  # Don't crash on validation failure
+                pass
 
     def _apply_cached_state(self, cached: dict) -> None:
         """Restore engine state from a Redis snapshot."""
@@ -941,6 +971,22 @@ class VirtualContextEngine:
         # History — stash as list of dicts for ProxyState to pick up
         # (ProxyState handles the dict->Message conversion)
         self._restored_conversation_history = cached.get("history", [])
+
+        # Override the snapshot's compaction watermark with a fresh derivation
+        # from canonical rows. Another worker may have committed a compaction
+        # since this Redis snapshot was written; canonical rows reflect that
+        # commit immediately, the cached snapshot does not.
+        derived = self._derive_compacted_prefix_messages_from_rows(
+            self.config.conversation_id,
+        )
+        if derived is not None:
+            compacted_prefix_messages, last_compacted_turn = derived
+            self._engine_state.compacted_prefix_messages = compacted_prefix_messages
+            self._engine_state.last_compacted_turn = last_compacted_turn
+            self._engine_state.flushed_prefix_messages = min(
+                int(self._engine_state.flushed_prefix_messages or 0),
+                compacted_prefix_messages,
+            )
 
     def _apply_persisted_state_to_delegates(self) -> None:
         """Wire restored state into delegates created after _load_persisted_state."""
@@ -1114,6 +1160,24 @@ class VirtualContextEngine:
         # Segmenter also reads _turn_tag_index during compaction
         if hasattr(self, "_segmenter") and hasattr(self._segmenter, "_turn_tag_index"):
             self._segmenter._turn_tag_index = new_tti
+
+        # Canonical rows are authoritative for compacted_prefix_messages across
+        # all workers. The session state we just loaded may be stale relative
+        # to another worker's committed compaction — re-derive from the DB so
+        # this request operates on current truth. flushed_prefix_messages stays
+        # as session state provided it (per-session flush progress is not
+        # DB-derivable), but we clamp it to the derived compacted watermark.
+        derived = self._derive_compacted_prefix_messages_from_rows(
+            self.config.conversation_id,
+        )
+        if derived is not None:
+            compacted_prefix_messages, last_compacted_turn = derived
+            self._engine_state.compacted_prefix_messages = compacted_prefix_messages
+            self._engine_state.last_compacted_turn = last_compacted_turn
+            self._engine_state.flushed_prefix_messages = min(
+                int(self._engine_state.flushed_prefix_messages or 0),
+                compacted_prefix_messages,
+            )
 
     def extract_session_state(self):
         """Extract current checkpoint state for SessionStateProvider save.
@@ -1377,14 +1441,7 @@ class VirtualContextEngine:
             metadata=assistant_messages[-1].metadata if assistant_messages else None,
             raw_content=assistant_messages[-1].raw_content if assistant_messages else None,
         )
-        entry = next(
-            (
-                candidate
-                for candidate in reversed(self._turn_tag_index.entries)
-                if candidate.turn_number == turn_number
-            ),
-            None,
-        )
+        entry = self._turn_tag_index.get_tags_for_logical_turn(turn_number)
         try:
             result = IngestReconciler(
                 self._store,
