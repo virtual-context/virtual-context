@@ -98,6 +98,7 @@ class IngestReconciler:
                         row.sort_key = existing_row.sort_key
                         row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
                         row.last_seen_at = utcnow_iso()
+                        self._preserve_existing_enrichment(row, existing_row)
                         self._write_turn(
                             row,
                             turn_number=self._ordinal_for_row(existing, existing_row.canonical_turn_id),
@@ -239,6 +240,7 @@ class IngestReconciler:
                 row.source_batch_id = batch_id
                 row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
                 row.last_seen_at = now
+                self._preserve_existing_enrichment(row, existing_row)
                 self._write_turn(row, turn_number=alignment.existing_start + offset)
                 rows_touched.append(row)
                 turns_matched += 1
@@ -305,6 +307,21 @@ class IngestReconciler:
             batch=batch,
             rows=rows_touched,
         )
+
+    @staticmethod
+    def _preserve_existing_enrichment(
+        row: CanonicalTurnRow, existing_row: CanonicalTurnRow,
+    ) -> None:
+        # Re-ingest of an already-stored turn constructs a new prepared row
+        # from the incoming payload and overwrites the stored row. When the
+        # incoming payload lacks metadata that the stored row already has —
+        # for example a resync batch that doesn't carry the session_date the
+        # original ingestion extracted from a "[Session from ...]" header —
+        # the naive overwrite clobbers good data with empty. Merge alignment
+        # is content-hash only (see _find_alignment), so preserving the
+        # existing enrichment here does not affect row identity or ordering.
+        if not (row.session_date or "").strip() and (existing_row.session_date or "").strip():
+            row.session_date = existing_row.session_date
 
     def _prepare_message_row(
         self,
