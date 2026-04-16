@@ -1080,7 +1080,6 @@ def _hydrate_lookup_summary_results(
                 match_type=qr.match_type,
                 similarity=qr.similarity,
                 session_date=session_date,
-                created_at=qr.created_at,
                 source_scope="segment",
             )
         )
@@ -1909,7 +1908,6 @@ def _build_exact_value_candidates(
             "session": row.get("session", ""),
             "session_date_normalized": row.get("session_date_normalized", ""),
             "turn_number": row.get("turn_number"),
-            "created_at": row.get("created_at", ""),
             "excerpt": excerpt,
             "distinct_version_count": distinct_version_count,
             "user_statement": user_statement,
@@ -1995,7 +1993,7 @@ def _latest_user_version_candidate(
         version_candidates,
         key=lambda candidate: (
             str(candidate.get("session_date_normalized", "")),
-            str(candidate.get("created_at", "")),
+            int(candidate.get("turn_number") or 0),
             tuple(candidate.get("_score", ())),
         ),
     )
@@ -2245,7 +2243,6 @@ def _merge_segment_excerpts(
             match_type=best.match_type,
             similarity=best_similarity,
             session_date=best.session_date,
-            created_at=best.created_at,
         ))
 
         # Append any excerpts we couldn't locate (don't lose data)
@@ -2443,7 +2440,6 @@ def _supplement_aggregate_total_from_summaries(
                 tags=seg.tags,
                 match_type="summary_scan",
                 session_date=seg.metadata.session_date if seg.metadata else "",
-                created_at=str(seg.created_at) if seg.created_at else "",
             ),
         ))
 
@@ -2636,8 +2632,6 @@ def search_summaries(
                         quantities = _extract_quantity_mentions(qr.text)
                         if quantities:
                             entry["quantities"] = quantities
-                    if qr.created_at:
-                        entry["created_at"] = qr.created_at
                     if qr.match_type == "semantic":
                         entry["similarity"] = qr.similarity
                     formatted.append(entry)
@@ -2645,8 +2639,6 @@ def search_summaries(
                 seen_texts: set[str] = set()
                 merged_parts: list[str] = []
                 topics: list[str] = []
-                group_created = [qr.created_at for qr in group if qr.created_at]
-                earliest_created = min(group_created) if group_created else ""
                 for qr in group:
                     norm = qr.text.strip()
                     if norm not in seen_texts:
@@ -2674,8 +2666,6 @@ def search_summaries(
                     quantities = _extract_quantity_mentions(entry["excerpt"])
                     if quantities:
                         entry["quantities"] = quantities
-                if earliest_created:
-                    entry["created_at"] = earliest_created
                 formatted.append(entry)
         for qr in no_session:
             entry = {
@@ -2792,8 +2782,6 @@ def search_summaries(
                     quantities = _extract_quantity_mentions(qr.text)
                     if quantities:
                         entry["quantities"] = quantities
-                if qr.created_at:
-                    entry["created_at"] = qr.created_at
                 if current_state_multi_session:
                     entry["session_recency_rank"] = session_rank
                     if session_rank == 1:
@@ -2817,9 +2805,6 @@ def search_summaries(
                 if qr.segment_ref not in all_refs:
                     all_refs.append(qr.segment_ref)
 
-            # Use earliest created_at from the group for chronological ordering
-            group_created = [qr.created_at for qr in group if qr.created_at]
-            earliest_created = min(group_created) if group_created else ""
             entry = {
                 "excerpt": "\n---\n".join(merged_parts),
                 "topic": ", ".join(topics),
@@ -2841,16 +2826,18 @@ def search_summaries(
                 quantities = _extract_quantity_mentions(entry["excerpt"])
                 if quantities:
                     entry["quantities"] = quantities
-            if earliest_created:
-                entry["created_at"] = earliest_created
             if current_state_multi_session:
                 entry["session_recency_rank"] = session_rank
                 if session_rank == 1:
                     entry["priority"] = "HIGHEST_PRIORITY_CURRENT_STATE"
             formatted.append(entry)
 
-    # Sort no-session results chronologically when created_at is available
-    no_session.sort(key=lambda qr: qr.created_at or "")
+    # Session-less results: sort by turn order within the conversation when
+    # available, then segment_ref as a stable tiebreaker. We deliberately do
+    # not sort by ingestion time — a created_at that merely reflects when the
+    # row was written (vs. when the turn happened) would mislead callers who
+    # expect chronological ordering.
+    no_session.sort(key=lambda qr: (qr.turn_number if qr.turn_number is not None else 0, qr.segment_ref))
 
     # Append results with no session date individually
     for qr in no_session:
@@ -2872,8 +2859,6 @@ def search_summaries(
             quantities = _extract_quantity_mentions(qr.text)
             if quantities:
                 entry["quantities"] = quantities
-        if qr.created_at:
-            entry["created_at"] = qr.created_at
         if qr.match_type == "semantic":
             entry["similarity"] = qr.similarity
         formatted.append(entry)
@@ -3023,8 +3008,6 @@ def find_quote(
             normalized = _normalize_session_date(qr.session_date)
             if normalized:
                 entry["session_date_normalized"] = normalized
-        if qr.created_at:
-            entry["created_at"] = qr.created_at
         if qr.match_type in {"semantic", "turn_semantic", "full_text_semantic"} and qr.similarity:
             entry["match_type"] = qr.match_type
             entry["similarity"] = qr.similarity
