@@ -56,7 +56,7 @@ class IngestReconciler:
         sender: str = "",
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
-    ) -> CanonicalIngestResult:
+        ) -> CanonicalIngestResult:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
             prepared = [
@@ -87,39 +87,41 @@ class IngestReconciler:
             ]
             if len(existing) >= len(prepared):
                 recent_window = existing[-min(5, len(existing)):]
-                recent = recent_window[-len(prepared):]
-                if (
-                    [row.turn_hash for row in recent] == [row.turn_hash for row in prepared]
-                    and all(self._seen_recently(row.last_seen_at or "") for row in recent)
-                ):
-                    for idx, row in enumerate(prepared):
-                        existing_row = recent[idx]
-                        row.canonical_turn_id = existing_row.canonical_turn_id
-                        row.sort_key = existing_row.sort_key
-                        row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
-                        row.last_seen_at = utcnow_iso()
-                        self._preserve_existing_enrichment(row, existing_row)
-                        self._write_turn(
-                            row,
-                            turn_number=self._ordinal_for_row(existing, existing_row.canonical_turn_id),
-                            first_seen_at=row.first_seen_at,
-                            last_seen_at=row.last_seen_at,
+                for window_start in range(0, len(recent_window) - len(prepared) + 1):
+                    recent = recent_window[window_start:window_start + len(prepared)]
+                    if (
+                        [row.turn_hash for row in recent] == [row.turn_hash for row in prepared]
+                        and all(self._seen_recently(row.last_seen_at or "") for row in recent)
+                    ):
+                        for idx, row in enumerate(prepared):
+                            existing_row = recent[idx]
+                            row.canonical_turn_id = existing_row.canonical_turn_id
+                            row.sort_key = existing_row.sort_key
+                            row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
+                            row.last_seen_at = utcnow_iso()
+                            self._preserve_existing_enrichment(row, existing_row)
+                            self._write_turn(
+                                row,
+                                turn_number=self._ordinal_for_row(existing, existing_row.canonical_turn_id),
+                                first_seen_at=row.first_seen_at,
+                                last_seen_at=row.last_seen_at,
+                            )
+                        self._refresh_persisted_anchors(conversation_id)
+                        return CanonicalIngestResult(
+                            merge_mode="exact_resend",
+                            turns_written=0,
+                            turns_matched=len(prepared),
+                            turns_appended=0,
+                            turns_prepended=0,
+                            turns_inserted=0,
+                            rows=recent,
                         )
-                    self._refresh_persisted_anchors(conversation_id)
-                    return CanonicalIngestResult(
-                        merge_mode="exact_resend",
-                        turns_written=0,
-                        turns_matched=len(prepared),
-                        turns_appended=0,
-                        turns_prepended=0,
-                        turns_inserted=0,
-                        rows=recent,
-                    )
             return self._ingest_prepared_turns_locked(
                 conversation_id,
                 prepared_turns=prepared,
                 raw_turn_count=len(prepared),
                 existing=existing,
+                allow_short_overlap=False,
             )
 
     def ingest_batch(
@@ -153,6 +155,7 @@ class IngestReconciler:
         *,
         prepared_turns: list[CanonicalTurnRow],
         raw_turn_count: int,
+        allow_short_overlap: bool = True,
     ) -> CanonicalIngestResult:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
@@ -161,6 +164,7 @@ class IngestReconciler:
                 prepared_turns=prepared_turns,
                 raw_turn_count=raw_turn_count,
                 existing=existing,
+                allow_short_overlap=allow_short_overlap,
             )
 
     def _ingest_prepared_turns_locked(
@@ -170,6 +174,7 @@ class IngestReconciler:
         prepared_turns: list[CanonicalTurnRow],
         raw_turn_count: int,
         existing: list[CanonicalTurnRow],
+        allow_short_overlap: bool = True,
     ) -> CanonicalIngestResult:
         if not prepared_turns:
             logger.info(
@@ -190,7 +195,12 @@ class IngestReconciler:
             )
             return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
 
-        alignment = self._find_alignment(conversation_id, existing, prepared_turns)
+        alignment = self._find_alignment(
+            conversation_id,
+            existing,
+            prepared_turns,
+            allow_short_overlap=allow_short_overlap,
+        )
         merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
         if alignment is None and existing and prepared_turns:
             logger.warning(
@@ -295,8 +305,22 @@ class IngestReconciler:
         )
         recompute_groups = getattr(self._store, "recompute_canonical_turn_groups", None)
         if callable(recompute_groups):
-            recompute_groups(conversation_id)
-        self._refresh_persisted_anchors(conversation_id)
+            try:
+                recompute_groups(conversation_id)
+            except Exception:
+                logger.warning(
+                    "CANONICAL_TURN_GROUP_RECOMPUTE_FAILED: conv=%s",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+        try:
+            self._refresh_persisted_anchors(conversation_id)
+        except Exception:
+            logger.warning(
+                "CANONICAL_TURN_ANCHOR_REFRESH_FAILED: conv=%s",
+                conversation_id[:12],
+                exc_info=True,
+            )
         return CanonicalIngestResult(
             merge_mode=merge_mode,
             turns_written=turns_written,
@@ -399,6 +423,8 @@ class IngestReconciler:
         conversation_id: str,
         existing: list[CanonicalTurnRow],
         incoming: list[CanonicalTurnRow],
+        *,
+        allow_short_overlap: bool = True,
     ) -> _Alignment | None:
         if not existing or not incoming:
             return None
@@ -413,6 +439,35 @@ class IngestReconciler:
 
         if len(existing_hashes) <= len(incoming_hashes) and incoming_hashes[-len(existing_hashes):] == existing_hashes:
             return _Alignment(0, len(incoming_hashes) - len(existing_hashes), len(existing_hashes), 0, "prefix_widening")
+
+        def _alignment_mode(existing_start: int, incoming_start: int, overlap_len: int) -> str:
+            if overlap_len == len(incoming_hashes):
+                return "exact_resend"
+            if incoming_start == 0 and existing_start == 0:
+                return "tail_append" if len(incoming_hashes) > overlap_len else "exact_resend"
+            if (
+                existing_start == 0
+                and incoming_start > 0
+                and incoming_start + overlap_len == len(incoming_hashes)
+            ):
+                return "prefix_widening"
+            return "interior_overlap"
+
+        if allow_short_overlap and min(len(existing_hashes), len(incoming_hashes)) < 3:
+            max_overlap = min(len(existing_hashes), len(incoming_hashes))
+            for overlap_len in range(max_overlap, 0, -1):
+                for incoming_start in range(0, len(incoming_hashes) - overlap_len + 1):
+                    incoming_slice = incoming_hashes[incoming_start:incoming_start + overlap_len]
+                    for existing_start in range(0, len(existing_hashes) - overlap_len + 1):
+                        if existing_hashes[existing_start:existing_start + overlap_len] != incoming_slice:
+                            continue
+                        return _Alignment(
+                            existing_start=existing_start,
+                            incoming_start=incoming_start,
+                            overlap_len=overlap_len,
+                            window_size=overlap_len,
+                            merge_mode=_alignment_mode(existing_start, incoming_start, overlap_len),
+                        )
 
         best: _Alignment | None = None
         for window_size in (5, 4, 3):
@@ -447,17 +502,16 @@ class IngestReconciler:
                         overlap_len = left + right
                         normalized_incoming_start = incoming_start - left
                         normalized_existing_start = existing_start - left
-                        mode = "interior_overlap"
-                        if normalized_incoming_start == 0 and normalized_existing_start == 0:
-                            mode = "tail_append" if len(incoming_hashes) > overlap_len else "exact_resend"
-                        elif normalized_existing_start == 0 and normalized_incoming_start > 0 and normalized_incoming_start + overlap_len == len(incoming_hashes):
-                            mode = "prefix_widening"
                         candidate = _Alignment(
                             existing_start=normalized_existing_start,
                             incoming_start=normalized_incoming_start,
                             overlap_len=overlap_len,
                             window_size=window_size,
-                            merge_mode=mode,
+                            merge_mode=_alignment_mode(
+                                normalized_existing_start,
+                                normalized_incoming_start,
+                                overlap_len,
+                            ),
                         )
                         if best is None or candidate.overlap_len > best.overlap_len or (
                             candidate.overlap_len == best.overlap_len and candidate.window_size > best.window_size

@@ -96,11 +96,25 @@ def test_save_increments_version(provider, mock_redis):
     state = SessionState()
     state.version = 5
 
-    provider.save("conv-123", state)
+    saved_version = provider.save("conv-123", state)
 
     raw = mock_redis._test_store.get("vc:session:conv-123")
     blob = json.loads(raw)
+    assert saved_version == 6
     assert blob["version"] == 6
+
+
+def test_save_rejects_newer_redis_version_without_mutating_local_version(provider, mock_redis):
+    current = SessionState(version=2)
+    assert provider.save("conv-123", current) == 3
+
+    stale = SessionState(version=2)
+    assert provider.save("conv-123", stale) is None
+    assert stale.version == 2
+
+    raw = mock_redis._test_store.get("vc:session:conv-123")
+    blob = json.loads(raw)
+    assert blob["version"] == 3
 
 
 def test_delete_sets_tombstone(provider, mock_redis):
