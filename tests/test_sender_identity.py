@@ -204,7 +204,7 @@ class TestTurnTagEntrySender:
         )
         state = EngineStateSnapshot(
             conversation_id="test-conv",
-            compacted_through=0,
+            compacted_prefix_messages=0,
             turn_count=1,
             turn_tag_entries=[entry],
         )
@@ -224,7 +224,7 @@ class TestTurnTagEntrySender:
         )
         state = EngineStateSnapshot(
             conversation_id="test-conv",
-            compacted_through=0,
+            compacted_prefix_messages=0,
             turn_count=1,
             turn_tag_entries=[entry],
         )

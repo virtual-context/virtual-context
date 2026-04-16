@@ -100,17 +100,65 @@ class CompactionPipeline:
 
     def _refresh_compaction_watermark(self) -> None:
         rows = list(self._store.get_all_canonical_turns(self._config.conversation_id))
+        if not rows:
+            self._engine_state.compacted_prefix_messages = 0
+            self._engine_state.last_compacted_turn = -1
+            return
+        explicit_groups = [
+            int(getattr(row, "turn_group_number"))
+            if getattr(row, "turn_group_number", None) is not None
+            else -1
+            for row in rows
+        ]
+        if rows and all(group >= 0 for group in explicit_groups):
+            grouped_rows: list[tuple[int, list["CanonicalTurnRow"]]] = []
+            grouped_by_turn: dict[int, list["CanonicalTurnRow"]] = {}
+            for row, turn_group_number in zip(rows, explicit_groups, strict=False):
+                grouped_by_turn.setdefault(turn_group_number, []).append(row)
+            grouped_rows = sorted(grouped_by_turn.items(), key=lambda item: item[0])
+        else:
+            grouped_rows = []
+            pending: list["CanonicalTurnRow"] = []
+
+            def _flush_pending() -> None:
+                nonlocal pending
+                if not pending:
+                    return
+                grouped_rows.append((len(grouped_rows), list(pending)))
+                pending = []
+
+            for row in rows:
+                has_user = bool(getattr(row, "user_content", ""))
+                has_assistant = bool(getattr(row, "assistant_content", ""))
+                if has_user and has_assistant:
+                    _flush_pending()
+                    grouped_rows.append((len(grouped_rows), [row]))
+                    continue
+                if has_user:
+                    _flush_pending()
+                    pending = [row]
+                    continue
+                if has_assistant:
+                    if pending:
+                        pending.append(row)
+                        _flush_pending()
+                    else:
+                        grouped_rows.append((len(grouped_rows), [row]))
+                    continue
+                _flush_pending()
+            _flush_pending()
+
         last_prefix_turn = -1
-        for row in rows:
-            if getattr(row, "compacted_at", None):
-                last_prefix_turn = row.turn_number
+        for turn_number, group_rows in grouped_rows:
+            if group_rows and all(getattr(row, "compacted_at", None) for row in group_rows):
+                last_prefix_turn = turn_number
                 continue
             break
         if last_prefix_turn < 0:
-            self._engine_state.compacted_through = 0
+            self._engine_state.compacted_prefix_messages = 0
             self._engine_state.last_compacted_turn = -1
             return
-        self._engine_state.compacted_through = (last_prefix_turn + 1) * 2
+        self._engine_state.compacted_prefix_messages = (last_prefix_turn + 1) * 2
         self._engine_state.last_compacted_turn = last_prefix_turn
 
     # ------------------------------------------------------------------
@@ -151,10 +199,10 @@ class CompactionPipeline:
         if not compact_messages:
             logger.info(
                 "Compaction skipped: no uncompacted canonical turns outside protected zone "
-                "(history=%d msgs, protected=%d turns, compacted_through=%d)",
+                "(history=%d msgs, protected=%d turns, compacted_prefix_messages=%d)",
                 len(conversation_history),
                 self._config.monitor.protected_recent_turns,
-                self._engine_state.compacted_through,
+                self._engine_state.compacted_prefix_messages,
             )
             return None
 
@@ -164,7 +212,7 @@ class CompactionPipeline:
             len(compact_messages),
             compact_rows[0].turn_number if compact_rows else -1,
             compact_rows[-1].turn_number if compact_rows else -1,
-            self._engine_state.compacted_through,
+            self._engine_state.compacted_prefix_messages,
         )
         report = self._run_compaction(
             conversation_history,
@@ -256,7 +304,7 @@ class CompactionPipeline:
 
         compact_rows = list(compact_rows or [])
 
-        turn_offset = compact_rows[0].turn_number if compact_rows else (self._engine_state.compacted_through // 2)
+        turn_offset = compact_rows[0].turn_number if compact_rows else (self._engine_state.compacted_prefix_messages // 2)
 
         def _emit_weighted_progress(
             done: int,
@@ -320,7 +368,7 @@ class CompactionPipeline:
         )
         logger.info(
             "Segmented %d messages into %d segments (watermark=%d)",
-            len(compact_messages), len(segments), self._engine_state.compacted_through,
+            len(compact_messages), len(segments), self._engine_state.compacted_prefix_messages,
         )
 
         # Phase 2+3: Compact + Store (25-75%)

@@ -331,7 +331,7 @@ def filter_body_messages(
             keep_pair[pair_idx] = False
             logger.debug("T%d DROP (paging: below compacted watermark %d)", pair_idx, compacted_turn)
         else:
-            entry = turn_tag_index.get_tags_for_turn(pair_idx)
+            entry = turn_tag_index.get_tags_for_logical_turn(pair_idx)
             if entry is None:
                 keep_pair[pair_idx] = True
             elif "rule" in entry.tags or set(entry.tags) & tag_set:
@@ -705,17 +705,17 @@ def _build_compacted_stub_pair(
 def stub_compacted_messages(
     body: dict,
     turn_tag_index: TurnTagIndex,
-    compacted_through: int,
+    compacted_prefix_messages: int,
     *,
     fmt: PayloadFormat | None = None,
 ) -> tuple[dict, int]:
     """Collapse compacted hash-matching turns to simple user/assistant stubs.
 
     This is kept as a compatibility helper for older paging/filter behavior and
-    tests. ``compacted_through`` uses the historical message-based watermark,
+    tests. ``compacted_prefix_messages`` uses the historical message-based watermark,
     so every two compacted messages correspond to one compacted turn.
     """
-    if compacted_through <= 0:
+    if compacted_prefix_messages <= 0:
         return body, 0
 
     if fmt is None:
@@ -725,7 +725,7 @@ def stub_compacted_messages(
     if not messages:
         return body, 0
 
-    compacted_turn_limit = max(compacted_through // 2, 0)
+    compacted_turn_limit = max(compacted_prefix_messages // 2, 0)
     if compacted_turn_limit <= 0:
         return body, 0
 
@@ -830,7 +830,7 @@ def stub_compacted_messages(
 def drop_compacted_turns(
     body: dict,
     turn_tag_index: TurnTagIndex,
-    compacted_through: int,
+    compacted_prefix_messages: int,
     *,
     fmt: PayloadFormat | None = None,
     protected_recent_turns: int = 6,
@@ -848,11 +848,11 @@ def drop_compacted_turns(
 
     When *drop_boundary* is set, limit the drop range to
     ``drop_boundary // 2`` turns (capped by the protected window start).
-    This allows partial flushing when ``flushed_through < compacted_through``.
+    This allows partial flushing when ``flushed_prefix_messages < compacted_prefix_messages``.
 
     Returns (modified_body, drop_count).
     """
-    if compacted_through <= 0:
+    if compacted_prefix_messages <= 0:
         return body, 0
 
     if fmt is None:
@@ -1662,7 +1662,7 @@ def collapse_turn_chains(
     Individual tool outputs are also stored for FTS search.
 
     **Deep compaction:** Turns whose canonical turn number is below
-    ``compacted_through * deep_compaction_ratio`` are dropped entirely
+    ``compacted_prefix_messages * deep_compaction_ratio`` are dropped entirely
     (no stub pair inserted).  Their tool outputs are already linked to
     segments and recoverable via ``vc_find_quote`` / ``vc_expand_topic``.
     Set *deep_compaction_ratio* to 0 to disable (keep all stubs).
@@ -2010,7 +2010,7 @@ def collapse_turn_chains(
 
         desc_parts = [f"Compacted turn {turn_label}"]
         if canonical_turn >= 0:
-            entry = turn_tag_index.get_tags_for_turn(canonical_turn)
+            entry = turn_tag_index.get_tags_for_logical_turn(canonical_turn)
             if entry and entry.tags:
                 desc_parts.append(f"topics={', '.join(entry.tags[:5])}")
         if tool_str:

@@ -561,7 +561,7 @@ def paging_test_client(tmp_path):
         engine.tag_turn.return_value = None
         engine._turn_tag_index = TurnTagIndex()
         engine._retrieval._resolve_paging_mode.return_value = "autonomous"
-        engine._engine_state.compacted_through = 0
+        engine._engine_state.compacted_prefix_messages = 0
         engine.expand_topic.return_value = {
             "tag": "database",
             "depth": "full",

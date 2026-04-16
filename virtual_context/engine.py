@@ -76,16 +76,16 @@ def _is_stub_content(text: str) -> bool:
     return len(residual.split()) < 3
 
 
-def _restored_flushed_through(
-    compacted_through: int,
-    flushed_through: int | None,
+def _restored_flushed_prefix_messages(
+    compacted_prefix_messages: int,
+    flushed_prefix_messages: int | None,
     *,
     present: bool,
 ) -> int:
     """Restore the flush watermark while preserving a valid persisted zero."""
     if not present:
-        return compacted_through
-    return int(flushed_through or 0)
+        return compacted_prefix_messages
+    return int(flushed_prefix_messages or 0)
 
 
 from .core.compaction_pipeline import CompactionPipeline
@@ -572,6 +572,18 @@ class VirtualContextEngine:
 
     @staticmethod
     def _group_canonical_rows_into_pairs(rows: list[object]) -> list[tuple[int, list[object]]]:
+        explicit_groups = [
+            int(getattr(row, "turn_group_number"))
+            if getattr(row, "turn_group_number", None) is not None
+            else -1
+            for row in rows
+        ]
+        if rows and all(group >= 0 for group in explicit_groups):
+            grouped_by_turn: dict[int, list[object]] = {}
+            for row, turn_group_number in zip(rows, explicit_groups, strict=False):
+                grouped_by_turn.setdefault(turn_group_number, []).append(row)
+            return sorted(grouped_by_turn.items(), key=lambda item: item[0])
+
         grouped: list[tuple[int, list[object]]] = []
         pending: list[object] = []
 
@@ -712,15 +724,15 @@ class VirtualContextEngine:
             for turn_number, pair_rows in paired_rows
             if not pair_rows or not all(getattr(row, "tagged_at", None) for row in pair_rows)
         ]
-        compacted_through, last_compacted_turn = self._canonical_prefix_watermark(paired_rows)
-        self._engine_state.compacted_through = compacted_through
-        self._engine_state.flushed_through = self._engine_state.compacted_through
+        compacted_prefix_messages, last_compacted_turn = self._canonical_prefix_watermark(paired_rows)
+        self._engine_state.compacted_prefix_messages = compacted_prefix_messages
+        self._engine_state.flushed_prefix_messages = self._engine_state.compacted_prefix_messages
         self._engine_state.last_compacted_turn = last_compacted_turn
         last_completed_turn = paired_rows[-1][0] if paired_rows else -1
         last_indexed_turn = tagged_pairs[-1][0] if tagged_pairs else -1
         self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, last_completed_turn)
         self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, last_indexed_turn)
-        self._engine_state.checkpoint_version = max(self._engine_state.checkpoint_version, 2)
+        self._engine_state.checkpoint_version = max(self._engine_state.checkpoint_version, 4)
         self._restored_conversation_history = [
             (turn_number, *self._pair_payload_from_rows(pair_rows)[:2])
             for turn_number, pair_rows in live_pairs
@@ -763,11 +775,11 @@ class VirtualContextEngine:
         if not saved:
             return
         self.config.conversation_id = saved.conversation_id
-        self._engine_state.compacted_through = saved.compacted_through
-        self._engine_state.flushed_through = _restored_flushed_through(
-            saved.compacted_through,
-            getattr(saved, 'flushed_through', 0),
-            present=getattr(saved, 'flushed_through_present', True),
+        self._engine_state.compacted_prefix_messages = saved.compacted_prefix_messages
+        self._engine_state.flushed_prefix_messages = _restored_flushed_prefix_messages(
+            saved.compacted_prefix_messages,
+            getattr(saved, 'flushed_prefix_messages', 0),
+            present=getattr(saved, 'flushed_prefix_messages_present', True),
         )
         self._engine_state.last_request_time = getattr(saved, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = saved.last_compacted_turn
@@ -799,9 +811,9 @@ class VirtualContextEngine:
             self._restored_conversation_history = []
             self._restored_pending_turns = []
         logger.info(
-            "Restored engine state: conversation=%s, compacted_through=%d, indexed=%d, completed=%d, "
+            "Restored engine state: conversation=%s, compacted_prefix_messages=%d, indexed=%d, completed=%d, "
             "turns=%d, split_processed=%d, working_set=%d, history_messages=%d pending_turns=%d",
-            saved.conversation_id[:12], saved.compacted_through,
+            saved.conversation_id[:12], saved.compacted_prefix_messages,
             self._engine_state.last_indexed_turn,
             self._engine_state.last_completed_turn,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
@@ -813,7 +825,7 @@ class VirtualContextEngine:
         # If the store has no segments for this conversation (e.g., user deleted
         # the conversation or segments were purged), reset the watermark so
         # ingested history can be compacted fresh.
-        if self._engine_state.compacted_through > 0:
+        if self._engine_state.compacted_prefix_messages > 0:
             try:
                 segs = self._store.get_segments_by_tags(
                     tags=["_general"], min_overlap=0, limit=1,
@@ -825,10 +837,10 @@ class VirtualContextEngine:
                     if not tags:
                         logger.warning(
                             "Watermark=%d but store has no segments for conversation %s — resetting to 0",
-                            self._engine_state.compacted_through, self.config.conversation_id[:12],
+                            self._engine_state.compacted_prefix_messages, self.config.conversation_id[:12],
                         )
-                        self._engine_state.compacted_through = 0
-                        self._engine_state.flushed_through = 0
+                        self._engine_state.compacted_prefix_messages = 0
+                        self._engine_state.flushed_prefix_messages = 0
                         self._engine_state.last_request_time = 0.0
             except Exception:
                 pass  # Don't crash on validation failure
@@ -840,18 +852,18 @@ class VirtualContextEngine:
 
         self.config.conversation_id = cached["conversation_id"]
 
-        # Engine state — compacted_through is 0 in snapshot (history is uncompacted suffix)
+        # Engine state — compacted_prefix_messages is 0 in snapshot (history is uncompacted suffix)
         es = cached.get("engine_state", {})
-        self._engine_state.compacted_through = es.get("compacted_through", 0)
-        self._engine_state.flushed_through = _restored_flushed_through(
-            es.get("compacted_through", 0),
-            es.get("flushed_through", 0),
-            present=("flushed_through" in es),
+        self._engine_state.compacted_prefix_messages = es.get("compacted_prefix_messages", 0)
+        self._engine_state.flushed_prefix_messages = _restored_flushed_prefix_messages(
+            es.get("compacted_prefix_messages", 0),
+            es.get("flushed_prefix_messages", 0),
+            present=("flushed_prefix_messages" in es),
         )
         self._engine_state.last_request_time = es.get("last_request_time", 0.0)
         self._engine_state.last_compacted_turn = es.get(
             "last_compacted_turn",
-            (self._engine_state.compacted_through // 2) - 1 if self._engine_state.compacted_through > 0 else -1,
+            (self._engine_state.compacted_prefix_messages // 2) - 1 if self._engine_state.compacted_prefix_messages > 0 else -1,
         )
         self._engine_state.last_completed_turn = es.get(
             "last_completed_turn",
@@ -986,11 +998,11 @@ class VirtualContextEngine:
 
         # Engine state markers (including tool_tag_counter for fallback continuity)
         self._engine_state.tool_tag_counter = state.tool_tag_counter
-        self._engine_state.compacted_through = state.compacted_through
-        self._engine_state.flushed_through = _restored_flushed_through(
-            state.compacted_through,
-            getattr(state, 'flushed_through', 0),
-            present=getattr(state, 'flushed_through_present', True),
+        self._engine_state.compacted_prefix_messages = state.compacted_prefix_messages
+        self._engine_state.flushed_prefix_messages = _restored_flushed_prefix_messages(
+            state.compacted_prefix_messages,
+            getattr(state, 'flushed_prefix_messages', 0),
+            present=getattr(state, 'flushed_prefix_messages_present', True),
         )
         self._engine_state.last_request_time = getattr(state, 'last_request_time', 0.0)
         self._engine_state.last_compacted_turn = state.last_compacted_turn
@@ -1113,8 +1125,8 @@ class VirtualContextEngine:
         from .proxy.session_state import SessionState
 
         return SessionState(
-            compacted_through=self._engine_state.compacted_through,
-            flushed_through=self._engine_state.flushed_through,
+            compacted_prefix_messages=self._engine_state.compacted_prefix_messages,
+            flushed_prefix_messages=self._engine_state.flushed_prefix_messages,
             last_request_time=self._engine_state.last_request_time,
             last_compacted_turn=self._engine_state.last_compacted_turn,
             last_completed_turn=self._engine_state.last_completed_turn,
@@ -1206,8 +1218,8 @@ class VirtualContextEngine:
                     pass
             snapshot = EngineStateSnapshot(
                 conversation_id=self.config.conversation_id,
-                compacted_through=self._engine_state.compacted_through,
-                flushed_through=self._engine_state.flushed_through,
+                compacted_prefix_messages=self._engine_state.compacted_prefix_messages,
+                flushed_prefix_messages=self._engine_state.flushed_prefix_messages,
                 last_request_time=self._engine_state.last_request_time,
                 last_compacted_turn=self._engine_state.last_compacted_turn,
                 last_completed_turn=self._engine_state.last_completed_turn,
@@ -1263,7 +1275,7 @@ class VirtualContextEngine:
         saved_at: datetime | None = None,
     ) -> dict:
         """Build atomic snapshot dict for Redis cache."""
-        ct = self._engine_state.compacted_through
+        ct = self._engine_state.compacted_prefix_messages
         saved_at = saved_at or datetime.now(timezone.utc)
 
         # History: uncompacted suffix only
@@ -1318,8 +1330,8 @@ class VirtualContextEngine:
             "history": history,
             "turn_tag_entries": entries,
             "engine_state": {
-                "compacted_through": self._engine_state.compacted_through,
-                "flushed_through": self._engine_state.flushed_through,
+                "compacted_prefix_messages": self._engine_state.compacted_prefix_messages,
+                "flushed_prefix_messages": self._engine_state.flushed_prefix_messages,
                 "last_request_time": self._engine_state.last_request_time,
                 "last_compacted_turn": self._engine_state.last_compacted_turn,
                 "last_completed_turn": self._engine_state.last_completed_turn,
@@ -1365,7 +1377,14 @@ class VirtualContextEngine:
             metadata=assistant_messages[-1].metadata if assistant_messages else None,
             raw_content=assistant_messages[-1].raw_content if assistant_messages else None,
         )
-        entry = self._turn_tag_index.get_tags_for_turn(turn_number)
+        entry = next(
+            (
+                candidate
+                for candidate in reversed(self._turn_tag_index.entries)
+                if candidate.turn_number == turn_number
+            ),
+            None,
+        )
         try:
             result = IngestReconciler(
                 self._store,
@@ -1444,8 +1463,8 @@ class VirtualContextEngine:
         completed = max(completed, self._engine_state.last_indexed_turn)
         self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, completed)
 
-        compacted_turn = (self._engine_state.compacted_through // 2) - 1
-        if self._engine_state.compacted_through <= 0:
+        compacted_turn = (self._engine_state.compacted_prefix_messages // 2) - 1
+        if self._engine_state.compacted_prefix_messages <= 0:
             compacted_turn = -1
         self._engine_state.last_compacted_turn = max(self._engine_state.last_compacted_turn, compacted_turn)
 
@@ -1475,10 +1494,10 @@ class VirtualContextEngine:
         if cached_saved_at is not None and db_state.saved_at != cached_saved_at:
             return False
         cached_turns = len(cached.get("turn_tag_entries", []) or []) if isinstance(cached, dict) else 0
-        cached_ct = cached_state.get("compacted_through", 0) if isinstance(cached_state, dict) else 0
+        cached_ct = cached_state.get("compacted_prefix_messages", 0) if isinstance(cached_state, dict) else 0
         return (
             cached_turns == len(db_state.turn_tag_entries)
-            and cached_ct == db_state.compacted_through
+            and cached_ct == db_state.compacted_prefix_messages
         )
 
     @staticmethod
@@ -1503,12 +1522,12 @@ class VirtualContextEngine:
             return False
         cached_turns = len(cached.get("turn_tag_entries", []) or [])
         cached_ct = (
-            cached.get("engine_state", {}).get("compacted_through", 0)
+            cached.get("engine_state", {}).get("compacted_prefix_messages", 0)
             if isinstance(cached.get("engine_state"), dict) else 0
         )
         return (
             db_state.turn_count > cached_turns
-            or db_state.compacted_through > cached_ct
+            or db_state.compacted_prefix_messages > cached_ct
         )
 
     def _init_supersession_checker(self) -> None:

@@ -227,8 +227,8 @@ class TestProxyState:
         def _compact_if_needed(history, compaction_signal, progress_callback=None):
             calls.append(history)
             release.wait(0.5)
-            engine._engine_state.compacted_through = max(
-                engine._engine_state.compacted_through,
+            engine._engine_state.compacted_prefix_messages = max(
+                engine._engine_state.compacted_prefix_messages,
                 len(history) - (engine.config.monitor.protected_recent_turns * 2),
             )
             return None
@@ -1266,7 +1266,7 @@ class TestCompactionConcurrencyGuard:
             engine.compact_manual.return_value = None
             engine._turn_tag_index = MagicMock()
             engine._turn_tag_index.entries = []
-            engine._engine_state.compacted_through = 0
+            engine._engine_state.compacted_prefix_messages = 0
             MockEngine.return_value = engine
             app = create_app(upstream="http://fake:9999", config_path=None)
 

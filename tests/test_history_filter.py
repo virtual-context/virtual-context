@@ -494,7 +494,7 @@ class TestPreCompactionFilteringModes:
                 ("auth token", "RS256"),
                 ("database index", "CREATE INDEX"),
             ])
-            engine._engine_state.compacted_through = 2
+            engine._engine_state.compacted_prefix_messages = 2
             # Working set: history[2:] = 8 msgs, 2 turns protected (4 msgs)
             # Candidates: turn 1 (auth→dropped), turn 2 (database→kept)
             filtered = engine.filter_history(history, current_tags=["database"])
