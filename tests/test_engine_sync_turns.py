@@ -141,6 +141,24 @@ def test_sync_incremental(engine):
     assert synced == 2
 
 
+def test_sync_warns_but_succeeds_when_group_recompute_fails(engine, monkeypatch, caplog):
+    body = _make_anthropic_messages()
+    fmt = detect_format(body)
+
+    inner = _inner_store(engine)
+    monkeypatch.setattr(
+        inner,
+        "recompute_canonical_turn_groups",
+        lambda conversation_id: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    with caplog.at_level("WARNING"):
+        synced = engine.sync_turns_from_payload(body, fmt)
+
+    assert synced >= 5
+    assert "CANONICAL_TURN_GROUP_RECOMPUTE_FAILED" in caplog.text
+
+
 def test_sync_gemini_format(engine):
     body = _make_gemini_messages()
     fmt = detect_format(body)
