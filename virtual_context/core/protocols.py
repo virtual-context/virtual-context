@@ -87,7 +87,12 @@ class SegmentStore(Protocol):
         first_seen_at: str | None = None,
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
+        turn_group_number: int = -1,
     ) -> None: ...
+    def recompute_canonical_turn_groups(
+        self,
+        conversation_id: str,
+    ) -> int: ...
     def get_canonical_turn_rows(
         self,
         conversation_id: str,

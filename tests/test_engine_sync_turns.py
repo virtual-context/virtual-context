@@ -288,6 +288,29 @@ def test_sync_no_overlap_append_preserves_existing_rows(engine):
     ]
 
 
+def test_sync_no_overlap_append_logs_alignment_warning(engine, caplog):
+    first_window = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Alpha user"},
+            {"role": "assistant", "content": "Alpha assistant"},
+        ],
+    }
+    second_window = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Gamma user"},
+            {"role": "assistant", "content": "Gamma assistant"},
+        ],
+    }
+
+    assert engine.sync_turns_from_payload(first_window, detect_format(first_window)) == 2
+    with caplog.at_level("WARNING"):
+        assert engine.sync_turns_from_payload(second_window, detect_format(second_window)) == 2
+
+    assert "CANONICAL_TURN_NO_ALIGNMENT" in caplog.text
+
+
 def test_sync_interior_overlap_reuses_existing_canonical_ids(engine):
     initial = {
         "model": "gpt-4o",
@@ -443,6 +466,34 @@ def test_ingest_single_invalid_timestamp_disables_dedup_with_warning(engine, cap
     assert len(engine._store.get_all_canonical_turns("test-conv-sync")) == 2
 
 
+def test_ingest_single_retry_outside_last_five_rows_is_not_deduped(engine):
+    from virtual_context.core.ingest_reconciler import IngestReconciler
+
+    reconciler = IngestReconciler(_inner_store(engine), engine._semantic)
+    payloads = [
+        ("Old user", "Old assistant"),
+        ("Middle user 1", "Middle assistant 1"),
+        ("Middle user 2", "Middle assistant 2"),
+    ]
+    for user_content, assistant_content in payloads:
+        reconciler.ingest_single(
+            "test-conv-sync",
+            user_content=user_content,
+            assistant_content=assistant_content,
+        )
+
+    result = reconciler.ingest_single(
+        "test-conv-sync",
+        user_content="Old user",
+        assistant_content="Old assistant",
+    )
+
+    assert result.merge_mode == "no_overlap_append"
+    assert result.turns_written == 2
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert len(rows) == 8
+
+
 def test_sync_concurrent_writers_do_not_duplicate_rows(engine, monkeypatch):
     body = {
         "model": "gpt-4o",
@@ -466,6 +517,27 @@ def test_sync_concurrent_writers_do_not_duplicate_rows(engine, monkeypatch):
     rows = engine._store.get_all_canonical_turns("test-conv-sync")
     assert len(rows) == 4
     assert len({row.canonical_turn_id for row in rows}) == 4
+
+
+def test_sync_logs_embedding_failures_without_aborting_ingest(engine, monkeypatch, caplog):
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Embedding failure user"},
+            {"role": "assistant", "content": "Embedding failure assistant"},
+        ],
+    }
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("embedding offline")
+
+    monkeypatch.setattr(engine._semantic, "embed_and_store_turn", _raise)
+
+    with caplog.at_level("WARNING"):
+        assert engine.sync_turns_from_payload(body, detect_format(body)) == 2
+
+    assert "CANONICAL_TURN_EMBED_FAILED" in caplog.text
+    assert len(engine._store.get_all_canonical_turns("test-conv-sync")) == 2
 
 
 def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
@@ -493,3 +565,81 @@ def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
         ("enter", "test-conv-sync"),
         ("exit", "test-conv-sync"),
     ]
+
+
+def test_restore_prefers_persisted_turn_groups(tmp_path):
+    from virtual_context.config import VirtualContextConfig
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.types import EngineStateSnapshot, StorageConfig, TagGeneratorConfig
+
+    db_path = tmp_path / "restore-groups.db"
+    config = VirtualContextConfig(
+        conversation_id="restore-groups",
+        storage=StorageConfig(backend="sqlite", sqlite_path=str(db_path)),
+        tag_generator=TagGeneratorConfig(type="keyword"),
+    )
+
+    engine1 = VirtualContextEngine(config=config)
+    store = _inner_store(engine1)
+    tagged_at = "2026-04-16T00:00:00+00:00"
+    store.save_canonical_turn(
+        "restore-groups",
+        0,
+        "user-0",
+        "",
+        canonical_turn_id="00000000-0000-0000-0000-000000000001",
+        sort_key=1000.0,
+        tagged_at=tagged_at,
+        turn_group_number=0,
+    )
+    store.save_canonical_turn(
+        "restore-groups",
+        1,
+        "user-1",
+        "",
+        canonical_turn_id="00000000-0000-0000-0000-000000000002",
+        sort_key=2000.0,
+        tagged_at=tagged_at,
+        turn_group_number=1,
+    )
+    store.save_canonical_turn(
+        "restore-groups",
+        2,
+        "",
+        "assistant-1",
+        canonical_turn_id="00000000-0000-0000-0000-000000000003",
+        sort_key=3000.0,
+        tagged_at=tagged_at,
+        turn_group_number=1,
+    )
+    store.save_canonical_turn(
+        "restore-groups",
+        3,
+        "",
+        "assistant-0",
+        canonical_turn_id="00000000-0000-0000-0000-000000000004",
+        sort_key=4000.0,
+        tagged_at=tagged_at,
+        turn_group_number=0,
+    )
+    store.save_engine_state(
+        EngineStateSnapshot(
+            conversation_id="restore-groups",
+            compacted_prefix_messages=0,
+            turn_count=2,
+            turn_tag_entries=[],
+            last_compacted_turn=-1,
+            last_completed_turn=1,
+            last_indexed_turn=1,
+            checkpoint_version=3,
+        )
+    )
+    engine1.close()
+
+    engine2 = VirtualContextEngine(config=config)
+    assert engine2._restored_conversation_history == [
+        (0, "user-0", "assistant-0"),
+        (1, "user-1", "assistant-1"),
+    ]
+    assert engine2._engine_state.checkpoint_version >= 4
+    engine2.close()

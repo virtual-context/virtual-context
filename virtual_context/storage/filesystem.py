@@ -708,7 +708,7 @@ class FilesystemStore(ContextStore):
         path = state_dir / f"{safe_id}.json"
         data = {
             "conversation_id": state.conversation_id,
-            "compacted_through": state.compacted_through,
+            "compacted_prefix_messages": state.compacted_prefix_messages,
             "last_compacted_turn": state.last_compacted_turn,
             "last_completed_turn": state.last_completed_turn,
             "last_indexed_turn": state.last_indexed_turn,
@@ -742,7 +742,7 @@ class FilesystemStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint,
             "request_captures": state.request_captures,
             "provider": state.provider,
-            "flushed_through": state.flushed_through,
+            "flushed_prefix_messages": state.flushed_prefix_messages,
             "last_request_time": state.last_request_time,
             "tool_tag_counter": state.tool_tag_counter,
         }
@@ -774,15 +774,15 @@ class FilesystemStore(ContextStore):
         ]
         return EngineStateSnapshot(
             conversation_id=data.get("conversation_id", data.get("session_id", "")),
-            compacted_through=data.get("compacted_through", 0),
-            flushed_through=data.get("flushed_through", 0),
-            flushed_through_present=("flushed_through" in data),
+            compacted_prefix_messages=data.get("compacted_prefix_messages", 0),
+            flushed_prefix_messages=data.get("flushed_prefix_messages", 0),
+            flushed_prefix_messages_present=("flushed_prefix_messages" in data),
             last_request_time=data.get("last_request_time", 0.0),
             turn_tag_entries=entries,
             turn_count=data.get("turn_count", 0),
             last_compacted_turn=data.get(
                 "last_compacted_turn",
-                (data.get("compacted_through", 0) // 2) - 1 if data.get("compacted_through", 0) > 0 else -1,
+                (data.get("compacted_prefix_messages", 0) // 2) - 1 if data.get("compacted_prefix_messages", 0) > 0 else -1,
             ),
             last_completed_turn=data.get(
                 "last_completed_turn",
@@ -822,14 +822,14 @@ class FilesystemStore(ContextStore):
         for path in state_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text())
-                ct = data.get("compacted_through", 0)
+                ct = data.get("compacted_prefix_messages", 0)
                 saved = data.get("saved_at", "")
                 candidates.append((ct, saved, data))
             except (json.JSONDecodeError, OSError):
                 continue
         if not candidates:
             return None
-        # Highest compacted_through first, then most recent saved_at
+        # Highest compacted_prefix_messages first, then most recent saved_at
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
         try:
             return self._parse_engine_state_data(candidates[0][2])

@@ -11,11 +11,11 @@ class TestTurnTagIndex:
         entry = TurnTagEntry(turn_number=0, message_hash="abc123", tags=["database", "api"], primary_tag="database")
         index.append(entry)
         assert len(index.entries) == 1
-        assert index.get_tags_for_turn(0) == entry
+        assert index.get_tags_for_logical_turn(0) == entry
 
     def test_get_tags_for_turn_not_found(self):
         index = TurnTagIndex()
-        assert index.get_tags_for_turn(99) is None
+        assert index.get_tags_for_logical_turn(99) is None
 
     def test_get_active_tags(self):
         index = TurnTagIndex()

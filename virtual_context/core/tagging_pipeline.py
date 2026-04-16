@@ -263,6 +263,7 @@ class TaggingPipeline:
                 source_batch_id=user_row.source_batch_id,
                 created_at=user_row.created_at,
                 updated_at=tagged_at,
+                turn_group_number=entry.turn_number,
             )
             self._store.save_canonical_turn(
                 self.config.conversation_id,
@@ -290,6 +291,7 @@ class TaggingPipeline:
                 source_batch_id=assistant_row.source_batch_id,
                 created_at=assistant_row.created_at,
                 updated_at=tagged_at,
+                turn_group_number=entry.turn_number,
             )
             entry.canonical_turn_id = user_row.canonical_turn_id or entry.canonical_turn_id
             return
@@ -562,7 +564,7 @@ class TaggingPipeline:
             # Persist turn message text for post-restart recall
             if latest_pair:
                 turn_num = turn_number
-                entry = self._turn_tag_index.get_tags_for_turn(turn_num)
+                entry = self._turn_tag_index.get_tags_for_logical_turn(turn_num)
                 t_stage = time.monotonic()
                 try:
                     if entry is not None:

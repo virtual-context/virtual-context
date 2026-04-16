@@ -66,7 +66,7 @@ def test_load_returns_none_for_missing_key(provider, mock_redis):
 
 def test_save_and_load_roundtrip(provider, mock_redis):
     state = SessionState()
-    state.compacted_through = 42
+    state.compacted_prefix_messages = 42
     state.last_indexed_turn = 10
     state.session_state = "ingesting"
     state.live_turn_count = 500
@@ -80,7 +80,7 @@ def test_save_and_load_roundtrip(provider, mock_redis):
 
     loaded = provider.load("conv-123")
     assert loaded is not None
-    assert loaded.compacted_through == 42
+    assert loaded.compacted_prefix_messages == 42
     assert loaded.last_indexed_turn == 10
     assert loaded.session_state == "ingesting"
     assert loaded.live_turn_count == 500

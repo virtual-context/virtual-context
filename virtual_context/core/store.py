@@ -215,8 +215,15 @@ class ContextStore(ABC):
         first_seen_at: str | None = None,
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
+        turn_group_number: int = -1,
     ) -> None:
         """Upsert a canonical turn, using ``turn_number`` only as an ordinal hint."""
+
+    def recompute_canonical_turn_groups(
+        self,
+        conversation_id: str,
+    ) -> int:
+        return 0
 
     def get_canonical_turn_rows(
         self,

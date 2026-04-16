@@ -831,7 +831,7 @@ class TestStubCompactedMessages:
         ])
         from virtual_context.proxy.message_filter import stub_compacted_messages
         result, stub_count = stub_compacted_messages(
-            body, idx, compacted_through=2,  # turn 0 is compacted
+            body, idx, compacted_prefix_messages=2,  # turn 0 is compacted
         )
         msgs = result["messages"]
         assert stub_count == 1
@@ -875,7 +875,7 @@ class TestStubCompactedMessages:
         ])
         from virtual_context.proxy.message_filter import stub_compacted_messages
         result, stub_count = stub_compacted_messages(
-            body, idx, compacted_through=2,  # turn 0 compacted
+            body, idx, compacted_prefix_messages=2,  # turn 0 compacted
         )
         msgs = result["messages"]
         assert stub_count == 1
@@ -910,9 +910,9 @@ class TestStubCompactedMessages:
             (0, h, ["greeting"]),
         ])
         from virtual_context.proxy.message_filter import stub_compacted_messages
-        # compacted_through=0 means nothing is compacted
+        # compacted_prefix_messages=0 means nothing is compacted
         result, stub_count = stub_compacted_messages(
-            body, idx, compacted_through=0,
+            body, idx, compacted_prefix_messages=0,
         )
         assert stub_count == 0
         assert result["messages"][0]["content"] == user_text
@@ -929,7 +929,7 @@ class TestStubCompactedMessages:
         ])
         from virtual_context.proxy.message_filter import stub_compacted_messages
         result, stub_count = stub_compacted_messages(
-            body, idx, compacted_through=2,
+            body, idx, compacted_prefix_messages=2,
         )
         assert stub_count == 0
         assert result["messages"][0]["content"] == "Unique message not in index"
@@ -987,7 +987,7 @@ class TestStubCompactedMessages:
 
         from virtual_context.proxy.message_filter import stub_compacted_messages
         result, stub_count = stub_compacted_messages(
-            body, idx, compacted_through=4,  # turns 0-1 compacted (4 internal messages)
+            body, idx, compacted_prefix_messages=4,  # turns 0-1 compacted (4 internal messages)
         )
         msgs = result["messages"]
 

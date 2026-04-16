@@ -16,18 +16,18 @@ class TurnTagIndex:
 
     def __init__(self) -> None:
         self.entries: list[TurnTagEntry] = []
-        self._by_turn: dict[int, TurnTagEntry] = {}
+        self._by_logical_turn: dict[int, TurnTagEntry] = {}
         self._by_canonical_turn: dict[str, TurnTagEntry] = {}
         self._by_hash: dict[str, TurnTagEntry] = {}
         self._all_tags: set[str] = set()
 
     def append(self, entry: TurnTagEntry) -> None:
-        if entry.turn_number in self._by_turn:
+        if entry.turn_number in self._by_logical_turn:
             import logging
             logging.getLogger(__name__).warning(
                 "OVERWRITE_BLOCKED turn=%d existing_tags=%s new_tags=%s — keeping original",
                 entry.turn_number,
-                self._by_turn[entry.turn_number].tags,
+                self._by_logical_turn[entry.turn_number].tags,
                 entry.tags,
             )
             return  # silently reject duplicate turn_number
@@ -41,7 +41,7 @@ class TurnTagIndex:
             )
             return
         self.entries.append(entry)
-        self._by_turn[entry.turn_number] = entry
+        self._by_logical_turn[entry.turn_number] = entry
         if entry.canonical_turn_id:
             self._by_canonical_turn[entry.canonical_turn_id] = entry
         if entry.message_hash:
@@ -56,8 +56,8 @@ class TurnTagIndex:
         tags -= self._NON_INHERITABLE_TAGS  # exclude _general, _stub from retrieval queries
         return tags
 
-    def get_tags_for_turn(self, turn_number: int) -> TurnTagEntry | None:
-        return self._by_turn.get(turn_number)
+    def get_tags_for_logical_turn(self, turn_number: int) -> TurnTagEntry | None:
+        return self._by_logical_turn.get(turn_number)
 
     def get_tags_for_canonical_turn(self, canonical_turn_id: str) -> TurnTagEntry | None:
         return self._by_canonical_turn.get(canonical_turn_id)
@@ -72,7 +72,7 @@ class TurnTagIndex:
         existing = self._by_canonical_turn.get(canonical_turn_id)
         if existing is not None:
             return existing
-        entry = self._by_turn.get(turn_number)
+        entry = self._by_logical_turn.get(turn_number)
         if entry is None:
             return None
         entry.canonical_turn_id = canonical_turn_id

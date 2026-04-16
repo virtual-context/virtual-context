@@ -11,7 +11,7 @@ def _make_pipeline(*, save_ok: bool = True, committed_turn: int = 4):
     store = MagicMock()
     store.load_engine_state.return_value = EngineStateSnapshot(
         conversation_id="conv-1",
-        compacted_through=(committed_turn + 1) * 2 if committed_turn >= 0 else 0,
+        compacted_prefix_messages=(committed_turn + 1) * 2 if committed_turn >= 0 else 0,
         turn_tag_entries=[],
         turn_count=committed_turn + 1 if committed_turn >= 0 else 0,
         last_compacted_turn=committed_turn,

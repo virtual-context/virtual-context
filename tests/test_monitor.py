@@ -131,7 +131,7 @@ def test_engine_on_turn_complete_payload_tokens(tmp_path):
     # Need a compactor for actual compaction, but we can check the signal path
     # by verifying the snapshot the monitor builds
     snapshot = engine._monitor.build_snapshot(
-        history[engine._engine_state.compacted_through:],
+        history[engine._engine_state.compacted_prefix_messages:],
         payload_tokens=82_000,
     )
     signal = engine._monitor.check(snapshot)

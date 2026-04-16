@@ -1970,8 +1970,8 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
         label = labels.get(effective_conv_id, "")
 
     turns = int(getattr(state, "_ingestible_entry_count", 0) or 0)
-    compacted = getattr(es, "compacted_through", 0)
-    flushed = getattr(es, "flushed_through", 0)
+    compacted = getattr(es, "compacted_prefix_messages", 0)
+    flushed = getattr(es, "flushed_prefix_messages", 0)
     generation = getattr(es, "conversation_generation", 0)
     history_messages = int(getattr(state, "_raw_payload_entry_count", 0) or 0)
 
@@ -2170,7 +2170,7 @@ def _handle_vccompact(state):
     es = engine._engine_state
 
     turns = len(tti.entries) if tti else 0
-    compacted = getattr(es, "compacted_through", 0)
+    compacted = getattr(es, "compacted_prefix_messages", 0)
     uncompacted = turns - compacted
 
     if uncompacted < 2:

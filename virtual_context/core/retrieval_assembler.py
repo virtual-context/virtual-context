@@ -145,7 +145,7 @@ class RetrievalAssembler:
         # Post-compaction: don't suppress retrieval -- stored summaries are needed
         # since raw turns have been compacted away
         _active_stage = time.monotonic()
-        _ft = self._engine_state.flushed_through
+        _ft = self._engine_state.flushed_prefix_messages
         if _ft > 0:
             active_tags = []
         else:
@@ -421,8 +421,8 @@ class RetrievalAssembler:
             "pre_compaction_filtering", "aggressive",
         )
         watermark = max(
-            int(getattr(self._engine_state, "flushed_through", 0) or 0),
-            int(getattr(self._engine_state, "compacted_through", 0) or 0),
+            int(getattr(self._engine_state, "flushed_prefix_messages", 0) or 0),
+            int(getattr(self._engine_state, "compacted_prefix_messages", 0) or 0),
         )
         pre_compaction = watermark == 0
 
@@ -464,7 +464,7 @@ class RetrievalAssembler:
                 break
 
             turn_idx = (watermark + i) // 2
-            entry = self._turn_tag_index.get_tags_for_turn(turn_idx)
+            entry = self._turn_tag_index.get_tags_for_logical_turn(turn_idx)
 
             if entry is None:
                 # No tag data -- conservatively include
@@ -501,8 +501,8 @@ class RetrievalAssembler:
         ]
         payload = {
             "mode": paging_mode or "default",
-            "compacted_through": self._engine_state.compacted_through,
-            "flushed_through": self._engine_state.flushed_through,
+            "compacted_prefix_messages": self._engine_state.compacted_prefix_messages,
+            "flushed_prefix_messages": self._engine_state.flushed_prefix_messages,
             "last_compacted_turn": self._engine_state.last_compacted_turn,
             "generation": self._engine_state.conversation_generation,
             "context_hint_max_tokens": self.config.assembler.context_hint_max_tokens,
@@ -530,7 +530,7 @@ class RetrievalAssembler:
         """
         if not self.config.assembler.context_hint_enabled:
             return ""
-        if int(getattr(self._engine_state, "compacted_through", 0) or 0) == 0:
+        if int(getattr(self._engine_state, "compacted_prefix_messages", 0) or 0) == 0:
             return ""
 
         # Determine paging mode

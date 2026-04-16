@@ -86,7 +86,8 @@ class IngestReconciler:
                 ),
             ]
             if len(existing) >= len(prepared):
-                recent = existing[-len(prepared):]
+                recent_window = existing[-min(5, len(existing)):]
+                recent = recent_window[-len(prepared):]
                 if (
                     [row.turn_hash for row in recent] == [row.turn_hash for row in prepared]
                     and all(self._seen_recently(row.last_seen_at or "") for row in recent)
@@ -190,6 +191,13 @@ class IngestReconciler:
 
         alignment = self._find_alignment(conversation_id, existing, prepared_turns)
         merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
+        if alignment is None and existing and prepared_turns:
+            logger.warning(
+                "CANONICAL_TURN_NO_ALIGNMENT: conv=%s existing=%d incoming=%d -> no_overlap_append",
+                conversation_id[:12],
+                len(existing),
+                len(prepared_turns),
+            )
         turns_written = 0
         turns_matched = 0
         turns_appended = 0
@@ -283,6 +291,9 @@ class IngestReconciler:
             turns_inserted=turns_inserted,
             batch_id=batch_id,
         )
+        recompute_groups = getattr(self._store, "recompute_canonical_turn_groups", None)
+        if callable(recompute_groups):
+            recompute_groups(conversation_id)
         self._refresh_persisted_anchors(conversation_id)
         return CanonicalIngestResult(
             merge_mode=merge_mode,
@@ -343,6 +354,7 @@ class IngestReconciler:
         return CanonicalTurnRow(
             conversation_id=conversation_id,
             turn_number=-1,
+            turn_group_number=-1,
             sort_key=0.0,
             turn_hash=turn_hash,
             hash_version=HASH_VERSION,
@@ -472,6 +484,7 @@ class IngestReconciler:
             first_seen_at=first_seen_at or row.first_seen_at,
             last_seen_at=last_seen_at or row.last_seen_at,
             source_batch_id=row.source_batch_id or None,
+            turn_group_number=row.turn_group_number,
         )
         resolved_turn_number = turn_number
         if turn_number < 0 and row.canonical_turn_id:
@@ -479,15 +492,23 @@ class IngestReconciler:
             if callable(lookup):
                 resolved_turn_number = int(lookup(row.conversation_id, row.canonical_turn_id))
         if resolved_turn_number >= 0:
-            self._semantic.embed_and_store_turn(
-                row.conversation_id,
-                resolved_turn_number,
-                canonical_turn_id=row.canonical_turn_id or None,
-                user_text=row.user_content,
-                assistant_text=row.assistant_content,
-                user_raw_content=row.user_raw_content,
-                assistant_raw_content=row.assistant_raw_content,
-            )
+            try:
+                self._semantic.embed_and_store_turn(
+                    row.conversation_id,
+                    resolved_turn_number,
+                    canonical_turn_id=row.canonical_turn_id or None,
+                    user_text=row.user_content,
+                    assistant_text=row.assistant_content,
+                    user_raw_content=row.user_raw_content,
+                    assistant_raw_content=row.assistant_raw_content,
+                )
+            except Exception:
+                logger.warning(
+                    "CANONICAL_TURN_EMBED_FAILED side=both conv=%s turn=%d",
+                    row.conversation_id[:12],
+                    resolved_turn_number,
+                    exc_info=True,
+                )
 
     def _conversation_merge_lock(self, conversation_id: str):
         locker = getattr(self._store, "conversation_reconcile", None)

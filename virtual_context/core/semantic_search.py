@@ -202,8 +202,8 @@ class SemanticSearchManager:
             try:
                 vectors = embed_fn(chunks)
             except Exception:
-                logger.debug(
-                    "Failed to embed %s turn chunks for %s:%d",
+                logger.warning(
+                    "CANONICAL_TURN_EMBED_FAILED side=%s conv=%s turn=%d",
                     side,
                     conversation_id,
                     turn_number,

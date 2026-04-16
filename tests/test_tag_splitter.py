@@ -478,7 +478,7 @@ class TestEngineTagSplitting:
 
         # Verify old tag removed from split turns
         for i in range(5):
-            entry = engine._turn_tag_index.get_tags_for_turn(i)
+            entry = engine._turn_tag_index.get_tags_for_logical_turn(i)
             assert "troubleshooting" not in entry.tags
 
         # Verify new tags present
@@ -615,7 +615,7 @@ class TestSplitPersistence:
 
         snap = EngineStateSnapshot(
             conversation_id="test-session",
-            compacted_through=4,
+            compacted_prefix_messages=4,
             turn_tag_entries=[
                 TurnTagEntry(
                     turn_number=0, message_hash="h0",
@@ -640,7 +640,7 @@ class TestSplitPersistence:
 
         snap = EngineStateSnapshot(
             conversation_id="test-session",
-            compacted_through=4,
+            compacted_prefix_messages=4,
             turn_tag_entries=[
                 TurnTagEntry(
                     turn_number=0, message_hash="h0",
@@ -677,7 +677,7 @@ class TestSplitPersistence:
         ])
         conn.execute(
             """INSERT OR REPLACE INTO engine_state
-            (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at)
+            (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at)
             VALUES (?, ?, ?, ?, ?)""",
             ("old-session", 0, 1, entries_json, "2026-01-15T10:00:00+00:00"),
         )

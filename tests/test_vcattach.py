@@ -145,7 +145,7 @@ def test_vcstatus_uses_effective_engine_conversation_id():
     state = SimpleNamespace(
         engine=SimpleNamespace(
             config=SimpleNamespace(conversation_id="target-conv"),
-            _engine_state=SimpleNamespace(compacted_through=4, conversation_generation=9),
+            _engine_state=SimpleNamespace(compacted_prefix_messages=4, conversation_generation=9),
             _turn_tag_index=_TurnTagIndex(),
             _store=_Store(),
             _paging=SimpleNamespace(working_set={}),
@@ -242,8 +242,8 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
                 monitor=SimpleNamespace(soft_threshold=80000, hard_threshold=120000),
             ),
             _engine_state=SimpleNamespace(
-                compacted_through=986,
-                flushed_through=983,
+                compacted_prefix_messages=986,
+                flushed_prefix_messages=983,
                 conversation_generation=15,
             ),
             _turn_tag_index=_TurnTagIndex(),

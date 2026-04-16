@@ -94,8 +94,8 @@ class TestCompactionCycle:
             history = _simulate_turns(engine, pairs)
 
             # Compaction should have fired
-            assert engine._engine_state.compacted_through > 0, (
-                f"Expected compaction, but _compacted_through={engine._engine_state.compacted_through}"
+            assert engine._engine_state.compacted_prefix_messages > 0, (
+                f"Expected compaction, but _compacted_through={engine._engine_state.compacted_prefix_messages}"
             )
 
             # Post-compaction retrieval should still work
@@ -204,7 +204,7 @@ class TestCompactionCycle:
             history = _simulate_turns(engine, pairs)
 
             # Should have compacted multiple times
-            assert engine._engine_state.compacted_through > 0
+            assert engine._engine_state.compacted_prefix_messages > 0
 
             # Engine should still respond without errors
             result = engine.on_message_inbound("What topics did we cover?", history)

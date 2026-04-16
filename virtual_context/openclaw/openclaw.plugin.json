@@ -2,6 +2,10 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Domain-aware virtual memory for persistent context across long sessions",
+  "version": "0.3.7",
+  "kind": "context-engine",
+  "contextEngine": true,
+  "main": "./virtual-context.mjs",
   "configSchema": {
     "type": "object",
     "properties": {

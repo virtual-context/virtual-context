@@ -198,7 +198,7 @@ class TopicSegmenter:
 
             # Check index first — avoid redundant LLM call
             global_turn = turn_offset + i
-            entry = self._turn_tag_index.get_tags_for_turn(global_turn) if self._turn_tag_index else None
+            entry = self._turn_tag_index.get_tags_for_logical_turn(global_turn) if self._turn_tag_index else None
             if entry:
                 tag_result = TagResult(
                     tags=entry.tags, primary=entry.primary_tag,

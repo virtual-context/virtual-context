@@ -518,7 +518,7 @@ class TestLiveSessions:
         metrics = ProxyMetrics()
         engine = MagicMock()
         engine.config.conversation_id = "live-session-1"
-        engine._engine_state.compacted_through = 0
+        engine._engine_state.compacted_prefix_messages = 0
         engine._turn_tag_index = MagicMock()
         engine._turn_tag_index.entries = []
         engine._turn_tag_index.get_active_tags.return_value = ["tag-a"]
@@ -542,7 +542,7 @@ class TestLiveSessions:
             live_sessions.append({
                 "conversation_id": sid,
                 "turn_count": len(s.conversation_history) // 2,
-                "compacted_through": s.engine._engine_state.compacted_through,
+                "compacted_prefix_messages": s.engine._engine_state.compacted_prefix_messages,
                 "tag_count": len(s.engine._turn_tag_index.entries),
                 "active_tags": list(
                     s.engine._turn_tag_index.get_active_tags(lookback=6)

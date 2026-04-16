@@ -734,7 +734,7 @@ async def prepare_payload(
     _dispatch_needed_turns = 0
     _dispatch_completed_turns = -1
     _dispatch_indexed_turns = -1
-    _dispatch_compacted_through = 0
+    _dispatch_compacted_prefix_messages = 0
     _dispatch_pending_indexing = False
     _dispatch_manual_passthrough = False
     if state:
@@ -746,8 +746,8 @@ async def prepare_payload(
         _dispatch_existing_turns = _dispatch_indexed_turns
         _dispatch_pending_indexing = state.has_pending_indexing()
         _dispatch_manual_passthrough = bool(getattr(state, "_manual_passthrough", False))
-        _dispatch_compacted_through = int(
-            getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_through", 0) or 0
+        _dispatch_compacted_prefix_messages = int(
+            getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_prefix_messages", 0) or 0
         )
         if _dispatch_manual_passthrough:
             _passthrough_reason = "manual_override"
@@ -764,8 +764,8 @@ async def prepare_payload(
             _dispatch_indexed_turns = state._indexed_turn_count()
             _dispatch_existing_turns = _dispatch_indexed_turns
             _dispatch_pending_indexing = state.has_pending_indexing()
-            _dispatch_compacted_through = int(
-                getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_through", 0) or 0
+            _dispatch_compacted_prefix_messages = int(
+                getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_prefix_messages", 0) or 0
             )
             if _passthrough_reason == "pending_indexing":
                 state.resume_pending_ingestion_if_needed()
@@ -777,7 +777,7 @@ async def prepare_payload(
                 _passthrough_reason = "pending_indexing" if current_state == SessionState.INGESTING else "restore_not_ready"
             logger.info(
                 "PASSTHROUGH_DECISION conversation=%s reason=%s existing_turns=%d needed_turns=%d "
-                "last_completed_turn=%d last_indexed_turn=%d compacted_through=%d "
+                "last_completed_turn=%d last_indexed_turn=%d compacted_prefix_messages=%d "
                 "pending_indexing=%s manual_passthrough=%s",
                 state.engine.config.conversation_id[:12],
                 _passthrough_reason,
@@ -785,7 +785,7 @@ async def prepare_payload(
                 _dispatch_needed_turns,
                 _dispatch_completed_turns - 1,
                 _dispatch_indexed_turns - 1,
-                _dispatch_compacted_through,
+                _dispatch_compacted_prefix_messages,
                 _dispatch_pending_indexing,
                 _dispatch_manual_passthrough,
             )
@@ -894,7 +894,7 @@ async def prepare_payload(
                 "context_tokens": 0,
                 "budget": {},
                 "history_len": len(state.conversation_history),
-                "compacted_through": 0,
+                "compacted_prefix_messages": 0,
                 "wait_ms": 0,
                 "inbound_ms": 0,
                 "overhead_ms": _prepare_total_ms,
@@ -1102,8 +1102,8 @@ async def prepare_payload(
     try:
         _has_engine = state and getattr(state, 'engine', None) is not None
         _es = state.engine._engine_state if _has_engine else None
-        _ct = int(getattr(_es, 'compacted_through', 0) or 0)
-        _ft = int(getattr(_es, 'flushed_through', 0) or 0)
+        _ct = int(getattr(_es, 'compacted_prefix_messages', 0) or 0)
+        _ft = int(getattr(_es, 'flushed_prefix_messages', 0) or 0)
         _defer = bool(getattr(state.engine.config.monitor if _has_engine else None, "defer_payload_mutation", False))
         _flush_ttl = int(getattr(state.engine.config.monitor if _has_engine else None, "flush_ttl_seconds", 300) or 300)
         _last_req = float(getattr(_es, 'last_request_time', 0.0) or 0.0)
@@ -1112,7 +1112,7 @@ async def prepare_payload(
             # 5a. Legacy auto-track: no deferral — flushed tracks compacted
             logger.info("FLUSH_GATE: defer=False (legacy) ct=%d ft=%d", _ct, _ft)
             if _has_engine and _ct > _ft:
-                state.engine._engine_state.flushed_through = _ct
+                state.engine._engine_state.flushed_prefix_messages = _ct
                 _ft = _ct
         else:
             # 5b. Compute cache age — treat unknown (0) as warm, not cold.
@@ -1128,7 +1128,7 @@ async def prepare_payload(
                     _cache_age, _flush_ttl, _ct, _ft, _last_req,
                 )
                 if _has_engine and _ct > _ft:
-                    state.engine._engine_state.flushed_through = _ct
+                    state.engine._engine_state.flushed_prefix_messages = _ct
                     _ft = _ct
             else:
                 # 5d. Warm-cache — only defer mutations when there's
@@ -1159,15 +1159,15 @@ async def prepare_payload(
     _recovery_turns = 0
     _drop_compacted_stage = time.monotonic()
     try:
-        if not _warm_defer and state and int(state.engine._engine_state.flushed_through) > 0:
+        if not _warm_defer and state and int(state.engine._engine_state.flushed_prefix_messages) > 0:
             from .message_filter import drop_compacted_turns
             body, turns_stubbed = drop_compacted_turns(
                 body,
                 state.engine._turn_tag_index,
-                state.engine._engine_state.flushed_through,
+                state.engine._engine_state.flushed_prefix_messages,
                 fmt=fmt,
                 protected_recent_turns=state.engine.config.monitor.protected_recent_turns,
-                drop_boundary=state.engine._engine_state.flushed_through if _defer else None,
+                drop_boundary=state.engine._engine_state.flushed_prefix_messages if _defer else None,
             )
             if turns_stubbed:
                 logger.info("DROP-COMPACTED: removed %d non-tool compacted turns", turns_stubbed)
@@ -1187,7 +1187,7 @@ async def prepare_payload(
         recent = state.engine.config.monitor.protected_recent_turns
         # PROXY-023: when paging is active, drop compacted turns so the
         # LLM relies on VC summaries + vc_expand_topic for old content.
-        # NOTE: compacted_through is a lifetime segment index, not a
+        # NOTE: compacted_prefix_messages is a lifetime segment index, not a
         # body-local pair index.  The stub filter already handles
         # replacement of compacted turns via hash matching.  Passing
         # the raw watermark to filter_body_messages would over-drop
@@ -1200,7 +1200,7 @@ async def prepare_payload(
             state.engine.config.assembler,
             "pre_compaction_filtering", "aggressive",
         )
-        _pre_compaction = state.engine._engine_state.compacted_through == 0
+        _pre_compaction = state.engine._engine_state.compacted_prefix_messages == 0
         body, turns_dropped = _filter_body_messages(
             body,
             state.engine._turn_tag_index,
@@ -1223,7 +1223,7 @@ async def prepare_payload(
     _tool_stubs_present = False
     try:
         if state and state.engine.config.tool_output.enabled and not _warm_defer:
-            _ct = int(state.engine._engine_state.compacted_through)
+            _ct = int(state.engine._engine_state.compacted_prefix_messages)
             if _ct > 0:
                 # Stage 2: full chain collapse (post-compaction)
                 from .message_filter import collapse_turn_chains
@@ -1342,7 +1342,7 @@ async def prepare_payload(
         if _paging_mode == "autonomous":
             tool_turn_count = len(state.engine._turn_tag_index.entries)
             try:
-                compacted_count = int(state.engine._engine_state.compacted_through)
+                compacted_count = int(state.engine._engine_state.compacted_prefix_messages)
             except (TypeError, ValueError):
                 compacted_count = 0
             require_tools = compacted_count > 0
@@ -1357,7 +1357,7 @@ async def prepare_payload(
             paging_enabled = True
             _vc_names = [t["name"] for t in enriched_body.get("tools", []) if t.get("name", "").startswith("vc_")]
             logger.info(
-                "PAGING Tools injected: %s (total tools: %d, policy=%s, turns=%d, compacted_through=%d)",
+                "PAGING Tools injected: %s (total tools: %d, policy=%s, turns=%d, compacted_prefix_messages=%d)",
                 _vc_names, len(enriched_body.get("tools", [])),
                 "required" if require_tools else "optional",
                 tool_turn_count, compacted_count,
@@ -1440,8 +1440,8 @@ async def prepare_payload(
                 "FLUSH_GATE: SAFETY VALVE — payload %dt exceeds %dt (hard=%.2f * budget=%dt). Forcing flush.",
                 outbound_tokens, _size_limit, _hard, _budget,
             )
-            # Force flush: advance flushed_through and re-run mutations
-            state.engine._engine_state.flushed_through = state.engine._engine_state.compacted_through
+            # Force flush: advance flushed_prefix_messages and re-run mutations
+            state.engine._engine_state.flushed_prefix_messages = state.engine._engine_state.compacted_prefix_messages
             _warm_defer = False
 
             # Re-run drop_compacted_turns
@@ -1450,9 +1450,9 @@ async def prepare_payload(
                 enriched_body, _sv_dropped = drop_compacted_turns(
                     enriched_body,
                     state.engine._turn_tag_index,
-                    state.engine._engine_state.flushed_through,
+                    state.engine._engine_state.flushed_prefix_messages,
                     fmt=fmt,
-                    drop_boundary=state.engine._engine_state.flushed_through,
+                    drop_boundary=state.engine._engine_state.flushed_prefix_messages,
                 )
                 if _sv_dropped:
                     logger.info("SAFETY-VALVE DROP-COMPACTED: removed %d turns", _sv_dropped)
@@ -1462,7 +1462,7 @@ async def prepare_payload(
             # Re-run tool stubbing (chain collapse + position stubbing)
             try:
                 if state.engine.config.tool_output.enabled:
-                    _ct = int(state.engine._engine_state.compacted_through)
+                    _ct = int(state.engine._engine_state.compacted_prefix_messages)
                     if _ct > 0:
                         from .message_filter import collapse_turn_chains, stub_tool_outputs_by_position
                         _deep_ratio = getattr(state.engine.config.compactor, "deep_compaction_ratio", 0.5)
@@ -1928,8 +1928,8 @@ async def prepare_payload(
         "context_tokens": context_tokens,
         "budget": assembled.budget_breakdown if assembled else {},
         "history_len": len(state.conversation_history) if state else 0,
-        "compacted_through": state.engine._engine_state.compacted_through if state else 0,
-        "flushed_through": state.engine._engine_state.flushed_through if state else 0,
+        "compacted_prefix_messages": state.engine._engine_state.compacted_prefix_messages if state else 0,
+        "flushed_prefix_messages": state.engine._engine_state.flushed_prefix_messages if state else 0,
         "wait_ms": wait_ms,
         "inbound_ms": inbound_ms,
         "overhead_ms": overhead_ms,

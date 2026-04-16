@@ -612,7 +612,7 @@
       <dt>Freed</dt><dd>Tokens reclaimed by replacing raw conversation turns with compressed summaries.</dd>
       <dt>Tags</dt><dd>The semantic tags covered by the compacted segments. These tags now have stored summaries available for future retrieval.</dd>
       <dt>Tag summaries built</dt><dd>Number of tag-level summaries (re)built. Tag summaries roll up all segment summaries for a given tag into one cohesive summary for efficient retrieval.</dd>
-      <dt>Watermark</dt><dd>The compacted_through message index after this compaction. All messages up to this index have been compacted and are no longer in raw history.</dd>
+      <dt>Watermark</dt><dd>The compacted_prefix_messages message index after this compaction. All messages up to this index have been compacted and are no longer in raw history.</dd>
     </dl>
   </div>
   <div id="compaction-list"><span class="empty-state">no compactions yet</span></div>
@@ -786,7 +786,7 @@
   }
 
   function updateMemory() {
-    // Rough estimate: compacted_through / history_len as progress
+    // Rough estimate: compacted_prefix_messages / history_len as progress
     const pct = historyLen > 0 ? Math.round((compactedThrough / historyLen) * 100) : 0;
     const fill = $('mem-fill');
     fill.style.width = pct + '%';
@@ -1139,9 +1139,9 @@
       evt.segments + ' segments \u00b7 freed ' + fmtNum(evt.tokens_freed || 0) + 't' +
       ' \u00b7 [' + (evt.tags || []).join(', ') + ']</div>' +
       '<div class="compaction-detail">Built ' + (evt.tag_summaries_built || 0) +
-      ' tag summaries \u00b7 watermark ' + (evt.compacted_through || 0) + '</div>';
+      ' tag summaries \u00b7 watermark ' + (evt.compacted_prefix_messages || 0) + '</div>';
     list.insertBefore(div, list.firstChild);
-    compactedThrough = evt.compacted_through || compactedThrough;
+    compactedThrough = evt.compacted_prefix_messages || compactedThrough;
     lastCompactionEvt = evt;
     updateMemory();
     updateSavings();
@@ -1175,7 +1175,7 @@
     waitSum = (data.last_wait_ms || 0) * totalRequests;
     inboundSum = (data.last_inbound_ms || 0) * totalRequests;
     contextSum = (data.last_context_tokens || 0) * totalRequests;
-    compactedThrough = data.compacted_through || 0;
+    compactedThrough = data.compacted_prefix_messages || 0;
     historyLen = data.history_len || 0;
     contextWindow = data.context_window || 120000;
     totalTurns = data.history_len ? Math.floor(data.history_len / 2) : totalRequests;
@@ -1396,7 +1396,7 @@
         html += mc('Requests', live.total_requests || 0);
         html += mc('Turns', initT + '\u2192' + live.turn_count);
         html += mc('Tags', initTags + '\u2192' + live.tag_count);
-        html += mc('Compacted', 'T' + Math.floor(live.compacted_through / 2));
+        html += mc('Compacted', 'T' + Math.floor(live.compacted_prefix_messages / 2));
 
         // Row 2: window, history, utilization, segments/summaries
         var cw = live.context_window || 0;
@@ -1823,7 +1823,7 @@
         if (data.raw_input_tokens) cumBaselineInput += data.raw_input_tokens;
         latestSystemTokens = data.system_tokens || latestSystemTokens;
         historyLen = data.history_len || historyLen;
-        compactedThrough = data.compacted_through || compactedThrough;
+        compactedThrough = data.compacted_prefix_messages || compactedThrough;
         addRequestRow(data);
         updateStats();
         updatePipeline();

@@ -543,8 +543,8 @@ def _clear_compaction_state(cache_dir: str, question_id: str) -> None:
     except sqlite3.OperationalError:
         pass
 
-    # Reset compacted_through to 0 but keep turn_tag_entries intact
-    conn.execute("UPDATE engine_state SET compacted_through = 0")
+    # Reset compacted_prefix_messages to 0 but keep turn_tag_entries intact
+    conn.execute("UPDATE engine_state SET compacted_prefix_messages = 0")
 
     conn.commit()
     conn.close()
@@ -693,17 +693,17 @@ def run_vc(
 
     # 3. Check if we can resume from cached state
     #    Three modes:
-    #    - fully cached: compacted_through > 0 → skip ingestion + compaction
-    #    - recompact: compacted_through == 0 but TurnTagIndex has entries → skip ingestion, re-compact
+    #    - fully cached: compacted_prefix_messages > 0 → skip ingestion + compaction
+    #    - recompact: compacted_prefix_messages == 0 but TurnTagIndex has entries → skip ingestion, re-compact
     #    - fresh: nothing cached → ingest + compact
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_through > 0
+    fully_cached = engine._engine_state.compacted_prefix_messages > 0
     tags_only = not fully_cached and n_index_entries > 0
 
     if fully_cached:
         logger.info(
-            "VC [%s]: CACHE HIT — %d turns indexed, compacted_through=%d. Skipping ingestion + compaction.",
-            question.question_id, n_index_entries, engine._engine_state.compacted_through,
+            "VC [%s]: CACHE HIT — %d turns indexed, compacted_prefix_messages=%d. Skipping ingestion + compaction.",
+            question.question_id, n_index_entries, engine._engine_state.compacted_prefix_messages,
         )
         compaction_events = -1  # sentinel: cached
         timings["ingest_s"] = 0.0
@@ -711,7 +711,7 @@ def run_vc(
         turns_ingested = n_index_entries
     elif tags_only:
         logger.info(
-            "VC [%s]: RECOMPACT — %d turns indexed, compacted_through=0. Skipping ingestion, re-running compaction.",
+            "VC [%s]: RECOMPACT — %d turns indexed, compacted_prefix_messages=0. Skipping ingestion, re-running compaction.",
             question.question_id, n_index_entries,
         )
         timings["ingest_s"] = 0.0
@@ -857,7 +857,7 @@ def run_vc(
     # Mirror proxy behavior: VC context goes into system/instructions,
     # user message contains ONLY the question.
     context_hint = assembled.context_hint
-    use_raw_history = engine._engine_state.compacted_through == 0
+    use_raw_history = engine._engine_state.compacted_prefix_messages == 0
     question_tail = _question_block(
         question, diagnostic_rationale=reader_diagnostic_rationale,
     )
@@ -915,12 +915,12 @@ def run_vc(
     )
 
     reader_api_url = API_URLS.get(reader_provider, "")
-    require_tools = engine._engine_state.compacted_through > 0
+    require_tools = engine._engine_state.compacted_prefix_messages > 0
     logger.info(
-        "VC [%s]: reader tool policy: %s (compacted_through=%d)",
+        "VC [%s]: reader tool policy: %s (compacted_prefix_messages=%d)",
         question.question_id,
         "required" if require_tools else "optional",
-        engine._engine_state.compacted_through,
+        engine._engine_state.compacted_prefix_messages,
     )
     loop_result = engine.query_with_tools(
         messages=[{"role": "user", "content": user_prompt}],
@@ -1123,7 +1123,7 @@ def run_vc_ingest_only(
 
     # Check cache status
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_through > 0
+    fully_cached = engine._engine_state.compacted_prefix_messages > 0
 
     if fully_cached:
         logger.info("VC [%s]: CACHE HIT — skipping ingest+compact", question.question_id)

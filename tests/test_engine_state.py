@@ -17,7 +17,7 @@ from virtual_context.types import EngineStateSnapshot, TurnTagEntry
 
 def _make_snapshot(
     conversation_id: str = "test-session-abc",
-    compacted_through: int = 4,
+    compacted_prefix_messages: int = 4,
     turn_count: int = 10,
 ) -> EngineStateSnapshot:
     """Build a realistic EngineStateSnapshot for testing."""
@@ -34,10 +34,10 @@ def _make_snapshot(
     ]
     return EngineStateSnapshot(
         conversation_id=conversation_id,
-        compacted_through=compacted_through,
+        compacted_prefix_messages=compacted_prefix_messages,
         turn_tag_entries=entries,
         turn_count=turn_count,
-        last_compacted_turn=(compacted_through // 2) - 1 if compacted_through > 0 else -1,
+        last_compacted_turn=(compacted_prefix_messages // 2) - 1 if compacted_prefix_messages > 0 else -1,
         last_completed_turn=turn_count - 1,
         last_indexed_turn=turn_count - 1,
         checkpoint_version=7,
@@ -61,7 +61,7 @@ class TestEngineStateSQLite:
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
         assert loaded.conversation_id == snap.conversation_id
-        assert loaded.compacted_through == snap.compacted_through
+        assert loaded.compacted_prefix_messages == snap.compacted_prefix_messages
         assert loaded.turn_count == snap.turn_count
         assert loaded.last_compacted_turn == snap.last_compacted_turn
         assert loaded.last_completed_turn == snap.last_completed_turn
@@ -91,15 +91,15 @@ class TestEngineStateSQLite:
         db = tmp_path / "test.db"
         store = SQLiteStore(db_path=db)
 
-        snap1 = _make_snapshot(compacted_through=2, turn_count=5)
+        snap1 = _make_snapshot(compacted_prefix_messages=2, turn_count=5)
         store.save_engine_state(snap1)
 
-        snap2 = _make_snapshot(compacted_through=8, turn_count=15)
+        snap2 = _make_snapshot(compacted_prefix_messages=8, turn_count=15)
         store.save_engine_state(snap2)
 
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
-        assert loaded.compacted_through == 8
+        assert loaded.compacted_prefix_messages == 8
         assert loaded.turn_count == 15
         assert len(loaded.turn_tag_entries) == 15
 
@@ -120,7 +120,7 @@ class TestEngineStateFilesystem:
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
         assert loaded.conversation_id == snap.conversation_id
-        assert loaded.compacted_through == snap.compacted_through
+        assert loaded.compacted_prefix_messages == snap.compacted_prefix_messages
         assert loaded.turn_count == snap.turn_count
         assert loaded.last_compacted_turn == snap.last_compacted_turn
         assert loaded.last_completed_turn == snap.last_completed_turn
@@ -146,15 +146,15 @@ class TestEngineStateFilesystem:
         """Saving twice overwrites — load gets latest."""
         store = FilesystemStore(root=tmp_path / "store")
 
-        snap1 = _make_snapshot(compacted_through=2, turn_count=5)
+        snap1 = _make_snapshot(compacted_prefix_messages=2, turn_count=5)
         store.save_engine_state(snap1)
 
-        snap2 = _make_snapshot(compacted_through=8, turn_count=15)
+        snap2 = _make_snapshot(compacted_prefix_messages=8, turn_count=15)
         store.save_engine_state(snap2)
 
         loaded = store.load_engine_state("test-session-abc")
         assert loaded is not None
-        assert loaded.compacted_through == 8
+        assert loaded.compacted_prefix_messages == 8
         assert loaded.turn_count == 15
 
     def test_state_file_is_valid_json(self, tmp_path):
@@ -168,7 +168,7 @@ class TestEngineStateFilesystem:
 
         data = json.loads(path.read_text())
         assert data["conversation_id"] == snap.conversation_id
-        assert data["compacted_through"] == snap.compacted_through
+        assert data["compacted_prefix_messages"] == snap.compacted_prefix_messages
         assert data["last_completed_turn"] == snap.last_completed_turn
         assert data["last_indexed_turn"] == snap.last_indexed_turn
         assert data["checkpoint_version"] == snap.checkpoint_version
@@ -206,7 +206,7 @@ class TestEngineStateIntegration:
                 tags=[f"tag-{i}"],
                 primary_tag=f"tag-{i}",
             ))
-        engine1._engine_state.compacted_through = 4
+        engine1._engine_state.compacted_prefix_messages = 4
 
         # Store a segment so watermark validation passes on reload
         from virtual_context.types import Message, StoredSegment, SegmentMetadata
@@ -236,7 +236,7 @@ class TestEngineStateIntegration:
         assert engine2.config.conversation_id == conversation_id
         # Restore now preserves the persisted compaction watermark so the
         # recovered session can resume from the correct suffix.
-        assert engine2._engine_state.compacted_through == 4
+        assert engine2._engine_state.compacted_prefix_messages == 4
         assert len(engine2._turn_tag_index.entries) == 5
         assert engine2._turn_tag_index.entries[0].tags == ["tag-0"]
         assert engine2._turn_tag_index.entries[4].tags == ["tag-4"]
@@ -326,7 +326,7 @@ class TestEngineStateIntegration:
         )
         engine1._store.save_engine_state(EngineStateSnapshot(
             conversation_id=conversation_id,
-            compacted_through=4,
+            compacted_prefix_messages=4,
             turn_tag_entries=[],
             turn_count=3,
             last_compacted_turn=1,
@@ -344,7 +344,7 @@ class TestEngineStateIntegration:
         config2.conversation_id = conversation_id
         engine2 = VirtualContextEngine(config=config2)
 
-        assert engine2._engine_state.compacted_through == 0
+        assert engine2._engine_state.compacted_prefix_messages == 0
         assert engine2._engine_state.last_compacted_turn == -1
         assert [row[0] for row in engine2._restored_conversation_history] == [0]
 
@@ -405,7 +405,7 @@ class TestVocabularyBootstrap:
         # Save state directly via store to avoid silent failure in _save_state
         engine1._store.save_engine_state(EngineStateSnapshot(
             conversation_id=conversation_id,
-            compacted_through=0,
+            compacted_prefix_messages=0,
             turn_tag_entries=entries,
             turn_count=5,
         ))

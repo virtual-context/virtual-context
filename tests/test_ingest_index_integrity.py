@@ -43,7 +43,7 @@ class TestCatchUpIngestionNoOverwrite:
 
         # Batch 1 entries must NOT be overwritten
         assert engine._turn_tag_index.entries[0].message_hash == batch1_turn0_hash
-        entry0 = engine._turn_tag_index.get_tags_for_turn(0)
+        entry0 = engine._turn_tag_index.get_tags_for_logical_turn(0)
         assert entry0 is not None
         assert entry0.message_hash == batch1_turn0_hash
 
@@ -52,8 +52,8 @@ class TestCatchUpIngestionNoOverwrite:
         assert engine._turn_tag_index.entries[6].turn_number == 6
         assert engine._turn_tag_index.entries[7].turn_number == 7
 
-        # get_tags_for_turn should return correct entries
-        entry5 = engine._turn_tag_index.get_tags_for_turn(5)
+        # get_tags_for_logical_turn should return correct entries
+        entry5 = engine._turn_tag_index.get_tags_for_logical_turn(5)
         assert entry5 is not None
         assert "running" in entry5.message_hash or entry5.turn_number == 5
 
@@ -78,8 +78,8 @@ class TestCatchUpIngestionNoOverwrite:
         ]
         engine.ingest_history(batch, turn_offset=0)
 
-        turn0_entry = engine._turn_tag_index.get_tags_for_turn(0)
-        turn1_entry = engine._turn_tag_index.get_tags_for_turn(1)
+        turn0_entry = engine._turn_tag_index.get_tags_for_logical_turn(0)
+        turn1_entry = engine._turn_tag_index.get_tags_for_logical_turn(1)
         assert turn0_entry is not None
         assert turn1_entry is not None
 
@@ -91,9 +91,9 @@ class TestCatchUpIngestionNoOverwrite:
         engine.ingest_history(gap, turn_offset=2)
 
         # Turn 0 and 1 must still have original tags
-        assert engine._turn_tag_index.get_tags_for_turn(0) is turn0_entry
-        assert engine._turn_tag_index.get_tags_for_turn(1) is turn1_entry
+        assert engine._turn_tag_index.get_tags_for_logical_turn(0) is turn0_entry
+        assert engine._turn_tag_index.get_tags_for_logical_turn(1) is turn1_entry
         # Turn 2 should be the new entry
-        turn2_entry = engine._turn_tag_index.get_tags_for_turn(2)
+        turn2_entry = engine._turn_tag_index.get_tags_for_logical_turn(2)
         assert turn2_entry is not None
         assert turn2_entry is not turn0_entry

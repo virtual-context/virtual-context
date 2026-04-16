@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
 
 CREATE TABLE IF NOT EXISTS engine_state (
     conversation_id TEXT PRIMARY KEY,
-    compacted_through INTEGER NOT NULL,
+    compacted_prefix_messages INTEGER NOT NULL,
     turn_count INTEGER NOT NULL,
     turn_tag_entries TEXT NOT NULL,
     saved_at TEXT NOT NULL
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS conversation_lifecycle (
 CREATE TABLE IF NOT EXISTS canonical_turns (
     canonical_turn_id UUID PRIMARY KEY,
     conversation_id TEXT NOT NULL,
+    turn_group_number INTEGER NOT NULL DEFAULT -1,
     sort_key DOUBLE PRECISION NOT NULL,
     turn_hash TEXT NOT NULL,
     hash_version SMALLINT NOT NULL DEFAULT 1,
@@ -146,6 +147,9 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
     updated_at TEXT NOT NULL DEFAULT '',
     UNIQUE (conversation_id, sort_key)
 );
+
+ALTER TABLE canonical_turns
+ADD COLUMN IF NOT EXISTS turn_group_number INTEGER NOT NULL DEFAULT -1;
 
 CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_order
 ON canonical_turns (conversation_id, sort_key);
@@ -592,7 +596,8 @@ def _row_to_canonical_turn(row: dict) -> CanonicalTurnRow:
     return CanonicalTurnRow(
         conversation_id=row["conversation_id"],
         canonical_turn_id=str(row.get("canonical_turn_id", "") or ""),
-        turn_number=int(row.get("turn_number", -1) or -1),
+        turn_number=int(row["turn_number"]) if row.get("turn_number") is not None else -1,
+        turn_group_number=int(row["turn_group_number"]) if row.get("turn_group_number") is not None else -1,
         sort_key=float(row.get("sort_key", 0.0) or 0.0),
         turn_hash=row.get("turn_hash", "") or "",
         hash_version=int(row.get("hash_version", 0) or 0),
@@ -616,6 +621,141 @@ def _row_to_canonical_turn(row: dict) -> CanonicalTurnRow:
         created_at=row.get("created_at", "") or "",
         updated_at=row.get("updated_at", "") or "",
     )
+
+
+def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, CanonicalTurnRow]:
+    if not rows:
+        return {}
+
+    grouped: list[tuple[int, list[CanonicalTurnRow]]] = []
+    explicit_groups = [
+        int(getattr(row, "turn_group_number")) if getattr(row, "turn_group_number", None) is not None else -1
+        for row in rows
+    ]
+    if all(group >= 0 for group in explicit_groups):
+        grouped_by_turn: dict[int, list[CanonicalTurnRow]] = {}
+        for row, turn_group_number in zip(rows, explicit_groups, strict=False):
+            grouped_by_turn.setdefault(turn_group_number, []).append(row)
+        grouped = sorted(grouped_by_turn.items(), key=lambda item: item[0])
+    else:
+        pending: list[CanonicalTurnRow] = []
+
+        def _flush_pending() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            grouped.append((len(grouped), list(pending)))
+            pending = []
+
+        for row in rows:
+            has_user = bool(row.user_content)
+            has_assistant = bool(row.assistant_content)
+            if has_user and has_assistant:
+                _flush_pending()
+                grouped.append((len(grouped), [row]))
+                continue
+            if has_user:
+                _flush_pending()
+                pending = [row]
+                continue
+            if has_assistant:
+                if pending:
+                    pending.append(row)
+                    _flush_pending()
+                else:
+                    grouped.append((len(grouped), [row]))
+                continue
+            _flush_pending()
+
+        _flush_pending()
+
+    merged: dict[int, CanonicalTurnRow] = {}
+    for turn_number, group_rows in grouped:
+        if not group_rows:
+            continue
+        first = group_rows[0]
+        merged_row = CanonicalTurnRow(
+            conversation_id=first.conversation_id,
+            canonical_turn_id=first.canonical_turn_id,
+            turn_number=turn_number,
+            turn_group_number=turn_number,
+            sort_key=min(row.sort_key for row in group_rows),
+            turn_hash=first.turn_hash,
+            hash_version=first.hash_version,
+            normalized_user_text="",
+            normalized_assistant_text="",
+            user_content="",
+            assistant_content="",
+            user_raw_content=None,
+            assistant_raw_content=None,
+            primary_tag=first.primary_tag or "_general",
+            tags=[],
+            session_date="",
+            sender="",
+            fact_signals=[],
+            code_refs=[],
+            tagged_at=None,
+            compacted_at=None,
+            first_seen_at=None,
+            last_seen_at=None,
+            source_batch_id=first.source_batch_id,
+            created_at=first.created_at,
+            updated_at=first.updated_at,
+        )
+        tagged_values: list[str] = []
+        compacted_values: list[str] = []
+        for row in group_rows:
+            if row.user_content and not merged_row.user_content:
+                merged_row.user_content = row.user_content
+                merged_row.user_raw_content = row.user_raw_content
+                merged_row.normalized_user_text = row.normalized_user_text
+                if row.canonical_turn_id:
+                    merged_row.canonical_turn_id = row.canonical_turn_id
+            if row.assistant_content and not merged_row.assistant_content:
+                merged_row.assistant_content = row.assistant_content
+                merged_row.assistant_raw_content = row.assistant_raw_content
+                merged_row.normalized_assistant_text = row.normalized_assistant_text
+                if not merged_row.canonical_turn_id and row.canonical_turn_id:
+                    merged_row.canonical_turn_id = row.canonical_turn_id
+            if row.primary_tag and (merged_row.primary_tag == "_general" or not merged_row.primary_tag):
+                merged_row.primary_tag = row.primary_tag
+            if not merged_row.session_date and row.session_date:
+                merged_row.session_date = row.session_date
+            if not merged_row.sender and row.sender:
+                merged_row.sender = row.sender
+            if row.source_batch_id and not merged_row.source_batch_id:
+                merged_row.source_batch_id = row.source_batch_id
+            if row.created_at and (not merged_row.created_at or row.created_at < merged_row.created_at):
+                merged_row.created_at = row.created_at
+            if row.updated_at and row.updated_at > merged_row.updated_at:
+                merged_row.updated_at = row.updated_at
+            if row.first_seen_at and (
+                not merged_row.first_seen_at or row.first_seen_at < merged_row.first_seen_at
+            ):
+                merged_row.first_seen_at = row.first_seen_at
+            if row.last_seen_at and (
+                not merged_row.last_seen_at or row.last_seen_at > merged_row.last_seen_at
+            ):
+                merged_row.last_seen_at = row.last_seen_at
+            if row.tagged_at:
+                tagged_values.append(row.tagged_at)
+            if row.compacted_at:
+                compacted_values.append(row.compacted_at)
+            for tag in row.tags:
+                if tag not in merged_row.tags:
+                    merged_row.tags.append(tag)
+            for signal in row.fact_signals:
+                if signal not in merged_row.fact_signals:
+                    merged_row.fact_signals.append(signal)
+            for code_ref in row.code_refs:
+                if code_ref not in merged_row.code_refs:
+                    merged_row.code_refs.append(code_ref)
+        if len(tagged_values) == len(group_rows):
+            merged_row.tagged_at = max(tagged_values)
+        if len(compacted_values) == len(group_rows):
+            merged_row.compacted_at = max(compacted_values)
+        merged[turn_number] = merged_row
+    return merged
 
 
 class PostgresStore(ContextStore):
@@ -898,7 +1038,7 @@ class PostgresStore(ContextStore):
     def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
         conn = self._get_conn()
         rows = conn.execute(
-            """SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
+            """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
                       normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                       user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
                       sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
@@ -2045,7 +2185,7 @@ class PostgresStore(ContextStore):
             "trailing_fingerprint": state.trailing_fingerprint or "",
             "request_captures": state.request_captures,
             "provider": state.provider,
-            "flushed_through": state.flushed_through,
+            "flushed_prefix_messages": state.flushed_prefix_messages,
             "last_request_time": state.last_request_time,
             "tool_tag_counter": state.tool_tag_counter,
             "last_compacted_turn": state.last_compacted_turn,
@@ -2054,15 +2194,15 @@ class PostgresStore(ContextStore):
             "checkpoint_version": state.checkpoint_version,
         }
         conn.execute(
-            """INSERT INTO engine_state (conversation_id, compacted_through, turn_count, turn_tag_entries, saved_at, flushed_through, last_request_time)
+            """INSERT INTO engine_state (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at, flushed_prefix_messages, last_request_time)
             VALUES (%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (conversation_id) DO UPDATE SET
-                compacted_through=EXCLUDED.compacted_through, turn_count=EXCLUDED.turn_count,
+                compacted_prefix_messages=EXCLUDED.compacted_prefix_messages, turn_count=EXCLUDED.turn_count,
                 turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at,
-                flushed_through=EXCLUDED.flushed_through, last_request_time=EXCLUDED.last_request_time""",
-            (state.conversation_id, state.compacted_through, state.turn_count,
+                flushed_prefix_messages=EXCLUDED.flushed_prefix_messages, last_request_time=EXCLUDED.last_request_time""",
+            (state.conversation_id, state.compacted_prefix_messages, state.turn_count,
              json.dumps(entries_data), _dt_to_str(state.saved_at),
-             state.flushed_through, state.last_request_time),
+             state.flushed_prefix_messages, state.last_request_time),
         )
 
     def _parse_engine_state_row(self, row: dict) -> EngineStateSnapshot:
@@ -2074,11 +2214,11 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
-            flushed_through = row.get("flushed_through") or 0
-            flushed_through_present = bool(row.get("flushed_through"))
+            flushed_prefix_messages = row.get("flushed_prefix_messages") or 0
+            flushed_prefix_messages_present = bool(row.get("flushed_prefix_messages"))
             last_request_time = row.get("last_request_time") or 0.0
             tool_tag_counter = 0
-            last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
+            last_compacted_turn = (row["compacted_prefix_messages"] // 2) - 1 if row["compacted_prefix_messages"] > 0 else -1
             last_completed_turn = max(row["turn_count"] - 1, len(entries_list) - 1)
             last_indexed_turn = len(entries_list) - 1
             checkpoint_version = 0
@@ -2110,13 +2250,13 @@ class PostgresStore(ContextStore):
             fingerprint = raw.get("trailing_fingerprint", "")
             request_captures = raw.get("request_captures", [])
             provider = raw.get("provider", "")
-            flushed_through = raw.get("flushed_through", 0)
-            flushed_through_present = "flushed_through" in raw
+            flushed_prefix_messages = raw.get("flushed_prefix_messages", 0)
+            flushed_prefix_messages_present = "flushed_prefix_messages" in raw
             last_request_time = raw.get("last_request_time", 0.0)
             tool_tag_counter = raw.get("tool_tag_counter", 0)
             last_compacted_turn = raw.get(
                 "last_compacted_turn",
-                (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1,
+                (row["compacted_prefix_messages"] // 2) - 1 if row["compacted_prefix_messages"] > 0 else -1,
             )
             last_completed_turn = raw.get(
                 "last_completed_turn",
@@ -2131,11 +2271,11 @@ class PostgresStore(ContextStore):
             fingerprint = ""
             request_captures = []
             provider = ""
-            flushed_through = row.get("flushed_through") or 0
-            flushed_through_present = bool(row.get("flushed_through"))
+            flushed_prefix_messages = row.get("flushed_prefix_messages") or 0
+            flushed_prefix_messages_present = bool(row.get("flushed_prefix_messages"))
             last_request_time = row.get("last_request_time") or 0.0
             tool_tag_counter = 0
-            last_compacted_turn = (row["compacted_through"] // 2) - 1 if row["compacted_through"] > 0 else -1
+            last_compacted_turn = (row["compacted_prefix_messages"] // 2) - 1 if row["compacted_prefix_messages"] > 0 else -1
             last_completed_turn = row["turn_count"] - 1
             last_indexed_turn = -1
             checkpoint_version = 0
@@ -2161,9 +2301,9 @@ class PostgresStore(ContextStore):
 
         return EngineStateSnapshot(
             conversation_id=row["conversation_id"],
-            compacted_through=row["compacted_through"],
-            flushed_through=flushed_through,
-            flushed_through_present=flushed_through_present,
+            compacted_prefix_messages=row["compacted_prefix_messages"],
+            flushed_prefix_messages=flushed_prefix_messages,
+            flushed_prefix_messages_present=flushed_prefix_messages_present,
             last_request_time=last_request_time,
             turn_count=row["turn_count"],
             turn_tag_entries=entries,
@@ -2189,7 +2329,7 @@ class PostgresStore(ContextStore):
 
     def load_latest_engine_state(self) -> EngineStateSnapshot | None:
         conn = self._get_conn()
-        row = conn.execute("SELECT * FROM engine_state ORDER BY compacted_through DESC, saved_at DESC LIMIT 1").fetchone()
+        row = conn.execute("SELECT * FROM engine_state ORDER BY compacted_prefix_messages DESC, saved_at DESC LIMIT 1").fetchone()
         if not row:
             return None
         return self._parse_engine_state_row(row)
@@ -2257,6 +2397,7 @@ class PostgresStore(ContextStore):
         first_seen_at: str | None = None,
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
+        turn_group_number: int = -1,
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
@@ -2312,13 +2453,14 @@ class PostgresStore(ContextStore):
                 sort_key = float((tail["max_sort_key"] or 0.0) + 1000.0)
         conn.execute(
             """INSERT INTO canonical_turns
-            (canonical_turn_id, conversation_id, sort_key, turn_hash, hash_version,
+            (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
              normalized_user_text, normalized_assistant_text, user_content, assistant_content,
              user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
              fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
              source_batch_id, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (canonical_turn_id) DO UPDATE SET
+                turn_group_number=EXCLUDED.turn_group_number,
                 sort_key=EXCLUDED.sort_key,
                 turn_hash=EXCLUDED.turn_hash,
                 hash_version=EXCLUDED.hash_version,
@@ -2342,6 +2484,7 @@ class PostgresStore(ContextStore):
             (
                 canonical_turn_id,
                 conversation_id,
+                int(turn_group_number),
                 sort_key,
                 turn_hash,
                 hash_version,
@@ -2367,6 +2510,56 @@ class PostgresStore(ContextStore):
             ),
         )
 
+    def recompute_canonical_turn_groups(
+        self,
+        conversation_id: str,
+    ) -> int:
+        rows = self.get_all_canonical_turns(conversation_id)
+        if not rows:
+            return 0
+
+        assignments: list[tuple[int, str]] = []
+        current_group = -1
+        pending_user_group = -1
+        for row in rows:
+            has_user = bool(row.user_content)
+            has_assistant = bool(row.assistant_content)
+            if has_user and has_assistant:
+                current_group += 1
+                pending_user_group = -1
+                assignments.append((current_group, row.canonical_turn_id))
+                continue
+            if has_user:
+                current_group += 1
+                pending_user_group = current_group
+                assignments.append((current_group, row.canonical_turn_id))
+                continue
+            if has_assistant:
+                if pending_user_group >= 0:
+                    assignments.append((pending_user_group, row.canonical_turn_id))
+                    pending_user_group = -1
+                else:
+                    current_group += 1
+                    assignments.append((current_group, row.canonical_turn_id))
+                continue
+            current_group += 1
+            pending_user_group = -1
+            assignments.append((current_group, row.canonical_turn_id))
+
+        conn = self._get_conn()
+        changed = 0
+        for turn_group_number, canonical_turn_id in assignments:
+            conn.execute(
+                """UPDATE canonical_turns
+                   SET turn_group_number = %s
+                   WHERE conversation_id = %s
+                     AND canonical_turn_id = %s
+                     AND turn_group_number <> %s""",
+                (turn_group_number, conversation_id, canonical_turn_id, turn_group_number),
+            )
+            changed += int(conn.rowcount or 0)
+        return changed
+
     def get_canonical_turn_rows(
         self,
         conversation_id: str,
@@ -2374,22 +2567,11 @@ class PostgresStore(ContextStore):
     ) -> dict[int, CanonicalTurnRow]:
         if not turn_numbers:
             return {}
-        conn = self._get_conn()
-        placeholders = ",".join("%s" for _ in turn_numbers)
-        rows = conn.execute(
-            f"""SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
-                       normalized_user_text, normalized_assistant_text, user_content, assistant_content,
-                       user_raw_content, assistant_raw_content, primary_tag, tags_json,
-                       session_date, sender, fact_signals_json, code_refs_json,
-                       tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id,
-                       created_at, updated_at
-            FROM canonical_turns_ordinal
-            WHERE conversation_id = %s AND turn_number IN ({placeholders})""",
-            [conversation_id] + turn_numbers,
-        ).fetchall()
+        merged_rows = _merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id))
         return {
-            row["turn_number"]: _row_to_canonical_turn(row)
-            for row in rows
+            turn_number: merged_rows[turn_number]
+            for turn_number in turn_numbers
+            if turn_number in merged_rows
         }
 
     def get_all_canonical_turns(
@@ -2404,24 +2586,13 @@ class PostgresStore(ContextStore):
         *,
         protected_recent_turns: int = 0,
     ) -> list[CanonicalTurnRow]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT canonical_turn_id, conversation_id, turn_number, sort_key, turn_hash, hash_version,
-                      normalized_user_text, normalized_assistant_text, user_content, assistant_content,
-                      user_raw_content, assistant_raw_content, primary_tag, tags_json,
-                      session_date, sender, fact_signals_json, code_refs_json,
-                      tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id,
-                      created_at, updated_at
-               FROM canonical_turns_ordinal
-               WHERE conversation_id = %s AND compacted_at IS NULL
-               ORDER BY sort_key, canonical_turn_id""",
-            (conversation_id,),
-        ).fetchall()
-        if protected_recent_turns > 0 and len(rows) > protected_recent_turns:
-            rows = rows[:-protected_recent_turns]
+        merged_rows = list(_merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id)).values())
+        uncompacted = [row for row in merged_rows if not row.compacted_at]
+        if protected_recent_turns > 0 and len(uncompacted) > protected_recent_turns:
+            uncompacted = uncompacted[:-protected_recent_turns]
         elif protected_recent_turns > 0:
-            rows = []
-        return [_row_to_canonical_turn(row) for row in rows]
+            uncompacted = []
+        return uncompacted
 
     def mark_canonical_turns_tagged(
         self,

@@ -357,7 +357,7 @@ class ProxyState:
 
     def _restore_signature(self) -> tuple[int, int, int, int]:
         try:
-            compacted = int(getattr(self.engine._engine_state, "compacted_through", 0) or 0)
+            compacted = int(getattr(self.engine._engine_state, "compacted_prefix_messages", 0) or 0)
         except (TypeError, ValueError, AttributeError):
             compacted = 0
         return (
@@ -465,7 +465,7 @@ class ProxyState:
         user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
         assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
         entry = getattr(self.engine, "_turn_tag_index", None)
-        entry = entry.get_tags_for_turn(turn_number) if entry is not None else None
+        entry = entry.get_tags_for_logical_turn(turn_number) if entry is not None else None
         try:
             persist_turn_with_embeddings(
                 self.engine._store,
@@ -797,7 +797,7 @@ class ProxyState:
                 len(getattr(engine._store, "get_all_canonical_turns", lambda *_: [])(engine.config.conversation_id)),
             ),
             "total_requests": self._total_requests,
-            "compacted_through": engine._engine_state.compacted_through,
+            "compacted_prefix_messages": engine._engine_state.compacted_prefix_messages,
             "tag_count": len(idx.entries),
             "distinct_tags": len(all_tags),
             "active_tags": list(idx.get_active_tags(lookback=6)),
@@ -1007,7 +1007,7 @@ class ProxyState:
             logger.info("fire_turn_complete skipped (no completed pair)")
             return
         reserved_turn, message_hash = signature
-        existing = self.engine._turn_tag_index.get_tags_for_turn(reserved_turn)
+        existing = self.engine._turn_tag_index.get_tags_for_logical_turn(reserved_turn)
         if existing is not None:
             if existing.message_hash != message_hash:
                 logger.warning(
@@ -1062,7 +1062,7 @@ class ProxyState:
         turn_hash = message_hash or (signature[1] if signature else "")
         conversation_id = self.engine.config.conversation_id
         try:
-            existing = self.engine._turn_tag_index.get_tags_for_turn(turn)
+            existing = self.engine._turn_tag_index.get_tags_for_logical_turn(turn)
             if not isinstance(existing, TurnTagEntry):
                 existing = None
             if existing is not None:
@@ -1101,9 +1101,9 @@ class ProxyState:
                 " -> COMPACT queued" if _needs_compact else "",
             )
             logger.info(
-                "T%d tagged (%dms) conversation=%s compacted_through=%d history=%d%s",
+                "T%d tagged (%dms) conversation=%s compacted_prefix_messages=%d history=%d%s",
                 turn, int(tag_ms), conversation_id[:12],
-                self.engine._engine_state.compacted_through,
+                self.engine._engine_state.compacted_prefix_messages,
                 len(history),
                 " compact_queued" if _needs_compact else "",
             )
@@ -1403,7 +1403,7 @@ class ProxyState:
                             "summary_tokens": summary_tokens,
                             "tags": report.tags,
                             "tag_summaries_built": report.tag_summaries_built,
-                            "compacted_through": self.engine._engine_state.compacted_through,
+                            "compacted_prefix_messages": self.engine._engine_state.compacted_prefix_messages,
                             "conversation_id": conversation_id,
                             "operation_id": operation_id,
                         })
@@ -1482,7 +1482,7 @@ class ProxyState:
                 self._active_compaction_target_end = -1
                 queued = self._queued_compaction_request
                 self._queued_compaction_request = None
-                current_watermark = self._engine_state_int("compacted_through", 0)
+                current_watermark = self._engine_state_int("compacted_prefix_messages", 0)
                 if queued is not None and int(queued.get("target_end", -1) or -1) > current_watermark:
                     follow_up = queued
             if follow_up is not None:
@@ -1506,7 +1506,7 @@ class ProxyState:
             # Use conversation_history (full proxy history) not just ingestion pairs
             compact_history = self.conversation_history if self.conversation_history else history
             protected = self.engine.config.monitor.protected_recent_turns * 2
-            watermark = self.engine._engine_state.compacted_through
+            watermark = self.engine._engine_state.compacted_prefix_messages
             compactable = len(compact_history) - watermark - protected
             if compactable <= 0:
                 logger.info("POST-INGEST: no compactable messages (history=%d, watermark=%d, protected=%d)",
@@ -1822,7 +1822,7 @@ class ProxyState:
     def _advance_compaction_watermark(self) -> None:
         """Refresh the derived compaction watermark from durable canonical turns.
 
-        ``compacted_through`` still drives status reporting and sliding-window
+        ``compacted_prefix_messages`` still drives status reporting and sliding-window
         history assembly, so it must reflect the actual compacted canonical
         prefix rather than whatever happens to be in memory right now.
         """
@@ -1834,9 +1834,9 @@ class ProxyState:
             )
             paired_rows = self.engine._group_canonical_rows_into_pairs(rows)
             new_wm, _ = self.engine._canonical_prefix_watermark(paired_rows)
-            old_wm = int(self.engine._engine_state.compacted_through)
+            old_wm = int(self.engine._engine_state.compacted_prefix_messages)
             if new_wm != old_wm:
-                self.engine._engine_state.compacted_through = new_wm
+                self.engine._engine_state.compacted_prefix_messages = new_wm
                 logger.info(
                     "Compaction watermark refreshed from canonical rows: %d -> %d "
                     "(paired_turns=%d)",
@@ -1844,9 +1844,9 @@ class ProxyState:
                     new_wm,
                     len(paired_rows),
                 )
-            self.engine._engine_state.flushed_through = min(
-                int(self.engine._engine_state.flushed_through or 0),
-                int(self.engine._engine_state.compacted_through or 0),
+            self.engine._engine_state.flushed_prefix_messages = min(
+                int(self.engine._engine_state.flushed_prefix_messages or 0),
+                int(self.engine._engine_state.compacted_prefix_messages or 0),
             )
         except (TypeError, ValueError, AttributeError):
             pass
@@ -1901,7 +1901,7 @@ class ProxyState:
                 baseline_history_tokens = 0
                 grouped = self._group_history_messages(history_messages)
                 for turn_num, pair in enumerate(grouped):
-                    entry = self.engine._turn_tag_index.get_tags_for_turn(
+                    entry = self.engine._turn_tag_index.get_tags_for_logical_turn(
                         turn_num,
                     )
                     if not pair.messages:
@@ -2085,7 +2085,7 @@ class ProxyState:
         if handoff_turn <= 0:
             return
         prev_turn = handoff_turn - 1
-        entry = self.engine._turn_tag_index.get_tags_for_turn(prev_turn)
+        entry = self.engine._turn_tag_index.get_tags_for_logical_turn(prev_turn)
         if entry is None:
             return
         grouped = self._group_history_messages(new_messages)

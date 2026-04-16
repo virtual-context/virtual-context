@@ -264,7 +264,7 @@ def _clear_compaction_state(cache_dir: str, conv_id: str) -> None:
             conn.execute(f"DELETE FROM {tbl}")
         except sqlite3.OperationalError:
             pass
-    conn.execute("UPDATE engine_state SET compacted_through = 0")
+    conn.execute("UPDATE engine_state SET compacted_prefix_messages = 0")
     conn.commit()
     conn.close()
     logger.info("VC [%s]: cleared compaction state, kept TurnTagIndex", conv_id)
@@ -417,13 +417,13 @@ def ingest_conversation(
     n_pairs = len(messages) // 2
 
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_through > 0
+    fully_cached = engine._engine_state.compacted_prefix_messages > 0
     tags_only = not fully_cached and n_index_entries > 0
 
     if require_fully_cached and not fully_cached:
         raise RuntimeError(
             "Cache-only mode requires a fully compacted cache, but this conversation "
-            f"has compacted_through={engine._engine_state.compacted_through} and "
+            f"has compacted_prefix_messages={engine._engine_state.compacted_prefix_messages} and "
             f"{n_index_entries}/{n_pairs} indexed turns. Refusing to ingest or compact."
         )
 
@@ -441,8 +441,8 @@ def ingest_conversation(
 
     if fully_cached:
         logger.info(
-            "VC [%s]: CACHE HIT -- %d turns indexed, compacted_through=%d",
-            conv.conv_id, n_index_entries, engine._engine_state.compacted_through,
+            "VC [%s]: CACHE HIT -- %d turns indexed, compacted_prefix_messages=%d",
+            conv.conv_id, n_index_entries, engine._engine_state.compacted_prefix_messages,
         )
         stats["turns_ingested"] = n_index_entries
         stats["compaction_events"] = -1
@@ -629,7 +629,7 @@ def query_question(
     api_key = os.environ.get(key_env, "")
 
     timings: dict[str, float] = {}
-    cached = engine._engine_state.compacted_through > 0
+    cached = engine._engine_state.compacted_prefix_messages > 0
 
     # --- Haiku cost tracking (matches LongMemEval pattern) ---
     pre_reader_telem = engine.get_telemetry().total()
@@ -663,7 +663,7 @@ def query_question(
     assembled_budget_breakdown = (assembled.budget_breakdown or {}) if assembled and hasattr(assembled, "budget_breakdown") else {}
 
     # --- Build reader prompt ---
-    use_raw_history = engine._engine_state.compacted_through == 0
+    use_raw_history = engine._engine_state.compacted_prefix_messages == 0
     if use_raw_history:
         system_prompt = _format_full_haystack(conv, messages)
         vc_injection = ""
@@ -723,7 +723,7 @@ def query_question(
     elif reader_provider == "openrouter":
         reader_api_url = "https://openrouter.ai/api/v1/chat/completions"
 
-    require_tools = engine._engine_state.compacted_through > 0
+    require_tools = engine._engine_state.compacted_prefix_messages > 0
 
     # Place VC injection near last turn (matching proxy), not system prompt
     if vc_injection:

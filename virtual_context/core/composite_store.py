@@ -208,6 +208,7 @@ class CompositeStore:
         first_seen_at: str | None = None,
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
+        turn_group_number: int = -1,
     ) -> None:
         return self._segments.save_canonical_turn(
             conversation_id,
@@ -235,7 +236,17 @@ class CompositeStore:
             first_seen_at=first_seen_at,
             last_seen_at=last_seen_at,
             source_batch_id=source_batch_id,
+            turn_group_number=turn_group_number,
         )
+
+    def recompute_canonical_turn_groups(
+        self,
+        conversation_id: str,
+    ) -> int:
+        recompute = getattr(self._segments, "recompute_canonical_turn_groups", None)
+        if callable(recompute):
+            return int(recompute(conversation_id) or 0)
+        return 0
 
     def get_canonical_turn_rows(
         self,
