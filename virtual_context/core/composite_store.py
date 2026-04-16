@@ -487,6 +487,26 @@ class CompositeStore:
             ) or 0
         )
 
+    def replace_canonical_turn_anchors(
+        self,
+        conversation_id: str,
+        anchors: list[tuple[int, str, str]],
+    ) -> int:
+        replacer = getattr(self._segments, "replace_canonical_turn_anchors", None)
+        if not callable(replacer):
+            return 0
+        return int(replacer(conversation_id, anchors) or 0)
+
+    def get_canonical_turn_anchor_positions(
+        self,
+        conversation_id: str,
+        window_size: int,
+    ) -> dict[str, list[int]]:
+        loader = getattr(self._segments, "get_canonical_turn_anchor_positions", None)
+        if not callable(loader):
+            return {}
+        return loader(conversation_id, window_size)
+
     def save_ingest_batch(self, batch: dict) -> str:
         saver = getattr(self._segments, "save_ingest_batch", None)
         if callable(saver):

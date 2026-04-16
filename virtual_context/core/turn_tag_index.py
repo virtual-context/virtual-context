@@ -62,6 +62,23 @@ class TurnTagIndex:
     def get_tags_for_canonical_turn(self, canonical_turn_id: str) -> TurnTagEntry | None:
         return self._by_canonical_turn.get(canonical_turn_id)
 
+    def bind_canonical_turn_id(
+        self,
+        turn_number: int,
+        canonical_turn_id: str,
+    ) -> TurnTagEntry | None:
+        if not canonical_turn_id:
+            return None
+        existing = self._by_canonical_turn.get(canonical_turn_id)
+        if existing is not None:
+            return existing
+        entry = self._by_turn.get(turn_number)
+        if entry is None:
+            return None
+        entry.canonical_turn_id = canonical_turn_id
+        self._by_canonical_turn[canonical_turn_id] = entry
+        return entry
+
     def get_entry_by_hash(self, message_hash: str) -> TurnTagEntry | None:
         return self._by_hash.get(message_hash)
 

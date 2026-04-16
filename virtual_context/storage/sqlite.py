@@ -147,6 +147,9 @@ ON canonical_turns(conversation_id, sort_key);
 CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_hash
 ON canonical_turns(conversation_id, turn_hash);
 
+CREATE INDEX IF NOT EXISTS idx_canonical_turns_compaction_queue
+ON canonical_turns(conversation_id, compacted_at, sort_key);
+
 CREATE TABLE IF NOT EXISTS canonical_turn_anchors (
     conversation_id TEXT NOT NULL,
     anchor_hash TEXT NOT NULL,
@@ -2735,6 +2738,58 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
         conn.commit()
         return int(cur.rowcount or 0)
+
+    def replace_canonical_turn_anchors(
+        self,
+        conversation_id: str,
+        anchors: list[tuple[int, str, str]],
+    ) -> int:
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM canonical_turn_anchors WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        rows = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in anchors
+            if anchor_hash and start_turn_id
+        ]
+        if not rows:
+            self._commit_if_unlocked(conn)
+            return 0
+        conn.executemany(
+            """INSERT INTO canonical_turn_anchors
+               (conversation_id, anchor_hash, start_turn_id, window_size)
+               VALUES (?, ?, ?, ?)""",
+            rows,
+        )
+        self._commit_if_unlocked(conn)
+        return len(rows)
+
+    def get_canonical_turn_anchor_positions(
+        self,
+        conversation_id: str,
+        window_size: int,
+    ) -> dict[str, list[int]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT cta.anchor_hash, cto.turn_number
+               FROM canonical_turn_anchors cta
+               JOIN canonical_turns_ordinal cto
+                 ON cto.conversation_id = cta.conversation_id
+                AND cto.canonical_turn_id = cta.start_turn_id
+               WHERE cta.conversation_id = ?
+                 AND cta.window_size = ?
+               ORDER BY cto.turn_number""",
+            (conversation_id, int(window_size)),
+        ).fetchall()
+        anchors: dict[str, list[int]] = {}
+        for row in rows:
+            digest = str(row["anchor_hash"] or "")
+            if not digest:
+                continue
+            anchors.setdefault(digest, []).append(int(row["turn_number"]))
+        return anchors
 
     def save_ingest_batch(self, batch: dict) -> str:
         conn = self._get_conn()

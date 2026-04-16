@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,6 +12,7 @@ from ..core.canonical_turns import (
     CanonicalIngestResult,
     HASH_VERSION,
     build_anchor_index,
+    compute_anchor_hash,
     compute_turn_hash_from_raw,
     default_sort_key,
     generate_canonical_turn_id,
@@ -29,6 +30,9 @@ class _Alignment:
     overlap_len: int
     window_size: int
     merge_mode: str
+
+
+logger = logging.getLogger(__name__)
 
 
 class IngestReconciler:
@@ -80,6 +84,7 @@ class IngestReconciler:
                         first_seen_at=row.first_seen_at or prepared.first_seen_at,
                         last_seen_at=prepared.last_seen_at,
                     )
+                    self._refresh_persisted_anchors(conversation_id)
                     return CanonicalIngestResult(
                         merge_mode="exact_resend",
                         turns_written=0,
@@ -93,6 +98,7 @@ class IngestReconciler:
             prepared.canonical_turn_id = generate_canonical_turn_id()
             prepared.sort_key = default_sort_key(existing)
             self._write_turn(prepared, turn_number=len(existing))
+            self._refresh_persisted_anchors(conversation_id)
             return CanonicalIngestResult(
                 merge_mode="tail_append",
                 turns_written=1,
@@ -138,10 +144,15 @@ class IngestReconciler:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
             if not prepared_turns:
+                logger.info(
+                    "INGEST_EMPTY_PAYLOAD: conv=%s raw_turn_count=%d",
+                    conversation_id[:12],
+                    raw_turn_count,
+                )
                 batch = self._save_batch(
                     conversation_id,
                     raw_turn_count=0,
-                    merge_mode="exact_resend",
+                    merge_mode="empty_payload",
                     first_turn_hash="",
                     last_turn_hash="",
                     turns_matched=0,
@@ -149,9 +160,9 @@ class IngestReconciler:
                     turns_prepended=0,
                     turns_inserted=0,
                 )
-                return CanonicalIngestResult("exact_resend", 0, 0, 0, 0, 0, batch=batch, rows=[])
+                return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
 
-            alignment = self._find_alignment(existing, prepared_turns)
+            alignment = self._find_alignment(conversation_id, existing, prepared_turns)
             merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
             turns_written = 0
             turns_matched = 0
@@ -246,6 +257,7 @@ class IngestReconciler:
                 turns_inserted=turns_inserted,
                 batch_id=batch_id,
             )
+            self._refresh_persisted_anchors(conversation_id)
             return CanonicalIngestResult(
                 merge_mode=merge_mode,
                 turns_written=turns_written,
@@ -367,7 +379,12 @@ class IngestReconciler:
             return item if isinstance(item, TurnTagEntry) else None
         return None
 
-    def _find_alignment(self, existing: list[CanonicalTurnRow], incoming: list[CanonicalTurnRow]) -> _Alignment | None:
+    def _find_alignment(
+        self,
+        conversation_id: str,
+        existing: list[CanonicalTurnRow],
+        incoming: list[CanonicalTurnRow],
+    ) -> _Alignment | None:
         if not existing or not incoming:
             return None
         existing_hashes = [row.turn_hash for row in existing]
@@ -384,7 +401,11 @@ class IngestReconciler:
 
         best: _Alignment | None = None
         for window_size in (5, 4, 3):
-            existing_index = build_anchor_index(existing, window_size)
+            existing_index = self._load_existing_anchor_index(
+                conversation_id,
+                existing,
+                window_size,
+            )
             if not existing_index:
                 continue
             incoming_index = build_anchor_index(incoming, window_size)
@@ -554,6 +575,11 @@ class IngestReconciler:
         try:
             seen_at = datetime.fromisoformat(str(last_seen_at).replace("Z", "+00:00"))
         except Exception:
+            if last_seen_at:
+                logger.warning(
+                    "CANONICAL_TURN_DEDUP_TIMESTAMP_INVALID: value=%r",
+                    last_seen_at,
+                )
             return False
         return datetime.now(timezone.utc) - seen_at <= timedelta(minutes=10)
 
@@ -562,3 +588,38 @@ class IngestReconciler:
             if row.canonical_turn_id == canonical_turn_id:
                 return idx
         return -1
+
+    def _load_existing_anchor_index(
+        self,
+        conversation_id: str,
+        existing: list[CanonicalTurnRow],
+        window_size: int,
+    ) -> dict[str, list[int]]:
+        loader = getattr(self._store, "get_canonical_turn_anchor_positions", None)
+        if callable(loader):
+            anchors = loader(conversation_id, window_size)
+            if anchors:
+                return anchors
+        return build_anchor_index(existing, window_size)
+
+    def _refresh_persisted_anchors(self, conversation_id: str) -> None:
+        saver = getattr(self._store, "replace_canonical_turn_anchors", None)
+        if not callable(saver):
+            return
+        rows = self._store.get_all_canonical_turns(conversation_id)
+        anchors: list[tuple[int, str, str]] = []
+        for window_size in (3, 4, 5):
+            if len(rows) < window_size:
+                continue
+            for start in range(0, len(rows) - window_size + 1):
+                start_turn_id = rows[start].canonical_turn_id
+                if not start_turn_id:
+                    continue
+                anchors.append(
+                    (
+                        window_size,
+                        compute_anchor_hash(rows, start, window_size),
+                        start_turn_id,
+                    )
+                )
+        saver(conversation_id, anchors)
