@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs, get_recent_context
@@ -51,6 +51,53 @@ _TAG_BREAKDOWN_MAX_STAGES = 8
 # still work.  The actual definitions live in engine.py.
 _SESSION_HEADER_RE: re.Pattern | None = None
 _is_stub_content_fn: Callable[[str], bool] | None = None
+
+# Extraction patterns beyond the canonical "[Session from ...]" header. Order
+# matters — earlier patterns win. Each pattern's group(1) is the raw date
+# string we adopt verbatim (no parsing/reformatting).
+_SESSION_DATE_EXTRACT_PATTERNS: tuple[re.Pattern, ...] = (
+    # Proxy system-event envelope: "System: [2026-02-15T22:00:00Z] Model switched"
+    # or "System (untrusted): [2026-02-15 22:00:00 UTC] ...".
+    re.compile(r"System(?:\s*\([^)]*\))?:\s*\[(\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\s+[A-Z]{2,4})?[^\]]*)\]"),
+    # Bare "[YYYY-MM-DD HH:MM:SS UTC]" at the start of a line — seen in some
+    # ingest payloads that prepend a timestamp without the Session/System prefix.
+    re.compile(r"(?m)^\[(\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\s+[A-Z]{2,4})?)\]"),
+)
+
+
+def _extract_session_date_from_content(content: str) -> str | None:
+    # Preferentially use the canonical header (set by the segmenter-aware
+    # bulk ingest paths), then fall back to the broader patterns above.
+    if _SESSION_HEADER_RE is not None:
+        m = _SESSION_HEADER_RE.search(content)
+        if m:
+            return m.group(1).strip()
+    for pat in _SESSION_DATE_EXTRACT_PATTERNS:
+        m = pat.search(content)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _bump_session_date_one_second(date_str: str) -> str | None:
+    # Adds +1 second to an ISO 8601 date string so consecutive inherited turns
+    # don't collapse onto an identical timestamp when the downstream consumer
+    # relies on session_date for ordering. Returns None when the string is
+    # empty or not ISO-parseable, letting the caller leave running_session_date
+    # unchanged rather than corrupting a non-ISO format (e.g. "2023/05/25 (Thu)").
+    if not date_str:
+        return None
+    normalized = date_str.replace("Z", "+00:00") if date_str.endswith("Z") else date_str
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    bumped = dt + timedelta(seconds=1)
+    if dt.tzinfo is None:
+        return bumped.strftime("%Y-%m-%dT%H:%M:%S")
+    if date_str.endswith("Z"):
+        return bumped.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    return bumped.isoformat()
 
 
 def _ensure_engine_imports() -> None:
@@ -763,7 +810,21 @@ class TaggingPipeline:
         history_turns = pair_messages_into_turns(list(history_messages))
         _total_turns = len(history_turns)
         n_context = self.config.tag_generator.context_lookback_pairs
+        # Seed from DB when resuming bulk ingest mid-conversation: the caller
+        # passes turn_offset > 0 when there are already-persisted turns that
+        # preceded this batch. Without seeding, the first few turns of the
+        # new batch fall into the no-session bucket even when the prior batch
+        # carried a session_date the next turn would otherwise inherit.
         running_session_date = ""
+        if turn_offset > 0:
+            try:
+                prior_rows = self._store.get_all_canonical_turns(self.config.conversation_id)
+            except Exception:
+                prior_rows = []
+            for row in reversed(prior_rows):
+                if row.turn_number < turn_offset and (row.session_date or "").strip():
+                    running_session_date = row.session_date.strip()
+                    break
 
         for batch_turn, pair in enumerate(history_turns):
             user_msg, asst_msg = self._split_pair_messages(pair.messages)
@@ -810,12 +871,25 @@ class TaggingPipeline:
                 logger.debug("Skipping empty turn at turn index %d", batch_turn)
                 continue
 
-            # Track running session date BEFORE stub/tagger — stubs need timestamps too
-            m = _SESSION_HEADER_RE.search(user_msg.content)
-            if m:
-                running_session_date = m.group(1)
+            # Track running session date BEFORE stub/tagger — stubs need
+            # timestamps too. Priority: (1) explicit header/envelope in content,
+            # (2) message timestamp from payload metadata (live proxy wall-clock
+            # or REST-payload conversation time), (3) inherit from the prior
+            # turn. When inheriting, bump by +1s on ISO-parseable dates so
+            # consecutive turns don't collapse onto the same timestamp and
+            # lose their ordering signal. We never synthesize a "now" value —
+            # if nothing is known and running_session_date is empty, it stays
+            # empty, and the turn is written with an empty session_date
+            # rather than a misleading ingestion-time placeholder.
+            extracted = _extract_session_date_from_content(user_msg.content)
+            if extracted:
+                running_session_date = extracted
             elif user_msg.timestamp:
                 running_session_date = user_msg.timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+            elif running_session_date:
+                bumped = _bump_session_date_one_second(running_session_date)
+                if bumped:
+                    running_session_date = bumped
 
             # Stub turns (media attachments, image placeholders, etc.):
             # skip tagger, assign _stub tag, preserve raw text for passthrough.

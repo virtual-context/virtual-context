@@ -488,3 +488,112 @@ class TestIngestHistorySessionDate:
         entries = list(engine._turn_tag_index.entries)
         assert len(entries) == 1
         assert entries[0].session_date == "2023-05-25T10:04:00"
+
+    def test_ingest_history_captures_system_event_envelope(self, tmp_path):
+        # Proxy system-event envelope "System: [ISO timestamp]" is recognized
+        # by the extended extractor. Without this, live conversations that
+        # were bulk-ingested with a system-event header fall into the
+        # no-session bucket.
+        from virtual_context.types import VirtualContextConfig, TagGeneratorConfig, StorageConfig
+        from virtual_context.engine import VirtualContextEngine
+
+        config = VirtualContextConfig(
+            storage_root=str(tmp_path / "vc"),
+            storage=StorageConfig(
+                backend="sqlite",
+                sqlite_path=str(tmp_path / "test.db"),
+                root=str(tmp_path / "store"),
+            ),
+            tag_generator=TagGeneratorConfig(type="keyword"),
+        )
+        engine = VirtualContextEngine(config=config)
+
+        history = [
+            Message(role="user", content="System: [2026-02-15T22:00:00Z] Model switched\n\nhello"),
+            Message(role="assistant", content="Hi there"),
+            Message(role="user", content="System (untrusted): [2026-02-15 22:05:10 UTC] follow-up"),
+            Message(role="assistant", content="OK"),
+        ]
+        engine.ingest_history(history)
+
+        entries = list(engine._turn_tag_index.entries)
+        assert len(entries) == 2
+        assert entries[0].session_date == "2026-02-15T22:00:00Z"
+        assert entries[1].session_date == "2026-02-15 22:05:10 UTC"
+
+    def test_ingest_history_inherit_bumps_iso_date_by_one_second(self, tmp_path):
+        # Inherited session_date is bumped +1s when ISO-parseable so
+        # consecutive turns without their own header don't collapse onto
+        # identical timestamps. Non-ISO formats (e.g. "2023/05/25 (Thu)")
+        # are preserved verbatim — preserved by test_ingest_history_tracks_session_date.
+        from virtual_context.types import VirtualContextConfig, TagGeneratorConfig, StorageConfig
+        from virtual_context.engine import VirtualContextEngine
+
+        config = VirtualContextConfig(
+            storage_root=str(tmp_path / "vc"),
+            storage=StorageConfig(
+                backend="sqlite",
+                sqlite_path=str(tmp_path / "test.db"),
+                root=str(tmp_path / "store"),
+            ),
+            tag_generator=TagGeneratorConfig(type="keyword"),
+        )
+        engine = VirtualContextEngine(config=config)
+
+        # First turn has System header. Turns 2 and 3 have no header and no
+        # timestamp (Message.timestamp defaults to None), so they inherit.
+        history = [
+            Message(role="user", content="System: [2026-02-15T22:00:00Z] question 1"),
+            Message(role="assistant", content="answer 1"),
+            Message(role="user", content="follow-up 2"),
+            Message(role="assistant", content="answer 2"),
+            Message(role="user", content="follow-up 3"),
+            Message(role="assistant", content="answer 3"),
+        ]
+        engine.ingest_history(history)
+
+        entries = list(engine._turn_tag_index.entries)
+        assert len(entries) == 3
+        assert entries[0].session_date == "2026-02-15T22:00:00Z"
+        assert entries[1].session_date == "2026-02-15T22:00:01Z"
+        assert entries[2].session_date == "2026-02-15T22:00:02Z"
+
+    def test_ingest_history_seeds_running_session_date_from_db(self, tmp_path):
+        # When ingest_history is called with turn_offset > 0, the first turn
+        # of the new batch inherits from the latest stored session_date
+        # instead of starting from empty.
+        from virtual_context.types import VirtualContextConfig, TagGeneratorConfig, StorageConfig
+        from virtual_context.engine import VirtualContextEngine
+
+        config = VirtualContextConfig(
+            storage_root=str(tmp_path / "vc"),
+            storage=StorageConfig(
+                backend="sqlite",
+                sqlite_path=str(tmp_path / "test.db"),
+                root=str(tmp_path / "store"),
+            ),
+            tag_generator=TagGeneratorConfig(type="keyword"),
+        )
+        engine = VirtualContextEngine(config=config)
+
+        # Batch 1: one turn with a known session_date.
+        engine.ingest_history([
+            Message(role="user", content="System: [2026-02-15T22:00:00Z] start"),
+            Message(role="assistant", content="ok"),
+        ])
+
+        # Batch 2: turns without any header/timestamp. Without the DB seed,
+        # these would start with empty running_session_date and get no date.
+        engine.ingest_history(
+            [
+                Message(role="user", content="continuation 1"),
+                Message(role="assistant", content="ack 1"),
+            ],
+            turn_offset=1,
+        )
+
+        entries = list(engine._turn_tag_index.entries)
+        assert len(entries) == 2
+        assert entries[0].session_date == "2026-02-15T22:00:00Z"
+        # Batch 2 turn inherits from seed, bumped +1s.
+        assert entries[1].session_date == "2026-02-15T22:00:01Z"
