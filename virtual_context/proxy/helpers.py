@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 from ..types import Message
 from .formats import (
     detect_format,
+    extract_ingestible_messages,
     get_format,
 )
 
@@ -88,6 +89,12 @@ def _extract_message_text(msg: dict, api_format: str = "anthropic") -> str:
 def _extract_history_pairs(body: dict) -> list[Message]:
     fmt = detect_format(body)
     return fmt.extract_history_pairs(body)
+
+
+def _extract_ingestible_messages(body: dict) -> list[Message]:
+    fmt = detect_format(body)
+    messages, _ = extract_ingestible_messages(body, fmt)
+    return messages
 
 
 def _inject_context(body: dict, prepend_text: str, api_format: str) -> dict:

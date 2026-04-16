@@ -62,6 +62,7 @@ from .helpers import (  # noqa: F401 — re-exported for tests
     _extract_user_message,
     _extract_message_text,
     _extract_history_pairs,
+    _extract_ingestible_messages,
     _inject_context,
     _inject_conversation_marker,
     _extract_delta_text,
@@ -602,6 +603,15 @@ async def prepare_payload(
         fmt,
         raw_summary=_raw_payload_accounting,
     )
+    if state is not None:
+        try:
+            state.note_payload_accounting(_payload_accounting, done=0, total=int(_payload_accounting.get("ingestible_entry_count", 0) or 0))
+        except Exception:
+            logger.debug(
+                "Failed to note payload accounting for conv=%s",
+                state.engine.config.conversation_id[:12],
+                exc_info=True,
+            )
 
     api_format = fmt.name
     _extract_user_stage = time.monotonic()
@@ -670,7 +680,7 @@ async def prepare_payload(
 
     # Resolve upstream context window limit for this model
     from .helpers import (
-        _extract_history_pairs,
+        _extract_ingestible_messages,
         _inject_context,
         _inject_vc_tools,
     )
@@ -718,7 +728,7 @@ async def prepare_payload(
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
     # ---------------------------------------------------------------
-    _dispatch_history_pairs: list[Message] | None = None
+    _dispatch_history_messages: list[Message] | None = None
     _passthrough_reason: str | None = None
     _dispatch_existing_turns = 0
     _dispatch_needed_turns = 0
@@ -747,9 +757,9 @@ async def prepare_payload(
         # Fresh session starts ACTIVE but may need ingestion — check and
         # redirect to passthrough path if there's history to ingest.
         if current_state == SessionState.ACTIVE:
-            _dispatch_history_pairs = _extract_history_pairs(body)
-            _dispatch_needed_turns = len(_dispatch_history_pairs) // 2
-            current_state, _passthrough_reason = state.resolve_prepare_state(_dispatch_history_pairs)
+            _dispatch_history_messages = state._completed_history_messages(_extract_ingestible_messages(body))
+            _dispatch_needed_turns = state._history_turn_count(_dispatch_history_messages)
+            current_state, _passthrough_reason = state.resolve_prepare_state(_dispatch_history_messages)
             _dispatch_completed_turns = state._completed_turn_count()
             _dispatch_indexed_turns = state._indexed_turn_count()
             _dispatch_existing_turns = _dispatch_indexed_turns
@@ -784,11 +794,13 @@ async def prepare_payload(
 
             # On first request: kick off non-blocking ingestion
             if not state._history_ingested():
-                _dispatch_history_pairs = _dispatch_history_pairs or _extract_history_pairs(body)
-                if _dispatch_history_pairs and not state.is_conversation_deleted():
-                    state.conversation_history = list(_dispatch_history_pairs)
+                _dispatch_history_messages = _dispatch_history_messages or state._completed_history_messages(
+                    _extract_ingestible_messages(body)
+                )
+                if _dispatch_history_messages and not state.is_conversation_deleted():
+                    state.conversation_history = list(_dispatch_history_messages)
                 await asyncio.to_thread(
-                    state.start_ingestion_if_needed, _dispatch_history_pairs,
+                    state.start_ingestion_if_needed, _dispatch_history_messages,
                 )
 
             if not state.is_conversation_deleted():
@@ -982,14 +994,15 @@ async def prepare_payload(
     if state:
         _history_rebuild_stage = time.monotonic()
         _expected = len(state.engine._turn_tag_index.entries)
-        _have = len(state.conversation_history) // 2
+        _have = state._history_turn_count()
         if _have < _expected and _expected > 0:
-            _client_pairs = _extract_history_pairs(body)
-            if _client_pairs and len(_client_pairs) // 2 > _have:
-                state.conversation_history = list(_client_pairs)
+            _client_messages = state._completed_history_messages(_extract_ingestible_messages(body))
+            _client_turns = state._history_turn_count(_client_messages)
+            if _client_messages and _client_turns > _have:
+                state.conversation_history = list(_client_messages)
                 logger.info(
-                    "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d pairs)",
-                    _have, _expected, len(_client_pairs) // 2,
+                    "HISTORY_REBUILD: persisted=%d, expected=%d, rebuilt from client payload (%d turns)",
+                    _have, _expected, _client_turns,
                 )
         _note_prep("history_rebuild", _history_rebuild_stage)
 
