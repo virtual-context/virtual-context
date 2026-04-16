@@ -630,7 +630,12 @@ class ProxyState:
         snapshot.payload_ingestion_total = int(total or 0)
         return snapshot
 
-    def _persist_shared_session_state(self, *, force: bool = False) -> None:
+    def _persist_shared_session_state(
+        self,
+        *,
+        force: bool = False,
+        reject_is_stale: bool = False,
+    ) -> None:
         provider = getattr(self.engine, "_session_state_provider", None)
         if provider is None:
             return
@@ -645,7 +650,14 @@ class ProxyState:
             )
             if saved_version is not None:
                 self.engine._session_state_version = int(saved_version)
+            elif reject_is_stale:
+                raise StaleConversationWriteError(
+                    "shared session state rejected for stale/deleted conversation "
+                    f"{self.engine.config.conversation_id[:12]}",
+                )
             self._last_shared_state_save = now
+        except StaleConversationWriteError:
+            raise
         except Exception:
             logger.debug(
                 "Shared session state save failed for conv=%s",
@@ -2256,7 +2268,7 @@ class ProxyState:
                     "done": cum_done,
                     "total": _total,
                 })
-            self._persist_shared_session_state()
+            self._persist_shared_session_state(reject_is_stale=True)
 
         ingest_kwargs = {
             "progress_callback": on_progress,
@@ -2281,7 +2293,7 @@ class ProxyState:
                 "conversation_id": conversation_id,
                 "baseline_history_tokens": baseline_history_tokens,
             })
-        self._persist_shared_session_state(force=True)
+        self._persist_shared_session_state(force=True, reject_is_stale=True)
 
     def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
         try:
