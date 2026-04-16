@@ -19,6 +19,7 @@ from virtual_context.proxy.server import (
 )
 from virtual_context.config import load_config
 from virtual_context.proxy.metrics import ProxyMetrics
+from virtual_context.proxy.session_state import SessionState as SharedSessionState
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import AssembledContext, EngineState, Message, TurnTagEntry
 
@@ -968,6 +969,7 @@ class TestSessionStateMachine:
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
         engine.config.proxy.history_widening_threshold = 0.10
+        engine.config.monitor.context_window = 200000
         engine.config.tag_generator.context_lookback_pairs = 3
         engine.config.tag_generator.context_bleed_threshold = 0
         if metrics is None:
@@ -1035,6 +1037,43 @@ class TestSessionStateMachine:
         assert len(state_events) == 1
         assert state_events[0]["from"] == "active"
         assert state_events[0]["to"] == "ingesting"
+
+    def test_state_transition_persists_shared_session_snapshot(self):
+        state = self._make_state()
+        provider = MagicMock()
+        state.engine._session_state_provider = provider
+        state.engine.extract_session_state = MagicMock(return_value=SharedSessionState())
+
+        state._transition_to(SessionState.INGESTING)
+
+        provider.save.assert_called_once()
+        conv_id, snapshot = provider.save.call_args.args
+        assert conv_id == state.engine.config.conversation_id
+        assert snapshot.session_state == "ingesting"
+
+    def test_hydrate_from_shared_session_restores_ui_fields(self):
+        state = self._make_state()
+        state.engine.hydrate_from_session_state = MagicMock()
+        shared = SharedSessionState(
+            session_state="ingesting",
+            live_turn_count=500,
+            history_message_count=1000,
+            ingestion_done=20,
+            ingestion_total=499,
+            last_payload_kb=23062.4,
+            last_payload_tokens=12541785,
+        )
+
+        state.hydrate_from_session_state(shared)
+
+        state.engine.hydrate_from_session_state.assert_called_once_with(shared)
+        assert state.session_state == SessionState.INGESTING
+        assert state._ingestion_progress == (20, 499)
+        assert state.live_snapshot()["turn_count"] == 500
+        snapshot = state.extract_session_state()
+        assert snapshot.live_turn_count == 500
+        assert snapshot.history_message_count == 1000
+        assert snapshot.last_payload_tokens == 12541785
 
     def test_persisted_state_skips_ingestion(self):
         state = self._make_state()

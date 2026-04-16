@@ -143,6 +143,9 @@ class ProxyState:
         self._last_payload_tokens: int = 0
         self._last_enriched_payload_tokens: int = 0
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
+        self._last_shared_state_save: float = 0.0
+        self._shared_live_turn_count: int = 0
+        self._shared_history_message_count: int = 0
         self._inbound_payload_token_cache = None
         self._outbound_payload_token_cache = None
         self._restore_readiness_pending: bool = False
@@ -212,6 +215,43 @@ class ProxyState:
             engine._restored_conversation_history = []
         if engine._restored_from_checkpoint:
             self.note_engine_restore(force=True)
+
+    def hydrate_from_session_state(self, state) -> None:
+        """Hydrate both engine state and worker-visible runtime counters."""
+        if hasattr(self.engine, "hydrate_from_session_state"):
+            self.engine.hydrate_from_session_state(state)
+
+        raw_state = str(getattr(state, "session_state", "") or "").strip().lower()
+        if raw_state:
+            try:
+                self._state = SessionState(raw_state)
+            except ValueError:
+                logger.debug(
+                    "Ignoring unknown shared session state '%s' for conv=%s",
+                    raw_state,
+                    self.engine.config.conversation_id[:12],
+                )
+
+        def _int_attr(name: str) -> int:
+            try:
+                return int(getattr(state, name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _float_attr(name: str) -> float:
+            try:
+                return float(getattr(state, name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        self._shared_live_turn_count = max(0, _int_attr("live_turn_count"))
+        self._shared_history_message_count = max(0, _int_attr("history_message_count"))
+        done = max(0, _int_attr("ingestion_done"))
+        total = max(done, _int_attr("ingestion_total"))
+        self._ingestion_progress = (done, total)
+        self._last_payload_kb = max(0.0, _float_attr("last_payload_kb"))
+        self._last_payload_tokens = max(0, _int_attr("last_payload_tokens"))
+        self.note_engine_restore(force=True)
 
     @property
     def turn_offset(self) -> int:
@@ -485,6 +525,52 @@ class ProxyState:
             "Conversation %s: %s → %s",
             self.engine.config.conversation_id[:12], old.value, new_state.value,
         )
+        self._persist_shared_session_state(force=True)
+
+    def extract_session_state(self):
+        """Return the shared session snapshot, including UI-facing runtime fields."""
+        snapshot = self.engine.extract_session_state()
+        live_turn_count = max(
+            len(self.conversation_history) // 2,
+            self._shared_live_turn_count,
+            len(getattr(self.engine._turn_tag_index, "entries", [])),
+            int(getattr(self.engine._engine_state, "last_completed_turn", -1) or -1) + 1,
+            int(getattr(self.engine._engine_state, "last_indexed_turn", -1) or -1) + 1,
+        )
+        history_message_count = max(
+            len(self.conversation_history),
+            self._shared_history_message_count,
+            live_turn_count * 2,
+        )
+        done, total = self._ingestion_progress
+        snapshot.session_state = self.session_state.value
+        snapshot.live_turn_count = live_turn_count
+        snapshot.history_message_count = history_message_count
+        snapshot.ingestion_done = int(done or 0)
+        snapshot.ingestion_total = int(total or 0)
+        snapshot.last_payload_kb = float(self._last_payload_kb or 0.0)
+        snapshot.last_payload_tokens = int(self._last_payload_tokens or 0)
+        return snapshot
+
+    def _persist_shared_session_state(self, *, force: bool = False) -> None:
+        provider = getattr(self.engine, "_session_state_provider", None)
+        if provider is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_shared_state_save) < 1.0:
+            return
+        try:
+            provider.save(
+                self.engine.config.conversation_id,
+                self.extract_session_state(),
+            )
+            self._last_shared_state_save = now
+        except Exception:
+            logger.debug(
+                "Shared session state save failed for conv=%s",
+                self.engine.config.conversation_id[:12],
+                exc_info=True,
+            )
 
     def _update_compaction_state(
         self,
@@ -593,7 +679,12 @@ class ProxyState:
 
         snap = {
             "conversation_id": engine.config.conversation_id,
-            "turn_count": len(self.conversation_history) // 2,
+            "turn_count": max(
+                len(self.conversation_history) // 2,
+                self._shared_live_turn_count,
+                self._completed_turn_count(),
+                self._indexed_turn_count(),
+            ),
             "total_requests": self._total_requests,
             "compacted_through": engine._engine_state.compacted_through,
             "tag_count": len(idx.entries),
@@ -1462,6 +1553,8 @@ class ProxyState:
         self._last_payload_tokens = 0
         self._last_enriched_payload_tokens = 0
         self._last_non_virtualizable_floor = 0
+        self._shared_live_turn_count = 0
+        self._shared_history_message_count = 0
         self._inbound_payload_token_cache = None
         self._outbound_payload_token_cache = None
         self._restore_readiness_pending = False
@@ -2026,6 +2119,7 @@ class ProxyState:
                     "done": cum_done,
                     "total": _total,
                 })
+            self._persist_shared_session_state()
 
         ingest_kwargs = {
             "progress_callback": on_progress,
@@ -2050,6 +2144,7 @@ class ProxyState:
                 "conversation_id": conversation_id,
                 "baseline_history_tokens": baseline_history_tokens,
             })
+        self._persist_shared_session_state(force=True)
 
     def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
         try:
