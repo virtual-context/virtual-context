@@ -38,6 +38,11 @@ from ._envelope import (  # noqa: E402
     extract_timestamp_from_metadata,
 )
 
+_VC_BLOCK_RE = re.compile(
+    r"<(?:virtual-context|system-reminder)>\n.*?\n</(?:virtual-context|system-reminder)>",
+    re.DOTALL,
+)
+
 
 # ---------------------------------------------------------------------------
 # Normalized tool-call / tool-output info
@@ -1255,14 +1260,10 @@ class AnthropicFormat(PayloadFormat):
                 continue
             content = msg.get("content", "")
             if isinstance(content, str):
-                text = _strip_envelope(content)
-                if text:
-                    return text
+                return _strip_envelope(content)
             elif isinstance(content, list):
-                text = _strip_envelope(_last_text_block(content))
-                if text:
-                    return text
-            # No text in this user message (e.g. tool_result only) — keep looking
+                return _strip_envelope(_last_text_block(content))
+            return ""
         return ""
 
     def extract_user_raw_content(self, body: dict) -> list[dict] | None:
@@ -2071,24 +2072,37 @@ class OpenAIFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Append to the LAST user message (current turn) so the conversation
-        # prefix stays byte-identical between turns, maximising OpenAI prefix
-        # caching.  Appending keeps tool-call content at the front.
         messages = body.get("messages", [])
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") != "user":
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "system":
                 continue
             content = msg.get("content", "")
+            messages[i] = dict(msg)
             if isinstance(content, str):
-                messages[i] = dict(msg)
-                messages[i]["content"] = f"{content}\n\n{context_block}"
+                cleaned = _VC_BLOCK_RE.sub("", content, count=1).strip()
+                messages[i]["content"] = (
+                    f"{cleaned}\n\n{context_block}" if cleaned else context_block
+                )
             elif isinstance(content, list):
-                messages[i] = dict(msg)
-                messages[i]["content"] = list(content) + [{"type": "text", "text": context_block}]
+                new_content = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        new_content.append(block)
+                        continue
+                    if "text" not in block:
+                        new_content.append(copy.deepcopy(block))
+                        continue
+                    cleaned = _VC_BLOCK_RE.sub("", block.get("text", ""), count=1).strip()
+                    if not cleaned:
+                        continue
+                    updated = dict(block)
+                    updated["text"] = cleaned
+                    new_content.append(updated)
+                new_content.append({"type": "text", "text": context_block})
+                messages[i]["content"] = new_content
             break
         else:
-            messages.append({"role": "user", "content": context_block})
+            messages.insert(0, {"role": "system", "content": context_block})
         body["messages"] = messages
         return body
 
@@ -2463,22 +2477,24 @@ class GeminiFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Append to the LAST user message (current turn) so the conversation
-        # prefix stays byte-identical between turns, maximising Gemini context
-        # caching.
-        contents = body.get("contents", [])
-        for i in range(len(contents) - 1, -1, -1):
-            msg = contents[i]
-            if msg.get("role") != "user":
-                continue
-            parts = msg.get("parts", [])
-            contents[i] = dict(msg)
-            contents[i]["parts"] = list(parts) + [{"text": context_block}]
-            break
-        else:
-            # No user message — prepend as user message
-            contents.insert(0, {"role": "user", "parts": [{"text": context_block}]})
-        body["contents"] = contents
+        instruction = copy.deepcopy(body.get("system_instruction") or {})
+        parts = instruction.get("parts", [])
+        new_parts: list[dict] = []
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if "text" not in part:
+                    new_parts.append(copy.deepcopy(part))
+                    continue
+                cleaned = _VC_BLOCK_RE.sub("", part.get("text", ""), count=1).strip()
+                if not cleaned:
+                    continue
+                updated = dict(part)
+                updated["text"] = cleaned
+                new_parts.append(updated)
+        new_parts.append({"text": context_block})
+        body["system_instruction"] = {"parts": new_parts}
         return body
 
     # -- Conversation markers --
@@ -3031,29 +3047,14 @@ class OpenAIResponsesFormat(PayloadFormat):
             return body
         body = copy.deepcopy(body)
         context_block = f"<system-reminder>\n{prepend_text}\n</system-reminder>"
-        # Append to the LAST user item in input (current turn) so the
-        # conversation prefix stays byte-identical between turns, maximising
-        # OpenAI prefix caching.
-        items = body.get("input", [])
-        if isinstance(items, list):
-            for i in range(len(items) - 1, -1, -1):
-                item = items[i]
-                if not isinstance(item, dict) or item.get("role") != "user":
-                    continue
-                content = item.get("content", "")
-                if isinstance(content, str):
-                    items[i] = dict(item)
-                    items[i]["content"] = f"{content}\n\n{context_block}"
-                elif isinstance(content, list):
-                    items[i] = dict(item)
-                    items[i]["content"] = list(content) + [{"type": "input_text", "text": context_block}]
-                break
-            else:
-                items.append({"role": "user", "content": context_block})
-            body["input"] = items
-        elif isinstance(items, str):
-            # input is a plain string — append context
-            body["input"] = f"{items}\n\n{context_block}"
+        instructions = body.get("instructions", "")
+        if isinstance(instructions, str):
+            cleaned = _VC_BLOCK_RE.sub("", instructions, count=1).strip()
+            body["instructions"] = (
+                f"{context_block}\n\n{cleaned}" if cleaned else context_block
+            )
+        else:
+            body["instructions"] = context_block
         return body
 
     # -- Conversation markers --
@@ -3219,8 +3220,49 @@ class OpenAIResponsesFormat(PayloadFormat):
         return results
 
     def estimate_message_tokens(self, msg: dict) -> int:
-        """Responses: recurse through content for media-aware token counting."""
-        return super().estimate_message_tokens(msg)
+        """Responses: count semantic content rather than JSON wrapper scaffolding."""
+        item_type = msg.get("type", "")
+        if item_type == "function_call":
+            total = 0
+            if isinstance(msg.get("name"), str):
+                total += self._count(msg["name"])
+            if isinstance(msg.get("arguments"), str):
+                total += self._count(msg["arguments"])
+            return max(1, total)
+        if item_type == "function_call_output":
+            output = msg.get("output", "")
+            if isinstance(output, str):
+                return max(1, self._count(output))
+            return max(1, self._count(json.dumps(output, default=str)))
+
+        content = msg.get("content", "")
+        text_tokens = 0
+        if isinstance(content, str):
+            text_tokens = self._count(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("input_text", "output_text", "text"):
+                    text_tokens += self._count(block.get("text", ""))
+                elif block.get("type") == "input_image":
+                    media = self._extract_media_from_block(block)
+                    if media is not None:
+                        text_tokens += _estimate_media_tokens(media)
+        return max(1, text_tokens)
+
+    def estimate_payload_tokens(self, body: dict) -> int:
+        items = self.get_messages(body)
+        return self._estimate_system_tokens(body) + sum(
+            self.estimate_message_tokens(item) for item in items
+        )
+
+    def estimate_payload_tokens_from_serialized(
+        self,
+        body: dict,
+        serialized_json: str,
+    ) -> int:
+        return self.estimate_payload_tokens(body)
 
     # -- Fingerprinting --
 

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         CompactionResult,
         CompactionSignal,
         EngineState,
+        CanonicalTurnRow,
         Message,
         SegmentMetadata,
         StoredSegment,
@@ -82,6 +83,36 @@ class CompactionPipeline:
         self._save_state_callback = save_state_callback
         self._session_state_provider = session_state_provider
 
+    def _load_compactable_rows(self) -> tuple[list["CanonicalTurnRow"], list["Message"]]:
+        from ..types import Message
+
+        rows = list(
+            self._store.get_uncompacted_canonical_turns(
+                self._config.conversation_id,
+                protected_recent_turns=self._config.monitor.protected_recent_turns,
+            )
+        )
+        messages: list[Message] = []
+        for row in rows:
+            messages.append(Message(role="user", content=row.user_content))
+            messages.append(Message(role="assistant", content=row.assistant_content))
+        return rows, messages
+
+    def _refresh_compaction_watermark(self) -> None:
+        rows = list(self._store.get_all_canonical_turns(self._config.conversation_id))
+        last_prefix_turn = -1
+        for row in rows:
+            if getattr(row, "compacted_at", None):
+                last_prefix_turn = row.turn_number
+                continue
+            break
+        if last_prefix_turn < 0:
+            self._engine_state.compacted_through = 0
+            self._engine_state.last_compacted_turn = -1
+            return
+        self._engine_state.compacted_through = (last_prefix_turn + 1) * 2
+        self._engine_state.last_compacted_turn = last_prefix_turn
+
     # ------------------------------------------------------------------
     # Public entry points
     # ------------------------------------------------------------------
@@ -115,40 +146,30 @@ class CompactionPipeline:
             f"overflow={signal.overflow_tokens}"
         )
 
-        # Select messages to compact (not in protected zone)
-        protected_turns = self._config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2  # user + assistant per turn
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        # Messages to compact: everything between watermark and protected zone.
-        # Compact all available messages (not just the minimum) so compaction
-        # fires infrequently — one big batch instead of many small ones.
-        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
-        offset = self._engine_state.history_offset(
-            len(conversation_history), total_turns_indexed=_total_turns,
-        )
-        compact_messages = conversation_history[offset:-protected_count]
+        compact_rows, compact_messages = self._load_compactable_rows()
 
         if not compact_messages:
             logger.info(
-                "Compaction skipped: no messages between offset=%d (watermark=%d) and protected zone "
-                "(history=%d msgs, protected=%d turns)",
-                offset, self._engine_state.compacted_through,
-                len(conversation_history), protected_turns,
+                "Compaction skipped: no uncompacted canonical turns outside protected zone "
+                "(history=%d msgs, protected=%d turns, compacted_through=%d)",
+                len(conversation_history),
+                self._config.monitor.protected_recent_turns,
+                self._engine_state.compacted_through,
             )
             return None
 
         logger.info(
-            "Compacting %d messages (offset=%d, watermark=%d, history=%d, protected=%d turns, indexed=%s)",
-            len(compact_messages), offset, self._engine_state.compacted_through,
-            len(conversation_history), protected_turns, _total_turns,
+            "Compacting %d canonical turns (%d messages, first_turn=%d, last_turn=%d, watermark=%d)",
+            len(compact_rows),
+            len(compact_messages),
+            compact_rows[0].turn_number if compact_rows else -1,
+            compact_rows[-1].turn_number if compact_rows else -1,
+            self._engine_state.compacted_through,
         )
         report = self._run_compaction(
             conversation_history,
             compact_messages,
+            compact_rows=compact_rows,
             progress_callback=progress_callback,
             generated_by_turn_id=turn_id,
         )
@@ -175,26 +196,14 @@ class CompactionPipeline:
         if not conversation_history:
             return None
 
-        # Select messages to compact (same logic as on_turn_complete)
-        protected_turns = self._config.monitor.protected_recent_turns
-        protected_count = protected_turns * 2
-
-        if len(conversation_history) <= protected_count:
-            logger.info("Not enough messages outside protected zone to compact")
-            return None
-
-        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
-        offset = self._engine_state.history_offset(
-            len(conversation_history), total_turns_indexed=_total_turns,
-        )
-        compact_messages = conversation_history[offset:-protected_count]
-
+        compact_rows, compact_messages = self._load_compactable_rows()
         if not compact_messages:
             return None
 
         report = self._run_compaction(
             conversation_history,
             compact_messages,
+            compact_rows=compact_rows,
             generated_by_turn_id=turn_id,
         )
 
@@ -230,6 +239,8 @@ class CompactionPipeline:
         self,
         conversation_history: list[Message],
         compact_messages: list[Message],
+        *,
+        compact_rows: list["CanonicalTurnRow"] | None = None,
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
     ) -> CompactionReport:
@@ -243,7 +254,9 @@ class CompactionPipeline:
         """
         from ..types import CompactionReport
 
-        turn_offset = self._engine_state.compacted_through // 2
+        compact_rows = list(compact_rows or [])
+
+        turn_offset = compact_rows[0].turn_number if compact_rows else (self._engine_state.compacted_through // 2)
 
         def _emit_weighted_progress(
             done: int,
@@ -314,12 +327,23 @@ class CompactionPipeline:
         results = self._compact_and_store(
             segments,
             len(compact_messages),
+            compact_rows=compact_rows,
             progress_callback=progress_callback,
             generated_by_turn_id=generated_by_turn_id,
         )
 
-        # Advance watermark past compacted messages
-        self._engine_state.compacted_through += len(compact_messages)
+        compacted_turn_ids = [
+            row.canonical_turn_id
+            for row in compact_rows
+            if getattr(row, "canonical_turn_id", "")
+        ]
+        if compacted_turn_ids:
+            self._store.mark_canonical_turns_compacted(
+                self._config.conversation_id,
+                compacted_turn_ids,
+            )
+        if compact_rows:
+            self._refresh_compaction_watermark()
 
         tokens_freed = sum(r.original_tokens - r.summary_tokens for r in results)
         tags = list({tag for r in results for tag in r.tags})
@@ -356,10 +380,15 @@ class CompactionPipeline:
 
                 # Gather turn numbers per tag from index
                 tag_to_turns: dict[str, list[int]] = {}
+                tag_to_canonical_turn_ids: dict[str, list[str]] = {}
                 for entry in self._turn_tag_index.entries:
                     for tag in entry.tags:
                         if tag in cover_tags:
                             tag_to_turns.setdefault(tag, []).append(entry.turn_number)
+                            if entry.canonical_turn_id:
+                                tag_to_canonical_turn_ids.setdefault(tag, []).append(
+                                    entry.canonical_turn_id,
+                                )
 
                 # Load existing tag summaries for staleness check
                 existing_tag_summaries = {}
@@ -375,6 +404,7 @@ class CompactionPipeline:
                         cover_tags=cover_tags,
                         tag_to_summaries=tag_to_summaries,
                         tag_to_turns=tag_to_turns,
+                        tag_to_canonical_turn_ids=tag_to_canonical_turn_ids,
                         existing_tag_summaries=existing_tag_summaries,
                         max_turn=max_turn,
                         generated_by_turn_id=generated_by_turn_id,
@@ -444,57 +474,18 @@ class CompactionPipeline:
             )
 
     def _commit_compaction_state(self, conversation_history: list[Message]) -> None:
-        """Persist the committed compaction checkpoint, then prune raw turns from that prefix."""
-        expected_last_compacted_turn = int(self._engine_state.last_compacted_turn)
+        """Persist the committed compaction checkpoint."""
         saved = self._save_state_callback(conversation_history)
         if not saved:
             logger.warning(
-                "Compaction checkpoint save failed for conversation %s; skipping turn_messages prune",
-                self._config.conversation_id[:12],
-            )
-            return
-        prune = getattr(self._store, "prune_turn_messages", None)
-        if prune is None:
-            return
-        # Trust in-memory engine_state rather than reloading from Postgres.
-        # In provider mode, _save_state writes to Redis/memory but
-        # store.load_engine_state() reads from Postgres which lags behind,
-        # causing false "checkpoint regression" warnings and skipped prunes.
-        committed_turn = int(self._engine_state.last_compacted_turn)
-        if committed_turn < expected_last_compacted_turn:
-            logger.warning(
-                "Compaction checkpoint regression for conversation %s: "
-                "engine_state.last_compacted_turn=%d but expected=%d. "
-                "Skipping turn_messages prune.",
-                self._config.conversation_id[:12],
-                committed_turn,
-                expected_last_compacted_turn,
-            )
-            return
-        keep_from_turn = committed_turn + 1
-        try:
-            removed = self._store.prune_turn_messages(
-                self._config.conversation_id,
-                keep_from_turn,
-            )
-        except Exception:
-            logger.warning(
-                "Committed compaction prune failed for conversation %s at keep_from_turn=%d",
-                self._config.conversation_id[:12],
-                keep_from_turn,
-                exc_info=True,
-            )
-            return
-        if removed:
-            logger.info(
-                "Pruned %d committed turn_messages before turn %d for conversation %s",
-                removed,
-                keep_from_turn,
+                "Compaction checkpoint save failed for conversation %s",
                 self._config.conversation_id[:12],
             )
 
     def _compact_and_store(
         self, segments: list, compact_messages_len: int,
+        *,
+        compact_rows: list["CanonicalTurnRow"] | None = None,
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
     ) -> list[CompactionResult]:
@@ -511,6 +502,7 @@ class CompactionPipeline:
         from .tag_scoring import compute_relatedness
 
         _ensure_engine_imports()
+        compact_rows = list(compact_rows or [])
 
         all_results: list[CompactionResult] = []
 
@@ -542,19 +534,32 @@ class CompactionPipeline:
 
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
         # Also record the contributing turn range per segment for tool-output linkage.
-        turn_offset = self._engine_state.compacted_through // 2
-        seg_cursor = turn_offset
+        seg_cursor = 0
         segment_signals: dict[str, list[FactSignal]] = {}
         segment_code_refs: dict[str, list[dict]] = {}
         segment_turn_ranges: dict[str, tuple[int, int]] = {}  # seg.id -> (start, end_exclusive)
+        segment_canonical_turn_ids: dict[str, list[str]] = {}
         merged_existing_exact_ranges: dict[str, tuple[int, int] | None] = {}
         for seg in segments:
             seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
-            segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
+            seg_rows = compact_rows[seg_cursor:seg_cursor + seg_turn_count]
+            if seg_rows:
+                segment_turn_ranges[seg.id] = (
+                    seg_rows[0].turn_number,
+                    seg_rows[-1].turn_number + 1,
+                )
+                segment_canonical_turn_ids[seg.id] = [
+                    row.canonical_turn_id for row in seg_rows if row.canonical_turn_id
+                ]
+            else:
+                segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
+                segment_canonical_turn_ids[seg.id] = []
             signals: list[FactSignal] = []
             code_refs: list[dict] = []
-            for t in range(seg_cursor, seg_cursor + seg_turn_count):
-                entry = self._turn_tag_index.get_tags_for_turn(t)
+            for row in seg_rows:
+                entry = self._turn_tag_index.get_tags_for_canonical_turn(row.canonical_turn_id)
+                if entry is None:
+                    entry = self._turn_tag_index.get_tags_for_turn(row.turn_number)
                 if entry and entry.fact_signals:
                     signals.extend(entry.fact_signals)
                 if entry and getattr(entry, "code_refs", None):
@@ -569,20 +574,6 @@ class CompactionPipeline:
         max_seg_tokens = self._config.compactor.max_segment_tokens
         merge_threshold = self._config.compactor.merge_overlap_threshold
 
-        # ------------------------------------------------------------------
-        # Store-based skip: collect turn numbers already covered by stored
-        # tag summaries so we can skip segments that would re-compact the
-        # same turns (happens when compacted_through > history_len and
-        # history_offset() returns 0).
-        # ------------------------------------------------------------------
-        try:
-            _already_compacted_turns = self._store.get_compacted_turn_numbers(
-                self._config.conversation_id,
-            )
-        except Exception:
-            _already_compacted_turns = set()
-        _skipped_segments = 0
-
         # ==================================================================
         # Pass 1: Sequential pre-pass — stubs + merge check (no LLM calls)
         # ==================================================================
@@ -596,19 +587,6 @@ class CompactionPipeline:
         embed_fn = self._semantic.get_embed_fn() if self._semantic else None
 
         for seg in segments:
-            # --- Store-based skip: already-compacted turn range ---
-            if _already_compacted_turns:
-                seg_range = segment_turn_ranges.get(seg.id)
-                if seg_range:
-                    seg_turns = set(range(seg_range[0], seg_range[1]))
-                    if seg_turns and seg_turns <= _already_compacted_turns:
-                        _skipped_segments += 1
-                        logger.info(
-                            "SEGMENT SKIP (already compacted) ref=%s turns=%d-%d primary=%s",
-                            seg.id[:8], seg_range[0], seg_range[1] - 1, seg.primary_tag,
-                        )
-                        continue
-
             # --- Stub passthrough (no LLM) ---
             text = " ".join(m.content for m in seg.messages)
             if _is_stub_content_fn(text):
@@ -630,6 +608,7 @@ class CompactionPipeline:
                     metadata=SegmentMetadata(
                         code_refs=segment_code_refs.get(seg.id, []),
                         turn_count=seg.turn_count,
+                        canonical_turn_ids=list(segment_canonical_turn_ids.get(seg.id, [])),
                         start_turn_number=turn_range[0] if turn_range else -1,
                         end_turn_number=(turn_range[1] - 1) if turn_range and turn_range[1] > turn_range[0] else -1,
                         generated_by_turn_id=generated_by_turn_id,
@@ -749,11 +728,9 @@ class CompactionPipeline:
                 )
             return all_results
 
-        if _skipped_segments:
-            logger.info("Store-based skip: %d segments skipped (turns already compacted)", _skipped_segments)
-        logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges, %d skipped)",
+        logger.info("Pass 1 complete: %d stubs stored, %d segments ready for compaction (%d merges)",
                     len(all_results), len(compactable),
-                    sum(1 for s in compactable if s.merge_ref), _skipped_segments)
+                    sum(1 for s in compactable if s.merge_ref))
 
         # ==================================================================
         # Pass 2: Batch LLM compaction + store
@@ -806,6 +783,7 @@ class CompactionPipeline:
             result.metadata.start_turn_number = exact_start
             result.metadata.end_turn_number = exact_end
             result.metadata.generated_by_turn_id = generated_by_turn_id
+            result.metadata.canonical_turn_ids = list(segment_canonical_turn_ids.get(seg.id, []))
 
             # Store or update
             if seg.merge_ref:

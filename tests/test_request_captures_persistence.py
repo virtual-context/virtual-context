@@ -210,19 +210,6 @@ class TestRequestCapturesPersistence:
         assert len(loaded) == 2
         assert sorted(c["turn_id"] for c in loaded) == ["req-a", "req-b"]
 
-    def test_prune_turn_messages_keeps_suffix(self, tmp_path):
-        store = SQLiteStore(tmp_path / "test.db")
-        for turn in range(6):
-            store.save_turn_message("conv-1", turn, f"user-{turn}", f"assistant-{turn}")
-
-        removed = store.prune_turn_messages("conv-1", keep_from_turn=4)
-
-        assert removed == 4
-        assert store.load_recent_turn_messages("conv-1", limit=10) == [
-            (4, "user-4", "assistant-4"),
-            (5, "user-5", "assistant-5"),
-        ]
-
     def test_request_context_assigns_monotonic_request_turns_concurrently(self, tmp_path):
         store = SQLiteStore(tmp_path / "test.db")
         total = 12
@@ -713,7 +700,7 @@ class TestDeleteConversationCleanup:
                 summary=f"{conversation_id} summary",
                 **base_segment,
             ))
-            store.save_turn_message(conversation_id, 0, "user", "assistant")
+            store.save_canonical_turn(conversation_id, 0, "user", "assistant")
             store.save_request_capture({
                 "turn": 1,
                 "ts": "2026-03-20T10:00:00+00:00",
@@ -787,8 +774,9 @@ class TestDeleteConversationCleanup:
         assert deleted == 1
         assert store.get_segment("conv-a-seg", conversation_id="conv-a") is None
         assert store.get_segment("conv-b-seg", conversation_id="conv-b") is not None
-        assert store.load_recent_turn_messages("conv-a", limit=5) == []
-        assert store.load_recent_turn_messages("conv-b", limit=5) == [
+        assert store.get_all_canonical_turns("conv-a") == []
+        rows_b = store.get_all_canonical_turns("conv-b")
+        assert [(row.turn_number, row.user_content, row.assistant_content) for row in rows_b] == [
             (0, "user", "assistant"),
         ]
         assert store.load_request_captures(conversation_id="conv-a") == []

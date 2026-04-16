@@ -449,7 +449,12 @@ class ContextAssembler:
         return "<facts>\n" + "\n".join(lines) + "\n</facts>"
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
-        return format_tag_section(tag, summaries, store=self._store, conversation_id=self._conversation_id)
+        return format_tag_section(
+            tag,
+            summaries,
+            store=getattr(self, "_store", None),
+            conversation_id=getattr(self, "_conversation_id", ""),
+        )
 
     def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
         if not segments:

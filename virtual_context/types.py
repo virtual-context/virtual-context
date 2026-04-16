@@ -288,8 +288,9 @@ class KeywordTagConfig:
 @dataclass
 class TurnTagEntry:
     """Tag metadata for a single round trip, computed in real time."""
-    turn_number: int
-    message_hash: str              # sha256[:16] of user+assistant content
+    turn_number: int = -1
+    message_hash: str = ""              # sha256[:16] of user+assistant content
+    canonical_turn_id: str = ""
     tags: list[str] = field(default_factory=list)
     primary_tag: str = "_general"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -332,8 +333,8 @@ class EngineState:
            messages whose turns have already been compacted to avoid
            re-processing.
 
-        Without *total_turns_indexed* the legacy behaviour is preserved:
-        return 0 whenever ``compacted_through >= history_len``.
+        Without *total_turns_indexed*, the safe default is to treat rebuilt
+        history as fresh and return 0 whenever ``compacted_through >= history_len``.
 
         When *watermark* is provided, it overrides ``self.compacted_through``
         as the boundary.  This lets callers pass ``flushed_through`` for
@@ -346,7 +347,7 @@ class EngineState:
 
         # compacted_through >= history_len
         if total_turns_indexed is None:
-            # Legacy path — no additional info, assume restart / fresh history.
+            # No index coverage information — assume restart / fresh history.
             return 0
 
         # Sliding-window detection: if the turn-tag index has grown beyond
@@ -461,6 +462,7 @@ class SegmentMetadata:
     date_references: list[str] = field(default_factory=list)
     code_refs: list[dict] = field(default_factory=list)
     turn_count: int = 0
+    canonical_turn_ids: list[str] = field(default_factory=list)
     start_turn_number: int = -1
     end_turn_number: int = -1
     generated_by_turn_id: str = ""
@@ -564,10 +566,16 @@ class ChunkEmbedding:
 
 
 @dataclass
-class FullTextRow:
+class CanonicalTurnRow:
     """Canonical archived user/assistant turn text."""
     conversation_id: str
-    turn_number: int
+    canonical_turn_id: str = ""
+    turn_number: int = -1
+    sort_key: float = 0.0
+    turn_hash: str = ""
+    hash_version: int = 0
+    normalized_user_text: str = ""
+    normalized_assistant_text: str = ""
     user_content: str = ""
     assistant_content: str = ""
     user_raw_content: str | None = None
@@ -578,24 +586,39 @@ class FullTextRow:
     sender: str = ""
     fact_signals: list[FactSignal] = field(default_factory=list)
     code_refs: list[dict] = field(default_factory=list)
+    tagged_at: str | None = None
+    compacted_at: str | None = None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+    source_batch_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
 
 @dataclass
-class FullTextChunkEmbedding:
-    """A chunk of canonical full_text with its embedding vector."""
+class CanonicalTurnChunkEmbedding:
+    """One embedded chunk from a canonical turn side."""
     conversation_id: str
-    turn_number: int
     side: str
     chunk_index: int
     text: str
     embedding: list[float]
+    canonical_turn_id: str = ""
+    turn_number: int = -1
 
-
-# Backward-compatible alias while callers migrate to the canonical name.
-TurnChunkEmbedding = FullTextChunkEmbedding
-
+@dataclass
+class IngestBatchRecord:
+    batch_id: str = ""
+    conversation_id: str = ""
+    received_at: str = ""
+    raw_turn_count: int = 0
+    merge_mode: str = ""
+    turns_matched: int = 0
+    turns_appended: int = 0
+    turns_prepended: int = 0
+    turns_inserted: int = 0
+    first_turn_hash: str = ""
+    last_turn_hash: str = ""
 
 @dataclass
 class TagSummary:
@@ -606,8 +629,10 @@ class TagSummary:
     summary_tokens: int = 0
     source_segment_refs: list[str] = field(default_factory=list)
     source_turn_numbers: list[int] = field(default_factory=list)
+    source_canonical_turn_ids: list[str] = field(default_factory=list)
     code_refs: list[dict] = field(default_factory=list)
     covers_through_turn: int = -1  # highest turn number covered; -1 = never built
+    covers_through_canonical_turn_id: str = ""
     generated_by_turn_id: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

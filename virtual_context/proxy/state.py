@@ -21,7 +21,7 @@ from ..core.conversation_store import StaleConversationWriteError
 from ..core.semantic_search import persist_turn_with_embeddings
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
-from ..types import EngineState, Message, SplitResult
+from ..types import EngineState, Message, SplitResult, TurnTagEntry
 
 from .helpers import (
     _strip_envelope,
@@ -390,7 +390,7 @@ class ProxyState:
             logger.warning("Failed to persist completed turn", exc_info=True)
 
     def resume_pending_ingestion_if_needed(self) -> bool:
-        """Resume indexing from durable turn_messages when completed turns outpace indexed turns."""
+        """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""
         conversation_id = self.engine.config.conversation_id
         if not self.has_pending_indexing():
             return False
@@ -404,10 +404,10 @@ class ProxyState:
             if not pending_rows:
                 turn_numbers = list(range(baseline, total))
                 try:
-                    rows = self.engine._store.get_turn_messages(conversation_id, turn_numbers)
+                    rows = self.engine._store.get_canonical_turn_rows(conversation_id, turn_numbers)
                 except Exception:
                     logger.warning(
-                        "Failed to load pending turn_messages for durable resume (conv=%s)",
+                        "Failed to load pending canonical turns for durable resume (conv=%s)",
                         conversation_id[:12],
                         exc_info=True,
                     )
@@ -416,9 +416,14 @@ class ProxyState:
                     row = rows.get(turn_number)
                     if row is None:
                         continue
-                    user_content, assistant_content, user_raw, assistant_raw = row
                     pending_rows.append(
-                        (turn_number, user_content, assistant_content, user_raw, assistant_raw)
+                        (
+                            turn_number,
+                            row.user_content,
+                            row.assistant_content,
+                            row.user_raw_content,
+                            row.assistant_raw_content,
+                        )
                     )
 
             if not pending_rows:
@@ -850,6 +855,8 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         try:
             existing = self.engine._turn_tag_index.get_tags_for_turn(turn)
+            if not isinstance(existing, TurnTagEntry):
+                existing = None
             if existing is not None:
                 if turn_hash and existing.message_hash != turn_hash:
                     logger.warning(
@@ -1596,35 +1603,34 @@ class ProxyState:
                 self._compaction_lock.release()
 
     def _advance_compaction_watermark(self) -> None:
-        """Advance compacted_through to cover all already-processed messages.
+        """Refresh the derived compaction watermark from durable canonical turns.
 
-        Uses conversation_history length only — the TurnTagIndex may include
-        restored entries from previous sessions whose messages are not in the
-        current history array, and using its size would set the watermark beyond
-        the actual message count, causing compaction drift.
-
-        On a fresh volume (no stored segments), don't advance — everything needs
-        first-time compaction.
+        ``compacted_through`` still drives status reporting and sliding-window
+        history assembly, so it must reflect the actual compacted canonical
+        prefix rather than whatever happens to be in memory right now.
         """
         try:
-            if int(self.engine._engine_state.compacted_through) > 0:
-                return
-            # Don't advance if there are no stored segments — everything needs first-time compaction
-            existing_tags = self.engine._store.get_all_tags(
-                conversation_id=self.engine.config.conversation_id,
-            )
-            if not existing_tags:
-                logger.info(
-                    "Compaction watermark: no stored segments, keeping at %d for first-time compaction",
-                    self.engine._engine_state.compacted_through,
+            rows = list(
+                self.engine._store.get_all_canonical_turns(
+                    self.engine.config.conversation_id,
                 )
-                return
-
-            new_wm = len(self.conversation_history)
+            )
+            compacted_rows = [row for row in rows if getattr(row, "compacted_at", None)]
+            new_wm = ((compacted_rows[-1].turn_number + 1) * 2) if compacted_rows else 0
             old_wm = int(self.engine._engine_state.compacted_through)
-            if new_wm > old_wm:
+            if new_wm != old_wm:
                 self.engine._engine_state.compacted_through = new_wm
-                logger.info("Compaction watermark advanced: %d → %d (post-ingestion)", old_wm, new_wm)
+                logger.info(
+                    "Compaction watermark refreshed from canonical rows: %d -> %d "
+                    "(compacted_turns=%d)",
+                    old_wm,
+                    new_wm,
+                    len(compacted_rows),
+                )
+            self.engine._engine_state.flushed_through = min(
+                int(self.engine._engine_state.flushed_through or 0),
+                int(self.engine._engine_state.compacted_through or 0),
+            )
         except (TypeError, ValueError, AttributeError):
             pass
 

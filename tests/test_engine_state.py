@@ -275,10 +275,12 @@ class TestEngineStateIntegration:
         assert len(engine2._restored_pending_turns) == 1
         assert engine2._restored_pending_turns[0][0] == 0
 
-    def test_startup_retries_committed_turn_prune(self, tmp_path):
-        from virtual_context.engine import VirtualContextEngine
+    def test_canonical_restore_uses_contiguous_compacted_prefix(self, tmp_path):
+        from datetime import datetime, timezone
+
         from virtual_context.config import load_config
-        from virtual_context.types import Message, StoredSegment, SegmentMetadata
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import EngineStateSnapshot
 
         db_path = str(tmp_path / "store.db")
         config1 = load_config(config_dict={
@@ -289,24 +291,39 @@ class TestEngineStateIntegration:
         engine1 = VirtualContextEngine(config=config1)
         conversation_id = engine1.config.conversation_id
 
-        engine1._store.store_segment(StoredSegment(
-            ref="seg-0",
-            conversation_id=conversation_id,
+        now = datetime.now(timezone.utc).isoformat()
+        engine1._store.save_canonical_turn(
+            conversation_id,
+            0,
+            "Turn 2 user",
+            "Turn 2 assistant",
             primary_tag="topic",
             tags=["topic"],
-            summary="Compacted summary",
-            summary_tokens=5,
-            full_text="full text",
-            full_tokens=10,
-            metadata=SegmentMetadata(turn_count=2),
-        ))
-        for turn in range(3):
-            engine1._store.save_turn_message(
-                conversation_id,
-                turn,
-                f"user-{turn}",
-                f"assistant-{turn}",
-            )
+            tagged_at=now,
+            compacted_at=now,
+        )
+        engine1._store.save_canonical_turn(
+            conversation_id,
+            1,
+            "Turn 3 user",
+            "Turn 3 assistant",
+            primary_tag="topic",
+            tags=["topic"],
+            tagged_at=now,
+            compacted_at=now,
+        )
+        engine1._store.save_canonical_turn(
+            conversation_id,
+            0,
+            "Turn 1 user",
+            "Turn 1 assistant",
+            primary_tag="topic",
+            tags=["topic"],
+            canonical_turn_id="prepended-turn",
+            sort_key=500.0,
+            tagged_at=now,
+            compacted_at=None,
+        )
         engine1._store.save_engine_state(EngineStateSnapshot(
             conversation_id=conversation_id,
             compacted_through=4,
@@ -327,11 +344,9 @@ class TestEngineStateIntegration:
         config2.conversation_id = conversation_id
         engine2 = VirtualContextEngine(config=config2)
 
-        remaining = engine2._store.get_turn_messages(conversation_id, [0, 1, 2])
-        assert 0 not in remaining
-        assert 1 not in remaining
-        assert 2 in remaining
-        assert engine2._restored_conversation_history == [(2, "user-2", "assistant-2")]
+        assert engine2._engine_state.compacted_through == 0
+        assert engine2._engine_state.last_compacted_turn == -1
+        assert [row[0] for row in engine2._restored_conversation_history] == [0]
 
 
 # ---------------------------------------------------------------------------

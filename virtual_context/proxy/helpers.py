@@ -120,12 +120,16 @@ def _inject_vc_tools(
 ) -> dict:
     from ..core.tool_loop import vc_tool_definitions_for_runtime
     fmt = detect_format(body)
-    return fmt.inject_tools(
-        body,
-        vc_tool_definitions_for_runtime(
+    defs = [
+        d for d in vc_tool_definitions_for_runtime(
             tool_runtime,
             restore_available=restore_available,
-        ),
+        )
+        if d.get("name") != "vc_remember_when"
+    ]
+    return fmt.inject_tools(
+        body,
+        defs,
         require_tool_use=require_tool_use,
     )
 

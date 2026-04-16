@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, FullTextChunkEmbedding, FullTextRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 
 
 class ContextStore(ABC):
@@ -115,13 +116,18 @@ class ContextStore(ABC):
         Returns QuoteResult objects with excerpts (~200 chars context around match).
         """
 
-    def search_canonical_full_text(
+    def search_canonical_turn_text(
         self,
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list[QuoteResult]:
+        """Search canonical turn text across stored conversation turns."""
         return []
+
+    def conversation_reconcile(self, conversation_id: str):
+        """Optional per-conversation write lock for merge-style ingest paths."""
+        return nullcontext()
 
     @abstractmethod
     def get_segments_by_tags(
@@ -138,25 +144,27 @@ class ContextStore(ABC):
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return []
 
-    def store_full_text_chunk_embeddings(
+    def store_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int,
         side: str,
-        chunks: list[FullTextChunkEmbedding],
+        chunks: list[CanonicalTurnChunkEmbedding],
+        canonical_turn_id: str | None = None,
     ) -> None:
-        """Idempotent: replaces any existing full_text chunks for this turn side."""
+        """Idempotent: replaces any existing embedded chunks for this turn side."""
 
-    def get_all_full_text_chunk_embeddings(
+    def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
-    ) -> list[FullTextChunkEmbedding]:
+    ) -> list[CanonicalTurnChunkEmbedding]:
         return []
 
-    def delete_full_text_chunk_embeddings(
+    def delete_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int | None = None,
+        canonical_turn_id: str | None = None,
     ) -> int:
         return 0
 
@@ -177,70 +185,10 @@ class ContextStore(ABC):
         """
 
     # ------------------------------------------------------------------
-    # Compaction dedup: turn numbers already covered by stored segments
+    # Canonical turn ledger
     # ------------------------------------------------------------------
 
-    def get_compacted_turn_numbers(self, conversation_id: str) -> set[int]:
-        """Return the set of turn numbers already covered by stored tag summaries.
-
-        Used by the compaction pipeline to skip segments whose turns have
-        already been compacted, preventing redundant LLM calls when the
-        compaction watermark drifts ahead of the in-memory history window.
-        """
-        tag_summaries = self.get_all_tag_summaries(conversation_id=conversation_id)
-        covered: set[int] = set()
-        for ts in tag_summaries:
-            covered.update(ts.source_turn_numbers)
-        return covered
-
-    # ------------------------------------------------------------------
-    # Turn messages (lightweight per-turn text for post-restart recall)
-    # ------------------------------------------------------------------
-
-    def save_turn_message(
-        self,
-        conversation_id: str,
-        turn_number: int,
-        user_content: str,
-        assistant_content: str,
-        user_raw_content: str | None = None,
-        assistant_raw_content: str | None = None,
-    ) -> None:
-        """Upsert by (conversation_id, turn_number)."""
-
-    def get_turn_messages(
-        self,
-        conversation_id: str,
-        turn_numbers: list[int],
-    ) -> dict[int, tuple[str, str, str | None, str | None]]:
-        """Retrieve message text for specific turns.
-
-        Returns {turn_number: (user_content, assistant_content, user_raw_content, assistant_raw_content)}.
-        Missing turns are omitted from the result.
-        """
-        return {}
-
-    def load_recent_turn_messages(
-        self,
-        conversation_id: str,
-        limit: int = 100,
-    ) -> list[tuple[int, str, str]]:
-        """Load the most recent turn messages, ordered by turn_number ascending.
-
-        Returns list of (turn_number, user_content, assistant_content).
-        Used to rebuild conversation_history after restart.
-        """
-        return []
-
-    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int:
-        """Delete persisted turn messages older than ``keep_from_turn``."""
-        return 0
-
-    # ------------------------------------------------------------------
-    # Canonical archived full_text (permanent quote-search source of truth)
-    # ------------------------------------------------------------------
-
-    def save_full_text(
+    def save_canonical_turn(
         self,
         conversation_id: str,
         turn_number: int,
@@ -256,28 +204,73 @@ class ContextStore(ABC):
         code_refs: list[dict] | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
+        canonical_turn_id: str | None = None,
+        sort_key: float | None = None,
+        turn_hash: str = "",
+        hash_version: int = 0,
+        normalized_user_text: str = "",
+        normalized_assistant_text: str = "",
+        tagged_at: str | None = None,
+        compacted_at: str | None = None,
+        first_seen_at: str | None = None,
+        last_seen_at: str | None = None,
+        source_batch_id: str | None = None,
     ) -> None:
-        """Upsert canonical archived text by (conversation_id, turn_number)."""
+        """Upsert a canonical turn, using ``turn_number`` only as an ordinal hint."""
 
-    def get_full_text_rows(
+    def get_canonical_turn_rows(
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, FullTextRow]:
+    ) -> dict[int, CanonicalTurnRow]:
         return {}
 
-    def get_all_full_text_rows(
+    def get_all_canonical_turns(
         self,
         conversation_id: str,
-    ) -> list[FullTextRow]:
+    ) -> list[CanonicalTurnRow]:
         return []
 
-    def delete_full_text_rows(
+    def get_uncompacted_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        protected_recent_turns: int = 0,
+    ) -> list[CanonicalTurnRow]:
+        rows = [row for row in self.get_all_canonical_turns(conversation_id) if not row.compacted_at]
+        if protected_recent_turns > 0 and len(rows) > protected_recent_turns:
+            return rows[:-protected_recent_turns]
+        if protected_recent_turns > 0:
+            return []
+        return rows
+
+    def mark_canonical_turns_tagged(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        tagged_at: str | None = None,
+    ) -> int:
+        return 0
+
+    def mark_canonical_turns_compacted(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        compacted_at: str | None = None,
+    ) -> int:
+        return 0
+
+    def delete_canonical_turns(
         self,
         conversation_id: str,
         turn_number: int | None = None,
     ) -> int:
         return 0
+
+    def save_ingest_batch(self, batch: dict) -> str:
+        return str(batch.get("batch_id", "") or "")
 
     # ------------------------------------------------------------------
     # Conversation lifecycle fencing

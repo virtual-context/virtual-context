@@ -12,8 +12,8 @@ from ..types import (
     Fact,
     FactLink,
     FactSignal,
-    FullTextChunkEmbedding,
-    FullTextRow,
+    CanonicalTurnChunkEmbedding,
+    CanonicalTurnRow,
     LinkedFact,
     QuoteResult,
     StoredSegment,
@@ -60,11 +60,7 @@ class SegmentStore(Protocol):
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]: ...
     def update_segment(self, segment: StoredSegment) -> None: ...
     def delete_conversation(self, conversation_id: str) -> int: ...
-    def save_turn_message(self, conversation_id: str, turn_number: int, user_content: str, assistant_content: str, user_raw_content: str | None = None, assistant_raw_content: str | None = None) -> None: ...
-    def get_turn_messages(self, conversation_id: str, turn_numbers: list[int]) -> dict[int, tuple[str, str, str | None, str | None]]: ...
-    def load_recent_turn_messages(self, conversation_id: str, limit: int = 100) -> list[tuple[int, str, str]]: ...
-    def prune_turn_messages(self, conversation_id: str, keep_from_turn: int) -> int: ...
-    def save_full_text(
+    def save_canonical_turn(
         self,
         conversation_id: str,
         turn_number: int,
@@ -80,17 +76,48 @@ class SegmentStore(Protocol):
         code_refs: list[dict] | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
+        canonical_turn_id: str | None = None,
+        sort_key: float | None = None,
+        turn_hash: str = "",
+        hash_version: int = 0,
+        normalized_user_text: str = "",
+        normalized_assistant_text: str = "",
+        tagged_at: str | None = None,
+        compacted_at: str | None = None,
+        first_seen_at: str | None = None,
+        last_seen_at: str | None = None,
+        source_batch_id: str | None = None,
     ) -> None: ...
-    def get_full_text_rows(
+    def get_canonical_turn_rows(
         self,
         conversation_id: str,
         turn_numbers: list[int],
-    ) -> dict[int, FullTextRow]: ...
-    def get_all_full_text_rows(
+    ) -> dict[int, CanonicalTurnRow]: ...
+    def get_all_canonical_turns(
         self,
         conversation_id: str,
-    ) -> list[FullTextRow]: ...
-    def delete_full_text_rows(
+    ) -> list[CanonicalTurnRow]: ...
+    def get_uncompacted_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        protected_recent_turns: int = 0,
+    ) -> list[CanonicalTurnRow]: ...
+    def mark_canonical_turns_tagged(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        tagged_at: str | None = None,
+    ) -> int: ...
+    def mark_canonical_turns_compacted(
+        self,
+        conversation_id: str,
+        canonical_turn_ids: list[str],
+        *,
+        compacted_at: str | None = None,
+    ) -> int: ...
+    def delete_canonical_turns(
         self,
         conversation_id: str,
         turn_number: int | None = None,
@@ -162,7 +189,7 @@ class SearchStore(Protocol):
     """Full-text search and embedding storage."""
 
     def search_full_text(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list[QuoteResult]: ...
-    def search_canonical_full_text(
+    def search_canonical_turn_text(
         self,
         query: str,
         limit: int = 5,
@@ -170,21 +197,23 @@ class SearchStore(Protocol):
     ) -> list[QuoteResult]: ...
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None: ...
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]: ...
-    def store_full_text_chunk_embeddings(
+    def store_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int,
         side: str,
-        chunks: list[FullTextChunkEmbedding],
+        chunks: list[CanonicalTurnChunkEmbedding],
+        canonical_turn_id: str | None = None,
     ) -> None: ...
-    def get_all_full_text_chunk_embeddings(
+    def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
-    ) -> list[FullTextChunkEmbedding]: ...
-    def delete_full_text_chunk_embeddings(
+    ) -> list[CanonicalTurnChunkEmbedding]: ...
+    def delete_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
         turn_number: int | None = None,
+        canonical_turn_id: str | None = None,
     ) -> int: ...
     def store_tool_output(self, ref: str, conversation_id: str, tool_name: str, command: str, turn: int, content: str, original_bytes: int) -> None: ...
     def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list: ...

@@ -324,7 +324,7 @@ class TestEngineFindQuote:
         assert result["found"] is True
 
     def test_find_quote_cross_tag(self, tmp_path):
-        """find_quote searches canonical full_text instead of relying on segment tags."""
+        """find_quote searches canonical turn text instead of relying on segment tags."""
         engine = _make_engine(tmp_path)
         _persist_find_quote_turn(
             engine,
@@ -1389,7 +1389,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_default_queries_keep_original_session_order(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text="older result",
                 tag="status",
@@ -1409,7 +1409,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1533,7 +1533,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_exact_value_mode_prioritizes_explicit_value_hits(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "The pipeline targeted 96% detection across 3,000 query "
@@ -1560,7 +1560,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1591,7 +1591,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_exact_value_mode_prioritizes_clean_version_candidates(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "Assistant: For indexing over 1 million documents, Milvus "
@@ -1620,7 +1620,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1645,7 +1645,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_exact_value_mode_surfaces_shared_rate_candidates_for_quote_evidence(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm trying to implement a system that can handle "
@@ -1713,7 +1713,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1745,7 +1745,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_exact_value_mode_prefers_latest_user_version_self_report(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm evaluating Milvus 2.2.0 for indexing over "
@@ -1772,7 +1772,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1791,7 +1791,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_lookup_mode_adds_reader_hint_for_conflicting_user_self_state_quotes(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm setting up diagnostic logs to capture shard "
@@ -1825,7 +1825,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1846,7 +1846,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_lookup_mode_adds_soft_compare_hint_for_non_conflicting_quotes(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm working with Johnny on securing tuning logic "
@@ -1864,7 +1864,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1881,7 +1881,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_lookup_mode_reranks_raw_turns_by_distinct_query_phrase_coverage(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I've been getting some issues with vector lookups "
@@ -1945,7 +1945,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -1959,7 +1959,7 @@ class TestFindQuoteIntentAndRecency:
 
     def test_exact_value_mode_reserves_semantic_budget_when_lexical_is_full(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm evaluating Elasticsearch 8.9.0 for sparse "
@@ -1978,7 +1978,7 @@ class TestFindQuoteIntentAndRecency:
         ]
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = [
+        semantic.semantic_canonical_turn_search.return_value = [
             QuoteResult(
                 text=(
                     "User: I'm trying to optimize the performance of my "
@@ -2008,13 +2008,13 @@ class TestFindQuoteIntentAndRecency:
             mode="exact_value",
         )
 
-        semantic.semantic_full_text_search.assert_called_once()
+        semantic.semantic_canonical_turn_search.assert_called_once()
         assert out["chosen_exact_value_candidate"]["values"][0] == "2.3.1"
         assert "2.3.1" in out["results"][0]["excerpt"]
 
     def test_find_quote_uses_canonical_turn_context_without_segment_join(self):
         store = MagicMock()
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text="User: I'm setting up logs to catch IngestionParseError.",
                 tag="ingestion-error-handling",
@@ -2030,7 +2030,7 @@ class TestFindQuoteIntentAndRecency:
         store.get_all_segments.side_effect = AssertionError("segment join should not be used")
         store.get_all_tag_summaries.return_value = []
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = []
+        semantic.semantic_canonical_turn_search.return_value = []
 
         out = core_find_quote(
             store=store,
@@ -2101,7 +2101,7 @@ class TestFindQuoteIntentAndRecency:
         keyboard session (sim=0.26) suppressed shoe-storage sessions."""
         store = MagicMock()
         # FTS returns the topically relevant older sessions
-        store.search_canonical_full_text.return_value = [
+        store.search_canonical_turn_text.return_value = [
             QuoteResult(
                 text="I keep my old sneakers under my bed",
                 tag="sneaker-care",
@@ -2122,7 +2122,7 @@ class TestFindQuoteIntentAndRecency:
         store.get_all_tag_summaries.return_value = []
         # Semantic search returns a weak, unrelated match from a newer session
         semantic = MagicMock()
-        semantic.semantic_full_text_search.return_value = [
+        semantic.semantic_canonical_turn_search.return_value = [
             QuoteResult(
                 text="I got a new cherry-mx-brown keyboard",
                 tag="cherry-mx-brown",

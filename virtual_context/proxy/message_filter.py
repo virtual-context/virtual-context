@@ -152,20 +152,18 @@ def _chain_has_tool_activity(messages: list[dict], indices: tuple[int, ...] | ra
     Checks all supported provider formats:
     - OpenAI Chat: ``role: "tool"`` or ``tool_calls`` array on assistant
     - OpenAI Responses: bare items with ``type`` of ``function_call`` / ``function_call_output``
-    - Anthropic: content blocks with ``type`` of ``tool_use`` / ``tool_result``
     - Gemini: parts with ``functionCall`` or ``functionResponse``
+
+    Anthropic tool_use/tool_result content blocks are intentionally excluded
+    here. Those chains are filtered pair-by-pair and then repaired through the
+    explicit referential-integrity pass below; treating them as globally
+    drop-exempt breaks the expected tag-based filtering semantics.
     """
     for ci in indices:
         msg = messages[ci]
         if msg.get("role") == "tool" or msg.get("tool_calls"):
             return True
         if msg.get("type") in ("function_call", "function_call_output"):
-            return True
-        content = msg.get("content", [])
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
-            for b in content
-        ):
             return True
         # Gemini: functionCall/functionResponse in parts
         parts = msg.get("parts", [])
@@ -292,12 +290,9 @@ def filter_body_messages(
                 # Anthropic tool result (user message with tool_result-only content)
                 if next_role not in ("user", "human"):
                     break
-                if not _is_tool_result_only_user(next_msg):
-                    break  # real user message, not part of tool chain
-                if j + 1 >= len(chat_msgs) or chat_msgs[j + 1].get("role") != _asst_role:
-                    break  # tool_result without following assistant — stop
-                chain_indices.extend([j, j + 1])
-                j += 2
+                if _is_tool_result_only_user(next_msg):
+                    break
+                break  # real user message, not part of tool chain
             pairs.append(tuple(chain_indices))
             for ci in chain_indices:
                 paired_indices.add(ci)
@@ -313,7 +308,9 @@ def filter_body_messages(
 
     tag_set = set(matched_tags)
 
-    # Detect which chains contain tool activity — these are drop-exempt.
+    # Detect which chains contain provider-native tool rounds that must remain
+    # atomic at the filtering layer (Responses / OpenAI Chat / Gemini). Raw
+    # Anthropic tool_result pairs are handled by the referential-integrity pass.
     chain_has_tools = [False] * total_pairs
     for pair_idx, chain in enumerate(pairs):
         if _chain_has_tool_activity(chat_msgs, chain):
@@ -325,9 +322,6 @@ def filter_body_messages(
         if pair_idx >= total_pairs - protected:
             keep_pair[pair_idx] = True
         elif chain_has_tools[pair_idx]:
-            # Tool-bearing chains are drop-exempt — always kept regardless
-            # of tag match. Tool history is handled by position-based
-            # stubbing, not semantic filtering.
             keep_pair[pair_idx] = True
             logger.debug("T%d KEEP (tool activity: drop-exempt)", pair_idx)
         elif compacted_turn > 0 and pair_idx < compacted_turn:
@@ -682,6 +676,155 @@ def _extract_text_for_stub_hash(msg: dict) -> str:
                 text = part.get("text", "")
                 return _strip_envelope(text).strip()
     return ""
+
+
+def _build_compacted_stub_pair(
+    fmt: PayloadFormat,
+    canonical_turn: int,
+) -> list[dict]:
+    stub_text = (
+        f"[Compacted turn {canonical_turn} summarized in memory. "
+        "Use VC retrieval tools if you need the full details.]"
+    )
+    if fmt.name == "gemini":
+        return [
+            {"role": "user", "parts": [{"text": stub_text}]},
+            {"role": "model", "parts": [{"text": stub_text}]},
+        ]
+    if fmt.name == "openai_responses":
+        return [
+            {"role": "user", "content": stub_text},
+            {"role": "assistant", "content": [{"type": "output_text", "text": stub_text}]},
+        ]
+    return [
+        {"role": "user", "content": stub_text},
+        {"role": "assistant", "content": [{"type": "text", "text": stub_text}]},
+    ]
+
+
+def stub_compacted_messages(
+    body: dict,
+    turn_tag_index: TurnTagIndex,
+    compacted_through: int,
+    *,
+    fmt: PayloadFormat | None = None,
+) -> tuple[dict, int]:
+    """Collapse compacted hash-matching turns to simple user/assistant stubs.
+
+    This is kept as a compatibility helper for older paging/filter behavior and
+    tests. ``compacted_through`` uses the historical message-based watermark,
+    so every two compacted messages correspond to one compacted turn.
+    """
+    if compacted_through <= 0:
+        return body, 0
+
+    if fmt is None:
+        fmt = detect_format(body)
+
+    messages = fmt.get_messages(body)
+    if not messages:
+        return body, 0
+
+    compacted_turn_limit = max(compacted_through // 2, 0)
+    if compacted_turn_limit <= 0:
+        return body, 0
+
+    if fmt.name == "gemini":
+        assistant_role = "model"
+    else:
+        assistant_role = "assistant"
+
+    chains: list[tuple[int, ...]] = []
+    i = 0
+    while i + 1 < len(messages):
+        if messages[i].get("role") == "user" and messages[i + 1].get("role") == assistant_role:
+            chain_indices: list[int] = [i, i + 1]
+            j = i + 2
+            while j < len(messages) - 1:
+                next_msg = messages[j]
+                next_role = next_msg.get("role", "")
+                if next_role == "tool":
+                    tool_batch = [j]
+                    k = j + 1
+                    while k < len(messages) and messages[k].get("role") == "tool":
+                        tool_batch.append(k)
+                        k += 1
+                    if k < len(messages) and messages[k].get("role") == assistant_role:
+                        chain_indices.extend(tool_batch)
+                        chain_indices.append(k)
+                        j = k + 1
+                        continue
+                    break
+                responses_round = _consume_responses_tool_round(messages, j, assistant_role)
+                if responses_round:
+                    round_indices, next_index = responses_round
+                    chain_indices.extend(round_indices)
+                    j = next_index
+                    continue
+                if next_role in ("user", "human") and _is_tool_result_only_user(next_msg):
+                    if j + 1 < len(messages) and messages[j + 1].get("role") == assistant_role:
+                        chain_indices.extend([j, j + 1])
+                        j += 2
+                        continue
+                break
+            chains.append(tuple(chain_indices))
+            i = chain_indices[-1] + 1
+            continue
+        i += 1
+
+    replacement_by_start: dict[int, list[dict]] = {}
+    stub_count = 0
+
+    for turn_idx, chain in enumerate(chains):
+        if turn_idx >= compacted_turn_limit:
+            continue
+
+        user_text = ""
+        asst_text = ""
+        for gi in chain:
+            msg = messages[gi]
+            role = msg.get("role")
+            if role in ("user", "human") and not _is_tool_result_only_user(msg):
+                user_text = _extract_text_for_stub_hash(msg)
+            elif role in ("assistant", "model") and not asst_text:
+                asst_text = _extract_text_for_stub_hash(msg)
+
+        if not user_text:
+            continue
+
+        combined = f"{user_text} {asst_text}".strip()
+        message_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+        entry = turn_tag_index.get_entry_by_hash(message_hash)
+        if entry is None or entry.turn_number >= compacted_turn_limit:
+            continue
+
+        replacement_by_start[chain[0]] = _build_compacted_stub_pair(fmt, entry.turn_number)
+        stub_count += 1
+
+    if stub_count == 0:
+        return body, 0
+
+    new_messages: list[dict] = []
+    i = 0
+    while i < len(messages):
+        replacement = replacement_by_start.get(i)
+        if replacement is not None:
+            new_messages.extend(replacement)
+            chain = next((c for c in chains if c and c[0] == i), None)
+            if chain is not None:
+                i = chain[-1] + 1
+                continue
+        new_messages.append(messages[i])
+        i += 1
+
+    new_body = dict(body)
+    msg_key = "messages"
+    if fmt.name == "gemini":
+        msg_key = "contents"
+    elif fmt.name == "openai_responses":
+        msg_key = "input"
+    new_body[msg_key] = new_messages
+    return new_body, stub_count
 
 
 def drop_compacted_turns(
@@ -2669,9 +2812,28 @@ def enforce_payload_budget(
     """
     _MAX_TOTAL_REDUCTIONS = 200
     _MAX_RESCAN_ROUNDS = 8
-    estimate_tokens = token_estimator or fmt.estimate_payload_tokens
 
-    outbound_tokens = initial_tokens if initial_tokens is not None else estimate_tokens(body)
+    def _serialized_token_floor(payload: dict) -> int:
+        serialized = json.dumps(payload, default=str)
+        estimated = fmt.estimate_payload_tokens_from_serialized(payload, serialized)
+        counter = getattr(fmt, "_count", None)
+        if callable(counter):
+            try:
+                estimated = max(estimated, int(counter(serialized)))
+            except Exception:
+                pass
+        return estimated
+
+    base_estimator = token_estimator or fmt.estimate_payload_tokens
+
+    def estimate_tokens(payload: dict) -> int:
+        estimated = int(base_estimator(payload))
+        return max(estimated, _serialized_token_floor(payload))
+
+    outbound_tokens = estimate_tokens(body) if initial_tokens is None else max(
+        int(initial_tokens),
+        _serialized_token_floor(body),
+    )
     if outbound_tokens <= context_window:
         return body, 0, 0
 
@@ -2845,9 +3007,13 @@ def fill_pass(
 
     if turn_budget > 200:
         if client_truncated and store is not None:
-            # Store-backed: restore from turn_messages (unpruned suffix)
+            # Store-backed: restore from canonical persisted turns.
             import hashlib as _hl
-            store_turns = store.load_recent_turn_messages(conversation_id, limit=200)
+            store_rows = store.get_all_canonical_turns(conversation_id)
+            store_turns = [
+                (row.turn_number, row.user_content, row.assistant_content)
+                for row in store_rows[-200:]
+            ]
 
             # Build set of canonical turn numbers already in the payload
             # using hash lookup (same approach as collapse_turn_chains)

@@ -1301,7 +1301,19 @@ async def prepare_payload(
     _note_prep("merge_consecutive_messages", _merge_stage)
 
     _inject_stage = time.monotonic()
-    enriched_body = _inject_context(body, prepend_text, api_format)
+    if api_format == "anthropic" and prepend_text:
+        from ..core.provider_adapters import AnthropicAdapter
+
+        enriched_body = copy.deepcopy(body)
+        AnthropicAdapter(api_key="").inject_context(enriched_body, prepend_text)
+        if isinstance(enriched_body.get("system"), list):
+            enriched_body["system"] = "\n\n".join(
+                block.get("text", "")
+                for block in enriched_body["system"]
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+    else:
+        enriched_body = _inject_context(body, prepend_text, api_format)
     _note_prep("inject_context", _inject_stage)
 
     # Inject VC paging tools for autonomous mode (formats that support it)
@@ -1514,7 +1526,10 @@ async def prepare_payload(
     # PAYLOAD SANITY CHECK — fire alarms for anything abnormal
     # ------------------------------------------------------------------
     if state and outbound_tokens > 0:
-        _budget = state.engine.config.monitor.context_window
+        try:
+            _budget = int(state.engine.config.monitor.context_window)
+        except (TypeError, ValueError):
+            _budget = 0
         _sanity_msgs = enriched_body.get("messages", enriched_body.get("input", enriched_body.get("contents", [])))
         if isinstance(_sanity_msgs, list):
             _sys_t, _tools_t = _current_outbound_floor_components(enriched_body)
@@ -1522,7 +1537,7 @@ async def prepare_payload(
             _nv_pct = (_nv_floor / _budget * 100) if _budget else 0
 
             # 1. Total payload exceeds budget
-            if outbound_tokens > _budget:
+            if _budget and outbound_tokens > _budget:
                 logger.warning(
                     "SANITY_OVER_BUDGET: outbound=%dt exceeds budget=%dt (%.0f%%)",
                     outbound_tokens, _budget, outbound_tokens / _budget * 100,
@@ -1599,9 +1614,13 @@ async def prepare_payload(
     # PAYLOAD BUDGET ENFORCEMENT — hard cap on VC context window
     # ------------------------------------------------------------------
     _budget_enforce_stage = time.monotonic()
-    if state and outbound_tokens > state.engine.config.monitor.context_window:
+    try:
+        _context_window_limit = int(state.engine.config.monitor.context_window) if state else 0
+    except (TypeError, ValueError):
+        _context_window_limit = 0
+    if state and _context_window_limit and outbound_tokens > _context_window_limit:
         from .message_filter import enforce_payload_budget
-        _budget_window = state.engine.config.monitor.context_window
+        _budget_window = _context_window_limit
         def _budget_token_estimator(payload: dict) -> int:
             return _estimate_payload_tokens_cached(payload, cache_scope="outbound")
         enriched_body, _budget_reductions, _budget_freed = enforce_payload_budget(
@@ -1706,7 +1725,11 @@ async def prepare_payload(
     # treat as passthrough — all downstream metrics/capture will record
     # the passthrough values.
     _bloat_stage = time.monotonic()
-    if outbound_tokens > inbound_tokens:
+    _proxy_cfg = getattr(getattr(getattr(state, "engine", None), "config", None), "proxy", None)
+    _enforce_client_payload_ceiling = (
+        getattr(_proxy_cfg, "enforce_client_payload_ceiling", False) is True
+    )
+    if _enforce_client_payload_ceiling and outbound_tokens > inbound_tokens:
         logger.warning(
             "VC_BLOAT_FALLBACK: enriched %dt > inbound %dt — reverting to passthrough (delta +%dt)",
             outbound_tokens, inbound_tokens, outbound_tokens - inbound_tokens,

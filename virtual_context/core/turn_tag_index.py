@@ -17,6 +17,7 @@ class TurnTagIndex:
     def __init__(self) -> None:
         self.entries: list[TurnTagEntry] = []
         self._by_turn: dict[int, TurnTagEntry] = {}
+        self._by_canonical_turn: dict[str, TurnTagEntry] = {}
         self._by_hash: dict[str, TurnTagEntry] = {}
         self._all_tags: set[str] = set()
 
@@ -30,8 +31,19 @@ class TurnTagIndex:
                 entry.tags,
             )
             return  # silently reject duplicate turn_number
+        if entry.canonical_turn_id and entry.canonical_turn_id in self._by_canonical_turn:
+            import logging
+            logging.getLogger(__name__).warning(
+                "OVERWRITE_BLOCKED canonical_turn_id=%s existing_tags=%s new_tags=%s — keeping original",
+                entry.canonical_turn_id,
+                self._by_canonical_turn[entry.canonical_turn_id].tags,
+                entry.tags,
+            )
+            return
         self.entries.append(entry)
         self._by_turn[entry.turn_number] = entry
+        if entry.canonical_turn_id:
+            self._by_canonical_turn[entry.canonical_turn_id] = entry
         if entry.message_hash:
             self._by_hash[entry.message_hash] = entry
         self._all_tags.update(entry.tags)
@@ -46,6 +58,9 @@ class TurnTagIndex:
 
     def get_tags_for_turn(self, turn_number: int) -> TurnTagEntry | None:
         return self._by_turn.get(turn_number)
+
+    def get_tags_for_canonical_turn(self, canonical_turn_id: str) -> TurnTagEntry | None:
+        return self._by_canonical_turn.get(canonical_turn_id)
 
     def get_entry_by_hash(self, message_hash: str) -> TurnTagEntry | None:
         return self._by_hash.get(message_hash)

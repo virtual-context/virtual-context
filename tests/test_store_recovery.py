@@ -1,6 +1,8 @@
 """Tests for store-backed pipeline recovery."""
 
 import hashlib
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from virtual_context.types import MonitorConfig
 
@@ -54,7 +56,6 @@ def test_get_tool_names_for_refs_abstract():
 
 
 def test_collapse_turn_chains_recovers_from_store():
-    from unittest.mock import MagicMock
     from virtual_context.proxy.message_filter import collapse_turn_chains
     from virtual_context.proxy.formats import detect_format
     from virtual_context.core.turn_tag_index import TurnTagIndex, TurnTagEntry
@@ -311,9 +312,9 @@ def test_fill_pass_restores_from_store_on_truncation():
 
     mock_store = MagicMock()
     mock_store.get_all_tag_summaries.return_value = []
-    mock_store.load_recent_turn_messages.return_value = [
-        (10, "older question about cooking", "I explained Italian techniques"),
-        (11, "what about baking?", "Bread baking involves..."),
+    mock_store.get_all_canonical_turns.return_value = [
+        SimpleNamespace(turn_number=10, user_content="older question about cooking", assistant_content="I explained Italian techniques"),
+        SimpleNamespace(turn_number=11, user_content="what about baking?", assistant_content="Bread baking involves..."),
     ]
     mock_store.get_tool_outputs_for_turn.return_value = []
 
@@ -338,7 +339,7 @@ def test_fill_pass_restores_from_store_on_truncation():
         turn_tag_index=tti,
     )
 
-    mock_store.load_recent_turn_messages.assert_called_once()
+    mock_store.get_all_canonical_turns.assert_called_once_with("test-conv")
     assert turns >= 1
 
 
@@ -359,9 +360,9 @@ def test_fill_pass_skips_tool_turns_from_store():
 
     mock_store = MagicMock()
     mock_store.get_all_tag_summaries.return_value = []
-    mock_store.load_recent_turn_messages.return_value = [
-        (10, "run the tests", "Here are the results"),
-        (11, "what about baking?", "Bread baking involves..."),
+    mock_store.get_all_canonical_turns.return_value = [
+        SimpleNamespace(turn_number=10, user_content="run the tests", assistant_content="Here are the results"),
+        SimpleNamespace(turn_number=11, user_content="what about baking?", assistant_content="Bread baking involves..."),
     ]
     mock_store.get_tool_outputs_for_turn.side_effect = lambda cid, tn: ["ref1"] if tn == 10 else []
 

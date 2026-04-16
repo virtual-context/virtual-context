@@ -29,23 +29,21 @@ def store(tmp_path):
     s.close()
 
 
-def test_save_and_get_turn_message_with_raw_content(store):
+def test_save_and_get_canonical_turn_with_raw_content(store):
     user_raw = json.dumps([{"type": "text", "text": "hello"}])
     asst_raw = json.dumps([
         {"type": "text", "text": "Hi!"},
         {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}},
     ])
-    store.save_turn_message(
+    store.save_canonical_turn(
         "conv-1", 0, "hello", "Hi!",
         user_raw_content=user_raw, assistant_raw_content=asst_raw,
     )
-    result = store.get_turn_messages("conv-1", [0])
-    assert 0 in result
-    user_content, asst_content, user_rc, asst_rc = result[0]
-    assert user_content == "hello"
-    assert asst_content == "Hi!"
-    assert json.loads(user_rc) == [{"type": "text", "text": "hello"}]
-    assert json.loads(asst_rc)[1]["name"] == "bash"
+    row = store.get_canonical_turn_rows("conv-1", [0])[0]
+    assert row.user_content == "hello"
+    assert row.assistant_content == "Hi!"
+    assert json.loads(row.user_raw_content) == [{"type": "text", "text": "hello"}]
+    assert json.loads(row.assistant_raw_content)[1]["name"] == "bash"
 
 
 def test_extract_user_raw_content_anthropic():
@@ -94,14 +92,13 @@ def test_extract_assistant_raw_content_anthropic():
     assert raw[1]["name"] == "bash"
 
 
-def test_save_turn_message_without_raw_content(store):
-    store.save_turn_message("conv-1", 0, "hello", "Hi!")
-    result = store.get_turn_messages("conv-1", [0])
-    user_content, asst_content, user_rc, asst_rc = result[0]
-    assert user_content == "hello"
-    assert asst_content == "Hi!"
-    assert user_rc is None
-    assert asst_rc is None
+def test_save_canonical_turn_without_raw_content(store):
+    store.save_canonical_turn("conv-1", 0, "hello", "Hi!")
+    row = store.get_canonical_turn_rows("conv-1", [0])[0]
+    assert row.user_content == "hello"
+    assert row.assistant_content == "Hi!"
+    assert row.user_raw_content is None
+    assert row.assistant_raw_content is None
 
 
 # ---------------------------------------------------------------------------

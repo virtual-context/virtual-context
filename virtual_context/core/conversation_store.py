@@ -21,11 +21,10 @@ class ConversationStoreView:
         "save_request_capture",
         "save_tag_summary",
         "save_tool_call",
-        "save_full_text",
-        "save_turn_message",
-        "delete_full_text_rows",
-        "store_full_text_chunk_embeddings",
-        "delete_full_text_chunk_embeddings",
+        "save_canonical_turn",
+        "delete_canonical_turns",
+        "store_canonical_turn_chunk_embeddings",
+        "delete_canonical_turn_chunk_embeddings",
         "save_request_context",
         "set_fact_superseded",
         "set_tag_alias",
@@ -39,7 +38,6 @@ class ConversationStoreView:
         "store_tool_output",
         "update_fact_fields",
         "update_segment",
-        "prune_turn_messages",
     }
 
     def __init__(self, store: Any, conversation_id: str, generation: int) -> None:
@@ -109,3 +107,9 @@ class ConversationStoreView:
             object.__setattr__(self, name, value)
             return
         setattr(self._store, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in {"_store", "_conversation_id", "_generation"}:
+            object.__delattr__(self, name)
+            return
+        delattr(self._store, name)

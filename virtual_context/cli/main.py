@@ -1157,9 +1157,8 @@ def _install_windows_task_daemon(config_path: Path, upstream: str | None, start:
 
 
 def cmd_onboard(args):
-    vc_home = Path.home() / ".virtual-context"
-    vc_home.mkdir(parents=True, exist_ok=True)
-    config_path = Path(args.config) if args.config else vc_home / "virtual-context.yaml"
+    config_path = Path(args.config) if args.config else (Path.cwd() / "virtual-context.yaml")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not config_path.exists():
         preset = get_preset(args.preset)

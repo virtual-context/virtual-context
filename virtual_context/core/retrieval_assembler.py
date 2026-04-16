@@ -420,7 +420,10 @@ class RetrievalAssembler:
             getattr(self.config, "assembler", None),
             "pre_compaction_filtering", "aggressive",
         )
-        watermark = self._engine_state.flushed_through
+        watermark = max(
+            int(getattr(self._engine_state, "flushed_through", 0) or 0),
+            int(getattr(self._engine_state, "compacted_through", 0) or 0),
+        )
         pre_compaction = watermark == 0
 
         # Determine protection window
@@ -527,7 +530,7 @@ class RetrievalAssembler:
         """
         if not self.config.assembler.context_hint_enabled:
             return ""
-        if self._engine_state.flushed_through == 0:
+        if int(getattr(self._engine_state, "compacted_through", 0) or 0) == 0:
             return ""
 
         # Determine paging mode

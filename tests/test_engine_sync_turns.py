@@ -2,6 +2,8 @@
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+from contextlib import contextmanager
+
 import pytest
 from virtual_context.proxy.formats import detect_format
 
@@ -67,15 +69,15 @@ def engine(tmp_path):
 
 
 def _search_via_store(engine, query):
-    """Search canonical full_text through the CompositeStore delegate.
+    """Search canonical turn text through the CompositeStore delegate.
 
-    Validates that the CompositeStore.search_canonical_full_text delegation works,
+    Validates that the CompositeStore.search_canonical_turn_text delegation works,
     not just the raw concrete store method.
     """
     store = engine._store
-    _search = getattr(store, "search_canonical_full_text", None)
+    _search = getattr(store, "search_canonical_turn_text", None)
     assert _search is not None, (
-        "search_canonical_full_text not reachable through store chain — "
+        "search_canonical_turn_text not reachable through store chain — "
         "CompositeStore delegation missing")
     return _search(query, conversation_id="test-conv-sync")
 
@@ -193,3 +195,95 @@ def test_sync_single_turn(engine):
     fmt = detect_format(body)
     synced = engine.sync_turns_from_payload(body, fmt)
     assert synced == 1
+
+
+def test_sync_prefix_widening_prepends_older_turns(engine):
+    initial = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Turn 2 user"},
+            {"role": "assistant", "content": "Turn 2 assistant"},
+            {"role": "user", "content": "Turn 3 user"},
+            {"role": "assistant", "content": "Turn 3 assistant"},
+        ],
+    }
+    widened = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Turn 1 user"},
+            {"role": "assistant", "content": "Turn 1 assistant"},
+            {"role": "user", "content": "Turn 2 user"},
+            {"role": "assistant", "content": "Turn 2 assistant"},
+            {"role": "user", "content": "Turn 3 user"},
+            {"role": "assistant", "content": "Turn 3 assistant"},
+        ],
+    }
+
+    assert engine.sync_turns_from_payload(initial, detect_format(initial)) == 2
+    assert engine.sync_turns_from_payload(widened, detect_format(widened)) == 1
+
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert [row.user_content for row in rows] == [
+        "Turn 1 user",
+        "Turn 2 user",
+        "Turn 3 user",
+    ]
+
+
+def test_sync_no_overlap_append_preserves_existing_rows(engine):
+    first_window = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Alpha user"},
+            {"role": "assistant", "content": "Alpha assistant"},
+            {"role": "user", "content": "Beta user"},
+            {"role": "assistant", "content": "Beta assistant"},
+        ],
+    }
+    second_window = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Gamma user"},
+            {"role": "assistant", "content": "Gamma assistant"},
+            {"role": "user", "content": "Delta user"},
+            {"role": "assistant", "content": "Delta assistant"},
+        ],
+    }
+
+    assert engine.sync_turns_from_payload(first_window, detect_format(first_window)) == 2
+    assert engine.sync_turns_from_payload(second_window, detect_format(second_window)) == 2
+
+    rows = engine._store.get_all_canonical_turns("test-conv-sync")
+    assert [row.user_content for row in rows] == [
+        "Alpha user",
+        "Beta user",
+        "Gamma user",
+        "Delta user",
+    ]
+
+
+def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Lock me"},
+            {"role": "assistant", "content": "Locked"},
+        ],
+    }
+    calls: list[tuple[str, str]] = []
+
+    @contextmanager
+    def _lock(conversation_id: str):
+        calls.append(("enter", conversation_id))
+        try:
+            yield
+        finally:
+            calls.append(("exit", conversation_id))
+
+    monkeypatch.setattr(engine._store, "conversation_reconcile", _lock)
+
+    assert engine.sync_turns_from_payload(body, detect_format(body)) == 1
+    assert calls == [
+        ("enter", "test-conv-sync"),
+        ("exit", "test-conv-sync"),
+    ]

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ..types import ChunkEmbedding, FactSignal, FullTextChunkEmbedding, QuoteResult, StoredSegment, VirtualContextConfig
+from ..types import ChunkEmbedding, FactSignal, CanonicalTurnChunkEmbedding, QuoteResult, StoredSegment, VirtualContextConfig
 from .math_utils import cosine_similarity
 from .store import ContextStore
 
@@ -174,6 +174,7 @@ class SemanticSearchManager:
         self,
         conversation_id: str,
         turn_number: int,
+        canonical_turn_id: str | None = None,
         *,
         user_text: str = "",
         assistant_text: str = "",
@@ -184,9 +185,10 @@ class SemanticSearchManager:
         if embed_fn is None:
             return
 
-        self._store.delete_full_text_chunk_embeddings(
+        self._store.delete_canonical_turn_chunk_embeddings(
             conversation_id,
             turn_number=turn_number,
+            canonical_turn_id=canonical_turn_id,
         )
 
         sides = [
@@ -209,8 +211,9 @@ class SemanticSearchManager:
                 )
                 continue
             chunk_embeddings = [
-                FullTextChunkEmbedding(
+                CanonicalTurnChunkEmbedding(
                     conversation_id=conversation_id,
+                    canonical_turn_id=canonical_turn_id or "",
                     turn_number=turn_number,
                     side=side,
                     chunk_index=i,
@@ -219,28 +222,29 @@ class SemanticSearchManager:
                 )
                 for i, (chunk_text, vec) in enumerate(zip(chunks, vectors))
             ]
-            self._store.store_full_text_chunk_embeddings(
+            self._store.store_canonical_turn_chunk_embeddings(
                 conversation_id,
                 turn_number,
                 side,
                 chunk_embeddings,
+                canonical_turn_id=canonical_turn_id,
             )
 
-    def semantic_full_text_search(
+    def semantic_canonical_turn_search(
         self,
         query: str,
         *,
         max_results: int = 5,
         conversation_id: str | None = None,
     ) -> list[QuoteResult]:
+        """Run semantic retrieval over canonical turn chunks."""
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
 
-        get_full_text_chunks = getattr(self._store, "get_all_full_text_chunk_embeddings", None)
-        if not callable(get_full_text_chunks):
-            return []
-        all_chunks = get_full_text_chunks(conversation_id=conversation_id)
+        all_chunks = self._store.get_all_canonical_turn_chunk_embeddings(
+            conversation_id=conversation_id,
+        )
         if not all_chunks:
             return []
 
@@ -250,7 +254,7 @@ class SemanticSearchManager:
             logger.debug("Failed to embed query for semantic turn search")
             return []
 
-        scored: list[tuple[float, FullTextChunkEmbedding]] = []
+        scored: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
         for chunk in all_chunks:
             sim = cosine_similarity(query_vec, chunk.embedding)
             if sim >= 0.25:
@@ -264,7 +268,7 @@ class SemanticSearchManager:
             if identity in seen_turn_sides:
                 continue
             seen_turn_sides.add(identity)
-            row = self._store.get_full_text_rows(
+            row = self._store.get_canonical_turn_rows(
                 conversation_id or "",
                 [chunk.turn_number],
             ).get(chunk.turn_number)
@@ -453,6 +457,8 @@ def persist_turn_with_embeddings(
     *,
     conversation_id: str,
     turn_number: int,
+    canonical_turn_id: str | None = None,
+    sort_key: float | None = None,
     user_content: str,
     assistant_content: str,
     user_raw_content: str | None = None,
@@ -464,20 +470,13 @@ def persist_turn_with_embeddings(
     fact_signals: list[FactSignal] | None = None,
     code_refs: list[dict] | None = None,
 ) -> None:
-    """Persist a turn pair to the operational buffer and canonical archive."""
-    store.save_turn_message(
-        conversation_id,
-        turn_number,
-        user_content,
-        assistant_content,
-        user_raw_content=user_raw_content,
-        assistant_raw_content=assistant_raw_content,
-    )
-    store.save_full_text(
-        conversation_id,
-        turn_number,
-        user_content,
-        assistant_content,
+    """Persist a turn pair into the canonical turn ledger and embeddings store."""
+    from .ingest_reconciler import IngestReconciler
+
+    IngestReconciler(store, semantic).ingest_single(
+        conversation_id=conversation_id,
+        user_content=user_content,
+        assistant_content=assistant_content,
         user_raw_content=user_raw_content,
         assistant_raw_content=assistant_raw_content,
         primary_tag=primary_tag,
@@ -486,12 +485,4 @@ def persist_turn_with_embeddings(
         sender=sender,
         fact_signals=fact_signals,
         code_refs=code_refs,
-    )
-    semantic.embed_and_store_turn(
-        conversation_id,
-        turn_number,
-        user_text=user_content,
-        assistant_text=assistant_content,
-        user_raw_content=user_raw_content,
-        assistant_raw_content=assistant_raw_content,
     )
