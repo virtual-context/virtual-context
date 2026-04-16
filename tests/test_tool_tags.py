@@ -11,7 +11,7 @@ from virtual_context.core.turn_tag_index import TurnTagIndex
 def test_engine_state_snapshot_has_tool_tag_counter():
     snap = EngineStateSnapshot(
         conversation_id="test",
-        compacted_through=0,
+        compacted_prefix_messages=0,
         turn_tag_entries=[],
         turn_count=0,
         tool_tag_counter=5,
@@ -22,7 +22,7 @@ def test_engine_state_snapshot_has_tool_tag_counter():
 def test_engine_state_snapshot_tool_tag_counter_default():
     snap = EngineStateSnapshot(
         conversation_id="test",
-        compacted_through=0,
+        compacted_prefix_messages=0,
         turn_tag_entries=[],
         turn_count=0,
     )
@@ -146,7 +146,7 @@ def test_tool_tag_counter_persists_in_snapshot():
     """tool_tag_counter round-trips through EngineStateSnapshot."""
     snap = EngineStateSnapshot(
         conversation_id="test",
-        compacted_through=0,
+        compacted_prefix_messages=0,
         turn_tag_entries=[],
         turn_count=0,
         tool_tag_counter=7,
@@ -156,7 +156,7 @@ def test_tool_tag_counter_persists_in_snapshot():
     # Simulate save/restore
     snap_dict = {
         "conversation_id": snap.conversation_id,
-        "compacted_through": snap.compacted_through,
+        "compacted_prefix_messages": snap.compacted_prefix_messages,
         "turn_tag_entries": snap.turn_tag_entries,
         "turn_count": snap.turn_count,
         "tool_tag_counter": snap.tool_tag_counter,

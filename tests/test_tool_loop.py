@@ -1999,7 +1999,7 @@ class TestToolLoopInjectsReassembledContext:
 class TestToolQueryRunnerAnthropicCaching:
     def test_initial_request_preserves_stable_system_prefix(self):
         engine = MagicMock()
-        engine._engine_state.flushed_through = 0
+        engine._engine_state.flushed_prefix_messages = 0
 
         config = MagicMock()
         config.paging.enabled = False

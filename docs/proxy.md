@@ -299,7 +299,7 @@ The dashboard connects to `GET /dashboard/events` for real-time updates. The str
 | `request` | New request intercepted | `turn`, `tags`, `broad`, `temporal`, `context_tokens`, `input_tokens`, `system_tokens`, `wait_ms`, `inbound_ms` |
 | `response` | Upstream response complete | `turn`, `upstream_ms`, `total_ms`, `streaming`, `error` |
 | `turn_complete` | Background tagging done | `turn`, `tags`, `primary_tag`, `active_tags`, `store_tag_count`, `turn_pair_tokens`, `complete_ms` |
-| `compaction` | Compaction event | `turn`, `segments`, `tokens_freed`, `original_tokens`, `summary_tokens`, `tags`, `compacted_through` |
+| `compaction` | Compaction event | `turn`, `segments`, `tokens_freed`, `original_tokens`, `summary_tokens`, `tags`, `compacted_prefix_messages` |
 | `history_ingestion` | History bootstrap done | `turns_ingested`, `pairs_received`, `elapsed_ms`, `session_id` |
 | `ingested_turn` | Per-turn from ingestion | `turn`, `tags`, `primary_tag`, `message_preview` |
 | `replay_progress` | Replay turn done | `turn`, `total`, `prompt_preview`, `elapsed_ms` |

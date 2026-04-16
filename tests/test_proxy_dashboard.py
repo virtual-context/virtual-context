@@ -227,7 +227,7 @@ def mock_engine():
     engine.compact_if_needed.return_value = None
     engine._turn_tag_index = MagicMock()
     engine._turn_tag_index.get_active_tags.return_value = {"auth", "api"}
-    engine._turn_tag_index.get_tags_for_turn.return_value = None
+    engine._turn_tag_index.get_tags_for_logical_turn.return_value = None
     engine._store = MagicMock()
     engine._store.get_all_tags.return_value = []
     from virtual_context.types import EngineState
@@ -365,7 +365,7 @@ class TestMetricsIntegration:
         entry = MagicMock()
         entry.tags = ["auth", "jwt"]
         entry.primary_tag = "auth"
-        engine._turn_tag_index.get_tags_for_turn.side_effect = lambda turn: entry if engine._turn_tag_index.entries else None
+        engine._turn_tag_index.get_tags_for_logical_turn.side_effect = lambda turn: entry if engine._turn_tag_index.entries else None
         engine._turn_tag_index.get_active_tags.return_value = {"auth", "jwt"}
         engine._store.get_all_tags.return_value = []
 
@@ -415,9 +415,9 @@ class TestMetricsIntegration:
         )
         engine.tag_turn.return_value = signal
         engine.compact_if_needed.return_value = report
-        engine._engine_state.compacted_through = 20
+        engine._engine_state.compacted_prefix_messages = 20
         engine._turn_tag_index = MagicMock()
-        engine._turn_tag_index.get_tags_for_turn.return_value = None
+        engine._turn_tag_index.get_tags_for_logical_turn.return_value = None
 
         metrics = ProxyMetrics()
         state = ProxyState(engine, metrics=metrics)
@@ -441,7 +441,7 @@ class TestMetricsIntegration:
         assert compaction["summary_tokens"] == 2000
         assert compaction["tags"] == ["auth", "db"]
         assert compaction["tag_summaries_built"] == 2
-        assert compaction["compacted_through"] == 20
+        assert compaction["compacted_prefix_messages"] == 20
 
     def test_proxy_state_no_metrics(self):
         """ProxyState works without metrics (backwards compat)."""
@@ -933,7 +933,7 @@ class TestDashboardCompact:
             tag_summaries_built=1,
         )
         engine.compact_manual = MagicMock(return_value=report)
-        engine._engine_state.compacted_through = 10
+        engine._engine_state.compacted_prefix_messages = 10
 
         resp = client.post("/dashboard/compact")
         assert resp.status_code == 200

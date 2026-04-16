@@ -303,8 +303,8 @@ class TurnTagEntry:
 @dataclass
 class EngineState:
     """Mutable shared state passed to engine delegates."""
-    compacted_through: int = 0
-    flushed_through: int = 0
+    compacted_prefix_messages: int = 0
+    flushed_prefix_messages: int = 0
     last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
@@ -324,7 +324,7 @@ class EngineState:
 
         When *total_turns_indexed* is provided (the total number of entries in
         the turn-tag index), the method can distinguish between two cases where
-        ``compacted_through >= history_len``:
+        ``compacted_prefix_messages >= history_len``:
 
         1. **Session restart** — history was rebuilt from scratch; everything
            in the current history is genuinely new.  Return 0.
@@ -334,18 +334,18 @@ class EngineState:
            re-processing.
 
         Without *total_turns_indexed*, the safe default is to treat rebuilt
-        history as fresh and return 0 whenever ``compacted_through >= history_len``.
+        history as fresh and return 0 whenever ``compacted_prefix_messages >= history_len``.
 
-        When *watermark* is provided, it overrides ``self.compacted_through``
-        as the boundary.  This lets callers pass ``flushed_through`` for
+        When *watermark* is provided, it overrides ``self.compacted_prefix_messages``
+        as the boundary.  This lets callers pass ``flushed_prefix_messages`` for
         payload assembly while compaction/tagging callers keep using
-        ``compacted_through`` implicitly.
+        ``compacted_prefix_messages`` implicitly.
         """
-        ct = watermark if watermark is not None else self.compacted_through
+        ct = watermark if watermark is not None else self.compacted_prefix_messages
         if ct < history_len:
             return ct
 
-        # compacted_through >= history_len
+        # compacted_prefix_messages >= history_len
         if total_turns_indexed is None:
             # No index coverage information — assume restart / fresh history.
             return 0
@@ -372,11 +372,11 @@ class EngineState:
 class EngineStateSnapshot:
     """Serializable snapshot of engine state for persistence across restarts."""
     conversation_id: str
-    compacted_through: int
+    compacted_prefix_messages: int
     turn_tag_entries: list[TurnTagEntry]
     turn_count: int  # len(conversation_history) // 2
-    flushed_through: int = 0
-    flushed_through_present: bool = True
+    flushed_prefix_messages: int = 0
+    flushed_prefix_messages_present: bool = True
     last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
@@ -567,10 +567,11 @@ class ChunkEmbedding:
 
 @dataclass
 class CanonicalTurnRow:
-    """Canonical archived user/assistant turn text."""
+    """Canonical archived transcript entry with explicit turn-group metadata."""
     conversation_id: str
     canonical_turn_id: str = ""
     turn_number: int = -1
+    turn_group_number: int = -1
     sort_key: float = 0.0
     turn_hash: str = ""
     hash_version: int = 0

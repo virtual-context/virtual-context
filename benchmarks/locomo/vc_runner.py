@@ -309,7 +309,7 @@ def _clear_compaction_state(cache_dir: str, conv_id: str) -> None:
             conn.execute(f"DELETE FROM {tbl}")
         except sqlite3.OperationalError:
             pass
-    conn.execute("UPDATE engine_state SET compacted_through = 0")
+    conn.execute("UPDATE engine_state SET compacted_prefix_messages = 0")
     conn.commit()
     conn.close()
     logger.info("VC [%s]: cleared compaction state, kept TurnTagIndex", conv_id)
@@ -443,15 +443,15 @@ def ingest_conversation(
     n_pairs = len(messages) // 2
 
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_through > 0
+    fully_cached = engine._engine_state.compacted_prefix_messages > 0
     tags_only = not fully_cached and n_index_entries > 0
 
     stats: dict = {"conv_id": conv.conv_id, "turns_ingested": 0, "compaction_events": 0}
 
     if fully_cached:
         logger.info(
-            "VC [%s]: CACHE HIT — %d turns indexed, compacted_through=%d",
-            conv.conv_id, n_index_entries, engine._engine_state.compacted_through,
+            "VC [%s]: CACHE HIT — %d turns indexed, compacted_prefix_messages=%d",
+            conv.conv_id, n_index_entries, engine._engine_state.compacted_prefix_messages,
         )
         stats["turns_ingested"] = n_index_entries
         stats["compaction_events"] = -1
@@ -575,7 +575,7 @@ def query_question(
     tokens_injected = assembled.total_tokens if assembled else 0
 
     # Determine if compacted
-    compacted = engine._engine_state.compacted_through > 0 and assembled and assembled.prepend_text
+    compacted = engine._engine_state.compacted_prefix_messages > 0 and assembled and assembled.prepend_text
 
     # Build prompt
     if compacted:
@@ -651,7 +651,7 @@ def query_question(
         reader_input=reader_input,
         reader_output=reader_output,
         timings=timings,
-        cached=engine._engine_state.compacted_through > 0,
+        cached=engine._engine_state.compacted_prefix_messages > 0,
     )
 
     return {
@@ -664,5 +664,5 @@ def query_question(
         "continuation_count": loop_result.continuation_count,
         "stop_reason": loop_result.stop_reason or "",
         "timings": timings,
-        "cached": engine._engine_state.compacted_through > 0,
+        "cached": engine._engine_state.compacted_prefix_messages > 0,
     }

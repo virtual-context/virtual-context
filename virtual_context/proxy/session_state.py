@@ -25,9 +25,9 @@ _MAX_VERSION = 2**53  # tombstone version — higher than any real save
 @dataclass
 class SessionState:
     """Serializable conversation checkpoint — what goes in Redis."""
-    compacted_through: int = 0
-    flushed_through: int = 0
-    flushed_through_present: bool = True
+    compacted_prefix_messages: int = 0
+    flushed_prefix_messages: int = 0
+    flushed_prefix_messages_present: bool = True
     last_request_time: float = 0.0
     last_compacted_turn: int = -1
     last_completed_turn: int = -1
@@ -59,8 +59,8 @@ class SessionState:
 
     def to_json(self) -> bytes:
         d = {
-            "compacted_through": self.compacted_through,
-            "flushed_through": self.flushed_through,
+            "compacted_prefix_messages": self.compacted_prefix_messages,
+            "flushed_prefix_messages": self.flushed_prefix_messages,
             "last_request_time": self.last_request_time,
             "last_compacted_turn": self.last_compacted_turn,
             "last_completed_turn": self.last_completed_turn,
@@ -96,9 +96,9 @@ class SessionState:
     def from_json(cls, data: bytes) -> SessionState:
         d = json.loads(data)
         return cls(
-            compacted_through=d.get("compacted_through", 0),
-            flushed_through=d.get("flushed_through", 0),
-            flushed_through_present=("flushed_through" in d),
+            compacted_prefix_messages=d.get("compacted_prefix_messages", 0),
+            flushed_prefix_messages=d.get("flushed_prefix_messages", 0),
+            flushed_prefix_messages_present=("flushed_prefix_messages" in d),
             last_request_time=d.get("last_request_time", 0.0),
             last_compacted_turn=d.get("last_compacted_turn", -1),
             last_completed_turn=d.get("last_completed_turn", -1),
@@ -854,9 +854,9 @@ class SessionStateProvider:
 
         return EngineStateSnapshot(
             conversation_id=conversation_id,
-            compacted_through=state.compacted_through,
-            flushed_through=state.flushed_through,
-            flushed_through_present=state.flushed_through_present,
+            compacted_prefix_messages=state.compacted_prefix_messages,
+            flushed_prefix_messages=state.flushed_prefix_messages,
+            flushed_prefix_messages_present=state.flushed_prefix_messages_present,
             last_request_time=state.last_request_time,
             turn_tag_entries=entries,
             turn_count=len(entries),
@@ -907,9 +907,9 @@ class SessionStateProvider:
             })
 
         return SessionState(
-            compacted_through=snapshot.compacted_through,
-            flushed_through=getattr(snapshot, 'flushed_through', 0),
-            flushed_through_present=getattr(snapshot, 'flushed_through_present', True),
+            compacted_prefix_messages=snapshot.compacted_prefix_messages,
+            flushed_prefix_messages=getattr(snapshot, 'flushed_prefix_messages', 0),
+            flushed_prefix_messages_present=getattr(snapshot, 'flushed_prefix_messages_present', True),
             last_request_time=getattr(snapshot, 'last_request_time', 0.0),
             last_compacted_turn=snapshot.last_compacted_turn,
             last_completed_turn=snapshot.last_completed_turn,
