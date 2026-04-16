@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1210,9 +1211,19 @@ class TestSessionStateMachine:
         ))
         state.engine._engine_state.last_indexed_turn = 0
         state.engine._engine_state.last_completed_turn = 2
-        state.engine._store.get_turn_messages.return_value = {
-            1: ("Q1", "A1", None, None),
-            2: ("Q2", "A2", None, None),
+        state.engine._store.get_canonical_turn_rows.return_value = {
+            1: SimpleNamespace(
+                user_content="Q1",
+                assistant_content="A1",
+                user_raw_content=None,
+                assistant_raw_content=None,
+            ),
+            2: SimpleNamespace(
+                user_content="Q2",
+                assistant_content="A2",
+                user_raw_content=None,
+                assistant_raw_content=None,
+            ),
         }
 
         def ingest_gap(pairs, progress_callback=None, turn_offset=0):

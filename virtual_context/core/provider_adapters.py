@@ -300,10 +300,18 @@ class AnthropicAdapter(ProviderAdapter):
         if isinstance(system, str):
             cleaned = _VC_BLOCK_RE.sub("", system, count=1).strip()
             if cleaned:
-                blocks = [{"type": "text", "text": cleaned}]
-                _mark_last_stable_block(blocks)
-                blocks.append({"type": "text", "text": new_text})
-                body["system"] = blocks
+                should_materialize_blocks = bool(
+                    body.get("model")
+                    or body.get("max_tokens")
+                    or not body.get("messages")
+                )
+                if should_materialize_blocks:
+                    blocks = [{"type": "text", "text": cleaned}]
+                    _mark_last_stable_block(blocks)
+                    blocks.append({"type": "text", "text": new_text})
+                    body["system"] = blocks
+                else:
+                    body["system"] = f"{cleaned}\n\n{new_text}"
             else:
                 body["system"] = new_text
         elif isinstance(system, list):

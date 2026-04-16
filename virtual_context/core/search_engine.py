@@ -104,7 +104,7 @@ class SearchEngine:
             })
 
         # Live turns: TurnTagIndex entries where tag appears,
-        # paired with conversation_history messages or persisted turn_messages
+        # paired with conversation_history messages or persisted canonical turns.
         history = conversation_history or []
         missing_turn_numbers: list[int] = []
         live_entries: list[tuple] = []  # (entry, msg_idx)
@@ -126,9 +126,9 @@ class SearchEngine:
                 missing_turn_numbers.append(entry.turn_number)
                 live_entries.append(entry)
 
-        # Fall back to canonical full_text for restored turns
+        # Fall back to canonical turn text for restored turns
         if missing_turn_numbers:
-            persisted = self._store.get_full_text_rows(
+            persisted = self._store.get_canonical_turn_rows(
                 self._config.conversation_id, missing_turn_numbers,
             )
             for entry in live_entries:

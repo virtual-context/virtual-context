@@ -13,11 +13,11 @@ from pathlib import Path
 from .config import load_config
 from .core.assembler import ContextAssembler
 from .core.compactor import DomainCompactor
+from .core.ingest_reconciler import IngestReconciler
 from .core.model_catalog import ModelCatalog
 from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
-from .core.semantic_search import persist_turn_with_embeddings
 from .core.segmenter import TopicSegmenter
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
@@ -226,15 +226,6 @@ class VirtualContextEngine:
                     logger.info(
                         "Ignoring Redis snapshot for conversation %s because it does not match the committed store checkpoint",
                         self.config.conversation_id[:12],
-                    )
-            if _store_loaded:
-                try:
-                    self.prune_committed_turn_messages()
-                except Exception:
-                    logger.warning(
-                        "Startup turn_messages prune failed for conversation %s",
-                        self.config.conversation_id[:12],
-                        exc_info=True,
                     )
         else:
             # Provider mode: state will be injected by caller before each request.
@@ -567,6 +558,97 @@ class VirtualContextEngine:
             self._model_catalog = ModelCatalog(models_path)
         self._telemetry = TelemetryLedger(self._model_catalog)
 
+    @staticmethod
+    def _parse_turn_timestamp(*values: str | None) -> datetime:
+        for value in values:
+            if not value:
+                continue
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _canonical_prefix_watermark(rows: list[object]) -> tuple[int, int]:
+        last_prefix_turn = -1
+        for row in rows:
+            if getattr(row, "compacted_at", None):
+                last_prefix_turn = int(getattr(row, "turn_number", -1))
+                continue
+            break
+        if last_prefix_turn < 0:
+            return 0, -1
+        return ((last_prefix_turn + 1) * 2), last_prefix_turn
+
+    def _restore_from_canonical_rows(self, conversation_id: str) -> bool:
+        try:
+            rows = list(self._store.get_all_canonical_turns(conversation_id))
+        except Exception:
+            logger.warning(
+                "Failed to load canonical turns for conversation %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return False
+        if not rows:
+            return False
+
+        tagged_rows = [row for row in rows if row.tagged_at]
+        self._turn_tag_index = TurnTagIndex()
+        for row in tagged_rows:
+            self._turn_tag_index.append(TurnTagEntry(
+                turn_number=row.turn_number,
+                canonical_turn_id=row.canonical_turn_id or "",
+                message_hash=row.turn_hash[:16] if row.turn_hash else "",
+                tags=list(row.tags or []),
+                primary_tag=row.primary_tag or "_general",
+                timestamp=self._parse_turn_timestamp(
+                    row.last_seen_at, row.first_seen_at, row.updated_at, row.created_at,
+                ),
+                session_date=row.session_date or "",
+                fact_signals=list(row.fact_signals or []),
+                sender=row.sender or "",
+                code_refs=list(row.code_refs or []),
+            ))
+
+        compacted_rows = [row for row in rows if row.compacted_at]
+        live_rows = [row for row in tagged_rows if not row.compacted_at]
+        pending_rows = [row for row in rows if not row.tagged_at]
+        compacted_through, last_compacted_turn = self._canonical_prefix_watermark(rows)
+        self._engine_state.compacted_through = compacted_through
+        self._engine_state.flushed_through = self._engine_state.compacted_through
+        self._engine_state.last_compacted_turn = last_compacted_turn
+        last_completed_turn = rows[-1].turn_number if rows else -1
+        last_indexed_turn = tagged_rows[-1].turn_number if tagged_rows else -1
+        self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, last_completed_turn)
+        self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, last_indexed_turn)
+        self._engine_state.checkpoint_version = max(self._engine_state.checkpoint_version, 2)
+        self._restored_conversation_history = [
+            (row.turn_number, row.user_content, row.assistant_content)
+            for row in live_rows
+        ]
+        self._restored_pending_turns = [
+            (
+                row.turn_number,
+                row.user_content,
+                row.assistant_content,
+                row.user_raw_content,
+                row.assistant_raw_content,
+            )
+            for row in pending_rows
+        ]
+        logger.info(
+            "Canonical restore loaded %d turns (%d indexed, %d compacted, %d live, %d pending) for conversation %s",
+            len(rows),
+            len(tagged_rows),
+            len(compacted_rows),
+            len(live_rows),
+            len(pending_rows),
+            conversation_id[:12],
+        )
+        return True
+
     def _load_persisted_state(
         self,
         saved: EngineStateSnapshot | None = None,
@@ -619,21 +701,9 @@ class VirtualContextEngine:
         self._restored_checkpoint_source = "store"
         # Stash working set entries for _apply_persisted_state_to_delegates
         self._restored_working_set = saved.working_set or []
-        # Load conversation history from turn messages for post-restart rebuild
-        try:
-            restored_turns = self._store.load_recent_turn_messages(
-                saved.conversation_id,
-                limit=max(200, min(saved.turn_count or 0, 1000)),
-            )
-            if saved.last_compacted_turn >= 0:
-                restored_turns = [
-                    row for row in restored_turns
-                    if row[0] > saved.last_compacted_turn
-                ]
-            self._restored_conversation_history = restored_turns
-        except Exception:
+        if not self._restore_from_canonical_rows(saved.conversation_id):
             self._restored_conversation_history = []
-        self._restore_pending_turns(saved)
+            self._restored_pending_turns = []
         logger.info(
             "Restored engine state: conversation=%s, compacted_through=%d, indexed=%d, completed=%d, "
             "turns=%d, split_processed=%d, working_set=%d, history_messages=%d pending_turns=%d",
@@ -731,6 +801,7 @@ class VirtualContextEngine:
                 ts = datetime.now(timezone.utc)
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=entry_dict["turn_number"],
+                canonical_turn_id=entry_dict.get("canonical_turn_id", "") or "",
                 tags=entry_dict["tags"],
                 primary_tag=entry_dict.get("primary_tag", ""),
                 message_hash=entry_dict.get("message_hash", ""),
@@ -869,6 +940,7 @@ class VirtualContextEngine:
 
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=entry_dict.get("turn_number", 0),
+                canonical_turn_id=entry_dict.get("canonical_turn_id", "") or "",
                 tags=entry_dict.get("tags", []),
                 primary_tag=entry_dict.get("primary_tag", "_general"),
                 message_hash=entry_dict.get("message_hash", ""),
@@ -974,6 +1046,7 @@ class VirtualContextEngine:
             turn_tag_entries=[
                 {
                     "turn_number": e.turn_number,
+                    "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
                     "tags": e.tags,
                     "primary_tag": e.primary_tag,
                     "message_hash": e.message_hash,
@@ -1120,6 +1193,7 @@ class VirtualContextEngine:
         for e in self._turn_tag_index.entries:
             entries.append({
                 "turn_number": e.turn_number,
+                "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
                 "tags": e.tags,
                 "primary_tag": e.primary_tag,
                 "message_hash": e.message_hash,
@@ -1181,11 +1255,11 @@ class VirtualContextEngine:
         assistant_msg = conversation_history[-1]
         entry = self._turn_tag_index.get_tags_for_turn(turn_number)
         try:
-            persist_turn_with_embeddings(
+            result = IngestReconciler(
                 self._store,
                 self._semantic,
+            ).ingest_single(
                 conversation_id=self.config.conversation_id,
-                turn_number=turn_number,
                 user_content=user_msg.content,
                 assistant_content=assistant_msg.content,
                 user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
@@ -1197,6 +1271,8 @@ class VirtualContextEngine:
                 fact_signals=list(entry.fact_signals) if entry else [],
                 code_refs=list(entry.code_refs) if entry else [],
             )
+            if entry is not None and result.rows:
+                entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
         except StaleConversationWriteError as exc:
             logger.info(
                 "Suppressed stale completed-turn persist for conversation %s: %s",
@@ -1216,60 +1292,6 @@ class VirtualContextEngine:
             conversation_history,
             last_completed_turn=turn_number,
         )
-
-    def prune_committed_turn_messages(
-        self,
-        *,
-        minimum_last_compacted_turn: int | None = None,
-    ) -> int:
-        """Prune raw turn_messages only from the durably committed compacted prefix."""
-        try:
-            saved = self._store.load_engine_state(self.config.conversation_id)
-        except Exception:
-            logger.warning(
-                "Failed to load committed checkpoint before pruning turn_messages for conversation %s",
-                self.config.conversation_id[:12],
-                exc_info=True,
-            )
-            return 0
-        if not saved:
-            return 0
-        committed_turn = int(getattr(saved, "last_compacted_turn", -1) or -1)
-        if committed_turn < 0:
-            return 0
-        if (
-            minimum_last_compacted_turn is not None
-            and committed_turn < minimum_last_compacted_turn
-        ):
-            logger.info(
-                "Skipping turn_messages prune for conversation %s: committed turn %d below expected %d",
-                self.config.conversation_id[:12],
-                committed_turn,
-                minimum_last_compacted_turn,
-            )
-            return 0
-        keep_from_turn = committed_turn + 1
-        try:
-            removed = self._store.prune_turn_messages(
-                self.config.conversation_id,
-                keep_from_turn,
-            )
-        except Exception:
-            logger.warning(
-                "Committed turn_messages prune failed for conversation %s at keep_from_turn=%d",
-                self.config.conversation_id[:12],
-                keep_from_turn,
-                exc_info=True,
-            )
-            return 0
-        if removed:
-            logger.info(
-                "Pruned %d committed turn_messages before turn %d for conversation %s",
-                removed,
-                keep_from_turn,
-                self.config.conversation_id[:12],
-            )
-        return removed
 
     def _reset_restored_state(self) -> None:
         self._turn_tag_index = TurnTagIndex()
@@ -1311,41 +1333,6 @@ class VirtualContextEngine:
         if self._engine_state.compacted_through <= 0:
             compacted_turn = -1
         self._engine_state.last_compacted_turn = max(self._engine_state.last_compacted_turn, compacted_turn)
-
-    def _restore_pending_turns(self, saved: EngineStateSnapshot) -> None:
-        self._restored_pending_turns = []
-        start_turn = saved.last_indexed_turn + 1
-        end_turn = saved.last_completed_turn
-        if end_turn < start_turn:
-            return
-        turn_numbers = list(range(start_turn, end_turn + 1))
-        try:
-            stored = self._store.get_turn_messages(saved.conversation_id, turn_numbers)
-        except Exception:
-            logger.warning(
-                "Failed to load pending turn_messages for conversation %s",
-                saved.conversation_id[:12],
-                exc_info=True,
-            )
-            return
-
-        missing: list[int] = []
-        for turn_number in turn_numbers:
-            row = stored.get(turn_number)
-            if row is None:
-                missing.append(turn_number)
-                continue
-            user_content, assistant_content, user_raw, assistant_raw = row
-            self._restored_pending_turns.append(
-                (turn_number, user_content, assistant_content, user_raw, assistant_raw)
-            )
-        if missing:
-            logger.warning(
-                "Pending checkpoint gap for conversation %s is missing %d stored turn_messages starting at turn %d",
-                saved.conversation_id[:12],
-                len(missing),
-                missing[0],
-            )
 
     def _cache_checkpoint_matches_store(
         self,
@@ -1654,103 +1641,34 @@ class VirtualContextEngine:
 
         Uses fmt.group_into_turns(body) for format-agnostic grouping across
         Anthropic, OpenAI Chat, OpenAI Responses, and Gemini. Extracts
-        user + assistant/model text per turn group and upserts ALL turns
-        to turn_messages. Since save_turn_message uses ON CONFLICT DO UPDATE,
-        this repairs gaps from earlier partial failures.
+        user + assistant/model text per turn group and reconciles them into
+        the canonical turn ledger. Re-sends update existing canonical turns
+        instead of creating duplicate transcript rows.
 
         Returns the number of genuinely new turns persisted (0 if all existed).
         """
         conv_id = conversation_id or self.config.conversation_id
-        messages = fmt.get_messages(body)
-        if not messages:
-            return 0
-
-        # OpenAI Responses string-input shorthand: {"input": "some text"}
-        # get_messages() synthesizes a user message, but group_into_turns()
-        # returns [] because it checks for a list.
-        raw_input = body.get("input")
-        if isinstance(raw_input, str) and raw_input.strip():
-            return 0
-
-        turns = fmt.group_into_turns(body)
-
-        # Role names differ by format: Gemini uses "model" for assistant
-        assistant_roles = {"assistant", "model"}
-
-        pairs: list[tuple[str, str]] = []
-        for turn in turns:
-            u_parts: list[str] = []
-            a_parts: list[str] = []
-            for idx in turn.indices:
-                if idx >= len(messages):
-                    continue
-                m = messages[idx]
-                if not isinstance(m, dict):
-                    continue
-                text = fmt.extract_message_text(m)
-                if not text:
-                    continue
-                role = m.get("role", "")
-                if role == "user":
-                    u_parts.append(text)
-                elif role in assistant_roles:
-                    a_parts.append(text)
-            u_text = "\n".join(u_parts)
-            a_text = "\n".join(a_parts)
-            if u_text or a_text:
-                pairs.append((u_text, a_text))
-
-        if not pairs:
-            return 0
-
-        # Use the underlying store directly for bulk backfill.
-        # The guarded store's refresh_generation doesn't reliably unblock
-        # bulk writes across conversation_id mismatches (short vs full UUID).
-        # This is an authoritative backfill from the current client request.
         store = self._store
         _inner = getattr(store, '_store', None)
         if _inner is not None:
             store = _inner
-
-        # Determine which turns already exist so we can report new count.
-        try:
-            stored = store.load_recent_turn_messages(conv_id, limit=len(pairs))
-            stored_nums = {t[0] for t in stored}
-        except Exception:
-            stored_nums = set()
-
-        # Upsert ALL turns unconditionally. save_turn_message uses
-        # ON CONFLICT DO UPDATE, so this fills gaps AND refreshes
-        # stale/incomplete rows from earlier partial writes.
-        logger.info(
-            "SYNC_TURNS: conv=%s store=%s pairs=%d stored_nums=%s",
-            conv_id[:12], type(store).__name__, len(pairs), sorted(stored_nums)[:5],
+        result = IngestReconciler(store, self._semantic).ingest_batch(
+            conv_id,
+            body=body,
+            fmt=fmt,
+            turn_entries=self._turn_tag_index,
         )
-        new_count = 0
-        for turn_num, (u, a) in enumerate(pairs):
-            entry = self._turn_tag_index.get_tags_for_turn(turn_num)
-            try:
-                persist_turn_with_embeddings(
-                    store,
-                    self._semantic,
-                    conversation_id=conv_id,
-                    turn_number=turn_num,
-                    user_content=u,
-                    assistant_content=a,
-                    primary_tag=entry.primary_tag if entry else "_general",
-                    tags=list(entry.tags) if entry else [],
-                    session_date=entry.session_date if entry else "",
-                    sender=entry.sender if entry else "",
-                    fact_signals=list(entry.fact_signals) if entry else [],
-                    code_refs=list(entry.code_refs) if entry else [],
-                )
-                if turn_num not in stored_nums:
-                    new_count += 1
-            except Exception as exc:
-                logger.warning(
-                    "Failed to persist turn %d for %s: %s", turn_num, conv_id[:12], exc)
-
-        return new_count
+        logger.info(
+            "SYNC_TURNS_CANONICAL: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",
+            conv_id[:12],
+            result.merge_mode,
+            result.turns_written,
+            result.turns_matched,
+            result.turns_appended,
+            result.turns_prepended,
+            result.turns_inserted,
+        )
+        return result.turns_written
 
     def find_quote(
         self,

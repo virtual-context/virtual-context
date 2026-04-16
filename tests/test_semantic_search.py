@@ -240,24 +240,24 @@ class TestFindQuoteSemanticFallback:
         _store_canonical_turn(engine)
 
         # Mock semantic search to verify it's not called when lexical full_text search fills quota
-        engine._semantic.semantic_full_text_search = MagicMock(return_value=[])
+        engine._semantic.semantic_canonical_turn_search = MagicMock(return_value=[])
 
         # max_results=1 so FTS finding 1 result fills the quota
         result = engine.find_quote("arrived", max_results=1)
         assert result["found"] is True
-        engine._semantic.semantic_full_text_search.assert_not_called()
+        engine._semantic.semantic_canonical_turn_search.assert_not_called()
 
     def test_fts_hit_still_supplements_with_semantic(self, tmp_path):
         """When FTS finds matches but has remaining slots, semantic supplements."""
         engine = _make_engine(tmp_path)
         _store_canonical_turn(engine)
 
-        engine._semantic.semantic_full_text_search = MagicMock(return_value=[])
+        engine._semantic.semantic_canonical_turn_search = MagicMock(return_value=[])
 
         # FTS finds 1 result, max_results=5, so semantic runs for remaining 4
         result = engine.find_quote("arrived", max_results=5)
         assert result["found"] is True
-        engine._semantic.semantic_full_text_search.assert_called_once_with(
+        engine._semantic.semantic_canonical_turn_search.assert_called_once_with(
             "arrived", max_results=4, conversation_id=engine.config.conversation_id,
         )
 
@@ -279,13 +279,13 @@ class TestFindQuoteSemanticFallback:
             turn_number=0,
             matched_side="assistant",
         )
-        engine._semantic.semantic_full_text_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_canonical_turn_search = MagicMock(return_value=[semantic_result])
 
         result = engine.find_quote("shipping confirmation")
         assert result["found"] is True
         assert result["results"][0]["match_type"] == "full_text_semantic"
         assert result["results"][0]["similarity"] == 0.87
-        engine._semantic.semantic_full_text_search.assert_called_once()
+        engine._semantic.semantic_canonical_turn_search.assert_called_once()
 
     def test_no_embeddings_graceful(self, tmp_path):
         """No sentence-transformers → no crash, just returns not found."""
@@ -313,7 +313,7 @@ class TestFindQuoteSemanticFallback:
             turn_number=0,
             matched_side="assistant",
         )
-        engine._semantic.semantic_full_text_search = MagicMock(return_value=[semantic_result])
+        engine._semantic.semantic_canonical_turn_search = MagicMock(return_value=[semantic_result])
 
         result = engine.find_quote("nonexistent_fts_term")
         assert result["found"] is True

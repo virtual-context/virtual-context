@@ -15,20 +15,22 @@ def test_conversation_store_view_blocks_stale_writes_after_delete(tmp_path):
 
     generation0 = store.activate_conversation(conversation_id)
     view0 = ConversationStoreView(store, conversation_id, generation0)
-    view0.save_turn_message(conversation_id, 0, "u0", "a0")
-    assert store.get_turn_messages(conversation_id, [0])[0][:2] == ("u0", "a0")
+    view0.save_canonical_turn(conversation_id, 0, "u0", "a0")
+    assert store.get_canonical_turn_rows(conversation_id, [0])[0].user_content == "u0"
+    assert store.get_canonical_turn_rows(conversation_id, [0])[0].assistant_content == "a0"
 
     deleted_generation = store.begin_conversation_deletion(conversation_id)
     with pytest.raises(StaleConversationWriteError):
-        view0.save_turn_message(conversation_id, 1, "stale-u", "stale-a")
+        view0.save_canonical_turn(conversation_id, 1, "stale-u", "stale-a")
 
     store.delete_conversation(conversation_id)
     generation1 = store.activate_conversation(conversation_id)
     assert generation1 == deleted_generation
 
     view1 = ConversationStoreView(store, conversation_id, generation1)
-    view1.save_turn_message(conversation_id, 0, "fresh-u", "fresh-a")
-    assert store.get_turn_messages(conversation_id, [0])[0][:2] == ("fresh-u", "fresh-a")
+    view1.save_canonical_turn(conversation_id, 0, "fresh-u", "fresh-a")
+    assert store.get_canonical_turn_rows(conversation_id, [0])[0].user_content == "fresh-u"
+    assert store.get_canonical_turn_rows(conversation_id, [0])[0].assistant_content == "fresh-a"
 
 
 def test_conversation_store_view_blocks_chain_and_tool_link_writes_after_delete(tmp_path):

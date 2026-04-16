@@ -889,8 +889,9 @@ class DomainCompactor:
         cover_tags: list[str],
         tag_to_summaries: dict[str, list[StoredSummary]],
         tag_to_turns: dict[str, list[int]],
-        existing_tag_summaries: dict[str, TagSummary],
-        max_turn: int,
+        tag_to_canonical_turn_ids: dict[str, list[str]] | None = None,
+        existing_tag_summaries: dict[str, TagSummary] | None = None,
+        max_turn: int = -1,
         generated_by_turn_id: str = "",
     ) -> list[TagSummary]:
         """Build or update tag summaries for cover tags.
@@ -898,6 +899,7 @@ class DomainCompactor:
         Only rebuilds tag summaries that are stale (``covers_through_turn`` <
         ``max_turn``) or missing.  Uses ThreadPoolExecutor for concurrency.
         """
+        existing_tag_summaries = existing_tag_summaries or {}
         tags_to_build: list[str] = []
         for tag in cover_tags:
             summaries = tag_to_summaries.get(tag, [])
@@ -918,6 +920,7 @@ class DomainCompactor:
                     tag,
                     tag_to_summaries.get(tag, []),
                     tag_to_turns.get(tag, []),
+                    (tag_to_canonical_turn_ids or {}).get(tag, []),
                     max_turn,
                     generated_by_turn_id=generated_by_turn_id,
                 )
@@ -940,6 +943,7 @@ class DomainCompactor:
                     tag,
                     tag_to_summaries.get(tag, []),
                     tag_to_turns.get(tag, []),
+                    (tag_to_canonical_turn_ids or {}).get(tag, []),
                     max_turn,
                     generated_by_turn_id,
                 ): i
@@ -975,10 +979,16 @@ class DomainCompactor:
                         summary_tokens=self.token_counter(fallback_text),
                         source_segment_refs=[s.ref for s in summaries],
                         source_turn_numbers=sorted(set(tag_to_turns.get(tag, []))),
+                        source_canonical_turn_ids=list(dict.fromkeys((tag_to_canonical_turn_ids or {}).get(tag, []))),
                         code_refs=_collect_code_refs(
                             *[getattr(s.metadata, "code_refs", []) for s in summaries]
                         ),
                         covers_through_turn=max_turn,
+                        covers_through_canonical_turn_id=(
+                            list(dict.fromkeys((tag_to_canonical_turn_ids or {}).get(tag, [])))[-1]
+                            if (tag_to_canonical_turn_ids or {}).get(tag, [])
+                            else ""
+                        ),
                         generated_by_turn_id=generated_by_turn_id,
                     )
 
@@ -991,6 +1001,7 @@ class DomainCompactor:
         tag: str,
         summaries: list[StoredSummary],
         turn_numbers: list[int],
+        canonical_turn_ids: list[str],
         max_turn: int,
         generated_by_turn_id: str = "",
     ) -> TagSummary:
@@ -1056,7 +1067,12 @@ class DomainCompactor:
             summary_tokens=self.token_counter(summary_text),
             source_segment_refs=[s.ref for s in summaries],
             source_turn_numbers=sorted(set(turn_numbers)),
+            source_canonical_turn_ids=list(dict.fromkeys(canonical_turn_ids or [])),
             code_refs=code_refs,
             covers_through_turn=max_turn,
+            covers_through_canonical_turn_id=(
+                list(dict.fromkeys(canonical_turn_ids or []))[-1]
+                if canonical_turn_ids else ""
+            ),
             generated_by_turn_id=generated_by_turn_id,
         )
