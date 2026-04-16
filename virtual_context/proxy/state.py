@@ -613,7 +613,10 @@ class ProxyState:
             live_turn_count,
         )
         done, total = self._payload_ingestion_progress
-        snapshot.session_state = self.session_state.value
+        effective_state = self.session_state.value
+        if total > 0 and done < total and effective_state == SessionState.ACTIVE.value:
+            effective_state = SessionState.INGESTING.value
+        snapshot.session_state = effective_state
         snapshot.live_turn_count = live_turn_count
         snapshot.history_message_count = history_message_count
         snapshot.ingestion_done = int(done or 0)
@@ -635,10 +638,13 @@ class ProxyState:
         if not force and (now - self._last_shared_state_save) < 1.0:
             return
         try:
-            provider.save(
+            snapshot = self.extract_session_state()
+            saved_version = provider.save(
                 self.engine.config.conversation_id,
-                self.extract_session_state(),
+                snapshot,
             )
+            if saved_version is not None:
+                self.engine._session_state_version = int(saved_version)
             self._last_shared_state_save = now
         except Exception:
             logger.debug(
@@ -801,7 +807,13 @@ class ProxyState:
             "tag_count": len(idx.entries),
             "distinct_tags": len(all_tags),
             "active_tags": list(idx.get_active_tags(lookback=6)),
-            "session_state": self.session_state.value,
+            "session_state": (
+                SessionState.INGESTING.value
+                if self._payload_ingestion_progress[1] > 0
+                and self._payload_ingestion_progress[0] < self._payload_ingestion_progress[1]
+                and self.session_state == SessionState.ACTIVE
+                else self.session_state.value
+            ),
             "ingestion_progress": list(self._payload_ingestion_progress),
             "raw_payload_entry_count": self._raw_payload_entry_count,
             "ingestible_entry_count": self._ingestible_entry_count,

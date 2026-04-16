@@ -277,7 +277,7 @@ class SessionStateProvider:
             # Degraded — try Postgres fallback
             return self._load_from_store(conversation_id)
 
-    def save(self, conversation_id: str, state: SessionState) -> None:
+    def save(self, conversation_id: str, state: SessionState) -> int | None:
         """Save session state to Redis with optimistic version check.
 
         Uses a Redis transaction (WATCH/MULTI) so an in-flight stale worker
@@ -290,7 +290,8 @@ class SessionStateProvider:
         - If WATCH fails (concurrent write): discard, log warning
         """
         key = self._key(conversation_id)
-        state.version += 1
+        original_version = int(getattr(state, "version", 0) or 0)
+        next_version = original_version + 1
         try:
             with self._redis.pipeline() as pipe:
                 pipe.watch(key)
@@ -298,12 +299,20 @@ class SessionStateProvider:
                 if current_raw:
                     current = json.loads(current_raw)
                     if current.get("deleted"):
+                        state.version = original_version
                         logger.info("Save rejected for %s — tombstoned", conversation_id[:12])
-                        return
-                    if current.get("version", 0) >= state.version:
-                        logger.info("Save rejected for %s — stale version %d < %d",
-                                    conversation_id[:12], state.version, current["version"])
-                        return
+                        return None
+                    current_version = int(current.get("version", 0) or 0)
+                    if current_version > original_version:
+                        state.version = original_version
+                        logger.info(
+                            "Save rejected for %s — stale version %d < %d",
+                            conversation_id[:12],
+                            original_version,
+                            current_version,
+                        )
+                        return None
+                state.version = next_version
                 pipe.multi()
                 pipe.set(key, state.to_json())
                 pipe.execute()
@@ -312,10 +321,13 @@ class SessionStateProvider:
             # writing to Postgres would put it ahead of Redis, and load()
             # would later trust the stale Redis copy over the newer store.
             self._save_to_store(conversation_id, state)
+            return next_version
         except Exception:
+            state.version = original_version
             logger.warning("Redis save failed for %s — skipping Postgres backup",
                            conversation_id[:12], exc_info=True)
             self._degraded = True
+            return None
 
     def load_payload_token_cache(self, conversation_id: str, *, scope: str = "inbound"):
         """Load the segmented inbound token cache for a conversation.
