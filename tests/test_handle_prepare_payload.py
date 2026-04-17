@@ -351,3 +351,117 @@ def test_step_5_5_ingesting_stays_ingesting_when_work_remains(tmp_path):
     assert decision.phase == "ingesting"
     snap = inner.read_progress_snapshot(conv_id)
     assert snap.phase == "ingesting"
+
+
+# ---------------------------------------------------------------------------
+# Task A26 — step 6 (upsert episode + attempt lease claim)
+# ---------------------------------------------------------------------------
+
+
+def test_step_6_creates_episode_and_claims_lease_on_empty(tmp_path):
+    """Fresh init conversation with payload content → phase transitions to
+    ingesting, episode row created, lease claimed, tagger spawned."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    decision = state.handle_prepare_payload(
+        body={"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]},
+        payload_accounting={
+            "raw_payload_entry_count": 500,
+            "ingestible_entry_count": 200,
+        },
+    )
+    assert decision.phase == "ingesting"
+    assert decision.started_tagger is True
+    # Episode row exists with our worker as owner.
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.active_episode is not None
+    assert snap.active_episode.owner_worker_id == state._worker_id
+    assert snap.active_episode.raw_payload_entries == 500
+
+
+def test_step_6_does_not_claim_when_fresh_owner(tmp_path):
+    """If a different worker already holds a fresh lease, this worker
+    widens raw but does NOT claim."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    # Seed canonical rows so total>done.
+    from virtual_context.core.canonical_turns import utcnow_iso
+    now = utcnow_iso()
+    with inner._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_hash, hash_version,
+                normalized_user_text, normalized_assistant_text,
+                user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, tagged_at,
+                created_at, updated_at
+            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, ?, ?)
+        """, (conv_id, now, now, now, now))
+    inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
+    # Another worker already owns the lease at epoch=1 with raw=100.
+    inner.upsert_ingestion_episode(
+        conversation_id=conv_id, lifecycle_epoch=1,
+        worker_id="other_worker", raw_payload_entries=100,
+    )
+    inner.claim_ingestion_lease(
+        conversation_id=conv_id, lifecycle_epoch=1,
+        worker_id="other_worker", lease_ttl_s=30.0,
+    )
+    # Our call: widens raw, fails to claim (other_worker has fresh lease).
+    decision = state.handle_prepare_payload(
+        body={},
+        payload_accounting={
+            "raw_payload_entry_count": 200,
+            "ingestible_entry_count": 50,
+        },
+    )
+    assert decision.phase == "ingesting"
+    assert decision.started_tagger is False  # didn't claim
+    # Raw widened via GREATEST/MAX but owner unchanged.
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.active_episode.raw_payload_entries == 200  # widened
+    assert snap.active_episode.owner_worker_id == "other_worker"  # unchanged
+
+
+def test_step_6_reclaims_stale_lease(tmp_path):
+    """If previous owner's lease is stale (old heartbeat), this worker takes over."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    from virtual_context.core.canonical_turns import utcnow_iso
+    now = utcnow_iso()
+    with inner._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_hash, hash_version,
+                normalized_user_text, normalized_assistant_text,
+                user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, tagged_at,
+                created_at, updated_at
+            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, ?, ?)
+        """, (conv_id, now, now, now, now))
+    inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
+    inner.upsert_ingestion_episode(
+        conversation_id=conv_id, lifecycle_epoch=1,
+        worker_id="dead_worker", raw_payload_entries=100,
+    )
+    # Force stale heartbeat.
+    with inner._get_conn() as conn:
+        conn.execute(
+            "UPDATE ingestion_episode SET heartbeat_ts = '2000-01-01T00:00:00+00:00' WHERE conversation_id = ?",
+            (conv_id,),
+        )
+    decision = state.handle_prepare_payload(
+        body={},
+        payload_accounting={"raw_payload_entry_count": 0, "ingestible_entry_count": 0},
+    )
+    assert decision.started_tagger is True  # reclaimed
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.active_episode.owner_worker_id == state._worker_id

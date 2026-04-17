@@ -11,6 +11,8 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import socket
 import threading
 import time
 import uuid
@@ -33,6 +35,11 @@ from .helpers import (
 from .metrics import ProxyMetrics
 
 logger = logging.getLogger(__name__)
+
+# Ingestion lease TTL (seconds). A claim older than this is considered stale
+# and may be reclaimed by another worker. Used by step 6 of
+# ``ProxyState.handle_prepare_payload`` via ``claim_ingestion_lease``.
+INGESTION_LEASE_TTL_S: float = 30.0
 
 # ---------------------------------------------------------------------------
 # Provider derivation from upstream URL
@@ -187,6 +194,17 @@ class ProxyState:
         # Upstream context window enforcement
         self._instance_upstream_limit: int = 0  # set by create_app from ProxyInstanceConfig
         self._last_model: str = ""  # last model name seen (for dashboard)
+
+        # Ingestion ownership (step 6 of handle_prepare_payload). Unique per
+        # process instance so claim_ingestion_lease can distinguish
+        # concurrent workers.
+        self._worker_id: str = (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        )
+        # Background tagger thread spawned after a successful lease claim.
+        # Actual tagger loop body lands in A27; step 6 only wires up the
+        # daemon thread lifecycle.
+        self._tagger_thread: threading.Thread | None = None
 
         # Set provider on engine for persistence (only if not already restored)
         if self.provider and not engine._engine_state.provider:
@@ -514,6 +532,22 @@ class ProxyState:
         except Exception:
             logger.warning("Failed to persist completed turn", exc_info=True)
 
+    def _tagger_run(self) -> None:
+        """Background tagger loop entrypoint.
+
+        Placeholder — Task A27 implements the full heartbeat + tagging loop
+        driven by ``claim_ingestion_lease`` / ``refresh_ingestion_heartbeat``.
+        Step 6 only needs the thread to exist for lifecycle-tracking tests;
+        returning immediately is intentional.
+        """
+        return
+
+    def _spawn_tagger_thread(self) -> None:
+        """Start ``_tagger_run`` in a daemon thread and record the handle."""
+        t = threading.Thread(target=self._tagger_run, daemon=True)
+        t.start()
+        self._tagger_thread = t
+
     def handle_prepare_payload(
         self,
         *,
@@ -683,9 +717,35 @@ class ProxyState:
             phase = "ingesting"
             # PhaseTransitionEvent publish in Task A31.
 
-        # Fall through — phase is now 'ingesting'. A26 will add step 6
-        # (episode creation + claim).
-        return PhaseDecision(phase=phase, started_tagger=False)
+        # Step 6 — reached only when phase == 'ingesting' AND total > done
+        # (the total == done branch already returned from step 5.5).
+        #
+        # Step 6(a): ownership-free widening of the episode's raw payload
+        # bound. Inserts a running episode with this worker as initial owner
+        # if none exists; otherwise widens raw_payload_entries via MAX
+        # without touching ownership.
+        self.engine._store.upsert_ingestion_episode(
+            conversation_id=conversation_id,
+            lifecycle_epoch=my_epoch,
+            worker_id=self._worker_id,
+            raw_payload_entries=new_raw,
+        )
+
+        # Step 6(b): attempt to claim the ingestion lease. Succeeds iff the
+        # caller already owns it or the current heartbeat is stale. Epoch
+        # filter prevents a stale lifecycle from stealing a fresh lease.
+        claimed = self.engine._store.claim_ingestion_lease(
+            conversation_id=conversation_id,
+            lifecycle_epoch=my_epoch,
+            worker_id=self._worker_id,
+            lease_ttl_s=INGESTION_LEASE_TTL_S,
+        )
+
+        if claimed:
+            # Spawn the (stubbed) tagger thread. A27 fills in the loop body.
+            self._spawn_tagger_thread()
+            return PhaseDecision(phase="ingesting", started_tagger=True)
+        return PhaseDecision(phase="ingesting", started_tagger=False)
 
     def resume_pending_ingestion_if_needed(self) -> bool:
         """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""
