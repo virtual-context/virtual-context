@@ -9,7 +9,6 @@ from __future__ import annotations
 import enum
 import hashlib
 import inspect
-import json
 import logging
 import os
 import socket
@@ -22,7 +21,6 @@ from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
 from ..core.lifecycle_epoch import LifecycleEpochMismatch
-from ..core.semantic_search import persist_turn_with_embeddings
 from ..core.segmenter import pair_messages_into_turns
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
@@ -171,7 +169,6 @@ class ProxyState:
         self._skipped_payload_entry_count: int = 0
         self._payload_ingestion_progress: tuple[int, int] = (0, 0)
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
-        self._last_shared_state_save: float = 0.0
         self._shared_live_turn_count: int = 0
         self._shared_history_message_count: int = 0
         self._inbound_payload_token_cache = None
@@ -477,60 +474,6 @@ class ProxyState:
         reason = "initial_ingest" if self._indexed_turn_count() <= 0 else "restore_not_ready"
         self._ingested_conversations.discard(conversation_id)
         return SessionState.PASSTHROUGH, reason
-
-    def persist_completed_turn(self) -> None:
-        if self.is_conversation_deleted():
-            return
-        grouped = self._group_history_messages(self.conversation_history)
-        if not grouped or not any(msg.role == "assistant" for msg in grouped[-1].messages):
-            return
-        persist = getattr(self.engine, "persist_completed_turn", None)
-        if callable(persist):
-            persist(list(self.conversation_history))
-            if self._ingestible_entry_count > 0:
-                self._payload_ingestion_progress = (
-                    self._ingestible_entry_count,
-                    self._ingestible_entry_count,
-                )
-                self._persist_shared_session_state()
-            return
-        turn_number = len(grouped) - 1
-        latest_turn = grouped[-1]
-        user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
-        assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
-        entry = getattr(self.engine, "_turn_tag_index", None)
-        entry = entry.get_tags_for_logical_turn(turn_number) if entry is not None else None
-        try:
-            persist_turn_with_embeddings(
-                self.engine._store,
-                self.engine._semantic,
-                conversation_id=self.engine.config.conversation_id,
-                turn_number=turn_number,
-                user_content="\n".join(msg.content for msg in user_messages),
-                assistant_content="\n".join(msg.content for msg in assistant_messages),
-                user_raw_content=json.dumps(user_messages[-1].raw_content)
-                if user_messages and user_messages[-1].raw_content else None,
-                assistant_raw_content=json.dumps(assistant_messages[-1].raw_content)
-                if assistant_messages and assistant_messages[-1].raw_content else None,
-                primary_tag=entry.primary_tag if entry else "_general",
-                tags=list(entry.tags) if entry else [],
-                session_date=entry.session_date if entry else "",
-                sender=entry.sender if entry else "",
-                fact_signals=list(entry.fact_signals) if entry else [],
-                code_refs=list(entry.code_refs) if entry else [],
-            )
-            self.engine._engine_state.last_completed_turn = max(
-                getattr(self.engine._engine_state, "last_completed_turn", -1),
-                turn_number,
-            )
-            if self._ingestible_entry_count > 0:
-                self._payload_ingestion_progress = (
-                    self._ingestible_entry_count,
-                    self._ingestible_entry_count,
-                )
-                self._persist_shared_session_state()
-        except Exception:
-            logger.warning("Failed to persist completed turn", exc_info=True)
 
     def _tagger_run(self) -> None:
         """Background tagger loop. Processes untagged canonical rows until
@@ -1096,7 +1039,6 @@ class ProxyState:
             "Conversation %s: %s → %s",
             self.engine.config.conversation_id[:12], old.value, new_state.value,
         )
-        self._persist_shared_session_state(force=True)
 
     def extract_session_state(self):
         """Return the shared session snapshot, including UI-facing runtime fields."""
@@ -1128,78 +1070,6 @@ class ProxyState:
         snapshot.payload_ingestion_done = int(done or 0)
         snapshot.payload_ingestion_total = int(total or 0)
         return snapshot
-
-    def _persist_shared_session_state(
-        self,
-        *,
-        force: bool = False,
-        reject_is_stale: bool = False,
-    ) -> None:
-        provider = getattr(self.engine, "_session_state_provider", None)
-        if provider is None:
-            return
-        now = time.time()
-        if not force and (now - self._last_shared_state_save) < 1.0:
-            return
-        try:
-            snapshot = self.extract_session_state()
-            saved_version = provider.save(
-                self.engine.config.conversation_id,
-                snapshot,
-            )
-            if saved_version is not None:
-                self.engine._session_state_version = int(saved_version)
-            elif reject_is_stale:
-                raise StaleConversationWriteError(
-                    "shared session state rejected for stale/deleted conversation "
-                    f"{self.engine.config.conversation_id[:12]}",
-                )
-            self._last_shared_state_save = now
-        except StaleConversationWriteError:
-            raise
-        except Exception:
-            logger.debug(
-                "Shared session state save failed for conv=%s",
-                self.engine.config.conversation_id[:12],
-                exc_info=True,
-            )
-
-    def note_payload_accounting(
-        self,
-        payload_accounting: dict | None,
-        *,
-        done: int | None = None,
-        total: int | None = None,
-    ) -> None:
-        accounting = dict(payload_accounting or {})
-        self._raw_payload_entry_count = max(
-            0,
-            int(accounting.get("raw_payload_entry_count", 0) or 0),
-        )
-        self._ingestible_entry_count = max(
-            0,
-            int(
-                accounting.get(
-                    "ingestible_entry_count",
-                    accounting.get("normalized_chat_entry_count", 0),
-                )
-                or 0
-            ),
-        )
-        self._skipped_payload_entry_count = max(
-            0,
-            int(
-                accounting.get(
-                    "skipped_scaffolding_entry_count",
-                    self._raw_payload_entry_count - self._ingestible_entry_count,
-                )
-                or 0
-            ),
-        )
-        payload_done = self._ingestible_entry_count if done is None else max(0, int(done or 0))
-        payload_total = self._ingestible_entry_count if total is None else max(payload_done, int(total or 0))
-        self._payload_ingestion_progress = (payload_done, payload_total)
-        self._persist_shared_session_state()
 
     def _update_compaction_state(
         self,
@@ -2767,7 +2637,6 @@ class ProxyState:
                     "done": cum_done,
                     "total": _total,
                 })
-            self._persist_shared_session_state(reject_is_stale=True)
 
         ingest_kwargs = {
             "progress_callback": on_progress,
@@ -2792,7 +2661,6 @@ class ProxyState:
                 "conversation_id": conversation_id,
                 "baseline_history_tokens": baseline_history_tokens,
             })
-        self._persist_shared_session_state(force=True, reject_is_stale=True)
 
     def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
         try:

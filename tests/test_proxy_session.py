@@ -1038,19 +1038,6 @@ class TestSessionStateMachine:
         assert state_events[0]["from"] == "active"
         assert state_events[0]["to"] == "ingesting"
 
-    def test_state_transition_persists_shared_session_snapshot(self):
-        state = self._make_state()
-        provider = MagicMock()
-        state.engine._session_state_provider = provider
-        state.engine.extract_session_state = MagicMock(return_value=SharedSessionState())
-
-        state._transition_to(SessionState.INGESTING)
-
-        provider.save.assert_called_once()
-        conv_id, snapshot = provider.save.call_args.args
-        assert conv_id == state.engine.config.conversation_id
-        assert snapshot.session_state == "ingesting"
-
     def test_hydrate_from_shared_session_restores_ui_fields(self):
         state = self._make_state()
         state.engine.hydrate_from_session_state = MagicMock()

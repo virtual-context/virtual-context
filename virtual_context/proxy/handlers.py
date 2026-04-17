@@ -1465,7 +1465,6 @@ async def _handle_streaming(
                             timestamp=datetime.now(timezone.utc),
                             raw_content=all_content_blocks if all_content_blocks else None),
                 )
-                state.persist_completed_turn()
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
@@ -1607,7 +1606,6 @@ async def _handle_streaming(
                             timestamp=datetime.now(timezone.utc),
                             raw_content=np_content_blocks if np_content_blocks else None)
                 )
-                state.persist_completed_turn()
                 if not passthrough:
                     state.fire_turn_complete(
                         list(state.conversation_history),
@@ -1716,7 +1714,6 @@ async def _handle_non_streaming(
                     timestamp=datetime.now(timezone.utc),
                     raw_content=_extract_assistant_raw_content(response_body, api_format))
         )
-        state.persist_completed_turn()
         if not passthrough:
             state.fire_turn_complete(
                 list(state.conversation_history),

@@ -604,11 +604,32 @@ async def prepare_payload(
         raw_summary=_raw_payload_accounting,
     )
     if state is not None:
+        # In-memory payload accounting counters for dashboard snapshot reads.
+        # Durable progress is derived from canonical rows by handle_prepare_payload;
+        # these mirrors exist only for the ProxyState.live_snapshot UI fields.
         try:
-            state.note_payload_accounting(_payload_accounting, done=0, total=int(_payload_accounting.get("ingestible_entry_count", 0) or 0))
+            _raw = int(_payload_accounting.get("raw_payload_entry_count", 0) or 0)
+            _ing = int(
+                _payload_accounting.get(
+                    "ingestible_entry_count",
+                    _payload_accounting.get("normalized_chat_entry_count", 0),
+                )
+                or 0
+            )
+            _skipped = int(
+                _payload_accounting.get(
+                    "skipped_scaffolding_entry_count",
+                    _raw - _ing,
+                )
+                or 0
+            )
+            state._raw_payload_entry_count = max(0, _raw)
+            state._ingestible_entry_count = max(0, _ing)
+            state._skipped_payload_entry_count = max(0, _skipped)
+            state._payload_ingestion_progress = (0, max(0, _ing))
         except Exception:
             logger.debug(
-                "Failed to note payload accounting for conv=%s",
+                "Failed to record in-memory payload accounting for conv=%s",
                 state.engine.config.conversation_id[:12],
                 exc_info=True,
             )

@@ -166,7 +166,6 @@ class VirtualContextEngine:
         self._engine_state = EngineState()  # mutable shared state for delegates
         self._engine_state.conversation_generation = self._conversation_generation
         self._load_lifecycle_epoch_into_engine_state()
-        self._session_state_version: int = 0  # Tracks loaded Redis version for optimistic save
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
         self._restored_request_captures: list[dict] = []  # loaded from persisted state, consumed by ProxyState
@@ -1127,9 +1126,6 @@ class VirtualContextEngine:
         """
         from .proxy.session_state import SessionState  # noqa: F811
 
-        # Carry the Redis version so extract_session_state can pass it back
-        self._session_state_version = state.version
-
         # Engine state markers (including tool_tag_counter for fallback continuity)
         self._engine_state.tool_tag_counter = state.tool_tag_counter
         self._engine_state.compacted_prefix_messages = state.compacted_prefix_messages
@@ -1288,7 +1284,6 @@ class VirtualContextEngine:
             split_processed_tags=set(self._engine_state.split_processed_tags),
             trailing_fingerprint=self._engine_state.trailing_fingerprint,
             provider=self._engine_state.provider,
-            version=self._session_state_version,  # Carry loaded version for CAS
             tool_tag_counter=self._engine_state.tool_tag_counter,
             # Use rollup only — strip raw events to keep Redis blobs small.
             telemetry_rollup={
