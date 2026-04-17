@@ -1618,6 +1618,102 @@ class PostgresStore(ContextStore):
         deleted = bool(row["deleted"] if isinstance(row, dict) else row[1])
         return current == int(generation or 0) and not deleted
 
+    # ------------------------------------------------------------------
+    # Conversation row lifecycle (progress-bar redesign `conversations` table)
+    # ------------------------------------------------------------------
+    # These methods mirror the SQLiteStore implementations (see sqlite.py) on
+    # the newer `conversations` table — the one that carries
+    # ``lifecycle_epoch`` and ``phase`` for the progress tracker and
+    # delete+resurrect invariants. They are separate from the legacy
+    # ``conversation_lifecycle`` table (activate/begin deletion) just above.
+
+    def upsert_conversation(self, *, tenant_id: str, conversation_id: str) -> None:
+        """Create the conversations row if missing; otherwise just refresh updated_at.
+
+        Epoch starts at 1 on new rows; never bumped by this method.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                conversation_id, tenant_id, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (conversation_id) DO UPDATE SET
+                updated_at = EXCLUDED.updated_at
+            """,
+            (conversation_id, tenant_id, now, now),
+        )
+
+    def get_lifecycle_epoch(self, conversation_id: str) -> int:
+        """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+
+    def mark_conversation_deleted(self, conversation_id: str) -> None:
+        """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
+
+        Called only by the delete endpoint — caller is authoritative; no
+        epoch check needed. Raises KeyError if no row exists so callers get
+        symmetric signaling with ``increment_lifecycle_epoch_on_resurrect``.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE conversations
+               SET phase = 'deleted',
+                   deleted_at = %s,
+                   updated_at = %s
+             WHERE conversation_id = %s
+            """,
+            (now, now, conversation_id),
+        )
+        if cur.rowcount == 0:
+            raise KeyError(conversation_id)
+
+    def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
+        """Bump lifecycle_epoch ONLY when phase == 'deleted'.
+
+        Uses a single-statement ``UPDATE ... WHERE phase='deleted' RETURNING``
+        which is atomic under Postgres's autocommit — a concurrent caller
+        cannot double-bump because the guard predicate only matches once. If
+        the UPDATE returns no rows (phase already 'init'/'active'/etc.), we
+        fall back to reading the current epoch. Raises KeyError if no row
+        exists.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        row = conn.execute(
+            """
+            UPDATE conversations
+               SET lifecycle_epoch = lifecycle_epoch + 1,
+                   phase = 'init',
+                   deleted_at = NULL,
+                   updated_at = %s
+             WHERE conversation_id = %s
+               AND phase = 'deleted'
+            RETURNING lifecycle_epoch
+            """,
+            (now, conversation_id),
+        ).fetchone()
+        if row is not None:
+            return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+        # Not deleted (already init/active or unknown) — read current epoch.
+        row = conn.execute(
+            "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         with conn.transaction():
