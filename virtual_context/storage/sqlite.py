@@ -2399,6 +2399,164 @@ CREATE TABLE IF NOT EXISTS request_captures (
             active_compaction=active_compaction,
         )
 
+    # ------------------------------------------------------------------
+    # Ingestion episode CRUD (epoch-guarded)
+    # ------------------------------------------------------------------
+    # Ownership-free widening upsert + epoch-scoped lease/heartbeat/complete
+    # operations on the `ingestion_episode` table created in `_ensure_schema`.
+    # All four methods filter on `lifecycle_epoch` in SQL so a stale thread
+    # carrying an old epoch cannot mutate the current lifecycle's row. The
+    # partial unique index `(conversation_id, lifecycle_epoch) WHERE status
+    # = 'running'` supplies the conflict target for the upsert.
+
+    def upsert_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+    ) -> None:
+        """Ownership-free upsert. On INSERT, creates a running episode with
+        the given worker as initial owner. On CONFLICT (another running row
+        exists), ONLY widens ``raw_payload_entries`` via MAX — does NOT
+        change ownership or other fields. Idempotent.
+
+        Uses SQLite's partial-index conflict target (requires SQLite 3.38+).
+        """
+        import uuid
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_episode (
+                    episode_id, conversation_id, lifecycle_epoch,
+                    raw_payload_entries, started_at, status,
+                    owner_worker_id, heartbeat_ts
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+                ON CONFLICT (conversation_id, lifecycle_epoch) WHERE status = 'running'
+                DO UPDATE SET
+                    raw_payload_entries =
+                        MAX(ingestion_episode.raw_payload_entries, excluded.raw_payload_entries)
+                """,
+                (
+                    str(uuid.uuid4()), conversation_id, lifecycle_epoch,
+                    raw_payload_entries, now, worker_id, now,
+                ),
+            )
+
+    def claim_ingestion_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ) -> bool:
+        """Claim the ingestion lease for this (conversation, lifecycle_epoch).
+
+        Returns True iff the caller now owns the lease. Rules:
+          - If caller already owns it: refresh heartbeat, return True.
+          - If current heartbeat is stale (older than ``lease_ttl_s``):
+            take over, return True.
+          - Otherwise: another worker owns a fresh lease; return False.
+        Epoch-scoped: filters on ``lifecycle_epoch`` so a stale epoch
+        cannot claim a lease on the current lifecycle.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
+        ).isoformat()
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET owner_worker_id = ?, heartbeat_ts = ?
+                 WHERE conversation_id = ? AND status = 'running'
+                   AND lifecycle_epoch = ?
+                   AND (owner_worker_id = ? OR heartbeat_ts < ?)
+                """,
+                (
+                    worker_id, now, conversation_id, lifecycle_epoch,
+                    worker_id, cutoff,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def refresh_ingestion_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Epoch-scoped heartbeat refresh. A stale thread carrying an old
+        epoch cannot refresh a new lifecycle's heartbeat. Returns True iff
+        a matching (running, caller-owned, epoch-matched) row was updated.
+
+        The ``lifecycle_epoch`` filter is doubly-scoped: it must match both
+        the episode row AND the authoritative ``conversations`` row — a
+        stale thread that thinks it is still on epoch N but whose
+        conversation was resurrected to epoch N+1 is rejected at SQL level.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode SET heartbeat_ts = ?
+                 WHERE conversation_id = ? AND status = 'running'
+                   AND lifecycle_epoch = ?
+                   AND owner_worker_id = ?
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ?
+                   )
+                """,
+                (now, conversation_id, lifecycle_epoch, worker_id, conversation_id),
+            )
+            return cur.rowcount == 1
+
+    def complete_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Race-guarded completion. Epoch-scoped. Returns True iff:
+          - A running episode exists at the caller's ``lifecycle_epoch``.
+          - The caller is the current owner.
+          - The caller's epoch equals the conversation's current
+            ``lifecycle_epoch`` (stale-epoch guard — see
+            ``refresh_ingestion_heartbeat`` for the same mechanism).
+          - No untagged canonical rows remain (NOT EXISTS guard).
+        Returns False if any condition fails.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET status = 'completed', completed_at = ?
+                 WHERE conversation_id = ? AND status = 'running'
+                   AND lifecycle_epoch = ?
+                   AND owner_worker_id = ?
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ?
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM canonical_turns
+                        WHERE conversation_id = ? AND tagged_at IS NULL
+                   )
+                """,
+                (
+                    now, conversation_id, lifecycle_epoch, worker_id,
+                    conversation_id, conversation_id,
+                ),
+            )
+            return cur.rowcount == 1
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
