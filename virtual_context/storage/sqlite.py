@@ -452,10 +452,18 @@ def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
                 )
     except Exception:
         fact_signals = []
+    # turn_number is a VIEW-only column computed by canonical_turns_ordinal via
+    # ROW_NUMBER(). Base-table queries (e.g. iter_untagged_canonical_rows, which
+    # hits the partial index idx_canonical_turns_conv_untagged and therefore
+    # cannot join through the view) won't supply it — default to -1.
+    try:
+        turn_number = row["turn_number"]
+    except (KeyError, IndexError):
+        turn_number = -1
     return CanonicalTurnRow(
         conversation_id=row["conversation_id"],
         canonical_turn_id=str(row["canonical_turn_id"]) if "canonical_turn_id" in row.keys() and row["canonical_turn_id"] else "",
-        turn_number=row["turn_number"],
+        turn_number=turn_number,
         turn_group_number=int(row["turn_group_number"]) if "turn_group_number" in row.keys() and row["turn_group_number"] is not None else -1,
         sort_key=float(row["sort_key"]) if "sort_key" in row.keys() and row["sort_key"] is not None else 0.0,
         turn_hash=(row["turn_hash"] if "turn_hash" in row.keys() else "") or "",
@@ -3567,21 +3575,25 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[CanonicalTurnRow]:
         """Epoch-guarded. Stale-epoch caller receives an empty list.
 
-        Query runs against the ``canonical_turns_ordinal`` view (which exposes
-        ``turn_number`` computed via ``ROW_NUMBER()``; see
-        ``_ensure_canonical_turn_views``) so the existing
-        ``_row_to_canonical_turn`` helper — which accesses ``row["turn_number"]``
-        unconditionally on SQLite — works unchanged. We JOIN against
-        ``conversations.lifecycle_epoch`` so a caller carrying a stale epoch
-        simply matches zero rows at SQL level rather than raising. Ordering
-        uses ``sort_key`` (base-table column), NOT ``turn_number`` (a VIEW
-        column that is recomputed on every read and not stable under
-        concurrent writes).
+        Query runs against the ``canonical_turns`` base table — NOT the
+        ``canonical_turns_ordinal`` view — so the partial index
+        ``idx_canonical_turns_conv_untagged ON canonical_turns
+        (conversation_id, sort_key) WHERE tagged_at IS NULL`` can drive the
+        walk (EXPLAIN QUERY PLAN: ``SEARCH ct USING INDEX
+        idx_canonical_turns_conv_untagged``). Routing through the view forces
+        SQLite into a full scan of ``canonical_turns`` plus a temp B-tree
+        sort, which is unacceptable on the tagger hot path.
+        ``turn_number`` is a view-only computed column; omitting it here is
+        tolerated by ``_row_to_canonical_turn`` (defaults to ``-1``). We JOIN
+        against ``conversations.lifecycle_epoch`` so a caller carrying a
+        stale epoch simply matches zero rows at SQL level rather than
+        raising. Ordering uses ``sort_key`` — the same column the partial
+        index is sorted on.
         """
         conn = self._get_conn()
         rows = conn.execute(
             """
-            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_number, ct.turn_group_number,
+            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
                    ct.sort_key, ct.turn_hash, ct.hash_version,
                    ct.normalized_user_text, ct.normalized_assistant_text,
                    ct.user_content, ct.assistant_content,
@@ -3591,7 +3603,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ct.tagged_at, ct.compacted_at,
                    ct.first_seen_at, ct.last_seen_at,
                    ct.source_batch_id, ct.created_at, ct.updated_at
-              FROM canonical_turns_ordinal AS ct
+              FROM canonical_turns AS ct
               JOIN conversations AS c
                 ON c.conversation_id = ct.conversation_id
              WHERE ct.conversation_id = ?
