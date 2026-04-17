@@ -385,6 +385,16 @@ class IngestReconciler:
         # existing enrichment here does not affect row identity or ordering.
         if not (row.session_date or "").strip() and (existing_row.session_date or "").strip():
             row.session_date = existing_row.session_date
+        # turn_group_number is derived by recompute_canonical_turn_groups()
+        # after writes settle. On the exact_resend path (ingest_single) we
+        # return early without calling recompute, so a prepared row with the
+        # default -1 would clobber an already-assigned group on the existing
+        # row. Concurrent writers (proxy single + REST batch) race on this:
+        # if REST wrote groups 0,0,1,1 then PROXY exact_resends rows 0,1,
+        # the overwrite leaves those rows at -1 while rows 2,3 keep group 1.
+        # Inheriting the existing group closes that race.
+        if row.turn_group_number < 0 and existing_row.turn_group_number >= 0:
+            row.turn_group_number = existing_row.turn_group_number
 
     def _prepare_message_row(
         self,
