@@ -841,6 +841,42 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("conversations table bootstrap failed", exc_info=True)
+        # Progress-tracking columns for the DB-derived progress model.
+        # Mirrors the SQLite schema (see sqlite.py):
+        #   covered_ingestible_entries — how many ingestible payload entries
+        #     this canonical row represents (set at insert time). The progress
+        #     denominator is SUM(covered_ingestible_entries).
+        #   tagged_at — timestamp set when the tagger enriches the row. The
+        #     progress numerator is
+        #     SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
+        # The two partial indexes below make each SUM path an index-only scan.
+        # Postgres supports ADD COLUMN IF NOT EXISTS natively, so the ALTERs
+        # are idempotent. Note: ``tagged_at`` already exists on the base
+        # canonical_turns schema (as TEXT) — the ADD COLUMN IF NOT EXISTS is
+        # defensive parity with SQLite. The partial indexes use sort_key
+        # (not turn_number) because turn_number is view-derived on both
+        # backends; sort_key is the physical ordering column.
+        try:
+            conn.execute("""
+                ALTER TABLE canonical_turns
+                    ADD COLUMN IF NOT EXISTS covered_ingestible_entries INT NOT NULL DEFAULT 1
+            """)
+            conn.execute("""
+                ALTER TABLE canonical_turns
+                    ADD COLUMN IF NOT EXISTS tagged_at TIMESTAMPTZ NULL
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_untagged
+                    ON canonical_turns (conversation_id, sort_key)
+                    WHERE tagged_at IS NULL
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_tagged
+                    ON canonical_turns (conversation_id, tagged_at)
+                    WHERE tagged_at IS NOT NULL
+            """)
+        except Exception:
+            logger.warning("canonical_turns progress columns bootstrap failed", exc_info=True)
         # FTS setup
         try:
             conn.execute(FTS_SQL)
