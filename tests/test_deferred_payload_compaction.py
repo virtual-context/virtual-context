@@ -363,3 +363,100 @@ class TestStorageBackendFields:
         assert loaded is not None
         assert loaded.flushed_prefix_messages == 0
         assert loaded.last_request_time == 0.0
+
+
+# ---------------------------------------------------------------------------
+# ProxyState._advance_compaction_watermark
+# ---------------------------------------------------------------------------
+
+class TestAdvanceCompactionWatermark:
+    """Validate the belt-and-braces refresh after the branch simplification:
+    the method must derive compacted_prefix_messages from canonical rows and
+    unconditionally clamp flushed_prefix_messages down with a single min(),
+    never let flushed exceed compacted.
+    """
+
+    def _make_engine(self, tmp_path):
+        from datetime import datetime, timezone
+
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+
+        db_path = str(tmp_path / "store.db")
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine = VirtualContextEngine(config=config)
+        return engine, datetime.now(timezone.utc).isoformat()
+
+    def test_refresh_advances_compacted_from_canonical_rows(self, tmp_path):
+        from virtual_context.proxy.server import ProxyState
+
+        engine, now = self._make_engine(tmp_path)
+        for i in range(2):
+            engine._store.save_canonical_turn(
+                engine.config.conversation_id, i, f"u{i}", f"a{i}",
+                primary_tag="topic", tags=["topic"],
+                tagged_at=now, compacted_at=now,
+            )
+
+        state = ProxyState(engine)
+        engine._engine_state.compacted_prefix_messages = 0
+        engine._engine_state.flushed_prefix_messages = 0
+
+        state._advance_compaction_watermark()
+
+        # Two compacted turn-groups = 4 messages derived.
+        assert engine._engine_state.compacted_prefix_messages == 4
+        # Flushed clamped to min(0, 4) = 0.
+        assert engine._engine_state.flushed_prefix_messages == 0
+
+    def test_refresh_clamps_flushed_that_exceeds_compacted(self, tmp_path):
+        from virtual_context.proxy.server import ProxyState
+
+        engine, now = self._make_engine(tmp_path)
+        # One compacted turn → derived = 2 messages.
+        engine._store.save_canonical_turn(
+            engine.config.conversation_id, 0, "u0", "a0",
+            primary_tag="topic", tags=["topic"],
+            tagged_at=now, compacted_at=now,
+        )
+
+        state = ProxyState(engine)
+        # In-memory state has flushed over-claiming past derived compacted.
+        engine._engine_state.compacted_prefix_messages = 0
+        engine._engine_state.flushed_prefix_messages = 99
+
+        state._advance_compaction_watermark()
+
+        assert engine._engine_state.compacted_prefix_messages == 2
+        # min(99, 2) = 2 — flushed clamped down via single min(), never up.
+        assert engine._engine_state.flushed_prefix_messages == 2
+
+    def test_refresh_preserves_flushed_when_below_compacted(self, tmp_path):
+        """The min() clamp never RAISES flushed toward compacted — the
+        legacy `if _ct > _ft: _ft = _ct` branch that auto-advanced flushed
+        has been removed. Session-state-authoritative flushed value stays.
+        """
+        from virtual_context.proxy.server import ProxyState
+
+        engine, now = self._make_engine(tmp_path)
+        for i in range(3):
+            engine._store.save_canonical_turn(
+                engine.config.conversation_id, i, f"u{i}", f"a{i}",
+                primary_tag="topic", tags=["topic"],
+                tagged_at=now, compacted_at=now,
+            )
+
+        state = ProxyState(engine)
+        engine._engine_state.compacted_prefix_messages = 0
+        engine._engine_state.flushed_prefix_messages = 2
+
+        state._advance_compaction_watermark()
+
+        # Derived compacted advanced to 6, but flushed stays at 2 (legit
+        # session-scoped under-reporting of flush progress).
+        assert engine._engine_state.compacted_prefix_messages == 6
+        assert engine._engine_state.flushed_prefix_messages == 2

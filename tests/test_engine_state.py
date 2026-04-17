@@ -348,6 +348,161 @@ class TestEngineStateIntegration:
         assert engine2._engine_state.last_compacted_turn == -1
         assert [row[0] for row in engine2._restored_conversation_history] == [0]
 
+    def test_stale_checkpoint_over_claims_are_replaced_by_derivation(self, tmp_path):
+        """Worker-A compaction commits canonical rows; Worker-B's stale checkpoint
+        over-claims compaction progress. On cold restore, derivation from
+        canonical rows must override the stale value.
+
+        This is the multi-worker authority invariant: canonical_at columns are
+        SQL-visible across workers, but Redis/checkpoint caches are not. A
+        restored engine must trust the DB, not the snapshot.
+        """
+        from datetime import datetime, timezone
+
+        from virtual_context.config import load_config
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.types import EngineStateSnapshot
+
+        db_path = str(tmp_path / "store.db")
+        config1 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine1 = VirtualContextEngine(config=config1)
+        conversation_id = engine1.config.conversation_id
+
+        now = datetime.now(timezone.utc).isoformat()
+        # Write 3 canonical rows: first 2 compacted, 3rd uncompacted.
+        # Derived compacted_prefix_messages should be 4 (2 compacted turns * 2 msgs/turn).
+        engine1._store.save_canonical_turn(
+            conversation_id, 0, "u0", "a0",
+            primary_tag="topic", tags=["topic"],
+            tagged_at=now, compacted_at=now,
+        )
+        engine1._store.save_canonical_turn(
+            conversation_id, 1, "u1", "a1",
+            primary_tag="topic", tags=["topic"],
+            tagged_at=now, compacted_at=now,
+        )
+        engine1._store.save_canonical_turn(
+            conversation_id, 2, "u2", "a2",
+            primary_tag="topic", tags=["topic"],
+            tagged_at=now, compacted_at=None,
+        )
+        # Persist a STALE checkpoint claiming more compacted than DB reality.
+        # The engine must discard this and use the derived value (4).
+        engine1._store.save_engine_state(EngineStateSnapshot(
+            conversation_id=conversation_id,
+            compacted_prefix_messages=12,  # stale: claims 6 turns compacted
+            flushed_prefix_messages=10,     # stale: also over-claims
+            turn_tag_entries=[],
+            turn_count=3,
+            last_compacted_turn=5,           # stale
+            last_completed_turn=2,
+            last_indexed_turn=2,
+            checkpoint_version=3,
+        ))
+        engine1.close()
+
+        # Cold restore: derivation must override the stale checkpoint.
+        config2 = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        config2.conversation_id = conversation_id
+        engine2 = VirtualContextEngine(config=config2)
+
+        # Derived from canonical rows: 2 compacted turns → 4 messages.
+        assert engine2._engine_state.compacted_prefix_messages == 4
+        assert engine2._engine_state.last_compacted_turn == 1
+        # flushed clamped to min(stale=10, derived=4) = 4.
+        assert engine2._engine_state.flushed_prefix_messages == 4
+
+    def test_flushed_clamped_to_derived_compacted_on_hydrate(self, tmp_path):
+        """hydrate_from_session_state must clamp flushed to min(flushed, derived)
+        so stale session state cannot over-report flush progress.
+        """
+        from datetime import datetime, timezone
+
+        from virtual_context.config import load_config
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.proxy.session_state import SessionState
+
+        db_path = str(tmp_path / "store.db")
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine = VirtualContextEngine(config=config)
+        conversation_id = engine.config.conversation_id
+
+        now = datetime.now(timezone.utc).isoformat()
+        # 1 compacted turn in the DB → derived compacted = 2.
+        engine._store.save_canonical_turn(
+            conversation_id, 0, "u0", "a0",
+            primary_tag="topic", tags=["topic"],
+            tagged_at=now, compacted_at=now,
+        )
+
+        # Session state claims flushed=8 (stale over-report) and compacted=6.
+        # Both should be overridden: compacted→2 (derived), flushed→2 (clamped).
+        state = SessionState()
+        state.compacted_prefix_messages = 6
+        state.flushed_prefix_messages = 8
+        state.flushed_prefix_messages_present = True
+        state.last_compacted_turn = 2
+
+        engine.hydrate_from_session_state(state)
+
+        assert engine._engine_state.compacted_prefix_messages == 2
+        assert engine._engine_state.last_compacted_turn == 0
+        assert engine._engine_state.flushed_prefix_messages == 2
+
+    def test_flushed_below_derived_is_preserved_on_hydrate(self, tmp_path):
+        """When session flushed < derived compacted (legit under-reporting due
+        to mid-flight flush state), the clamp is a no-op — keep session's
+        value. The invariant only clamps down, never up.
+        """
+        from datetime import datetime, timezone
+
+        from virtual_context.config import load_config
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.proxy.session_state import SessionState
+
+        db_path = str(tmp_path / "store.db")
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+            "tag_generator": {"type": "keyword"},
+        })
+        engine = VirtualContextEngine(config=config)
+        conversation_id = engine.config.conversation_id
+
+        now = datetime.now(timezone.utc).isoformat()
+        # 2 compacted turns → derived compacted = 4.
+        for i in range(2):
+            engine._store.save_canonical_turn(
+                conversation_id, i, f"u{i}", f"a{i}",
+                primary_tag="topic", tags=["topic"],
+                tagged_at=now, compacted_at=now,
+            )
+
+        # Session state under-reports flush (2 < derived 4) — this is valid:
+        # compaction happened, but this session hasn't flushed all of it yet.
+        state = SessionState()
+        state.compacted_prefix_messages = 4
+        state.flushed_prefix_messages = 2
+        state.flushed_prefix_messages_present = True
+        state.last_compacted_turn = 1
+
+        engine.hydrate_from_session_state(state)
+
+        assert engine._engine_state.compacted_prefix_messages == 4
+        assert engine._engine_state.flushed_prefix_messages == 2  # preserved
+
 
 # ---------------------------------------------------------------------------
 # Vocabulary bootstrap
