@@ -235,3 +235,56 @@ def test_increment_raises_keyerror_for_unknown_pg():
     s = _store()
     with pytest.raises(KeyError):
         s.increment_lifecycle_epoch_on_resurrect(_cid())
+
+
+def test_delete_conversation_removes_lifecycle_and_progress_rows_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    s.save_canonical_turn(cid, 0, "u0", "a0")
+    conn = s._get_conn()
+    ep_id = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO ingestion_episode (
+            episode_id, conversation_id, lifecycle_epoch,
+            raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 96, NOW(), 'running', 'w1', NOW())
+        """,
+        (ep_id, cid),
+    )
+    conn.execute(
+        """
+        INSERT INTO compaction_operation (
+            operation_id, conversation_id, lifecycle_epoch,
+            phase_index, phase_count, phase_name, status,
+            started_at, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 0, 3, 'queued', 'queued', NOW(), 'w1', NOW())
+        """,
+        (op_id, cid),
+    )
+
+    s.delete_conversation(cid)
+
+    conv_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM conversations WHERE conversation_id = %s",
+        (cid,),
+    ).fetchone()["c"]
+    episode_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM ingestion_episode WHERE conversation_id = %s",
+        (cid,),
+    ).fetchone()["c"]
+    compaction_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM compaction_operation WHERE conversation_id = %s",
+        (cid,),
+    ).fetchone()["c"]
+    canonical_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM canonical_turns WHERE conversation_id = %s",
+        (cid,),
+    ).fetchone()["c"]
+
+    assert int(conv_count) == 0
+    assert int(episode_count) == 0
+    assert int(compaction_count) == 0
+    assert int(canonical_count) == 0
