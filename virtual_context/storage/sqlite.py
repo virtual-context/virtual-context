@@ -1276,12 +1276,40 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 COMMIT;
                 """
             )
+            pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
+            by_name = {row["name"]: row for row in pragma_rows}
         else:
             for column in lifecycle_columns:
                 try:
                     conn.execute(f"UPDATE canonical_turns SET {column} = NULL WHERE {column} = ''")
                 except sqlite3.OperationalError:
                     pass
+        # Progress-tracking columns for the DB-derived progress model:
+        #   covered_ingestible_entries — how many ingestible payload entries
+        #     this canonical row represents (set at insert time). The progress
+        #     denominator is SUM(covered_ingestible_entries).
+        #   tagged_at — ISO timestamp set when the tagger enriches the row.
+        #     The progress numerator is
+        #     SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
+        # The two partial indexes below make each SUM path an index-only scan.
+        if "covered_ingestible_entries" not in by_name:
+            conn.execute(
+                "ALTER TABLE canonical_turns ADD COLUMN covered_ingestible_entries INTEGER NOT NULL DEFAULT 1"
+            )
+        if "tagged_at" not in by_name:
+            conn.execute(
+                "ALTER TABLE canonical_turns ADD COLUMN tagged_at TEXT NULL"
+            )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_untagged
+                   ON canonical_turns (conversation_id, sort_key)
+                   WHERE tagged_at IS NULL"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_tagged
+                   ON canonical_turns (conversation_id, tagged_at)
+                   WHERE tagged_at IS NOT NULL"""
+        )
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
         conn = self._get_conn()
