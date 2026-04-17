@@ -99,6 +99,52 @@ def test_read_progress_snapshot_derives_total_and_done_from_canonical_pg():
     assert snap.done_ingestible == 2
 
 
+def test_recompute_canonical_turn_groups_assigns_explicit_groups_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    now = _now()
+    conn = s._get_conn()
+    rows = [
+        (str(uuid.uuid4()), "hello", "", 1000.0),
+        (str(uuid.uuid4()), "", "hi", 2000.0),
+        (str(uuid.uuid4()), "follow-up", "", 3000.0),
+    ]
+    for canonical_turn_id, user_content, assistant_content, sort_key in rows:
+        conn.execute(
+            """
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_group_number,
+                turn_hash, hash_version, normalized_user_text,
+                normalized_assistant_text, user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, created_at, updated_at
+            ) VALUES (%s, %s, -1, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
+            """,
+            (
+                canonical_turn_id,
+                cid,
+                canonical_turn_id[:16],
+                user_content,
+                assistant_content,
+                user_content,
+                assistant_content,
+                sort_key,
+                str(uuid.uuid4()),
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
+
+    changed = s.recompute_canonical_turn_groups(cid)
+    rows_after = s.get_all_canonical_turns(cid)
+
+    assert changed == 3
+    assert [row.turn_group_number for row in rows_after] == [0, 0, 1]
+
+
 def test_read_progress_snapshot_includes_active_episode_pg():
     s = _store()
     cid = _cid()

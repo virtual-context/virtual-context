@@ -256,7 +256,25 @@ class TaggingPipeline:
         entry: "TurnTagEntry",
         user_msg: "Message",
         asst_msg: "Message",
+        *,
+        pair_messages: list["Message"] | None = None,
+        existing_rows: list["CanonicalTurnRow"] | None = None,
+        append_missing: bool = True,
     ) -> None:
+        if existing_rows is not None:
+            persisted = self._persist_existing_canonical_rows(
+                entry,
+                pair_messages or [],
+                existing_rows,
+            )
+            if persisted:
+                return
+            if not append_missing:
+                raise RuntimeError(
+                    "strict canonical tagging could not map payload messages to "
+                    f"existing rows for logical turn {entry.turn_number}"
+                )
+
         user_hash, user_norm, _ = compute_turn_hash_from_raw(
             user_msg.content,
             "",
@@ -358,6 +376,81 @@ class TaggingPipeline:
         )
         if result.rows:
             entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
+
+    def _persist_existing_canonical_rows(
+        self,
+        entry: "TurnTagEntry",
+        pair_messages: list["Message"],
+        existing_rows: list["CanonicalTurnRow"],
+    ) -> bool:
+        """Update pre-persisted canonical rows in-place for payload ingest.
+
+        ``handle_prepare_payload`` persists canonical rows before the legacy
+        pair-based tagger runs. During that follow-up tagging pass we must only
+        enrich and mark those existing rows; appending fresh canonical rows here
+        would inflate the DB-derived denominator mid-run.
+        """
+
+        source_messages = [msg for msg in pair_messages if msg.role in {"user", "assistant"}]
+        if not source_messages or not existing_rows:
+            return False
+        if len(source_messages) != len(existing_rows):
+            return False
+
+        tagged_at = utcnow_iso()
+        sorted_rows = sorted(existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id))
+        for row, message in zip(sorted_rows, source_messages, strict=False):
+            role = message.role
+            user_content = message.content if role == "user" else ""
+            assistant_content = message.content if role == "assistant" else ""
+            row_has_user = bool((row.user_content or "").strip())
+            row_has_assistant = bool((row.assistant_content or "").strip())
+            if row_has_user and not row_has_assistant and role != "user":
+                return False
+            if row_has_assistant and not row_has_user and role != "assistant":
+                return False
+
+            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+                user_content,
+                assistant_content,
+                version=row.hash_version or HASH_VERSION,
+            )
+            if role == "user":
+                user_raw_content = json.dumps(message.raw_content) if message.raw_content else None
+                assistant_raw_content = None
+            else:
+                user_raw_content = None
+                assistant_raw_content = json.dumps(message.raw_content) if message.raw_content else None
+            self._store.save_canonical_turn(
+                self.config.conversation_id,
+                entry.turn_number,
+                user_content,
+                assistant_content,
+                user_raw_content=user_raw_content,
+                assistant_raw_content=assistant_raw_content,
+                primary_tag=entry.primary_tag,
+                tags=list(entry.tags),
+                session_date=entry.session_date,
+                sender=entry.sender,
+                fact_signals=list(entry.fact_signals),
+                code_refs=list(entry.code_refs),
+                canonical_turn_id=row.canonical_turn_id,
+                sort_key=row.sort_key,
+                turn_hash=turn_hash,
+                hash_version=row.hash_version or HASH_VERSION,
+                normalized_user_text=normalized_user_text,
+                normalized_assistant_text=normalized_assistant_text,
+                tagged_at=tagged_at,
+                compacted_at=row.compacted_at,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at or tagged_at,
+                source_batch_id=row.source_batch_id,
+                created_at=row.created_at,
+                updated_at=tagged_at,
+                turn_group_number=row.turn_group_number,
+            )
+        entry.canonical_turn_id = sorted_rows[0].canonical_turn_id or entry.canonical_turn_id
+        return True
 
     def _get_recent_context(
         self, history: list[Message], n_pairs: int, exclude_last: int = 2,
@@ -872,6 +965,8 @@ class TaggingPipeline:
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
+        require_existing_canonical: bool = False,
+        expected_lifecycle_epoch: int | None = None,
     ) -> int:
         """Bootstrap TurnTagIndex from pre-existing conversation history.
 
@@ -906,6 +1001,31 @@ class TaggingPipeline:
         history_turns = pair_messages_into_turns(list(history_messages))
         _total_turns = len(history_turns)
         n_context = self.config.tag_generator.context_lookback_pairs
+        strict_rows: list["CanonicalTurnRow"] = []
+        strict_row_cursor = 0
+        if require_existing_canonical:
+            expected_rows = sum(
+                1 for msg in history_messages if msg.role in {"user", "assistant"}
+            )
+            if expected_lifecycle_epoch is not None:
+                strict_rows = list(
+                    self._store.iter_untagged_canonical_rows(
+                        conversation_id=self.config.conversation_id,
+                        expected_lifecycle_epoch=expected_lifecycle_epoch,
+                        batch_size=max(expected_rows, 32),
+                    )
+                )
+            else:
+                strict_rows = [
+                    row
+                    for row in self._store.get_all_canonical_turns(self.config.conversation_id)
+                    if not row.tagged_at
+                ]
+            if len(strict_rows) < expected_rows:
+                raise RuntimeError(
+                    "strict canonical tagging expected at least "
+                    f"{expected_rows} untagged rows, found {len(strict_rows)}"
+                )
         # Seed from DB when resuming bulk ingest mid-conversation: the caller
         # passes turn_offset > 0 when there are already-persisted turns that
         # preceded this batch. Without seeding, the first few turns of the
@@ -924,6 +1044,15 @@ class TaggingPipeline:
 
         for batch_turn, pair in enumerate(history_turns):
             user_msg, asst_msg = self._split_pair_messages(pair.messages)
+            strict_pair_rows: list["CanonicalTurnRow"] | None = None
+            if require_existing_canonical:
+                pair_row_count = sum(
+                    1 for msg in pair.messages if msg.role in {"user", "assistant"}
+                )
+                strict_pair_rows = strict_rows[
+                    strict_row_cursor: strict_row_cursor + pair_row_count
+                ]
+                strict_row_cursor += pair_row_count
             turn_tool_refs = None
             if tool_output_refs_by_turn is not None:
                 turn_tool_refs = tool_output_refs_by_turn.get(batch_turn, [])
@@ -955,8 +1084,17 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    self._persist_canonical_turn(entry, user_msg, asst_msg)
+                    self._persist_canonical_turn(
+                        entry,
+                        user_msg,
+                        asst_msg,
+                        pair_messages=pair.messages,
+                        existing_rows=strict_pair_rows,
+                        append_missing=not require_existing_canonical,
+                    )
                 except Exception:
+                    if require_existing_canonical:
+                        raise
                     pass
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
@@ -1001,8 +1139,17 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    self._persist_canonical_turn(entry, user_msg, asst_msg)
+                    self._persist_canonical_turn(
+                        entry,
+                        user_msg,
+                        asst_msg,
+                        pair_messages=pair.messages,
+                        existing_rows=strict_pair_rows,
+                        append_missing=not require_existing_canonical,
+                    )
                 except Exception:
+                    if require_existing_canonical:
+                        raise
                     pass
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
@@ -1120,8 +1267,17 @@ class TaggingPipeline:
             )
             self._turn_tag_index.append(entry)
             try:
-                self._persist_canonical_turn(entry, user_msg, asst_msg)
+                self._persist_canonical_turn(
+                    entry,
+                    user_msg,
+                    asst_msg,
+                    pair_messages=pair.messages,
+                    existing_rows=strict_pair_rows,
+                    append_missing=not require_existing_canonical,
+                )
             except Exception:
+                if require_existing_canonical:
+                    raise
                 pass
             self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
             ingested += 1

@@ -3514,7 +3514,7 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         changed = 0
         for turn_group_number, canonical_turn_id in assignments:
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE canonical_turns
                    SET turn_group_number = %s
                    WHERE conversation_id = %s
@@ -3522,7 +3522,7 @@ class PostgresStore(ContextStore):
                      AND turn_group_number <> %s""",
                 (turn_group_number, conversation_id, canonical_turn_id, turn_group_number),
             )
-            changed += int(conn.rowcount or 0)
+            changed += int(cursor.rowcount or 0)
         return changed
 
     def get_canonical_turn_rows(

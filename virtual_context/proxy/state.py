@@ -3183,6 +3183,8 @@ class ProxyState:
         ingest_kwargs = {
             "progress_callback": on_progress,
             "turn_offset": baseline,
+            "require_existing_canonical": True,
+            "expected_lifecycle_epoch": self.engine._engine_state.lifecycle_epoch,
         }
         if tool_output_refs_by_turn is not None:
             ingest_kwargs["tool_output_refs_by_turn"] = tool_output_refs_by_turn
