@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from .progress_snapshot import ProgressSnapshot
 
 
 class ContextStore(ABC):
@@ -352,6 +353,17 @@ class ContextStore(ABC):
 
         TOCTOU-safe: concurrent resurrect calls cannot double-bump.
         Raises KeyError if no row exists.
+        """
+        raise NotImplementedError
+
+    def read_progress_snapshot(self, conversation_id: str) -> ProgressSnapshot:
+        """Return a point-in-time ProgressSnapshot for ``conversation_id``.
+
+        ``total_ingestible`` / ``done_ingestible`` are derived at read
+        time from SUM(covered_ingestible_entries) over ``canonical_turns``
+        (filtered by ``tagged_at IS NOT NULL`` for the numerator) so they
+        can never drift from canonical truth.  Raises ``KeyError`` if the
+        conversation row doesn't exist.
         """
         raise NotImplementedError
 
