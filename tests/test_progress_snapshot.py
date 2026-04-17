@@ -69,6 +69,32 @@ def test_read_progress_snapshot_includes_active_episode(tmp_path: Path):
     assert snap.active_episode.owner_worker_id == "workerA"
 
 
+def test_read_progress_snapshot_ignores_stale_running_episode_from_prior_epoch(tmp_path: Path):
+    s = SQLiteStore(tmp_path / "vc.db")
+    s.upsert_conversation(tenant_id="t", conversation_id="c")
+    s.mark_conversation_deleted("c")
+    assert s.increment_lifecycle_epoch_on_resurrect("c") == 2
+    now = _now()
+    with s._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO ingestion_episode (
+                episode_id, conversation_id, lifecycle_epoch,
+                raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+            ) VALUES ('ep_old', 'c', 1, 500, ?, 'running', 'old-worker', ?)
+        """, (now, now))
+        conn.execute("""
+            INSERT INTO ingestion_episode (
+                episode_id, conversation_id, lifecycle_epoch,
+                raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+            ) VALUES ('ep_new', 'c', 2, 96, ?, 'running', 'new-worker', ?)
+        """, (now, now))
+    snap = s.read_progress_snapshot("c")
+    assert snap.lifecycle_epoch == 2
+    assert snap.active_episode is not None
+    assert snap.active_episode.episode_id == "ep_new"
+    assert snap.active_episode.owner_worker_id == "new-worker"
+
+
 def test_read_progress_snapshot_skips_completed_episode(tmp_path: Path):
     s = SQLiteStore(tmp_path / "vc.db")
     s.upsert_conversation(tenant_id="t", conversation_id="c")
@@ -104,6 +130,35 @@ def test_read_progress_snapshot_includes_active_compaction(tmp_path: Path):
     assert snap.active_compaction.phase_index == 2
     assert snap.active_compaction.phase_count == 5
     assert snap.active_compaction.status == "running"
+
+
+def test_read_progress_snapshot_ignores_stale_active_compaction_from_prior_epoch(tmp_path: Path):
+    s = SQLiteStore(tmp_path / "vc.db")
+    s.upsert_conversation(tenant_id="t", conversation_id="c")
+    s.mark_conversation_deleted("c")
+    assert s.increment_lifecycle_epoch_on_resurrect("c") == 2
+    now = _now()
+    with s._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO compaction_operation (
+                operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, owner_worker_id, heartbeat_ts
+            ) VALUES ('op_old', 'c', 1, 1, 5, 'stale', 'running', ?, 'old-worker', ?)
+        """, (now, now))
+        conn.execute("""
+            INSERT INTO compaction_operation (
+                operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, owner_worker_id, heartbeat_ts
+            ) VALUES ('op_new', 'c', 2, 0, 5, 'fresh', 'queued', ?, 'new-worker', ?)
+        """, (now, now))
+    snap = s.read_progress_snapshot("c")
+    assert snap.lifecycle_epoch == 2
+    assert snap.active_compaction is not None
+    assert snap.active_compaction.operation_id == "op_new"
+    assert snap.active_compaction.phase_name == "fresh"
+    assert snap.active_compaction.status == "queued"
 
 
 def test_read_progress_snapshot_queued_compaction_is_also_active(tmp_path: Path):
