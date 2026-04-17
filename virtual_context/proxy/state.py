@@ -1085,10 +1085,56 @@ class ProxyState:
             return PhaseDecision(phase="ingesting", started_tagger=True)
         return PhaseDecision(phase="ingesting", started_tagger=False)
 
+    def _another_worker_owns_lease(self, conversation_id: str) -> bool:
+        """Defense-in-depth check: return True iff an active ingestion
+        episode exists and is owned by a DIFFERENT worker than this one.
+
+        This is belt-and-suspenders: the authoritative gate lives in
+        ``server.py`` (which skips both legacy spawn paths when
+        ``PhaseDecision.started_tagger`` is False). This helper handles
+        callers that bypass the server-side gate — direct test harnesses,
+        older entry points, and any future code that invokes the legacy
+        spawners without routing through ``handle_prepare_payload``.
+
+        A missing / failed snapshot read is treated as "don't block" — the
+        server-side gate already covers the normal path, so spurious lock-out
+        here would only break legacy fallback behaviour in edge cases. To
+        keep the check robust in test harnesses that use ``MagicMock`` for
+        the store, only a real ``ProgressSnapshot`` with a real
+        ``ActiveEpisodeSnapshot`` triggers the block — a non-typed mock
+        sentinel reads as "no active episode".
+        """
+        from ..core.progress_snapshot import (
+            ActiveEpisodeSnapshot,
+            ProgressSnapshot,
+        )
+        try:
+            snap = self.engine._store.read_progress_snapshot(conversation_id)
+        except Exception:
+            return False
+        if not isinstance(snap, ProgressSnapshot):
+            return False
+        active = snap.active_episode
+        if not isinstance(active, ActiveEpisodeSnapshot):
+            return False
+        return active.owner_worker_id != self._worker_id
+
     def resume_pending_ingestion_if_needed(self) -> bool:
         """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""
         conversation_id = self.engine.config.conversation_id
         if not self.has_pending_indexing():
+            return False
+        # Defense-in-depth: refuse to spawn the legacy thread if another
+        # worker holds the ingestion lease. The server-side gate in
+        # ``prepare_payload`` already handles the primary path; this catches
+        # direct callers that bypass that gate.
+        if self._another_worker_owns_lease(conversation_id):
+            logger.info(
+                "resume_pending_ingestion_if_needed: skipping spawn — "
+                "active ingestion episode is owned by another worker "
+                "(conv=%s, this=%s)",
+                conversation_id[:12], self._worker_id,
+            )
             return False
         with self._ingestion_lock:
             if self._ingestion_thread is not None and self._ingestion_thread.is_alive():
@@ -2589,6 +2635,18 @@ class ProxyState:
             self._check_history_widening(history_messages, conversation_id)
             if conversation_id in self._ingested_conversations:
                 return
+        # Defense-in-depth: refuse to spawn the legacy thread if another
+        # worker holds the ingestion lease. The server-side gate in
+        # ``prepare_payload`` already handles the primary path; this catches
+        # direct callers that bypass that gate.
+        if self._another_worker_owns_lease(conversation_id):
+            logger.info(
+                "start_ingestion_if_needed: skipping spawn — "
+                "active ingestion episode is owned by another worker "
+                "(conv=%s, this=%s)",
+                conversation_id[:12], self._worker_id,
+            )
+            return
         with self._ingestion_lock:
             if conversation_id in self._ingested_conversations:
                 return
@@ -2762,6 +2820,7 @@ class ProxyState:
         """Background thread: ingest initial message history, then catch up any gap."""
         conversation_id = self.engine.config.conversation_id
         cancelled = False
+        completed_cleanly = False
         try:
             # Tag all initial history
             self._ingest_messages_with_progress(
@@ -2794,6 +2853,11 @@ class ProxyState:
                 self._ingestion_progress = (have, needed)
                 self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
 
+            # The catch-up loop exited without raising, and the cancel
+            # event was not set during a progress callback. This is the
+            # only path that owns the lease cleanly through to the end.
+            completed_cleanly = not self._ingestion_cancel.is_set()
+
         except _IngestionCancelled as e:
             # New request is taking over — exit cleanly without
             # transitioning to ACTIVE or marking as ingested.
@@ -2812,6 +2876,78 @@ class ProxyState:
             logger.error("Ingestion error: %s", e, exc_info=True)
         finally:
             if not cancelled:
+                # Lease-lifecycle ownership (section 2 of P1 migration):
+                # on clean completion, close the ingestion episode and
+                # flip the DB phase back to 'active'. This is the legacy
+                # thread's equivalent of the per-row ``_tagger_run``
+                # block at state.py:~605 that does the same thing.
+                #
+                # Ordering:
+                #   1. complete_ingestion_episode — atomic epoch-guarded
+                #      write. Returns False if the lease was stolen, the
+                #      epoch moved, or untagged rows remain.
+                #   2. set_phase — epoch-guarded phase flip. Returns False
+                #      on stale-epoch race between step 1 and step 2.
+                #   3. _publish_phase_transition — fires only on a
+                #      successful phase flip.
+                #
+                # Any failure path leaves the episode 'running' so the
+                # next arriving worker can pick it up; no exception
+                # propagates.
+                if completed_cleanly:
+                    try:
+                        my_epoch = int(self.engine._engine_state.lifecycle_epoch)
+                        episode_completed = self.engine._store.complete_ingestion_episode(
+                            conversation_id=conversation_id,
+                            lifecycle_epoch=my_epoch,
+                            worker_id=self._worker_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "complete_ingestion_episode raised for conv=%s — "
+                            "leaving episode 'running' for next worker",
+                            conversation_id[:12],
+                            exc_info=True,
+                        )
+                        episode_completed = False
+                    if episode_completed:
+                        try:
+                            phase_ok = self.engine._store.set_phase(
+                                conversation_id=conversation_id,
+                                lifecycle_epoch=my_epoch,
+                                phase="active",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "set_phase raised after successful episode "
+                                "completion for conv=%s — not publishing event",
+                                conversation_id[:12],
+                                exc_info=True,
+                            )
+                            phase_ok = False
+                        if phase_ok:
+                            try:
+                                self._publish_phase_transition("ingesting", "active")
+                            except Exception:
+                                logger.warning(
+                                    "_publish_phase_transition raised for conv=%s",
+                                    conversation_id[:12],
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.info(
+                                "legacy ingestion: complete_ingestion_episode "
+                                "succeeded but set_phase rejected (stale epoch) "
+                                "for conv=%s — skipping phase event",
+                                conversation_id[:12],
+                            )
+                    else:
+                        logger.info(
+                            "legacy ingestion finished but episode not "
+                            "completable — deferring to next worker "
+                            "(conv=%s)",
+                            conversation_id[:12],
+                        )
                 self._ingested_conversations.add(conversation_id)
                 self._advance_compaction_watermark()
                 # Record watermark for history widening detection
@@ -2860,6 +2996,36 @@ class ProxyState:
             if self._ingestion_cancel.is_set():
                 raise _IngestionCancelled(cum_done, _total)
             self._ingestion_progress = (cum_done, _total)
+            # Lease-lifecycle ownership (section 2 of P1 migration): refresh
+            # the ingestion heartbeat every 2 turns so a long-running legacy
+            # thread does not let its lease go stale and get stolen by
+            # another worker. If the refresh returns False the lease has
+            # been lost (stale epoch or ownership changed) — flip the
+            # cancel event so the pipeline bails out cleanly without
+            # completing the episode or flipping the phase.
+            if done > 0 and (done % 2) == 0:
+                try:
+                    refreshed = self.engine._store.refresh_ingestion_heartbeat(
+                        conversation_id=conversation_id,
+                        lifecycle_epoch=int(self.engine._engine_state.lifecycle_epoch),
+                        worker_id=self._worker_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "refresh_ingestion_heartbeat raised for conv=%s — "
+                        "treating as lease loss and cancelling",
+                        conversation_id[:12],
+                        exc_info=True,
+                    )
+                    refreshed = False
+                if not refreshed:
+                    logger.info(
+                        "refresh_ingestion_heartbeat returned False for conv=%s "
+                        "(worker=%s) — lease lost, cancelling ingestion",
+                        conversation_id[:12], self._worker_id,
+                    )
+                    self._ingestion_cancel.set()
+                    raise _IngestionCancelled(cum_done, _total)
             if self.metrics:
                 turn_num = entry.turn_number
                 local_turn = turn_num - baseline
