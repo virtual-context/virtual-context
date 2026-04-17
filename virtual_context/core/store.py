@@ -261,6 +261,48 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
+    def iter_untagged_canonical_rows(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[CanonicalTurnRow]:
+        """Return up to ``batch_size`` untagged canonical rows for a
+        conversation, scoped to the given ``expected_lifecycle_epoch``.
+
+        Implementations MUST JOIN against ``conversations.lifecycle_epoch``
+        so a stale caller whose in-memory epoch no longer matches the
+        authoritative row simply sees an empty list (no exception) — that
+        keeps a background tagger loop from mutating rows that belong to a
+        new lifecycle after a delete/resurrect. Rows MUST be ordered by
+        ``sort_key ASC`` (never ``turn_number``, which is a VIEW column
+        and not stable under concurrent writes). Concrete backends MUST
+        implement.
+        """
+        raise NotImplementedError
+
+    def mark_canonical_row_tagged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        """Flip a single canonical row's ``tagged_at`` to ``utcnow`` iff it is
+        currently untagged AND the conversation still sits at
+        ``expected_lifecycle_epoch``.
+
+        Returns ``True`` when exactly one row was updated, else ``False``.
+        The EXISTS subclause binds the write to the authoritative lifecycle
+        epoch so a stale tagger thread cannot accidentally touch a row that
+        belongs to a newer lifecycle after a delete/resurrect. Already-tagged
+        rows also return ``False`` (the ``tagged_at IS NULL`` predicate
+        filters them out), which makes the call safely idempotent on retry.
+        Concrete backends MUST implement.
+        """
+        raise NotImplementedError
+
     def mark_canonical_turns_compacted(
         self,
         conversation_id: str,
