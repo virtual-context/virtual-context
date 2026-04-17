@@ -910,6 +910,41 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("ingestion_episode table bootstrap failed", exc_info=True)
+        # Ownership + lifecycle record for a compaction operation. Mirrors
+        # the SQLite schema (see sqlite.py). Sibling to ingestion_episode
+        # but tracks the multi-phase compaction pipeline
+        # (phase_index/phase_count/phase_name) rather than raw payload
+        # counts. `status` carries a `queued` state in addition to the
+        # episode lifecycle so workers can enqueue work ahead of execution,
+        # and the partial unique index treats both `queued` and `running`
+        # as active — only one pending-or-in-flight compaction is allowed
+        # per (conversation, lifecycle_epoch) at the DB layer.
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS compaction_operation (
+                    operation_id      UUID PRIMARY KEY,
+                    conversation_id   UUID NOT NULL,
+                    lifecycle_epoch   INT NOT NULL,
+                    phase_index       INT NOT NULL DEFAULT 0,
+                    phase_count       INT NOT NULL,
+                    phase_name        VARCHAR NOT NULL,
+                    status            VARCHAR NOT NULL
+                                      CHECK (status IN ('queued','running','completed','cancelled','failed')),
+                    started_at        TIMESTAMPTZ NOT NULL,
+                    completed_at      TIMESTAMPTZ NULL,
+                    owner_worker_id   VARCHAR NOT NULL,
+                    heartbeat_ts      TIMESTAMPTZ NOT NULL,
+                    error_message     TEXT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
+                    ON compaction_operation(conversation_id, lifecycle_epoch)
+                    WHERE status IN ('queued','running')
+            """)
+        except Exception:
+            logger.warning("compaction_operation table bootstrap failed", exc_info=True)
         # FTS setup
         try:
             conn.execute(FTS_SQL)
