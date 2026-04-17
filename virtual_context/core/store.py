@@ -318,6 +318,38 @@ class ContextStore(ABC):
         return generation == self.get_conversation_generation(conversation_id)
 
     # ------------------------------------------------------------------
+    # Conversation row lifecycle (progress-bar redesign `conversations` table)
+    # ------------------------------------------------------------------
+    # These methods operate on the per-tenant `conversations` table that
+    # carries `lifecycle_epoch` + `phase` for the progress tracker and the
+    # delete+resurrect invariants. Distinct from the legacy lifecycle
+    # fencing above (`activate_conversation` et al.) which uses the older
+    # `conversation_lifecycle` table.
+
+    def upsert_conversation(self, *, tenant_id: str, conversation_id: str) -> None:
+        """Create the conversations row if missing; otherwise refresh updated_at.
+
+        Epoch starts at 1 on new rows; never bumped by this method.
+        """
+        raise NotImplementedError
+
+    def get_lifecycle_epoch(self, conversation_id: str) -> int:
+        """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
+        raise NotImplementedError
+
+    def mark_conversation_deleted(self, conversation_id: str) -> None:
+        """Admin-flow delete: sets phase='deleted' and stamps deleted_at."""
+        raise NotImplementedError
+
+    def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
+        """Bump lifecycle_epoch ONLY when phase == 'deleted'.
+
+        TOCTOU-safe: concurrent resurrect calls cannot double-bump.
+        Raises KeyError if no row exists.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
 

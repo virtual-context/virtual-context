@@ -2209,6 +2209,94 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return int(generation or 0) == 0
         return int(row[0]) == int(generation or 0) and not bool(row[1])
 
+    # ------------------------------------------------------------------
+    # Conversation row lifecycle (progress-bar redesign `conversations` table)
+    # ------------------------------------------------------------------
+    # These methods operate on the `conversations` table created in
+    # `_ensure_schema` (not the legacy `conversation_lifecycle` table used
+    # by activate_conversation/begin_conversation_deletion above). The new
+    # table carries `lifecycle_epoch` + `phase` for the progress tracker
+    # and delete+resurrect invariants.
+
+    def upsert_conversation(self, *, tenant_id: str, conversation_id: str) -> None:
+        """Create the conversations row if missing; otherwise just refresh updated_at.
+
+        Epoch starts at 1 on new rows; never bumped by this method.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    conversation_id, tenant_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (conversation_id, tenant_id, now, now),
+            )
+
+    def get_lifecycle_epoch(self, conversation_id: str) -> int:
+        """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return int(row[0])
+
+    def mark_conversation_deleted(self, conversation_id: str) -> None:
+        """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
+
+        Called only by the delete endpoint — caller is authoritative; no
+        epoch check needed.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = 'deleted',
+                       deleted_at = ?,
+                       updated_at = ?
+                 WHERE conversation_id = ?
+                """,
+                (now, now, conversation_id),
+            )
+
+    def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
+        """Bump lifecycle_epoch ONLY when phase == 'deleted'.
+
+        Concurrent resurrect calls cannot double-bump: the second caller
+        finds the guard fails and returns the current (already-bumped)
+        epoch. Raises KeyError if no row exists.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET lifecycle_epoch = lifecycle_epoch + 1,
+                       phase = 'init',
+                       deleted_at = NULL,
+                       updated_at = ?
+                 WHERE conversation_id = ?
+                   AND phase = 'deleted'
+                """,
+                (now, conversation_id),
+            )
+            row = conn.execute(
+                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            raise KeyError(conversation_id)
+        return int(row[0])
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
