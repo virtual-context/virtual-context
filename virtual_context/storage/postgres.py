@@ -3336,19 +3336,22 @@ class PostgresStore(ContextStore):
     ) -> list[CanonicalTurnRow]:
         """Epoch-guarded. Stale-epoch caller receives an empty list.
 
-        Query runs against the ``canonical_turns_ordinal`` view (which adds
-        ``turn_number`` via ``ROW_NUMBER()``; see ``_ensure_canonical_turn_views``)
-        to keep the shared ``_row_to_canonical_turn`` parser happy. We JOIN
-        against ``conversations.lifecycle_epoch`` so a stale-epoch caller
-        simply matches zero rows at SQL level rather than raising. Ordering
-        uses ``sort_key`` (base-table column), NOT ``turn_number`` (a VIEW
-        column that is recomputed on every read and not stable under
-        concurrent writes).
+        Query runs against the ``canonical_turns`` base table — NOT the
+        ``canonical_turns_ordinal`` view — so the partial index
+        ``idx_canonical_turns_conv_untagged ON canonical_turns
+        (conversation_id, sort_key) WHERE tagged_at IS NULL`` can drive the
+        index scan. Routing through the view forces a full scan plus sort,
+        which is unacceptable on the tagger hot path. ``turn_number`` is a
+        view-only computed column; omitting it here is tolerated by the
+        shared ``_row_to_canonical_turn`` parser (defaults to ``-1``). We
+        JOIN against ``conversations.lifecycle_epoch`` so a stale-epoch
+        caller matches zero rows at SQL level rather than raising. Ordering
+        uses ``sort_key`` — the same column the partial index is sorted on.
         """
         conn = self._get_conn()
         rows = conn.execute(
             """
-            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_number, ct.turn_group_number,
+            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
                    ct.sort_key, ct.turn_hash, ct.hash_version,
                    ct.normalized_user_text, ct.normalized_assistant_text,
                    ct.user_content, ct.assistant_content,
@@ -3358,7 +3361,7 @@ class PostgresStore(ContextStore):
                    ct.tagged_at, ct.compacted_at,
                    ct.first_seen_at, ct.last_seen_at,
                    ct.source_batch_id, ct.created_at, ct.updated_at
-              FROM canonical_turns_ordinal AS ct
+              FROM canonical_turns AS ct
               JOIN conversations AS c
                 ON c.conversation_id = ct.conversation_id
              WHERE ct.conversation_id = %s
