@@ -311,6 +311,12 @@ class EngineState:
     last_indexed_turn: int = -1
     checkpoint_version: int = 0
     conversation_generation: int = 0
+    # Progress-bar redesign: lifecycle_epoch tracks the conversations row's
+    # current lifecycle. Matches schema default (conversations.lifecycle_epoch
+    # DEFAULT 1). Engine.__init__ loads the live value from the store; the
+    # epoch bumps only on external delete+resurrect, in which case the in-memory
+    # handle is stale and Engine.verify_epoch() raises LifecycleEpochMismatch.
+    lifecycle_epoch: int = 1
     tool_tag_counter: int = 0
     split_processed_tags: set[str] = field(default_factory=set)
     trailing_fingerprint: str = ""
