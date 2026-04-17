@@ -2260,6 +2260,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
             raise KeyError(conversation_id)
         return int(row[0])
 
+    def get_conversation_phase(self, conversation_id: str) -> str:
+        """Return the current phase for the conversation.
+
+        Returns one of ``"init" | "ingesting" | "compacting" | "active" |
+        "deleted"``. Raises ``KeyError`` if no row exists.
+        """
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT phase FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return str(row[0])
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
 

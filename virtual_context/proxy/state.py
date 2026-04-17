@@ -599,8 +599,39 @@ class ProxyState:
                 observed=observed,
             )
 
-        # Steps 4, 5.5, 6-8 will be added by tasks A24-A29.
-        return PhaseDecision(phase="init", started_tagger=False)
+        # Step 4: phase gate.
+        phase = self.engine._store.get_conversation_phase(conversation_id)
+
+        if phase == "deleted":
+            # Resurrect bumps the lifecycle epoch and resets phase to 'init'.
+            # Keep the engine's in-memory epoch in lockstep so subsequent
+            # epoch-guarded writes on this call use the new lifecycle.
+            new_epoch = self.engine._store.increment_lifecycle_epoch_on_resurrect(
+                conversation_id,
+            )
+            self.engine._engine_state.lifecycle_epoch = int(new_epoch)
+            my_epoch = int(new_epoch)
+            # LifecycleResetEvent publish in Task A31.
+            # Continue past the gate with the new epoch.
+        elif phase == "compacting":
+            # Widen pending-raw for UI transparency on compaction exit.
+            # Per-request last_* metadata was already updated in step 5.
+            # Episode creation is forbidden during compaction, so the flow
+            # returns after the widen.
+            self.engine.verify_epoch()  # fresh check before the write
+            widened = self.engine._store.widen_pending_raw_payload_entries(
+                conversation_id=conversation_id,
+                lifecycle_epoch=my_epoch,
+                value=new_raw,
+            )
+            if not widened:
+                # Lifecycle bumped between verify and UPDATE. Return early.
+                return PhaseDecision(phase=phase, started_tagger=False)
+            return PhaseDecision(phase="compacting", started_tagger=False)
+
+        # phase in ('init', 'ingesting', 'active') — fall through.
+        # Steps 5.5, 6-8 will be added by tasks A25-A29.
+        return PhaseDecision(phase=phase, started_tagger=False)
 
     def resume_pending_ingestion_if_needed(self) -> bool:
         """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""

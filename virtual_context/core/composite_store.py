@@ -564,6 +564,12 @@ class CompositeStore:
             return int(fn(conversation_id))
         raise KeyError(conversation_id)
 
+    def get_conversation_phase(self, conversation_id: str) -> str:
+        fn = getattr(self._segments, "get_conversation_phase", None)
+        if callable(fn):
+            return str(fn(conversation_id))
+        raise KeyError(conversation_id)
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         fn = getattr(self._segments, "mark_conversation_deleted", None)
         if callable(fn):
