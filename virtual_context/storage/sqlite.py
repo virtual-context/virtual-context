@@ -695,9 +695,17 @@ class SQLiteStore(ContextStore):
                 UNIQUE (tenant_id, conversation_id)
             )
         """)
+        # Drop-and-recreate keeps the partial-index clause in lockstep with
+        # Postgres (see postgres.py). SQLite 3.8+ supports partial indexes;
+        # the `WHERE phase <> 'deleted'` predicate excludes tombstones so
+        # tenant-scoped phase queries never scan them. The drop is
+        # idempotent on fresh DBs (no-op) and replaces any pre-partial index
+        # on upgraded DBs.
+        conn.execute("DROP INDEX IF EXISTS idx_conversations_tenant_phase")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_conversations_tenant_phase
                 ON conversations(tenant_id, phase)
+                 WHERE phase <> 'deleted'
         """)
         try:
             conn.executescript(FTS_SQL)
