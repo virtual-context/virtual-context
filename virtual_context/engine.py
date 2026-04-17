@@ -1915,16 +1915,14 @@ class VirtualContextEngine:
                     conv_id[:12],
                     exc_info=True,
                 )
-        # expected_lifecycle_epoch=1 is the default-lifecycle case for callers
-        # that don't yet plumb epoch through their in-memory state (A22+ will
-        # pass the actual engine_state.lifecycle_epoch here). Since this path
-        # currently runs without a delete+resurrect model, the entry-time and
-        # commit-time checks will normally observe epoch=1 and pass through.
+        # Epoch is taken from self._engine_state (loaded on __init__ via
+        # _load_lifecycle_epoch_into_engine_state) so delete+resurrect flows
+        # correctly pass the real lifecycle_epoch to IngestReconciler.
         result = IngestReconciler(store, self._semantic).ingest_batch(
             conv_id,
             body=body,
             fmt=fmt,
-            expected_lifecycle_epoch=1,
+            expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
         )
         logger.info(
             "SYNC_CANONICAL_ENTRIES: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",
