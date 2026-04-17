@@ -661,6 +661,42 @@ class CompositeStore:
             )
         raise NotImplementedError
 
+    def upsert_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+    ) -> None:
+        fn = getattr(self._segments, "upsert_ingestion_episode", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                raw_payload_entries=raw_payload_entries,
+            )
+        raise NotImplementedError
+
+    def claim_ingestion_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ) -> bool:
+        fn = getattr(self._segments, "claim_ingestion_lease", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                lease_ttl_s=lease_ttl_s,
+            ))
+        raise NotImplementedError
+
     def store_tool_output(
         self,
         ref: str,
