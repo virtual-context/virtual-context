@@ -773,3 +773,72 @@ def test_restore_prefers_persisted_turn_groups(tmp_path):
     ]
     assert engine2._engine_state.checkpoint_version >= 4
     engine2.close()
+
+
+def test_sync_turns_uses_real_lifecycle_epoch_after_delete_resurrect(tmp_path):
+    """sync_turns_from_payload must pass the real engine_state.lifecycle_epoch.
+
+    Regression guard for F-B: a conversation resurrected to lifecycle_epoch=2
+    must accept new ingests. Previously the call hardcoded
+    ``expected_lifecycle_epoch=1``, which made the IngestReconciler entry-time
+    verify_epoch() raise LifecycleEpochMismatch against an epoch=2 DB row and
+    rejected the write. After the fix, sync_turns_from_payload pulls the epoch
+    from ``self._engine_state.lifecycle_epoch`` (populated on __init__ from
+    the store), so a rehydrated engine at epoch=2 reconciles cleanly.
+    """
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.types import (
+        StorageConfig,
+        TagGeneratorConfig,
+        VirtualContextConfig,
+    )
+
+    conv_id = "test-sync-resurrect-epoch"
+    db_path = tmp_path / "resurrect.db"
+    config = VirtualContextConfig(
+        conversation_id=conv_id,
+        storage=StorageConfig(backend="sqlite", sqlite_path=str(db_path)),
+        tag_generator=TagGeneratorConfig(type="keyword"),
+    )
+
+    # Engine #1: create conversation at epoch=1.
+    engine1 = VirtualContextEngine(config=config)
+    assert engine1._engine_state.lifecycle_epoch == 1
+
+    # Mark deleted and resurrect — bumps DB epoch to 2.
+    store1 = _inner_store(engine1)
+    store1.mark_conversation_deleted(conv_id)
+    new_epoch = store1.increment_lifecycle_epoch_on_resurrect(conv_id)
+    assert new_epoch == 2
+    engine1.close()
+
+    # Engine #2: fresh engine rehydrates lifecycle_epoch from the store,
+    # mirroring the production rehydrate flow after LifecycleEpochMismatch.
+    engine2 = VirtualContextEngine(config=config)
+    assert engine2._engine_state.lifecycle_epoch == 2
+
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Resurrected user turn"},
+            {"role": "assistant", "content": "Resurrected assistant turn"},
+        ],
+    }
+    fmt = detect_format(body)
+
+    # With the fix, sync passes expected_lifecycle_epoch=2 and the write
+    # succeeds. Without the fix (hardcoded 1), IngestReconciler's entry-time
+    # verify_epoch would raise LifecycleEpochMismatch against the DB's epoch=2.
+    synced = engine2.sync_turns_from_payload(body, fmt)
+    assert synced == 2
+
+    rows = engine2._store.get_all_canonical_turns(conv_id)
+    assert _entry_texts(rows) == [
+        ("user", "Resurrected user turn"),
+        ("assistant", "Resurrected assistant turn"),
+    ]
+
+    # Confirm the rows were written against the current (epoch=2) lifecycle.
+    store2 = _inner_store(engine2)
+    assert store2.get_lifecycle_epoch(conv_id) == 2
+    engine2.close()
