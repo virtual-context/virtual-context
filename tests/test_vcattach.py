@@ -214,6 +214,16 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
                 }
             ]
 
+        def read_progress_snapshot(self, conversation_id):
+            return SimpleNamespace(
+                conversation_id=conversation_id,
+                phase="ingesting",
+                done_ingestible=989,
+                total_ingestible=989,
+                active_episode=None,
+                active_compaction=None,
+            )
+
     class _Metrics:
         def get_captured_requests_summary(self, conversation_id=None):
             return [
@@ -228,7 +238,6 @@ def test_vcstatus_surfaces_ingestion_payload_and_cache_metrics():
     state = SimpleNamespace(
         session_state=SimpleNamespace(value="ingesting"),
         _ingestion_progress=(99, 494),
-        _payload_ingestion_progress=(989, 989),
         _ingestible_entry_count=989,
         _raw_payload_entry_count=4632,
         _last_payload_kb=22550.3,

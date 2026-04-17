@@ -626,7 +626,10 @@ async def prepare_payload(
             state._raw_payload_entry_count = max(0, _raw)
             state._ingestible_entry_count = max(0, _ing)
             state._skipped_payload_entry_count = max(0, _skipped)
-            state._payload_ingestion_progress = (0, max(0, _ing))
+            # Progress (done/total) is derived from read_progress_snapshot
+            # at dashboard/SSE/extract_session_state time — no process-local
+            # fabrication (previously wrote (0, _ing) here which presented as
+            # a false "0% then 100%" when ingestion was in fact complete).
         except Exception:
             logger.debug(
                 "Failed to record in-memory payload accounting for conv=%s",

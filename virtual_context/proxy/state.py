@@ -187,7 +187,6 @@ class ProxyState:
         self._raw_payload_entry_count: int = 0
         self._ingestible_entry_count: int = 0
         self._skipped_payload_entry_count: int = 0
-        self._payload_ingestion_progress: tuple[int, int] = (0, 0)
         self._last_non_virtualizable_floor: int = 0  # outbound - VC context tokens
         self._shared_live_turn_count: int = 0
         self._shared_history_message_count: int = 0
@@ -305,9 +304,6 @@ class ProxyState:
         done = max(0, _int_attr("ingestion_done"))
         total = max(done, _int_attr("ingestion_total"))
         self._ingestion_progress = (done, total)
-        payload_done = max(0, _int_attr("payload_ingestion_done"))
-        payload_total = max(payload_done, _int_attr("payload_ingestion_total"))
-        self._payload_ingestion_progress = (payload_done, payload_total)
         self._raw_payload_entry_count = max(0, _int_attr("raw_payload_entry_count"))
         self._ingestible_entry_count = max(0, _int_attr("ingestible_entry_count"))
         self._skipped_payload_entry_count = max(0, _int_attr("skipped_payload_entry_count"))
@@ -1171,7 +1167,14 @@ class ProxyState:
         )
 
     def extract_session_state(self):
-        """Return the shared session snapshot, including UI-facing runtime fields."""
+        """Return the shared session snapshot, including UI-facing runtime fields.
+
+        Ingestion progress is sourced from ``read_progress_snapshot`` (the
+        DB-derived view over ``canonical_turns`` + ``ingestion_episode``) so
+        the snapshot is always the single source of truth for ingestion
+        phase and counts.  The legacy per-process ``_payload_ingestion_progress``
+        tuple has been removed — no fabricated (0, total) counters.
+        """
         snapshot = self.engine.extract_session_state()
         live_turn_count = max(
             self._ingestible_entry_count,
@@ -1183,22 +1186,23 @@ class ProxyState:
             self._shared_history_message_count,
             live_turn_count,
         )
-        done, total = self._payload_ingestion_progress
         effective_state = self.session_state.value
-        if total > 0 and done < total and effective_state == SessionState.ACTIVE.value:
-            effective_state = SessionState.INGESTING.value
+        reader = getattr(self.engine._store, "read_progress_snapshot", None)
+        if reader is not None:
+            try:
+                prog = reader(self.engine.config.conversation_id)
+                if prog.phase == "ingesting" and effective_state == SessionState.ACTIVE.value:
+                    effective_state = SessionState.INGESTING.value
+            except Exception:
+                pass
         snapshot.session_state = effective_state
         snapshot.live_turn_count = live_turn_count
         snapshot.history_message_count = history_message_count
-        snapshot.ingestion_done = int(done or 0)
-        snapshot.ingestion_total = int(total or 0)
         snapshot.last_payload_kb = float(self._last_payload_kb or 0.0)
         snapshot.last_payload_tokens = int(self._last_payload_tokens or 0)
         snapshot.raw_payload_entry_count = int(self._raw_payload_entry_count or 0)
         snapshot.ingestible_entry_count = int(self._ingestible_entry_count or 0)
         snapshot.skipped_payload_entry_count = int(self._skipped_payload_entry_count or 0)
-        snapshot.payload_ingestion_done = int(done or 0)
-        snapshot.payload_ingestion_total = int(total or 0)
         return snapshot
 
     def _update_compaction_state(
@@ -1306,6 +1310,22 @@ class ProxyState:
         all_tags.discard("_general")
         compaction = self.compaction_snapshot()
 
+        # Ingestion phase + counts are DB-derived via read_progress_snapshot —
+        # the process-local ``_payload_ingestion_progress`` tuple has been
+        # removed so every consumer agrees with the canonical conversation row.
+        _snap_phase = ""
+        _snap_done = 0
+        _snap_total = 0
+        _snap_reader = getattr(engine._store, "read_progress_snapshot", None)
+        if _snap_reader is not None:
+            try:
+                _prog = _snap_reader(engine.config.conversation_id)
+                _snap_phase = str(_prog.phase or "")
+                _snap_done = int(_prog.done_ingestible or 0)
+                _snap_total = int(_prog.total_ingestible or 0)
+            except Exception:
+                pass
+
         snap = {
             "conversation_id": engine.config.conversation_id,
             "turn_count": max(
@@ -1320,12 +1340,10 @@ class ProxyState:
             "active_tags": list(idx.get_active_tags(lookback=6)),
             "session_state": (
                 SessionState.INGESTING.value
-                if self._payload_ingestion_progress[1] > 0
-                and self._payload_ingestion_progress[0] < self._payload_ingestion_progress[1]
-                and self.session_state == SessionState.ACTIVE
+                if _snap_phase == "ingesting" and self.session_state == SessionState.ACTIVE
                 else self.session_state.value
             ),
-            "ingestion_progress": list(self._payload_ingestion_progress),
+            "ingestion_progress": [_snap_done, _snap_total],
             "raw_payload_entry_count": self._raw_payload_entry_count,
             "ingestible_entry_count": self._ingestible_entry_count,
             "skipped_payload_entry_count": self._skipped_payload_entry_count,
@@ -2277,7 +2295,6 @@ class ProxyState:
         self._raw_payload_entry_count = 0
         self._ingestible_entry_count = 0
         self._skipped_payload_entry_count = 0
-        self._payload_ingestion_progress = (0, 0)
         self._last_non_virtualizable_floor = 0
         self._shared_live_turn_count = 0
         self._shared_history_message_count = 0

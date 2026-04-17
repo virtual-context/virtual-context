@@ -2023,7 +2023,23 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     elif raw_session_state == "passthrough":
         status = "passthrough"
 
-    done, total = getattr(state, "_payload_ingestion_progress", getattr(state, "_ingestion_progress", (0, 0)))
+    # Ingestion progress is DB-derived. Read the canonical ProgressSnapshot
+    # so ``VCSTATUS`` surfaces the same numbers as the dashboard and SSE feed.
+    done, total = 0, 0
+    if store is not None:
+        _snap_reader = getattr(store, "read_progress_snapshot", None)
+        if _snap_reader is not None:
+            try:
+                _prog = _snap_reader(effective_conv_id)
+                done = int(getattr(_prog, "done_ingestible", 0) or 0)
+                total = int(getattr(_prog, "total_ingestible", 0) or 0)
+            except Exception:
+                done, total = 0, 0
+    if total == 0:
+        # Fall back to the tagger's per-process ``_ingestion_progress`` tuple
+        # (distinct from the retired ``_payload_ingestion_progress``) — it
+        # tracks the resumed-durable ingestion pipeline, not payload counts.
+        done, total = getattr(state, "_ingestion_progress", (0, 0))
     pct = (done / total * 100.0) if total else 0.0
 
     # Thresholds

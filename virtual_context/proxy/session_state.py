@@ -48,8 +48,6 @@ class SessionState:
     raw_payload_entry_count: int = 0
     ingestible_entry_count: int = 0
     skipped_payload_entry_count: int = 0
-    payload_ingestion_done: int = 0
-    payload_ingestion_total: int = 0
     turn_tag_entries: list[dict] = field(default_factory=list)
     working_set: list[dict] = field(default_factory=list)
     telemetry_rollup: dict = field(default_factory=dict)
@@ -81,8 +79,6 @@ class SessionState:
             "raw_payload_entry_count": self.raw_payload_entry_count,
             "ingestible_entry_count": self.ingestible_entry_count,
             "skipped_payload_entry_count": self.skipped_payload_entry_count,
-            "payload_ingestion_done": self.payload_ingestion_done,
-            "payload_ingestion_total": self.payload_ingestion_total,
             "turn_tag_entries": self.turn_tag_entries,
             "working_set": self.working_set,
             "telemetry_rollup": self.telemetry_rollup,
@@ -119,8 +115,6 @@ class SessionState:
             raw_payload_entry_count=d.get("raw_payload_entry_count", 0),
             ingestible_entry_count=d.get("ingestible_entry_count", 0),
             skipped_payload_entry_count=d.get("skipped_payload_entry_count", 0),
-            payload_ingestion_done=d.get("payload_ingestion_done", 0),
-            payload_ingestion_total=d.get("payload_ingestion_total", 0),
             turn_tag_entries=d.get("turn_tag_entries", []),
             working_set=d.get("working_set", []),
             telemetry_rollup=d.get("telemetry_rollup", {}),
