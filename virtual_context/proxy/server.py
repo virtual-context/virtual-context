@@ -765,6 +765,7 @@ async def prepare_payload(
     _phase_decision = None
     if state is not None and hasattr(state, "handle_prepare_payload"):
         from ..core.lifecycle_epoch import LifecycleEpochMismatch as _LE_MISMATCH
+        from .state import PhaseDecision as _PhaseDecision
         _hpp_stage = time.monotonic()
         try:
             _phase_decision = state.handle_prepare_payload(
@@ -777,6 +778,13 @@ async def prepare_payload(
             logger.exception(
                 "handle_prepare_payload failed for conv=%s",
                 state.engine.config.conversation_id[:12],
+            )
+            # Fail closed: a DB hiccup MUST NOT silently disable the
+            # multi-worker ingestion gate. ``started_tagger=False`` forces
+            # ``_owns_ingestion_lease`` False below, so neither legacy
+            # spawn path runs on this request.
+            _phase_decision = _PhaseDecision(
+                phase="ingesting", started_tagger=False,
             )
         _note_prep("handle_prepare_payload", _hpp_stage)
 
@@ -796,9 +804,11 @@ async def prepare_payload(
     # the lease (``started_tagger is False``), another worker owns ingestion
     # for this conversation — we must skip BOTH legacy spawn paths
     # (``start_ingestion_if_needed`` AND ``resume_pending_ingestion_if_needed``)
-    # to avoid two workers racing on the same canonical rows. If
-    # ``_phase_decision is None`` (engine lacks the hook, state is None, or
-    # the call raised) we default to the legacy flow (status quo preserved).
+    # to avoid two workers racing on the same canonical rows. Generic
+    # exceptions from ``handle_prepare_payload`` produce a fail-closed
+    # ``started_tagger=False`` sentinel above, so the only remaining ``None``
+    # cases are "state is None" or "engine lacks the hook" — both treated
+    # as owning the lease to preserve the legacy fallback path.
     _owns_ingestion_lease = (
         _phase_decision is None or _phase_decision.started_tagger
     )

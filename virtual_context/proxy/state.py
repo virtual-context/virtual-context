@@ -230,10 +230,6 @@ class ProxyState:
         self._worker_id: str = (
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
-        # Background tagger thread spawned after a successful lease claim.
-        # Actual tagger loop body lands in A27; step 6 only wires up the
-        # daemon thread lifecycle.
-        self._tagger_thread: threading.Thread | None = None
 
         # Set provider on engine for persistence (only if not already restored)
         if self.provider and not engine._engine_state.provider:
@@ -699,12 +695,6 @@ class ProxyState:
         """
         self.engine._tagging.tag_canonical_row(row)
 
-    def _spawn_tagger_thread(self) -> None:
-        """Start ``_tagger_run`` in a daemon thread and record the handle."""
-        t = threading.Thread(target=self._tagger_run, daemon=True)
-        t.start()
-        self._tagger_thread = t
-
     # ------------------------------------------------------------------
     # Compaction lifecycle (Task A29)
     # ------------------------------------------------------------------
@@ -893,8 +883,8 @@ class ProxyState:
         this method only manages DB bookkeeping and phase transitions.
         The legacy ``_ingestion_thread`` (per-pair ``tag_turn`` with
         full history) is the authoritative tagger; this method never
-        calls ``_spawn_tagger_thread`` itself, avoiding split-brain with
-        two tagger threads racing on the same canonical rows.
+        spawns a tagger thread itself, avoiding split-brain with two
+        tagger threads racing on the same canonical rows.
 
         Every DB boundary op is epoch-safe:
 
@@ -1206,13 +1196,13 @@ class ProxyState:
                 max(total, baseline + self._history_turn_count(messages)),
             )
             self._transition_to(SessionState.INGESTING)
-            self._ingestion_thread = threading.Thread(
-                target=self._run_ingestion_with_catchup,
-                args=(messages, baseline, total),
-                daemon=True,
-                name="vc-ingest-resume",
+            self._spawn_ingestion_workers(
+                history_messages=messages,
+                existing_turns=baseline,
+                total=total,
+                tool_output_refs_by_turn=None,
+                ingest_thread_name="vc-ingest-resume",
             )
-            self._ingestion_thread.start()
             logger.info(
                 "Resuming durable ingestion for conversation %s from turn %d to %d",
                 conversation_id[:12],
@@ -1246,25 +1236,25 @@ class ProxyState:
         tuple has been removed — no fabricated (0, total) counters.
         """
         snapshot = self.engine.extract_session_state()
-        live_turn_count = max(
-            self._ingestible_entry_count,
-            self._shared_live_turn_count,
-            len(getattr(self.engine._store, "get_all_canonical_turns", lambda *_: [])(self.engine.config.conversation_id)),
-        )
+        conversation_id = self.engine.config.conversation_id
+        effective_state = self.session_state.value
+        try:
+            prog = self.engine._store.read_progress_snapshot(conversation_id)
+        except Exception as exc:
+            logger.warning(
+                "extract_session_state: read_progress_snapshot failed for conv=%s: %s",
+                conversation_id[:12], exc,
+            )
+            live_turn_count = 0
+        else:
+            live_turn_count = int(prog.total_ingestible or 0)
+            if prog.phase == "ingesting" and effective_state == SessionState.ACTIVE.value:
+                effective_state = SessionState.INGESTING.value
         history_message_count = max(
             self._raw_payload_entry_count,
             self._shared_history_message_count,
             live_turn_count,
         )
-        effective_state = self.session_state.value
-        reader = getattr(self.engine._store, "read_progress_snapshot", None)
-        if reader is not None:
-            try:
-                prog = reader(self.engine.config.conversation_id)
-                if prog.phase == "ingesting" and effective_state == SessionState.ACTIVE.value:
-                    effective_state = SessionState.INGESTING.value
-            except Exception:
-                pass
         snapshot.session_state = effective_state
         snapshot.live_turn_count = live_turn_count
         snapshot.history_message_count = history_message_count
@@ -1383,26 +1373,14 @@ class ProxyState:
         # Ingestion phase + counts are DB-derived via read_progress_snapshot —
         # the process-local ``_payload_ingestion_progress`` tuple has been
         # removed so every consumer agrees with the canonical conversation row.
-        _snap_phase = ""
-        _snap_done = 0
-        _snap_total = 0
-        _snap_reader = getattr(engine._store, "read_progress_snapshot", None)
-        if _snap_reader is not None:
-            try:
-                _prog = _snap_reader(engine.config.conversation_id)
-                _snap_phase = str(_prog.phase or "")
-                _snap_done = int(_prog.done_ingestible or 0)
-                _snap_total = int(_prog.total_ingestible or 0)
-            except Exception:
-                pass
+        _prog = engine._store.read_progress_snapshot(engine.config.conversation_id)
+        _snap_phase = str(_prog.phase or "")
+        _snap_done = int(_prog.done_ingestible or 0)
+        _snap_total = int(_prog.total_ingestible or 0)
 
         snap = {
             "conversation_id": engine.config.conversation_id,
-            "turn_count": max(
-                self._ingestible_entry_count,
-                self._shared_live_turn_count,
-                len(getattr(engine._store, "get_all_canonical_turns", lambda *_: [])(engine.config.conversation_id)),
-            ),
+            "turn_count": _snap_total,
             "total_requests": self._total_requests,
             "compacted_prefix_messages": engine._engine_state.compacted_prefix_messages,
             "tag_count": len(idx.entries),
@@ -2812,29 +2790,44 @@ class ProxyState:
 
             self._transition_to(SessionState.INGESTING)
 
-            # Separate daemon thread (not the _pool) so on_turn_complete
-            # can use the pool once we transition to ACTIVE.
-            self._ingestion_thread = threading.Thread(
-                target=self._run_ingestion_with_catchup,
-                args=(list(history_messages), existing_turns, total, tool_output_refs_by_turn),
-                daemon=True,
-                name="vc-ingest",
+            self._spawn_ingestion_workers(
+                history_messages=list(history_messages),
+                existing_turns=existing_turns,
+                total=total,
+                tool_output_refs_by_turn=tool_output_refs_by_turn,
+                ingest_thread_name="vc-ingest",
             )
-            # Bug 2 fix (P2): spawn the heartbeat sidecar BEFORE starting
-            # the ingestion worker so the first refresh is scheduled for
-            # ``INGESTION_LEASE_TTL_S / 2`` seconds from now — independent
-            # of whether the worker is mid-turn or between turns. This
-            # prevents a single long-running tagging turn from letting
-            # the lease expire before the next turn-completion callback.
-            heartbeat_epoch = int(self.engine._engine_state.lifecycle_epoch)
-            self._heartbeat_thread = threading.Thread(
-                target=self._run_heartbeat_sidecar,
-                args=(conversation_id, heartbeat_epoch),
-                daemon=True,
-                name="vc-ingest-heartbeat",
-            )
-            self._heartbeat_thread.start()
-            self._ingestion_thread.start()
+
+    def _spawn_ingestion_workers(
+        self,
+        *,
+        history_messages: list[Message],
+        existing_turns: int,
+        total: int,
+        tool_output_refs_by_turn: dict[int, list[str]] | None = None,
+        ingest_thread_name: str,
+    ) -> None:
+        # Heartbeat sidecar must start BEFORE the ingestion worker so its
+        # first refresh is scheduled for ``INGESTION_LEASE_TTL_S / 2`` seconds
+        # from now — independent of whether the worker is mid-turn or between
+        # turns. A single long-running tagging turn (>TTL) would otherwise let
+        # the lease expire before the next turn-completion callback fires.
+        conversation_id = self.engine.config.conversation_id
+        heartbeat_epoch = int(self.engine._engine_state.lifecycle_epoch)
+        self._heartbeat_thread = threading.Thread(
+            target=self._run_heartbeat_sidecar,
+            args=(conversation_id, heartbeat_epoch),
+            daemon=True,
+            name="vc-ingest-heartbeat",
+        )
+        self._ingestion_thread = threading.Thread(
+            target=self._run_ingestion_with_catchup,
+            args=(history_messages, existing_turns, total, tool_output_refs_by_turn),
+            daemon=True,
+            name=ingest_thread_name,
+        )
+        self._heartbeat_thread.start()
+        self._ingestion_thread.start()
 
     def _verify_handoff_hash(
         self, new_messages: list[Message], handoff_turn: int,
@@ -3176,8 +3169,6 @@ class ProxyState:
                     "message_preview": preview,
                     "turn_pair_tokens": tpt,
                     "conversation_id": conversation_id,
-                    "done": cum_done,
-                    "total": _total,
                 })
 
         ingest_kwargs = {

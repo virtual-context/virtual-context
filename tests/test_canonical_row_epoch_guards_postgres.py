@@ -3,12 +3,13 @@
 
 Skipped unless ``VC_TEST_POSTGRES_URL`` is set. Mirrors
 ``test_canonical_row_epoch_guards.py`` (SQLite) 1:1 so both backends stay in
-lockstep on the SQL-level epoch fence. ``conversations.conversation_id`` and
-``canonical_turns.canonical_turn_id`` are ``UUID`` in Postgres (see
-``postgres.py:127`` and ``postgres.py:828``) so test IDs use
-``uuid.uuid4()``. ``source_batch_id`` is also UUID, so the seed helper
-generates a fresh UUID per row. psycopg3 adapts ``datetime`` directly so we
-pass ``datetime.now(timezone.utc)`` rather than ISO strings for the
+lockstep on the SQL-level epoch fence. ``conversations.conversation_id`` is
+``TEXT PRIMARY KEY`` (aligned with ``canonical_turns.conversation_id``), and
+``canonical_turns.canonical_turn_id`` is ``UUID``, so test conversation IDs
+use ``str(uuid.uuid4())`` and canonical IDs use ``uuid.uuid4()``.
+``source_batch_id`` is also UUID, so the seed helper generates a fresh UUID
+per row. psycopg3 adapts ``datetime`` directly so we pass
+``datetime.now(timezone.utc)`` rather than ISO strings for the
 ``TIMESTAMPTZ`` lifecycle columns on ``canonical_turns`` — except that
 ``tagged_at`` / ``first_seen_at`` / ``last_seen_at`` / ``created_at`` /
 ``updated_at`` on ``canonical_turns`` are ``TEXT`` in the Postgres schema
