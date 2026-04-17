@@ -877,6 +877,39 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("canonical_turns progress columns bootstrap failed", exc_info=True)
+        # Ownership + lifecycle record for an ingestion episode. Mirrors the
+        # SQLite schema (see sqlite.py). Progress counters (done/total) are
+        # DERIVED from canonical_turns SUMs at read time — this row only
+        # tracks ownership (`owner_worker_id`, `heartbeat_ts`), the largest
+        # raw payload observed during the episode (`raw_payload_entries`),
+        # and the status transitions. The partial unique index below
+        # enforces at-most-one running episode per
+        # (conversation, lifecycle_epoch) at the DB layer without requiring
+        # a distributed lock — a concurrent worker attempting to INSERT a
+        # second 'running' row collides at INSERT time.
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ingestion_episode (
+                    episode_id            UUID PRIMARY KEY,
+                    conversation_id       UUID NOT NULL,
+                    lifecycle_epoch       INT NOT NULL,
+                    raw_payload_entries   INT NOT NULL DEFAULT 0,
+                    started_at            TIMESTAMPTZ NOT NULL,
+                    completed_at          TIMESTAMPTZ NULL,
+                    status                VARCHAR NOT NULL
+                                          CHECK (status IN ('running','completed','cancelled','abandoned')),
+                    owner_worker_id       VARCHAR NOT NULL,
+                    heartbeat_ts          TIMESTAMPTZ NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ingestion_episode_active
+                    ON ingestion_episode(conversation_id, lifecycle_epoch)
+                    WHERE status = 'running'
+            """)
+        except Exception:
+            logger.warning("ingestion_episode table bootstrap failed", exc_info=True)
         # FTS setup
         try:
             conn.execute(FTS_SQL)
