@@ -15,9 +15,11 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
+from ..core.lifecycle_epoch import LifecycleEpochMismatch
 from ..core.semantic_search import persist_turn_with_embeddings
 from ..core.segmenter import pair_messages_into_turns
 from ..engine import VirtualContextEngine
@@ -80,6 +82,20 @@ class _IngestionCancelled(Exception):
         self.done = done
         self.total = total
         super().__init__(f"Cancelled at {done}/{total}")
+
+
+@dataclass(frozen=True)
+class PhaseDecision:
+    """Result of ``ProxyState.handle_prepare_payload``.
+
+    Describes the phase the conversation should settle into after the
+    prepare-payload flow runs, plus whether a background tagger was
+    kicked off. Tasks A24-A29 extend the flow; the returned decision
+    carries the same two fields throughout.
+    """
+
+    phase: str
+    started_tagger: bool
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +513,94 @@ class ProxyState:
                 self._persist_shared_session_state()
         except Exception:
             logger.warning("Failed to persist completed turn", exc_info=True)
+
+    def handle_prepare_payload(
+        self,
+        *,
+        body: dict,
+        payload_accounting: dict,
+    ) -> PhaseDecision:
+        """Run the ingestion flow (spec §5, steps 1-8) for one inbound request.
+
+        This task (A23) wires up the minimal shell: steps 1-3 (epoch verify +
+        canonical row persistence) and step 5 (per-request metadata). Future
+        tasks (A24-A29) add the remaining steps (episode widening, phase
+        transition, tagger dispatch, commit).
+
+        Every DB boundary op is epoch-safe:
+
+        * ``IngestReconciler.ingest_batch`` takes
+          ``expected_lifecycle_epoch`` and filters in SQL (A18).
+        * ``update_request_metadata`` filters on ``lifecycle_epoch`` in
+          its ``UPDATE`` (A20) and returns ``False`` when the caller is
+          stale.
+        * A defense-in-depth ``verify_epoch()`` call fires before each
+          write so races between the entry check and the write are caught
+          early.
+
+        Raises
+        ------
+        LifecycleEpochMismatch
+            When the in-memory epoch drifts from the authoritative DB
+            epoch (external delete+resurrect). Callers rehydrate and
+            retry.
+        """
+        conversation_id = self.engine.config.conversation_id
+        new_raw = int(payload_accounting.get("raw_payload_entry_count", 0) or 0)
+        new_ing = int(payload_accounting.get("ingestible_entry_count", 0) or 0)
+
+        # Step 2: entry-verify. Re-verified before each subsequent write as
+        # defense in depth — a delete+resurrect between verify and write
+        # would otherwise stomp the new lifecycle's row.
+        self.engine.verify_epoch()
+        my_epoch = int(self.engine._engine_state.lifecycle_epoch)
+
+        # Step 3: persist canonical rows via IngestReconciler. Skip when
+        # the body carries no payload keys — empty bodies arrive on paths
+        # like resurrect/init where there's nothing to merge yet.
+        if body and any(k in body for k in ("messages", "input", "contents")):
+            from ..proxy.formats import detect_format
+            fmt = detect_format(body)
+            try:
+                self.engine._ingest_reconciler.ingest_batch(
+                    conversation_id,
+                    body=body,
+                    fmt=fmt,
+                    expected_lifecycle_epoch=my_epoch,
+                )
+            except AttributeError:
+                # No reconciler configured on engine — acceptable for
+                # test harnesses that inject a mock engine.
+                logger.debug(
+                    "handle_prepare_payload: engine._ingest_reconciler missing; "
+                    "skipping canonical row persistence for conv=%s",
+                    conversation_id[:12],
+                )
+
+        # Defense-in-depth: fresh epoch check before the next write.
+        self.engine.verify_epoch()
+
+        # Step 5 (always): update per-request metadata. Epoch-filtered in SQL.
+        ok = self.engine._store.update_request_metadata(
+            conversation_id=conversation_id,
+            lifecycle_epoch=my_epoch,
+            last_raw_payload_entries=new_raw,
+            last_ingestible_payload_entries=new_ing,
+        )
+        if not ok:
+            # Lifecycle bumped between the verify and the UPDATE. Stop.
+            try:
+                observed = int(self.engine._store.get_lifecycle_epoch(conversation_id))
+            except (KeyError, NotImplementedError, AttributeError):
+                observed = -1
+            raise LifecycleEpochMismatch(
+                conversation_id=conversation_id,
+                expected=my_epoch,
+                observed=observed,
+            )
+
+        # Steps 4, 5.5, 6-8 will be added by tasks A24-A29.
+        return PhaseDecision(phase="init", started_tagger=False)
 
     def resume_pending_ingestion_if_needed(self) -> bool:
         """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""

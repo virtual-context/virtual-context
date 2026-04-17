@@ -575,6 +575,86 @@ class CompositeStore:
             return int(fn(conversation_id))
         raise KeyError(conversation_id)
 
+    # ------------------------------------------------------------------
+    # Progress snapshot + request metadata (progress-bar redesign)
+    # ------------------------------------------------------------------
+    # Delegate the read-side snapshot and the four epoch-guarded write
+    # helpers introduced in A20 to the segments store. These are invoked
+    # directly from the engine-owned ``handle_prepare_payload`` flow so
+    # ``engine._store.<method>(...)`` must resolve without traversing the
+    # nested composite/inner-segment chain.
+    def read_progress_snapshot(self, conversation_id: str):
+        fn = getattr(self._segments, "read_progress_snapshot", None)
+        if callable(fn):
+            return fn(conversation_id)
+        raise NotImplementedError
+
+    def update_request_metadata(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        last_raw_payload_entries: int,
+        last_ingestible_payload_entries: int,
+    ) -> bool:
+        fn = getattr(self._segments, "update_request_metadata", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                last_raw_payload_entries=last_raw_payload_entries,
+                last_ingestible_payload_entries=last_ingestible_payload_entries,
+            ))
+        raise NotImplementedError
+
+    def widen_pending_raw_payload_entries(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        value: int,
+    ) -> bool:
+        fn = getattr(self._segments, "widen_pending_raw_payload_entries", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                value=value,
+            ))
+        raise NotImplementedError
+
+    def set_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        phase: str,
+    ) -> bool:
+        fn = getattr(self._segments, "set_phase", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                phase=phase,
+            ))
+        raise NotImplementedError
+
+    def set_phase_and_drain_pending_raw(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        new_phase: str,
+    ) -> int | None:
+        fn = getattr(self._segments, "set_phase_and_drain_pending_raw", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                new_phase=new_phase,
+            )
+        raise NotImplementedError
+
     def store_tool_output(
         self,
         ref: str,
