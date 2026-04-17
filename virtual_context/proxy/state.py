@@ -475,6 +475,36 @@ class ProxyState:
         self._ingested_conversations.discard(conversation_id)
         return SessionState.PASSTHROUGH, reason
 
+    # ------------------------------------------------------------------
+    # Progress-event publishes (Task A31)
+    # ------------------------------------------------------------------
+    # Both helpers are called AFTER a successful ``set_phase`` (or epoch
+    # increment) so a failed epoch-guard write never emits a spurious
+    # event. The bus is per-Engine and thread-safe; subscriber exceptions
+    # are swallowed inside ``ProgressEventBus.publish``.
+
+    def _publish_phase_transition(self, old_phase: str, new_phase: str) -> None:
+        from ..core.progress_events import PhaseTransitionEvent
+        self.engine.progress_event_bus.publish(PhaseTransitionEvent(
+            conversation_id=self.engine.config.conversation_id,
+            lifecycle_epoch=int(self.engine._engine_state.lifecycle_epoch),
+            kind="phase_transition",
+            timestamp=time.time(),
+            old_phase=old_phase,
+            new_phase=new_phase,
+        ))
+
+    def _publish_lifecycle_reset(self, old_epoch: int, new_epoch: int) -> None:
+        from ..core.progress_events import LifecycleResetEvent
+        self.engine.progress_event_bus.publish(LifecycleResetEvent(
+            conversation_id=self.engine.config.conversation_id,
+            lifecycle_epoch=int(new_epoch),
+            kind="lifecycle_reset",
+            timestamp=time.time(),
+            old_epoch=int(old_epoch),
+            new_epoch=int(new_epoch),
+        ))
+
     def _tagger_run(self) -> None:
         """Background tagger loop. Processes untagged canonical rows until
         none remain, then completes the episode. Exits cleanly on epoch
@@ -530,12 +560,13 @@ class ProxyState:
                 )
                 if completed:
                     # Transition phase to 'active'. Epoch-guarded.
-                    self.engine._store.set_phase(
+                    ok = self.engine._store.set_phase(
                         conversation_id=conversation_id,
                         lifecycle_epoch=my_epoch,
                         phase="active",
                     )
-                    # PhaseTransitionEvent publish in A31.
+                    if ok:
+                        self._publish_phase_transition("ingesting", "active")
                     return
                 # rows-affected == 0 — either new untagged row appeared
                 # (race) or lifecycle moved on. Loop; next verify_epoch
@@ -662,7 +693,7 @@ class ProxyState:
             phase_count=phase_count,
             phase_name=initial_phase_name,
         )
-        # PhaseTransitionEvent publish in A31.
+        self._publish_phase_transition("active", "compacting")
 
     def advance_compaction_phase(
         self, *, phase_index: int, phase_name: str,
@@ -734,12 +765,13 @@ class ProxyState:
         # transaction as the phase UPDATE via a direct EXISTS check on
         # canonical_turns.tagged_at, so a concurrent tagger cannot flip
         # the answer between read and write.
-        self.engine._store.drain_compaction_exit(
+        new_phase = self.engine._store.drain_compaction_exit(
             conversation_id=conv,
             lifecycle_epoch=epoch,
             worker_id=self._worker_id,
         )
-        # PhaseTransitionEvent publish in A31.
+        if new_phase in ("ingesting", "active"):
+            self._publish_phase_transition("compacting", new_phase)
 
     def handle_prepare_payload(
         self,
@@ -833,12 +865,13 @@ class ProxyState:
             # Resurrect bumps the lifecycle epoch and resets phase to 'init'.
             # Keep the engine's in-memory epoch in lockstep so subsequent
             # epoch-guarded writes on this call use the new lifecycle.
+            old_epoch = my_epoch
             new_epoch = self.engine._store.increment_lifecycle_epoch_on_resurrect(
                 conversation_id,
             )
             self.engine._engine_state.lifecycle_epoch = int(new_epoch)
             my_epoch = int(new_epoch)
-            # LifecycleResetEvent publish in Task A31.
+            self._publish_lifecycle_reset(old_epoch, int(new_epoch))
             # Continue past the gate with the new epoch.
         elif phase == "compacting":
             # Widen pending-raw for UI transparency on compaction exit.
@@ -888,11 +921,13 @@ class ProxyState:
                             conversation_id,
                         ),
                     )
+                self._publish_phase_transition("init", "active")
                 phase = "active"
             return PhaseDecision(phase=phase, started_tagger=False)
 
         # total_ingestible > done_ingestible: there IS untagged work.
         if phase in ("init", "active"):
+            old_phase = phase
             self.engine.verify_epoch()
             ok = self.engine._store.set_phase(
                 conversation_id=conversation_id,
@@ -907,8 +942,8 @@ class ProxyState:
                         conversation_id,
                     ),
                 )
+            self._publish_phase_transition(old_phase, "ingesting")
             phase = "ingesting"
-            # PhaseTransitionEvent publish in Task A31.
 
         # Step 6 — reached only when phase == 'ingesting' AND total > done
         # (the total == done branch already returned from step 5.5).
