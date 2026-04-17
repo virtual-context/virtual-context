@@ -73,6 +73,47 @@ def test_mark_conversation_deleted_sets_phase_and_deleted_at_pg():
     assert row["deleted_at"] is not None
 
 
+def test_mark_conversation_deleted_terminalizes_active_episode_and_compaction_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    conn = s._get_conn()
+    ep_id = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO ingestion_episode (
+            episode_id, conversation_id, lifecycle_epoch,
+            raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 96, NOW(), 'running', 'w1', NOW())
+        """,
+        (ep_id, cid),
+    )
+    conn.execute(
+        """
+        INSERT INTO compaction_operation (
+            operation_id, conversation_id, lifecycle_epoch,
+            phase_index, phase_count, phase_name, status,
+            started_at, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 0, 3, 'queued', 'queued', NOW(), 'w1', NOW())
+        """,
+        (op_id, cid),
+    )
+    s.mark_conversation_deleted(cid)
+    ep = conn.execute(
+        "SELECT status, completed_at FROM ingestion_episode WHERE episode_id = %s",
+        (ep_id,),
+    ).fetchone()
+    op = conn.execute(
+        "SELECT status, completed_at FROM compaction_operation WHERE operation_id = %s",
+        (op_id,),
+    ).fetchone()
+    assert ep["status"] == "abandoned"
+    assert ep["completed_at"] is not None
+    assert op["status"] == "cancelled"
+    assert op["completed_at"] is not None
+
+
 def test_mark_conversation_deleted_raises_keyerror_for_unknown_pg():
     s = _store()
     with pytest.raises(KeyError):
@@ -94,6 +135,48 @@ def test_increment_lifecycle_epoch_bumps_on_resurrect_pg():
     ).fetchone()
     assert row["phase"] == "init"
     assert row["deleted_at"] is None
+
+
+def test_increment_lifecycle_epoch_resurrect_cleans_stale_active_rows_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    conn = s._get_conn()
+    ep_id = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO ingestion_episode (
+            episode_id, conversation_id, lifecycle_epoch,
+            raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 96, NOW(), 'running', 'w1', NOW())
+        """,
+        (ep_id, cid),
+    )
+    conn.execute(
+        """
+        INSERT INTO compaction_operation (
+            operation_id, conversation_id, lifecycle_epoch,
+            phase_index, phase_count, phase_name, status,
+            started_at, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 0, 3, 'queued', 'running', NOW(), 'w1', NOW())
+        """,
+        (op_id, cid),
+    )
+    s.mark_conversation_deleted(cid)
+    assert s.increment_lifecycle_epoch_on_resurrect(cid) == 2
+    ep = conn.execute(
+        "SELECT status, completed_at FROM ingestion_episode WHERE episode_id = %s",
+        (ep_id,),
+    ).fetchone()
+    op = conn.execute(
+        "SELECT status, completed_at FROM compaction_operation WHERE operation_id = %s",
+        (op_id,),
+    ).fetchone()
+    assert ep["status"] == "abandoned"
+    assert ep["completed_at"] is not None
+    assert op["status"] == "cancelled"
+    assert op["completed_at"] is not None
 
 
 def test_repeat_resurrect_does_not_double_bump_pg():
