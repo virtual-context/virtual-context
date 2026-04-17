@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .tag_splitter import TagSplitter
     from .telemetry import TelemetryLedger
     from ..types import (
+        CanonicalTurnRow,
         CompactionSignal,
         EngineState,
         Message,
@@ -769,6 +770,101 @@ class TaggingPipeline:
             ],
         )
         return result
+
+    def tag_canonical_row(self, row: "CanonicalTurnRow") -> None:
+        """Tag a single canonical row in-place (background backfill entry).
+
+        Unlike ``tag_turn``, this is designed for the background tagger loop
+        which processes REST-ingested rows after ``IngestReconciler`` has
+        persisted them without tags. It runs the tag generator on the row's
+        content, assigns a primary tag + tag list, and re-saves the row via
+        ``save_canonical_turn`` preserving all other fields. It does NOT:
+
+        * build or consult ``conversation_history`` (one-row scope only),
+        * fire compaction signals (``_monitor.check`` is intentionally
+          skipped — those signals belong to the live ``tag_turn`` flow),
+        * mutate ``TurnTagIndex`` (the index is owned by proxy-flow callers
+          via ``ingest_history`` and ``tag_turn``),
+        * stamp ``tagged_at`` (the outer ``_tagger_run`` loop flips that
+          atomically via ``mark_canonical_row_tagged`` on the same row).
+
+        Row text selection: canonical rows carry one side only
+        (user_content OR assistant_content) per the split-ingest layout in
+        ``IngestReconciler._prepare_message_row``. We concatenate both sides
+        so the tag generator sees whichever is populated.
+        """
+        _ensure_engine_imports()
+
+        from ..types import TagResult
+
+        user_text = (row.user_content or "").strip()
+        asst_text = (row.assistant_content or "").strip()
+        combined_text = f"{user_text} {asst_text}".strip()
+
+        # Fast-path: empty or stub content → assign `_stub` and persist.
+        if not combined_text or (
+            _is_stub_content_fn is not None and _is_stub_content_fn(combined_text)
+        ):
+            tag_result = TagResult(tags=["_stub"], primary="_stub", source="stub")
+        else:
+            store_tags = [
+                ts.tag for ts in self._store.get_all_tags(
+                    conversation_id=self.config.conversation_id,
+                )
+            ]
+            try:
+                tag_result = self._tag_generator.generate_tags(
+                    combined_text, store_tags, context_turns=None,
+                )
+            except Exception:
+                logger.exception(
+                    "tag_canonical_row: generator failed conv=%s turn_id=%s",
+                    self.config.conversation_id[:12],
+                    row.canonical_turn_id[:12] if row.canonical_turn_id else "?",
+                )
+                raise
+
+        # Preserve session_date if already set on the row; else try to extract
+        # from content so a background-tagged row carries the same date hint
+        # the proxy flow produces.
+        session_date = (row.session_date or "").strip()
+        if not session_date:
+            extracted = _extract_session_date_from_content(row.user_content or "")
+            if extracted:
+                session_date = extracted
+
+        # Persist the enriched fields. We DO NOT set ``tagged_at`` here —
+        # the outer ``_tagger_run`` loop owns the epoch-guarded flip via
+        # ``mark_canonical_row_tagged``. We re-supply every existing field so
+        # the UPSERT does not clobber pre-existing metadata.
+        self._store.save_canonical_turn(
+            self.config.conversation_id,
+            row.turn_number,
+            row.user_content,
+            row.assistant_content,
+            user_raw_content=row.user_raw_content,
+            assistant_raw_content=row.assistant_raw_content,
+            primary_tag=tag_result.primary,
+            tags=list(tag_result.tags),
+            session_date=session_date,
+            sender=row.sender,
+            fact_signals=list(tag_result.fact_signals) or list(row.fact_signals),
+            code_refs=list(tag_result.code_refs) or list(row.code_refs),
+            canonical_turn_id=row.canonical_turn_id,
+            sort_key=row.sort_key,
+            turn_hash=row.turn_hash,
+            hash_version=row.hash_version,
+            normalized_user_text=row.normalized_user_text,
+            normalized_assistant_text=row.normalized_assistant_text,
+            tagged_at=row.tagged_at,  # intentionally None — outer loop flips it
+            compacted_at=row.compacted_at,
+            first_seen_at=row.first_seen_at,
+            last_seen_at=row.last_seen_at,
+            source_batch_id=row.source_batch_id,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            turn_group_number=row.turn_group_number,
+        )
 
     def ingest_history(
         self,

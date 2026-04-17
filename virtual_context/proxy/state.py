@@ -657,16 +657,18 @@ class ProxyState:
                 ))
 
     def _run_tagging_pipeline(self, row) -> None:
-        """Run the existing tagging pipeline on a single canonical row.
+        """Run the real tagging pipeline on a single canonical row.
 
-        For A27 this is a no-op — the row is stamped ``tagged_at = now`` by
-        ``mark_canonical_row_tagged`` without further enrichment. The A27
-        scope is the loop control flow and the four boundary epoch checks;
-        wiring the real ``TaggingPipeline.tag_turn`` entry point is deferred
-        to a later task that can also bridge the per-row ``CanonicalTurnRow``
-        into the history-oriented shape the pipeline expects.
+        Delegates to ``TaggingPipeline.tag_canonical_row`` which runs the
+        configured tag generator against the row's combined user/assistant
+        text and re-saves the row with ``primary_tag``, ``tags``,
+        ``fact_signals``, and ``code_refs`` populated. ``tagged_at`` is left
+        untouched — the outer ``_tagger_run`` loop flips it atomically via
+        ``mark_canonical_row_tagged`` on the next step, which keeps the
+        epoch guard as the single source of truth for "this row has been
+        processed in this lifecycle".
         """
-        return
+        self.engine._tagging.tag_canonical_row(row)
 
     def _spawn_tagger_thread(self) -> None:
         """Start ``_tagger_run`` in a daemon thread and record the handle."""
