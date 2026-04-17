@@ -241,12 +241,18 @@ def test_non_owner_start_ingestion_defense_in_depth() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_ingestion_heartbeats_during_long_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The progress callback must refresh the ingestion heartbeat on
-    wall-clock cadence (every ``INGESTION_LEASE_TTL_S / 2`` seconds of
-    turn time) so a long-running legacy thread does not lose its lease.
+def test_legacy_ingestion_heartbeats_during_long_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sidecar heartbeat thread must refresh the ingestion lease on
+    wall-clock cadence (every ``INGESTION_LEASE_TTL_S / 2`` seconds) so a
+    long-running legacy thread does not lose its lease — independent of
+    whether the worker is mid-turn or between turns.
     """
     from virtual_context.proxy import state as state_module
+
+    # Monkeypatch TTL to a very small value so the test runs quickly.
+    monkeypatch.setattr(state_module, "INGESTION_LEASE_TTL_S", 0.2)
 
     state, _metrics = _make_state()
 
@@ -258,49 +264,29 @@ def test_legacy_ingestion_heartbeats_during_long_run(monkeypatch: pytest.MonkeyP
 
     state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
 
-    # Manual clock that advances 20 seconds per progress callback,
-    # simulating a slow LLM-heavy tagging turn. With
-    # ``INGESTION_LEASE_TTL_S = 30`` the refresh threshold is 15 seconds,
-    # so every turn crosses the threshold and a heartbeat should fire.
-    clock = {"t": 1_000_000.0}
+    # Run the sidecar directly with a fake worker alive for ~0.5s so we
+    # get at least 2 refresh ticks at the 0.1s interval.
+    stop = threading.Event()
 
-    def _monotonic() -> float:
-        return clock["t"]
+    def _fake_worker() -> None:
+        stop.wait(timeout=0.5)
 
-    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
-
-    # Drive ingest_history synchronously so it fires the progress
-    # callback ``turns`` times (done = 1 .. turns). Advance the clock
-    # by 20s per turn so the wall-clock threshold (15s) is crossed each
-    # call.
-    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
-        n = len(messages) // 2
-        for i in range(n):
-            entry = TurnTagEntry(
-                turn_number=turn_offset + i,
-                message_hash=f"h{turn_offset + i}",
-                tags=[f"t{turn_offset + i}"],
-                primary_tag=f"t{turn_offset + i}",
-            )
-            clock["t"] += 20.0
-            if progress_callback:
-                progress_callback(i + 1, n, entry)
-        return n
-
-    state.engine.ingest_history.side_effect = _fake_ingest
-
-    # 6 slow turns → each crosses the 15s threshold → 6 heartbeats.
-    messages: list[Message] = []
-    for i in range(6):
-        messages.append(Message(role="user", content=f"Q{i}"))
-        messages.append(Message(role="assistant", content=f"A{i}"))
-
-    state._ingest_messages_with_progress(messages, baseline=0)
+    worker = threading.Thread(target=_fake_worker, daemon=True)
+    state._ingestion_thread = worker
+    worker.start()
+    try:
+        state._run_heartbeat_sidecar(
+            state.engine.config.conversation_id,
+            epoch=int(state.engine._engine_state.lifecycle_epoch),
+        )
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
 
     assert heartbeat_counter["count"] >= 2, (
-        f"Expected at least 2 heartbeat refreshes during a 6-slow-turn "
-        f"ingestion (wall-clock cadence INGESTION_LEASE_TTL_S/2 = 15s, "
-        f"each turn advances clock by 20s), got {heartbeat_counter['count']}"
+        f"Expected at least 2 heartbeat refreshes during a 0.5s sidecar "
+        f"run (wall-clock cadence INGESTION_LEASE_TTL_S/2 = 0.1s), "
+        f"got {heartbeat_counter['count']}"
     )
 
 
@@ -447,60 +433,75 @@ def test_legacy_ingestion_does_not_complete_episode_on_stale_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If ``refresh_ingestion_heartbeat`` returns False (stale epoch or
-    ownership lost), the legacy thread must bail out WITHOUT calling
-    ``complete_ingestion_episode``. The episode stays 'running'.
+    ownership lost), the sidecar sets ``_ingestion_cancel`` and the legacy
+    thread must bail out WITHOUT calling ``complete_ingestion_episode``.
+    The episode stays 'running'.
     """
     from virtual_context.proxy import state as state_module
+
+    # Shrink TTL so the sidecar fires quickly during the test.
+    monkeypatch.setattr(state_module, "INGESTION_LEASE_TTL_S", 0.2)
 
     state, _metrics = _make_state()
     state.engine._engine_state.lifecycle_epoch = 5
 
-    # Heartbeat refresh rejects — simulates stale epoch.
+    # Heartbeat refresh rejects — simulates stale epoch. Sidecar sees
+    # this and sets ``_ingestion_cancel``.
     state.engine._store.refresh_ingestion_heartbeat.return_value = False
 
-    # Manual clock that advances 20s per turn so the 15s wall-clock
-    # heartbeat threshold is crossed and the refresh call fires.
-    clock = {"t": 2_000_000.0}
-
-    def _monotonic() -> float:
-        return clock["t"]
-
-    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
-
-    # Drive ingest_history far enough to trigger at least one heartbeat
-    # call. With 20s-per-turn advancement the first turn already crosses
-    # the 15s threshold and the refresh fires.
+    # Slow ingest_history — simulate a single long turn by sleeping so
+    # the sidecar runs at least one refresh cycle and flips cancel.
     def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
-        n = len(messages) // 2
-        for i in range(n):
-            entry = TurnTagEntry(
-                turn_number=turn_offset + i,
-                message_hash=f"h{turn_offset + i}",
-                tags=[f"t{turn_offset + i}"],
-                primary_tag=f"t{turn_offset + i}",
-            )
-            clock["t"] += 20.0
-            if progress_callback:
-                progress_callback(i + 1, n, entry)
-        return n
+        # Wait long enough for the sidecar (TTL/2 = 0.1s cadence) to
+        # issue a rejected refresh and set cancel.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if state._ingestion_cancel.is_set():
+                # Mirror engine behaviour — stop ingesting once cancel
+                # flips so the progress callback can raise.
+                break
+            time.sleep(0.02)
+        # Fire one progress callback post-cancel so the cancel check
+        # inside ``on_progress`` raises ``_IngestionCancelled``.
+        entry = TurnTagEntry(
+            turn_number=turn_offset,
+            message_hash="h0", tags=["t0"], primary_tag="t0",
+        )
+        if progress_callback:
+            progress_callback(1, 1, entry)
+        return 1
 
     state.engine.ingest_history.side_effect = _fake_ingest
 
     initial_messages = [
         Message(role="user", content="Q0"),
         Message(role="assistant", content="A0"),
-        Message(role="user", content="Q1"),
-        Message(role="assistant", content="A1"),
-        Message(role="user", content="Q2"),
-        Message(role="assistant", content="A2"),
     ]
-    state._run_ingestion_with_catchup(
-        initial_messages, baseline=0, cumulative_total=3,
-    )
 
-    # Heartbeat rejected → we raise _IngestionCancelled from the progress
-    # callback → _run_ingestion_with_catchup sees the cancel path and
-    # skips completion.
+    # Spawn the sidecar ourselves — ``_run_ingestion_with_catchup`` is
+    # invoked synchronously from this test, so the caller must wire up
+    # the heartbeat thread the same way ``start_ingestion_if_needed``
+    # would in production. Use the current thread as the "worker".
+    worker = threading.current_thread()
+    state._ingestion_thread = worker
+    sidecar = threading.Thread(
+        target=state._run_heartbeat_sidecar,
+        args=(state.engine.config.conversation_id, 5),
+        daemon=True,
+    )
+    state._heartbeat_thread = sidecar
+    sidecar.start()
+    try:
+        state._run_ingestion_with_catchup(
+            initial_messages, baseline=0, cumulative_total=1,
+        )
+    finally:
+        state._ingestion_cancel.set()
+        sidecar.join(timeout=1.0)
+
+    # Heartbeat rejected → sidecar set cancel → progress callback raised
+    # ``_IngestionCancelled`` → _run_ingestion_with_catchup saw the cancel
+    # path and skipped completion.
     assert not state.engine._store.complete_ingestion_episode.called, (
         "complete_ingestion_episode must NOT be called when the heartbeat "
         "refresh rejects (stale epoch). The episode must remain 'running'."
@@ -697,24 +698,17 @@ def test_legacy_ingestion_defers_local_completion_when_set_phase_failed() -> Non
 def test_heartbeat_refreshes_on_wall_clock_interval_not_turn_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With a manual clock that advances 20 seconds per turn (simulating
-    a slow LLM-heavy tagging turn), each turn should cross the 15-second
-    wall-clock threshold and fire a heartbeat — regardless of turn count
-    being low.
+    """The sidecar heartbeat thread runs on wall-clock cadence —
+    ``INGESTION_LEASE_TTL_S / 2`` — independent of turn completion, so a
+    long-running single turn cannot let the lease expire before a
+    refresh fires.
     """
     from virtual_context.proxy import state as state_module
 
+    # Shrink TTL so the test completes in <1s. Interval becomes 0.1s.
+    monkeypatch.setattr(state_module, "INGESTION_LEASE_TTL_S", 0.2)
+
     state, _metrics = _make_state()
-    state.engine._store.refresh_ingestion_heartbeat.return_value = True
-
-    # Manual clock. Advance 20s per progress callback; the wall-clock
-    # threshold is INGESTION_LEASE_TTL_S / 2 = 15s.
-    clock = {"t": 5_000_000.0}
-
-    def _monotonic() -> float:
-        return clock["t"]
-
-    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
 
     refresh_calls = {"count": 0}
 
@@ -724,57 +718,47 @@ def test_heartbeat_refreshes_on_wall_clock_interval_not_turn_count(
 
     state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
 
-    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
-        n = len(messages) // 2
-        for i in range(n):
-            entry = TurnTagEntry(
-                turn_number=turn_offset + i,
-                message_hash=f"h{turn_offset + i}",
-                tags=[f"t{turn_offset + i}"],
-                primary_tag=f"t{turn_offset + i}",
-            )
-            # Simulate a slow LLM-heavy tagging turn (20s).
-            clock["t"] += 20.0
-            if progress_callback:
-                progress_callback(i + 1, n, entry)
-        return n
+    # Fake worker that stays alive for ~0.4s — long enough for ≥2
+    # refresh ticks at the 0.1s interval. No turn callbacks fired.
+    stop = threading.Event()
 
-    state.engine.ingest_history.side_effect = _fake_ingest
+    def _fake_worker() -> None:
+        stop.wait(timeout=0.4)
 
-    # 3 slow turns → 6 messages.
-    messages: list[Message] = []
-    for i in range(3):
-        messages.append(Message(role="user", content=f"Q{i}"))
-        messages.append(Message(role="assistant", content=f"A{i}"))
-
-    state._ingest_messages_with_progress(messages, baseline=0)
+    worker = threading.Thread(target=_fake_worker, daemon=True)
+    state._ingestion_thread = worker
+    worker.start()
+    try:
+        state._run_heartbeat_sidecar(
+            state.engine.config.conversation_id,
+            epoch=int(state.engine._engine_state.lifecycle_epoch),
+        )
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
 
     assert refresh_calls["count"] >= 2, (
-        f"Expected at least 2 heartbeat refreshes across 3 slow turns "
-        f"(wall-clock 20s-per-turn vs 15s threshold), got "
+        f"Expected at least 2 heartbeat refreshes across a 0.4s sidecar "
+        f"run with 0.1s cadence and ZERO turn callbacks, got "
         f"{refresh_calls['count']}. Cadence must NOT be gated on turn "
-        f"count being even."
+        f"completion."
     )
 
 
 def test_heartbeat_does_not_refresh_when_wall_clock_has_not_elapsed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With a manual clock that advances only 1 second per turn, no
-    heartbeat should fire across 5 turns (total 5s elapsed, well under
-    the 15s threshold).
+    """If the sidecar is cancelled before the first interval elapses,
+    no heartbeat refresh should fire. ``Event.wait(timeout)`` returns
+    True on set (no timeout) → the loop returns without refreshing.
     """
     from virtual_context.proxy import state as state_module
 
+    # 30s TTL → 15s interval. We cancel immediately so the first
+    # refresh never fires.
+    monkeypatch.setattr(state_module, "INGESTION_LEASE_TTL_S", 30.0)
+
     state, _metrics = _make_state()
-    state.engine._store.refresh_ingestion_heartbeat.return_value = True
-
-    clock = {"t": 6_000_000.0}
-
-    def _monotonic() -> float:
-        return clock["t"]
-
-    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
 
     refresh_calls = {"count": 0}
 
@@ -784,34 +768,250 @@ def test_heartbeat_does_not_refresh_when_wall_clock_has_not_elapsed(
 
     state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
 
-    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
-        n = len(messages) // 2
-        for i in range(n):
-            entry = TurnTagEntry(
-                turn_number=turn_offset + i,
-                message_hash=f"h{turn_offset + i}",
-                tags=[f"t{turn_offset + i}"],
-                primary_tag=f"t{turn_offset + i}",
-            )
-            # Fast turn — 1 second.
-            clock["t"] += 1.0
-            if progress_callback:
-                progress_callback(i + 1, n, entry)
-        return n
+    # Worker present, but cancel fires immediately so the sidecar's
+    # first ``wait`` returns True (cancelled) and it exits without
+    # calling refresh.
+    stop_worker = threading.Event()
 
-    state.engine.ingest_history.side_effect = _fake_ingest
+    def _fake_worker() -> None:
+        stop_worker.wait(timeout=5.0)
 
-    # 5 fast turns → 10 messages. Cumulative wall-clock = 5s, below the
-    # 15-second threshold.
-    messages: list[Message] = []
-    for i in range(5):
-        messages.append(Message(role="user", content=f"Q{i}"))
-        messages.append(Message(role="assistant", content=f"A{i}"))
+    worker = threading.Thread(target=_fake_worker, daemon=True)
+    state._ingestion_thread = worker
+    worker.start()
 
-    state._ingest_messages_with_progress(messages, baseline=0)
+    # Flip cancel BEFORE starting sidecar so its first wait returns
+    # immediately.
+    state._ingestion_cancel.set()
+    try:
+        state._run_heartbeat_sidecar(
+            state.engine.config.conversation_id,
+            epoch=int(state.engine._engine_state.lifecycle_epoch),
+        )
+    finally:
+        stop_worker.set()
+        worker.join(timeout=1.0)
+        state._ingestion_cancel.clear()
 
     assert refresh_calls["count"] == 0, (
-        f"No heartbeat refresh should fire when cumulative wall-clock "
-        f"(5s) is below INGESTION_LEASE_TTL_S/2 (15s); got "
-        f"{refresh_calls['count']} refreshes."
+        f"No heartbeat refresh should fire when cancel is set before "
+        f"the first interval elapses; got {refresh_calls['count']} "
+        f"refreshes."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 fix follow-up: cancel-and-resume empty-history shortcut must go
+# through the DB-authoritative finalisation helper, not the 3-line
+# local-only completion that caused the split-brain.
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_and_resume_empty_history_requires_db_completion() -> None:
+    """When a running ingestion is cancelled and the sliced remaining
+    history is empty, the local worker must NOT self-complete without
+    a DB-authoritative ``complete_ingestion_episode`` + ``set_phase``
+    sequence. If ``complete_ingestion_episode`` returns False (lease
+    stolen, untagged rows remain, or stale epoch), the worker must stay
+    in INGESTING and skip all post-ingestion side effects.
+
+    Covers the split-brain described in the Bug 1 review:
+    ``start_ingestion_if_needed`` shortcut at state.py:~2745 (the
+    cancel-and-resume empty-history path) formerly called
+    ``_ingested_conversations.add`` + ``_transition_to(ACTIVE)`` without
+    ever asking the DB whether the episode could actually close.
+
+    Strategy: set up the state so the cancel-and-resume branch is taken
+    AND the post-cancel slice leaves empty history. We use a fake
+    ``ingest_history`` that blocks until signalled, so the first call
+    leaves the thread alive. A threading.Event gates when the thread
+    appends to the tag index. We then issue the second call, which
+    cancels the first thread; after cancel, re-reading
+    ``_indexed_turn_count()`` returns exactly ``needed_turns`` so the
+    slice is empty — hitting the shortcut at state.py:~2745.
+    """
+    import time as _time
+
+    state, _metrics = _make_state()
+    conv_id = state.engine.config.conversation_id
+
+    # Episode completion refuses — e.g. untagged rows remain.
+    state.engine._store.complete_ingestion_episode.return_value = False
+    state.engine._store.set_phase.return_value = True
+    state.engine._store.refresh_ingestion_heartbeat.return_value = True
+
+    # Spy on _compact_after_ingestion to verify it's NOT invoked.
+    compact_calls = {"count": 0}
+
+    def _spy_compact(history: list[Message]) -> None:
+        compact_calls["count"] += 1
+
+    state._compact_after_ingestion = _spy_compact
+
+    # Thread coordination events. ``ready`` is set when the worker has
+    # entered ``ingest_history`` (so we know the thread is alive);
+    # ``release`` is set by the test to allow the thread to proceed.
+    ready = threading.Event()
+    release = threading.Event()
+
+    def _blocking_ingest(pairs, progress_callback=None, turn_offset=0, **_kw):
+        ready.set()
+        # Block until the test releases us OR cancel fires. This keeps
+        # the thread alive long enough for the second call to see
+        # ``_ingestion_thread.is_alive()`` True at line 2722.
+        while not release.is_set() and not state._ingestion_cancel.is_set():
+            _time.sleep(0.01)
+        n = len(pairs) // 2
+        # Raise _IngestionCancelled via the progress callback if cancel
+        # was the reason for wakeup (simulates real cancel path).
+        if progress_callback and n > 0:
+            entry = TurnTagEntry(
+                turn_number=turn_offset, message_hash="h0",
+                tags=["t"], primary_tag="t",
+            )
+            progress_callback(1, n, entry)
+        return 0
+
+    state.engine.ingest_history.side_effect = _blocking_ingest
+
+    pairs = [
+        Message(role=("user" if j % 2 == 0 else "assistant"), content=f"m{j}")
+        for j in range(6)  # 3 pairs → needed_turns == 3
+    ]
+
+    # First call — spawns the background thread. existing_turns == 0,
+    # needed_turns == 3 → bypasses the "already covered" and
+    # "existing_turns > 0 and not _thread_running" gates and starts a
+    # thread via the normal path.
+    state.start_ingestion_if_needed(pairs)
+    assert state._state == SessionState.INGESTING
+
+    # Wait for the worker to confirm it's inside ingest_history.
+    assert ready.wait(timeout=2.0), "worker did not enter ingest_history"
+    assert state._ingestion_thread is not None
+    assert state._ingestion_thread.is_alive()
+
+    # Now seed the tag index to cover all 3 pairs. This simulates
+    # another worker having tagged all three turns while our legacy
+    # thread was blocked. When the second call arrives, the outer
+    # ``existing_turns >= needed_turns`` gate at state.py:~2673 would
+    # short-circuit — so we instead use exactly ``needed_turns - 1``
+    # entries first, then top up right after cancel so the re-read at
+    # state.py:~2742 returns >= needed_turns.
+    # Strategy: set 2 entries now, then the cancel-and-resume block
+    # does its cancel, re-reads indexed_turn_count, and at THAT point
+    # we want 3 entries. We can't inject code into the cancel path, so
+    # we use a different angle: inject a fake thread stop hook via a
+    # thread that tops up the index once cancel fires.
+    for i in range(2):
+        state.engine._turn_tag_index.append(TurnTagEntry(
+            turn_number=i, message_hash=f"h{i}",
+            tags=["t"], primary_tag="t",
+        ))
+    state.engine._engine_state.last_indexed_turn = 1
+
+    # Helper thread: watches for cancel, tops up the index to 3 before
+    # the worker exits so the post-join re-read sees 3.
+    def _topup_on_cancel() -> None:
+        # Wait until the main test sets cancel (i.e., enters
+        # cancel-and-resume).
+        state._ingestion_cancel.wait(timeout=5.0)
+        # Add the final entry so ``_indexed_turn_count() == needed_turns``.
+        state.engine._turn_tag_index.append(TurnTagEntry(
+            turn_number=2, message_hash="h2",
+            tags=["t"], primary_tag="t",
+        ))
+        state.engine._engine_state.last_indexed_turn = 2
+        # Also release the blocking worker so join() returns.
+        release.set()
+
+    topup = threading.Thread(target=_topup_on_cancel, daemon=True)
+    topup.start()
+
+    try:
+        # Second call — enters cancel-and-resume at state.py:~2722.
+        # After the worker exits, re-reads ``_indexed_turn_count()`` → 3,
+        # slices history → empty, hits the shortcut that MUST route
+        # through ``_finalize_legacy_ingestion`` (DB returns False,
+        # so no local completion).
+        state.start_ingestion_if_needed(pairs)
+    finally:
+        release.set()
+        topup.join(timeout=2.0)
+
+    # complete_ingestion_episode was attempted but said no.
+    assert state.engine._store.complete_ingestion_episode.called, (
+        "complete_ingestion_episode must be called on the cancel-and-resume "
+        "empty-history shortcut — the shortcut can no longer self-complete."
+    )
+    # Local worker did NOT self-mark as ingested.
+    assert conv_id not in state._ingested_conversations, (
+        "Local worker must NOT add itself to _ingested_conversations when "
+        "complete_ingestion_episode returned False on the cancel-and-resume "
+        "empty-history shortcut."
+    )
+    # No transition to ACTIVE.
+    assert state.session_state != SessionState.ACTIVE, (
+        f"SessionState must NOT transition to ACTIVE when the DB refused to "
+        f"complete the episode on the cancel-and-resume shortcut; got "
+        f"{state.session_state}"
+    )
+    # No compaction side effect.
+    assert compact_calls["count"] == 0, (
+        f"_compact_after_ingestion must NOT be called when the episode "
+        f"refused to complete on the cancel-and-resume shortcut; got "
+        f"{compact_calls['count']} calls"
+    )
+
+
+def test_sidecar_heartbeats_during_single_long_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single long-running tagging turn (>TTL) must not lose the
+    ingestion lease. The dedicated sidecar thread refreshes every
+    ``INGESTION_LEASE_TTL_S / 2`` seconds regardless of turn completion.
+    """
+    from virtual_context.proxy import state as state_module
+
+    # Shrink TTL so one "long turn" can be simulated in <1s.
+    # Interval becomes 0.1s; we sleep 0.35s → ≥2 refresh ticks.
+    monkeypatch.setattr(state_module, "INGESTION_LEASE_TTL_S", 0.2)
+
+    state, _metrics = _make_state()
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(**_kwargs) -> bool:
+        refresh_calls["count"] += 1
+        return True
+
+    state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
+
+    # Fake "worker" = thread that simulates ONE very slow tagging turn
+    # by sleeping for 3× the half-TTL interval. The sidecar must fire
+    # multiple refreshes during this single turn.
+    done = threading.Event()
+
+    def _one_long_turn() -> None:
+        # Single long turn — block for 3× the 0.1s interval.
+        done.wait(timeout=0.35)
+
+    worker = threading.Thread(target=_one_long_turn, daemon=True)
+    state._ingestion_thread = worker
+    worker.start()
+    try:
+        state._run_heartbeat_sidecar(
+            state.engine.config.conversation_id,
+            epoch=int(state.engine._engine_state.lifecycle_epoch),
+        )
+    finally:
+        done.set()
+        worker.join(timeout=1.0)
+
+    assert refresh_calls["count"] >= 2, (
+        f"Expected sidecar to issue at least 2 refreshes during a single "
+        f"0.35s turn at 0.1s cadence, got {refresh_calls['count']}. "
+        f"The callback-based heartbeat never fired mid-turn — the whole "
+        f"point of the sidecar is to decouple refresh cadence from turn "
+        f"completion."
     )

@@ -181,6 +181,11 @@ class ProxyState:
         self._manual_passthrough = False
         self._ingestion_thread: threading.Thread | None = None
         self._ingestion_cancel = threading.Event()
+        # Sidecar heartbeat thread: refreshes the ingestion lease every
+        # ``INGESTION_LEASE_TTL_S / 2`` seconds while ``_ingestion_thread``
+        # is alive. Separate from ``_ingestion_thread`` so a single
+        # long-running tagging turn (>TTL) cannot let the lease expire.
+        self._heartbeat_thread: threading.Thread | None = None
         self._deletion_requested = threading.Event()
         # Initial snapshot: captured at first ingestion start for growth tracking
         self._initial_turns: int | None = None
@@ -2451,6 +2456,13 @@ class ProxyState:
         if thread is None or not thread.is_alive():
             self._ingestion_thread = None
             self._ingestion_cancel.clear()
+            # If the worker is gone the sidecar will also exit on its
+            # next loop iteration (is_alive False → return). Best-effort
+            # join then clear so we don't leak a zombie handle.
+            heartbeat = self._heartbeat_thread
+            if heartbeat is not None and heartbeat.is_alive():
+                heartbeat.join(timeout=timeout_s)
+            self._heartbeat_thread = None
             return
 
         self._ingestion_cancel.set()
@@ -2466,6 +2478,18 @@ class ProxyState:
             return
 
         self._ingestion_thread = None
+        # Drain the heartbeat sidecar too — setting cancel above already
+        # woke it up, so the join should be quick.
+        heartbeat = self._heartbeat_thread
+        if heartbeat is not None and heartbeat.is_alive():
+            heartbeat.join(timeout=timeout_s)
+            if heartbeat.is_alive():
+                logger.warning(
+                    "Heartbeat sidecar did not stop within %.1fs for conv=%s",
+                    timeout_s,
+                    self.engine.config.conversation_id[:12],
+                )
+        self._heartbeat_thread = None
         self._ingestion_cancel.clear()
 
     def reset_for_conversation_deletion(
@@ -2699,8 +2723,18 @@ class ProxyState:
                         if turn_idx >= existing_turns
                     }
                 if not history_messages:
-                    self._ingested_conversations.add(conversation_id)
-                    self._advance_compaction_watermark()
+                    # Bug 1 fix (P1): do NOT locally mark the conversation
+                    # as ingested without a DB-authoritative completion.
+                    # The legacy-thread cancel policy forbids the old
+                    # thread from calling ``complete_ingestion_episode``
+                    # on cancel, so the DB episode may still be 'running'
+                    # and the phase still 'ingesting'. Delegate to the
+                    # shared helper; if the DB refuses (stale epoch,
+                    # untagged rows, lease stolen), leave the worker in
+                    # INGESTING and return without any local completion.
+                    if self._finalize_legacy_ingestion(conversation_id):
+                        self._transition_to(SessionState.ACTIVE)
+                        self._compact_after_ingestion(history_messages)
                     return
 
             # ---- PROXY-013: cancel-and-resume if already running ----
@@ -2718,6 +2752,15 @@ class ProxyState:
                 self._ingestion_thread.join(timeout=5.0)
                 if self._ingestion_thread.is_alive():
                     logger.warning("Old ingestion thread did not exit in 5s")
+                # Stop the old heartbeat sidecar too — it is bound to
+                # the old ``_ingestion_cancel`` / thread pair and will
+                # exit once it sees cancel set or the worker not alive.
+                old_heartbeat = self._heartbeat_thread
+                if old_heartbeat is not None and old_heartbeat.is_alive():
+                    old_heartbeat.join(timeout=5.0)
+                    if old_heartbeat.is_alive():
+                        logger.warning("Old heartbeat sidecar did not exit in 5s")
+                self._heartbeat_thread = None
                 # Reset cancel event for the new thread
                 self._ingestion_cancel.clear()
 
@@ -2743,9 +2786,19 @@ class ProxyState:
                         if turn_idx >= existing_turns
                     }
                 if not history_messages:
-                    self._ingested_conversations.add(conversation_id)
-                    self._advance_compaction_watermark()
-                    self._transition_to(SessionState.ACTIVE)
+                    # Bug 1 fix (P1): the cancelled old thread did NOT
+                    # call ``complete_ingestion_episode`` (per cancel
+                    # policy — the finally block skips finalisation on
+                    # cancel). If we short-circuit here with only local
+                    # completion, the DB episode stays 'running' and
+                    # phase stays 'ingesting' while the worker thinks
+                    # it's done — classic split-brain. Delegate to the
+                    # shared helper; if the DB refuses (stale epoch,
+                    # untagged rows, lease stolen), leave the worker in
+                    # INGESTING and return without local completion.
+                    if self._finalize_legacy_ingestion(conversation_id):
+                        self._transition_to(SessionState.ACTIVE)
+                        self._compact_after_ingestion(history_messages)
                     return
                 needed_turns = self._history_turn_count(history_messages) + existing_turns
 
@@ -2767,6 +2820,20 @@ class ProxyState:
                 daemon=True,
                 name="vc-ingest",
             )
+            # Bug 2 fix (P2): spawn the heartbeat sidecar BEFORE starting
+            # the ingestion worker so the first refresh is scheduled for
+            # ``INGESTION_LEASE_TTL_S / 2`` seconds from now — independent
+            # of whether the worker is mid-turn or between turns. This
+            # prevents a single long-running tagging turn from letting
+            # the lease expire before the next turn-completion callback.
+            heartbeat_epoch = int(self.engine._engine_state.lifecycle_epoch)
+            self._heartbeat_thread = threading.Thread(
+                target=self._run_heartbeat_sidecar,
+                args=(conversation_id, heartbeat_epoch),
+                daemon=True,
+                name="vc-ingest-heartbeat",
+            )
+            self._heartbeat_thread.start()
             self._ingestion_thread.start()
 
     def _verify_handoff_hash(
@@ -2809,6 +2876,138 @@ class ProxyState:
                 "Handoff hash verified at turn %d: %s",
                 prev_turn, new_hash,
             )
+
+    def _finalize_legacy_ingestion(self, conversation_id: str) -> bool:
+        """Shared DB-authoritative finalization for the legacy ingestion thread.
+
+        Performs the canonical end-of-ingestion sequence:
+
+          1. ``complete_ingestion_episode`` — atomic epoch-guarded write.
+             Returns False if the lease was stolen, the epoch moved, or
+             untagged rows remain.
+          2. ``set_phase`` — epoch-guarded phase flip to ``'active'``.
+             Returns False on stale-epoch race between step 1 and step 2.
+          3. ``_publish_phase_transition`` — fires only on a successful
+             phase flip.
+          4. Local state advance — add to ``_ingested_conversations`` and
+             call ``_advance_compaction_watermark``.
+
+        Returns:
+            True iff both DB ops succeeded and local state has been
+            advanced. Callers should treat this as "it is safe to
+            transition SessionState to ACTIVE, run post-ingestion
+            compaction, and record the ingestion watermark". When False,
+            the episode stays ``'running'`` so the next worker can pick
+            it up; the caller MUST leave the local worker in INGESTING
+            and skip all post-ingestion side effects.
+        """
+        try:
+            epoch = int(self.engine._engine_state.lifecycle_epoch)
+            episode_completed = self.engine._store.complete_ingestion_episode(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                worker_id=self._worker_id,
+            )
+        except Exception:
+            logger.warning(
+                "legacy ingestion: complete_ingestion_episode raised for "
+                "conv=%s — leaving episode 'running' for next worker",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return False
+        if not episode_completed:
+            logger.info(
+                "legacy ingestion: episode not completable for conv=%s — "
+                "deferring to next worker",
+                conversation_id[:12],
+            )
+            return False
+        try:
+            phase_ok = self.engine._store.set_phase(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                phase="active",
+            )
+        except Exception:
+            logger.warning(
+                "legacy ingestion: set_phase raised after successful "
+                "episode completion for conv=%s — not publishing event",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return False
+        if not phase_ok:
+            logger.info(
+                "legacy ingestion: set_phase('active') returned False for "
+                "conv=%s — epoch stale; deferring",
+                conversation_id[:12],
+            )
+            return False
+        # Both DB ops succeeded — advance local state.
+        self._ingested_conversations.add(conversation_id)
+        self._advance_compaction_watermark()
+        try:
+            self._publish_phase_transition("ingesting", "active")
+        except Exception:
+            logger.warning(
+                "_publish_phase_transition raised for conv=%s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+        return True
+
+    def _run_heartbeat_sidecar(self, conversation_id: str, epoch: int) -> None:
+        """Refresh ingestion lease every ``INGESTION_LEASE_TTL_S / 2``
+        seconds while ``_ingestion_thread`` is alive.
+
+        Sidecar for the legacy ingestion thread. A single long-running
+        tagging turn (>TTL) would otherwise let the lease expire before
+        the turn-completion callback could refresh it. Running refresh
+        from a dedicated thread decouples cadence from turn completion.
+
+        Exits when:
+          * ``_ingestion_cancel`` becomes set (cooperative stop),
+          * ``_ingestion_thread`` is None or not alive (worker finished),
+          * ``refresh_ingestion_heartbeat`` returns False (lease stolen
+            or stale epoch) — in which case we set
+            ``_ingestion_cancel`` to signal the worker to bail.
+
+        Uses ``threading.Event.wait(timeout=interval)`` rather than
+        ``time.sleep`` so a cancel signal interrupts the wait promptly.
+        """
+        interval = INGESTION_LEASE_TTL_S / 2
+        while True:
+            # Wait up to ``interval`` seconds, but wake early if cancel
+            # is set. Event.wait returns True on set, False on timeout.
+            if self._ingestion_cancel.wait(timeout=interval):
+                return
+            # Worker gone → lease no longer this sidecar's concern.
+            worker = self._ingestion_thread
+            if worker is None or not worker.is_alive():
+                return
+            try:
+                ok = self.engine._store.refresh_ingestion_heartbeat(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=epoch,
+                    worker_id=self._worker_id,
+                )
+            except Exception:
+                logger.warning(
+                    "heartbeat sidecar: refresh exception for conv=%s — "
+                    "retrying next tick",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+                continue
+            if not ok:
+                logger.info(
+                    "heartbeat sidecar: refresh rejected for conv=%s "
+                    "(worker=%s) — lease lost; cancelling ingestion",
+                    conversation_id[:12], self._worker_id,
+                )
+                self._ingestion_cancel.set()
+                return
 
     def _run_ingestion_with_catchup(
         self,
@@ -2878,90 +3077,22 @@ class ProxyState:
             if not cancelled:
                 # Lease-lifecycle ownership (section 2 of P1 migration):
                 # on clean completion, close the ingestion episode and
-                # flip the DB phase back to 'active'. This is the legacy
-                # thread's equivalent of the per-row ``_tagger_run``
-                # block at state.py:~605 that does the same thing.
-                #
-                # Ordering:
-                #   1. complete_ingestion_episode — atomic epoch-guarded
-                #      write. Returns False if the lease was stolen, the
-                #      epoch moved, or untagged rows remain.
-                #   2. set_phase — epoch-guarded phase flip. Returns False
-                #      on stale-epoch race between step 1 and step 2.
-                #   3. _publish_phase_transition — fires only on a
-                #      successful phase flip.
-                #
-                # Any failure path leaves the episode 'running' so the
-                # next arriving worker can pick it up; no exception
-                # propagates.
-                episode_completed = False
-                phase_ok = False
+                # flip the DB phase back to 'active' via the shared
+                # ``_finalize_legacy_ingestion`` helper. On cancel /
+                # stale-epoch / exception paths we skip finalisation
+                # entirely so the episode stays 'running' for the next
+                # worker to pick up.
+                finalized = False
                 if completed_cleanly:
-                    try:
-                        my_epoch = int(self.engine._engine_state.lifecycle_epoch)
-                        episode_completed = self.engine._store.complete_ingestion_episode(
-                            conversation_id=conversation_id,
-                            lifecycle_epoch=my_epoch,
-                            worker_id=self._worker_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "complete_ingestion_episode raised for conv=%s — "
-                            "leaving episode 'running' for next worker",
-                            conversation_id[:12],
-                            exc_info=True,
-                        )
-                        episode_completed = False
-                    if episode_completed:
-                        try:
-                            phase_ok = self.engine._store.set_phase(
-                                conversation_id=conversation_id,
-                                lifecycle_epoch=my_epoch,
-                                phase="active",
-                            )
-                        except Exception:
-                            logger.warning(
-                                "set_phase raised after successful episode "
-                                "completion for conv=%s — not publishing event",
-                                conversation_id[:12],
-                                exc_info=True,
-                            )
-                            phase_ok = False
-                        if phase_ok:
-                            try:
-                                self._publish_phase_transition("ingesting", "active")
-                            except Exception:
-                                logger.warning(
-                                    "_publish_phase_transition raised for conv=%s",
-                                    conversation_id[:12],
-                                    exc_info=True,
-                                )
-                        else:
-                            logger.info(
-                                "legacy ingestion: complete_ingestion_episode "
-                                "succeeded but set_phase rejected (stale epoch) "
-                                "for conv=%s — skipping phase event",
-                                conversation_id[:12],
-                            )
-                    else:
-                        logger.info(
-                            "legacy ingestion finished but episode not "
-                            "completable — deferring to next worker "
-                            "(conv=%s)",
-                            conversation_id[:12],
-                        )
-                # Bug 1 fix (P1): only mark this worker complete and run
-                # post-ingestion side effects when the DB actually moved to
-                # "active with nothing running". If either the episode did
-                # not complete (lease stolen / untagged rows remain) or the
-                # phase flip did not land (stale epoch), leave the worker
-                # in its pre-finalisation state — do NOT advance the local
-                # watermark, do NOT fire compaction, and do NOT transition
-                # to ACTIVE. The next worker or the next request picks up
-                # where we left off.
-                if episode_completed and phase_ok:
-                    self._ingested_conversations.add(conversation_id)
-                    self._advance_compaction_watermark()
+                    finalized = self._finalize_legacy_ingestion(conversation_id)
+                # Bug 1 fix (P1): only run post-ingestion side effects when
+                # the DB actually moved to "active with nothing running".
+                # If the helper returned False (episode not completable,
+                # lease stolen / untagged rows remain, or phase flip
+                # rejected on stale epoch), leave the worker in its
+                # pre-finalisation state — do NOT record the watermark,
+                # do NOT fire compaction, and do NOT transition to ACTIVE.
+                if finalized:
                     # Record watermark for history widening detection
                     latest = self._latest_body
                     if latest:
@@ -2975,11 +3106,8 @@ class ProxyState:
                 else:
                     logger.info(
                         "legacy ingestion finalisation deferred for conv=%s "
-                        "(episode_completed=%s, phase_ok=%s) — staying in "
-                        "INGESTING so the next worker can resume",
+                        "— staying in INGESTING so the next worker can resume",
                         conversation_id[:12],
-                        episode_completed,
-                        phase_ok,
                     )
 
     def _ingest_messages_with_progress(
@@ -3009,54 +3137,26 @@ class ProxyState:
             len(self.engine._turn_tag_index.entries),
             conversation_id[:12],
         )
-        # Bug 2 fix (P2): wall-clock heartbeat cadence. Turn-based cadence
-        # (every N turns) loses the lease when a single LLM-heavy tagging
-        # turn exceeds ``INGESTION_LEASE_TTL_S``. Initialise the clock at
-        # function entry so the first refresh is due after ~TTL/2 seconds
-        # of turn time, not immediately, and reset it on every successful
-        # ``refresh_ingestion_heartbeat`` return.
-        last_heartbeat_monotonic = time.monotonic()
-        heartbeat_threshold_s = INGESTION_LEASE_TTL_S / 2
+        # Bug 2 fix (P2): heartbeat cadence is handled by the dedicated
+        # ``_run_heartbeat_sidecar`` thread (started alongside the
+        # ingestion worker in ``start_ingestion_if_needed``). We no longer
+        # refresh the lease from the progress callback because a single
+        # long-running tagging turn (>TTL) would let the lease expire
+        # before the next callback fires. The sidecar uses
+        # ``threading.Event.wait`` so cancel signals interrupt its sleep
+        # promptly; when it detects a rejected refresh it sets
+        # ``_ingestion_cancel`` — which we pick up at the top of each
+        # progress tick via the cancellation check below.
 
         def on_progress(done: int, total: int, entry) -> None:
-            nonlocal baseline_history_tokens, last_heartbeat_monotonic
+            nonlocal baseline_history_tokens
             cum_done = baseline + done
-            # Check cancellation before updating progress
+            # Check cancellation before updating progress. The sidecar
+            # heartbeat thread flips ``_ingestion_cancel`` on lease loss,
+            # and cancel-and-resume does the same for takeover.
             if self._ingestion_cancel.is_set():
                 raise _IngestionCancelled(cum_done, _total)
             self._ingestion_progress = (cum_done, _total)
-            # Lease-lifecycle ownership (section 2 of P1 migration): refresh
-            # the ingestion heartbeat on wall-clock cadence (half the lease
-            # TTL) so a long-running legacy thread does not let its lease
-            # go stale and get stolen by another worker. If the refresh
-            # returns False the lease has been lost (stale epoch or
-            # ownership changed) — flip the cancel event so the pipeline
-            # bails out cleanly without completing the episode or flipping
-            # the phase.
-            if time.monotonic() - last_heartbeat_monotonic >= heartbeat_threshold_s:
-                try:
-                    refreshed = self.engine._store.refresh_ingestion_heartbeat(
-                        conversation_id=conversation_id,
-                        lifecycle_epoch=int(self.engine._engine_state.lifecycle_epoch),
-                        worker_id=self._worker_id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "refresh_ingestion_heartbeat raised for conv=%s — "
-                        "treating as lease loss and cancelling",
-                        conversation_id[:12],
-                        exc_info=True,
-                    )
-                    refreshed = False
-                if not refreshed:
-                    logger.info(
-                        "refresh_ingestion_heartbeat returned False for conv=%s "
-                        "(worker=%s) — lease lost, cancelling ingestion",
-                        conversation_id[:12], self._worker_id,
-                    )
-                    self._ingestion_cancel.set()
-                    raise _IngestionCancelled(cum_done, _total)
-                last_heartbeat_monotonic = time.monotonic()
             if self.metrics:
                 turn_num = entry.turn_number
                 local_turn = turn_num - baseline
