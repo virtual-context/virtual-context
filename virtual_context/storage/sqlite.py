@@ -3558,6 +3558,91 @@ CREATE TABLE IF NOT EXISTS request_captures (
         self._commit_if_unlocked(conn)
         return int(cur.rowcount or 0)
 
+    def iter_untagged_canonical_rows(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[CanonicalTurnRow]:
+        """Epoch-guarded. Stale-epoch caller receives an empty list.
+
+        Query runs against the ``canonical_turns_ordinal`` view (which exposes
+        ``turn_number`` computed via ``ROW_NUMBER()``; see
+        ``_ensure_canonical_turn_views``) so the existing
+        ``_row_to_canonical_turn`` helper — which accesses ``row["turn_number"]``
+        unconditionally on SQLite — works unchanged. We JOIN against
+        ``conversations.lifecycle_epoch`` so a caller carrying a stale epoch
+        simply matches zero rows at SQL level rather than raising. Ordering
+        uses ``sort_key`` (base-table column), NOT ``turn_number`` (a VIEW
+        column that is recomputed on every read and not stable under
+        concurrent writes).
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_number, ct.turn_group_number,
+                   ct.sort_key, ct.turn_hash, ct.hash_version,
+                   ct.normalized_user_text, ct.normalized_assistant_text,
+                   ct.user_content, ct.assistant_content,
+                   ct.user_raw_content, ct.assistant_raw_content,
+                   ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                   ct.fact_signals_json, ct.code_refs_json,
+                   ct.tagged_at, ct.compacted_at,
+                   ct.first_seen_at, ct.last_seen_at,
+                   ct.source_batch_id, ct.created_at, ct.updated_at
+              FROM canonical_turns_ordinal AS ct
+              JOIN conversations AS c
+                ON c.conversation_id = ct.conversation_id
+             WHERE ct.conversation_id = ?
+               AND ct.tagged_at IS NULL
+               AND c.lifecycle_epoch = ?
+             ORDER BY ct.sort_key ASC
+             LIMIT ?
+            """,
+            (conversation_id, expected_lifecycle_epoch, batch_size),
+        ).fetchall()
+        return [_row_to_canonical_turn(row) for row in rows]
+
+    def mark_canonical_row_tagged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        """Epoch-guarded flip of a single row's ``tagged_at``. Returns
+        ``True`` iff exactly one row was updated.
+
+        The ``EXISTS`` subclause pins the write to
+        ``conversations.lifecycle_epoch == expected_lifecycle_epoch`` so a
+        stale caller (whose conversation has been resurrected to a newer
+        epoch) matches nothing and quietly gets ``False`` — the caller is
+        expected to interpret that as "my lifecycle is over, exit". The
+        ``tagged_at IS NULL`` predicate keeps the call idempotent: a retry
+        on an already-tagged row is also ``False`` (no-op).
+        """
+        now = utcnow_iso()
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE canonical_turns
+               SET tagged_at = ?, updated_at = ?
+             WHERE canonical_turn_id = ?
+               AND conversation_id = ?
+               AND tagged_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM conversations c
+                    WHERE c.conversation_id = ?
+                      AND c.lifecycle_epoch = ?
+               )
+            """,
+            (now, now, canonical_turn_id, conversation_id,
+             conversation_id, expected_lifecycle_epoch),
+        )
+        self._commit_if_unlocked(conn)
+        return int(cur.rowcount or 0) == 1
+
     def mark_canonical_turns_compacted(
         self,
         conversation_id: str,
