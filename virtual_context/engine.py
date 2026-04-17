@@ -246,6 +246,11 @@ class VirtualContextEngine:
             store=self._store, config=self.config,
             embedding_provider=self._embedding_provider,
         )
+        # Canonical-turn ingest reconciler: one instance per engine lifetime
+        # so the upcoming ``handle_prepare_payload`` flow (A23+) can call
+        # ``engine._ingest_reconciler.ingest_batch(...)`` without re-allocating
+        # the object on every turn.
+        self._ingest_reconciler = IngestReconciler(self._store, self._semantic)
         from .core.fact_query import FactQueryEngine
         self._facts = FactQueryEngine(store=self._store, semantic=self._semantic, config=self.config)
         from .core.search_engine import SearchEngine
