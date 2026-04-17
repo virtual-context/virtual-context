@@ -629,8 +629,62 @@ class ProxyState:
                 return PhaseDecision(phase=phase, started_tagger=False)
             return PhaseDecision(phase="compacting", started_tagger=False)
 
-        # phase in ('init', 'ingesting', 'active') — fall through.
-        # Steps 5.5, 6-8 will be added by tasks A25-A29.
+        # Step 5.5: derive progress from canonical_turns SUM and transition
+        # phase when the derived totals cross a boundary (total==done with
+        # phase='init' → 'active'; total>done with phase in ('init','active')
+        # → 'ingesting'). Steps 6-8 will be added by tasks A26-A29.
+        snap = self.engine._store.read_progress_snapshot(conversation_id)
+        total_ingestible = snap.total_ingestible
+        done_ingestible = snap.done_ingestible
+
+        # Post-resurrect the local ``phase`` variable still reflects the
+        # pre-resurrect value ('deleted'); the DB phase is now 'init'. Reread
+        # the effective phase from the snapshot before making decisions.
+        if phase == "deleted":
+            phase = snap.phase  # should now be 'init'
+
+        if total_ingestible == done_ingestible:
+            # Nothing untagged — no ingestion work to start.
+            if phase == "init":
+                # Empty conversation — transition init → active.
+                self.engine.verify_epoch()  # fresh check before the write
+                ok = self.engine._store.set_phase(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    phase="active",
+                )
+                if not ok:
+                    raise LifecycleEpochMismatch(
+                        conversation_id=conversation_id,
+                        expected=my_epoch,
+                        observed=self.engine._store.get_lifecycle_epoch(
+                            conversation_id,
+                        ),
+                    )
+                phase = "active"
+            return PhaseDecision(phase=phase, started_tagger=False)
+
+        # total_ingestible > done_ingestible: there IS untagged work.
+        if phase in ("init", "active"):
+            self.engine.verify_epoch()
+            ok = self.engine._store.set_phase(
+                conversation_id=conversation_id,
+                lifecycle_epoch=my_epoch,
+                phase="ingesting",
+            )
+            if not ok:
+                raise LifecycleEpochMismatch(
+                    conversation_id=conversation_id,
+                    expected=my_epoch,
+                    observed=self.engine._store.get_lifecycle_epoch(
+                        conversation_id,
+                    ),
+                )
+            phase = "ingesting"
+            # PhaseTransitionEvent publish in Task A31.
+
+        # Fall through — phase is now 'ingesting'. A26 will add step 6
+        # (episode creation + claim).
         return PhaseDecision(phase=phase, started_tagger=False)
 
     def resume_pending_ingestion_if_needed(self) -> bool:

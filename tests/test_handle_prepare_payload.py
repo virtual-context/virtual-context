@@ -133,7 +133,8 @@ def test_handle_prepare_payload_persists_canonical_rows(tmp_path):
 
 
 def test_handle_prepare_payload_returns_phase_decision(tmp_path):
-    """The shell returns a ``PhaseDecision`` with the initial fields."""
+    """The shell returns a ``PhaseDecision``. An empty init conversation
+    with no untagged rows transitions to ``active`` via step 5.5."""
     state = _make_proxy_state(tmp_path)
     try:
         decision = state.handle_prepare_payload(
@@ -144,7 +145,8 @@ def test_handle_prepare_payload_returns_phase_decision(tmp_path):
             },
         )
         assert isinstance(decision, PhaseDecision)
-        assert decision.phase == "init"
+        # Step 5.5 transitions init → active when total == done == 0.
+        assert decision.phase == "active"
         assert decision.started_tagger is False
     finally:
         state.engine.close()
@@ -157,7 +159,8 @@ def test_handle_prepare_payload_returns_phase_decision(tmp_path):
 
 def test_phase_gate_deleted_resurrects(tmp_path):
     """``phase == 'deleted'`` resurrects the conversation — lifecycle_epoch
-    bumps and the engine's in-memory epoch is updated to match."""
+    bumps and the engine's in-memory epoch is updated to match. Step 5.5
+    then transitions the resurrected-empty conversation to ``active``."""
     state = _make_proxy_state(tmp_path)
     try:
         conv_id = state.engine.config.conversation_id
@@ -175,7 +178,9 @@ def test_phase_gate_deleted_resurrects(tmp_path):
         assert state.engine._engine_state.lifecycle_epoch == 2
         assert inner.get_lifecycle_epoch(conv_id) == 2
         snap = inner.read_progress_snapshot(conv_id)
-        assert snap.phase == "init"  # resurrect resets phase to init
+        # Resurrect resets phase to 'init'; step 5.5 sees total==done==0 and
+        # moves the empty conversation on to 'active'.
+        assert snap.phase == "active"
     finally:
         state.engine.close()
 
@@ -246,3 +251,103 @@ def test_phase_gate_ingesting_falls_through(tmp_path):
         assert pending == 0
     finally:
         state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Task A25 — step 5.5 (derive progress + transition phase)
+# ---------------------------------------------------------------------------
+
+
+def test_step_5_5_transitions_init_to_ingesting_when_untagged_work_exists(tmp_path):
+    """Empty init conversation receives a payload with content →
+    canonical rows land, derived total > done, phase transitions to 'ingesting'."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    decision = state.handle_prepare_payload(
+        body={"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]},
+        payload_accounting={"raw_payload_entry_count": 2, "ingestible_entry_count": 2},
+    )
+    # Phase transitioned to ingesting because total > done.
+    assert decision.phase == "ingesting"
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.phase == "ingesting"
+
+
+def test_step_5_5_empty_init_transitions_to_active(tmp_path):
+    """Init conversation with empty payload (no canonical rows) →
+    total == done == 0 → init transitions to active, no ingestion."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    decision = state.handle_prepare_payload(
+        body={},
+        payload_accounting={"raw_payload_entry_count": 0, "ingestible_entry_count": 0},
+    )
+    assert decision.phase == "active"
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.phase == "active"
+
+
+def test_step_5_5_active_with_no_new_work_stays_active(tmp_path):
+    """Active conversation receives a resend (same content, no new turns) →
+    total == done → stays active."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    # Simulate a fully-tagged conversation.
+    from virtual_context.core.canonical_turns import utcnow_iso
+    now = utcnow_iso()
+    with inner._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_hash, hash_version,
+                normalized_user_text, normalized_assistant_text,
+                user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, tagged_at,
+                created_at, updated_at
+            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, ?, ?, ?)
+        """, (conv_id, now, now, now, now, now))
+    inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="active")
+    decision = state.handle_prepare_payload(
+        body={},  # no new content
+        payload_accounting={"raw_payload_entry_count": 0, "ingestible_entry_count": 0},
+    )
+    assert decision.phase == "active"
+    assert decision.started_tagger is False
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.phase == "active"
+
+
+def test_step_5_5_ingesting_stays_ingesting_when_work_remains(tmp_path):
+    """Already-ingesting conversation with more untagged rows → stays ingesting."""
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    # Seed untagged canonical rows + force phase='ingesting'.
+    from virtual_context.core.canonical_turns import utcnow_iso
+    now = utcnow_iso()
+    with inner._get_conn() as conn:
+        for i in range(3):
+            conn.execute("""
+                INSERT INTO canonical_turns (
+                    canonical_turn_id, conversation_id, turn_hash, hash_version,
+                    normalized_user_text, normalized_assistant_text,
+                    user_content, assistant_content,
+                    sort_key, source_batch_id, first_seen_at, last_seen_at,
+                    covered_ingestible_entries, tagged_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, NULL, ?, ?)
+            """, (f"t{i}", conv_id, f"h{i}", float((i + 1) * 1000), now, now, now, now))
+    inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
+    decision = state.handle_prepare_payload(
+        body={},
+        payload_accounting={"raw_payload_entry_count": 0, "ingestible_entry_count": 0},
+    )
+    assert decision.phase == "ingesting"
+    snap = inner.read_progress_snapshot(conv_id)
+    assert snap.phase == "ingesting"
