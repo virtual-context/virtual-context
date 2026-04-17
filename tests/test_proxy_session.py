@@ -1062,6 +1062,35 @@ class TestSessionStateMachine:
         assert snapshot.history_message_count == 1000
         assert snapshot.last_payload_tokens == 12541785
 
+    def test_extract_session_state_has_no_legacy_payload_ingestion_fields(self):
+        """The ``payload_ingestion_done`` / ``payload_ingestion_total`` fields
+        on the shared session snapshot have been removed — ingestion progress
+        is DB-derived via ``read_progress_snapshot``.  No fabricated (done=0,
+        total=N) counters should ever appear on the serialized snapshot.
+        """
+        state = self._make_state()
+        # The engine returns a real SharedSessionState so we can inspect its
+        # concrete field list (MagicMock would auto-synthesise any attribute).
+        state.engine.extract_session_state = MagicMock(
+            return_value=SharedSessionState(),
+        )
+        # No ``_payload_ingestion_progress`` should exist on ProxyState.
+        assert not hasattr(state, "_payload_ingestion_progress")
+        # The SharedSessionState dataclass no longer exposes the legacy
+        # fields (removed as part of the cleanup).
+        dataclass_fields = SharedSessionState.__dataclass_fields__
+        assert "payload_ingestion_done" not in dataclass_fields
+        assert "payload_ingestion_total" not in dataclass_fields
+        # extract_session_state() must not set the legacy attributes on the
+        # returned snapshot either.
+        snapshot = state.extract_session_state()
+        assert "payload_ingestion_done" not in snapshot.__dict__
+        assert "payload_ingestion_total" not in snapshot.__dict__
+        # The serialized Redis blob also must not carry the legacy keys.
+        data = json.loads(snapshot.to_json())
+        assert "payload_ingestion_done" not in data
+        assert "payload_ingestion_total" not in data
+
     def test_persisted_state_skips_ingestion(self):
         state = self._make_state()
         # Simulate persisted index covering the history
