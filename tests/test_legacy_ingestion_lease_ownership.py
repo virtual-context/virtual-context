@@ -241,10 +241,13 @@ def test_non_owner_start_ingestion_defense_in_depth() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_ingestion_heartbeats_during_long_run() -> None:
-    """The progress callback must refresh the ingestion heartbeat every
-    2 turns so a long-running legacy thread does not lose its lease.
+def test_legacy_ingestion_heartbeats_during_long_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The progress callback must refresh the ingestion heartbeat on
+    wall-clock cadence (every ``INGESTION_LEASE_TTL_S / 2`` seconds of
+    turn time) so a long-running legacy thread does not lose its lease.
     """
+    from virtual_context.proxy import state as state_module
+
     state, _metrics = _make_state()
 
     heartbeat_counter = {"count": 0}
@@ -255,8 +258,21 @@ def test_legacy_ingestion_heartbeats_during_long_run() -> None:
 
     state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
 
+    # Manual clock that advances 20 seconds per progress callback,
+    # simulating a slow LLM-heavy tagging turn. With
+    # ``INGESTION_LEASE_TTL_S = 30`` the refresh threshold is 15 seconds,
+    # so every turn crosses the threshold and a heartbeat should fire.
+    clock = {"t": 1_000_000.0}
+
+    def _monotonic() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
+
     # Drive ingest_history synchronously so it fires the progress
-    # callback ``turns`` times (done = 1 .. turns).
+    # callback ``turns`` times (done = 1 .. turns). Advance the clock
+    # by 20s per turn so the wall-clock threshold (15s) is crossed each
+    # call.
     def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
         n = len(messages) // 2
         for i in range(n):
@@ -266,15 +282,14 @@ def test_legacy_ingestion_heartbeats_during_long_run() -> None:
                 tags=[f"t{turn_offset + i}"],
                 primary_tag=f"t{turn_offset + i}",
             )
+            clock["t"] += 20.0
             if progress_callback:
                 progress_callback(i + 1, n, entry)
         return n
 
     state.engine.ingest_history.side_effect = _fake_ingest
 
-    # 6 turns → 12 messages → progress callback fires 6 times with
-    # done = 1,2,3,4,5,6. Heartbeat fires on done % 2 == 0 and done > 0,
-    # i.e. at done=2, done=4, done=6 → 3 heartbeats.
+    # 6 slow turns → each crosses the 15s threshold → 6 heartbeats.
     messages: list[Message] = []
     for i in range(6):
         messages.append(Message(role="user", content=f"Q{i}"))
@@ -283,8 +298,9 @@ def test_legacy_ingestion_heartbeats_during_long_run() -> None:
     state._ingest_messages_with_progress(messages, baseline=0)
 
     assert heartbeat_counter["count"] >= 2, (
-        f"Expected at least 2 heartbeat refreshes during a 6-turn ingestion "
-        f"(cadence is every 2 turns), got {heartbeat_counter['count']}"
+        f"Expected at least 2 heartbeat refreshes during a 6-slow-turn "
+        f"ingestion (wall-clock cadence INGESTION_LEASE_TTL_S/2 = 15s, "
+        f"each turn advances clock by 20s), got {heartbeat_counter['count']}"
     )
 
 
@@ -427,19 +443,33 @@ def test_legacy_ingestion_does_not_complete_episode_on_cancel() -> None:
     )
 
 
-def test_legacy_ingestion_does_not_complete_episode_on_stale_epoch() -> None:
+def test_legacy_ingestion_does_not_complete_episode_on_stale_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """If ``refresh_ingestion_heartbeat`` returns False (stale epoch or
     ownership lost), the legacy thread must bail out WITHOUT calling
     ``complete_ingestion_episode``. The episode stays 'running'.
     """
+    from virtual_context.proxy import state as state_module
+
     state, _metrics = _make_state()
     state.engine._engine_state.lifecycle_epoch = 5
 
     # Heartbeat refresh rejects — simulates stale epoch.
     state.engine._store.refresh_ingestion_heartbeat.return_value = False
 
+    # Manual clock that advances 20s per turn so the 15s wall-clock
+    # heartbeat threshold is crossed and the refresh call fires.
+    clock = {"t": 2_000_000.0}
+
+    def _monotonic() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
+
     # Drive ingest_history far enough to trigger at least one heartbeat
-    # call (done == 2 fires the heartbeat; we supply >= 2 turns).
+    # call. With 20s-per-turn advancement the first turn already crosses
+    # the 15s threshold and the refresh fires.
     def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
         n = len(messages) // 2
         for i in range(n):
@@ -449,6 +479,7 @@ def test_legacy_ingestion_does_not_complete_episode_on_stale_epoch() -> None:
                 tags=[f"t{turn_offset + i}"],
                 primary_tag=f"t{turn_offset + i}",
             )
+            clock["t"] += 20.0
             if progress_callback:
                 progress_callback(i + 1, n, entry)
         return n
@@ -473,4 +504,314 @@ def test_legacy_ingestion_does_not_complete_episode_on_stale_epoch() -> None:
     assert not state.engine._store.complete_ingestion_episode.called, (
         "complete_ingestion_episode must NOT be called when the heartbeat "
         "refresh rejects (stale epoch). The episode must remain 'running'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 (P1) — split-brain prevention. When the DB did NOT actually move to
+# "active with nothing running", the local worker must NOT mark itself
+# complete: no ``_ingested_conversations`` add, no watermark advance, no
+# compaction, no SessionState ACTIVE transition, no
+# ``PhaseTransitionEvent``.
+# ---------------------------------------------------------------------------
+
+
+def _install_happy_ingest(state: ProxyState) -> None:
+    """Install a trivial ingest_history that fires the progress callback
+    once and returns 1. Used by the Bug 1 tests that only care about
+    the finalisation branch, not the ingestion body.
+    """
+    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
+        n = len(messages) // 2
+        for i in range(n):
+            entry = TurnTagEntry(
+                turn_number=turn_offset + i,
+                message_hash=f"h{turn_offset + i}",
+                tags=[f"t{turn_offset + i}"],
+                primary_tag=f"t{turn_offset + i}",
+            )
+            if progress_callback:
+                progress_callback(i + 1, n, entry)
+        return n
+
+    state.engine.ingest_history.side_effect = _fake_ingest
+
+
+def test_legacy_ingestion_defers_local_completion_when_episode_not_completable() -> None:
+    """Bug 1 fix: if ``complete_ingestion_episode`` returns False
+    (untagged rows remain or lease was stolen), the legacy thread must
+    NOT flip local state into "ingested + active":
+
+      * ``_ingested_conversations`` must NOT contain the conversation.
+      * SessionState must NOT transition to ACTIVE.
+      * ``_compact_after_ingestion`` must NOT be called.
+      * No ``PhaseTransitionEvent(ingesting→active)`` is published.
+    """
+    state, _metrics = _make_state()
+    state.engine._engine_state.lifecycle_epoch = 11
+    # Start ingestion from INGESTING so we can detect "did NOT transition
+    # to ACTIVE".
+    state._state = SessionState.INGESTING
+
+    # Episode completion refuses — untagged rows remain.
+    state.engine._store.complete_ingestion_episode.return_value = False
+    state.engine._store.set_phase.return_value = True
+    state.engine._store.refresh_ingestion_heartbeat.return_value = True
+
+    # Event bus recorder.
+    from virtual_context.core.event_bus import ProgressEventBus
+    from virtual_context.core.progress_events import PhaseTransitionEvent
+    bus = ProgressEventBus()
+    published: list = []
+    bus.subscribe(lambda ev: published.append(ev))
+    state.engine.progress_event_bus = bus
+
+    # Spy on _compact_after_ingestion to verify it's NOT invoked.
+    compact_calls = {"count": 0}
+
+    def _spy_compact(history: list[Message]) -> None:
+        compact_calls["count"] += 1
+
+    state._compact_after_ingestion = _spy_compact
+
+    _install_happy_ingest(state)
+
+    conv_id = state.engine.config.conversation_id
+    initial_messages = [
+        Message(role="user", content="Q0"),
+        Message(role="assistant", content="A0"),
+    ]
+    state._run_ingestion_with_catchup(
+        initial_messages, baseline=0, cumulative_total=1,
+    )
+
+    # 1. complete_ingestion_episode was attempted but said no.
+    assert state.engine._store.complete_ingestion_episode.called, (
+        "complete_ingestion_episode must still be attempted on clean exit"
+    )
+    # 2. Local worker did NOT mark itself complete.
+    assert conv_id not in state._ingested_conversations, (
+        "Local worker must NOT add itself to _ingested_conversations when "
+        "complete_ingestion_episode returned False"
+    )
+    # 3. No transition to ACTIVE.
+    assert state.session_state != SessionState.ACTIVE, (
+        f"SessionState must NOT transition to ACTIVE when the DB refused to "
+        f"complete the episode; got {state.session_state}"
+    )
+    # 4. No compaction side effect.
+    assert compact_calls["count"] == 0, (
+        f"_compact_after_ingestion must NOT be called when the episode "
+        f"refused to complete; got {compact_calls['count']} calls"
+    )
+    # 5. No PhaseTransitionEvent(ingesting→active) published.
+    transitions = [
+        ev for ev in published
+        if isinstance(ev, PhaseTransitionEvent)
+        and ev.old_phase == "ingesting"
+        and ev.new_phase == "active"
+    ]
+    assert not transitions, (
+        f"No PhaseTransitionEvent(ingesting→active) may be published when "
+        f"complete_ingestion_episode returned False; got {transitions}"
+    )
+
+
+def test_legacy_ingestion_defers_local_completion_when_set_phase_failed() -> None:
+    """Bug 1 fix: if ``complete_ingestion_episode`` returned True but
+    ``set_phase`` subsequently returned False (stale epoch between the
+    two calls), the legacy thread must NOT flip local state. The episode
+    is closed but the DB phase is still 'ingesting'; a new lifecycle has
+    taken over.
+    """
+    state, _metrics = _make_state()
+    state.engine._engine_state.lifecycle_epoch = 13
+    state._state = SessionState.INGESTING
+
+    # Episode completion succeeds but phase flip rejects.
+    state.engine._store.complete_ingestion_episode.return_value = True
+    state.engine._store.set_phase.return_value = False
+    state.engine._store.refresh_ingestion_heartbeat.return_value = True
+
+    from virtual_context.core.event_bus import ProgressEventBus
+    from virtual_context.core.progress_events import PhaseTransitionEvent
+    bus = ProgressEventBus()
+    published: list = []
+    bus.subscribe(lambda ev: published.append(ev))
+    state.engine.progress_event_bus = bus
+
+    compact_calls = {"count": 0}
+
+    def _spy_compact(history: list[Message]) -> None:
+        compact_calls["count"] += 1
+
+    state._compact_after_ingestion = _spy_compact
+
+    _install_happy_ingest(state)
+
+    conv_id = state.engine.config.conversation_id
+    initial_messages = [
+        Message(role="user", content="Q0"),
+        Message(role="assistant", content="A0"),
+    ]
+    state._run_ingestion_with_catchup(
+        initial_messages, baseline=0, cumulative_total=1,
+    )
+
+    assert state.engine._store.complete_ingestion_episode.called
+    assert state.engine._store.set_phase.called, (
+        "set_phase must be attempted after complete_ingestion_episode returned True"
+    )
+    assert conv_id not in state._ingested_conversations, (
+        "Local worker must NOT add itself to _ingested_conversations when "
+        "set_phase returned False (stale epoch)"
+    )
+    assert state.session_state != SessionState.ACTIVE, (
+        f"SessionState must NOT transition to ACTIVE when set_phase failed; "
+        f"got {state.session_state}"
+    )
+    assert compact_calls["count"] == 0, (
+        f"_compact_after_ingestion must NOT be called when set_phase failed; "
+        f"got {compact_calls['count']} calls"
+    )
+    transitions = [
+        ev for ev in published
+        if isinstance(ev, PhaseTransitionEvent)
+        and ev.old_phase == "ingesting"
+        and ev.new_phase == "active"
+    ]
+    assert not transitions, (
+        f"No PhaseTransitionEvent(ingesting→active) may be published when "
+        f"set_phase returned False; got {transitions}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 (P2) — wall-clock heartbeat cadence. The lease TTL is 30s; a single
+# LLM-heavy tagging turn can exceed that, so we cannot rely on turn-count
+# cadence. The new cadence is ``INGESTION_LEASE_TTL_S / 2`` wall-clock
+# seconds between refreshes.
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_refreshes_on_wall_clock_interval_not_turn_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a manual clock that advances 20 seconds per turn (simulating
+    a slow LLM-heavy tagging turn), each turn should cross the 15-second
+    wall-clock threshold and fire a heartbeat — regardless of turn count
+    being low.
+    """
+    from virtual_context.proxy import state as state_module
+
+    state, _metrics = _make_state()
+    state.engine._store.refresh_ingestion_heartbeat.return_value = True
+
+    # Manual clock. Advance 20s per progress callback; the wall-clock
+    # threshold is INGESTION_LEASE_TTL_S / 2 = 15s.
+    clock = {"t": 5_000_000.0}
+
+    def _monotonic() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(**_kwargs) -> bool:
+        refresh_calls["count"] += 1
+        return True
+
+    state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
+
+    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
+        n = len(messages) // 2
+        for i in range(n):
+            entry = TurnTagEntry(
+                turn_number=turn_offset + i,
+                message_hash=f"h{turn_offset + i}",
+                tags=[f"t{turn_offset + i}"],
+                primary_tag=f"t{turn_offset + i}",
+            )
+            # Simulate a slow LLM-heavy tagging turn (20s).
+            clock["t"] += 20.0
+            if progress_callback:
+                progress_callback(i + 1, n, entry)
+        return n
+
+    state.engine.ingest_history.side_effect = _fake_ingest
+
+    # 3 slow turns → 6 messages.
+    messages: list[Message] = []
+    for i in range(3):
+        messages.append(Message(role="user", content=f"Q{i}"))
+        messages.append(Message(role="assistant", content=f"A{i}"))
+
+    state._ingest_messages_with_progress(messages, baseline=0)
+
+    assert refresh_calls["count"] >= 2, (
+        f"Expected at least 2 heartbeat refreshes across 3 slow turns "
+        f"(wall-clock 20s-per-turn vs 15s threshold), got "
+        f"{refresh_calls['count']}. Cadence must NOT be gated on turn "
+        f"count being even."
+    )
+
+
+def test_heartbeat_does_not_refresh_when_wall_clock_has_not_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a manual clock that advances only 1 second per turn, no
+    heartbeat should fire across 5 turns (total 5s elapsed, well under
+    the 15s threshold).
+    """
+    from virtual_context.proxy import state as state_module
+
+    state, _metrics = _make_state()
+    state.engine._store.refresh_ingestion_heartbeat.return_value = True
+
+    clock = {"t": 6_000_000.0}
+
+    def _monotonic() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(state_module.time, "monotonic", _monotonic)
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(**_kwargs) -> bool:
+        refresh_calls["count"] += 1
+        return True
+
+    state.engine._store.refresh_ingestion_heartbeat.side_effect = _refresh
+
+    def _fake_ingest(messages, progress_callback=None, turn_offset=0, **_kw):
+        n = len(messages) // 2
+        for i in range(n):
+            entry = TurnTagEntry(
+                turn_number=turn_offset + i,
+                message_hash=f"h{turn_offset + i}",
+                tags=[f"t{turn_offset + i}"],
+                primary_tag=f"t{turn_offset + i}",
+            )
+            # Fast turn — 1 second.
+            clock["t"] += 1.0
+            if progress_callback:
+                progress_callback(i + 1, n, entry)
+        return n
+
+    state.engine.ingest_history.side_effect = _fake_ingest
+
+    # 5 fast turns → 10 messages. Cumulative wall-clock = 5s, below the
+    # 15-second threshold.
+    messages: list[Message] = []
+    for i in range(5):
+        messages.append(Message(role="user", content=f"Q{i}"))
+        messages.append(Message(role="assistant", content=f"A{i}"))
+
+    state._ingest_messages_with_progress(messages, baseline=0)
+
+    assert refresh_calls["count"] == 0, (
+        f"No heartbeat refresh should fire when cumulative wall-clock "
+        f"(5s) is below INGESTION_LEASE_TTL_S/2 (15s); got "
+        f"{refresh_calls['count']} refreshes."
     )
