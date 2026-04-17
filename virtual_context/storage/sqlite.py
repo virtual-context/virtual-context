@@ -673,6 +673,32 @@ class SQLiteStore(ContextStore):
             except sqlite3.OperationalError:
                 pass  # Column already renamed or table doesn't exist
         conn.executescript(SCHEMA_SQL)
+        # Lifecycle/phase-tracked conversations table. New in the progress-bar
+        # redesign — carries lifecycle_epoch (for delete+resurrect invariants),
+        # a phase state machine (init/ingesting/compacting/active/deleted),
+        # and per-request metadata counters consumed by the progress tracker.
+        # Future tables (ingestion_episode, compaction_operation) will
+        # reference this one.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id                TEXT PRIMARY KEY,
+                tenant_id                      TEXT NOT NULL,
+                lifecycle_epoch                INTEGER NOT NULL DEFAULT 1,
+                phase                          TEXT NOT NULL DEFAULT 'init'
+                                               CHECK (phase IN ('init','ingesting','compacting','active','deleted')),
+                pending_raw_payload_entries    INTEGER NOT NULL DEFAULT 0,
+                last_raw_payload_entries       INTEGER NOT NULL DEFAULT 0,
+                last_ingestible_payload_entries INTEGER NOT NULL DEFAULT 0,
+                created_at                     TEXT NOT NULL,
+                updated_at                     TEXT NOT NULL,
+                deleted_at                     TEXT NULL,
+                UNIQUE (tenant_id, conversation_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_tenant_phase
+                ON conversations(tenant_id, phase)
+        """)
         try:
             conn.executescript(FTS_SQL)
             conn.executescript(FTS_TRIGGER_SQL)
