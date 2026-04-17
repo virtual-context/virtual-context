@@ -2557,6 +2557,206 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             return cur.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # Compaction operation CRUD (epoch-guarded)
+    # ------------------------------------------------------------------
+    # Multi-phase compaction pipeline tracked on the ``compaction_operation``
+    # table. ``start_compaction_operation`` issues a new row in ``'queued'``
+    # status and relies on the partial unique index
+    # ``(conversation_id, lifecycle_epoch) WHERE status IN
+    # ('queued','running')`` to keep at most one active operation per
+    # (conversation, epoch) — a second start on the same active window
+    # raises ``sqlite3.IntegrityError`` and the caller is expected to
+    # retry/wait. ``claim_compaction_lease`` matches the ingestion-lease
+    # pattern (owner-or-stale heartbeat), and the three terminal/phase
+    # operations (``advance_compaction_phase``,
+    # ``complete_compaction_operation``, ``fail_compaction_operation``)
+    # double-scope the epoch filter with a correlated subquery against
+    # ``conversations.lifecycle_epoch`` so a stale thread whose
+    # conversation was resurrected to a newer epoch is rejected at SQL
+    # level.
+
+    def start_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+        phase_name: str,
+    ) -> str:
+        """Insert a fresh ``compaction_operation`` row in ``'queued'``
+        status. Returns the new ``operation_id`` (UUID string).
+
+        Raises ``sqlite3.IntegrityError`` (via the partial unique index
+        on status IN ('queued','running')) if another active operation
+        already exists for this (conversation, epoch). The caller is
+        expected to retry or wait.
+        """
+        import uuid
+        op_id = str(uuid.uuid4())
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO compaction_operation (
+                    operation_id, conversation_id, lifecycle_epoch,
+                    phase_index, phase_count, phase_name, status,
+                    started_at, owner_worker_id, heartbeat_ts
+                ) VALUES (?, ?, ?, 0, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (
+                    op_id, conversation_id, lifecycle_epoch,
+                    phase_count, phase_name, now, worker_id, now,
+                ),
+            )
+        return op_id
+
+    def claim_compaction_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ) -> bool:
+        """Claim the compaction lease for this (conversation, epoch).
+
+        Works on queued OR running operations. Returns True iff:
+          - Caller already owns the row, OR
+          - Current heartbeat is stale (older than ``lease_ttl_s``).
+        Returns False if another worker holds a fresh lease or no active
+        row exists at the given ``lifecycle_epoch``.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
+        ).isoformat()
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET owner_worker_id = ?, heartbeat_ts = ?
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                   AND (owner_worker_id = ? OR heartbeat_ts < ?)
+                """,
+                (
+                    worker_id, now, conversation_id, lifecycle_epoch,
+                    worker_id, cutoff,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def advance_compaction_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_index: int,
+        phase_name: str,
+    ) -> bool:
+        """Epoch-scoped phase advance. Also transitions status from
+        ``'queued'`` to ``'running'`` (by unconditionally setting status
+        to ``'running'``; the WHERE clause restricts the row to an
+        already-active operation). Returns True iff a matching row was
+        updated: owner match + epoch match against both the local row
+        and the authoritative ``conversations.lifecycle_epoch`` via
+        correlated subquery.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET phase_index = ?, phase_name = ?, heartbeat_ts = ?,
+                       status = 'running'
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ?
+                   )
+                   AND owner_worker_id = ?
+                """,
+                (
+                    phase_index, phase_name, now,
+                    conversation_id, lifecycle_epoch, conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def complete_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Epoch-scoped completion. Returns True iff an active (queued
+        or running) compaction exists, the caller owns it, and the
+        caller's epoch equals the authoritative
+        ``conversations.lifecycle_epoch`` (correlated subquery guard).
+        Transitions status to ``'completed'`` and stamps
+        ``completed_at``.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'completed', completed_at = ?
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ?
+                   )
+                   AND owner_worker_id = ?
+                """,
+                (
+                    now, conversation_id, lifecycle_epoch,
+                    conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def fail_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        error_message: str,
+    ) -> bool:
+        """Epoch-scoped failure. Records ``error_message`` and stamps
+        ``completed_at`` alongside the terminal ``'failed'`` status.
+        Returns True iff the same ownership + epoch guards as
+        ``complete_compaction_operation`` pass.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'failed', completed_at = ?,
+                       error_message = ?
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ?
+                   )
+                   AND owner_worker_id = ?
+                """,
+                (
+                    now, error_message, conversation_id, lifecycle_epoch,
+                    conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)

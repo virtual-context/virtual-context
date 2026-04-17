@@ -435,6 +435,92 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def start_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+        phase_name: str,
+    ) -> str:
+        """Insert a fresh ``compaction_operation`` row in ``'queued'``
+        status. Returns the new ``operation_id`` (UUID string).
+
+        Raises the backend-specific unique-violation error (enforced by
+        the partial unique index on ``status IN ('queued','running')``)
+        if another active operation already exists for this
+        (conversation, lifecycle_epoch). Callers should retry or wait.
+        """
+        raise NotImplementedError
+
+    def claim_compaction_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ) -> bool:
+        """Claim the compaction lease for this (conversation, epoch).
+
+        Works on queued OR running operations. Returns True iff:
+          - Caller already owns the row, OR
+          - Current heartbeat is stale (older than ``lease_ttl_s``).
+        Returns False if another worker holds a fresh lease or no
+        active row exists at the given ``lifecycle_epoch``.
+        """
+        raise NotImplementedError
+
+    def advance_compaction_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_index: int,
+        phase_name: str,
+    ) -> bool:
+        """Epoch-scoped phase advance. Transitions status from
+        ``'queued'`` to ``'running'`` and records the new
+        phase_index/phase_name/heartbeat_ts. The epoch filter is
+        double-scoped with a correlated subquery against
+        ``conversations.lifecycle_epoch`` so a stale thread is
+        rejected at SQL level. Returns True iff a matching row was
+        updated.
+        """
+        raise NotImplementedError
+
+    def complete_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Epoch-scoped compaction completion. Transitions status to
+        ``'completed'`` and stamps ``completed_at``. Returns True iff
+        an active (queued or running) row exists, the caller owns it,
+        and the caller's epoch matches the authoritative
+        ``conversations.lifecycle_epoch``.
+        """
+        raise NotImplementedError
+
+    def fail_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        error_message: str,
+    ) -> bool:
+        """Epoch-scoped compaction failure. Records ``error_message``,
+        stamps ``completed_at``, and transitions status to
+        ``'failed'``. Same ownership + epoch guards as
+        ``complete_compaction_operation``.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
