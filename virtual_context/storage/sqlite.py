@@ -2251,11 +2251,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
 
         Called only by the delete endpoint — caller is authoritative; no
-        epoch check needed.
+        epoch check needed. Raises KeyError if no row exists so callers
+        get symmetric signaling with ``increment_lifecycle_epoch_on_resurrect``.
         """
         now = utcnow_iso()
         with self._get_conn() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE conversations
                    SET phase = 'deleted',
@@ -2265,6 +2266,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 """,
                 (now, now, conversation_id),
             )
+            if cur.rowcount == 0:
+                raise KeyError(conversation_id)
 
     def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
         """Bump lifecycle_epoch ONLY when phase == 'deleted'.
@@ -2274,8 +2277,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         epoch. Raises KeyError if no row exists.
         """
         now = utcnow_iso()
-        with self._get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute(
                 """
                 UPDATE conversations
@@ -2293,6 +2297,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (conversation_id,),
             ).fetchone()
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         if row is None:
             raise KeyError(conversation_id)
         return int(row[0])
