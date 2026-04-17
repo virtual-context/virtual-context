@@ -810,6 +810,37 @@ class PostgresStore(ContextStore):
                     conn.execute(stmt)
                 except Exception:
                     pass  # Table/index already exists
+        # Lifecycle/phase-tracked conversations table. Mirrors the SQLite
+        # schema (see sqlite.py) — carries lifecycle_epoch (for
+        # delete+resurrect invariants), a phase state machine
+        # (init/ingesting/compacting/active/deleted), and per-request
+        # metadata counters consumed by the progress tracker. The partial
+        # index on (tenant_id, phase) excludes deleted rows so tenant-scoped
+        # phase queries never scan tombstones.
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    conversation_id                UUID PRIMARY KEY,
+                    tenant_id                      VARCHAR NOT NULL,
+                    lifecycle_epoch                INT NOT NULL DEFAULT 1,
+                    phase                          VARCHAR NOT NULL DEFAULT 'init'
+                                                   CHECK (phase IN ('init','ingesting','compacting','active','deleted')),
+                    pending_raw_payload_entries    INT NOT NULL DEFAULT 0,
+                    last_raw_payload_entries       INT NOT NULL DEFAULT 0,
+                    last_ingestible_payload_entries INT NOT NULL DEFAULT 0,
+                    created_at                     TIMESTAMPTZ NOT NULL,
+                    updated_at                     TIMESTAMPTZ NOT NULL,
+                    deleted_at                     TIMESTAMPTZ NULL,
+                    UNIQUE (tenant_id, conversation_id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conversations_tenant_phase
+                    ON conversations(tenant_id, phase)
+                     WHERE phase <> 'deleted'
+            """)
+        except Exception:
+            logger.warning("conversations table bootstrap failed", exc_info=True)
         # FTS setup
         try:
             conn.execute(FTS_SQL)
