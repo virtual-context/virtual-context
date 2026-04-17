@@ -2296,6 +2296,26 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             if cur.rowcount == 0:
                 raise KeyError(conversation_id)
+            conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET status = 'abandoned',
+                       completed_at = COALESCE(completed_at, ?)
+                 WHERE conversation_id = ?
+                   AND status = 'running'
+                """,
+                (now, conversation_id),
+            )
+            conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'cancelled',
+                       completed_at = COALESCE(completed_at, ?)
+                 WHERE conversation_id = ?
+                   AND status IN ('queued', 'running')
+                """,
+                (now, conversation_id),
+            )
 
     def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
         """Bump lifecycle_epoch ONLY when phase == 'deleted'.
@@ -2324,6 +2344,30 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
+            if row is not None:
+                new_epoch = int(row[0])
+                conn.execute(
+                    """
+                    UPDATE ingestion_episode
+                       SET status = 'abandoned',
+                           completed_at = COALESCE(completed_at, ?)
+                     WHERE conversation_id = ?
+                       AND lifecycle_epoch < ?
+                       AND status = 'running'
+                    """,
+                    (now, conversation_id, new_epoch),
+                )
+                conn.execute(
+                    """
+                    UPDATE compaction_operation
+                       SET status = 'cancelled',
+                           completed_at = COALESCE(completed_at, ?)
+                     WHERE conversation_id = ?
+                       AND lifecycle_epoch < ?
+                       AND status IN ('queued', 'running')
+                    """,
+                    (now, conversation_id, new_epoch),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -2339,9 +2383,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         time via ``SUM(covered_ingestible_entries)`` over ``canonical_turns``
         (filtered by ``tagged_at IS NOT NULL`` for the numerator) — never
         stored counters that could drift from canonical truth. Point
-        lookups in ``ingestion_episode`` / ``compaction_operation`` surface
-        any currently-active row (running for episodes; queued OR running
-        for compactions).
+        lookups in ``ingestion_episode`` / ``compaction_operation`` are
+        scoped to the conversation's current ``lifecycle_epoch`` so stale
+        rows from earlier resurrected lifecycles cannot shadow the live one.
 
         Raises ``KeyError`` if the conversation row does not exist.
         """
@@ -2375,9 +2419,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 """
                 SELECT episode_id, raw_payload_entries, owner_worker_id, heartbeat_ts
                   FROM ingestion_episode
-                 WHERE conversation_id = ? AND status = 'running'
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                   AND status = 'running'
+                 ORDER BY started_at DESC, episode_id DESC
+                 LIMIT 1
                 """,
-                (conversation_id,),
+                (conversation_id, epoch),
             ).fetchone()
             active_episode = (
                 ActiveEpisodeSnapshot(
@@ -2394,9 +2442,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 """
                 SELECT operation_id, phase_name, phase_index, phase_count, status
                   FROM compaction_operation
-                 WHERE conversation_id = ? AND status IN ('queued','running')
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                   AND status IN ('queued','running')
+                 ORDER BY
+                     CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                     started_at DESC,
+                     operation_id DESC
+                 LIMIT 1
                 """,
-                (conversation_id,),
+                (conversation_id, epoch),
             ).fetchone()
             active_compaction = (
                 ActiveCompactionSnapshot(

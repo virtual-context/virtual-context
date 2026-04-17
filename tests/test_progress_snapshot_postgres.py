@@ -168,6 +168,40 @@ def test_read_progress_snapshot_includes_active_episode_pg():
     assert snap.active_episode.owner_worker_id == "workerA"
 
 
+def test_read_progress_snapshot_ignores_stale_running_episode_from_prior_epoch_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    s.mark_conversation_deleted(cid)
+    assert s.increment_lifecycle_epoch_on_resurrect(cid) == 2
+    now = _now()
+    conn = s._get_conn()
+    conn.execute(
+        """
+        INSERT INTO ingestion_episode (
+            episode_id, conversation_id, lifecycle_epoch,
+            raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 500, %s, 'running', 'old-worker', %s)
+        """,
+        (str(uuid.uuid4()), cid, now, now),
+    )
+    ep_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO ingestion_episode (
+            episode_id, conversation_id, lifecycle_epoch,
+            raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 2, 96, %s, 'running', 'new-worker', %s)
+        """,
+        (ep_id, cid, now, now),
+    )
+    snap = s.read_progress_snapshot(cid)
+    assert snap.lifecycle_epoch == 2
+    assert snap.active_episode is not None
+    assert snap.active_episode.episode_id == ep_id
+    assert snap.active_episode.owner_worker_id == "new-worker"
+
+
 def test_read_progress_snapshot_skips_completed_episode_pg():
     s = _store()
     cid = _cid()
@@ -212,6 +246,43 @@ def test_read_progress_snapshot_includes_active_compaction_pg():
     assert snap.active_compaction.phase_index == 2
     assert snap.active_compaction.phase_count == 5
     assert snap.active_compaction.status == "running"
+
+
+def test_read_progress_snapshot_ignores_stale_active_compaction_from_prior_epoch_pg():
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    s.mark_conversation_deleted(cid)
+    assert s.increment_lifecycle_epoch_on_resurrect(cid) == 2
+    now = _now()
+    conn = s._get_conn()
+    conn.execute(
+        """
+        INSERT INTO compaction_operation (
+            operation_id, conversation_id, lifecycle_epoch,
+            phase_index, phase_count, phase_name, status,
+            started_at, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 1, 1, 5, 'stale', 'running', %s, 'old-worker', %s)
+        """,
+        (str(uuid.uuid4()), cid, now, now),
+    )
+    op_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO compaction_operation (
+            operation_id, conversation_id, lifecycle_epoch,
+            phase_index, phase_count, phase_name, status,
+            started_at, owner_worker_id, heartbeat_ts
+        ) VALUES (%s, %s, 2, 0, 5, 'fresh', 'queued', %s, 'new-worker', %s)
+        """,
+        (op_id, cid, now, now),
+    )
+    snap = s.read_progress_snapshot(cid)
+    assert snap.lifecycle_epoch == 2
+    assert snap.active_compaction is not None
+    assert snap.active_compaction.operation_id == op_id
+    assert snap.active_compaction.phase_name == "fresh"
+    assert snap.active_compaction.status == "queued"
 
 
 def test_read_progress_snapshot_queued_compaction_is_also_active_pg():
