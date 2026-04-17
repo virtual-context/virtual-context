@@ -697,6 +697,70 @@ class CompositeStore:
             ))
         raise NotImplementedError
 
+    def refresh_ingestion_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "refresh_ingestion_heartbeat", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+            ))
+        raise NotImplementedError
+
+    def complete_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "complete_ingestion_episode", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+            ))
+        raise NotImplementedError
+
+    def iter_untagged_canonical_rows(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[CanonicalTurnRow]:
+        fn = getattr(self._segments, "iter_untagged_canonical_rows", None)
+        if callable(fn):
+            return list(fn(
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+                batch_size=batch_size,
+            ) or [])
+        raise NotImplementedError
+
+    def mark_canonical_row_tagged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        fn = getattr(self._segments, "mark_canonical_row_tagged", None)
+        if callable(fn):
+            return bool(fn(
+                canonical_turn_id=canonical_turn_id,
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        raise NotImplementedError
+
     def store_tool_output(
         self,
         ref: str,
