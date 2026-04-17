@@ -165,6 +165,7 @@ class VirtualContextEngine:
         self._init_tag_splitter()
         self._engine_state = EngineState()  # mutable shared state for delegates
         self._engine_state.conversation_generation = self._conversation_generation
+        self._load_lifecycle_epoch_into_engine_state()
         self._session_state_version: int = 0  # Tracks loaded Redis version for optimistic save
         self._reference_date: date | None = None  # override "today" for remember_when relative presets
         self._request_captures_provider: Callable[[], list[dict]] | None = None  # set by ProxyState
@@ -337,6 +338,83 @@ class VirtualContextEngine:
             self.close()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Lifecycle epoch (progress-bar redesign)
+    # ------------------------------------------------------------------
+
+    def _load_lifecycle_epoch_into_engine_state(self) -> None:
+        """Populate ``self._engine_state.lifecycle_epoch`` from the store.
+
+        - If the conversations row exists, mirror its ``lifecycle_epoch``.
+        - If the row is missing (``KeyError``), upsert it at the default
+          epoch=1 and set the in-memory value to 1.
+        - If the store backend does not implement the epoch API
+          (``NotImplementedError``/``AttributeError`` — e.g. FilesystemStore
+          exposes no-op wrappers), silently default to 1. Progress-bar
+          features require SQLite/Postgres; legacy backends simply skip.
+
+        Engine callers do not yet plumb a ``tenant_id`` through. Later tasks
+        (A22+) will wire the real tenant; for now we pass the empty string,
+        matching the pattern established in ``sync_turns_from_payload``.
+        """
+        conv_id = self.config.conversation_id
+        try:
+            self._engine_state.lifecycle_epoch = int(
+                self._store.get_lifecycle_epoch(conv_id)
+            )
+        except KeyError:
+            # Conversations row absent — create it at epoch=1.
+            try:
+                self._store.upsert_conversation(
+                    tenant_id="",
+                    conversation_id=conv_id,
+                )
+                self._engine_state.lifecycle_epoch = 1
+            except (NotImplementedError, AttributeError):
+                # Store backend doesn't support the epoch API.
+                self._engine_state.lifecycle_epoch = 1
+        except (NotImplementedError, AttributeError):
+            # Store backend doesn't support the epoch API.
+            self._engine_state.lifecycle_epoch = 1
+
+    def verify_epoch(self) -> None:
+        """Verify this engine's cached ``lifecycle_epoch`` still matches the DB.
+
+        Raises :class:`LifecycleEpochMismatch` if an external delete+resurrect
+        has bumped the epoch. Callers should rehydrate the engine (or whatever
+        handle holds this engine) and retry.
+
+        On stores that don't implement the epoch API (legacy/filesystem
+        backends), this is a no-op — there is no reliable way to detect
+        lifecycle drift without the ``conversations`` table, so the current
+        in-memory state is accepted as-is.
+        """
+        from .core.lifecycle_epoch import (  # local import to avoid cycles
+            LifecycleEpochMismatch,
+            verify_epoch as _verify_epoch,
+        )
+        conv_id = self.config.conversation_id
+        try:
+            observed = int(self._store.get_lifecycle_epoch(conv_id))
+        except (NotImplementedError, AttributeError):
+            # Store doesn't expose lifecycle_epoch (FS backend, etc.) —
+            # no way to detect drift, accept current state.
+            return
+        except KeyError:
+            # Row purged externally without replacement. Treat as mismatch
+            # so callers rehydrate rather than continue writing against a
+            # ghost conversation.
+            raise LifecycleEpochMismatch(
+                conversation_id=conv_id,
+                expected=self._engine_state.lifecycle_epoch,
+                observed=-1,  # sentinel: row absent
+            )
+        _verify_epoch(
+            conversation_id=conv_id,
+            expected=self._engine_state.lifecycle_epoch,
+            observed=observed,
+        )
 
     @property
     def reference_date(self) -> date | None:
