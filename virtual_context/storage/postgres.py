@@ -3367,6 +3367,22 @@ class PostgresStore(ContextStore):
             )
         return int(cur.rowcount or 0)
 
+    def delete_canonical_turns_by_batch_id(
+        self,
+        *,
+        conversation_id: str,
+        batch_id: str,
+    ) -> int:
+        """Delete rows from ``canonical_turns`` matching both ``conversation_id``
+        AND ``source_batch_id``. Used by ``IngestReconciler`` for commit-time
+        rollback on epoch race. Returns rows deleted."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM canonical_turns WHERE conversation_id = %s AND source_batch_id = %s",
+            (conversation_id, batch_id),
+        )
+        return int(cur.rowcount or 0)
+
     def replace_canonical_turn_anchors(
         self,
         conversation_id: str,

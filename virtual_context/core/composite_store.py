@@ -310,6 +310,22 @@ class CompositeStore:
             ) or 0
         )
 
+    def delete_canonical_turns_by_batch_id(
+        self,
+        *,
+        conversation_id: str,
+        batch_id: str,
+    ) -> int:
+        deleter = getattr(self._segments, "delete_canonical_turns_by_batch_id", None)
+        if not callable(deleter):
+            return 0
+        return int(
+            deleter(
+                conversation_id=conversation_id,
+                batch_id=batch_id,
+            ) or 0
+        )
+
     def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
         self._segments.save_conversation_alias(alias_id, target_id)
 
@@ -530,6 +546,34 @@ class CompositeStore:
             return locker(conversation_id)
         from contextlib import nullcontext
         return nullcontext()
+
+    # ------------------------------------------------------------------
+    # Conversation row lifecycle (progress-bar redesign)
+    # ------------------------------------------------------------------
+    # Delegate lifecycle-epoch methods to the segments store. These are used
+    # by IngestReconciler's epoch-safe ingest_prepared_turns to fence against
+    # delete+resurrect races.
+    def upsert_conversation(self, *, tenant_id: str, conversation_id: str) -> None:
+        fn = getattr(self._segments, "upsert_conversation", None)
+        if callable(fn):
+            fn(tenant_id=tenant_id, conversation_id=conversation_id)
+
+    def get_lifecycle_epoch(self, conversation_id: str) -> int:
+        fn = getattr(self._segments, "get_lifecycle_epoch", None)
+        if callable(fn):
+            return int(fn(conversation_id))
+        raise KeyError(conversation_id)
+
+    def mark_conversation_deleted(self, conversation_id: str) -> None:
+        fn = getattr(self._segments, "mark_conversation_deleted", None)
+        if callable(fn):
+            fn(conversation_id)
+
+    def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
+        fn = getattr(self._segments, "increment_lifecycle_epoch_on_resurrect", None)
+        if callable(fn):
+            return int(fn(conversation_id))
+        raise KeyError(conversation_id)
 
     def store_tool_output(
         self,

@@ -277,6 +277,21 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
+    def delete_canonical_turns_by_batch_id(
+        self,
+        *,
+        conversation_id: str,
+        batch_id: str,
+    ) -> int:
+        """Delete rows from ``canonical_turns`` matching both ``conversation_id``
+        AND ``source_batch_id``. Used by ``IngestReconciler`` for commit-time
+        rollback on epoch race — surgically removes only the rows a single
+        ingest call just wrote without touching concurrent new-lifecycle rows.
+
+        Returns the number of rows deleted. Concrete backends MUST implement.
+        """
+        raise NotImplementedError
+
     def replace_canonical_turn_anchors(
         self,
         conversation_id: str,
