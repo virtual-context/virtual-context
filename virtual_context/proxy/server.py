@@ -747,6 +747,36 @@ async def prepare_payload(
             logger.info("MEDIA-COMPRESS: compressed %d images", _media_compressed)
 
     # ---------------------------------------------------------------
+    # New progress-bar flow (ProxyState.handle_prepare_payload):
+    # verify epoch, persist canonical rows via IngestReconciler
+    # (epoch-guarded), update request metadata, apply phase gate,
+    # create episode if needed, claim lease, spawn tagger.
+    #
+    # Silently skip if state is None (e.g. deleted mid-request, or
+    # mock test harnesses) or the engine lacks handle_prepare_payload
+    # (legacy engines without lifecycle_epoch). LifecycleEpochMismatch
+    # is re-raised so the caller can rehydrate and retry; all other
+    # exceptions are logged — they must not break the request path
+    # because the legacy flow below still runs.
+    # ---------------------------------------------------------------
+    if state is not None and hasattr(state, "handle_prepare_payload"):
+        from ..core.lifecycle_epoch import LifecycleEpochMismatch as _LE_MISMATCH
+        _hpp_stage = time.monotonic()
+        try:
+            state.handle_prepare_payload(
+                body=body,
+                payload_accounting=_payload_accounting,
+            )
+        except _LE_MISMATCH:
+            raise
+        except Exception:
+            logger.exception(
+                "handle_prepare_payload failed for conv=%s",
+                state.engine.config.conversation_id[:12],
+            )
+        _note_prep("handle_prepare_payload", _hpp_stage)
+
+    # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
     # ---------------------------------------------------------------
     _dispatch_history_messages: list[Message] | None = None
