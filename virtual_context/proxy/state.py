@@ -615,7 +615,18 @@ class ProxyState:
                     lifecycle_epoch=my_epoch,
                     worker_id=self._worker_id,
                 )
-                # IngestionProgressEvent publish in A32.
+                # Publish IngestionProgressEvent with fresh canonical counts.
+                from ..core.progress_events import IngestionProgressEvent
+                snap = self.engine._store.read_progress_snapshot(conversation_id)
+                self.engine.progress_event_bus.publish(IngestionProgressEvent(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    kind="ingestion",
+                    timestamp=time.time(),
+                    episode_id=snap.active_episode.episode_id if snap.active_episode else "",
+                    done=snap.done_ingestible,
+                    total=snap.total_ingestible,
+                ))
 
     def _run_tagging_pipeline(self, row) -> None:
         """Run the existing tagging pipeline on a single canonical row.
