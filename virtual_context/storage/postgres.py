@@ -3596,8 +3596,13 @@ class PostgresStore(ContextStore):
         view-only computed column; omitting it here is tolerated by the
         shared ``_row_to_canonical_turn`` parser (defaults to ``-1``). We
         JOIN against ``conversations.lifecycle_epoch`` so a stale-epoch
-        caller matches zero rows at SQL level rather than raising. Ordering
-        uses ``sort_key`` — the same column the partial index is sorted on.
+        caller matches zero rows at SQL level rather than raising. On
+        Postgres, ``conversations.conversation_id`` is UUID while
+        ``canonical_turns.conversation_id`` is TEXT, so the JOIN casts the
+        conversations side to TEXT to avoid ``uuid = text`` errors while
+        still letting the partial index on ``canonical_turns`` drive the
+        scan. Ordering uses ``sort_key`` — the same column the partial index
+        is sorted on.
         """
         conn = self._get_conn()
         rows = conn.execute(
@@ -3614,7 +3619,7 @@ class PostgresStore(ContextStore):
                    ct.source_batch_id, ct.created_at, ct.updated_at
               FROM canonical_turns AS ct
               JOIN conversations AS c
-                ON c.conversation_id = ct.conversation_id
+                ON c.conversation_id::text = ct.conversation_id
              WHERE ct.conversation_id = %s
                AND ct.tagged_at IS NULL
                AND c.lifecycle_epoch = %s
