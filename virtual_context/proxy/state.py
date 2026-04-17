@@ -114,9 +114,17 @@ class PhaseDecision:
     """Result of ``ProxyState.handle_prepare_payload``.
 
     Describes the phase the conversation should settle into after the
-    prepare-payload flow runs, plus whether a background tagger was
-    kicked off. Tasks A24-A29 extend the flow; the returned decision
-    carries the same two fields throughout.
+    prepare-payload flow runs, plus whether this worker claimed the
+    ingestion lease on this call.
+
+    ``started_tagger``: historically named for the per-row tagger thread
+    that ``handle_prepare_payload`` used to spawn directly. That spawn
+    was removed when tagger dispatch was delegated to the legacy
+    ``start_ingestion_if_needed`` path (which runs ``_ingestion_thread``
+    with the richer ``tag_turn`` semantics). The field now means
+    "this call successfully claimed the ingestion lease" — a downstream
+    tagger thread will be launched by ``start_ingestion_if_needed``
+    later in the request flow.
     """
 
     phase: str
@@ -872,10 +880,16 @@ class ProxyState:
     ) -> PhaseDecision:
         """Run the ingestion flow (spec §5, steps 1-8) for one inbound request.
 
-        This task (A23) wires up the minimal shell: steps 1-3 (epoch verify +
-        canonical row persistence) and step 5 (per-request metadata). Future
-        tasks (A24-A29) add the remaining steps (episode widening, phase
-        transition, tagger dispatch, commit).
+        Manages the DB bookkeeping side of ingestion: canonical row
+        persistence (IngestReconciler), per-request metadata, phase
+        transitions, ingestion-episode widening, and lease claims.
+
+        Tagger dispatch is delegated to ``start_ingestion_if_needed`` —
+        this method only manages DB bookkeeping and phase transitions.
+        The legacy ``_ingestion_thread`` (per-pair ``tag_turn`` with
+        full history) is the authoritative tagger; this method never
+        calls ``_spawn_tagger_thread`` itself, avoiding split-brain with
+        two tagger threads racing on the same canonical rows.
 
         Every DB boundary op is epoch-safe:
 
@@ -1061,8 +1075,13 @@ class ProxyState:
         )
 
         if claimed:
-            # Spawn the (stubbed) tagger thread. A27 fills in the loop body.
-            self._spawn_tagger_thread()
+            # Tagger dispatch is delegated to ``start_ingestion_if_needed``
+            # (legacy ``_ingestion_thread`` running ``tag_turn`` with full
+            # history). Do NOT spawn the per-row tagger here — two tagger
+            # threads would race on the same canonical rows and the
+            # ``TurnTagIndex``. ``started_tagger=True`` signals that this
+            # call claimed the lease; the legacy path spawns the actual
+            # worker thread downstream in the same request flow.
             return PhaseDecision(phase="ingesting", started_tagger=True)
         return PhaseDecision(phase="ingesting", started_tagger=False)
 
