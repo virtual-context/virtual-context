@@ -166,3 +166,59 @@ def test_mark_canonical_row_tagged_wrong_conversation_id_returns_false(tmp_path:
         expected_lifecycle_epoch=1,
     )
     assert ok is False
+
+
+def test_iter_untagged_uses_partial_index(tmp_path: Path) -> None:
+    """``iter_untagged_canonical_rows`` must drive the partial index
+    ``idx_canonical_turns_conv_untagged`` and NOT fall back to a full scan.
+
+    The A19 implementation originally routed through the
+    ``canonical_turns_ordinal`` VIEW so the row parser could read
+    ``row["turn_number"]``. SQLite's planner cannot push the partial index
+    through the view's ``ROW_NUMBER()`` co-routine, producing a plan like
+    ``CO-ROUTINE canonical_turns_ordinal + SCAN ct + USE TEMP B-TREE FOR
+    ORDER BY`` — O(all rows in conversation) regardless of
+    ``tagged_at``. The tagger calls this in a tight loop; missing the index
+    is the regression this test locks in.
+    """
+    s = SQLiteStore(tmp_path / "vc.db")
+    s.upsert_conversation(tenant_id="t", conversation_id="c")
+    with s._get_conn() as conn:
+        plan = list(conn.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
+                   ct.sort_key, ct.turn_hash, ct.hash_version,
+                   ct.normalized_user_text, ct.normalized_assistant_text,
+                   ct.user_content, ct.assistant_content,
+                   ct.user_raw_content, ct.assistant_raw_content,
+                   ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                   ct.fact_signals_json, ct.code_refs_json,
+                   ct.tagged_at, ct.compacted_at,
+                   ct.first_seen_at, ct.last_seen_at,
+                   ct.source_batch_id, ct.created_at, ct.updated_at
+              FROM canonical_turns AS ct
+              JOIN conversations AS c
+                ON c.conversation_id = ct.conversation_id
+             WHERE ct.conversation_id = ?
+               AND ct.tagged_at IS NULL
+               AND c.lifecycle_epoch = ?
+             ORDER BY ct.sort_key ASC
+             LIMIT ?
+            """,
+            ("c", 1, 10),
+        ).fetchall())
+    detail = " | ".join(str(tuple(row)) for row in plan)
+    assert "idx_canonical_turns_conv_untagged" in detail, (
+        f"iter_untagged_canonical_rows is not using the partial index. "
+        f"Plan was: {detail}"
+    )
+    # Also guard against the view regression: a plan that mentions
+    # ``canonical_turns_ordinal`` or ``TEMP B-TREE FOR ORDER BY`` means we
+    # fell back to the view path and lost the index.
+    assert "canonical_turns_ordinal" not in detail, (
+        f"Query must not route through the view. Plan was: {detail}"
+    )
+    assert "TEMP B-TREE FOR ORDER BY" not in detail, (
+        f"Query must not fall back to a temp sort. Plan was: {detail}"
+    )
