@@ -2177,6 +2177,151 @@ class PostgresStore(ContextStore):
         )
         return cur.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # Request metadata + phase helpers (epoch-guarded)
+    # ------------------------------------------------------------------
+    # Postgres mirror of the SQLite helpers. All four methods filter on
+    # ``lifecycle_epoch`` in the WHERE clause so a stale caller whose
+    # in-memory epoch no longer matches the authoritative ``conversations``
+    # row sees a ``False``/``None`` return and never stomps a new
+    # lifecycle's counters/phase. Postgres uses scalar ``GREATEST()`` for
+    # the monotonic widener (SQLite uses ``MAX()``).
+    # ``set_phase_and_drain_pending_raw`` uses ``conn.transaction()``
+    # (matches the A14 pattern) so the read-then-UPDATE is atomic under
+    # autocommit; a concurrent resurrect cannot slip between the epoch
+    # check and the drain.
+
+    def update_request_metadata(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        last_raw_payload_entries: int,
+        last_ingestible_payload_entries: int,
+    ) -> bool:
+        """Overwrite the per-request snapshot counters
+        (``last_raw_payload_entries`` + ``last_ingestible_payload_entries``)
+        on the conversations row. Epoch-guarded: returns ``True`` iff the
+        UPDATE matched a row at the caller's ``lifecycle_epoch``.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE conversations
+               SET last_raw_payload_entries = %s,
+                   last_ingestible_payload_entries = %s,
+                   updated_at = %s
+             WHERE conversation_id = %s
+               AND lifecycle_epoch = %s
+            """,
+            (
+                last_raw_payload_entries,
+                last_ingestible_payload_entries,
+                now,
+                conversation_id,
+                lifecycle_epoch,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def widen_pending_raw_payload_entries(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        value: int,
+    ) -> bool:
+        """Monotonic widener for ``pending_raw_payload_entries``. Uses
+        Postgres's scalar ``GREATEST()`` so the column can only move
+        forwards. Epoch-guarded: returns ``True`` iff the UPDATE matched
+        a row at the caller's ``lifecycle_epoch``.
+        """
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE conversations
+               SET pending_raw_payload_entries =
+                   GREATEST(pending_raw_payload_entries, %s)
+             WHERE conversation_id = %s
+               AND lifecycle_epoch = %s
+            """,
+            (value, conversation_id, lifecycle_epoch),
+        )
+        return cur.rowcount == 1
+
+    def set_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        phase: str,
+    ) -> bool:
+        """Epoch-guarded phase write. Returns ``True`` iff the UPDATE
+        matched a row at the caller's epoch — a stale thread cannot
+        stomp a new lifecycle's phase.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE conversations
+               SET phase = %s, updated_at = %s
+             WHERE conversation_id = %s
+               AND lifecycle_epoch = %s
+            """,
+            (phase, now, conversation_id, lifecycle_epoch),
+        )
+        return cur.rowcount == 1
+
+    def set_phase_and_drain_pending_raw(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        new_phase: str,
+    ) -> int | None:
+        """Atomically transition phase and return the drained
+        ``pending_raw_payload_entries``. Wraps the read-then-UPDATE in
+        ``conn.transaction()`` so a concurrent resurrect cannot slip
+        between the epoch check and the drain. Returns the drained
+        integer on success, or ``None`` when the caller's
+        ``lifecycle_epoch`` does not match the authoritative
+        conversations row.
+        """
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        with conn.transaction():
+            row = conn.execute(
+                """
+                SELECT pending_raw_payload_entries, lifecycle_epoch
+                  FROM conversations WHERE conversation_id = %s
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if isinstance(row, dict):
+                current_epoch = int(row["lifecycle_epoch"])
+                drained = int(row["pending_raw_payload_entries"])
+            else:
+                current_epoch = int(row[1])
+                drained = int(row[0])
+            if current_epoch != lifecycle_epoch:
+                return None
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = %s,
+                       pending_raw_payload_entries = 0,
+                       updated_at = %s
+                 WHERE conversation_id = %s
+                   AND lifecycle_epoch = %s
+                """,
+                (new_phase, now, conversation_id, lifecycle_epoch),
+            )
+        return drained
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         with conn.transaction():
