@@ -533,12 +533,125 @@ class ProxyState:
             logger.warning("Failed to persist completed turn", exc_info=True)
 
     def _tagger_run(self) -> None:
-        """Background tagger loop entrypoint.
+        """Background tagger loop. Processes untagged canonical rows until
+        none remain, then completes the episode. Exits cleanly on epoch
+        mismatch (lifecycle bumped by delete+resurrect).
 
-        Placeholder — Task A27 implements the full heartbeat + tagging loop
-        driven by ``claim_ingestion_lease`` / ``refresh_ingestion_heartbeat``.
-        Step 6 only needs the thread to exist for lifecycle-tracking tests;
-        returning immediately is intentional.
+        Four boundary ``verify_epoch`` checks ensure a stale tagger cannot
+        affect a new lifecycle even if raced:
+
+        1. Top of loop — before the row fetch.
+        2. Before the completion write.
+        3. Before each row-mark write.
+        4. Before each heartbeat refresh.
+
+        ``my_epoch`` is captured at spawn time. Every SQL call filters on
+        ``my_epoch`` so stale-epoch writes are rejected at the DB level even
+        if ``verify_epoch`` races past a lifecycle change.
+        """
+        conversation_id = self.engine.config.conversation_id
+        # Capture epoch at spawn time. Every SQL call filters on my_epoch
+        # so stale-epoch writes are rejected even if verify_epoch races past
+        # a lifecycle change.
+        my_epoch = int(self.engine._engine_state.lifecycle_epoch)
+
+        def _verify_or_exit() -> bool:
+            try:
+                self.engine.verify_epoch()
+                return True
+            except LifecycleEpochMismatch:
+                logger.info(
+                    "Tagger %s exiting: lifecycle epoch changed for conv=%s",
+                    self._worker_id, conversation_id[:12],
+                )
+                return False
+
+        while True:
+            # Boundary check #1 — before the row fetch.
+            if not _verify_or_exit():
+                return
+
+            batch = self.engine._store.iter_untagged_canonical_rows(
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=my_epoch,
+                batch_size=32,
+            )
+            if not batch:
+                # Boundary check #2 — before the completion write.
+                if not _verify_or_exit():
+                    return
+                completed = self.engine._store.complete_ingestion_episode(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    worker_id=self._worker_id,
+                )
+                if completed:
+                    # Transition phase to 'active'. Epoch-guarded.
+                    self.engine._store.set_phase(
+                        conversation_id=conversation_id,
+                        lifecycle_epoch=my_epoch,
+                        phase="active",
+                    )
+                    # PhaseTransitionEvent publish in A31.
+                    return
+                # rows-affected == 0 — either new untagged row appeared
+                # (race) or lifecycle moved on. Loop; next verify_epoch
+                # catches the latter.
+                continue
+
+            for row in batch:
+                # Run the existing tagging pipeline on this row. On failure
+                # we leave ``tagged_at`` NULL so a later run can retry the
+                # row without dropping it on the floor.
+                try:
+                    self._run_tagging_pipeline(row)
+                except Exception:
+                    logger.exception(
+                        "Tagger %s failed to tag row %s",
+                        self._worker_id, row.canonical_turn_id[:12],
+                    )
+                    # On tagging failure, skip this row. A later run can
+                    # retry if tagged_at is still NULL.
+                    continue
+
+                # Boundary check #3 — before the row-mark write.
+                if not _verify_or_exit():
+                    return
+
+                marked = self.engine._store.mark_canonical_row_tagged(
+                    canonical_turn_id=row.canonical_turn_id,
+                    conversation_id=conversation_id,
+                    expected_lifecycle_epoch=my_epoch,
+                )
+                if not marked:
+                    logger.info(
+                        "Tagger %s exiting: mark_canonical_row_tagged"
+                        " rejected (epoch mismatch); tagged_at untouched"
+                        " for turn_id=%s",
+                        self._worker_id, row.canonical_turn_id[:12],
+                    )
+                    return
+
+                # Boundary check #4 — before the heartbeat write.
+                if not _verify_or_exit():
+                    return
+
+                self.engine._store.refresh_ingestion_heartbeat(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    worker_id=self._worker_id,
+                )
+                # IngestionProgressEvent publish in A32.
+
+    def _run_tagging_pipeline(self, row) -> None:
+        """Run the existing tagging pipeline on a single canonical row.
+
+        For A27 this is a no-op — the row is stamped ``tagged_at = now`` by
+        ``mark_canonical_row_tagged`` without further enrichment. The A27
+        scope is the loop control flow and the four boundary epoch checks;
+        wiring the real ``TaggingPipeline.tag_turn`` entry point is deferred
+        to a later task that can also bridge the per-row ``CanonicalTurnRow``
+        into the history-oriented shape the pipeline expects.
         """
         return
 
