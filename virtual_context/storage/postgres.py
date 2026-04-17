@@ -2337,6 +2337,97 @@ class PostgresStore(ContextStore):
             )
         return drained
 
+    def drain_compaction_exit(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> str | None:
+        """Atomic compaction-exit decision + pending drain.
+
+        Postgres mirror of the SQLite helper. Wraps the epoch check, the
+        ``EXISTS`` probe against ``canonical_turns``, the phase UPDATE, and
+        (on untagged-exists) a fresh ``ingestion_episode`` INSERT in a
+        single ``conn.transaction()`` so a concurrent tagger cannot flip
+        the answer between read and write.
+
+        Returns ``'ingesting'`` (work remains — episode row inserted) or
+        ``'active'`` (all canonical rows tagged) on success, or ``None``
+        when the caller's ``lifecycle_epoch`` does not match the
+        authoritative conversations row. Epoch-guarded.
+        """
+        import uuid
+
+        now = datetime.now(timezone.utc)
+        conn = self._get_conn()
+        with conn.transaction():
+            row = conn.execute(
+                """
+                SELECT pending_raw_payload_entries, lifecycle_epoch,
+                       EXISTS (
+                         SELECT 1 FROM canonical_turns
+                          WHERE conversation_id = %s AND tagged_at IS NULL
+                       )
+                  FROM conversations
+                 WHERE conversation_id = %s
+                """,
+                (conversation_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if isinstance(row, dict):
+                current_epoch = int(row["lifecycle_epoch"])
+                pending_raw = int(row["pending_raw_payload_entries"])
+                # When psycopg row factory returns dict rows, the
+                # unnamed EXISTS expression is keyed by its auto-generated
+                # alias "exists".
+                has_untagged = bool(row.get("exists"))
+            else:
+                pending_raw = int(row[0])
+                current_epoch = int(row[1])
+                has_untagged = bool(row[2])
+            if current_epoch != lifecycle_epoch:
+                return None
+            if has_untagged:
+                conn.execute(
+                    """
+                    UPDATE conversations
+                       SET phase = 'ingesting',
+                           pending_raw_payload_entries = 0,
+                           updated_at = %s
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch = %s
+                    """,
+                    (now, conversation_id, lifecycle_epoch),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ingestion_episode (
+                        episode_id, conversation_id, lifecycle_epoch,
+                        raw_payload_entries, started_at, status,
+                        owner_worker_id, heartbeat_ts
+                    ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
+                    """,
+                    (
+                        uuid.uuid4(), conversation_id, lifecycle_epoch,
+                        pending_raw, now, worker_id, now,
+                    ),
+                )
+                return "ingesting"
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = 'active',
+                       pending_raw_payload_entries = 0,
+                       updated_at = %s
+                 WHERE conversation_id = %s
+                   AND lifecycle_epoch = %s
+                """,
+                (now, conversation_id, lifecycle_epoch),
+            )
+            return "active"
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         with conn.transaction():

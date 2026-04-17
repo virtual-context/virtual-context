@@ -661,6 +661,96 @@ class CompositeStore:
             )
         raise NotImplementedError
 
+    def drain_compaction_exit(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> str | None:
+        fn = getattr(self._segments, "drain_compaction_exit", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+            )
+        raise NotImplementedError
+
+    def start_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+        phase_name: str,
+    ) -> str:
+        fn = getattr(self._segments, "start_compaction_operation", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                phase_count=phase_count,
+                phase_name=phase_name,
+            )
+        raise NotImplementedError
+
+    def advance_compaction_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_index: int,
+        phase_name: str,
+    ) -> bool:
+        fn = getattr(self._segments, "advance_compaction_phase", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                phase_index=phase_index,
+                phase_name=phase_name,
+            ))
+        raise NotImplementedError
+
+    def complete_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "complete_compaction_operation", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+            ))
+        raise NotImplementedError
+
+    def fail_compaction_operation(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        error_message: str,
+    ) -> bool:
+        fn = getattr(self._segments, "fail_compaction_operation", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                error_message=error_message,
+            ))
+        raise NotImplementedError
+
     def upsert_ingestion_episode(
         self,
         *,

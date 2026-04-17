@@ -655,6 +655,39 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def drain_compaction_exit(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> str | None:
+        """Atomic compaction-exit decision + pending drain.
+
+        Inside a single transaction:
+
+        1. Verify ``conversations.lifecycle_epoch`` matches the caller's —
+           return ``None`` on mismatch (no writes).
+        2. ``EXISTS (SELECT 1 FROM canonical_turns WHERE conversation_id = ?
+           AND tagged_at IS NULL)`` inside the same transaction.
+        3. If any untagged canonical rows remain → transition phase to
+           ``'ingesting'``, zero ``pending_raw_payload_entries``, and INSERT
+           a fresh ``ingestion_episode`` row in ``'running'`` status whose
+           ``raw_payload_entries`` equals the drained ``pending_raw``.
+           Else → transition phase to ``'active'`` and zero
+           ``pending_raw_payload_entries``.
+
+        Returns the new phase (``'ingesting'`` or ``'active'``) on success,
+        or ``None`` when the caller's ``lifecycle_epoch`` does not match the
+        authoritative conversations row. Epoch-guarded.
+
+        Callers (e.g. ``ProxyState.exit_compaction``) must NOT rely on
+        ``read_progress_snapshot`` for this decision — the EXISTS check
+        runs in the same transaction as the phase UPDATE so a concurrent
+        tagger cannot flip the answer between read and write.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
