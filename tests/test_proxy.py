@@ -796,6 +796,93 @@ class TestPrepareRouting:
         assert captured
         assert captured[-1]["passthrough"] is False
 
+    def test_prepare_payload_skips_legacy_ingestion_when_lease_not_claimed(self):
+        """Multi-worker gate: when ``handle_prepare_payload`` returns
+        ``started_tagger=False`` (another worker owns the lease), the
+        passthrough branch must NOT spawn the legacy ingestion thread.
+        When ``started_tagger=True`` (this worker owns the lease), it
+        MUST spawn it. Closes the third seam of P1 #1.
+        """
+        from virtual_context.proxy.state import PhaseDecision
+
+        # Helper: build a fresh passthrough-bound state for each sub-run.
+        def _build_state():
+            s, _m = self._make_state()
+            # Force passthrough on first request: fresh session, unindexed,
+            # history messages present -> resolve_prepare_state returns
+            # PASSTHROUGH / "initial_ingest".
+            s.engine._turn_tag_index = TurnTagIndex()
+            s.engine._engine_state = EngineState()
+            s._ingested_conversations.clear()
+            return s, _m
+
+        body = {
+            "model": "claude-opus-4-6",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Q0"},
+                {"role": "assistant", "content": "A0"},
+                {"role": "user", "content": "now"},
+            ],
+        }
+        fmt = AnthropicFormat()
+
+        # --- Non-owner branch: started_tagger=False -> skip legacy thread. ---
+        state, metrics = _build_state()
+        non_owner_calls = {"count": 0}
+
+        def _non_owner_hpp(*args, **kwargs):
+            return PhaseDecision(phase="ingesting", started_tagger=False)
+
+        def _count_start_ingestion(_history):
+            non_owner_calls["count"] += 1
+
+        state.handle_prepare_payload = _non_owner_hpp
+        state.start_ingestion_if_needed = _count_start_ingestion
+
+        asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                fmt,
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert non_owner_calls["count"] == 0, (
+            "Non-owner worker (started_tagger=False) must NOT spawn legacy "
+            "ingestion thread — another worker holds the lease."
+        )
+
+        # --- Owner branch: started_tagger=True -> legacy thread runs. ---
+        state2, metrics2 = _build_state()
+        owner_calls = {"count": 0}
+
+        def _owner_hpp(*args, **kwargs):
+            return PhaseDecision(phase="ingesting", started_tagger=True)
+
+        def _count_start_ingestion_owner(_history):
+            owner_calls["count"] += 1
+
+        state2.handle_prepare_payload = _owner_hpp
+        state2.start_ingestion_if_needed = _count_start_ingestion_owner
+
+        asyncio.run(
+            prepare_payload(
+                body,
+                state2,
+                fmt,
+                metrics2,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert owner_calls["count"] == 1, (
+            "Owner worker (started_tagger=True) must spawn legacy ingestion "
+            "thread exactly once."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Engine ingest_history
