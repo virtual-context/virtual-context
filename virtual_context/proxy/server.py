@@ -792,6 +792,16 @@ async def prepare_payload(
     _dispatch_compacted_prefix_messages = 0
     _dispatch_pending_indexing = False
     _dispatch_manual_passthrough = False
+    # Multi-worker gate: if ``handle_prepare_payload`` ran and did NOT claim
+    # the lease (``started_tagger is False``), another worker owns ingestion
+    # for this conversation — we must skip BOTH legacy spawn paths
+    # (``start_ingestion_if_needed`` AND ``resume_pending_ingestion_if_needed``)
+    # to avoid two workers racing on the same canonical rows. If
+    # ``_phase_decision is None`` (engine lacks the hook, state is None, or
+    # the call raised) we default to the legacy flow (status quo preserved).
+    _owns_ingestion_lease = (
+        _phase_decision is None or _phase_decision.started_tagger
+    )
     if state:
         _dispatch_stage = time.monotonic()
         state._total_requests += 1
@@ -822,7 +832,7 @@ async def prepare_payload(
             _dispatch_compacted_prefix_messages = int(
                 getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_prefix_messages", 0) or 0
             )
-            if _passthrough_reason == "pending_indexing":
+            if _passthrough_reason == "pending_indexing" and _owns_ingestion_lease:
                 state.resume_pending_ingestion_if_needed()
                 current_state = state.session_state
         _note_prep("session_state_dispatch", _dispatch_stage)
@@ -848,16 +858,10 @@ async def prepare_payload(
             state._latest_body = body
 
             # On first request: kick off non-blocking ingestion.
-            # Multi-worker gate: if ``handle_prepare_payload`` ran and did
-            # NOT claim the lease (``started_tagger is False``), another
-            # worker owns ingestion for this conversation — we must skip
-            # the legacy thread to avoid two workers racing on the same
-            # canonical rows. If ``_phase_decision is None`` (engine lacks
-            # the hook, state is None, or the call raised) we default to
-            # the legacy flow (status quo preserved).
-            _owns_ingestion_lease = (
-                _phase_decision is None or _phase_decision.started_tagger
-            )
+            # ``_owns_ingestion_lease`` was computed above the dispatch block
+            # and already gated the ``resume_pending_ingestion_if_needed``
+            # call; re-use the same gate here so both spawn paths honour
+            # the lease decision returned by ``handle_prepare_payload``.
             if not state._history_ingested():
                 _dispatch_history_messages = _dispatch_history_messages or state._completed_history_messages(
                     _extract_ingestible_messages(body)
