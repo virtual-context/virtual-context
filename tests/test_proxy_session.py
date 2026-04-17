@@ -1039,8 +1039,25 @@ class TestSessionStateMachine:
         assert state_events[0]["to"] == "ingesting"
 
     def test_hydrate_from_shared_session_restores_ui_fields(self):
+        from virtual_context.core.progress_snapshot import ProgressSnapshot
+
         state = self._make_state()
         state.engine.hydrate_from_session_state = MagicMock()
+        # ``live_turn_count`` / ``history_message_count`` on the serialized
+        # snapshot are DB-derived via ``read_progress_snapshot`` — not the
+        # hydrated shared-state mirrors. Return a real ProgressSnapshot with
+        # matching totals so the derived fields are deterministic.
+        state.engine._store.read_progress_snapshot.return_value = ProgressSnapshot(
+            conversation_id=state.engine.config.conversation_id,
+            lifecycle_epoch=1,
+            phase="ingesting",
+            total_ingestible=500,
+            done_ingestible=20,
+            last_raw_payload_entries=0,
+            last_ingestible_payload_entries=0,
+            active_episode=None,
+            active_compaction=None,
+        )
         shared = SharedSessionState(
             session_state="ingesting",
             live_turn_count=500,

@@ -376,7 +376,7 @@ class ProxyMetrics:
             elif etype == "compaction_error":
                 extras = f" error={event.get('error','')[:120]}"
             elif etype == "ingested_turn":
-                extras = f" turn={event.get('turn')} done={event.get('done')}/{event.get('total')} tags={event.get('tags',[])} preview=\"{event.get('message_preview','')[:40]}\""
+                extras = f" turn={event.get('turn')} tags={event.get('tags',[])} preview=\"{event.get('message_preview','')[:40]}\""
             elif etype == "history_ingestion":
                 extras = f" turns={event.get('turns_ingested')} ms={event.get('elapsed_ms',0):.0f}"
             elif etype == "conversation_deleted":

@@ -8,12 +8,13 @@ subquery in ``advance_compaction_phase`` / ``complete_compaction_operation``
 ``conversations.lifecycle_epoch`` so a stale thread whose conversation was
 resurrected to a newer epoch is rejected at SQL level.
 
-Note: ``conversations.conversation_id`` is ``UUID PRIMARY KEY`` in Postgres
-and ``compaction_operation.operation_id`` is also UUID, so test IDs use
-``uuid.uuid4()`` rather than free-form strings. UUIDs are generated
-per-test to keep the suite idempotent across reruns against a shared test
-database. psycopg3 adapts ``datetime.now(timezone.utc)`` directly to
-``TIMESTAMPTZ`` so no ISO-string conversion is needed when seeding rows.
+Note: ``conversations.conversation_id`` is ``TEXT PRIMARY KEY`` in Postgres
+(aligned with ``canonical_turns.conversation_id``), and
+``compaction_operation.operation_id`` is UUID. Test conversation IDs use
+``str(uuid.uuid4())`` per-test to keep the suite idempotent across reruns
+against a shared test database. psycopg3 adapts ``datetime.now(timezone.utc)``
+directly to ``TIMESTAMPTZ`` so no ISO-string conversion is needed when
+seeding rows.
 """
 
 from __future__ import annotations
