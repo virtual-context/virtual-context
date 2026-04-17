@@ -2765,6 +2765,147 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             return cur.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # Request metadata + phase helpers (epoch-guarded)
+    # ------------------------------------------------------------------
+    # All four methods filter on ``lifecycle_epoch`` in the WHERE clause
+    # so a stale caller whose in-memory epoch no longer matches the
+    # authoritative ``conversations`` row sees a ``False``/``None`` return
+    # and never stomps a new lifecycle's counters/phase. SQLite uses
+    # scalar ``MAX()`` for the monotonic widener (Postgres uses
+    # ``GREATEST()``). ``set_phase_and_drain_pending_raw`` wraps its
+    # read-then-UPDATE in ``BEGIN IMMEDIATE`` so a concurrent resurrect
+    # cannot slip between the epoch check and the drain.
+
+    def update_request_metadata(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        last_raw_payload_entries: int,
+        last_ingestible_payload_entries: int,
+    ) -> bool:
+        """Overwrite the per-request snapshot counters
+        (``last_raw_payload_entries`` + ``last_ingestible_payload_entries``)
+        on the conversations row. Epoch-guarded: returns ``True`` iff the
+        UPDATE matched a row at the caller's ``lifecycle_epoch``.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET last_raw_payload_entries = ?,
+                       last_ingestible_payload_entries = ?,
+                       updated_at = ?
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                """,
+                (
+                    last_raw_payload_entries,
+                    last_ingestible_payload_entries,
+                    now,
+                    conversation_id,
+                    lifecycle_epoch,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def widen_pending_raw_payload_entries(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        value: int,
+    ) -> bool:
+        """Monotonic widener for ``pending_raw_payload_entries``. Uses
+        SQLite's scalar ``MAX()`` (NOT the aggregate) so the column can
+        only move forwards. Epoch-guarded: returns ``True`` iff the
+        UPDATE matched a row at the caller's ``lifecycle_epoch``.
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET pending_raw_payload_entries =
+                       MAX(pending_raw_payload_entries, ?)
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                """,
+                (value, conversation_id, lifecycle_epoch),
+            )
+            return cur.rowcount == 1
+
+    def set_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        phase: str,
+    ) -> bool:
+        """Epoch-guarded phase write. Returns ``True`` iff the UPDATE
+        matched a row at the caller's epoch — a stale thread cannot
+        stomp a new lifecycle's phase.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = ?, updated_at = ?
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                """,
+                (phase, now, conversation_id, lifecycle_epoch),
+            )
+            return cur.rowcount == 1
+
+    def set_phase_and_drain_pending_raw(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        new_phase: str,
+    ) -> int | None:
+        """Atomically transition phase and return the drained
+        ``pending_raw_payload_entries``. Wraps the read-then-UPDATE in
+        ``BEGIN IMMEDIATE`` so a concurrent resurrect cannot slip between
+        the epoch check and the drain. Returns the drained integer on
+        success, or ``None`` when the caller's ``lifecycle_epoch`` does
+        not match the authoritative conversations row.
+        """
+        now = utcnow_iso()
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT pending_raw_payload_entries, lifecycle_epoch
+                  FROM conversations WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None or int(row[1]) != lifecycle_epoch:
+                conn.rollback()
+                return None
+            drained = int(row[0])
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = ?,
+                       pending_raw_payload_entries = 0,
+                       updated_at = ?
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                """,
+                (new_phase, now, conversation_id, lifecycle_epoch),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return drained
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)

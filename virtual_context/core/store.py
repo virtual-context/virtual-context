@@ -579,6 +579,75 @@ class ContextStore(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
+    # Request metadata + phase helpers (epoch-guarded)
+    # ------------------------------------------------------------------
+    # These four methods mutate the per-conversation progress metadata on
+    # the ``conversations`` table and are ALL epoch-guarded at the SQL
+    # layer. A stale caller whose in-memory ``lifecycle_epoch`` no longer
+    # matches the authoritative row sees a ``False``/``None`` return and
+    # never stomps a new lifecycle's counters/phase.
+
+    def update_request_metadata(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        last_raw_payload_entries: int,
+        last_ingestible_payload_entries: int,
+    ) -> bool:
+        """Overwrite the per-request snapshot counters
+        (``last_raw_payload_entries`` + ``last_ingestible_payload_entries``)
+        on the conversations row. Epoch-guarded. Returns ``True`` iff the
+        UPDATE matched a row at the caller's ``lifecycle_epoch``. A stale
+        caller gets ``False``.
+        """
+        raise NotImplementedError
+
+    def widen_pending_raw_payload_entries(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        value: int,
+    ) -> bool:
+        """Monotonic widener for ``pending_raw_payload_entries``. SQLite
+        uses scalar ``MAX()``; Postgres uses ``GREATEST()``. Never walks
+        the counter backwards — concurrent writers coalesce to the
+        largest seen value. Epoch-guarded. Returns ``True`` iff the
+        UPDATE matched a row at the caller's ``lifecycle_epoch``.
+        """
+        raise NotImplementedError
+
+    def set_phase(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        phase: str,
+    ) -> bool:
+        """Epoch-guarded phase write. Returns ``True`` iff the UPDATE
+        matched a row at the caller's epoch. A stale thread cannot stomp
+        a new lifecycle's phase.
+        """
+        raise NotImplementedError
+
+    def set_phase_and_drain_pending_raw(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        new_phase: str,
+    ) -> int | None:
+        """Atomically transition phase AND return the drained
+        ``pending_raw_payload_entries``. Transactional (SQLite uses
+        ``BEGIN IMMEDIATE``; Postgres uses ``conn.transaction()``).
+        Returns the drained integer on success, or ``None`` when the
+        caller's ``lifecycle_epoch`` doesn't match the authoritative
+        conversations row.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
 
