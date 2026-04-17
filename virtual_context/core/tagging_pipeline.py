@@ -394,11 +394,53 @@ class TaggingPipeline:
         source_messages = [msg for msg in pair_messages if msg.role in {"user", "assistant"}]
         if not source_messages or not existing_rows:
             return False
+        sorted_rows = sorted(existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id))
+        # Older conversations can still contain a single legacy canonical row
+        # that stores the whole logical user/assistant turn. Strict tagging
+        # should enrich that row in place instead of treating it as unmappable.
+        if len(sorted_rows) == 1 and len(source_messages) >= 2:
+            row = sorted_rows[0]
+            user_msg, asst_msg = self._split_pair_messages(pair_messages)
+            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+                user_msg.content,
+                asst_msg.content,
+                version=row.hash_version or HASH_VERSION,
+            )
+            tagged_at = utcnow_iso()
+            self._store.save_canonical_turn(
+                self.config.conversation_id,
+                entry.turn_number,
+                user_msg.content,
+                asst_msg.content,
+                user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
+                assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                primary_tag=entry.primary_tag,
+                tags=list(entry.tags),
+                session_date=entry.session_date,
+                sender=entry.sender,
+                fact_signals=list(entry.fact_signals),
+                code_refs=list(entry.code_refs),
+                canonical_turn_id=row.canonical_turn_id,
+                sort_key=row.sort_key,
+                turn_hash=turn_hash,
+                hash_version=row.hash_version or HASH_VERSION,
+                normalized_user_text=normalized_user_text,
+                normalized_assistant_text=normalized_assistant_text,
+                tagged_at=tagged_at,
+                compacted_at=row.compacted_at,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at or tagged_at,
+                source_batch_id=row.source_batch_id,
+                created_at=row.created_at,
+                updated_at=tagged_at,
+                turn_group_number=row.turn_group_number,
+            )
+            entry.canonical_turn_id = row.canonical_turn_id or entry.canonical_turn_id
+            return True
         if len(source_messages) != len(existing_rows):
             return False
 
         tagged_at = utcnow_iso()
-        sorted_rows = sorted(existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id))
         for row, message in zip(sorted_rows, source_messages, strict=False):
             role = message.role
             user_content = message.content if role == "user" else ""
@@ -1004,7 +1046,7 @@ class TaggingPipeline:
         strict_rows: list["CanonicalTurnRow"] = []
         strict_row_cursor = 0
         if require_existing_canonical:
-            expected_rows = sum(
+            expected_entries = sum(
                 1 for msg in history_messages if msg.role in {"user", "assistant"}
             )
             if expected_lifecycle_epoch is not None:
@@ -1012,7 +1054,7 @@ class TaggingPipeline:
                     self._store.iter_untagged_canonical_rows(
                         conversation_id=self.config.conversation_id,
                         expected_lifecycle_epoch=expected_lifecycle_epoch,
-                        batch_size=max(expected_rows, 32),
+                        batch_size=max(expected_entries, 32),
                     )
                 )
             else:
@@ -1021,10 +1063,15 @@ class TaggingPipeline:
                     for row in self._store.get_all_canonical_turns(self.config.conversation_id)
                     if not row.tagged_at
                 ]
-            if len(strict_rows) < expected_rows:
+            strict_covered_entries = sum(
+                max(1, int(getattr(row, "covered_ingestible_entries", 1) or 1))
+                for row in strict_rows
+            )
+            if strict_covered_entries < expected_entries:
                 raise RuntimeError(
                     "strict canonical tagging expected at least "
-                    f"{expected_rows} untagged rows, found {len(strict_rows)}"
+                    f"{expected_entries} covered ingestible entries, found "
+                    f"{strict_covered_entries} across {len(strict_rows)} rows"
                 )
         # Seed from DB when resuming bulk ingest mid-conversation: the caller
         # passes turn_offset > 0 when there are already-persisted turns that

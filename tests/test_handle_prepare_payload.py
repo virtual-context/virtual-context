@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,72 @@ def test_proxy_ingest_history_keeps_total_fixed_for_single_prepare_payload(tmp_p
         assert ingested == 2
         assert after.total_ingestible == before.total_ingestible
         assert after.done_ingestible == before.total_ingestible
+    finally:
+        state.engine.close()
+
+
+def test_proxy_ingest_history_strict_mode_accepts_legacy_combined_canonical_row(tmp_path):
+    """Strict payload tagging must handle pre-existing combined legacy rows.
+
+    Older conversations can still contain one canonical row per logical turn
+    with ``covered_ingestible_entries = 2``. The strict follow-up tagger must
+    enrich that row in place instead of erroring or widening the denominator.
+    """
+    state = _make_proxy_state(tmp_path)
+    try:
+        conv_id = state.engine.config.conversation_id
+        now = datetime.now(timezone.utc).isoformat()
+        state.engine._store.save_canonical_turn(
+            conv_id,
+            0,
+            "legacy hello",
+            "legacy hi",
+            canonical_turn_id="legacy-row",
+            sort_key=1000.0,
+            turn_hash="legacy-hash",
+            hash_version=1,
+            normalized_user_text="legacy hello",
+            normalized_assistant_text="legacy hi",
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+            turn_group_number=0,
+        )
+        inner = _inner_store(state.engine)
+        with inner._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE canonical_turns
+                   SET covered_ingestible_entries = 2,
+                       tagged_at = NULL
+                 WHERE conversation_id = ? AND canonical_turn_id = ?
+                """,
+                (conv_id, "legacy-row"),
+            )
+
+        body = {
+            "messages": [
+                {"role": "user", "content": "legacy hello"},
+                {"role": "assistant", "content": "legacy hi"},
+            ],
+        }
+        messages, _ = extract_ingestible_messages(body, detect_format(body))
+        ingested = state.engine.ingest_history(
+            messages,
+            require_existing_canonical=True,
+            expected_lifecycle_epoch=state.engine._engine_state.lifecycle_epoch,
+        )
+        snap = state.engine._store.read_progress_snapshot(conv_id)
+        rows = state.engine._store.get_all_canonical_turns(conv_id)
+
+        assert ingested == 1
+        assert snap.total_ingestible == 2
+        assert snap.done_ingestible == 2
+        assert len(rows) == 1
+        assert rows[0].user_content == "legacy hello"
+        assert rows[0].assistant_content == "legacy hi"
+        assert rows[0].tagged_at is not None
     finally:
         state.engine.close()
 
