@@ -736,6 +736,37 @@ class SQLiteStore(ContextStore):
                 ON ingestion_episode(conversation_id, lifecycle_epoch)
                 WHERE status = 'running'
         """)
+        # Ownership + lifecycle record for a compaction operation. Sibling to
+        # ingestion_episode but tracks the multi-phase compaction pipeline
+        # (phase_index/phase_count/phase_name) rather than raw payload
+        # counts. `status` carries a `queued` state in addition to the
+        # episode lifecycle so workers can enqueue work ahead of execution,
+        # and the partial unique index treats both `queued` and `running`
+        # as active — only one pending-or-in-flight compaction is allowed
+        # per (conversation, lifecycle_epoch) at the DB layer.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS compaction_operation (
+                operation_id      TEXT PRIMARY KEY,
+                conversation_id   TEXT NOT NULL,
+                lifecycle_epoch   INTEGER NOT NULL,
+                phase_index       INTEGER NOT NULL DEFAULT 0,
+                phase_count       INTEGER NOT NULL,
+                phase_name        TEXT NOT NULL,
+                status            TEXT NOT NULL
+                                  CHECK (status IN ('queued','running','completed','cancelled','failed')),
+                started_at        TEXT NOT NULL,
+                completed_at      TEXT NULL,
+                owner_worker_id   TEXT NOT NULL,
+                heartbeat_ts      TEXT NOT NULL,
+                error_message     TEXT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
+                ON compaction_operation(conversation_id, lifecycle_epoch)
+                WHERE status IN ('queued','running')
+        """)
         try:
             conn.executescript(FTS_SQL)
             conn.executescript(FTS_TRIGGER_SQL)
