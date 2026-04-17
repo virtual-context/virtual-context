@@ -505,6 +505,34 @@ class ProxyState:
             new_epoch=int(new_epoch),
         ))
 
+    def _publish_compaction_progress(self) -> None:
+        """Publish a ``CompactionProgressEvent`` from the current snapshot.
+
+        Reads the live progress snapshot for this conversation and — when an
+        active compaction row exists — emits an event carrying its
+        operation_id / phase_name / phase_index / phase_count / status.
+        Used by ``enter_compaction``, ``advance_compaction_phase``, and
+        ``exit_compaction`` to surface phase progress to subscribers.
+        """
+        from ..core.progress_events import CompactionProgressEvent
+
+        conv = self.engine.config.conversation_id
+        snap = self.engine._store.read_progress_snapshot(conv)
+        if snap.active_compaction is None:
+            return
+        c = snap.active_compaction
+        self.engine.progress_event_bus.publish(CompactionProgressEvent(
+            conversation_id=conv,
+            lifecycle_epoch=int(self.engine._engine_state.lifecycle_epoch),
+            kind="compaction",
+            timestamp=time.time(),
+            operation_id=c.operation_id,
+            phase_name=c.phase_name,
+            phase_index=c.phase_index,
+            phase_count=c.phase_count,
+            status=c.status,
+        ))
+
     def _tagger_run(self) -> None:
         """Background tagger loop. Processes untagged canonical rows until
         none remain, then completes the episode. Exits cleanly on epoch
@@ -667,8 +695,12 @@ class ProxyState:
     # stale compactor can always finish cleaning up its own bookkeeping
     # without stomping a new lifecycle.
     #
-    # Event publishes (PhaseTransitionEvent, CompactionProgressEvent) are
-    # deferred to A31/A33 per spec.
+    # Event publishes: ``PhaseTransitionEvent`` (A31) fires on every
+    # successful phase flip; ``CompactionProgressEvent`` (A33) fires on
+    # enter (status ``queued``/``running``), on each phase advance, and
+    # on exit (terminal ``completed``/``failed``). Publishes are gated on
+    # the successful store write so a rejected epoch-guarded call never
+    # emits a spurious event.
 
     def enter_compaction(
         self, *, phase_count: int, initial_phase_name: str = "init",
@@ -704,6 +736,7 @@ class ProxyState:
             phase_count=phase_count,
             phase_name=initial_phase_name,
         )
+        self._publish_compaction_progress()
         self._publish_phase_transition("active", "compacting")
 
     def advance_compaction_phase(
@@ -738,7 +771,7 @@ class ProxyState:
             phase_index=phase_index,
             phase_name=phase_name,
         )
-        # CompactionProgressEvent publish in A33.
+        self._publish_compaction_progress()
 
     def exit_compaction(
         self, *, success: bool, error_message: str | None = None,
@@ -756,14 +789,25 @@ class ProxyState:
         caller whose epoch no longer matches simply sees ``False``/``None``
         returns — no exception is raised from this method.
         """
+        from ..core.progress_events import CompactionProgressEvent
+
         conv = self.engine.config.conversation_id
         epoch = int(self.engine._engine_state.lifecycle_epoch)
+        # Capture the active compaction row BEFORE the terminal write so we
+        # can emit a terminal CompactionProgressEvent with the real
+        # operation_id/phase metadata. ``read_progress_snapshot`` filters
+        # ``active_compaction`` on ``status IN ('queued','running')`` — once
+        # complete/fail lands the row drops out of the snapshot, so we must
+        # grab it first.
+        pre_snap = self.engine._store.read_progress_snapshot(conv)
+        active = pre_snap.active_compaction
         if success:
             self.engine._store.complete_compaction_operation(
                 conversation_id=conv,
                 lifecycle_epoch=epoch,
                 worker_id=self._worker_id,
             )
+            terminal_status = "completed"
         else:
             self.engine._store.fail_compaction_operation(
                 conversation_id=conv,
@@ -771,6 +815,24 @@ class ProxyState:
                 worker_id=self._worker_id,
                 error_message=error_message or "unknown",
             )
+            terminal_status = "failed"
+        # Publish terminal CompactionProgressEvent carrying the
+        # now-terminal status alongside the operation_id/phase metadata
+        # captured before the status flip. Only emit when we actually saw
+        # an active row at entry — a stale caller whose row was already
+        # cleaned up should not fabricate a spurious terminal event.
+        if active is not None:
+            self.engine.progress_event_bus.publish(CompactionProgressEvent(
+                conversation_id=conv,
+                lifecycle_epoch=epoch,
+                kind="compaction",
+                timestamp=time.time(),
+                operation_id=active.operation_id,
+                phase_name=active.phase_name,
+                phase_index=active.phase_index,
+                phase_count=active.phase_count,
+                status=terminal_status,
+            ))
         # Drain pending + transition phase atomically. The decision
         # between 'ingesting' and 'active' is made inside the same
         # transaction as the phase UPDATE via a direct EXISTS check on
