@@ -5,10 +5,10 @@ the SQLite tests in ``test_lifecycle_epoch_store.py`` so both backends stay
 in lockstep on the upsert/get/mark-deleted/resurrect invariants and the
 TOCTOU guard on ``phase='deleted'``.
 
-Note: ``conversations.conversation_id`` is ``UUID PRIMARY KEY`` in Postgres
-(see postgres.py:823), so test IDs use ``uuid.uuid4()`` rather than free-form
-strings. UUIDs are generated per-test to keep the suite idempotent across
-reruns against a shared test database.
+Note: ``conversations.conversation_id`` is ``TEXT PRIMARY KEY`` in Postgres
+(aligned with ``canonical_turns.conversation_id``). Test conversation IDs use
+``str(uuid.uuid4())`` per-test to keep the suite idempotent across reruns
+against a shared test database.
 """
 
 from __future__ import annotations

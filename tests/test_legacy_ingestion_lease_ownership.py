@@ -1015,3 +1015,69 @@ def test_sidecar_heartbeats_during_single_long_turn(
         f"point of the sidecar is to decouple refresh cadence from turn "
         f"completion."
     )
+
+
+def test_resume_pending_ingestion_spawns_heartbeat_sidecar() -> None:
+    """The resume path must spawn the heartbeat sidecar alongside the
+    ingestion worker — a resumed tagging run longer than
+    ``INGESTION_LEASE_TTL_S`` would otherwise lose its lease and let
+    another worker race in.
+    """
+    state, _metrics = _make_state()
+
+    # Force has_pending_indexing() True so the resume flow fires.
+    state.engine._turn_tag_index.append(TurnTagEntry(
+        turn_number=0, message_hash="h0", tags=["t0"], primary_tag="t0",
+    ))
+    state.engine._engine_state.last_indexed_turn = 0
+    state.engine._engine_state.last_completed_turn = 2
+
+    # No owning episode — ``_another_worker_owns_lease`` returns False
+    # because the MagicMock return value is not a real ProgressSnapshot.
+    state.engine._store.read_progress_snapshot.return_value = MagicMock()
+
+    # Seed durable pending rows directly so the resume path skips the
+    # ``get_canonical_turn_rows`` load.
+    state.engine._restored_pending_turns = [
+        (0, "Q1", "A1", None, None),
+        (1, "Q2", "A2", None, None),
+    ]
+
+    # Stub the heavy worker loop so the test ends quickly; the test only
+    # asserts that the sidecar was spawned alongside the ingestion thread.
+    spawn_event = threading.Event()
+
+    def _no_op_ingest(*_a, **_kw) -> None:
+        spawn_event.wait(timeout=1.0)
+
+    state._run_ingestion_with_catchup = _no_op_ingest  # type: ignore[assignment]
+
+    # Stub the sidecar to block until the test releases it, so we can
+    # observe ``is_alive()`` True under a deterministic condition.
+    sidecar_release = threading.Event()
+
+    def _blocking_sidecar(*_a, **_kw) -> None:
+        sidecar_release.wait(timeout=1.0)
+
+    state._run_heartbeat_sidecar = _blocking_sidecar  # type: ignore[assignment]
+
+    try:
+        spawned = state.resume_pending_ingestion_if_needed()
+        assert spawned is True, "resume path must spawn when pending rows exist"
+        assert state._heartbeat_thread is not None, (
+            "resume_pending_ingestion_if_needed must spawn the heartbeat "
+            "sidecar alongside the ingestion worker"
+        )
+        assert state._heartbeat_thread.is_alive(), (
+            "heartbeat sidecar must be alive right after resume spawn"
+        )
+        assert state._ingestion_thread is not None
+        assert state._ingestion_thread.is_alive()
+    finally:
+        state._ingestion_cancel.set()
+        spawn_event.set()
+        sidecar_release.set()
+        if state._ingestion_thread is not None:
+            state._ingestion_thread.join(timeout=2.0)
+        if state._heartbeat_thread is not None:
+            state._heartbeat_thread.join(timeout=2.0)

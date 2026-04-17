@@ -7,12 +7,11 @@ row header, the ``SUM(covered_ingestible_entries)`` numerator/denominator
 pair over ``canonical_turns``, and the point lookups into
 ``ingestion_episode`` / ``compaction_operation``.
 
-Note: ``conversations.conversation_id`` is ``UUID PRIMARY KEY`` in Postgres
-(see postgres.py:823), and ``ingestion_episode.episode_id`` /
-``compaction_operation.operation_id`` are also UUID, so test IDs use
-``uuid.uuid4()`` rather than free-form strings. UUIDs are generated
-per-test to keep the suite idempotent across reruns against a shared test
-database.
+Note: ``conversations.conversation_id`` is ``TEXT PRIMARY KEY`` in Postgres
+(aligned with ``canonical_turns.conversation_id``), and
+``ingestion_episode.episode_id`` / ``compaction_operation.operation_id``
+are UUID. Test conversation IDs use ``str(uuid.uuid4())`` to keep the
+suite idempotent across reruns against a shared test database.
 """
 
 from __future__ import annotations

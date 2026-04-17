@@ -826,7 +826,7 @@ class PostgresStore(ContextStore):
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
-                    conversation_id                UUID PRIMARY KEY,
+                    conversation_id                TEXT PRIMARY KEY,
                     tenant_id                      VARCHAR NOT NULL,
                     lifecycle_epoch                INT NOT NULL DEFAULT 1,
                     phase                          VARCHAR NOT NULL DEFAULT 'init'
@@ -897,7 +897,7 @@ class PostgresStore(ContextStore):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ingestion_episode (
                     episode_id            UUID PRIMARY KEY,
-                    conversation_id       UUID NOT NULL,
+                    conversation_id       TEXT NOT NULL,
                     lifecycle_epoch       INT NOT NULL,
                     raw_payload_entries   INT NOT NULL DEFAULT 0,
                     started_at            TIMESTAMPTZ NOT NULL,
@@ -929,7 +929,7 @@ class PostgresStore(ContextStore):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS compaction_operation (
                     operation_id      UUID PRIMARY KEY,
-                    conversation_id   UUID NOT NULL,
+                    conversation_id   TEXT NOT NULL,
                     lifecycle_epoch   INT NOT NULL,
                     phase_index       INT NOT NULL DEFAULT 0,
                     phase_count       INT NOT NULL,
@@ -3653,13 +3653,12 @@ class PostgresStore(ContextStore):
         view-only computed column; omitting it here is tolerated by the
         shared ``_row_to_canonical_turn`` parser (defaults to ``-1``). We
         JOIN against ``conversations.lifecycle_epoch`` so a stale-epoch
-        caller matches zero rows at SQL level rather than raising. On
-        Postgres, ``conversations.conversation_id`` is UUID while
-        ``canonical_turns.conversation_id`` is TEXT, so the JOIN casts the
-        conversations side to TEXT to avoid ``uuid = text`` errors while
-        still letting the partial index on ``canonical_turns`` drive the
-        scan. Ordering uses ``sort_key`` — the same column the partial index
-        is sorted on.
+        caller matches zero rows at SQL level rather than raising.
+        ``conversations.conversation_id`` and ``canonical_turns.conversation_id``
+        are both TEXT, so the equality join uses the column directly and
+        lets the partial index on ``canonical_turns`` drive the scan.
+        Ordering uses ``sort_key`` — the same column the partial index is
+        sorted on.
         """
         conn = self._get_conn()
         rows = conn.execute(
@@ -3677,7 +3676,7 @@ class PostgresStore(ContextStore):
                    ct.source_batch_id, ct.created_at, ct.updated_at
               FROM canonical_turns AS ct
               JOIN conversations AS c
-                ON c.conversation_id::text = ct.conversation_id
+                ON c.conversation_id = ct.conversation_id
              WHERE ct.conversation_id = %s
                AND ct.tagged_at IS NULL
                AND c.lifecycle_epoch = %s

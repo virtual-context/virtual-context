@@ -6,10 +6,11 @@ the SQL-level epoch fence. Postgres uses scalar ``GREATEST()`` where SQLite
 uses ``MAX()`` and wraps the atomic drain in ``conn.transaction()`` instead of
 ``BEGIN IMMEDIATE``.
 
-``conversations.conversation_id`` is ``UUID PRIMARY KEY`` in Postgres (see
-postgres.py:828) so test IDs use ``uuid.uuid4()`` per-test to keep the suite
-idempotent across reruns against a shared test database. psycopg3 adapts
-``datetime.now(timezone.utc)`` directly to ``TIMESTAMPTZ``.
+``conversations.conversation_id`` is ``TEXT PRIMARY KEY`` in Postgres
+(aligned with ``canonical_turns.conversation_id``). Test conversation IDs use
+``str(uuid.uuid4())`` per-test to keep the suite idempotent across reruns
+against a shared test database. psycopg3 adapts ``datetime.now(timezone.utc)``
+directly to ``TIMESTAMPTZ``.
 """
 
 from __future__ import annotations
