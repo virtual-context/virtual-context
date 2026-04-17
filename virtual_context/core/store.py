@@ -401,6 +401,14 @@ class ContextStore(ABC):
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
         raise NotImplementedError
 
+    def get_conversation_phase(self, conversation_id: str) -> str:
+        """Return the current phase for the conversation.
+
+        Returns one of ``"init" | "ingesting" | "compacting" | "active" |
+        "deleted"``. Raises ``KeyError`` if no row exists.
+        """
+        raise NotImplementedError
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at."""
         raise NotImplementedError

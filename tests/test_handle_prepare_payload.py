@@ -148,3 +148,101 @@ def test_handle_prepare_payload_returns_phase_decision(tmp_path):
         assert decision.started_tagger is False
     finally:
         state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Task A24 — phase gate (step 4)
+# ---------------------------------------------------------------------------
+
+
+def test_phase_gate_deleted_resurrects(tmp_path):
+    """``phase == 'deleted'`` resurrects the conversation — lifecycle_epoch
+    bumps and the engine's in-memory epoch is updated to match."""
+    state = _make_proxy_state(tmp_path)
+    try:
+        conv_id = state.engine.config.conversation_id
+        inner = _inner_store(state.engine)
+        inner.mark_conversation_deleted(conv_id)
+        # Engine's cached epoch is still 1; DB has phase='deleted', epoch=1.
+        state.handle_prepare_payload(
+            body={},
+            payload_accounting={
+                "raw_payload_entry_count": 0,
+                "ingestible_entry_count": 0,
+            },
+        )
+        # Resurrect bumped to epoch=2; engine cache updated.
+        assert state.engine._engine_state.lifecycle_epoch == 2
+        assert inner.get_lifecycle_epoch(conv_id) == 2
+        snap = inner.read_progress_snapshot(conv_id)
+        assert snap.phase == "init"  # resurrect resets phase to init
+    finally:
+        state.engine.close()
+
+
+def test_phase_gate_compacting_widens_pending_and_returns(tmp_path):
+    """``phase == 'compacting'`` widens pending_raw (epoch-scoped) and
+    returns a ``PhaseDecision(phase='compacting', started_tagger=False)``
+    without triggering episode creation."""
+    state = _make_proxy_state(tmp_path)
+    try:
+        conv_id = state.engine.config.conversation_id
+        inner = _inner_store(state.engine)
+        # Force phase='compacting'.
+        inner.set_phase(
+            conversation_id=conv_id, lifecycle_epoch=1, phase="compacting",
+        )
+        decision = state.handle_prepare_payload(
+            body={"messages": [{"role": "user", "content": "hi"}]},
+            payload_accounting={
+                "raw_payload_entry_count": 1000,
+                "ingestible_entry_count": 500,
+            },
+        )
+        assert decision.phase == "compacting"
+        assert decision.started_tagger is False
+        # pending_raw should reflect the new_raw widening.
+        with inner._get_conn() as conn:
+            pending = conn.execute(
+                "SELECT pending_raw_payload_entries FROM conversations "
+                "WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+        assert pending == 1000
+        # Per-request metadata still updated (step 5 runs before step 4).
+        snap = inner.read_progress_snapshot(conv_id)
+        assert snap.last_raw_payload_entries == 1000
+        assert snap.last_ingestible_payload_entries == 500
+    finally:
+        state.engine.close()
+
+
+def test_phase_gate_ingesting_falls_through(tmp_path):
+    """``phase == 'ingesting'`` does not widen pending or resurrect; the
+    gate returns a stub ``PhaseDecision`` for now (A25-A29 will extend)."""
+    state = _make_proxy_state(tmp_path)
+    try:
+        conv_id = state.engine.config.conversation_id
+        inner = _inner_store(state.engine)
+        inner.set_phase(
+            conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting",
+        )
+        decision = state.handle_prepare_payload(
+            body={"messages": [{"role": "user", "content": "hi"}]},
+            payload_accounting={
+                "raw_payload_entry_count": 1,
+                "ingestible_entry_count": 1,
+            },
+        )
+        # Stub for now — subsequent tasks refine.
+        assert decision.phase == "ingesting"
+        # pending should NOT have been bumped.
+        with inner._get_conn() as conn:
+            pending = conn.execute(
+                "SELECT pending_raw_payload_entries FROM conversations "
+                "WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+        assert pending == 0
+    finally:
+        state.engine.close()
