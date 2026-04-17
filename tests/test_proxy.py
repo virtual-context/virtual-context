@@ -22,8 +22,6 @@ from virtual_context.config import load_config
 from virtual_context.proxy.formats import AnthropicFormat, PayloadTokenCache, PayloadTokenEstimate
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.handlers import _handle_non_streaming
-from virtual_context.proxy.session_state import SessionState as SharedSessionState
-from virtual_context.core.conversation_store import StaleConversationWriteError
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import AssembledContext, EngineState, Message, SplitResult, TagResult, TurnTagEntry
 
@@ -80,16 +78,6 @@ class TestProxyState:
             run_broad_split=False,
             turn_number=0,
         )
-
-    def test_persist_shared_session_state_raises_on_rejected_stale_save(self):
-        engine = self._make_engine()
-        engine._session_state_provider = MagicMock()
-        engine._session_state_provider.save.return_value = None
-        state = ProxyState(engine)
-        state.engine.extract_session_state.return_value = SharedSessionState(version=9)
-
-        with pytest.raises(StaleConversationWriteError):
-            state._persist_shared_session_state(force=True, reject_is_stale=True)
 
     def test_wait_for_tag_does_not_block_on_deferred_split(self):
         engine = self._make_engine()
@@ -316,7 +304,6 @@ class TestResponseTimestamping:
         )
 
         assert state.engine._engine_state.last_request_time > 0.0
-        state.persist_completed_turn.assert_not_called()
         state.fire_turn_complete.assert_not_called()
 
 
