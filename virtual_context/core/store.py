@@ -367,6 +367,74 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def upsert_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+    ) -> None:
+        """Ownership-free upsert of the running ingestion_episode row.
+
+        On INSERT, creates a running episode with the given worker as
+        initial owner. On CONFLICT (another running row exists at the
+        same (conversation, lifecycle_epoch)), ONLY widens
+        ``raw_payload_entries`` via MAX — does NOT change ownership or
+        other fields. Idempotent.
+        """
+        raise NotImplementedError
+
+    def claim_ingestion_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ) -> bool:
+        """Claim the ingestion lease for this (conversation, lifecycle_epoch).
+
+        Returns True iff the caller now owns the lease. Rules:
+          - If caller already owns it: refresh heartbeat, return True.
+          - If current heartbeat is stale (older than ``lease_ttl_s``):
+            take over, return True.
+          - Otherwise: another worker owns a fresh lease; return False.
+        Epoch-scoped: filters on ``lifecycle_epoch``.
+        """
+        raise NotImplementedError
+
+    def refresh_ingestion_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Epoch-scoped heartbeat refresh.
+
+        A stale thread carrying an old epoch cannot refresh a new
+        lifecycle's heartbeat. Returns True iff a matching row was updated.
+        """
+        raise NotImplementedError
+
+    def complete_ingestion_episode(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> bool:
+        """Race-guarded completion of the running ingestion_episode row.
+
+        Epoch-scoped. Returns True iff:
+          - A running episode exists at the caller's ``lifecycle_epoch``.
+          - The caller is the current owner.
+          - No untagged canonical rows remain (NOT EXISTS guard).
+        Returns False if any condition fails.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Tag summary search (used by RRF retrieval scoring)
     # ------------------------------------------------------------------
