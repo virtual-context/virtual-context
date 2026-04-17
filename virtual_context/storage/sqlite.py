@@ -2921,6 +2921,96 @@ CREATE TABLE IF NOT EXISTS request_captures (
             raise
         return drained
 
+    def drain_compaction_exit(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+    ) -> str | None:
+        """Atomic compaction-exit decision + pending drain.
+
+        Single ``BEGIN IMMEDIATE`` transaction containing: epoch check,
+        ``EXISTS (SELECT 1 FROM canonical_turns WHERE tagged_at IS NULL)``,
+        phase UPDATE with pending drain, and (on untagged-exists) a fresh
+        ``ingestion_episode`` INSERT seeded with the drained ``pending_raw``
+        value. Serialising the read and write in one transaction closes
+        the race where a concurrent tagger marks the last row tagged
+        between a separate snapshot read and the phase UPDATE.
+
+        Returns ``'ingesting'`` (work remains — episode row inserted) or
+        ``'active'`` (all canonical rows tagged) on success, or ``None``
+        when the caller's ``lifecycle_epoch`` does not match the
+        authoritative conversations row. Epoch-guarded.
+        """
+        import uuid
+
+        now = utcnow_iso()
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT pending_raw_payload_entries, lifecycle_epoch,
+                       EXISTS (
+                         SELECT 1 FROM canonical_turns
+                          WHERE conversation_id = ? AND tagged_at IS NULL
+                       )
+                  FROM conversations
+                 WHERE conversation_id = ?
+                """,
+                (conversation_id, conversation_id),
+            ).fetchone()
+            if row is None or int(row[1]) != lifecycle_epoch:
+                conn.rollback()
+                return None
+            pending_raw = int(row[0])
+            has_untagged = bool(row[2])
+            if has_untagged:
+                conn.execute(
+                    """
+                    UPDATE conversations
+                       SET phase = 'ingesting',
+                           pending_raw_payload_entries = 0,
+                           updated_at = ?
+                     WHERE conversation_id = ?
+                       AND lifecycle_epoch = ?
+                    """,
+                    (now, conversation_id, lifecycle_epoch),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ingestion_episode (
+                        episode_id, conversation_id, lifecycle_epoch,
+                        raw_payload_entries, started_at, status,
+                        owner_worker_id, heartbeat_ts
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()), conversation_id, lifecycle_epoch,
+                        pending_raw, now, worker_id, now,
+                    ),
+                )
+                new_phase = "ingesting"
+            else:
+                conn.execute(
+                    """
+                    UPDATE conversations
+                       SET phase = 'active',
+                           pending_raw_payload_entries = 0,
+                           updated_at = ?
+                     WHERE conversation_id = ?
+                       AND lifecycle_epoch = ?
+                    """,
+                    (now, conversation_id, lifecycle_epoch),
+                )
+                new_phase = "active"
+            conn.commit()
+            return new_phase
+        except Exception:
+            conn.rollback()
+            raise
+
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
         deleted = self._delete_conversation_rows(conn, "segments", conversation_id)

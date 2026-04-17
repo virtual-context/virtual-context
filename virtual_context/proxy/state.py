@@ -661,6 +661,143 @@ class ProxyState:
         t.start()
         self._tagger_thread = t
 
+    # ------------------------------------------------------------------
+    # Compaction lifecycle (Task A29)
+    # ------------------------------------------------------------------
+    # The conversation enters ``'compacting'`` via ``enter_compaction``; the
+    # compactor records intermediate phase progress via
+    # ``advance_compaction_phase``; and ``exit_compaction`` finalises the
+    # operation and drains pending payload entries atomically, deciding
+    # between re-entering ``'ingesting'`` (when untagged canonical rows
+    # remain) and returning to ``'active'`` on a single
+    # ``drain_compaction_exit`` transaction.
+    #
+    # All three methods are epoch-guarded. ``enter_compaction`` hard-checks
+    # via ``verify_epoch`` (a stale caller at entry must not transition a
+    # fresh lifecycle's phase). ``advance_compaction_phase`` yields on
+    # mismatch instead of raising — it is called inside the compactor's
+    # long-running loop where a lifecycle bump is a normal cancellation
+    # path. ``exit_compaction`` relies on the SQL-level epoch filter on
+    # each store call (complete/fail + drain) rather than raising, so a
+    # stale compactor can always finish cleaning up its own bookkeeping
+    # without stomping a new lifecycle.
+    #
+    # Event publishes (PhaseTransitionEvent, CompactionProgressEvent) are
+    # deferred to A31/A33 per spec.
+
+    def enter_compaction(
+        self, *, phase_count: int, initial_phase_name: str = "init",
+    ) -> None:
+        """Transition phase from ``'active'`` to ``'compacting'`` and start
+        a fresh ``compaction_operation`` row.
+
+        Epoch-guarded via ``verify_epoch`` at entry. The phase write is
+        additionally epoch-filtered at the SQL layer — a stale caller whose
+        epoch does not match the authoritative conversations row sees
+        ``set_phase`` return False and this method exits without writing
+        the operation row.
+        """
+        conv = self.engine.config.conversation_id
+        self.engine.verify_epoch()
+        epoch = int(self.engine._engine_state.lifecycle_epoch)
+        ok = self.engine._store.set_phase(
+            conversation_id=conv,
+            lifecycle_epoch=epoch,
+            phase="compacting",
+        )
+        if not ok:
+            logger.info(
+                "enter_compaction aborted: phase write rejected"
+                " (epoch mismatch) for conv=%s",
+                conv[:12],
+            )
+            return
+        self.engine._store.start_compaction_operation(
+            conversation_id=conv,
+            lifecycle_epoch=epoch,
+            worker_id=self._worker_id,
+            phase_count=phase_count,
+            phase_name=initial_phase_name,
+        )
+        # PhaseTransitionEvent publish in A31.
+
+    def advance_compaction_phase(
+        self, *, phase_index: int, phase_name: str,
+    ) -> None:
+        """Advance the active compaction's phase index/name.
+
+        Called from inside the compactor pipeline between phases. On a
+        lifecycle-epoch mismatch the method yields silently — the
+        compactor is expected to cancel itself on the next boundary — so
+        a stale advance write does not raise through the caller. The
+        store-level ``advance_compaction_phase`` is also epoch-filtered
+        at the SQL layer (double-scoped via the correlated subquery
+        against ``conversations.lifecycle_epoch``).
+        """
+        from virtual_context.core.lifecycle_epoch import LifecycleEpochMismatch
+
+        conv = self.engine.config.conversation_id
+        try:
+            self.engine.verify_epoch()
+        except LifecycleEpochMismatch:
+            logger.info(
+                "Compactor %s yielding phase advance: epoch changed"
+                " for conv=%s",
+                self._worker_id, conv[:12],
+            )
+            return
+        self.engine._store.advance_compaction_phase(
+            conversation_id=conv,
+            lifecycle_epoch=int(self.engine._engine_state.lifecycle_epoch),
+            worker_id=self._worker_id,
+            phase_index=phase_index,
+            phase_name=phase_name,
+        )
+        # CompactionProgressEvent publish in A33.
+
+    def exit_compaction(
+        self, *, success: bool, error_message: str | None = None,
+    ) -> None:
+        """Finalise the compaction operation and transition phase.
+
+        Records the operation's terminal status (``'completed'`` vs
+        ``'failed'``) first, then calls ``drain_compaction_exit`` which
+        atomically decides between re-entering ``'ingesting'`` (with a
+        seeded episode row) and returning to ``'active'``, draining
+        ``pending_raw_payload_entries`` in the same transaction as the
+        phase UPDATE.
+
+        Every store call is epoch-filtered at the SQL layer. A stale
+        caller whose epoch no longer matches simply sees ``False``/``None``
+        returns — no exception is raised from this method.
+        """
+        conv = self.engine.config.conversation_id
+        epoch = int(self.engine._engine_state.lifecycle_epoch)
+        if success:
+            self.engine._store.complete_compaction_operation(
+                conversation_id=conv,
+                lifecycle_epoch=epoch,
+                worker_id=self._worker_id,
+            )
+        else:
+            self.engine._store.fail_compaction_operation(
+                conversation_id=conv,
+                lifecycle_epoch=epoch,
+                worker_id=self._worker_id,
+                error_message=error_message or "unknown",
+            )
+        # Drain pending + transition phase atomically. The decision
+        # between 'ingesting' and 'active' is made inside the same
+        # transaction as the phase UPDATE via a direct EXISTS check on
+        # canonical_turns.tagged_at, so a concurrent tagger cannot flip
+        # the answer between read and write.
+        self.engine._store.drain_compaction_exit(
+            conversation_id=conv,
+            lifecycle_epoch=epoch,
+            worker_id=self._worker_id,
+        )
+        # PhaseTransitionEvent publish in A31.
+
     def handle_prepare_payload(
         self,
         *,
