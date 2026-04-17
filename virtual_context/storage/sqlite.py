@@ -707,6 +707,35 @@ class SQLiteStore(ContextStore):
                 ON conversations(tenant_id, phase)
                  WHERE phase <> 'deleted'
         """)
+        # Ownership + lifecycle record for an ingestion episode. Progress
+        # counters (done/total) are DERIVED from canonical_turns SUMs at read
+        # time — this row only tracks ownership (`owner_worker_id`,
+        # `heartbeat_ts`), the largest raw payload observed during the episode
+        # (`raw_payload_entries`), and the status transitions. The partial
+        # unique index below enforces at-most-one running episode per
+        # (conversation, lifecycle_epoch) at the DB layer without requiring a
+        # distributed lock — a concurrent worker attempting to INSERT a second
+        # 'running' row collides at INSERT time.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingestion_episode (
+                episode_id            TEXT PRIMARY KEY,
+                conversation_id       TEXT NOT NULL,
+                lifecycle_epoch       INTEGER NOT NULL,
+                raw_payload_entries   INTEGER NOT NULL DEFAULT 0,
+                started_at            TEXT NOT NULL,
+                completed_at          TEXT NULL,
+                status                TEXT NOT NULL
+                                      CHECK (status IN ('running','completed','cancelled','abandoned')),
+                owner_worker_id       TEXT NOT NULL,
+                heartbeat_ts          TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ingestion_episode_active
+                ON ingestion_episode(conversation_id, lifecycle_epoch)
+                WHERE status = 'running'
+        """)
         try:
             conn.executescript(FTS_SQL)
             conn.executescript(FTS_TRIGGER_SQL)
