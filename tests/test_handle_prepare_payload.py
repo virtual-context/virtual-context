@@ -529,3 +529,86 @@ def test_prepare_payload_calls_handle_prepare_payload(tmp_path):
         )
     finally:
         state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# P1 #1 (redux) — handle_prepare_payload stops spawning the tagger thread;
+# the legacy ``start_ingestion_if_needed`` path is the authoritative tagger.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_prepare_payload_does_not_spawn_tagger_thread(tmp_path):
+    """``handle_prepare_payload`` must NOT call ``_spawn_tagger_thread`` —
+    tagger dispatch is delegated to ``start_ingestion_if_needed`` so that
+    only one tagger thread races on a given conversation's canonical rows
+    (the legacy per-pair ``tag_turn`` path is the authoritative tagger).
+
+    The counter-based instrumentation also exercises the companion path:
+    ``start_ingestion_if_needed`` starts its own background thread
+    (``_ingestion_thread``) without calling ``_spawn_tagger_thread``.
+    """
+    from virtual_context.types import Message
+
+    state = _make_proxy_state(tmp_path)
+    try:
+        # Instrument _spawn_tagger_thread with a counter. Preserve the
+        # callable signature so that any accidental invocation is caught
+        # — but do not actually spawn a thread.
+        tagger_spawn_count = {"count": 0}
+
+        def counting_spawn_tagger_thread() -> None:
+            tagger_spawn_count["count"] += 1
+
+        state._spawn_tagger_thread = counting_spawn_tagger_thread  # type: ignore[assignment]
+
+        # Drive handle_prepare_payload through the hottest branch: content
+        # present, phase transitions to 'ingesting', lease claimed. Before
+        # the P1 #1 (redux) fix this branch unconditionally called
+        # ``_spawn_tagger_thread``.
+        decision = state.handle_prepare_payload(
+            body={"messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ]},
+            payload_accounting={
+                "raw_payload_entry_count": 2,
+                "ingestible_entry_count": 2,
+            },
+        )
+        assert decision.phase == "ingesting"
+        # ``started_tagger=True`` now means "lease was claimed", not
+        # "thread was literally spawned". The actual thread is launched
+        # by the legacy ``start_ingestion_if_needed`` path downstream.
+        assert decision.started_tagger is True
+        assert tagger_spawn_count["count"] == 0, (
+            "handle_prepare_payload must NOT spawn the tagger thread — "
+            "tagger dispatch is delegated to start_ingestion_if_needed "
+            f"(got spawn count={tagger_spawn_count['count']})"
+        )
+
+        # Stub the background ingestion loop so the thread exits
+        # immediately without running the real tagging pipeline.
+        state._run_ingestion_with_catchup = lambda *a, **kw: None  # type: ignore[assignment]
+
+        # Now call the legacy path — it must start the ingestion thread
+        # (count == 1) and must NOT call _spawn_tagger_thread either.
+        history = [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="world"),
+        ]
+        state.start_ingestion_if_needed(history)
+        assert state._ingestion_thread is not None, (
+            "start_ingestion_if_needed must create _ingestion_thread"
+        )
+        # Join the (no-op) thread so we assert on a stable post-start state
+        # rather than a liveness race. ``_run_ingestion_with_catchup`` was
+        # stubbed to return immediately.
+        state._ingestion_thread.join(timeout=2.0)
+        # The legacy tagger path does NOT invoke the new per-row tagger
+        # spawn helper — the counter stays at zero.
+        assert tagger_spawn_count["count"] == 0, (
+            "start_ingestion_if_needed must NOT call _spawn_tagger_thread "
+            f"(got spawn count={tagger_spawn_count['count']})"
+        )
+    finally:
+        state.engine.close()
