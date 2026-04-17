@@ -623,6 +623,7 @@ def _row_to_canonical_turn(row: dict) -> CanonicalTurnRow:
         first_seen_at=row.get("first_seen_at") or None,
         last_seen_at=row.get("last_seen_at") or None,
         source_batch_id=str(row.get("source_batch_id", "") or "") or None,
+        covered_ingestible_entries=int(row.get("covered_ingestible_entries", 1) or 1),
         created_at=row.get("created_at", "") or "",
         updated_at=row.get("updated_at", "") or "",
     )
@@ -3667,6 +3668,7 @@ class PostgresStore(ContextStore):
                    ct.user_raw_content, ct.assistant_raw_content,
                    ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
                    ct.fact_signals_json, ct.code_refs_json,
+                   ct.covered_ingestible_entries,
                    ct.tagged_at, ct.compacted_at,
                    ct.first_seen_at, ct.last_seen_at,
                    ct.source_batch_id, ct.created_at, ct.updated_at

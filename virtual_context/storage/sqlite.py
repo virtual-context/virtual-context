@@ -485,6 +485,9 @@ def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
         first_seen_at=((row["first_seen_at"] if "first_seen_at" in row.keys() else None) or None),
         last_seen_at=((row["last_seen_at"] if "last_seen_at" in row.keys() else None) or None),
         source_batch_id=((row["source_batch_id"] if "source_batch_id" in row.keys() else None) or None),
+        covered_ingestible_entries=int(row["covered_ingestible_entries"])
+        if "covered_ingestible_entries" in row.keys() and row["covered_ingestible_entries"] is not None
+        else 1,
         created_at=row["created_at"] or "",
         updated_at=row["updated_at"] or "",
     )
@@ -3901,6 +3904,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ct.user_raw_content, ct.assistant_raw_content,
                    ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
                    ct.fact_signals_json, ct.code_refs_json,
+                   ct.covered_ingestible_entries,
                    ct.tagged_at, ct.compacted_at,
                    ct.first_seen_at, ct.last_seen_at,
                    ct.source_batch_id, ct.created_at, ct.updated_at
