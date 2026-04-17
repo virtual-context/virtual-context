@@ -326,6 +326,12 @@ class ContextStore(ABC):
     # fencing above (`activate_conversation` et al.) which uses the older
     # `conversation_lifecycle` table.
 
+    # Lifecycle-epoch methods diverge from this base class's no-op default
+    # convention: silent defaults are unsafe here — a store that returns 0
+    # for get_lifecycle_epoch or no-ops mark_conversation_deleted would
+    # corrupt epoch-based stale-write protection. Forcing callers to get
+    # a clear NotImplementedError ensures any new store backend implements
+    # these before it can be used in a progress-bar context.
     def upsert_conversation(self, *, tenant_id: str, conversation_id: str) -> None:
         """Create the conversations row if missing; otherwise refresh updated_at.
 

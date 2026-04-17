@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 from pathlib import Path
 from virtual_context.storage.sqlite import SQLiteStore
@@ -66,7 +68,7 @@ def test_increment_lifecycle_epoch_bumps_on_resurrect(tmp_path: Path):
     assert row[1] is None  # deleted_at cleared
 
 
-def test_concurrent_resurrect_does_not_double_bump(tmp_path: Path):
+def test_repeat_resurrect_does_not_double_bump(tmp_path: Path):
     """Second resurrect on an already-init conversation is a no-op; returns
     the current epoch without incrementing again (TOCTOU-safe guard)."""
     s = SQLiteStore(tmp_path / "vc.db")
@@ -76,6 +78,34 @@ def test_concurrent_resurrect_does_not_double_bump(tmp_path: Path):
     e2 = s.increment_lifecycle_epoch_on_resurrect("c")  # second call: phase is now 'init', not 'deleted'
     assert e1 == 2
     assert e2 == 2  # NOT 3
+
+
+def test_concurrent_resurrect_does_not_double_bump(tmp_path: Path):
+    """Two concurrent resurrects — the BEGIN IMMEDIATE serialization
+    ensures only one bumps. Both return the same epoch."""
+    s = SQLiteStore(tmp_path / "vc.db")
+    s.upsert_conversation(tenant_id="t", conversation_id="c")
+    s.mark_conversation_deleted("c")
+
+    barrier = threading.Barrier(2)
+    results: list[int] = []
+    lock = threading.Lock()
+
+    def run() -> None:
+        barrier.wait()
+        e = s.increment_lifecycle_epoch_on_resurrect("c")
+        with lock:
+            results.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 2
+    assert results[0] == 2 and results[1] == 2  # both see the same bumped epoch
+    assert s.get_lifecycle_epoch("c") == 2  # DB has epoch=2, not 3
 
 
 def test_increment_on_never_deleted_conversation_is_noop(tmp_path: Path):
@@ -90,3 +120,9 @@ def test_increment_raises_keyerror_for_unknown(tmp_path: Path):
     s = SQLiteStore(tmp_path / "vc.db")
     with pytest.raises(KeyError):
         s.increment_lifecycle_epoch_on_resurrect("nonexistent")
+
+
+def test_mark_conversation_deleted_raises_keyerror_for_unknown(tmp_path: Path):
+    s = SQLiteStore(tmp_path / "vc.db")
+    with pytest.raises(KeyError):
+        s.mark_conversation_deleted("nonexistent")
