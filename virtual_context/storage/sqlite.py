@@ -28,6 +28,11 @@ from ..core.canonical_turns import (
     generate_canonical_turn_id,
     utcnow_iso,
 )
+from ..core.progress_snapshot import (
+    ActiveCompactionSnapshot,
+    ActiveEpisodeSnapshot,
+    ProgressSnapshot,
+)
 from ..core.store import ContextStore
 from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
@@ -2303,6 +2308,96 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if row is None:
             raise KeyError(conversation_id)
         return int(row[0])
+
+    def read_progress_snapshot(self, conversation_id: str) -> ProgressSnapshot:
+        """Derive the current progress state for a conversation.
+
+        ``total_ingestible`` and ``done_ingestible`` are computed at read
+        time via ``SUM(covered_ingestible_entries)`` over ``canonical_turns``
+        (filtered by ``tagged_at IS NOT NULL`` for the numerator) — never
+        stored counters that could drift from canonical truth. Point
+        lookups in ``ingestion_episode`` / ``compaction_operation`` surface
+        any currently-active row (running for episodes; queued OR running
+        for compactions).
+
+        Raises ``KeyError`` if the conversation row does not exist.
+        """
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT lifecycle_epoch, phase,
+                       last_raw_payload_entries, last_ingestible_payload_entries
+                  FROM conversations
+                 WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            epoch, phase, last_raw, last_ing = row[0], row[1], row[2], row[3]
+
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(covered_ingestible_entries), 0),
+                       COALESCE(SUM(CASE WHEN tagged_at IS NOT NULL
+                                         THEN covered_ingestible_entries ELSE 0 END), 0)
+                  FROM canonical_turns
+                 WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            total_ing, done_ing = totals[0], totals[1]
+
+            ep_row = conn.execute(
+                """
+                SELECT episode_id, raw_payload_entries, owner_worker_id, heartbeat_ts
+                  FROM ingestion_episode
+                 WHERE conversation_id = ? AND status = 'running'
+                """,
+                (conversation_id,),
+            ).fetchone()
+            active_episode = (
+                ActiveEpisodeSnapshot(
+                    episode_id=str(ep_row[0]),
+                    raw_payload_entries=int(ep_row[1]),
+                    owner_worker_id=str(ep_row[2]),
+                    heartbeat_ts=str(ep_row[3]),
+                )
+                if ep_row is not None
+                else None
+            )
+
+            cop_row = conn.execute(
+                """
+                SELECT operation_id, phase_name, phase_index, phase_count, status
+                  FROM compaction_operation
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                """,
+                (conversation_id,),
+            ).fetchone()
+            active_compaction = (
+                ActiveCompactionSnapshot(
+                    operation_id=str(cop_row[0]),
+                    phase_name=str(cop_row[1]),
+                    phase_index=int(cop_row[2]),
+                    phase_count=int(cop_row[3]),
+                    status=str(cop_row[4]),
+                )
+                if cop_row is not None
+                else None
+            )
+
+        return ProgressSnapshot(
+            conversation_id=conversation_id,
+            lifecycle_epoch=int(epoch),
+            phase=str(phase),
+            total_ingestible=int(total_ing),
+            done_ingestible=int(done_ing),
+            last_raw_payload_entries=int(last_raw),
+            last_ingestible_payload_entries=int(last_ing),
+            active_episode=active_episode,
+            active_compaction=active_compaction,
+        )
 
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
