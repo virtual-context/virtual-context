@@ -90,6 +90,7 @@ def _restored_flushed_prefix_messages(
 
 from .core.compaction_pipeline import CompactionPipeline
 from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
+from .core.event_bus import ProgressEventBus
 from .core.paging_manager import PagingManager
 from .core.retrieval_assembler import RetrievalAssembler
 from .core.semantic_search import SemanticSearchManager
@@ -146,6 +147,10 @@ class VirtualContextEngine:
             )
 
         self._conversation_generation = 0
+        # One bus per Engine instance. Downstream tasks (A31-A33) publish
+        # IngestionProgressEvent / CompactionProgressEvent onto this bus;
+        # the cloud bridge (B2) subscribes to fan out to Redis Pub/Sub.
+        self.progress_event_bus = ProgressEventBus()
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
         self._init_store()
