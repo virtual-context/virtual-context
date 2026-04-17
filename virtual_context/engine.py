@@ -1843,10 +1843,31 @@ class VirtualContextEngine:
         _inner = getattr(store, '_store', None)
         if _inner is not None:
             store = _inner
+        # Ensure a ``conversations`` row exists so the epoch check has
+        # something to read. ``upsert_conversation`` is idempotent — it
+        # creates the row at epoch=1 if missing, otherwise leaves the epoch
+        # intact. Engine callers don't yet plumb a tenant_id through, so we
+        # pass empty; later tasks (A22+) will wire the real tenant.
+        upsert = getattr(store, "upsert_conversation", None)
+        if callable(upsert):
+            try:
+                upsert(tenant_id="", conversation_id=conv_id)
+            except Exception:
+                logger.warning(
+                    "CANONICAL_UPSERT_CONVERSATION_FAILED conv=%s",
+                    conv_id[:12],
+                    exc_info=True,
+                )
+        # expected_lifecycle_epoch=1 is the default-lifecycle case for callers
+        # that don't yet plumb epoch through their in-memory state (A22+ will
+        # pass the actual engine_state.lifecycle_epoch here). Since this path
+        # currently runs without a delete+resurrect model, the entry-time and
+        # commit-time checks will normally observe epoch=1 and pass through.
         result = IngestReconciler(store, self._semantic).ingest_batch(
             conv_id,
             body=body,
             fmt=fmt,
+            expected_lifecycle_epoch=1,
         )
         logger.info(
             "SYNC_CANONICAL_ENTRIES: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",

@@ -130,6 +130,7 @@ class IngestReconciler:
         *,
         body: dict,
         fmt: Any,
+        expected_lifecycle_epoch: int,
     ) -> CanonicalIngestResult:
         from ..proxy.formats import extract_ingestible_messages
 
@@ -147,6 +148,7 @@ class IngestReconciler:
             conversation_id,
             prepared_turns=prepared,
             raw_turn_count=len(prepared),
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
         )
 
     def ingest_prepared_turns(
@@ -155,17 +157,54 @@ class IngestReconciler:
         *,
         prepared_turns: list[CanonicalTurnRow],
         raw_turn_count: int,
+        expected_lifecycle_epoch: int,
         allow_short_overlap: bool = True,
     ) -> CanonicalIngestResult:
+        from .lifecycle_epoch import verify_epoch
+        # Entry check — fail fast before acquiring the per-conversation lock.
+        verify_epoch(
+            conversation_id=conversation_id,
+            expected=expected_lifecycle_epoch,
+            observed=self._store.get_lifecycle_epoch(conversation_id),
+        )
         with self._conversation_merge_lock(conversation_id):
+            # Re-check inside the lock: another thread may have resurrected
+            # the conversation between our entry check and lock acquisition.
+            verify_epoch(
+                conversation_id=conversation_id,
+                expected=expected_lifecycle_epoch,
+                observed=self._store.get_lifecycle_epoch(conversation_id),
+            )
             existing = self._store.get_all_canonical_turns(conversation_id)
-            return self._ingest_prepared_turns_locked(
+            result = self._ingest_prepared_turns_locked(
                 conversation_id,
                 prepared_turns=prepared_turns,
                 raw_turn_count=raw_turn_count,
                 existing=existing,
                 allow_short_overlap=allow_short_overlap,
             )
+            # Commit-time check: a resurrect could have raced DURING our writes
+            # (the Python-level merge lock doesn't serialize against external
+            # delete+resurrect flows). If the epoch moved, purge the rows we
+            # just wrote — they belong to the old lifecycle and must not leak
+            # into the new one. We use source_batch_id (stamped on every row
+            # in this call) so the rollback is surgical: only THIS call's
+            # rows, no concurrent new-lifecycle writes affected.
+            observed_now = self._store.get_lifecycle_epoch(conversation_id)
+            if observed_now != expected_lifecycle_epoch:
+                batch_id = result.batch.batch_id if result.batch else None
+                if batch_id:
+                    self._store.delete_canonical_turns_by_batch_id(
+                        conversation_id=conversation_id,
+                        batch_id=batch_id,
+                    )
+                from .lifecycle_epoch import LifecycleEpochMismatch
+                raise LifecycleEpochMismatch(
+                    conversation_id=conversation_id,
+                    expected=expected_lifecycle_epoch,
+                    observed=observed_now,
+                )
+            return result
 
     def _ingest_prepared_turns_locked(
         self,
@@ -383,15 +422,12 @@ class IngestReconciler:
             sender = entry.sender or sender
             fact_signals = list(entry.fact_signals or [])
             code_refs = list(entry.code_refs or [])
-        tagged_at = now if (
-            entry is not None
-            or bool(tags)
-            or bool(fact_signals)
-            or bool(code_refs)
-            or bool(session_date)
-            or bool(sender)
-            or (primary_tag not in ("", "_general"))
-        ) else None
+        # IngestReconciler never sets ``tagged_at`` — the tagger (A27) owns
+        # that write as part of the progress-bar redesign. A row starts
+        # untagged and the tagger stamps it later.
+        # ``covered_ingestible_entries`` defaults to 1: each canonical row
+        # represents one ingestible payload entry (user/assistant side).
+        # Grouped-turn ingestion in later tasks may set this higher.
         return CanonicalTurnRow(
             conversation_id=conversation_id,
             turn_number=-1,
@@ -411,7 +447,8 @@ class IngestReconciler:
             sender=sender or "",
             fact_signals=list(fact_signals or []),
             code_refs=list(code_refs or []),
-            tagged_at=tagged_at,
+            tagged_at=None,
+            covered_ingestible_entries=1,
             first_seen_at=now,
             last_seen_at=now,
             created_at=now,

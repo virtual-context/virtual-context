@@ -591,6 +591,13 @@ class CanonicalTurnRow:
     first_seen_at: str | None = None
     last_seen_at: str | None = None
     source_batch_id: str | None = None
+    # Progress-tracking fields (progress-bar redesign).
+    # ``covered_ingestible_entries`` is how many ingestible payload entries
+    # this canonical row represents. Defaults to 1 for typical 1:1 row->entry
+    # ingestion; future grouped-turn ingestion may set it higher.
+    # ``tagged_at`` is also above (lifecycle timestamp); we leave it where it
+    # is for backwards compat but note that the tagger (A27) owns writes.
+    covered_ingestible_entries: int = 1
     created_at: str = ""
     updated_at: str = ""
 
