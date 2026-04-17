@@ -2894,6 +2894,8 @@ class ProxyState:
                 # Any failure path leaves the episode 'running' so the
                 # next arriving worker can pick it up; no exception
                 # propagates.
+                episode_completed = False
+                phase_ok = False
                 if completed_cleanly:
                     try:
                         my_epoch = int(self.engine._engine_state.lifecycle_epoch)
@@ -2948,18 +2950,37 @@ class ProxyState:
                             "(conv=%s)",
                             conversation_id[:12],
                         )
-                self._ingested_conversations.add(conversation_id)
-                self._advance_compaction_watermark()
-                # Record watermark for history widening detection
-                latest = self._latest_body
-                if latest:
-                    _messages = self._completed_history_messages(_extract_ingestible_messages(latest))
-                    self._record_ingestion_watermark(_messages, conversation_id)
-                # After ingestion, check if compaction is needed immediately.
-                # Without this, the payload stays over-budget and upstream
-                # rejects every request — a deadlock.
-                self._compact_after_ingestion(initial_messages)
-                self._transition_to(SessionState.ACTIVE)
+                # Bug 1 fix (P1): only mark this worker complete and run
+                # post-ingestion side effects when the DB actually moved to
+                # "active with nothing running". If either the episode did
+                # not complete (lease stolen / untagged rows remain) or the
+                # phase flip did not land (stale epoch), leave the worker
+                # in its pre-finalisation state — do NOT advance the local
+                # watermark, do NOT fire compaction, and do NOT transition
+                # to ACTIVE. The next worker or the next request picks up
+                # where we left off.
+                if episode_completed and phase_ok:
+                    self._ingested_conversations.add(conversation_id)
+                    self._advance_compaction_watermark()
+                    # Record watermark for history widening detection
+                    latest = self._latest_body
+                    if latest:
+                        _messages = self._completed_history_messages(_extract_ingestible_messages(latest))
+                        self._record_ingestion_watermark(_messages, conversation_id)
+                    # After ingestion, check if compaction is needed immediately.
+                    # Without this, the payload stays over-budget and upstream
+                    # rejects every request — a deadlock.
+                    self._compact_after_ingestion(initial_messages)
+                    self._transition_to(SessionState.ACTIVE)
+                else:
+                    logger.info(
+                        "legacy ingestion finalisation deferred for conv=%s "
+                        "(episode_completed=%s, phase_ok=%s) — staying in "
+                        "INGESTING so the next worker can resume",
+                        conversation_id[:12],
+                        episode_completed,
+                        phase_ok,
+                    )
 
     def _ingest_messages_with_progress(
         self,
@@ -2988,22 +3009,31 @@ class ProxyState:
             len(self.engine._turn_tag_index.entries),
             conversation_id[:12],
         )
+        # Bug 2 fix (P2): wall-clock heartbeat cadence. Turn-based cadence
+        # (every N turns) loses the lease when a single LLM-heavy tagging
+        # turn exceeds ``INGESTION_LEASE_TTL_S``. Initialise the clock at
+        # function entry so the first refresh is due after ~TTL/2 seconds
+        # of turn time, not immediately, and reset it on every successful
+        # ``refresh_ingestion_heartbeat`` return.
+        last_heartbeat_monotonic = time.monotonic()
+        heartbeat_threshold_s = INGESTION_LEASE_TTL_S / 2
 
         def on_progress(done: int, total: int, entry) -> None:
-            nonlocal baseline_history_tokens
+            nonlocal baseline_history_tokens, last_heartbeat_monotonic
             cum_done = baseline + done
             # Check cancellation before updating progress
             if self._ingestion_cancel.is_set():
                 raise _IngestionCancelled(cum_done, _total)
             self._ingestion_progress = (cum_done, _total)
             # Lease-lifecycle ownership (section 2 of P1 migration): refresh
-            # the ingestion heartbeat every 2 turns so a long-running legacy
-            # thread does not let its lease go stale and get stolen by
-            # another worker. If the refresh returns False the lease has
-            # been lost (stale epoch or ownership changed) — flip the
-            # cancel event so the pipeline bails out cleanly without
-            # completing the episode or flipping the phase.
-            if done > 0 and (done % 2) == 0:
+            # the ingestion heartbeat on wall-clock cadence (half the lease
+            # TTL) so a long-running legacy thread does not let its lease
+            # go stale and get stolen by another worker. If the refresh
+            # returns False the lease has been lost (stale epoch or
+            # ownership changed) — flip the cancel event so the pipeline
+            # bails out cleanly without completing the episode or flipping
+            # the phase.
+            if time.monotonic() - last_heartbeat_monotonic >= heartbeat_threshold_s:
                 try:
                     refreshed = self.engine._store.refresh_ingestion_heartbeat(
                         conversation_id=conversation_id,
@@ -3026,6 +3056,7 @@ class ProxyState:
                     )
                     self._ingestion_cancel.set()
                     raise _IngestionCancelled(cum_done, _total)
+                last_heartbeat_monotonic = time.monotonic()
             if self.metrics:
                 turn_num = entry.turn_number
                 local_turn = turn_num - baseline
