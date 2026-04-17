@@ -181,3 +181,41 @@ def test_mark_conversation_deleted_raises_keyerror_for_unknown(tmp_path: Path):
     s = SQLiteStore(tmp_path / "vc.db")
     with pytest.raises(KeyError):
         s.mark_conversation_deleted("nonexistent")
+
+
+def test_delete_conversation_removes_lifecycle_and_progress_rows(tmp_path: Path):
+    s = SQLiteStore(tmp_path / "vc.db")
+    s.upsert_conversation(tenant_id="t", conversation_id="c")
+    s.save_canonical_turn("c", 0, "u0", "a0")
+    with s._get_conn() as conn:
+        conn.execute("""
+            INSERT INTO ingestion_episode (
+                episode_id, conversation_id, lifecycle_epoch,
+                raw_payload_entries, started_at, status, owner_worker_id, heartbeat_ts
+            ) VALUES ('ep1', 'c', 1, 96, '2026-04-17T00:00:00+00:00', 'running', 'w1', '2026-04-17T00:00:00+00:00')
+        """)
+        conn.execute("""
+            INSERT INTO compaction_operation (
+                operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, owner_worker_id, heartbeat_ts
+            ) VALUES ('op1', 'c', 1, 0, 3, 'queued', 'queued', '2026-04-17T00:00:00+00:00', 'w1', '2026-04-17T00:00:00+00:00')
+        """)
+    s.delete_conversation("c")
+    with s._get_conn() as conn:
+        conv_count = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE conversation_id='c'"
+        ).fetchone()[0]
+        episode_count = conn.execute(
+            "SELECT COUNT(*) FROM ingestion_episode WHERE conversation_id='c'"
+        ).fetchone()[0]
+        compaction_count = conn.execute(
+            "SELECT COUNT(*) FROM compaction_operation WHERE conversation_id='c'"
+        ).fetchone()[0]
+        canonical_count = conn.execute(
+            "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id='c'"
+        ).fetchone()[0]
+    assert conv_count == 0
+    assert episode_count == 0
+    assert compaction_count == 0
+    assert canonical_count == 0

@@ -2505,6 +2505,9 @@ class PostgresStore(ContextStore):
                 "segment_tool_outputs",
                 "chain_snapshots",
                 "media_outputs",
+                "ingestion_episode",
+                "compaction_operation",
+                "conversations",
             ):
                 self._delete_conversation_rows(conn, table, conversation_id)
 
