@@ -39,6 +39,26 @@ logger = logging.getLogger(__name__)
 # ``ProxyState.handle_prepare_payload`` via ``claim_ingestion_lease``.
 INGESTION_LEASE_TTL_S: float = 30.0
 
+# Ordered phase plan used by ``_run_compact`` to drive the DB-backed
+# compaction_operation row. The initial ``"starting"`` phase is seeded
+# by ``enter_compaction``; every other name corresponds to a
+# ``phase_name=`` value emitted by the compactor pipeline's progress
+# callback (see ``core/compaction_pipeline.py`` + ``core/compactor.py``).
+# ``phase_count`` = len of this list so downstream consumers can render
+# "step i of N" progress without re-deriving the plan.
+_COMPACT_PHASE_PLAN: tuple[str, ...] = (
+    "starting",
+    "segment_tagging",
+    "segment_grouping",
+    "segment_postprocess",
+    "compactor",
+    "store",
+    "tag_summaries",
+)
+_COMPACT_PHASE_INDEX: dict[str, int] = {
+    name: idx for idx, name in enumerate(_COMPACT_PHASE_PLAN)
+}
+
 # ---------------------------------------------------------------------------
 # Provider derivation from upstream URL
 # ---------------------------------------------------------------------------
@@ -1755,10 +1775,26 @@ class ProxyState:
         turn: int,
         turn_id: str = "",
     ) -> None:
-        """Background compaction — runs in _compact_pool, doesn't block next request."""
+        """Background compaction — runs in _compact_pool, doesn't block next request.
+
+        In addition to the legacy dict-based ``_update_compaction_state``
+        mirror, this wires the DB-backed compaction lifecycle on
+        ``ProxyState`` so downstream consumers (SSE, dashboards) see the
+        ``conversations.phase`` flip to ``'compacting'``, a
+        ``compaction_operation`` row get written, and
+        ``PhaseTransitionEvent`` / ``CompactionProgressEvent`` fire on
+        enter / each phase advance / exit. See ``enter_compaction``,
+        ``advance_compaction_phase``, and ``exit_compaction`` on
+        ``ProxyState`` for the underlying primitives.
+        """
         conversation_id = self.engine.config.conversation_id
         operation_id = uuid.uuid4().hex[:12]
         compaction_started = time.monotonic()
+        # Mutable closure cell for the last phase index we advanced the
+        # DB-backed compaction_operation row to. Prevents redundant
+        # ``advance_compaction_phase`` writes when the pipeline emits
+        # multiple progress callbacks inside a single phase.
+        last_advanced_phase_index = -1
         self._update_compaction_state(
             operation_id=operation_id,
             status="queued",
@@ -1771,6 +1807,7 @@ class ProxyState:
         )
 
         def _compact_progress(done, total, result, *, phase="", **kwargs):
+            nonlocal last_advanced_phase_index
             if self._compaction_cancelled.is_set():
                 raise InterruptedError("Compaction cancelled (conversation deleted)")
             evt = {
@@ -1814,6 +1851,19 @@ class ProxyState:
                     }
                 },
             )
+            # Mirror the pipeline's phase_name onto the DB-backed
+            # compaction_operation row. Only advance when the named
+            # phase is one we planned for AND the plan index moved
+            # forward, so a noisy callback stream collapses into a
+            # single DB write + event per phase transition.
+            phase_name_kwarg = str(evt.get("phase_name", phase) or "")
+            plan_idx = _COMPACT_PHASE_INDEX.get(phase_name_kwarg, -1)
+            if plan_idx > last_advanced_phase_index:
+                self.advance_compaction_phase(
+                    phase_index=plan_idx,
+                    phase_name=phase_name_kwarg,
+                )
+                last_advanced_phase_index = plan_idx
             if self.metrics:
                 self.metrics.record(evt)
 
@@ -1830,6 +1880,35 @@ class ProxyState:
                 phase_detail="compaction already running",
             )
             return
+
+        # Enter the DB-backed compaction lifecycle. ``enter_compaction``
+        # is itself epoch-guarded and silently no-ops on mismatch
+        # (leaving no ``compaction_operation`` row), which is why we
+        # observe whether the row was created via the progress snapshot
+        # before deciding to emit a terminal ``exit_compaction``.
+        # Otherwise a concurrent delete+resurrect that flipped our
+        # epoch mid-enter would leave us calling
+        # ``drain_compaction_exit`` against a phase we never owned.
+        try:
+            self.enter_compaction(
+                phase_count=len(_COMPACT_PHASE_PLAN),
+                initial_phase_name=_COMPACT_PHASE_PLAN[0],
+            )
+            last_advanced_phase_index = 0
+        except Exception:
+            logger.warning(
+                "enter_compaction failed for %s — continuing legacy path only",
+                conversation_id[:12],
+                exc_info=True,
+            )
+        entered_lifecycle = False
+        try:
+            snap_after_enter = self.engine._store.read_progress_snapshot(
+                conversation_id,
+            )
+            entered_lifecycle = snap_after_enter.active_compaction is not None
+        except Exception:
+            entered_lifecycle = False
 
         try:
             t0 = time.monotonic()
@@ -1939,6 +2018,15 @@ class ProxyState:
                         elapsed_ms=compact_ms,
                         phase_detail="no messages to compact",
                     )
+                if entered_lifecycle:
+                    try:
+                        self.exit_compaction(success=True)
+                    except Exception:
+                        logger.warning(
+                            "exit_compaction(success=True) failed for %s",
+                            conversation_id[:12],
+                            exc_info=True,
+                        )
 
             except Exception as e:
                 elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -1962,6 +2050,17 @@ class ProxyState:
                         "elapsed_ms": elapsed_ms,
                     })
                 logger.error("compact_if_needed error: %s", e, exc_info=True)
+                if entered_lifecycle:
+                    try:
+                        self.exit_compaction(
+                            success=False, error_message=str(e),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "exit_compaction(success=False) failed for %s",
+                            conversation_id[:12],
+                            exc_info=True,
+                        )
         finally:
             self._compaction_lock.release()
 
