@@ -1661,6 +1661,21 @@ class PostgresStore(ContextStore):
             raise KeyError(conversation_id)
         return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
 
+    def get_conversation_phase(self, conversation_id: str) -> str:
+        """Return the current phase for the conversation.
+
+        Returns one of ``"init" | "ingesting" | "compacting" | "active" |
+        "deleted"``. Raises ``KeyError`` if no row exists.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT phase FROM conversations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return str(row["phase"] if isinstance(row, dict) else row[0])
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
 
