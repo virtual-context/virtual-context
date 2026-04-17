@@ -9,21 +9,21 @@ import os
 
 import pytest
 
-from virtual_context.storage.postgres import PostgresStore
-
 PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
 
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
 
-@pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+
 def test_conversations_table_has_phase_and_epoch_columns_pg():
+    from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    conn = store._get_conn()
-    rows = conn.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-         WHERE table_name = 'conversations'
-        """
-    ).fetchall()
+    with store._get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+             WHERE table_name = 'conversations'
+            """
+        ).fetchall()
     cols = {row["column_name"] for row in rows}
     expected = {
         "conversation_id", "tenant_id", "lifecycle_epoch", "phase",
