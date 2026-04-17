@@ -465,3 +465,67 @@ def test_step_6_reclaims_stale_lease(tmp_path):
     assert decision.started_tagger is True  # reclaimed
     snap = inner.read_progress_snapshot(conv_id)
     assert snap.active_episode.owner_worker_id == state._worker_id
+
+
+# ---------------------------------------------------------------------------
+# Wiring — server.py::prepare_payload must invoke state.handle_prepare_payload
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_payload_calls_handle_prepare_payload(tmp_path):
+    """Verify the integration point: ``server.py::prepare_payload`` calls
+    ``state.handle_prepare_payload`` when a valid state is provided, and the
+    new flow transitions the conversation into the expected phase."""
+    import asyncio
+
+    from virtual_context.proxy.formats import detect_format
+    from virtual_context.proxy.metrics import ProxyMetrics
+    from virtual_context.proxy.server import prepare_payload
+
+    state = _make_proxy_state(tmp_path)
+    try:
+        original = state.handle_prepare_payload
+        calls: list[tuple[tuple, dict]] = []
+
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        state.handle_prepare_payload = spy  # type: ignore[assignment]
+        body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }
+        fmt = detect_format(body)
+        body_bytes = (
+            b'{"model":"claude-opus-4-6",'
+            b'"messages":[{"role":"user","content":"hi"},'
+            b'{"role":"assistant","content":"hello"}]}'
+        )
+        asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                fmt,
+                ProxyMetrics(),
+                body_bytes=body_bytes,
+                inbound_conversation_id=state.engine.config.conversation_id,
+            )
+        )
+        assert len(calls) == 1, (
+            f"expected exactly one handle_prepare_payload call, got {len(calls)}"
+        )
+        # Verify new flow fired: phase transitioned to ingesting (total>done)
+        # or active (empty). A fresh conversation with 2 new messages and no
+        # tagged rows should land in 'ingesting'.
+        snap = state.engine._store.read_progress_snapshot(
+            state.engine.config.conversation_id,
+        )
+        assert snap.phase in ("ingesting", "active"), (
+            f"unexpected phase after wired handle_prepare_payload: {snap.phase}"
+        )
+    finally:
+        state.engine.close()
