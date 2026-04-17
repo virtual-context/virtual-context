@@ -762,11 +762,12 @@ async def prepare_payload(
     # exceptions are logged — they must not break the request path
     # because the legacy flow below still runs.
     # ---------------------------------------------------------------
+    _phase_decision = None
     if state is not None and hasattr(state, "handle_prepare_payload"):
         from ..core.lifecycle_epoch import LifecycleEpochMismatch as _LE_MISMATCH
         _hpp_stage = time.monotonic()
         try:
-            state.handle_prepare_payload(
+            _phase_decision = state.handle_prepare_payload(
                 body=body,
                 payload_accounting=_payload_accounting,
             )
@@ -846,16 +847,27 @@ async def prepare_payload(
             # Store latest body for catch-up loop
             state._latest_body = body
 
-            # On first request: kick off non-blocking ingestion
+            # On first request: kick off non-blocking ingestion.
+            # Multi-worker gate: if ``handle_prepare_payload`` ran and did
+            # NOT claim the lease (``started_tagger is False``), another
+            # worker owns ingestion for this conversation — we must skip
+            # the legacy thread to avoid two workers racing on the same
+            # canonical rows. If ``_phase_decision is None`` (engine lacks
+            # the hook, state is None, or the call raised) we default to
+            # the legacy flow (status quo preserved).
+            _owns_ingestion_lease = (
+                _phase_decision is None or _phase_decision.started_tagger
+            )
             if not state._history_ingested():
                 _dispatch_history_messages = _dispatch_history_messages or state._completed_history_messages(
                     _extract_ingestible_messages(body)
                 )
                 if _dispatch_history_messages and not state.is_conversation_deleted():
                     state.conversation_history = list(_dispatch_history_messages)
-                await asyncio.to_thread(
-                    state.start_ingestion_if_needed, _dispatch_history_messages,
-                )
+                if _owns_ingestion_lease:
+                    await asyncio.to_thread(
+                        state.start_ingestion_if_needed, _dispatch_history_messages,
+                    )
 
             if not state.is_conversation_deleted():
                 state.conversation_history.append(
