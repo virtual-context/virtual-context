@@ -20,6 +20,11 @@ from pathlib import Path
 import pytest
 
 from virtual_context.core.lifecycle_epoch import LifecycleEpochMismatch
+from virtual_context.proxy.formats import (
+    detect_format,
+    extract_ingestible_messages,
+    summarize_payload_accounting,
+)
 from virtual_context.proxy.state import PhaseDecision, ProxyState
 
 
@@ -128,6 +133,46 @@ def test_handle_prepare_payload_persists_canonical_rows(tmp_path):
         conv_id = state.engine.config.conversation_id
         rows = state.engine._store.get_all_canonical_turns(conv_id)
         assert len(rows) >= 1, "at least one canonical row was persisted"
+    finally:
+        state.engine.close()
+
+
+def test_proxy_ingest_history_keeps_total_fixed_for_single_prepare_payload(tmp_path):
+    """A single payload should not widen its own denominator while tagging.
+
+    ``handle_prepare_payload`` persists canonical rows up front. The proxy's
+    follow-up bulk ingester must only enrich/tag those rows, not append new
+    canonical rows while it works.
+    """
+    state = _make_proxy_state(tmp_path)
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "part one"},
+            {"role": "assistant", "content": "part two"},
+        ],
+    }
+    try:
+        fmt = detect_format(body)
+        payload_accounting = summarize_payload_accounting(body, fmt)
+        messages, _ = extract_ingestible_messages(body, fmt)
+
+        state.handle_prepare_payload(body=body, payload_accounting=payload_accounting)
+        conv_id = state.engine.config.conversation_id
+        before = state.engine._store.read_progress_snapshot(conv_id)
+        assert before.total_ingestible == 3
+        assert before.done_ingestible == 0
+
+        ingested = state.engine.ingest_history(
+            messages,
+            require_existing_canonical=True,
+            expected_lifecycle_epoch=state.engine._engine_state.lifecycle_epoch,
+        )
+        after = state.engine._store.read_progress_snapshot(conv_id)
+
+        assert ingested == 2
+        assert after.total_ingestible == before.total_ingestible
+        assert after.done_ingestible == before.total_ingestible
     finally:
         state.engine.close()
 

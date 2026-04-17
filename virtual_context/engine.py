@@ -1846,12 +1846,16 @@ class VirtualContextEngine:
         progress_callback: Callable[..., None] | None = None,
         turn_offset: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
+        require_existing_canonical: bool = False,
+        expected_lifecycle_epoch: int | None = None,
     ) -> int:
         return self._tagging.ingest_history(
             history_messages,
             progress_callback,
             turn_offset,
             tool_output_refs_by_turn=tool_output_refs_by_turn,
+            require_existing_canonical=require_existing_canonical,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
         )
 
     def retrieve(self, message: str, active_tags: list[str] | None = None) -> RetrievalResult:
