@@ -936,32 +936,6 @@ class VirtualContextEngine:
             len(self._restored_pending_turns),
         )
 
-        # Canonical rows are the authoritative source for compaction progress,
-        # so derivation above has already reconciled the in-memory watermark.
-        # We still sanity-check that segments exist to back the derived value;
-        # if not, log a warning so operators can investigate. We intentionally
-        # do NOT zero the watermark here — canonical rows would just re-derive
-        # it on the next ingest via _advance_compaction_watermark(), so a reset
-        # would not stick. Fixing the inconsistency requires clearing
-        # compacted_at on the affected canonical rows, which is out of scope
-        # for the restore path.
-        if self._engine_state.compacted_prefix_messages > 0:
-            try:
-                segs = self._store.get_segments_by_tags(
-                    tags=["_general"], min_overlap=0, limit=1,
-                    conversation_id=self.config.conversation_id,
-                )
-                if not segs:
-                    tags = self._store.get_all_tags(conversation_id=self.config.conversation_id)
-                    if not tags:
-                        logger.warning(
-                            "Canonical rows say compacted_prefix_messages=%d for conversation %s but no segments exist — inconsistent state, investigate",
-                            self._engine_state.compacted_prefix_messages,
-                            self.config.conversation_id[:12],
-                        )
-            except Exception:
-                pass
-
     def _apply_cached_state(self, cached: dict) -> None:
         """Restore engine state from a Redis snapshot."""
         from .types import TurnTagEntry, FactSignal, WorkingSetEntry, DepthLevel
