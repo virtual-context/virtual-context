@@ -282,15 +282,45 @@ class IngestReconciler:
         else:
             overlap_existing = existing[alignment.existing_start:alignment.existing_start + alignment.overlap_len]
             overlap_incoming = prepared_turns[alignment.incoming_start:alignment.incoming_start + alignment.overlap_len]
+            # Append-path fast-skip: overlap rows are already persisted with
+            # canonically-correct content (``_find_alignment`` proved the
+            # turn_hash matches). Re-writing them was a 164 s bottleneck on
+            # append-only payloads in production (5777 redundant UPDATEs for
+            # an incoming payload whose real novelty was 3 tail turns).
+            #
+            # We instead mirror the existing row's identity fields into the
+            # in-memory ``row`` so downstream consumers (batch record,
+            # rows_touched) see a consistent canonical set, and skip the DB
+            # write entirely. Trade-offs:
+            #
+            #  * ``source_batch_id`` on the stored overlap row stays on the
+            #    batch that originally wrote it. This is DESIRED: rollback
+            #    on lifecycle-epoch mismatch scopes to
+            #    ``source_batch_id = <this batch_id>``, so overlap rows
+            #    correctly do NOT get purged when a resurrect races this
+            #    batch — they belong to the prior (still-valid) batch.
+            #  * ``last_seen_at`` on the stored overlap row stays at its
+            #    original timestamp. It's a diagnostic field with no
+            #    invariant-enforcing reader; dashboards that surface it
+            #    should display ``updated_at`` (refreshed by the tagger)
+            #    instead.
+            #  * Enrichment upgrades (e.g. a late-arriving ``session_date``
+            #    replacing an empty one) on an overlap row are skipped
+            #    here. The background tagger's
+            #    ``_persist_existing_canonical_rows`` path still writes
+            #    fresh enrichment when it re-tags the row, so the upgrade
+            #    lands on the first tag pass — not lost, just deferred.
+            #
+            # Prefix / suffix writes below are genuinely new rows and must
+            # still happen.
             for offset, row in enumerate(overlap_incoming):
                 existing_row = overlap_existing[offset]
                 row.canonical_turn_id = existing_row.canonical_turn_id
                 row.sort_key = existing_row.sort_key
-                row.source_batch_id = batch_id
+                row.source_batch_id = existing_row.source_batch_id
                 row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
-                row.last_seen_at = now
+                row.last_seen_at = existing_row.last_seen_at or row.last_seen_at
                 self._preserve_existing_enrichment(row, existing_row)
-                self._write_turn(row, turn_number=alignment.existing_start + offset)
                 rows_touched.append(row)
                 turns_matched += 1
 
