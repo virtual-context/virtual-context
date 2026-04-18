@@ -189,10 +189,15 @@ def test_non_owner_resume_ingestion_defense_in_depth() -> None:
     state.engine._engine_state.last_indexed_turn = 0
     state.engine._engine_state.last_completed_turn = 2
 
-    # Active episode owned by SOMEONE ELSE.
+    # Active episode owned by SOMEONE ELSE. ``resume_pending_ingestion_if_needed``
+    # now atomically attempts to claim the lease — the store's
+    # ``claim_ingestion_lease`` is authoritative: it returns False iff another
+    # worker holds a live lease. The older ``read_progress_snapshot`` observer
+    # check is only used as a fallback for stores lacking the lease API.
     state.engine._store.read_progress_snapshot.return_value = (
         _snapshot_with_owner(conv_id, owner_worker_id="other-worker:1:deadbeef")
     )
+    state.engine._store.claim_ingestion_lease.return_value = False
 
     spawned = state.resume_pending_ingestion_if_needed()
 

@@ -91,6 +91,7 @@ def _restored_flushed_prefix_messages(
 from .core.compaction_pipeline import CompactionPipeline
 from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
 from .core.event_bus import ProgressEventBus
+from .core.lifecycle_epoch import LifecycleEpochMismatch
 from .core.paging_manager import PagingManager
 from .core.retrieval_assembler import RetrievalAssembler
 from .core.semantic_search import SemanticSearchManager
@@ -976,7 +977,12 @@ class VirtualContextEngine:
         self._restored_from_checkpoint = True
         self._restored_checkpoint_source = "redis"
 
-        # TurnTagIndex — populate in-place
+        # TurnTagIndex — populate in-place. ``TurnTagEntry`` declares list
+        # fields with ``default_factory=list``; we MUST preserve that contract
+        # so downstream consumers (e.g. ``persist_completed_turn``) can call
+        # ``list(entry.fact_signals)`` without a ``TypeError: 'NoneType' object
+        # is not iterable``. Earlier code wrote ``fact_signals=fs or None``,
+        # which violated the contract when the cached entry had no signals.
         for entry_dict in cached.get("turn_tag_entries", []):
             fs = []
             for sig in entry_dict.get("fact_signals", []) or []:
@@ -999,13 +1005,13 @@ class VirtualContextEngine:
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=entry_dict["turn_number"],
                 canonical_turn_id=entry_dict.get("canonical_turn_id", "") or "",
-                tags=entry_dict["tags"],
+                tags=list(entry_dict.get("tags") or []),
                 primary_tag=entry_dict.get("primary_tag", ""),
                 message_hash=entry_dict.get("message_hash", ""),
                 sender=entry_dict.get("sender", ""),
                 timestamp=ts,
-                fact_signals=fs or None,
-                code_refs=entry_dict.get("code_refs", []) or [],
+                fact_signals=fs,
+                code_refs=list(entry_dict.get("code_refs") or []),
             ))
         self._update_checkpoint_markers()
 
@@ -1131,9 +1137,13 @@ class VirtualContextEngine:
             else:
                 ts = datetime.now(timezone.utc)
 
-            # Restore fact_signals if present
-            fs_raw = entry_dict.get("fact_signals", [])
-            fs = None
+            # Restore fact_signals if present. ``TurnTagEntry`` declares
+            # ``fact_signals`` with ``default_factory=list`` so the canonical
+            # contract is "always a list". Preserve that contract here —
+            # ``None`` would violate it and crash ``list(entry.fact_signals)``
+            # in ``persist_completed_turn``.
+            fs_raw = entry_dict.get("fact_signals") or []
+            fs: list = []
             if fs_raw:
                 from .types import FactSignal
                 fs = [
@@ -1151,14 +1161,14 @@ class VirtualContextEngine:
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=entry_dict.get("turn_number", 0),
                 canonical_turn_id=entry_dict.get("canonical_turn_id", "") or "",
-                tags=entry_dict.get("tags", []),
+                tags=list(entry_dict.get("tags") or []),
                 primary_tag=entry_dict.get("primary_tag", "_general"),
                 message_hash=entry_dict.get("message_hash", ""),
                 sender=entry_dict.get("sender", ""),
                 timestamp=ts,
                 session_date=entry_dict.get("session_date", ""),
                 fact_signals=fs,
-                code_refs=entry_dict.get("code_refs", []) or [],
+                code_refs=list(entry_dict.get("code_refs") or []),
             ))
 
         # Working set — uses DepthLevel enum, NOT PagingDepth
@@ -1499,6 +1509,15 @@ class VirtualContextEngine:
             raw_content=assistant_messages[-1].raw_content if assistant_messages else None,
         )
         entry = self._turn_tag_index.get_tags_for_logical_turn(turn_number)
+        # ``TurnTagEntry`` declares its list fields with ``default_factory=list``
+        # so the canonical contract is that ``tags``, ``fact_signals`` and
+        # ``code_refs`` are always lists. Defense in depth: older persisted
+        # snapshots stored these fields as ``None`` when empty (see
+        # ``_apply_cached_state`` and ``postgres.load_engine_state`` prior to
+        # the fact_signals-None fix), so coerce before calling ``list(...)``
+        # instead of trusting the upstream invariant. ``list(None)`` raises
+        # ``TypeError`` and would crash the persist path silently under the
+        # broad exception handler below.
         try:
             result = IngestReconciler(
                 self._store,
@@ -1510,11 +1529,11 @@ class VirtualContextEngine:
                 user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
                 assistant_raw_content=json.dumps(assistant_msg.raw_content) if assistant_msg.raw_content else None,
                 primary_tag=entry.primary_tag if entry else "_general",
-                tags=list(entry.tags) if entry else [],
+                tags=list(entry.tags or []) if entry else [],
                 session_date=entry.session_date if entry else "",
                 sender=entry.sender if entry else "",
-                fact_signals=list(entry.fact_signals) if entry else [],
-                code_refs=list(entry.code_refs) if entry else [],
+                fact_signals=list(entry.fact_signals or []) if entry else [],
+                code_refs=list(entry.code_refs or []) if entry else [],
             )
             if entry is not None and result.rows:
                 entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
@@ -1525,11 +1544,27 @@ class VirtualContextEngine:
                 exc,
             )
             return
-        except Exception:
-            logger.warning(
-                "Failed to persist completed turn %d for conversation %s",
+        except LifecycleEpochMismatch as exc:
+            # Lifecycle drift — the conversation was deleted/resurrected while
+            # we were preparing the write. Log and return; the caller will
+            # re-hydrate on the next request.
+            logger.info(
+                "Lifecycle-epoch mismatch during completed-turn persist for "
+                "conversation %s: %s",
+                self.config.conversation_id[:12],
+                exc,
+            )
+            return
+        except (ValueError, TypeError, json.JSONDecodeError, AttributeError) as exc:
+            # Structural failures (malformed entry, encoding errors) that are
+            # genuinely per-turn and should not crash subsequent turns, but
+            # MUST be visible. Do not swallow these with ``pass``.
+            logger.error(
+                "Structural error persisting completed turn %d for "
+                "conversation %s: %s",
                 turn_number,
                 self.config.conversation_id[:12],
+                exc,
                 exc_info=True,
             )
             return
