@@ -243,14 +243,28 @@ class TaggingPipeline:
             pass  # non-critical
 
     def _get_latest_turn_pair(self, history: list[Message]) -> list[Message] | None:
-        """Extract the most recent completed user/assistant turn."""
+        """Extract the most recent completed user/assistant turn.
+
+        Returns ``None`` unless the pair contains BOTH a user message and
+        an assistant message. Lone halves — a user turn whose assistant
+        reply hasn't arrived yet, or an assistant-only turn from a
+        malformed payload — are rejected so downstream canonical-persist
+        callers never index into a missing half. Previously this method
+        accepted any pair containing an assistant, which let an orphan
+        assistant-only pair reach ``tag_turn``'s
+        ``latest_pair[1]`` access and raise ``IndexError``. That
+        propagated into a "Postgres backup save failed — marking store
+        stale" cascade that cancelled ingestion mid-run.
+        """
         pairs = pair_messages_into_turns(list(history))
         if not pairs:
             return None
         latest = pairs[-1].messages
-        if any(msg.role == "assistant" for msg in latest):
-            return latest
-        return None
+        has_user = any(msg.role == "user" for msg in latest)
+        has_asst = any(msg.role == "assistant" for msg in latest)
+        if not (has_user and has_asst):
+            return None
+        return latest
 
     def _persist_canonical_turn(
         self,
@@ -819,13 +833,39 @@ class TaggingPipeline:
                 # empty except clause.
                 try:
                     if entry is not None:
-                        self._persist_canonical_turn(entry, latest_pair[0], latest_pair[1])
+                        # Extract by role, not positional index. The pair can
+                        # legitimately include tool-call messages between the
+                        # user and assistant halves, so ``latest_pair[1]`` is
+                        # NOT guaranteed to be the assistant. ``_get_latest_turn_pair``
+                        # now guarantees both roles are present, but we still
+                        # extract defensively so a future shape drift can't
+                        # silently persist wrong content.
+                        user_msg = next(
+                            (m for m in latest_pair if m.role == "user"), None,
+                        )
+                        asst_msg = next(
+                            (m for m in latest_pair if m.role == "assistant"), None,
+                        )
+                        if user_msg is None or asst_msg is None:
+                            logger.warning(
+                                "TAGGER turn=%d canonical-persist skipped — "
+                                "incomplete pair roles=%s",
+                                turn_num,
+                                [m.role for m in latest_pair],
+                            )
+                        else:
+                            self._persist_canonical_turn(entry, user_msg, asst_msg)
                 except StaleConversationWriteError as exc:
                     logger.info(
                         "TAGGER turn=%d canonical-persist deferred (stale): %s",
                         turn_num, exc,
                     )
-                except (ValueError, TypeError, AttributeError) as exc:
+                except (ValueError, TypeError, AttributeError, IndexError) as exc:
+                    # ``IndexError`` added after production incident: a
+                    # malformed pair (lone half) reached ``latest_pair[1]``
+                    # and the exception bubbled up, marking the session
+                    # store stale and forcing cancel/resume. Surface loudly
+                    # but do not stop tagging.
                     logger.error(
                         "TAGGER turn=%d canonical-persist failed (structural): %s",
                         turn_num, exc,
