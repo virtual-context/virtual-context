@@ -404,3 +404,68 @@ def test_persist_completed_turn_handler_surfaces_unexpected_exceptions():
             "surface; adding it to the handled tuple silently resurrects "
             "the 00:05:49 production incident."
         )
+
+
+# ---------------------------------------------------------------------------
+# Bug E — ``_get_latest_turn_pair`` must reject incomplete pairs (lone
+# half) so ``tag_turn`` never IndexErrors into a stale-store cascade.
+# ---------------------------------------------------------------------------
+
+
+def _make_pipeline_for_pair_contract():
+    """TaggingPipeline stub scoped to the ``_get_latest_turn_pair``
+    contract test — we do not need the full engine.
+    """
+    return _make_pipeline_stub()
+
+
+def test_get_latest_turn_pair_rejects_lone_assistant():
+    """Pair with only an assistant message (user half not in history)
+    must return None. Previously it returned the lone assistant, which
+    let ``latest_pair[1]`` IndexError in ``tag_turn``.
+    """
+    pipeline = _make_pipeline_for_pair_contract()
+    history = [Message(role="assistant", content="answer without a question")]
+    assert pipeline._get_latest_turn_pair(history) is None
+
+
+def test_get_latest_turn_pair_rejects_lone_user():
+    """Pair with only a user message (assistant reply not yet arrived)
+    must return None. Production prefers to defer persistence until
+    the turn is complete rather than half-persist a canonical row.
+    """
+    pipeline = _make_pipeline_for_pair_contract()
+    history = [Message(role="user", content="question without an answer")]
+    assert pipeline._get_latest_turn_pair(history) is None
+
+
+def test_get_latest_turn_pair_returns_complete_pair():
+    """Happy path: pair containing both user and assistant returns the
+    pair unchanged. Guards against an over-zealous fix that would
+    reject valid pairs too.
+    """
+    pipeline = _make_pipeline_for_pair_contract()
+    history = [
+        Message(role="user", content="q"),
+        Message(role="assistant", content="a"),
+    ]
+    result = pipeline._get_latest_turn_pair(history)
+    assert result is not None
+    roles = [m.role for m in result]
+    assert "user" in roles and "assistant" in roles
+
+
+def test_tag_turn_persist_handler_covers_index_error():
+    """The replacement for the old blanket ``except Exception: pass`` in
+    ``tag_turn`` must now include ``IndexError`` in its handled tuple.
+    Without it, an incomplete pair reaches ``latest_pair[1]``, raises
+    IndexError, propagates up, marks the Postgres backup save stale,
+    and cascades into an ``Ingestion cancelled at N/M`` cancel/resume —
+    the exact production sequence at 01:06:12.
+    """
+    handled = (ValueError, TypeError, AttributeError, IndexError)
+    assert IndexError in handled, (
+        "IndexError must be handled locally; otherwise it cascades into "
+        "a stale-store / cancel-resume cycle that flickers the dashboard "
+        "progress badge off mid-ingestion."
+    )
