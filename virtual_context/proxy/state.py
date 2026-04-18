@@ -1115,18 +1115,47 @@ class ProxyState:
         return active.owner_worker_id != self._worker_id
 
     def resume_pending_ingestion_if_needed(self) -> bool:
-        """Resume indexing from durable canonical turns when completed turns outpace indexed turns."""
+        """Resume indexing from durable canonical turns when completed turns outpace indexed turns.
+
+        Multi-worker safety: this method can be called concurrently by
+        different worker processes (each with its own ``ProxyState``) for
+        the same conversation when all request paths point at the same
+        worker pool. The server-side ``_owns_ingestion_lease`` gate is the
+        primary guard, but callers outside that gate (tests, legacy
+        entrypoints, edge cases where the server gate is bypassed) can
+        still race here. We defend the spawn by ATOMICALLY claiming the
+        ingestion lease via ``claim_ingestion_lease`` — if the claim
+        fails (another worker owns a fresh lease) we back off without
+        spawning. The claim also refreshes the heartbeat when the caller
+        is already the owner, so repeated calls from the same worker stay
+        safe.
+        """
         conversation_id = self.engine.config.conversation_id
         if not self.has_pending_indexing():
             return False
-        # Defense-in-depth: refuse to spawn the legacy thread if another
-        # worker holds the ingestion lease. The server-side gate in
-        # ``prepare_payload`` already handles the primary path; this catches
-        # direct callers that bypass that gate.
-        if self._another_worker_owns_lease(conversation_id):
+        # Atomic lease claim. On success the caller owns the lease (either
+        # took it over because the previous heartbeat was stale or was
+        # already the owner). On failure another worker owns a live lease.
+        lifecycle_epoch = int(
+            getattr(self.engine._engine_state, "lifecycle_epoch", 1) or 1
+        )
+        try:
+            claimed = self.engine._store.claim_ingestion_lease(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=self._worker_id,
+                lease_ttl_s=INGESTION_LEASE_TTL_S,
+            )
+        except (AttributeError, NotImplementedError):
+            # Store backend lacks the lease API (in-memory test stores,
+            # legacy file backends). Fall through to the defense-in-depth
+            # observer check so test harnesses with MagicMock stores keep
+            # working.
+            claimed = not self._another_worker_owns_lease(conversation_id)
+        if not claimed:
             logger.info(
                 "resume_pending_ingestion_if_needed: skipping spawn — "
-                "active ingestion episode is owned by another worker "
+                "could not claim ingestion lease "
                 "(conv=%s, this=%s)",
                 conversation_id[:12], self._worker_id,
             )
@@ -3124,10 +3153,27 @@ class ProxyState:
         baseline_history_tokens = 0
         grouped = self._group_history_messages(messages)
         _total = cumulative_total if cumulative_total is not None else baseline + len(grouped)
+        # Bug D invariant: progress counters must never dip below the durable
+        # canonical floor. ``done_ingestible`` in Postgres is a monotonic
+        # SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL) that
+        # cannot regress. The in-memory ``_ingestion_progress`` tuple is a
+        # view over that floor — if we allow it to report ``(0, total)``
+        # during a resume while the DB still has thousands of tagged rows,
+        # the dashboard displays a false "ingestion restarted from zero".
+        try:
+            _snapshot_done_floor = int(
+                self.engine._store.read_progress_snapshot(
+                    conversation_id,
+                ).done_ingestible or 0
+            )
+        except Exception:  # pragma: no cover — defensive
+            _snapshot_done_floor = 0
         logger.info(
-            "INGEST_BATCH baseline=%d cumulative_total=%s turns=%d index_size=%d conversation=%s",
+            "INGEST_BATCH baseline=%d cumulative_total=%s turns=%d index_size=%d "
+            "durable_floor=%d conversation=%s",
             baseline, _total, len(grouped),
             len(self.engine._turn_tag_index.entries),
+            _snapshot_done_floor,
             conversation_id[:12],
         )
         # Bug 2 fix (P2): heartbeat cadence is handled by the dedicated
@@ -3149,7 +3195,14 @@ class ProxyState:
             # and cancel-and-resume does the same for takeover.
             if self._ingestion_cancel.is_set():
                 raise _IngestionCancelled(cum_done, _total)
-            self._ingestion_progress = (cum_done, _total)
+            # Bug D: clamp displayed progress to the durable floor. Even
+            # when this worker legitimately starts its in-memory counter
+            # low (e.g. a fresh resume where ``baseline`` reflects only
+            # this worker's restored ``TurnTagIndex`` size, not the DB
+            # truth), the user-facing counter must reflect the canonical
+            # row state. The floor itself is monotonic at the DB.
+            display_done = max(cum_done, _snapshot_done_floor)
+            self._ingestion_progress = (display_done, _total)
             if self.metrics:
                 turn_num = entry.turn_number
                 local_turn = turn_num - baseline

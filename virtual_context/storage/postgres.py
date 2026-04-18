@@ -3303,19 +3303,25 @@ class PostgresStore(ContextStore):
         entries = []
         for e in entries_list:
             signals = []
-            for fs in e.get("fact_signals", []):
+            for fs in e.get("fact_signals") or []:
                 signals.append(FactSignal(
                     subject=fs.get("subject", ""), verb=fs.get("verb", ""),
                     object=fs.get("object", ""), status=fs.get("status", ""),
                     fact_type=fs.get("fact_type", "personal"), what=fs.get("what", ""),
                 ))
+            # ``TurnTagEntry`` declares ``fact_signals`` / ``tags`` / ``code_refs``
+            # with ``default_factory=list``. Preserve that contract — ``None``
+            # would make ``list(entry.fact_signals)`` raise ``TypeError`` in
+            # ``persist_completed_turn``. (Previous code stored ``None`` when
+            # the list was empty, which crashed ingestion on resume.)
+            tags_list = list(e.get("tags") or [])
             entries.append(TurnTagEntry(
-                turn_number=e["turn_number"], tags=e["tags"],
+                turn_number=e["turn_number"], tags=tags_list,
                 canonical_turn_id=e.get("canonical_turn_id", "") or "",
-                primary_tag=e.get("primary_tag", e["tags"][0] if e["tags"] else "_general"),
+                primary_tag=e.get("primary_tag") or (tags_list[0] if tags_list else "_general"),
                 message_hash=e.get("message_hash", ""),
-                fact_signals=signals if signals else None,
-                code_refs=e.get("code_refs", []) or [],
+                fact_signals=signals,
+                code_refs=list(e.get("code_refs") or []),
                 sender=e.get("sender", ""),
             ))
 
