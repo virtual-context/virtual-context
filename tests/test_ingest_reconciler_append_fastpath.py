@@ -235,6 +235,123 @@ def test_overlap_rows_keep_original_source_batch_id(tmp_path: Path):
     )
 
 
+def _single_role_payload(*, role: str, content: str) -> dict:
+    return {"messages": [{"role": role, "content": content}]}
+
+
+def test_fragment_with_no_complete_pair_rejected_on_nonempty_conv(tmp_path: Path):
+    """An orphan-half fragment (e.g. lone 'testing' user message, lone
+    '[[reply_to_current]]' assistant message) arriving on a non-empty
+    conversation MUST be rejected. Otherwise it creates a permanently
+    untagged canonical row — the 2026-04-18 production stall where
+    13 such orphans wedged conv 77f110fc at 2419/2432 (99.5%) forever,
+    keeping phase='ingesting' and the dashboard badge permanent.
+    """
+    store = SQLiteStore(tmp_path / "vc.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    rec = _reconciler(store)
+
+    # Seed a normal paired conversation so ``existing`` is non-empty.
+    rec.ingest_batch(
+        conversation_id="c", body=_pair_payload(10), fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+    before = store.get_all_canonical_turns("c")
+    assert len(before) == 20  # 10 pairs × 2 rows
+
+    # Fragment case 1: lone user message, doesn't hash-align with anything
+    # existing.
+    result_u = rec.ingest_batch(
+        conversation_id="c",
+        body=_single_role_payload(role="user", content="testing"),
+        fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+    assert result_u.merge_mode == "fragment_rejected"
+    assert result_u.turns_written == 0
+
+    # Fragment case 2: lone assistant message.
+    result_a = rec.ingest_batch(
+        conversation_id="c",
+        body={"messages": [{"role": "assistant", "content": "[[reply_to_current]] ok"}]},
+        fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+    assert result_a.merge_mode == "fragment_rejected"
+    assert result_a.turns_written == 0
+
+    # Canonical table must be unchanged — NO orphan rows created.
+    after = store.get_all_canonical_turns("c")
+    assert len(after) == len(before), (
+        "Fragment rejection failed: orphan rows were persisted anyway. "
+        f"Before: {len(before)} rows; after: {len(after)} rows. "
+        "This resurrects the 2026-04-18 stall where the ingestion badge "
+        "gets stuck at ~99% because orphan halves can't be tagged."
+    )
+
+
+def test_complete_pair_with_no_alignment_still_writes(tmp_path: Path):
+    """A complete user+assistant pair arriving on a non-empty conversation
+    that doesn't hash-align with anything must still be persisted — it's
+    a legitimate new turn, just not detectable as an overlap extension.
+    The fragment guard must NOT over-reject valid content.
+    """
+    store = SQLiteStore(tmp_path / "vc.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    rec = _reconciler(store)
+    rec.ingest_batch(
+        conversation_id="c", body=_pair_payload(5), fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+    before_count = len(store.get_all_canonical_turns("c"))
+
+    # Genuine new round-trip — both roles present, hashes don't match any
+    # existing row (content is fresh).
+    result = rec.ingest_batch(
+        conversation_id="c",
+        body={"messages": [
+            {"role": "user", "content": "a brand new question"},
+            {"role": "assistant", "content": "a brand new answer"},
+        ]},
+        fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+    after_count = len(store.get_all_canonical_turns("c"))
+    assert result.merge_mode != "fragment_rejected", (
+        f"Genuine new pair must not be rejected; got {result.merge_mode}."
+    )
+    assert after_count == before_count + 2, (
+        f"Complete pair must be persisted as 2 new rows; "
+        f"before={before_count} after={after_count}"
+    )
+
+
+def test_orphan_half_on_fresh_conv_is_allowed(tmp_path: Path):
+    """A lone user or assistant message on a FRESH (empty) conversation
+    must still be persisted — the assistant reply / user follow-up can
+    legitimately arrive in a later request. The fragment guard only
+    fires when ``existing`` is non-empty.
+    """
+    store = SQLiteStore(tmp_path / "vc.db")
+    store.upsert_conversation(tenant_id="c-fresh1", conversation_id="c-fresh1")
+    rec = _reconciler(store)
+
+    result = rec.ingest_batch(
+        conversation_id="c-fresh1",
+        body=_single_role_payload(role="user", content="hello, this is the first turn"),
+        fmt=_fmt(),
+        expected_lifecycle_epoch=1,
+    )
+
+    assert result.merge_mode != "fragment_rejected", (
+        "Fresh-conversation ingest must not be fragment-rejected; "
+        f"got {result.merge_mode}."
+    )
+    assert result.turns_written >= 1
+    rows = store.get_all_canonical_turns("c-fresh1")
+    assert len(rows) >= 1
+
+
 def test_rollback_by_batch_id_purges_only_new_tail(tmp_path: Path):
     """If the new batch rolls back (epoch mismatch scenario), the
     overlap rows MUST survive — they belong to earlier batches and are

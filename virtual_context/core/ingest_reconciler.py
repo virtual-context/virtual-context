@@ -269,6 +269,70 @@ class IngestReconciler:
                 turns_written += 1
                 turns_appended += 1
         elif alignment is None:
+            # Fragment guard: a no-alignment append into a non-empty
+            # conversation is legitimate for genuine new turns, but tiny
+            # windowed-payload fragments (an 'testing' user turn without its
+            # assistant reply, an orphan '[[reply_to_current]]' assistant
+            # half, a system-generated 'NO_REPLY' emission) produce
+            # canonical rows the tagger can never tag — the tagger matches
+            # user+assistant pairs and orphan halves have no partner. Left
+            # in place, these rows keep ``done < total`` forever, so phase
+            # never transitions out of ``ingesting`` and the dashboard
+            # badge stalls at ~99% permanently (2026-04-18 production
+            # incident on conv 77f110fc — 13 orphan rows left the
+            # ingestion progress wedged at 2419/2432).
+            #
+            # Rule: reject ``no_overlap_append`` writes when the incoming
+            # payload has no complete user+assistant pair. "Complete pair"
+            # is evaluated at the payload level (at least one row with
+            # user content AND at least one row with assistant content),
+            # not per-row, so the rule passes for any payload that
+            # contains a real round-trip turn even if it also carries
+            # orphan halves alongside it.
+            #
+            # Fresh conversations (``not existing``) skip this guard —
+            # the first write of a new conversation can legitimately be a
+            # lone user message with the assistant reply arriving later.
+            has_user = any(
+                (row.user_content or "").strip() for row in prepared_turns
+            )
+            has_asst = any(
+                (row.assistant_content or "").strip() for row in prepared_turns
+            )
+            if not (has_user and has_asst):
+                logger.warning(
+                    "CANONICAL_TURN_FRAGMENT_REJECTED: conv=%s existing=%d "
+                    "incoming=%d has_user=%s has_asst=%s — no complete "
+                    "user+assistant pair, skipping persist to avoid "
+                    "permanently-untag-able orphan rows.",
+                    conversation_id[:12],
+                    len(existing),
+                    len(prepared_turns),
+                    has_user,
+                    has_asst,
+                )
+                batch = self._save_batch(
+                    conversation_id,
+                    raw_turn_count=raw_turn_count,
+                    merge_mode="fragment_rejected",
+                    first_turn_hash=prepared_turns[0].turn_hash,
+                    last_turn_hash=prepared_turns[-1].turn_hash,
+                    turns_matched=0,
+                    turns_appended=0,
+                    turns_prepended=0,
+                    turns_inserted=0,
+                    batch_id=batch_id,
+                )
+                return CanonicalIngestResult(
+                    merge_mode="fragment_rejected",
+                    turns_written=0,
+                    turns_matched=0,
+                    turns_appended=0,
+                    turns_prepended=0,
+                    turns_inserted=0,
+                    batch=batch,
+                    rows=[],
+                )
             start_key = default_sort_key(existing)
             for idx, row in enumerate(prepared_turns):
                 row.canonical_turn_id = generate_canonical_turn_id()
