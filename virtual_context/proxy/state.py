@@ -3079,6 +3079,44 @@ class ProxyState:
             # only path that owns the lease cleanly through to the end.
             completed_cleanly = not self._ingestion_cancel.is_set()
 
+            # DB-sweep catchup: the payload-driven catchup above only tags
+            # rows covered by messages actually present in the payloads
+            # we've been handed. Any canonical rows sitting in the DB with
+            # ``tagged_at IS NULL`` from a prior interrupted batch —
+            # container restart mid-tag, abandoned large-payload tail,
+            # windowed follow-ups that don't re-include the bulk history —
+            # are invisible to the payload-driven loop and would stall
+            # forever at ``done < total``.
+            #
+            # ``_tagger_run`` closes that loop: it queries
+            # ``iter_untagged_canonical_rows`` in batches of 32 and tags
+            # each row directly from its stored ``user_content`` /
+            # ``assistant_content`` (no payload needed). It's epoch-guarded
+            # on every write, refreshes the ingestion heartbeat per row,
+            # and flips the episode to ``completed`` + phase to ``active``
+            # when the untagged queue drains. Any subsequent prepare that
+            # adds more untagged rows while we're sweeping will be picked
+            # up by the next batch iteration.
+            #
+            # We only enter the sweep when the payload-driven pass
+            # completed cleanly (not cancelled by a racing new payload);
+            # the racing path will spawn its own _run_ingestion_with_catchup
+            # which will eventually reach this sweep.
+            if completed_cleanly:
+                try:
+                    self._tagger_run()
+                except LifecycleEpochMismatch:
+                    # Delete+resurrect race during the sweep. Safe exit:
+                    # the new lifecycle's next prepare will spawn a fresh
+                    # catchup that picks up where this one left off.
+                    logger.info(
+                        "Ingestion DB-sweep exited on lifecycle epoch "
+                        "mismatch for conv=%s",
+                        conversation_id[:12],
+                    )
+                    cancelled = True
+                    completed_cleanly = False
+
         except _IngestionCancelled as e:
             # New request is taking over — exit cleanly without
             # transitioning to ACTIVE or marking as ingested.
