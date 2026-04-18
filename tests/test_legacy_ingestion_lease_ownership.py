@@ -61,6 +61,13 @@ def _make_state(*, conversation_id: str = "conv-legacy-ingest") -> tuple[ProxySt
     engine._engine_state = EngineState()
     engine._store = MagicMock()
     engine._store.get_all_tags.return_value = []
+    # Row-based DB sweep runs after the legacy pair-based path in
+    # ``_run_ingestion_with_catchup``; it fetches untagged rows via this
+    # method. An unset MagicMock would return a truthy MagicMock and
+    # infinite-loop the while True. Return an empty list so the sweep
+    # no-ops (nothing to drain), then proceeds to complete the episode
+    # via the already-mocked ``complete_ingestion_episode``.
+    engine._store.iter_untagged_canonical_rows.return_value = []
     engine.config.conversation_id = conversation_id
     engine.config.context_window = 120_000
     engine.config.monitor.context_window = 120_000

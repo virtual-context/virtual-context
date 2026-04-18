@@ -127,6 +127,65 @@ def test_run_ingestion_with_catchup_sweeps_untagged_rows_from_prior_batch(tmp_pa
     )
 
 
+def test_db_sweep_runs_when_legacy_pair_tagger_errors(tmp_path: Path, monkeypatch):
+    """Scenario: legacy pair-based tagger raises mid-run (e.g. strict
+    canonical alignment failure on a conversation with orphan halves from
+    a prior crash). The row-based ``_tagger_run`` DB sweep MUST still fire
+    and drain the untagged queue — otherwise the episode stays wedged at
+    'ingesting' forever and every subsequent POST re-hits the same legacy
+    failure without making progress.
+
+    Pre-fix, the sweep only ran when the legacy path completed cleanly, so
+    a single strict-canonical RuntimeError would leave the episode stuck
+    until the DB state was manually repaired.
+    """
+    from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+
+    for i in range(5):
+        _seed_canonical_row(
+            inner, conv_id, f"orphan_{i}", float((i + 1) * 1000),
+            user_text=f"user msg {i}",
+            assistant_text=f"assistant reply {i}",
+        )
+    _prep_episode(inner, conv_id, state._worker_id)
+
+    from virtual_context.types import TagResult
+
+    def _fake_generate_tags(self, combined_text, store_tags, context_turns=None):
+        return TagResult(tags=["test-tag"], primary="test-tag", source="stub")
+    monkeypatch.setattr(
+        "virtual_context.core.tag_generator.TagGenerator.generate_tags",
+        _fake_generate_tags,
+    )
+
+    def _legacy_boom(self, *args, **kwargs):
+        raise RuntimeError(
+            "strict canonical tagging could not map payload messages to "
+            "existing rows for logical turn 10"
+        )
+    monkeypatch.setattr(
+        type(state), "_ingest_messages_with_progress", _legacy_boom,
+    )
+
+    state._run_ingestion_with_catchup(
+        initial_messages=[],
+        baseline=0,
+        cumulative_total=0,
+    )
+
+    remaining = _count_untagged(inner, conv_id)
+    assert remaining == 0, (
+        f"Row-based DB sweep regression: legacy pair-based tagger raised "
+        f"but {remaining} canonical rows are still untagged. The sweep "
+        "must run unconditionally after the legacy path (unless the pass "
+        "was explicitly cancelled) so a strict-canonical alignment failure "
+        "cannot wedge the episode forever."
+    )
+
+
 def test_db_sweep_skips_when_payload_pass_was_cancelled(tmp_path: Path):
     """If the payload-driven pass was cancelled by a racing new request,
     the DB sweep MUST NOT fire on this thread — the racing thread will do
