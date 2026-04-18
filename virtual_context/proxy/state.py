@@ -558,10 +558,20 @@ class ProxyState:
             status=c.status,
         ))
 
-    def _tagger_run(self) -> None:
+    def _tagger_run(self) -> bool:
         """Background tagger loop. Processes untagged canonical rows until
         none remain, then completes the episode. Exits cleanly on epoch
         mismatch (lifecycle bumped by delete+resurrect).
+
+        Returns ``True`` iff the untagged queue was drained to empty within
+        the caller's lifecycle — i.e. the episode was completed (or was
+        already completed by another worker) and the phase is ``active``.
+        Returns ``False`` when the sweep exited early on an epoch boundary
+        check or a rejected row-mark write. Callers use the return value to
+        trigger post-ingestion side effects (watermark, compaction,
+        SessionState transition) that ``_finalize_legacy_ingestion`` would
+        otherwise own — ``_finalize_legacy_ingestion`` returns False after
+        this sweep because the episode is already ``completed``.
 
         Four boundary ``verify_epoch`` checks ensure a stale tagger cannot
         affect a new lifecycle even if raced:
@@ -595,7 +605,7 @@ class ProxyState:
         while True:
             # Boundary check #1 — before the row fetch.
             if not _verify_or_exit():
-                return
+                return False
 
             batch = self.engine._store.iter_untagged_canonical_rows(
                 conversation_id=conversation_id,
@@ -605,14 +615,13 @@ class ProxyState:
             if not batch:
                 # Boundary check #2 — before the completion write.
                 if not _verify_or_exit():
-                    return
+                    return False
                 completed = self.engine._store.complete_ingestion_episode(
                     conversation_id=conversation_id,
                     lifecycle_epoch=my_epoch,
                     worker_id=self._worker_id,
                 )
                 if completed:
-                    # Transition phase to 'active'. Epoch-guarded.
                     ok = self.engine._store.set_phase(
                         conversation_id=conversation_id,
                         lifecycle_epoch=my_epoch,
@@ -620,10 +629,25 @@ class ProxyState:
                     )
                     if ok:
                         self._publish_phase_transition("ingesting", "active")
-                    return
-                # rows-affected == 0 — either new untagged row appeared
-                # (race) or lifecycle moved on. Loop; next verify_epoch
-                # catches the latter.
+                        return True
+                    # Episode is closed but the phase flip was rejected on
+                    # stale epoch. Another lifecycle owns local state now;
+                    # don't signal "drained for this caller's lifecycle".
+                    return False
+                # complete_ingestion_episode returned False. Either:
+                #   (a) a new untagged row appeared between our scan and
+                #       the completion guard (race) — loop and drain it; OR
+                #   (b) the episode was already closed by another worker
+                #       or the lifecycle moved — not ours to finalize.
+                if not _verify_or_exit():
+                    return False
+                retry_batch = self.engine._store.iter_untagged_canonical_rows(
+                    conversation_id=conversation_id,
+                    expected_lifecycle_epoch=my_epoch,
+                    batch_size=1,
+                )
+                if not retry_batch:
+                    return False
                 continue
 
             for row in batch:
@@ -643,7 +667,7 @@ class ProxyState:
 
                 # Boundary check #3 — before the row-mark write.
                 if not _verify_or_exit():
-                    return
+                    return False
 
                 marked = self.engine._store.mark_canonical_row_tagged(
                     canonical_turn_id=row.canonical_turn_id,
@@ -657,11 +681,11 @@ class ProxyState:
                         " for turn_id=%s",
                         self._worker_id, row.canonical_turn_id[:12],
                     )
-                    return
+                    return False
 
                 # Boundary check #4 — before the heartbeat write.
                 if not _verify_or_exit():
-                    return
+                    return False
 
                 self.engine._store.refresh_ingestion_heartbeat(
                     conversation_id=conversation_id,
@@ -3038,129 +3062,149 @@ class ProxyState:
         cumulative_total: int = 0,
         tool_output_refs_by_turn: dict[int, list[str]] | None = None,
     ) -> None:
-        """Background thread: ingest initial message history, then catch up any gap."""
+        """Background thread: ingest initial message history, then catch up any gap.
+
+        Architecture: two tagger paths run in sequence.
+
+        1. Legacy pair-based tagger (``_ingest_messages_with_progress``) walks
+           payload pairs and aligns them against existing canonical rows via
+           strict role-shape matching. It can fail on a conversation whose
+           canonical_turns table has orphan halves or half-tagged turn_groups
+           left by prior crashes — strict alignment cannot map payload pairs
+           to a messy DB.
+        2. Row-based DB sweep (``_tagger_run``) is the safety-net. It tags
+           untagged canonical rows directly from their stored
+           ``user_content``/``assistant_content`` with no payload alignment
+           required. It tolerates orphan halves and is the single
+           authoritative "drain the untagged queue" step.
+
+        The sweep runs unconditionally after the legacy path, regardless of
+        whether the legacy path succeeded or errored, unless the lease was
+        lost (``_IngestionCancelled``) or the conversation was deleted
+        (``StaleConversationWriteError``). Without this, a legacy strict
+        alignment failure would leave the episode wedged in INGESTING with
+        no worker making progress until the next POST — and that next POST
+        hits the same legacy failure.
+        """
         conversation_id = self.engine.config.conversation_id
         cancelled = False
         completed_cleanly = False
         try:
-            # Tag all initial history
-            self._ingest_messages_with_progress(
-                initial_messages,
-                baseline=baseline,
-                cumulative_total=cumulative_total or None,
-                tool_output_refs_by_turn=tool_output_refs_by_turn,
-            )
-
-            # Catch-up loop — tag any turns that arrived during ingestion
-            for _ in range(10):  # bounded to avoid infinite loops
-                if self._ingestion_cancel.is_set():
-                    break
-                latest = self._latest_body
-                if latest is None:
-                    break
-                latest_messages = self._completed_history_messages(_extract_ingestible_messages(latest))
-                needed = self._history_turn_count(latest_messages)
-                have = len(self.engine._turn_tag_index.entries)
-                if needed <= have:
-                    break
-                # Tag the gap
-                gap_messages = self._slice_messages_from_turn(latest_messages, have)
-                if not gap_messages:
-                    break
-                logger.info(
-                    "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
-                    self._history_turn_count(gap_messages), have, needed,
+            try:
+                self._ingest_messages_with_progress(
+                    initial_messages,
+                    baseline=baseline,
+                    cumulative_total=cumulative_total or None,
+                    tool_output_refs_by_turn=tool_output_refs_by_turn,
                 )
-                self._ingestion_progress = (have, needed)
-                self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
 
-            # The catch-up loop exited without raising, and the cancel
-            # event was not set during a progress callback. This is the
-            # only path that owns the lease cleanly through to the end.
-            completed_cleanly = not self._ingestion_cancel.is_set()
-
-            # DB-sweep catchup: the payload-driven catchup above only tags
-            # rows covered by messages actually present in the payloads
-            # we've been handed. Any canonical rows sitting in the DB with
-            # ``tagged_at IS NULL`` from a prior interrupted batch —
-            # container restart mid-tag, abandoned large-payload tail,
-            # windowed follow-ups that don't re-include the bulk history —
-            # are invisible to the payload-driven loop and would stall
-            # forever at ``done < total``.
-            #
-            # ``_tagger_run`` closes that loop: it queries
-            # ``iter_untagged_canonical_rows`` in batches of 32 and tags
-            # each row directly from its stored ``user_content`` /
-            # ``assistant_content`` (no payload needed). It's epoch-guarded
-            # on every write, refreshes the ingestion heartbeat per row,
-            # and flips the episode to ``completed`` + phase to ``active``
-            # when the untagged queue drains. Any subsequent prepare that
-            # adds more untagged rows while we're sweeping will be picked
-            # up by the next batch iteration.
-            #
-            # We only enter the sweep when the payload-driven pass
-            # completed cleanly (not cancelled by a racing new payload);
-            # the racing path will spawn its own _run_ingestion_with_catchup
-            # which will eventually reach this sweep.
-            if completed_cleanly:
-                try:
-                    self._tagger_run()
-                except LifecycleEpochMismatch:
-                    # Delete+resurrect race during the sweep. Safe exit:
-                    # the new lifecycle's next prepare will spawn a fresh
-                    # catchup that picks up where this one left off.
+                for _ in range(10):
+                    if self._ingestion_cancel.is_set():
+                        break
+                    latest = self._latest_body
+                    if latest is None:
+                        break
+                    latest_messages = self._completed_history_messages(_extract_ingestible_messages(latest))
+                    needed = self._history_turn_count(latest_messages)
+                    have = len(self.engine._turn_tag_index.entries)
+                    if needed <= have:
+                        break
+                    gap_messages = self._slice_messages_from_turn(latest_messages, have)
+                    if not gap_messages:
+                        break
                     logger.info(
-                        "Ingestion DB-sweep exited on lifecycle epoch "
+                        "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
+                        self._history_turn_count(gap_messages), have, needed,
+                    )
+                    self._ingestion_progress = (have, needed)
+                    self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
+
+                if self._ingestion_cancel.is_set():
+                    cancelled = True
+
+            except _IngestionCancelled as e:
+                cancelled = True
+                logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
+            except StaleConversationWriteError as e:
+                cancelled = True
+                logger.info(
+                    "Ingestion abandoned for deleted/stale conversation %s: %s",
+                    conversation_id[:12],
+                    e,
+                )
+            except Exception as e:
+                logger.error(
+                    "Legacy pair-based ingestion errored (falling through "
+                    "to row-based DB sweep): %s",
+                    e,
+                    exc_info=True,
+                )
+
+            sweep_drained = False
+            if not cancelled:
+                try:
+                    sweep_drained = bool(self._tagger_run())
+                    if sweep_drained:
+                        completed_cleanly = True
+                except LifecycleEpochMismatch:
+                    logger.info(
+                        "Row-based DB sweep exited on lifecycle epoch "
                         "mismatch for conv=%s",
                         conversation_id[:12],
                     )
                     cancelled = True
                     completed_cleanly = False
-
-        except _IngestionCancelled as e:
-            # New request is taking over — exit cleanly without
-            # transitioning to ACTIVE or marking as ingested.
-            # NOTE: Python's finally block runs even after return,
-            # so we use a flag to skip the finalization actions.
-            cancelled = True
-            logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
-        except StaleConversationWriteError as e:
-            cancelled = True
-            logger.info(
-                "Ingestion abandoned for deleted/stale conversation %s: %s",
-                conversation_id[:12],
-                e,
-            )
-        except Exception as e:
-            logger.error("Ingestion error: %s", e, exc_info=True)
+                except StaleConversationWriteError as e:
+                    cancelled = True
+                    logger.info(
+                        "Row-based DB sweep abandoned for deleted/stale "
+                        "conversation %s: %s",
+                        conversation_id[:12], e,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Row-based DB sweep errored for conv=%s; "
+                        "leaving episode INGESTING for next worker",
+                        conversation_id[:12],
+                    )
         finally:
             if not cancelled:
-                # Lease-lifecycle ownership (section 2 of P1 migration):
-                # on clean completion, close the ingestion episode and
-                # flip the DB phase back to 'active' via the shared
-                # ``_finalize_legacy_ingestion`` helper. On cancel /
-                # stale-epoch / exception paths we skip finalisation
-                # entirely so the episode stays 'running' for the next
-                # worker to pick up.
+                # Finalization: when the row-based sweep drained the
+                # queue it already wrote episode-completion + phase flip
+                # + published the transition event inline. In that case
+                # we skip ``_finalize_legacy_ingestion`` (which would
+                # re-run those same DB writes — redundant and would
+                # double-publish) but still need the caller-side
+                # bookkeeping the helper normally owns:
+                # ``_ingested_conversations`` membership and
+                # ``_advance_compaction_watermark``. Post-ingestion side
+                # effects (watermark recording, compaction check,
+                # SessionState transition) fire from either path.
+                #
+                # ``sweep_drained=False`` + ``completed_cleanly=True``
+                # shouldn't normally happen (sweep drained sets clean),
+                # but the explicit ``and not sweep_drained`` guard makes
+                # the single-finalization invariant clear.
                 finalized = False
-                if completed_cleanly:
+                if completed_cleanly and not sweep_drained:
                     finalized = self._finalize_legacy_ingestion(conversation_id)
-                # Bug 1 fix (P1): only run post-ingestion side effects when
-                # the DB actually moved to "active with nothing running".
-                # If the helper returned False (episode not completable,
-                # lease stolen / untagged rows remain, or phase flip
-                # rejected on stale epoch), leave the worker in its
-                # pre-finalisation state — do NOT record the watermark,
-                # do NOT fire compaction, and do NOT transition to ACTIVE.
-                if finalized:
-                    # Record watermark for history widening detection
+                should_run_post_ingestion = finalized or sweep_drained
+                if sweep_drained:
+                    self._ingested_conversations.add(conversation_id)
+                    try:
+                        self._advance_compaction_watermark()
+                    except Exception:
+                        logger.warning(
+                            "_advance_compaction_watermark raised after "
+                            "row-based sweep for conv=%s",
+                            conversation_id[:12],
+                            exc_info=True,
+                        )
+                if should_run_post_ingestion:
                     latest = self._latest_body
                     if latest:
                         _messages = self._completed_history_messages(_extract_ingestible_messages(latest))
                         self._record_ingestion_watermark(_messages, conversation_id)
-                    # After ingestion, check if compaction is needed immediately.
-                    # Without this, the payload stays over-budget and upstream
-                    # rejects every request — a deadlock.
                     self._compact_after_ingestion(initial_messages)
                     self._transition_to(SessionState.ACTIVE)
                 else:
