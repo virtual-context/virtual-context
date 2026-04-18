@@ -18,6 +18,7 @@ import copy
 import hashlib
 import io
 import json
+import time
 import logging
 import math
 import re
@@ -975,12 +976,18 @@ class PayloadFormat(ABC):
                 total_message_tokens += cached_tokens
                 reused_prefix_messages += 1
 
-        for msg in messages[reused_prefix_messages:]:
+        for _idx, msg in enumerate(messages[reused_prefix_messages:]):
             fingerprint = self._fingerprint_message_for_cache(msg)
             token_count = self.estimate_message_tokens(msg)
             message_fingerprints.append(fingerprint)
             message_tokens.append(token_count)
             total_message_tokens += token_count
+            # Cold-count on 5000+ messages can hold the GIL long enough that
+            # uvicorn's always_pong thread misses its liveness window and the
+            # supervisor SIGKILLs the worker. time.sleep(0.001) actually
+            # releases the GIL (time.sleep(0) is a no-op in Python 3.12).
+            if _idx and _idx % 100 == 0:
+                time.sleep(0.001)
 
         separator_tokens = self._count("," * max(0, len(messages) - 1))
         total_tokens = shell_tokens + total_message_tokens + separator_tokens
