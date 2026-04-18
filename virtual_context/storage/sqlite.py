@@ -1268,12 +1268,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
                FROM canonical_turns ct"""
         )
 
+    @staticmethod
+    def _add_column_if_missing(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        """Add a column with race-safety.
+
+        Multiple worker processes opening the same SQLite file during
+        startup all execute ``_ensure_canonical_turn_schema`` against the
+        same DB. The naive ``PRAGMA table_info`` + ``ALTER TABLE ADD
+        COLUMN`` pattern has a classic TOCTOU window: two workers both
+        see the column missing, both try to add it, the second one
+        raises ``sqlite3.OperationalError: duplicate column name``.
+        The migration is idempotent at the DB level (the column is
+        either there or not) but the noisy traceback at every startup
+        masks real errors.
+
+        Swallow the duplicate-column case narrowly (by sqlite3 error
+        message) — any other ``OperationalError`` propagates so real
+        bugs stay visible.
+        """
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
     def _ensure_canonical_turn_schema(self, conn: sqlite3.Connection) -> None:
         pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
         by_name = {row["name"]: row for row in pragma_rows}
         if "turn_group_number" not in by_name:
-            conn.execute(
-                "ALTER TABLE canonical_turns ADD COLUMN turn_group_number INTEGER NOT NULL DEFAULT -1"
+            self._add_column_if_missing(
+                conn,
+                "canonical_turns",
+                "turn_group_number",
+                "INTEGER NOT NULL DEFAULT -1",
             )
             pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
             by_name = {row["name"]: row for row in pragma_rows}
@@ -1369,12 +1401,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
         #     SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
         # The two partial indexes below make each SUM path an index-only scan.
         if "covered_ingestible_entries" not in by_name:
-            conn.execute(
-                "ALTER TABLE canonical_turns ADD COLUMN covered_ingestible_entries INTEGER NOT NULL DEFAULT 1"
+            self._add_column_if_missing(
+                conn,
+                "canonical_turns",
+                "covered_ingestible_entries",
+                "INTEGER NOT NULL DEFAULT 1",
             )
         if "tagged_at" not in by_name:
-            conn.execute(
-                "ALTER TABLE canonical_turns ADD COLUMN tagged_at TEXT NULL"
+            self._add_column_if_missing(
+                conn,
+                "canonical_turns",
+                "tagged_at",
+                "TEXT NULL",
             )
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_untagged
