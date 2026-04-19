@@ -1712,7 +1712,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 counter_rows,
             )
 
-    def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
+        from ..types import CompactionLeaseLost
         conn = self._get_conn()
         primary_tag = segment.primary_tag
         summary_text = segment.summary
@@ -1733,33 +1741,86 @@ CREATE TABLE IF NOT EXISTS request_captures (
             metadata_dict["session_date"] = segment.metadata.session_date
         metadata_json = json.dumps(metadata_dict)
 
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO segments
-                (ref, conversation_id, primary_tag, summary, full_text, messages_json,
-                 metadata_json, summary_tokens, full_tokens, compression_ratio,
-                 compaction_model, created_at, start_timestamp, end_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    segment.ref,
-                    segment.conversation_id,
-                    primary_tag,
-                    summary_text,
-                    full_text,
-                    json.dumps(segment.messages, default=str),
-                    metadata_json,
-                    segment.summary_tokens,
-                    segment.full_tokens,
-                    segment.compression_ratio,
-                    segment.compaction_model,
-                    _dt_to_str(segment.created_at),
-                    _dt_to_str(segment.start_timestamp),
-                    _dt_to_str(segment.end_timestamp),
-                ),
-            )
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                cur = conn.execute(
+                    """INSERT OR REPLACE INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp,
+                     operation_id)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                      FROM compaction_operation
+                     WHERE operation_id = ?
+                       AND conversation_id = ?
+                       AND status = 'running'
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?""",
+                    (
+                        segment.ref,
+                        segment.conversation_id,
+                        primary_tag,
+                        summary_text,
+                        full_text,
+                        json.dumps(segment.messages, default=str),
+                        metadata_json,
+                        segment.summary_tokens,
+                        segment.full_tokens,
+                        segment.compression_ratio,
+                        segment.compaction_model,
+                        _dt_to_str(segment.created_at),
+                        _dt_to_str(segment.start_timestamp),
+                        _dt_to_str(segment.end_timestamp),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id,
+                        segment.conversation_id,
+                        owner_worker_id,
+                        lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_segment",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT OR REPLACE INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        segment.ref,
+                        segment.conversation_id,
+                        primary_tag,
+                        summary_text,
+                        full_text,
+                        json.dumps(segment.messages, default=str),
+                        metadata_json,
+                        segment.summary_tokens,
+                        segment.full_tokens,
+                        segment.compression_ratio,
+                        segment.compaction_model,
+                        _dt_to_str(segment.created_at),
+                        _dt_to_str(segment.start_timestamp),
+                        _dt_to_str(segment.end_timestamp),
+                    ),
+                )
 
-            # Update tags
+            # Update tags (same for both paths)
             conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
             for tag in segment.tags:
                 conn.execute(
@@ -1768,6 +1829,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
 
             conn.execute("COMMIT")
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
