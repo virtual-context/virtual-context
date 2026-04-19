@@ -1160,3 +1160,18 @@ class VirtualContextConfig:
     def cost_tracking(self) -> TelemetryConfig:
         """Deprecated — use ``telemetry`` directly."""
         return self.telemetry
+
+
+@dataclass(frozen=True)
+class CompactionLeaseClaim:
+    """Return value of ``claim_compaction_lease``.
+
+    Carries both the claim decision and the previous row's identity so
+    the takeover path can scope cleanup DELETEs on ``prev_operation_id``
+    without a second round-trip. ``prev_operation_id`` and
+    ``prev_owner_worker_id`` are ``None`` when no prior running row
+    existed at the caller's lifecycle_epoch.
+    """
+    claimed: bool
+    prev_operation_id: str | None
+    prev_owner_worker_id: str | None
