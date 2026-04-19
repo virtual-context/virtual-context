@@ -1093,6 +1093,10 @@ class PostgresStore(ContextStore):
             self._ensure_canonical_turn_views()
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
+        try:
+            self._ensure_compaction_scoping_columns()
+        except Exception:
+            logger.warning("compaction scoping columns bootstrap failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1147,6 +1151,36 @@ class PostgresStore(ContextStore):
             )
         except Exception:
             pass
+
+    def _ensure_compaction_scoping_columns(self) -> None:
+        """Add operation_id / compaction_operation_id columns used by the
+        compaction-resume-parity takeover path. Postgres ``ADD COLUMN IF NOT
+        EXISTS`` is idempotent. Existing rows backfill to the zero-UUID
+        sentinel per the approved spec (line 61-63, rollout line 397-401).
+        """
+        zero_uuid = "00000000-0000-0000-0000-000000000000"
+        conn = self._get_conn()
+        for table, column in (
+            ("segments", "operation_id"),
+            ("facts", "operation_id"),
+            ("tag_summaries", "operation_id"),
+            ("tag_summary_embeddings", "operation_id"),
+            ("canonical_turns", "compaction_operation_id"),
+        ):
+            try:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} UUID"
+                )
+            except Exception:
+                pass
+            try:
+                # Idempotent backfill. Matches zero rows on second run.
+                conn.execute(
+                    f"UPDATE {table} SET {column} = %s WHERE {column} IS NULL",
+                    (zero_uuid,),
+                )
+            except Exception:
+                pass
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
         conn = self._get_conn()
