@@ -132,7 +132,7 @@ def test_claim_succeeds_when_caller_already_owns_pg():
     assert s.claim_compaction_lease(
         conversation_id=cid, lifecycle_epoch=1, worker_id="w1",
         lease_ttl_s=30.0,
-    ) is True
+    ).claimed is True
 
 
 def test_claim_fails_when_other_worker_holds_fresh_lease_pg():
@@ -144,7 +144,7 @@ def test_claim_fails_when_other_worker_holds_fresh_lease_pg():
     assert s.claim_compaction_lease(
         conversation_id=cid, lifecycle_epoch=1, worker_id="w2",
         lease_ttl_s=30.0,
-    ) is False
+    ).claimed is False
 
 
 def test_claim_succeeds_when_other_worker_lease_is_stale_pg():
@@ -163,7 +163,7 @@ def test_claim_succeeds_when_other_worker_lease_is_stale_pg():
     assert s.claim_compaction_lease(
         conversation_id=cid, lifecycle_epoch=1, worker_id="w2",
         lease_ttl_s=30.0,
-    ) is True
+    ).claimed is True
     row = conn.execute(
         "SELECT owner_worker_id FROM compaction_operation WHERE conversation_id = %s",
         (cid,),
@@ -181,7 +181,7 @@ def test_claim_fails_on_different_epoch_pg():
     assert s.claim_compaction_lease(
         conversation_id=cid, lifecycle_epoch=2, worker_id="w1",
         lease_ttl_s=30.0,
-    ) is False
+    ).claimed is False
 
 
 # ----------------------------------------------------------------------

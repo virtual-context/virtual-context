@@ -69,6 +69,7 @@ class CompactionPipeline:
         telemetry: TelemetryLedger,
         save_state_callback: Callable,
         session_state_provider=None,
+        worker_id: str | None = None,
     ) -> None:
         self._compactor = compactor
         self._segmenter = segmenter
@@ -82,6 +83,11 @@ class CompactionPipeline:
         self._telemetry = telemetry
         self._save_state_callback = save_state_callback
         self._session_state_provider = session_state_provider
+        # Per-write ownership guard: the worker identity seeded at construction
+        # (or set post-construction by the caller). ProxyState writes its own
+        # self._worker_id here after construction so store_segment guards can
+        # scope every write to the live compaction_operation row.
+        self._worker_id: str | None = worker_id
 
     def _load_compactable_rows(self) -> tuple[list["CanonicalTurnRow"], list["Message"]]:
         from ..types import Message
@@ -171,6 +177,9 @@ class CompactionPipeline:
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
         turn_id: str = "",
+        operation_id: str | None = None,
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> CompactionReport | None:
         """Phase 2 of turn processing: run compaction.
 
@@ -178,7 +187,16 @@ class CompactionPipeline:
         tag_turn() completes — the next request only needs the tag index.
 
         *signal*: the CompactionSignal returned by tag_turn().
+        *operation_id*: the compaction_operation PK for the per-write ownership
+        guard.  When provided (along with ``self._worker_id``), every
+        ``store_segment`` call is scoped to the active compaction row — stale
+        writes raise ``CompactionLeaseLost`` instead of inserting silently.
+        *preexisting_operation_id*: when set by the takeover path, overrides
+        *operation_id* so all downstream guarded writes use the pre-inserted
+        row's id rather than a freshly generated one.
         """
+        if preexisting_operation_id is not None:
+            operation_id = preexisting_operation_id
         _t_compact = time.monotonic()
 
         if self._compactor is None:
@@ -220,6 +238,7 @@ class CompactionPipeline:
             compact_rows=compact_rows,
             progress_callback=progress_callback,
             generated_by_turn_id=turn_id,
+            operation_id=operation_id,
         )
 
         self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
@@ -230,12 +249,14 @@ class CompactionPipeline:
         self,
         conversation_history: list[Message],
         turn_id: str = "",
+        operation_id: str | None = None,
     ) -> CompactionReport | None:
         """Trigger manual compaction regardless of thresholds.
 
         Uses the same pipeline as on_turn_complete: respects the compaction
         watermark, protected recent turns, advances the watermark, stores
         segments, and rebuilds tag summaries for affected tags.
+        *operation_id*: see ``compact_if_needed`` for ownership-guard semantics.
         """
         if self._compactor is None:
             logger.warning("No LLM provider configured for compaction")
@@ -253,6 +274,7 @@ class CompactionPipeline:
             compact_messages,
             compact_rows=compact_rows,
             generated_by_turn_id=turn_id,
+            operation_id=operation_id,
         )
 
         self._commit_compaction_state(conversation_history)
@@ -291,6 +313,8 @@ class CompactionPipeline:
         compact_rows: list["CanonicalTurnRow"] | None = None,
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
+        operation_id: str | None = None,
+        preexisting_operation_id: str | None = None,
     ) -> CompactionReport:
         """Shared compaction core: segment, compact, store, build tag summaries.
 
@@ -298,8 +322,16 @@ class CompactionPipeline:
         ``compact_manual`` (explicit) after their respective guard checks
         have selected *compact_messages*.
 
+        *operation_id*: when provided alongside ``self._worker_id``, every
+        ``store_segment`` call carries the ownership guard kwargs so a stale
+        write raises ``CompactionLeaseLost`` before it persists.
+        *preexisting_operation_id*: takeover path override; takes precedence
+        over *operation_id* when set.
+
         Returns a CompactionReport (never None — callers handle None guards).
         """
+        if preexisting_operation_id is not None:
+            operation_id = preexisting_operation_id
         from ..types import CompactionReport
 
         compact_rows = list(compact_rows or [])
@@ -378,6 +410,7 @@ class CompactionPipeline:
             compact_rows=compact_rows,
             progress_callback=progress_callback,
             generated_by_turn_id=generated_by_turn_id,
+            operation_id=operation_id,
         )
 
         compacted_turn_ids = [
@@ -389,6 +422,13 @@ class CompactionPipeline:
             self._store.mark_canonical_turns_compacted(
                 self._config.conversation_id,
                 compacted_turn_ids,
+                operation_id=operation_id,
+                owner_worker_id=self._worker_id,
+                lifecycle_epoch=(
+                    int(self._engine_state.lifecycle_epoch)
+                    if operation_id is not None and self._worker_id is not None
+                    else None
+                ),
             )
         if compact_rows:
             self._refresh_compaction_watermark()
@@ -459,7 +499,17 @@ class CompactionPipeline:
                     )
 
                     for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(ts, conversation_id=self._config.conversation_id)
+                        self._store.save_tag_summary(
+                            ts,
+                            conversation_id=self._config.conversation_id,
+                            operation_id=operation_id,
+                            owner_worker_id=self._worker_id,
+                            lifecycle_epoch=(
+                                int(self._engine_state.lifecycle_epoch)
+                                if operation_id is not None and self._worker_id is not None
+                                else None
+                            ),
+                        )
                         # Compute and store tag summary embedding for RRF scoring
                         try:
                             embed_fn = self._semantic.get_embed_fn()
@@ -467,6 +517,13 @@ class CompactionPipeline:
                                 emb = embed_fn([ts.summary[:2000]])[0]
                                 self._store.store_tag_summary_embedding(
                                     ts.tag, self._config.conversation_id, emb,
+                                    operation_id=operation_id,
+                                    owner_worker_id=self._worker_id,
+                                    lifecycle_epoch=(
+                                        int(self._engine_state.lifecycle_epoch)
+                                        if operation_id is not None and self._worker_id is not None
+                                        else None
+                                    ),
                                 )
                         except Exception as e:
                             logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
@@ -536,6 +593,7 @@ class CompactionPipeline:
         compact_rows: list["CanonicalTurnRow"] | None = None,
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
+        operation_id: str | None = None,
     ) -> list[CompactionResult]:
         """Two-pass compact and store.
 
@@ -692,7 +750,16 @@ class CompactionPipeline:
                     start_timestamp=result.timestamp,
                     end_timestamp=result.timestamp,
                 )
-                self._store.store_segment(stored)
+                self._store.store_segment(
+                    stored,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
+                )
                 # Propagate turn → segment tool output links
                 turn_range = segment_turn_ranges.get(seg.id)
                 if turn_range:
@@ -862,7 +929,16 @@ class CompactionPipeline:
                     start_timestamp=seg.start_timestamp,
                     end_timestamp=result.timestamp,
                 )
-                self._store.update_segment(stored)
+                self._store.update_segment(
+                    stored,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
+                )
                 self._semantic.embed_and_store_chunks(stored)
                 result.segment_id = seg.merge_ref
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
@@ -889,7 +965,16 @@ class CompactionPipeline:
                     start_timestamp=result.timestamp,
                     end_timestamp=result.timestamp,
                 )
-                self._store.store_segment(stored)
+                self._store.store_segment(
+                    stored,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
+                )
                 self._semantic.embed_and_store_chunks(stored)
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
@@ -924,6 +1009,13 @@ class CompactionPipeline:
                     fact.conversation_id = self._config.conversation_id
                 _deleted, _inserted = self._store.replace_facts_for_segment(
                     self._config.conversation_id, _seg_ref, result.facts,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
                 )
                 if _deleted:
                     logger.info("  Replaced %d old facts with %d new for segment %s",
