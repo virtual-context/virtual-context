@@ -24,7 +24,7 @@ from ..core.lifecycle_epoch import LifecycleEpochMismatch
 from ..core.segmenter import pair_messages_into_turns
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
-from ..types import EngineState, Message, SplitResult, TurnTagEntry
+from ..types import CompactionLeaseLost, EngineState, Message, SplitResult, TurnTagEntry
 
 from .helpers import (
     _strip_envelope,
@@ -2045,7 +2045,11 @@ class ProxyState:
         # enter_compaction() entirely and treat phase_index 0 as the
         # baseline so advance_compaction_phase picks up from there.
         if preexisting_operation_id is not None:
+            # Takeover path: the pre-inserted row is our responsibility to
+            # close, so we are unconditionally in the lifecycle — no snapshot
+            # probe needed.
             last_advanced_phase_index = 0
+            entered_lifecycle = True
         else:
             try:
                 self.enter_compaction(
@@ -2060,14 +2064,14 @@ class ProxyState:
                     conversation_id[:12],
                     exc_info=True,
                 )
-        entered_lifecycle = False
-        try:
-            snap_after_enter = self.engine._store.read_progress_snapshot(
-                conversation_id,
-            )
-            entered_lifecycle = snap_after_enter.active_compaction is not None
-        except Exception:
             entered_lifecycle = False
+            try:
+                snap_after_enter = self.engine._store.read_progress_snapshot(
+                    conversation_id,
+                )
+                entered_lifecycle = snap_after_enter.active_compaction is not None
+            except Exception:
+                entered_lifecycle = False
 
         try:
             t0 = time.monotonic()
@@ -2187,6 +2191,32 @@ class ProxyState:
                             conversation_id[:12],
                             exc_info=True,
                         )
+
+            except CompactionLeaseLost as e:
+                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                logger.info(
+                    "COMPACTION_WRITE_REJECTED op=%s site=%s elapsed_ms=%.1f",
+                    e.operation_id, e.write_site, elapsed_ms,
+                )
+                self._update_compaction_state(
+                    operation_id=operation_id,
+                    status="cancelled",
+                    phase="cancelled",
+                    phase_name="cancelled",
+                    overall_percent=None,
+                    elapsed_ms=elapsed_ms,
+                    error=f"lease_lost:{e.write_site}",
+                    phase_detail="compaction aborted on lease loss",
+                )
+                if entered_lifecycle:
+                    try:
+                        self.exit_compaction(success=False, error_message=str(e))
+                    except Exception:
+                        logger.warning(
+                            "exit_compaction(success=False) failed after lease-lost for conv=%s",
+                            conversation_id[:12], exc_info=True,
+                        )
+                return
 
             except Exception as e:
                 elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
