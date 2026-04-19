@@ -730,7 +730,14 @@ class ContextStore(ABC):
         return []
 
     def store_tag_summary_embedding(
-        self, tag: str, conversation_id: str, embedding: list[float],
+        self,
+        tag: str,
+        conversation_id: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
         """Store embedding vector for a tag summary."""
         pass

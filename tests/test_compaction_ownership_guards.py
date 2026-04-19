@@ -321,3 +321,83 @@ def test_save_tag_summary_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Pa
             "SELECT COUNT(*) FROM tag_summaries WHERE tag='legacy-tag' AND conversation_id='c'"
         ).fetchone()[0]
     assert n == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 13: per-write ownership guard on store_tag_summary_embedding
+# ---------------------------------------------------------------------------
+
+
+def test_store_tag_summary_embedding_write_succeeds_while_running(tmp_path: Path):
+    """Embedding UPSERT with guard kwargs succeeds when the operation is still running."""
+    store = SQLiteStore(tmp_path / "emb_ok.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-emb-1", worker="w")
+
+    store.store_tag_summary_embedding(
+        "python", "c", [0.1, 0.2, 0.3],
+        operation_id="op-emb-1",
+        owner_worker_id="w",
+        lifecycle_epoch=1,
+    )
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summary_embeddings "
+            "WHERE tag='python' AND conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 1
+
+
+def test_store_tag_summary_embedding_raises_lease_lost_when_operation_abandoned(tmp_path: Path):
+    """Guard raises CompactionLeaseLost(write_site='store_tag_summary_embedding')
+    when the operation has been marked abandoned before the write.
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "emb_abandon.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-emb-2", worker="w")
+
+    # Simulate takeover: mark op as abandoned.
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-emb-2'",
+        )
+
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.store_tag_summary_embedding(
+            "python-ghost", "c", [0.9, 0.8, 0.7],
+            operation_id="op-emb-2",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.operation_id == "op-emb-2"
+    assert exc_info.value.write_site == "store_tag_summary_embedding"
+
+    # Zero rows persisted.
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summary_embeddings "
+            "WHERE tag='python-ghost'"
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_store_tag_summary_embedding_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path):
+    """Callers that omit guard kwargs use the unconditional UPSERT path.
+    Existing test harnesses and non-compaction call sites must not break.
+    """
+    store = SQLiteStore(tmp_path / "emb_legacy.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    store.store_tag_summary_embedding("legacy-tag", "c", [1.0, 2.0, 3.0])
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summary_embeddings "
+            "WHERE tag='legacy-tag' AND conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 1
