@@ -758,6 +758,7 @@ class ProxyState:
 
     def enter_compaction(
         self, *, phase_count: int, initial_phase_name: str = "init",
+        operation_id: str | None = None,
     ) -> None:
         """Transition phase from ``'active'`` to ``'compacting'`` and start
         a fresh ``compaction_operation`` row.
@@ -767,6 +768,11 @@ class ProxyState:
         epoch does not match the authoritative conversations row sees
         ``set_phase`` return False and this method exits without writing
         the operation row.
+
+        *operation_id*: when provided, the DB row is inserted with this PK
+        rather than a store-generated UUID. This ensures the row PK matches
+        the id the caller already threaded into downstream per-write
+        ownership-guard kwargs.
         """
         conv = self.engine.config.conversation_id
         self.engine.verify_epoch()
@@ -789,6 +795,7 @@ class ProxyState:
             worker_id=self._worker_id,
             phase_count=phase_count,
             phase_name=initial_phase_name,
+            operation_id=operation_id,
         )
         self._publish_compaction_progress()
         self._publish_phase_transition("active", "compacting")
@@ -2021,6 +2028,7 @@ class ProxyState:
             self.enter_compaction(
                 phase_count=len(_COMPACT_PHASE_PLAN),
                 initial_phase_name=_COMPACT_PHASE_PLAN[0],
+                operation_id=operation_id,
             )
             last_advanced_phase_index = 0
         except Exception:
