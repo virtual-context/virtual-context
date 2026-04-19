@@ -2951,6 +2951,34 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._commit_if_unlocked(conn)
         return fresh_takeover
 
+    def refresh_compaction_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        operation_id: str,
+    ) -> bool:
+        """Refresh compaction_operation.heartbeat_ts atomically, scoped on
+        (operation_id, lifecycle_epoch, owner_worker_id). Returns True iff
+        the update hit a row. Sidecar callers interpret False as "our
+        claim was stolen" and signal the compactor to abort.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """UPDATE compaction_operation
+                      SET heartbeat_ts = ?
+                    WHERE operation_id = ?
+                      AND conversation_id = ?
+                      AND lifecycle_epoch = ?
+                      AND owner_worker_id = ?
+                      AND status = 'running'""",
+                (now, operation_id, conversation_id, lifecycle_epoch, worker_id),
+            )
+            self._commit_if_unlocked(conn)
+        return (cur.rowcount or 0) > 0
+
     def advance_compaction_phase(
         self,
         *,
