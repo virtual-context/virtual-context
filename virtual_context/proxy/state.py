@@ -1566,6 +1566,8 @@ class ProxyState:
         turn: int,
         target_end: int,
         turn_id: str = "",
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> None:
         priority = str(getattr(signal, "priority", "soft") or "soft")
         with self._background_state_lock:
@@ -1577,6 +1579,7 @@ class ProxyState:
             turn,
             target_end,
             turn_id,
+            preexisting_operation_id=preexisting_operation_id,
         )
         logger.info(
             "T%d compaction submitted target_end=%d priority=%s",
@@ -1591,6 +1594,8 @@ class ProxyState:
         signal: object,
         turn: int,
         turn_id: str = "",
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> None:
         target_end = self._compaction_target_end(history)
         priority = str(getattr(signal, "priority", "soft") or "soft")
@@ -1634,7 +1639,8 @@ class ProxyState:
                     )
                 return
 
-        self._submit_compaction_request(history, signal, turn, target_end, turn_id=turn_id)
+        self._submit_compaction_request(history, signal, turn, target_end, turn_id=turn_id,
+                                        preexisting_operation_id=preexisting_operation_id)
 
     def fire_turn_complete(
         self,
@@ -1909,6 +1915,8 @@ class ProxyState:
         signal: object,
         turn: int,
         turn_id: str = "",
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request.
 
@@ -1923,7 +1931,14 @@ class ProxyState:
         ``ProxyState`` for the underlying primitives.
         """
         conversation_id = self.engine.config.conversation_id
-        operation_id = uuid.uuid4().hex[:12]
+        if preexisting_operation_id is not None:
+            # Takeover path: the caller pre-inserted the compaction_operation
+            # row (e.g. via cleanup_abandoned_compaction).  Use the supplied
+            # id; do NOT call enter_compaction() which would attempt a second
+            # INSERT and could race or duplicate.
+            operation_id = preexisting_operation_id
+        else:
+            operation_id = uuid.uuid4().hex[:12]
         compaction_started = time.monotonic()
         # Mutable closure cell for the last phase index we advanced the
         # DB-backed compaction_operation row to. Prevents redundant
@@ -2024,19 +2039,27 @@ class ProxyState:
         # Otherwise a concurrent delete+resurrect that flipped our
         # epoch mid-enter would leave us calling
         # ``drain_compaction_exit`` against a phase we never owned.
-        try:
-            self.enter_compaction(
-                phase_count=len(_COMPACT_PHASE_PLAN),
-                initial_phase_name=_COMPACT_PHASE_PLAN[0],
-                operation_id=operation_id,
-            )
+        #
+        # Takeover path: when preexisting_operation_id is set the caller
+        # has ALREADY inserted the compaction_operation row.  Skip
+        # enter_compaction() entirely and treat phase_index 0 as the
+        # baseline so advance_compaction_phase picks up from there.
+        if preexisting_operation_id is not None:
             last_advanced_phase_index = 0
-        except Exception:
-            logger.warning(
-                "enter_compaction failed for %s — continuing legacy path only",
-                conversation_id[:12],
-                exc_info=True,
-            )
+        else:
+            try:
+                self.enter_compaction(
+                    phase_count=len(_COMPACT_PHASE_PLAN),
+                    initial_phase_name=_COMPACT_PHASE_PLAN[0],
+                    operation_id=operation_id,
+                )
+                last_advanced_phase_index = 0
+            except Exception:
+                logger.warning(
+                    "enter_compaction failed for %s — continuing legacy path only",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
         entered_lifecycle = False
         try:
             snap_after_enter = self.engine._store.read_progress_snapshot(
@@ -2208,9 +2231,12 @@ class ProxyState:
         turn: int,
         target_end: int,
         turn_id: str = "",
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> None:
         try:
-            self._run_compact(history, signal, turn, turn_id=turn_id)
+            self._run_compact(history, signal, turn, turn_id=turn_id,
+                              preexisting_operation_id=preexisting_operation_id)
         finally:
             follow_up: dict[str, object] | None = None
             with self._background_state_lock:
