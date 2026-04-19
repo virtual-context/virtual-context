@@ -1022,18 +1022,139 @@ class ProxyState:
             self._publish_lifecycle_reset(old_epoch, int(new_epoch))
             # Continue past the gate with the new epoch.
         elif phase == "compacting":
-            # Widen pending-raw for UI transparency on compaction exit.
-            # Per-request last_* metadata was already updated in step 5.
-            # Episode creation is forbidden during compaction, so the flow
-            # returns after the widen.
-            self.engine.verify_epoch()  # fresh check before the write
+            self.engine.verify_epoch()
+            import uuid as _uuid
+
+            claim = self.engine._store.claim_compaction_lease(
+                conversation_id=conversation_id,
+                lifecycle_epoch=my_epoch,
+                worker_id=self._worker_id,
+                lease_ttl_s=INGESTION_LEASE_TTL_S,
+            )
+
+            if not claim.claimed:
+                # Live owner on another worker — widen and return.
+                widened = self.engine._store.widen_pending_raw_payload_entries(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    value=new_raw,
+                )
+                if not widened:
+                    return PhaseDecision(phase=phase, started_tagger=False)
+                return PhaseDecision(phase="compacting", started_tagger=False)
+
+            # claim.claimed=True
+            if self._active_compaction_op == claim.prev_operation_id:
+                # We already own it — heartbeat refreshed. Widen and return.
+                widened = self.engine._store.widen_pending_raw_payload_entries(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    value=new_raw,
+                )
+                if not widened:
+                    return PhaseDecision(phase=phase, started_tagger=False)
+                return PhaseDecision(phase="compacting", started_tagger=False)
+
+            # Takeover path.
+            dead_op = claim.prev_operation_id
+            new_op = _uuid.uuid4().hex
+            phase_count = len(_COMPACT_PHASE_PLAN)  # 7
+            fresh_takeover = self.engine._store.cleanup_abandoned_compaction(
+                conversation_id=conversation_id,
+                dead_operation_id=dead_op,
+                new_operation_id=new_op,
+                lifecycle_epoch=my_epoch,
+                worker_id=self._worker_id,
+                phase_count=phase_count,
+            )
+
+            if not fresh_takeover:
+                # Cleanup's dead-op UPDATE matched zero rows → the dead_op was
+                # already marked abandoned/completed by the time we ran. A peer
+                # worker's earlier cleanup beat us to it, OR this call is an
+                # idempotent retry after our own partial-progress attempt. In
+                # either case, our ``new_op`` row was NEVER inserted (the
+                # cleanup helper gates the INSERT on fresh_takeover=True to
+                # preserve the one-active invariant), so submitting compaction
+                # with preexisting_operation_id=new_op would reference a row
+                # that doesn't exist — the heartbeat sidecar would fail every
+                # refresh and every per-write guard would raise
+                # CompactionLeaseLost on the first write.
+                #
+                # Correct behaviour: widen-and-return so the current POST
+                # passes through; the actual current running op (either a
+                # peer's new_op or none) will be seen on the next POST via the
+                # normal predicate. Do NOT submit compaction.
+                logger.info(
+                    "COMPACTION_TAKEOVER_SKIP_NO_FRESH conv=%s dead_op=%s "
+                    "worker=%s reason=dead_op_already_handled",
+                    conversation_id[:12], dead_op, self._worker_id,
+                )
+                widened = self.engine._store.widen_pending_raw_payload_entries(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=my_epoch,
+                    value=new_raw,
+                )
+                if not widened:
+                    return PhaseDecision(phase=phase, started_tagger=False)
+                return PhaseDecision(phase="compacting", started_tagger=False)
+
+            logger.info(
+                "COMPACTION_TAKEOVER conv=%s dead_op=%s new_op=%s worker=%s",
+                conversation_id[:12], dead_op, new_op, self._worker_id,
+            )
+
+            # Spawn fresh compaction with preexisting_operation_id.
+            #
+            # CRITICAL: use the full restored ``self.conversation_history``
+            # when available, not just the current POST body's messages. The
+            # compaction pipeline persists whatever history it was given via
+            # ``_commit_compaction_state(conversation_history)``
+            # (compaction_pipeline.py:_run_compaction → _commit_compaction_state).
+            # Seeding compaction from ``_extract_ingestible_messages(body)``
+            # alone would persist a truncated snapshot whenever the takeover
+            # POST's body is narrower than the full conversation — the exact
+            # shape a "hey just ping" follow-up takes during an active
+            # compaction. Mirror the pattern in ``_compact_after_ingestion``
+            # (state.py:2228) which reads ``self.conversation_history`` first
+            # and only falls back to the passed-in history when the engine's
+            # in-memory history hasn't been hydrated yet.
+            compact_history = (
+                self.conversation_history
+                if self.conversation_history
+                else self._completed_history_messages(
+                    _extract_ingestible_messages(body),
+                )
+            )
+            from ..types import CompactionSignal
+            signal = CompactionSignal(
+                priority="takeover", current_tokens=0, budget_tokens=0,
+                overflow_tokens=0,
+            )
+            target_end = len(compact_history)
+            try:
+                self._submit_compaction_request(
+                    compact_history, signal, turn=0, target_end=target_end,
+                    turn_id="",
+                    preexisting_operation_id=new_op,
+                )
+            except Exception:
+                # _submit_compaction_request's except already cleared
+                # self._active_compaction_op; re-raise for observability.
+                logger.exception(
+                    "COMPACTION_TAKEOVER_SUBMIT_FAILED conv=%s new_op=%s",
+                    conversation_id[:12], new_op,
+                )
+                # Do NOT re-raise — we still want to widen + return so the
+                # current POST can passthrough. Next POST will reclaim the
+                # empty new_op row as stale.
+
             widened = self.engine._store.widen_pending_raw_payload_entries(
                 conversation_id=conversation_id,
                 lifecycle_epoch=my_epoch,
                 value=new_raw,
             )
             if not widened:
-                # Lifecycle bumped between verify and UPDATE. Return early.
                 return PhaseDecision(phase=phase, started_tagger=False)
             return PhaseDecision(phase="compacting", started_tagger=False)
 
