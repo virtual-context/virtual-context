@@ -2216,9 +2216,14 @@ class PostgresStore(ContextStore):
         worker_id: str,
         phase_count: int,
         phase_name: str,
+        operation_id: str | None = None,
     ) -> str:
         """Insert a fresh ``compaction_operation`` row in ``'queued'``
         status. Returns the new ``operation_id`` (UUID string).
+
+        If *operation_id* is provided the caller's value is used verbatim
+        (no auto-generation). This is required so that the row PK matches
+        the id already threaded into per-write guard kwargs by the caller.
 
         Raises ``psycopg.errors.UniqueViolation`` (via the partial
         unique index on status IN ('queued','running')) if another
@@ -2226,7 +2231,7 @@ class PostgresStore(ContextStore):
         The caller is expected to retry or wait.
         """
         import uuid
-        op_id = uuid.uuid4()
+        op_id = operation_id if operation_id is not None else uuid.uuid4()
         now = datetime.now(timezone.utc)
         conn = self._get_conn()
         conn.execute(
@@ -4570,22 +4575,120 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
+        """Atomically replace all facts for a segment.
+
+        DELETE and INSERT run in a single transaction so a mid-operation
+        ``CompactionLeaseLost`` rolls back the DELETE rather than leaving
+        pre-existing facts permanently gone.
+
+        When guard kwargs are all provided, the ownership guard is probed
+        via a ``SELECT 1 … WHERE status='running'`` *before* the DELETE.
+        A stale worker therefore never deletes facts it has no authority
+        to touch.
+
+        When called without guard kwargs (legacy / non-compaction path),
+        behaviour is unchanged: unconditional DELETE + INSERT.
+        """
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
-        # Delete existing facts for the segment first.
         with conn.transaction():
+            if guard_all:
+                # Probe ownership BEFORE the DELETE.
+                row = conn.execute(
+                    """SELECT 1 FROM compaction_operation
+                       WHERE operation_id = %s
+                         AND conversation_id = %s
+                         AND status = 'running'
+                         AND owner_worker_id = %s
+                         AND lifecycle_epoch = %s""",
+                    (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
+                ).fetchone()
+                if row is None:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="replace_facts_for_segment",
+                    )
+
             result = conn.execute(
                 "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
                 (conversation_id, segment_ref),
             )
             deleted = result.rowcount
-        # Delegate insertion to store_facts (which handles the ownership guard).
-        inserted = self.store_facts(
-            facts,
-            operation_id=operation_id,
-            owner_worker_id=owner_worker_id,
-            lifecycle_epoch=lifecycle_epoch,
-        ) if facts else 0
-        return deleted, inserted
+
+            # INSERT new facts inline within the same transaction.
+            count = 0
+            for fact in facts:
+                if guard_all:
+                    cur = conn.execute(
+                        """INSERT INTO facts
+                        (id, subject, verb, object, status, what, who, when_date, "where", why,
+                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                         mentioned_at, session_date, superseded_by)
+                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (id) DO UPDATE SET
+                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id, fact.conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="replace_facts_for_segment",
+                        )
+                else:
+                    conn.execute(
+                        """INSERT INTO facts
+                        (id, subject, verb, object, status, what, who, when_date, "where", why,
+                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                         mentioned_at, session_date, superseded_by)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                        (fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                         fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                         fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                         fact.conversation_id, json.dumps(fact.turn_numbers),
+                         _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                    )
+                conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
+                for tag in fact.tags:
+                    conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
+                count += 1
+
+        return deleted, count
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         conn = self._get_conn()

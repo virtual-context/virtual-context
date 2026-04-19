@@ -2841,9 +2841,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
         worker_id: str,
         phase_count: int,
         phase_name: str,
+        operation_id: str | None = None,
     ) -> str:
         """Insert a fresh ``compaction_operation`` row in ``'queued'``
         status. Returns the new ``operation_id`` (UUID string).
+
+        If *operation_id* is provided the caller's value is used verbatim
+        (no auto-generation). This is required so that the row PK matches
+        the id already threaded into per-write guard kwargs by the caller.
 
         Raises ``sqlite3.IntegrityError`` (via the partial unique index
         on status IN ('queued','running')) if another active operation
@@ -2851,7 +2856,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         expected to retry or wait.
         """
         import uuid
-        op_id = str(uuid.uuid4())
+        op_id = operation_id if operation_id is not None else str(uuid.uuid4())
         now = utcnow_iso()
         with self._get_conn() as conn:
             conn.execute(
@@ -4832,10 +4837,51 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
+        """Atomically replace all facts for a segment.
+
+        DELETE and INSERT are executed in a single ``BEGIN IMMEDIATE``
+        transaction so a mid-operation ``CompactionLeaseLost`` rolls back
+        the DELETE rather than leaving pre-existing facts permanently gone.
+
+        When guard kwargs are all provided, the ownership guard is probed
+        via a ``SELECT 1 … WHERE status='running'`` *before* the DELETE.
+        This means a stale worker never deletes facts it has no authority
+        to touch.
+
+        When called without guard kwargs (legacy / non-compaction path),
+        behaviour is unchanged: unconditional DELETE + INSERT.
+        """
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Delete fact_tags first (before facts are removed)
+            if guard_all:
+                # Probe ownership BEFORE the DELETE so we never commit a
+                # DELETE without a matching INSERT.
+                row = conn.execute(
+                    """SELECT 1 FROM compaction_operation
+                       WHERE operation_id = ?
+                         AND conversation_id = ?
+                         AND status = 'running'
+                         AND owner_worker_id = ?
+                         AND lifecycle_epoch = ?""",
+                    (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="replace_facts_for_segment",
+                    )
+
+            # DELETE existing facts (and their tag links) for this segment.
             conn.execute(
                 "DELETE FROM fact_tags WHERE fact_id IN "
                 "(SELECT id FROM facts WHERE conversation_id = ? AND segment_ref = ?)",
@@ -4846,20 +4892,75 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (conversation_id, segment_ref),
             )
             deleted = cursor.rowcount
+
+            # INSERT new facts inline (same transaction — rolls back the
+            # DELETE if the guard fires on any INSERT).
+            count = 0
+            for fact in facts:
+                if guard_all:
+                    cur = conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                          FROM compaction_operation
+                         WHERE operation_id = ?
+                           AND conversation_id = ?
+                           AND status = 'running'
+                           AND owner_worker_id = ?
+                           AND lifecycle_epoch = ?""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date or "",
+                            fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id, fact.conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        conn.execute("ROLLBACK")
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="replace_facts_for_segment",
+                        )
+                else:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date or "",
+                            fact.superseded_by,
+                        ),
+                    )
+                # fact_tags junction (same for both paths)
+                conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
+                for tag in fact.tags:
+                    conn.execute(
+                        "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
+                        (fact.id, tag),
+                    )
+                count += 1
+
             conn.execute("COMMIT")
+            return deleted, count
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
-
-        # Delegate to store_facts (which handles the ownership guard and
-        # transaction internally).
-        inserted = self.store_facts(
-            facts,
-            operation_id=operation_id,
-            owner_worker_id=owner_worker_id,
-            lifecycle_epoch=lifecycle_epoch,
-        ) if facts else 0
-        return deleted, inserted
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact subject, verb, object, what fields.

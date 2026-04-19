@@ -552,3 +552,191 @@ def test_mark_canonical_turns_compacted_legacy_path_no_guard_kwargs_still_marks(
         ).fetchall()
     for row in rows:
         assert row[1] is not None, f"{row[0]}: legacy path should set compacted_at"
+
+
+# ---------------------------------------------------------------------------
+# P1 #1 regression: start_compaction_operation uses caller-supplied id
+# ---------------------------------------------------------------------------
+
+def test_start_compaction_operation_uses_caller_supplied_operation_id(tmp_path: Path):
+    """The DB row PK must equal the id supplied by the caller.
+
+    Before the fix, start_compaction_operation always generated its own UUID,
+    causing the per-write guard kwargs threaded by _run_compact to match zero
+    rows and raising CompactionLeaseLost on every normal compaction.
+    """
+    store = SQLiteStore(tmp_path / "caller_id.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    caller_id = "my-fixed-op-id-123"
+    returned_id = store.start_compaction_operation(
+        conversation_id="c",
+        lifecycle_epoch=1,
+        worker_id="w",
+        phase_count=7,
+        phase_name="init",
+        operation_id=caller_id,
+    )
+
+    # The return value must equal the caller's id.
+    assert returned_id == caller_id, (
+        f"expected returned_id={caller_id!r}, got {returned_id!r}"
+    )
+
+    # The DB row must be keyed by the caller's id.
+    with store._get_conn() as conn:
+        row = conn.execute(
+            "SELECT operation_id FROM compaction_operation WHERE operation_id = ?",
+            (caller_id,),
+        ).fetchone()
+    assert row is not None, "DB row not found for caller-supplied operation_id"
+    assert row[0] == caller_id
+
+
+def test_start_compaction_operation_auto_generates_id_when_none_supplied(tmp_path: Path):
+    """Legacy path: when operation_id is not supplied, a UUID is auto-generated."""
+    store = SQLiteStore(tmp_path / "auto_id.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    returned_id = store.start_compaction_operation(
+        conversation_id="c",
+        lifecycle_epoch=1,
+        worker_id="w",
+        phase_count=7,
+        phase_name="init",
+    )
+
+    assert returned_id is not None
+    assert len(returned_id) > 0
+    with store._get_conn() as conn:
+        row = conn.execute(
+            "SELECT operation_id FROM compaction_operation WHERE operation_id = ?",
+            (returned_id,),
+        ).fetchone()
+    assert row is not None, "DB row not found for auto-generated operation_id"
+
+
+# ---------------------------------------------------------------------------
+# P1 #2 regression: replace_facts_for_segment atomicity
+# ---------------------------------------------------------------------------
+
+def test_replace_facts_for_segment_does_not_lose_preexisting_facts_on_lease_lost(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: DELETE of pre-existing facts must roll back when
+    the guarded INSERT raises CompactionLeaseLost. Otherwise a stale
+    worker wipes facts it had no authority to modify.
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "replace_race.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    # Seed pre-existing facts attributed to segment_ref=seg-1 via the
+    # legacy (unguarded) path so they exist regardless of operation state.
+    pre_fact = _fact("pre-f1", conv="c")
+    pre_fact.segment_ref = "seg-1"
+    store.store_facts([pre_fact])
+
+    # Verify pre-existing facts are present.
+    with store._get_conn() as conn:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE conversation_id='c' AND segment_ref='seg-1'"
+        ).fetchone()[0]
+    assert before == 1, f"expected 1 pre-existing fact; got {before}"
+
+    # Seed a running compaction_operation and immediately abandon it to
+    # simulate a stale worker holding the id after a takeover.
+    _seed_running(store, "c", "op-race-1", worker="w")
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-race-1'",
+        )
+
+    new_fact = _fact("new-f1", conv="c")
+    new_fact.segment_ref = "seg-1"
+
+    # Call must raise CompactionLeaseLost.
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.replace_facts_for_segment(
+            "c", "seg-1", [new_fact],
+            operation_id="op-race-1",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.write_site == "replace_facts_for_segment"
+
+    # Pre-existing facts must still be present (DELETE was rolled back).
+    with store._get_conn() as conn:
+        after = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE conversation_id='c' AND segment_ref='seg-1'"
+        ).fetchone()[0]
+    assert after == 1, (
+        f"Pre-existing facts were deleted despite CompactionLeaseLost — "
+        f"expected 1 row, got {after}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# update_segment ownership guard
+# ---------------------------------------------------------------------------
+
+def test_update_segment_succeeds_while_operation_running(tmp_path: Path) -> None:
+    """update_segment with guard kwargs succeeds when the operation is running."""
+    store = SQLiteStore(tmp_path / "update_seg_ok.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-us-1", worker="w")
+
+    # First store the segment so it exists.
+    store.store_segment(_segment("c", "seg-upd-1"))
+
+    # Now update it with guard kwargs — must succeed.
+    updated = _segment("c", "seg-upd-1")
+    updated.summary = "updated summary"
+    store.update_segment(
+        updated,
+        operation_id="op-us-1",
+        owner_worker_id="w",
+        lifecycle_epoch=1,
+    )
+
+    with store._get_conn() as conn:
+        row = conn.execute(
+            "SELECT summary FROM segments WHERE ref='seg-upd-1'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "updated summary"
+
+
+def test_update_segment_raises_lease_lost_when_operation_abandoned(tmp_path: Path) -> None:
+    """update_segment with guard kwargs raises CompactionLeaseLost when the
+    operation has been abandoned — write_site must be 'update_segment'.
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "update_seg_abandon.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-us-2", worker="w")
+
+    # Store the segment first (legacy path, no guard).
+    store.store_segment(_segment("c", "seg-upd-2"))
+
+    # Abandon the operation.
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-us-2'",
+        )
+
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.update_segment(
+            _segment("c", "seg-upd-2"),
+            operation_id="op-us-2",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.operation_id == "op-us-2"
+    assert exc_info.value.write_site == "update_segment"
