@@ -2089,6 +2089,25 @@ class ProxyState:
             except Exception:
                 entered_lifecycle = False
 
+        # Spawn the heartbeat sidecar.  It refreshes the compaction_operation
+        # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor
+        # thread runs.  On a failed refresh (epoch mismatch, wrong owner, or
+        # status != 'running') it sets _compaction_cancelled so the progress
+        # callback raises InterruptedError and the compactor aborts cleanly.
+        # The sidecar is stopped (via _compaction_heartbeat_stop) in the
+        # finally block below — regardless of success, exception, or
+        # CompactionLeaseLost.
+        epoch_for_sidecar = int(self.engine._engine_state.lifecycle_epoch)
+        _compaction_heartbeat_stop = threading.Event()
+        _heartbeat_sidecar_thread = threading.Thread(
+            target=self._run_compaction_heartbeat_sidecar,
+            args=(conversation_id, epoch_for_sidecar, operation_id,
+                  _compaction_heartbeat_stop),
+            daemon=True,
+            name="vc-compact-heartbeat",
+        )
+        _heartbeat_sidecar_thread.start()
+
         try:
             t0 = time.monotonic()
             self._update_compaction_state(
@@ -2268,6 +2287,10 @@ class ProxyState:
                             exc_info=True,
                         )
         finally:
+            # Signal and join the heartbeat sidecar before releasing the lock
+            # so it cannot fire a spurious cancel after the operation is done.
+            _compaction_heartbeat_stop.set()
+            _heartbeat_sidecar_thread.join(timeout=5)
             self._compaction_lock.release()
 
     def _run_compact_wrapper(
@@ -3147,6 +3170,54 @@ class ProxyState:
                     conversation_id[:12], self._worker_id,
                 )
                 self._ingestion_cancel.set()
+                return
+
+    def _run_compaction_heartbeat_sidecar(
+        self,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        operation_id: str,
+        stop_event: threading.Event,
+    ) -> None:
+        """Refresh compaction_operation.heartbeat_ts every TTL/2 while the
+        compactor thread is alive. On failed refresh (operation_id /
+        lifecycle_epoch / owner mismatch, status != 'running'), set the
+        compaction cancel event so the compactor aborts cleanly.
+
+        Exits when:
+          * ``stop_event`` becomes set (cooperative stop, set in
+            ``_run_compact``'s finally block when the compactor exits),
+          * ``refresh_compaction_heartbeat`` returns False (lease stolen or
+            stale epoch) — in which case we also set ``_compaction_cancelled``
+            to signal the compactor to abort via the progress-callback path.
+
+        Uses ``threading.Event.wait(timeout=interval)`` rather than
+        ``time.sleep`` so the stop signal interrupts the wait promptly.
+        """
+        interval = INGESTION_LEASE_TTL_S / 2
+        while not stop_event.wait(timeout=interval):
+            try:
+                ok = self.engine._store.refresh_compaction_heartbeat(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    worker_id=self._worker_id,
+                    operation_id=operation_id,
+                )
+            except Exception:
+                logger.warning(
+                    "compaction heartbeat sidecar: refresh raised for conv=%s "
+                    "op=%s; retrying next tick",
+                    conversation_id[:12], operation_id[:8],
+                    exc_info=True,
+                )
+                continue
+            if not ok:
+                logger.info(
+                    "compaction heartbeat sidecar: refresh rejected for conv=%s "
+                    "op=%s (lease lost or epoch bumped) — signalling cancel",
+                    conversation_id[:12], operation_id[:8],
+                )
+                self._compaction_cancelled.set()
                 return
 
     def _run_ingestion_with_catchup(
