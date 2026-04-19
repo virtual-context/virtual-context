@@ -2315,6 +2315,31 @@ class PostgresStore(ContextStore):
                 )
         return fresh_takeover
 
+    def refresh_compaction_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        operation_id: str,
+    ) -> bool:
+        from datetime import datetime, timezone
+        conn = self._get_conn()
+        cur = conn.execute(
+            """UPDATE compaction_operation
+                  SET heartbeat_ts = %s
+                WHERE operation_id = %s
+                  AND conversation_id = %s
+                  AND lifecycle_epoch = %s
+                  AND owner_worker_id = %s
+                  AND status = 'running'""",
+            (
+                datetime.now(timezone.utc),
+                operation_id, conversation_id, lifecycle_epoch, worker_id,
+            ),
+        )
+        return (cur.rowcount or 0) > 0
+
     def advance_compaction_phase(
         self,
         *,
