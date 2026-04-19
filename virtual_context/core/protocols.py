@@ -157,7 +157,14 @@ class SegmentStore(Protocol):
 class FactStore(Protocol):
     """Fact CRUD, querying, and supersession."""
 
-    def store_facts(self, facts: list[Fact]) -> int: ...
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int: ...
     def query_facts(
         self, *, subject: str | None = None, verb: str | None = None,
         verbs: list[str] | None = None, object_contains: str | None = None,
@@ -167,7 +174,16 @@ class FactStore(Protocol):
     ) -> list[Fact]: ...
     def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]: ...
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]: ...
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]: ...
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]: ...
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]: ...
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None: ...
     def update_fact_fields(self, fact_id: str, verb: str, object: str, status: str, what: str) -> None: ...

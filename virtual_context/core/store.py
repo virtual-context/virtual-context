@@ -767,7 +767,14 @@ class ContextStore(ABC):
     # D1: Fact Extraction
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         return 0
 
     def query_facts(
@@ -791,9 +798,23 @@ class ContextStore(ABC):
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return []
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
         """Atomically replace all facts for a segment. Returns (deleted, inserted)."""
-        return 0, self.store_facts(facts)
+        return 0, self.store_facts(
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact fields. Returns non-superseded facts."""

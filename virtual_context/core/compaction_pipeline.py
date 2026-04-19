@@ -964,6 +964,13 @@ class CompactionPipeline:
                     fact.conversation_id = self._config.conversation_id
                 _deleted, _inserted = self._store.replace_facts_for_segment(
                     self._config.conversation_id, _seg_ref, result.facts,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
                 )
                 if _deleted:
                     logger.info("  Replaced %d old facts with %d new for segment %s",
