@@ -713,3 +713,70 @@ def test_takeover_on_same_proxystate_resets_compaction_cancelled(tmp_path):
         "_run_compact must clear _compaction_cancelled at start so a "
         "stale sidecar-set flag doesn't immediately kill a retry compaction"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test P1: normal-path compaction must not be misclassified as dead
+# ---------------------------------------------------------------------------
+
+def test_same_worker_live_compaction_not_misclassified_as_dead(tmp_path):
+    """Regression: during a healthy compaction, a second POST on the
+    same worker must NOT classify our own running op as abandoned.
+
+    Reproduces the P1 bug where _run_compact's normal path generated
+    operation_id locally but never set _active_compaction_op, leaving
+    the takeover predicate to treat our live op as dead.
+    """
+    from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
+    from unittest.mock import MagicMock
+    from virtual_context.core.canonical_turns import utcnow_iso
+
+    state = _make_proxy_state(tmp_path)
+    conv = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+
+    # Seed a healthy running compaction by directly setting _active_compaction_op
+    # and inserting the DB row — simulating _run_compact's normal-path init
+    # (the fix ensures _active_compaction_op is set before enter_compaction).
+    operation_id = "live-op-xyz"
+    state._active_compaction_op = operation_id  # what the fix ensures
+    inner.set_phase(conversation_id=conv, lifecycle_epoch=1, phase="compacting")
+    now = utcnow_iso()
+    with inner._get_conn() as c:
+        c.execute(
+            """INSERT INTO compaction_operation
+               (operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, heartbeat_ts, owner_worker_id, created_at)
+               VALUES (?, ?, 1, 0, 7, 'starting', 'running', ?, ?, ?, ?)""",
+            (operation_id, conv, now, now, state._worker_id, now),
+        )
+
+    # Second POST — _active_compaction_op already set; takeover must NOT fire.
+    cleanup_mock = MagicMock()
+    state.engine._store.cleanup_abandoned_compaction = cleanup_mock
+    submit_mock = MagicMock()
+    state._submit_compaction_request = submit_mock  # type: ignore[assignment]
+
+    decision = state.handle_prepare_payload(
+        body={"messages": [{"role": "user", "content": "hi"}]},
+        payload_accounting={"raw_payload_entry_count": 1,
+                            "ingestible_entry_count": 1},
+    )
+
+    assert decision.phase == "compacting"
+    assert cleanup_mock.call_count == 0, (
+        "Takeover's cleanup must NOT fire against our own live compaction"
+    )
+    assert submit_mock.call_count == 0, (
+        "No fresh compaction should spawn — we already own a live one"
+    )
+    # And the live compaction_operation row is untouched.
+    with inner._get_conn() as c:
+        status = c.execute(
+            "SELECT status FROM compaction_operation WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()[0]
+    assert status == "running", (
+        f"Live op must remain 'running'; got {status!r}"
+    )
