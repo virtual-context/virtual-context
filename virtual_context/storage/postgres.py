@@ -1090,13 +1090,11 @@ class PostgresStore(ContextStore):
         try:
             self._ensure_canonical_turn_schema()
             self._ensure_tag_summary_schema()
+            # Compaction scoping columns first so the view's ct.* picks them up.
+            self._ensure_compaction_scoping_columns()
             self._ensure_canonical_turn_views()
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
-        try:
-            self._ensure_compaction_scoping_columns()
-        except Exception:
-            logger.warning("compaction scoping columns bootstrap failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1104,8 +1102,13 @@ class PostgresStore(ContextStore):
 
     def _ensure_canonical_turn_views(self) -> None:
         conn = self._get_conn()
+        # DROP + CREATE instead of CREATE OR REPLACE VIEW: the view selects
+        # ``ct.*`` from canonical_turns, so whenever the underlying table
+        # gains a column the implicit column order changes. Postgres rejects
+        # that as a column-rename under CREATE OR REPLACE VIEW.
+        conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
         conn.execute(
-            """CREATE OR REPLACE VIEW canonical_turns_ordinal AS
+            """CREATE VIEW canonical_turns_ordinal AS
                SELECT
                    ct.*,
                    ROW_NUMBER() OVER (
