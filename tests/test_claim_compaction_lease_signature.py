@@ -43,3 +43,21 @@ def test_compaction_lease_claim_accepts_none_for_prev_fields():
     assert claim.claimed is False
     assert claim.prev_operation_id is None
     assert claim.prev_owner_worker_id is None
+
+
+def test_compaction_lease_lost_is_a_distinct_exception():
+    """Per-write guards raise this when the guarded INSERT/UPDATE
+    matches zero rows (operation marked abandoned). The compactor
+    pipeline catches it specifically to log COMPACTION_WRITE_REJECTED
+    and exit cleanly without walking the remaining phases.
+    """
+    from virtual_context.types import CompactionLeaseLost
+    exc = CompactionLeaseLost("op-xyz", write_site="store_segment")
+    # It must carry the abandoned op_id and the write site so the
+    # observability log line can reproduce the spec's format:
+    # COMPACTION_WRITE_REJECTED op=... site=...
+    assert exc.operation_id == "op-xyz"
+    assert exc.write_site == "store_segment"
+    assert isinstance(exc, Exception)
+    # Distinct from generic Exception so callers can catch it narrowly.
+    assert type(exc).__name__ == "CompactionLeaseLost"
