@@ -2766,20 +2766,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
         lifecycle_epoch: int,
         worker_id: str,
         lease_ttl_s: float,
-    ) -> bool:
+    ) -> "CompactionLeaseClaim":
         """Claim the compaction lease for this (conversation, epoch).
 
-        Works on queued OR running operations. Returns True iff:
-          - Caller already owns the row, OR
-          - Current heartbeat is stale (older than ``lease_ttl_s``).
-        Returns False if another worker holds a fresh lease or no active
-        row exists at the given ``lifecycle_epoch``.
+        Returns ``CompactionLeaseClaim`` carrying both the claim decision
+        AND the previous row's identity, so the takeover path can scope
+        cleanup on ``prev_operation_id`` without a second round-trip.
+
+        Atomic flow inside a single transaction:
+
+        1. Read the current `(operation_id, owner_worker_id, heartbeat_ts)`
+           of the unique queued/running row at this epoch.
+        2. If the caller already owns it OR heartbeat is older than TTL,
+           UPDATE to set owner=caller, heartbeat=NOW().
+        3. Return claim reflecting pre-update ``prev_operation_id`` /
+           ``prev_owner_worker_id`` and whether the UPDATE hit a row.
         """
+        from ..types import CompactionLeaseClaim
+        import datetime as _dt
+
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=lease_ttl_s)
         ).isoformat()
         now = utcnow_iso()
         with self._get_conn() as conn:
+            pre = conn.execute(
+                """
+                SELECT operation_id, owner_worker_id, heartbeat_ts
+                  FROM compaction_operation
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                (conversation_id, lifecycle_epoch),
+            ).fetchone()
+            prev_op = pre["operation_id"] if pre else None
+            prev_owner = pre["owner_worker_id"] if pre else None
+
             cur = conn.execute(
                 """
                 UPDATE compaction_operation
@@ -2793,7 +2817,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     worker_id, cutoff,
                 ),
             )
-            return cur.rowcount == 1
+            claimed = (cur.rowcount or 0) > 0
+            self._commit_if_unlocked(conn)
+
+        return CompactionLeaseClaim(
+            claimed=claimed,
+            prev_operation_id=prev_op,
+            prev_owner_worker_id=prev_owner,
+        )
 
     def advance_compaction_phase(
         self,
