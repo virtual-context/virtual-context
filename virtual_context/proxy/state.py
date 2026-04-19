@@ -2076,6 +2076,19 @@ class ProxyState:
             operation_id = preexisting_operation_id
         else:
             operation_id = uuid.uuid4().hex[:12]
+
+        # P1 fix: set BEFORE enter_compaction so same-worker concurrent POSTs
+        # see this as "our running compaction" via the takeover predicate
+        # ``self._active_compaction_op == claim.prev_operation_id``.
+        # Without this, the normal-path (no preexisting_operation_id) left
+        # _active_compaction_op=None and the takeover logic would classify our
+        # own live op as abandoned, calling cleanup_abandoned_compaction against
+        # it and raising CompactionLeaseLost. Covers:
+        #   - takeover path (wrapper calls _run_compact with preexisting_id)
+        #   - normal async path (wrapper calls _run_compact, generates locally)
+        #   - synchronous direct path (_compact_after_ingestion → _run_compact)
+        self._active_compaction_op = operation_id
+
         compaction_started = time.monotonic()
         # Mutable closure cell for the last phase index we advanced the
         # DB-backed compaction_operation row to. Prevents redundant
@@ -2433,6 +2446,12 @@ class ProxyState:
             # try was entered (code-review P1 C1 fix).
             if acquired:
                 self._compaction_lock.release()
+            # Clear _active_compaction_op regardless of success/failure so no
+            # stale op_id leaks to the next compaction on this ProxyState.
+            # Covers the synchronous direct path (_compact_after_ingestion →
+            # _run_compact without _run_compact_wrapper). The wrapper's own
+            # finally also clears it for the async path — double-clear is safe.
+            self._active_compaction_op = None
 
     def _run_compact_wrapper(
         self,
