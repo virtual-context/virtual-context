@@ -4453,42 +4453,112 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # D1: Fact Extraction
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         if not facts:
             return 0
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             count = 0
             for fact in facts:
-                conn.execute(
-                    """INSERT OR REPLACE INTO facts
-                    (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                     turn_numbers_json, mentioned_at, session_date, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        fact.id,
-                        fact.subject,
-                        fact.verb,
-                        fact.object,
-                        fact.status,
-                        fact.what,
-                        fact.who,
-                        fact.when_date,
-                        fact.where,
-                        fact.why,
-                        fact.fact_type,
-                        json.dumps(fact.tags),
-                        fact.segment_ref,
-                        fact.conversation_id,
-                        json.dumps(fact.turn_numbers),
-                        _dt_to_str(fact.mentioned_at),
-                        fact.session_date or "",
-                        fact.superseded_by,
-                    ),
-                )
-                # Update fact_tags junction
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the
+                    # compaction_operation row no longer matches
+                    # (status != 'running', owner mismatch, epoch mismatch).
+                    # The same transaction holds the write lock for the entire
+                    # batch, so a concurrent takeover cannot interleave between
+                    # rows. However, a takeover that completes *before* the
+                    # first INSERT fires (at-rest stale) is caught here.
+                    cur = conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                          FROM compaction_operation
+                         WHERE operation_id = ?
+                           AND conversation_id = ?
+                           AND status = 'running'
+                           AND owner_worker_id = ?
+                           AND lifecycle_epoch = ?""",
+                        (
+                            fact.id,
+                            fact.subject,
+                            fact.verb,
+                            fact.object,
+                            fact.status,
+                            fact.what,
+                            fact.who,
+                            fact.when_date,
+                            fact.where,
+                            fact.why,
+                            fact.fact_type,
+                            json.dumps(fact.tags),
+                            fact.segment_ref,
+                            fact.conversation_id,
+                            json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at),
+                            fact.session_date or "",
+                            fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id,
+                            fact.conversation_id,
+                            owner_worker_id,
+                            lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        conn.execute("ROLLBACK")
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="store_facts",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and
+                    # non-compaction write sites.
+                    conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fact.id,
+                            fact.subject,
+                            fact.verb,
+                            fact.object,
+                            fact.status,
+                            fact.what,
+                            fact.who,
+                            fact.when_date,
+                            fact.where,
+                            fact.why,
+                            fact.fact_type,
+                            json.dumps(fact.tags),
+                            fact.segment_ref,
+                            fact.conversation_id,
+                            json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at),
+                            fact.session_date or "",
+                            fact.superseded_by,
+                        ),
+                    )
+                # Update fact_tags junction (same for both paths)
                 conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
                 for tag in fact.tags:
                     conn.execute(
@@ -4498,6 +4568,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 count += 1
             conn.execute("COMMIT")
             return count
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -4604,7 +4677,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -4619,49 +4701,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (conversation_id, segment_ref),
             )
             deleted = cursor.rowcount
-            # Insert new facts using same logic as store_facts
-            inserted = 0
-            for fact in facts:
-                conn.execute(
-                    """INSERT OR REPLACE INTO facts
-                    (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                     turn_numbers_json, mentioned_at, session_date, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        fact.id,
-                        fact.subject,
-                        fact.verb,
-                        fact.object,
-                        fact.status,
-                        fact.what,
-                        fact.who,
-                        fact.when_date,
-                        fact.where,
-                        fact.why,
-                        fact.fact_type,
-                        json.dumps(fact.tags),
-                        fact.segment_ref,
-                        fact.conversation_id,
-                        json.dumps(fact.turn_numbers),
-                        _dt_to_str(fact.mentioned_at),
-                        fact.session_date or "",
-                        fact.superseded_by,
-                    ),
-                )
-                # Update fact_tags junction
-                conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
-                for tag in fact.tags:
-                    conn.execute(
-                        "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
-                        (fact.id, tag),
-                    )
-                inserted += 1
             conn.execute("COMMIT")
-            return deleted, inserted
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+        # Delegate to store_facts (which handles the ownership guard and
+        # transaction internally).
+        inserted = self.store_facts(
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        ) if facts else 0
+        return deleted, inserted
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact subject, verb, object, what fields.

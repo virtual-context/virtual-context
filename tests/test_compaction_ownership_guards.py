@@ -12,7 +12,7 @@ from pathlib import Path
 
 from virtual_context.core.canonical_turns import utcnow_iso
 from virtual_context.storage.sqlite import SQLiteStore
-from virtual_context.types import SegmentMetadata, StoredSegment
+from virtual_context.types import Fact, SegmentMetadata, StoredSegment
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -135,3 +135,100 @@ def test_store_segment_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path)
             "SELECT COUNT(*) FROM segments WHERE ref='ref-legacy'"
         ).fetchone()[0]
     assert n == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 11: per-write ownership guard on store_facts
+# ---------------------------------------------------------------------------
+
+def _fact(fact_id: str, conv: str = "c") -> Fact:
+    return Fact(
+        id=fact_id,
+        subject="user",
+        verb="likes",
+        object="coffee",
+        status="active",
+        conversation_id=conv,
+        tags=["preferences"],
+    )
+
+
+def test_store_facts_write_succeeds_while_operation_running(tmp_path: Path):
+    """Batch insert with guard kwargs succeeds when op is still running."""
+    store = SQLiteStore(tmp_path / "facts_ok.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-facts-1", worker="w")
+
+    inserted = store.store_facts(
+        [_fact("f-1"), _fact("f-2")],
+        operation_id="op-facts-1",
+        owner_worker_id="w",
+        lifecycle_epoch=1,
+    )
+    assert inserted == 2
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 2
+
+
+def test_store_facts_raises_lease_lost_when_operation_abandoned(tmp_path: Path):
+    """Guard raises CompactionLeaseLost with write_site=='store_facts'
+    when the operation has been marked abandoned before the batch insert.
+
+    Note: this test simulates the at-rest correctness case (operation
+    abandoned before the call). The guard is checked per-row via
+    INSERT-SELECT, so a concurrent takeover mid-batch may let the
+    in-flight transaction complete (documented trade-off: the up-front
+    per-row DB check fires on each INSERT but the same transaction
+    holds the write lock for the whole batch).
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "facts_abandon.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-facts-2", worker="w")
+
+    # Simulate takeover: mark op as abandoned.
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-facts-2'",
+        )
+
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.store_facts(
+            [_fact("f-ghost-1"), _fact("f-ghost-2")],
+            operation_id="op-facts-2",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.operation_id == "op-facts-2"
+    assert exc_info.value.write_site == "store_facts"
+
+    # Zero rows persisted.
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_store_facts_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path):
+    """Callers that omit guard kwargs use the unconditional INSERT path.
+    Existing test harnesses and non-compaction call sites must not break.
+    """
+    store = SQLiteStore(tmp_path / "facts_legacy.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    inserted = store.store_facts([_fact("f-legacy-1"), _fact("f-legacy-2")])
+    assert inserted == 2
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 2
