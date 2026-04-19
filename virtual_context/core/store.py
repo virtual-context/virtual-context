@@ -91,7 +91,15 @@ class ContextStore(ABC):
     ) -> int: ...
 
     @abstractmethod
-    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
+    def save_tag_summary(
+        self,
+        tag_summary: TagSummary,
+        conversation_id: str = "",
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         """Upsert on (tag, conversation_id)."""
 
     @abstractmethod
