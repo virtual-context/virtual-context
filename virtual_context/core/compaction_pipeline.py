@@ -178,6 +178,8 @@ class CompactionPipeline:
         progress_callback: Callable[..., None] | None = None,
         turn_id: str = "",
         operation_id: str | None = None,
+        *,
+        preexisting_operation_id: str | None = None,
     ) -> CompactionReport | None:
         """Phase 2 of turn processing: run compaction.
 
@@ -189,7 +191,12 @@ class CompactionPipeline:
         guard.  When provided (along with ``self._worker_id``), every
         ``store_segment`` call is scoped to the active compaction row — stale
         writes raise ``CompactionLeaseLost`` instead of inserting silently.
+        *preexisting_operation_id*: when set by the takeover path, overrides
+        *operation_id* so all downstream guarded writes use the pre-inserted
+        row's id rather than a freshly generated one.
         """
+        if preexisting_operation_id is not None:
+            operation_id = preexisting_operation_id
         _t_compact = time.monotonic()
 
         if self._compactor is None:
@@ -307,6 +314,7 @@ class CompactionPipeline:
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
         operation_id: str | None = None,
+        preexisting_operation_id: str | None = None,
     ) -> CompactionReport:
         """Shared compaction core: segment, compact, store, build tag summaries.
 
@@ -317,9 +325,13 @@ class CompactionPipeline:
         *operation_id*: when provided alongside ``self._worker_id``, every
         ``store_segment`` call carries the ownership guard kwargs so a stale
         write raises ``CompactionLeaseLost`` before it persists.
+        *preexisting_operation_id*: takeover path override; takes precedence
+        over *operation_id* when set.
 
         Returns a CompactionReport (never None — callers handle None guards).
         """
+        if preexisting_operation_id is not None:
+            operation_id = preexisting_operation_id
         from ..types import CompactionReport
 
         compact_rows = list(compact_rows or [])
