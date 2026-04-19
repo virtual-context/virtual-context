@@ -166,8 +166,8 @@ class CompositeStore:
     def search_tag_summaries_fts(self, query: str, limit: int = 20, conversation_id: str | None = None) -> list[tuple[str, float]]:
         return self._segments.search_tag_summaries_fts(query, limit=limit, conversation_id=conversation_id)
 
-    def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float]) -> None:
-        return self._segments.store_tag_summary_embedding(tag, conversation_id, embedding)
+    def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float], *, operation_id: str | None = None, owner_worker_id: str | None = None, lifecycle_epoch: int | None = None) -> None:
+        return self._segments.store_tag_summary_embedding(tag, conversation_id, embedding, operation_id=operation_id, owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch)
 
     def load_tag_summary_embeddings(self, conversation_id: str | None = None) -> dict[str, list[float]]:
         return self._segments.load_tag_summary_embeddings(conversation_id=conversation_id)

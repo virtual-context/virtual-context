@@ -4236,15 +4236,64 @@ class PostgresStore(ContextStore):
             return []
 
     def store_tag_summary_embedding(
-        self, tag: str, conversation_id: str, embedding: list[float],
+        self,
+        tag: str,
+        conversation_id: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (tag, conversation_id) DO UPDATE SET embedding_json = EXCLUDED.embedding_json""",
-            (tag, conversation_id, json.dumps(embedding)),
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
         )
+
+        conn = self._get_conn()
+        with conn.transaction():
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                # a row candidate — i.e., when the guard passes.
+                cur = conn.execute(
+                    """INSERT INTO tag_summary_embeddings
+                    (tag, conversation_id, embedding_json, operation_id)
+                    SELECT %s,%s,%s,%s
+                      FROM compaction_operation
+                     WHERE operation_id = %s
+                       AND conversation_id = %s
+                       AND status = 'running'
+                       AND owner_worker_id = %s
+                       AND lifecycle_epoch = %s
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        embedding_json = EXCLUDED.embedding_json,
+                        operation_id = EXCLUDED.operation_id""",
+                    (
+                        tag, conversation_id, json.dumps(embedding), operation_id,
+                        # WHERE clause params:
+                        operation_id, conversation_id,
+                        owner_worker_id, lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_tag_summary_embedding",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        embedding_json = EXCLUDED.embedding_json""",
+                    (tag, conversation_id, json.dumps(embedding)),
+                )
 
     def load_tag_summary_embeddings(
         self, conversation_id: str | None = None,
