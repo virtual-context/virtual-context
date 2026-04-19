@@ -4219,33 +4219,91 @@ class PostgresStore(ContextStore):
     # FactStore
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         if not facts:
             return 0
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         count = 0
         with conn.transaction():
             for fact in facts:
-                conn.execute(
-                    """INSERT INTO facts
-                    (id, subject, verb, object, status, what, who, when_date, "where", why,
-                     fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                     mentioned_at, session_date, superseded_by)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
-                        status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
-                        when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
-                        fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
-                        segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
-                        turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                        session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
-                    (fact.id, fact.subject, fact.verb, fact.object, fact.status,
-                     fact.what, fact.who, fact.when_date, fact.where, fact.why,
-                     fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
-                     fact.conversation_id, json.dumps(fact.turn_numbers),
-                     _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
-                )
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the
+                    # compaction_operation row no longer matches
+                    # (status != 'running', owner mismatch, epoch mismatch).
+                    cur = conn.execute(
+                        """INSERT INTO facts
+                        (id, subject, verb, object, status, what, who, when_date, "where", why,
+                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                         mentioned_at, session_date, superseded_by)
+                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (id) DO UPDATE SET
+                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id, fact.conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="store_facts",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and
+                    # non-compaction write sites.
+                    conn.execute(
+                        """INSERT INTO facts
+                        (id, subject, verb, object, status, what, who, when_date, "where", why,
+                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                         mentioned_at, session_date, superseded_by)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                        (fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                         fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                         fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                         fact.conversation_id, json.dumps(fact.turn_numbers),
+                         _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                    )
                 conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
                 for tag in fact.tags:
                     conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
@@ -4321,15 +4379,31 @@ class PostgresStore(ContextStore):
         rows = conn.execute("SELECT * FROM facts WHERE segment_ref = %s ORDER BY mentioned_at", (segment_ref,)).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
         conn = self._get_conn()
+        # Delete existing facts for the segment first.
         with conn.transaction():
             result = conn.execute(
                 "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
                 (conversation_id, segment_ref),
             )
             deleted = result.rowcount
-            inserted = self.store_facts(facts) if facts else 0
+        # Delegate insertion to store_facts (which handles the ownership guard).
+        inserted = self.store_facts(
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        ) if facts else 0
         return deleted, inserted
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:

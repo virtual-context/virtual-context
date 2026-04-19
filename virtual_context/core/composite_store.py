@@ -351,8 +351,20 @@ class CompositeStore:
     # FactStore
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
-        return self._facts.store_facts(facts)
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
+        return self._facts.store_facts(
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def query_facts(self, **kwargs) -> list[Fact]:
         return self._facts.query_facts(**kwargs)
@@ -363,8 +375,24 @@ class CompositeStore:
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return self._facts.get_facts_by_segment(segment_ref)
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
-        return self._facts.replace_facts_for_segment(conversation_id, segment_ref, facts)
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
+        return self._facts.replace_facts_for_segment(
+            conversation_id,
+            segment_ref,
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
