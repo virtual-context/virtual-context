@@ -231,6 +231,15 @@ class ProxyState:
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
 
+        # Wire this worker's identity into the compaction pipeline so the
+        # per-write ownership guard on store_segment can scope each INSERT
+        # to the live compaction_operation row.  Done here (post-_worker_id
+        # assignment) rather than at CompactionPipeline construction time
+        # because the engine is constructed before ProxyState initialises
+        # _worker_id.
+        if hasattr(engine, "_compaction") and engine._compaction is not None:
+            engine._compaction._worker_id = self._worker_id
+
         # Set provider on engine for persistence (only if not already restored)
         if self.provider and not engine._engine_state.provider:
             engine._engine_state.provider = self.provider
@@ -2062,7 +2071,8 @@ class ProxyState:
 
                 if supports_turn_id:
                     report = compact_if_needed(
-                        history, signal, progress_callback=_compact_progress, turn_id=turn_id,
+                        history, signal, progress_callback=_compact_progress,
+                        turn_id=turn_id, operation_id=operation_id,
                     )
                 else:
                     report = self.engine.compact_if_needed(

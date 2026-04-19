@@ -27,7 +27,14 @@ from ..types import (
 class SegmentStore(Protocol):
     """Segments, summaries, tag summaries, tags, and aliases."""
 
-    def store_segment(self, segment: StoredSegment) -> str: ...
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str: ...
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None: ...
     def get_summary(self, ref: str, *, conversation_id: str | None = None) -> StoredSummary | None: ...
     def get_summaries_by_tags(

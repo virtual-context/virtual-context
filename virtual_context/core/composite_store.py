@@ -54,8 +54,20 @@ class CompositeStore:
     # SegmentStore
     # ------------------------------------------------------------------
 
-    def store_segment(self, segment: StoredSegment) -> str:
-        return self._segments.store_segment(segment)
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
+        return self._segments.store_segment(
+            segment,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def update_segment(self, segment: StoredSegment) -> None:
         self._segments.update_segment(segment)

@@ -1829,12 +1829,14 @@ class VirtualContextEngine:
         signal: CompactionSignal,
         progress_callback: Callable[..., None] | None = None,
         turn_id: str = "",
+        operation_id: str | None = None,
     ) -> CompactionReport | None:
         return self._compaction.compact_if_needed(
             conversation_history,
             signal,
             progress_callback,
             turn_id=turn_id,
+            operation_id=operation_id,
         )
 
     def on_turn_complete(

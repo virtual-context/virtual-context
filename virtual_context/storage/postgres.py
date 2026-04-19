@@ -1316,7 +1316,15 @@ class PostgresStore(ContextStore):
     # SegmentStore
     # ------------------------------------------------------------------
 
-    def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
+        from ..types import CompactionLeaseLost
         conn = self._get_conn()
         primary_tag = segment.primary_tag
         summary_text = segment.summary
@@ -1336,28 +1344,85 @@ class PostgresStore(ContextStore):
         if segment.metadata.session_date:
             metadata_dict["session_date"] = segment.metadata.session_date
 
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         with conn.transaction():
-            conn.execute(
-                """INSERT INTO segments
-                (ref, conversation_id, primary_tag, summary, full_text, messages_json,
-                 metadata_json, summary_tokens, full_tokens, compression_ratio,
-                 compaction_model, created_at, start_timestamp, end_timestamp)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (ref) DO UPDATE SET
-                    conversation_id=EXCLUDED.conversation_id, primary_tag=EXCLUDED.primary_tag,
-                    summary=EXCLUDED.summary, full_text=EXCLUDED.full_text,
-                    messages_json=EXCLUDED.messages_json, metadata_json=EXCLUDED.metadata_json,
-                    summary_tokens=EXCLUDED.summary_tokens, full_tokens=EXCLUDED.full_tokens,
-                    compression_ratio=EXCLUDED.compression_ratio, compaction_model=EXCLUDED.compaction_model,
-                    created_at=EXCLUDED.created_at, start_timestamp=EXCLUDED.start_timestamp,
-                    end_timestamp=EXCLUDED.end_timestamp""",
-                (segment.ref, segment.conversation_id, primary_tag, summary_text,
-                 full_text, json.dumps(segment.messages, default=str),
-                 json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
-                 segment.compression_ratio, segment.compaction_model,
-                 _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
-                 _dt_to_str(segment.end_timestamp)),
-            )
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                cur = conn.execute(
+                    """INSERT INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp,
+                     operation_id)
+                    SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                      FROM compaction_operation
+                     WHERE operation_id = %s
+                       AND conversation_id = %s
+                       AND status = 'running'
+                       AND owner_worker_id = %s
+                       AND lifecycle_epoch = %s
+                    ON CONFLICT (ref) DO UPDATE SET
+                        conversation_id=EXCLUDED.conversation_id,
+                        primary_tag=EXCLUDED.primary_tag,
+                        summary=EXCLUDED.summary,
+                        full_text=EXCLUDED.full_text,
+                        messages_json=EXCLUDED.messages_json,
+                        metadata_json=EXCLUDED.metadata_json,
+                        summary_tokens=EXCLUDED.summary_tokens,
+                        full_tokens=EXCLUDED.full_tokens,
+                        compression_ratio=EXCLUDED.compression_ratio,
+                        compaction_model=EXCLUDED.compaction_model,
+                        created_at=EXCLUDED.created_at,
+                        start_timestamp=EXCLUDED.start_timestamp,
+                        end_timestamp=EXCLUDED.end_timestamp,
+                        operation_id=EXCLUDED.operation_id""",
+                    (
+                        segment.ref, segment.conversation_id, primary_tag, summary_text,
+                        full_text, json.dumps(segment.messages, default=str),
+                        json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
+                        segment.compression_ratio, segment.compaction_model,
+                        _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
+                        _dt_to_str(segment.end_timestamp),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id, segment.conversation_id,
+                        owner_worker_id, lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_segment",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (ref) DO UPDATE SET
+                        conversation_id=EXCLUDED.conversation_id, primary_tag=EXCLUDED.primary_tag,
+                        summary=EXCLUDED.summary, full_text=EXCLUDED.full_text,
+                        messages_json=EXCLUDED.messages_json, metadata_json=EXCLUDED.metadata_json,
+                        summary_tokens=EXCLUDED.summary_tokens, full_tokens=EXCLUDED.full_tokens,
+                        compression_ratio=EXCLUDED.compression_ratio, compaction_model=EXCLUDED.compaction_model,
+                        created_at=EXCLUDED.created_at, start_timestamp=EXCLUDED.start_timestamp,
+                        end_timestamp=EXCLUDED.end_timestamp""",
+                    (segment.ref, segment.conversation_id, primary_tag, summary_text,
+                     full_text, json.dumps(segment.messages, default=str),
+                     json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
+                     segment.compression_ratio, segment.compaction_model,
+                     _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
+                     _dt_to_str(segment.end_timestamp)),
+                )
             conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (segment.ref,))
             for tag in segment.tags:
                 conn.execute(
