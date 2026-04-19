@@ -2788,33 +2788,108 @@ class PostgresStore(ContextStore):
 
         return deleted
 
-    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO tag_summaries
-            (tag, conversation_id, summary, description, code_refs, summary_tokens, source_segment_refs, source_turn_numbers,
-             source_canonical_turn_ids, covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (tag, conversation_id) DO UPDATE SET
-                summary=EXCLUDED.summary, description=EXCLUDED.description, code_refs=EXCLUDED.code_refs,
-                summary_tokens=EXCLUDED.summary_tokens,
-                source_segment_refs=EXCLUDED.source_segment_refs,
-                source_turn_numbers=EXCLUDED.source_turn_numbers,
-                source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
-                covers_through_turn=EXCLUDED.covers_through_turn,
-                covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
-                generated_by_turn_id=EXCLUDED.generated_by_turn_id,
-                updated_at=EXCLUDED.updated_at""",
-            (tag_summary.tag, conversation_id, tag_summary.summary, getattr(tag_summary, "description", ""),
-             json.dumps(getattr(tag_summary, "code_refs", []) or []),
-             tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
-             json.dumps(tag_summary.source_turn_numbers),
-             json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
-             tag_summary.covers_through_turn,
-             getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
-             getattr(tag_summary, "generated_by_turn_id", "") or "",
-             _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
+    def save_tag_summary(
+        self,
+        tag_summary: TagSummary,
+        conversation_id: str = "",
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
         )
+
+        conn = self._get_conn()
+        with conn.transaction():
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                # a row candidate — i.e., when the guard passes.
+                cur = conn.execute(
+                    """INSERT INTO tag_summaries
+                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                     created_at, updated_at, operation_id)
+                    SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                      FROM compaction_operation
+                     WHERE operation_id = %s
+                       AND conversation_id = %s
+                       AND status = 'running'
+                       AND owner_worker_id = %s
+                       AND lifecycle_epoch = %s
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        summary=EXCLUDED.summary, description=EXCLUDED.description,
+                        code_refs=EXCLUDED.code_refs,
+                        summary_tokens=EXCLUDED.summary_tokens,
+                        source_segment_refs=EXCLUDED.source_segment_refs,
+                        source_turn_numbers=EXCLUDED.source_turn_numbers,
+                        source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                        covers_through_turn=EXCLUDED.covers_through_turn,
+                        covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
+                        generated_by_turn_id=EXCLUDED.generated_by_turn_id,
+                        updated_at=EXCLUDED.updated_at,
+                        operation_id=EXCLUDED.operation_id""",
+                    (
+                        tag_summary.tag, conversation_id, tag_summary.summary,
+                        getattr(tag_summary, "description", ""),
+                        json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                        tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
+                        json.dumps(tag_summary.source_turn_numbers),
+                        json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                        tag_summary.covers_through_turn,
+                        getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                        getattr(tag_summary, "generated_by_turn_id", "") or "",
+                        _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id, conversation_id,
+                        owner_worker_id, lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="save_tag_summary",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT INTO tag_summaries
+                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                     created_at, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        summary=EXCLUDED.summary, description=EXCLUDED.description,
+                        code_refs=EXCLUDED.code_refs,
+                        summary_tokens=EXCLUDED.summary_tokens,
+                        source_segment_refs=EXCLUDED.source_segment_refs,
+                        source_turn_numbers=EXCLUDED.source_turn_numbers,
+                        source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                        covers_through_turn=EXCLUDED.covers_through_turn,
+                        covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
+                        generated_by_turn_id=EXCLUDED.generated_by_turn_id,
+                        updated_at=EXCLUDED.updated_at""",
+                    (tag_summary.tag, conversation_id, tag_summary.summary,
+                     getattr(tag_summary, "description", ""),
+                     json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                     tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
+                     json.dumps(tag_summary.source_turn_numbers),
+                     json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                     tag_summary.covers_through_turn,
+                     getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                     getattr(tag_summary, "generated_by_turn_id", "") or "",
+                     _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
+                )
 
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         conn = self._get_conn()
