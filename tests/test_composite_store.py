@@ -22,13 +22,23 @@ class TestCompositeStoreDelegation:
     def test_store_segment_delegates(self):
         comp, segments, *_ = self._make_composite()
         comp.store_segment("seg")
-        segments.store_segment.assert_called_once_with("seg")
+        segments.store_segment.assert_called_once_with(
+            "seg",
+            operation_id=None,
+            owner_worker_id=None,
+            lifecycle_epoch=None,
+        )
 
     def test_store_facts_delegates(self):
         comp, _, facts, *_ = self._make_composite()
         fact_list = [Fact(subject="user")]
         comp.store_facts(fact_list)
-        facts.store_facts.assert_called_once_with(fact_list)
+        facts.store_facts.assert_called_once_with(
+            fact_list,
+            operation_id=None,
+            owner_worker_id=None,
+            lifecycle_epoch=None,
+        )
 
     def test_store_fact_links_delegates(self):
         comp, _, _, fact_links, *_ = self._make_composite()

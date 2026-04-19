@@ -917,7 +917,16 @@ class CompactionPipeline:
                     start_timestamp=seg.start_timestamp,
                     end_timestamp=result.timestamp,
                 )
-                self._store.update_segment(stored)
+                self._store.update_segment(
+                    stored,
+                    operation_id=operation_id,
+                    owner_worker_id=self._worker_id,
+                    lifecycle_epoch=(
+                        int(self._engine_state.lifecycle_epoch)
+                        if operation_id is not None and self._worker_id is not None
+                        else None
+                    ),
+                )
                 self._semantic.embed_and_store_chunks(stored)
                 result.segment_id = seg.merge_ref
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''

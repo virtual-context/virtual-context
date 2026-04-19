@@ -69,8 +69,20 @@ class CompositeStore:
             lifecycle_epoch=lifecycle_epoch,
         )
 
-    def update_segment(self, segment: StoredSegment) -> None:
-        self._segments.update_segment(segment)
+    def update_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        self._segments.update_segment(
+            segment,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         return self._segments.get_segment(ref, conversation_id=conversation_id)
@@ -745,6 +757,7 @@ class CompositeStore:
         worker_id: str,
         phase_count: int,
         phase_name: str,
+        operation_id: str | None = None,
     ) -> str:
         fn = getattr(self._segments, "start_compaction_operation", None)
         if callable(fn):
@@ -754,6 +767,7 @@ class CompositeStore:
                 worker_id=worker_id,
                 phase_count=phase_count,
                 phase_name=phase_name,
+                operation_id=operation_id,
             )
         raise NotImplementedError
 
