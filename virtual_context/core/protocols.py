@@ -136,6 +136,9 @@ class SegmentStore(Protocol):
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int: ...
     def delete_canonical_turns(
         self,

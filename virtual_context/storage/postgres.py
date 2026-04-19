@@ -4078,6 +4078,9 @@ class PostgresStore(ContextStore):
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int:
         """Mark compacted_at on all physical rows whose turn_group_number
         matches any of the provided canonical_turn_ids.
@@ -4100,31 +4103,85 @@ class PostgresStore(ContextStore):
         turn_group_number as one of the input ids. turn_group_number < 0
         (legacy rows without explicit grouping) falls back to id-only
         match so we don't accidentally mark unrelated legacy rows.
+
+        Ownership guard: when operation_id/owner_worker_id/lifecycle_epoch
+        are all provided, appends an EXISTS sub-select that verifies the
+        compaction_operation row is still 'running' and owned by this
+        worker. If rowcount == 0, raises CompactionLeaseLost. The
+        turn_group merge-expansion is preserved on BOTH paths.
+        Also sets compaction_operation_id on the guarded path so cleanup
+        can find these rows by operation.
         """
         if not canonical_turn_ids:
             return 0
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         timestamp = compacted_at or _dt_to_str(datetime.now(timezone.utc))
-        rows = conn.execute(
-            """UPDATE canonical_turns
-               SET compacted_at = %s, updated_at = %s
-               WHERE conversation_id = %s
-                 AND (
-                     canonical_turn_id = ANY(%s)
-                     OR turn_group_number IN (
-                         SELECT DISTINCT turn_group_number
-                           FROM canonical_turns
-                          WHERE conversation_id = %s
-                            AND canonical_turn_id = ANY(%s)
-                            AND turn_group_number >= 0
+
+        if guard_all:
+            rows = conn.execute(
+                """UPDATE canonical_turns
+                   SET compacted_at = %s, updated_at = %s,
+                       compaction_operation_id = %s
+                   WHERE conversation_id = %s
+                     AND (
+                         canonical_turn_id = ANY(%s)
+                         OR turn_group_number IN (
+                             SELECT DISTINCT turn_group_number
+                               FROM canonical_turns
+                              WHERE conversation_id = %s
+                                AND canonical_turn_id = ANY(%s)
+                                AND turn_group_number >= 0
+                         )
                      )
-                 )""",
-            (
-                timestamp, timestamp, conversation_id,
-                canonical_turn_ids, conversation_id, canonical_turn_ids,
-            ),
-        )
-        return int(rows.rowcount or 0)
+                     AND EXISTS (
+                         SELECT 1 FROM compaction_operation
+                          WHERE operation_id = %s
+                            AND conversation_id = %s
+                            AND status = 'running'
+                            AND owner_worker_id = %s
+                            AND lifecycle_epoch = %s
+                     )""",
+                (
+                    timestamp, timestamp, operation_id, conversation_id,
+                    canonical_turn_ids, conversation_id, canonical_turn_ids,
+                    operation_id, conversation_id, owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            if (rows.rowcount or 0) == 0:
+                raise CompactionLeaseLost(
+                    operation_id=operation_id,
+                    write_site="mark_canonical_turns_compacted",
+                )
+            return int(rows.rowcount)
+        else:
+            rows = conn.execute(
+                """UPDATE canonical_turns
+                   SET compacted_at = %s, updated_at = %s
+                   WHERE conversation_id = %s
+                     AND (
+                         canonical_turn_id = ANY(%s)
+                         OR turn_group_number IN (
+                             SELECT DISTINCT turn_group_number
+                               FROM canonical_turns
+                              WHERE conversation_id = %s
+                                AND canonical_turn_id = ANY(%s)
+                                AND turn_group_number >= 0
+                         )
+                     )""",
+                (
+                    timestamp, timestamp, conversation_id,
+                    canonical_turn_ids, conversation_id, canonical_turn_ids,
+                ),
+            )
+            return int(rows.rowcount or 0)
 
     def delete_canonical_turns(
         self,

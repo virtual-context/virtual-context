@@ -410,6 +410,13 @@ class CompactionPipeline:
             self._store.mark_canonical_turns_compacted(
                 self._config.conversation_id,
                 compacted_turn_ids,
+                operation_id=operation_id,
+                owner_worker_id=self._worker_id,
+                lifecycle_epoch=(
+                    int(self._engine_state.lifecycle_epoch)
+                    if operation_id is not None and self._worker_id is not None
+                    else None
+                ),
             )
         if compact_rows:
             self._refresh_compaction_watermark()

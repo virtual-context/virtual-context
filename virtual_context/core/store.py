@@ -317,6 +317,9 @@ class ContextStore(ABC):
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int:
         return 0
 
