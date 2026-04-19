@@ -54,11 +54,35 @@ class CompositeStore:
     # SegmentStore
     # ------------------------------------------------------------------
 
-    def store_segment(self, segment: StoredSegment) -> str:
-        return self._segments.store_segment(segment)
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
+        return self._segments.store_segment(
+            segment,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
-    def update_segment(self, segment: StoredSegment) -> None:
-        self._segments.update_segment(segment)
+    def update_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        self._segments.update_segment(
+            segment,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_segment(self, ref: str, *, conversation_id: str | None = None) -> StoredSegment | None:
         return self._segments.get_segment(ref, conversation_id=conversation_id)
@@ -128,8 +152,22 @@ class CompositeStore:
     ) -> int:
         return self._segments.cleanup(max_age=max_age, max_total_tokens=max_total_tokens)
 
-    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
-        return self._segments.save_tag_summary(tag_summary, conversation_id=conversation_id)
+    def save_tag_summary(
+        self,
+        tag_summary: TagSummary,
+        conversation_id: str = "",
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        return self._segments.save_tag_summary(
+            tag_summary,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         return self._segments.get_tag_summary(tag, conversation_id=conversation_id)
@@ -140,8 +178,8 @@ class CompositeStore:
     def search_tag_summaries_fts(self, query: str, limit: int = 20, conversation_id: str | None = None) -> list[tuple[str, float]]:
         return self._segments.search_tag_summaries_fts(query, limit=limit, conversation_id=conversation_id)
 
-    def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float]) -> None:
-        return self._segments.store_tag_summary_embedding(tag, conversation_id, embedding)
+    def store_tag_summary_embedding(self, tag: str, conversation_id: str, embedding: list[float], *, operation_id: str | None = None, owner_worker_id: str | None = None, lifecycle_epoch: int | None = None) -> None:
+        return self._segments.store_tag_summary_embedding(tag, conversation_id, embedding, operation_id=operation_id, owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch)
 
     def load_tag_summary_embeddings(self, conversation_id: str | None = None) -> dict[str, list[float]]:
         return self._segments.load_tag_summary_embeddings(conversation_id=conversation_id)
@@ -291,11 +329,17 @@ class CompositeStore:
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int:
         return self._segments.mark_canonical_turns_compacted(
             conversation_id,
             canonical_turn_ids,
             compacted_at=compacted_at,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
         )
 
     def delete_canonical_turns(
@@ -339,8 +383,20 @@ class CompositeStore:
     # FactStore
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
-        return self._facts.store_facts(facts)
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
+        return self._facts.store_facts(
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def query_facts(self, **kwargs) -> list[Fact]:
         return self._facts.query_facts(**kwargs)
@@ -351,8 +407,24 @@ class CompositeStore:
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return self._facts.get_facts_by_segment(segment_ref)
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
-        return self._facts.replace_facts_for_segment(conversation_id, segment_ref, facts)
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
+        return self._facts.replace_facts_for_segment(
+            conversation_id,
+            segment_ref,
+            facts,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
@@ -685,6 +757,7 @@ class CompositeStore:
         worker_id: str,
         phase_count: int,
         phase_name: str,
+        operation_id: str | None = None,
     ) -> str:
         fn = getattr(self._segments, "start_compaction_operation", None)
         if callable(fn):
@@ -694,6 +767,7 @@ class CompositeStore:
                 worker_id=worker_id,
                 phase_count=phase_count,
                 phase_name=phase_name,
+                operation_id=operation_id,
             )
         raise NotImplementedError
 
@@ -748,6 +822,64 @@ class CompositeStore:
                 lifecycle_epoch=lifecycle_epoch,
                 worker_id=worker_id,
                 error_message=error_message,
+            ))
+        raise NotImplementedError
+
+    def claim_compaction_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ):
+        fn = getattr(self._segments, "claim_compaction_lease", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                lease_ttl_s=lease_ttl_s,
+            )
+        raise NotImplementedError
+
+    def cleanup_abandoned_compaction(
+        self,
+        *,
+        conversation_id: str,
+        dead_operation_id: str,
+        new_operation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+    ) -> bool:
+        fn = getattr(self._segments, "cleanup_abandoned_compaction", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                dead_operation_id=dead_operation_id,
+                new_operation_id=new_operation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                phase_count=phase_count,
+            ))
+        raise NotImplementedError
+
+    def refresh_compaction_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        operation_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "refresh_compaction_heartbeat", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                operation_id=operation_id,
             ))
         raise NotImplementedError
 
