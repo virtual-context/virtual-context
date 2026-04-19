@@ -3737,6 +3737,28 @@ class PostgresStore(ContextStore):
         *,
         compacted_at: str | None = None,
     ) -> int:
+        """Mark compacted_at on all physical rows whose turn_group_number
+        matches any of the provided canonical_turn_ids.
+
+        The compaction pipeline operates on MERGED rows (one per logical
+        turn_group) produced by ``_merge_canonical_turn_rows``. Each merged
+        row carries a single ``canonical_turn_id`` even though the
+        underlying turn_group typically has two physical rows (user half +
+        assistant half, each its own canonical_turn_id). Marking only the
+        merged row's id would leave the sibling half NULL, re-surface it
+        on the next ``get_uncompacted_canonical_turns`` call, and cause
+        the next compaction to re-process the orphan half. Observed in
+        prod on conv 77f110fc-0c00 (2026-04-19): first compaction marked
+        1107 user halves, left 1082 assistant halves NULL, next compaction
+        treated those 1082 orphans as "new uncompacted content" and ran
+        the full LLM pipeline on them — doubled the compute cost and
+        stuck compacted_prefix_messages at 2 forever.
+
+        Fix: expand the WHERE clause to also match any row in the same
+        turn_group_number as one of the input ids. turn_group_number < 0
+        (legacy rows without explicit grouping) falls back to id-only
+        match so we don't accidentally mark unrelated legacy rows.
+        """
         if not canonical_turn_ids:
             return 0
         conn = self._get_conn()
@@ -3744,8 +3766,21 @@ class PostgresStore(ContextStore):
         rows = conn.execute(
             """UPDATE canonical_turns
                SET compacted_at = %s, updated_at = %s
-               WHERE conversation_id = %s AND canonical_turn_id = ANY(%s)""",
-            (timestamp, timestamp, conversation_id, canonical_turn_ids),
+               WHERE conversation_id = %s
+                 AND (
+                     canonical_turn_id = ANY(%s)
+                     OR turn_group_number IN (
+                         SELECT DISTINCT turn_group_number
+                           FROM canonical_turns
+                          WHERE conversation_id = %s
+                            AND canonical_turn_id = ANY(%s)
+                            AND turn_group_number >= 0
+                     )
+                 )""",
+            (
+                timestamp, timestamp, conversation_id,
+                canonical_turn_ids, conversation_id, canonical_turn_ids,
+            ),
         )
         return int(rows.rowcount or 0)
 
