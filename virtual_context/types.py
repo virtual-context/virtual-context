@@ -1175,3 +1175,26 @@ class CompactionLeaseClaim:
     claimed: bool
     prev_operation_id: str | None
     prev_owner_worker_id: str | None
+
+
+class CompactionLeaseLost(Exception):
+    """Raised by compaction-scoped store helpers when the per-write
+    ownership guard's ``INSERT ... SELECT`` / ``UPDATE ... WHERE EXISTS``
+    matches zero rows because the ``compaction_operation`` row has been
+    flipped to ``'abandoned'`` by a takeover on another worker (or the
+    owner_worker_id no longer matches, or the lifecycle_epoch has moved).
+
+    The compactor pipeline's outer handler catches this to emit
+    ``COMPACTION_WRITE_REJECTED`` and exit cleanly via
+    ``exit_compaction(success=False)`` without walking the remaining
+    phases. Do NOT swallow this in ``except Exception`` — it must
+    propagate to the wrapper.
+    """
+
+    def __init__(self, operation_id: str, *, write_site: str) -> None:
+        super().__init__(
+            f"compaction lease lost: operation_id={operation_id} "
+            f"write_site={write_site}",
+        )
+        self.operation_id = operation_id
+        self.write_site = write_site
