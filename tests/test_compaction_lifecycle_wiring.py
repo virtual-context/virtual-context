@@ -61,7 +61,7 @@ def test_compact_after_ingestion_wires_db_backed_lifecycle(
     # pipeline-advertised phase (``segment_tagging``).
     snapshot_during: dict = {}
 
-    def _fake_compact_if_needed(history, signal, progress_callback=None, turn_id=""):
+    def _fake_compact_if_needed(history, signal, progress_callback=None, turn_id="", **kwargs):
         # Snapshot the progress during compaction — the compaction_operation
         # row must be visible WHILE the compactor is still running.
         snapshot_during["phase"] = inner.read_progress_snapshot(conv_id).phase
