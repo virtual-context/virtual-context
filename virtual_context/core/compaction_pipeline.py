@@ -498,6 +498,13 @@ class CompactionPipeline:
                                 emb = embed_fn([ts.summary[:2000]])[0]
                                 self._store.store_tag_summary_embedding(
                                     ts.tag, self._config.conversation_id, emb,
+                                    operation_id=operation_id,
+                                    owner_worker_id=self._worker_id,
+                                    lifecycle_epoch=(
+                                        int(self._engine_state.lifecycle_epoch)
+                                        if operation_id is not None and self._worker_id is not None
+                                        else None
+                                    ),
                                 )
                         except Exception as e:
                             logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
