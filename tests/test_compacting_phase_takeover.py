@@ -664,3 +664,52 @@ def test_same_worker_after_submit_exception_re_enters_takeover(tmp_path: Path):
         "Second POST must re-attempt submit after _active_compaction_op "
         f"was cleared; only {submit_attempt[0]} attempt(s) made"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (P2.3 regression): takeover on same ProxyState resets
+# _compaction_cancelled so the new compactor doesn't immediately raise
+# ---------------------------------------------------------------------------
+
+def test_takeover_on_same_proxystate_resets_compaction_cancelled(tmp_path):
+    """Regression: if a prior compaction on this ProxyState was killed
+    by the sidecar (e.g., heartbeat refresh rejected), _compaction_cancelled
+    is set. A subsequent takeover must reset the flag so the new
+    compactor doesn't immediately raise InterruptedError on first progress.
+    """
+    from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
+    from unittest.mock import MagicMock
+    from virtual_context.types import CompactionLeaseClaim
+
+    state = _make_proxy_state(tmp_path)
+    # Simulate: prior sidecar set the cancel flag before we run again.
+    state._compaction_cancelled.set()
+    assert state._compaction_cancelled.is_set()
+
+    # Mock out the parts of _run_compact that touch external state so the
+    # method can complete without a real store or Anthropic call.
+    state.engine.compact_if_needed = MagicMock(return_value=None)
+    state._update_compaction_state = MagicMock()
+    state.enter_compaction = MagicMock()
+    state.exit_compaction = MagicMock()
+    # Also mock enter_compaction and the snapshot probe so entered_lifecycle
+    # stays False (avoids store calls).
+    try:
+        state.engine._store.read_progress_snapshot = MagicMock(
+            return_value=MagicMock(active_compaction=None)
+        )
+    except AttributeError:
+        pass
+
+    # Run _run_compact directly.  If the flag isn't reset, the compactor's
+    # progress callback path would raise InterruptedError on the first tick.
+    # Since compact_if_needed is mocked to return None, no callback fires and
+    # the test simply asserts the flag IS cleared at return.
+    state._run_compact(
+        history=[], signal=None, turn=0, turn_id="",
+        preexisting_operation_id=None,
+    )
+    assert not state._compaction_cancelled.is_set(), (
+        "_run_compact must clear _compaction_cancelled at start so a "
+        "stale sidecar-set flag doesn't immediately kill a retry compaction"
+    )
