@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import ChunkEmbedding, CompactionLeaseClaim, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
 from .progress_snapshot import ProgressSnapshot
 
 
@@ -526,14 +526,17 @@ class ContextStore(ABC):
         lifecycle_epoch: int,
         worker_id: str,
         lease_ttl_s: float,
-    ) -> bool:
+    ) -> "CompactionLeaseClaim":
         """Claim the compaction lease for this (conversation, epoch).
 
-        Works on queued OR running operations. Returns True iff:
+        Works on queued OR running operations. Returns a CompactionLeaseClaim
+        with claimed=True iff:
           - Caller already owns the row, OR
           - Current heartbeat is stale (older than ``lease_ttl_s``).
-        Returns False if another worker holds a fresh lease or no
+        Returns claimed=False if another worker holds a fresh lease or no
         active row exists at the given ``lifecycle_epoch``.
+        The prev_operation_id and prev_owner_worker_id fields reflect the row
+        observed before the UPDATE (None when no active row existed).
         """
         raise NotImplementedError
 
