@@ -99,6 +99,54 @@ def test_ensure_canonical_turn_views_survives_underlying_column_add_postgres():
     )
 
 
+def test_concurrent_workers_racing_canonical_turn_view_migration_postgres():
+    """Regression: two concurrent workers both running the view migration
+    must serialize via advisory lock; the 'later' worker must NOT fail
+    with ``duplicate key value violates unique constraint
+    pg_type_typname_nsp_index`` after both win the DROP IF EXISTS race.
+
+    Surfaced after the CREATE OR REPLACE VIEW → DROP+CREATE fix: the
+    first fix resolved the column-list refusal but uncovered a second
+    race on the CREATE.
+    """
+    import threading
+
+    dsn = os.environ["DATABASE_URL"]
+    # Two independent stores → two connections → true concurrency.
+    store_a = PostgresStore(dsn=dsn)
+    store_b = PostgresStore(dsn=dsn)
+
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def _run(store):
+        try:
+            barrier.wait(timeout=5)  # release both threads simultaneously
+            for _ in range(3):  # re-run to amplify any race window
+                store._ensure_canonical_turn_views()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_run, args=(store_a,))
+    t2 = threading.Thread(target=_run, args=(store_b,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert not errors, f"Concurrent view migration raised: {errors!r}"
+
+    # Final state must still have the view with the expected columns.
+    conn = store_a._get_conn()
+    cols = conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'canonical_turns_ordinal'"
+    ).fetchall()
+    names = {r[0] for r in cols}
+    assert "turn_number" in names
+    assert "compaction_operation_id" in names
+
+
 def test_migration_backfills_null_operation_id_to_zero_uuid_postgres():
     """Same spec contract as SQLite test. Legacy rows get the
     zero-UUID sentinel, never NULL, after migration.

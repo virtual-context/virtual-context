@@ -1100,23 +1100,41 @@ class PostgresStore(ContextStore):
     # Helpers
     # ------------------------------------------------------------------
 
+    # Advisory-lock key for serializing the canonical_turns_ordinal view
+    # migration across concurrent workers. Chosen as a stable bigint (not a
+    # hash) so it's reproducible across processes without a shared registry.
+    _VIEW_MIGRATION_LOCK_KEY = 0x7663566965777331  # "vcViews1"
+
     def _ensure_canonical_turn_views(self) -> None:
         conn = self._get_conn()
         # DROP + CREATE instead of CREATE OR REPLACE VIEW: the view selects
         # ``ct.*`` from canonical_turns, so whenever the underlying table
         # gains a column the implicit column order changes. Postgres rejects
         # that as a column-rename under CREATE OR REPLACE VIEW.
-        conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
-        conn.execute(
-            """CREATE VIEW canonical_turns_ordinal AS
-               SELECT
-                   ct.*,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY ct.conversation_id
-                       ORDER BY ct.sort_key, ct.first_seen_at, ct.canonical_turn_id
-                   ) - 1 AS turn_number
-               FROM canonical_turns ct"""
-        )
+        #
+        # Advisory lock serializes concurrent workers. Without it, two
+        # workers can both pass the DROP IF EXISTS step, then race on
+        # CREATE VIEW and one loses with
+        #   duplicate key value violates unique constraint pg_type_typname_nsp_index.
+        # The connection runs in autocommit mode, so we wrap in an explicit
+        # transaction to anchor pg_advisory_xact_lock (auto-releases on
+        # commit).
+        with conn.transaction():
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (self._VIEW_MIGRATION_LOCK_KEY,),
+            )
+            conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
+            conn.execute(
+                """CREATE VIEW canonical_turns_ordinal AS
+                   SELECT
+                       ct.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ct.conversation_id
+                           ORDER BY ct.sort_key, ct.first_seen_at, ct.canonical_turn_id
+                       ) - 1 AS turn_number
+                   FROM canonical_turns ct"""
+            )
 
     def _ensure_canonical_turn_schema(self) -> None:
         conn = self._get_conn()
