@@ -317,11 +317,17 @@ class CompositeStore:
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int:
         return self._segments.mark_canonical_turns_compacted(
             conversation_id,
             canonical_turn_ids,
             compacted_at=compacted_at,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
         )
 
     def delete_canonical_turns(

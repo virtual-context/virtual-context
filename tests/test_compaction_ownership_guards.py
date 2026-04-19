@@ -401,3 +401,154 @@ def test_store_tag_summary_embedding_legacy_path_no_guard_kwargs_still_inserts(t
             "WHERE tag='legacy-tag' AND conversation_id='c'"
         ).fetchone()[0]
     assert n == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 14: per-write ownership guard on mark_canonical_turns_compacted
+# ---------------------------------------------------------------------------
+
+def _seed_split_turn_group_for_guard(
+    store: SQLiteStore,
+    conv: str,
+    turn_group_number: int,
+    *,
+    u_id: str,
+    a_id: str,
+) -> None:
+    """Insert user-half and assistant-half rows for a single turn_group."""
+    from virtual_context.core.canonical_turns import utcnow_iso
+    now = utcnow_iso()
+    store.save_canonical_turn(
+        conv, -1,
+        f"user tg{turn_group_number}", "",
+        turn_group_number=turn_group_number,
+        canonical_turn_id=u_id,
+        sort_key=float((turn_group_number * 2 + 1) * 1000),
+        turn_hash=f"h-{u_id}",
+        hash_version=1,
+        tagged_at=now,
+        created_at=now, updated_at=now,
+        first_seen_at=now, last_seen_at=now,
+    )
+    store.save_canonical_turn(
+        conv, -1,
+        "", f"assistant tg{turn_group_number}",
+        turn_group_number=turn_group_number,
+        canonical_turn_id=a_id,
+        sort_key=float((turn_group_number * 2 + 2) * 1000),
+        turn_hash=f"h-{a_id}",
+        hash_version=1,
+        tagged_at=now,
+        created_at=now, updated_at=now,
+        first_seen_at=now, last_seen_at=now,
+    )
+
+
+def test_mark_canonical_turns_compacted_guarded_path_preserves_turn_group_merge_expansion(
+    tmp_path: Path,
+) -> None:
+    """Guarded path marks BOTH halves of each turn_group AND stamps
+    compaction_operation_id on each row, preserving the merge-expansion
+    behaviour from 6e2d5bd.
+    """
+    store = SQLiteStore(tmp_path / "mark_guard_ok.db")
+    conv = "conv-mark-guard"
+    store.upsert_conversation(tenant_id="t", conversation_id=conv)
+    _seed_running(store, conv, "op-mark-1", worker="w")
+
+    _seed_split_turn_group_for_guard(store, conv, 0, u_id="ct-U0", a_id="ct-A0")
+
+    # Pass the user-half id only — the turn_group expansion must also hit ct-A0.
+    marked = store.mark_canonical_turns_compacted(
+        conv,
+        ["ct-U0"],
+        operation_id="op-mark-1",
+        owner_worker_id="w",
+        lifecycle_epoch=1,
+    )
+    assert marked == 2, f"expected both halves marked; got {marked}"
+
+    with store._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT canonical_turn_id, compacted_at, compaction_operation_id "
+            "FROM canonical_turns WHERE conversation_id=? ORDER BY sort_key",
+            (conv,),
+        ).fetchall()
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row[1] is not None, f"{row[0]}: compacted_at should be set"
+        assert row[2] == "op-mark-1", (
+            f"{row[0]}: compaction_operation_id should be 'op-mark-1', got {row[2]}"
+        )
+
+
+def test_mark_canonical_turns_compacted_raises_lease_lost_when_operation_abandoned(
+    tmp_path: Path,
+) -> None:
+    """Guard raises CompactionLeaseLost(write_site='mark_canonical_turns_compacted')
+    when the operation has been marked abandoned before the UPDATE.
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "mark_guard_abandon.db")
+    conv = "conv-mark-abandon"
+    store.upsert_conversation(tenant_id="t", conversation_id=conv)
+    _seed_running(store, conv, "op-mark-2", worker="w")
+
+    _seed_split_turn_group_for_guard(store, conv, 0, u_id="ct-U0g", a_id="ct-A0g")
+
+    # Simulate takeover: mark op as abandoned.
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-mark-2'",
+        )
+
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.mark_canonical_turns_compacted(
+            conv,
+            ["ct-U0g"],
+            operation_id="op-mark-2",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.operation_id == "op-mark-2"
+    assert exc_info.value.write_site == "mark_canonical_turns_compacted"
+
+    # Zero rows should have been marked.
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM canonical_turns "
+            "WHERE conversation_id=? AND compacted_at IS NOT NULL",
+            (conv,),
+        ).fetchone()[0]
+    assert n == 0, f"expected 0 rows marked after lease lost; got {n}"
+
+
+def test_mark_canonical_turns_compacted_legacy_path_no_guard_kwargs_still_marks(
+    tmp_path: Path,
+) -> None:
+    """Regression: calling without guard kwargs uses the legacy path,
+    which still expands through turn_group_number (behaviour from 6e2d5bd).
+    Existing call sites and test harnesses must not break.
+    """
+    store = SQLiteStore(tmp_path / "mark_legacy.db")
+    conv = "conv-mark-legacy"
+    store.upsert_conversation(tenant_id="t", conversation_id=conv)
+
+    _seed_split_turn_group_for_guard(store, conv, 0, u_id="ct-UL0", a_id="ct-AL0")
+
+    # No guard kwargs — legacy path.
+    marked = store.mark_canonical_turns_compacted(conv, ["ct-UL0"])
+    assert marked == 2, f"legacy path should still mark both halves; got {marked}"
+
+    with store._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT canonical_turn_id, compacted_at FROM canonical_turns "
+            "WHERE conversation_id=? ORDER BY sort_key",
+            (conv,),
+        ).fetchall()
+    for row in rows:
+        assert row[1] is not None, f"{row[0]}: legacy path should set compacted_at"
