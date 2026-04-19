@@ -1249,6 +1249,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             logger.warning("request_context unique index setup failed", exc_info=True)
         try:
             self._ensure_canonical_turn_schema(conn)
+            self._ensure_compaction_scoping_columns(conn)
             self._ensure_canonical_turn_views(conn)
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
@@ -1424,6 +1425,33 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ON canonical_turns (conversation_id, tagged_at)
                    WHERE tagged_at IS NOT NULL"""
         )
+
+    def _ensure_compaction_scoping_columns(self, conn: sqlite3.Connection) -> None:
+        """Add operation_id / compaction_operation_id columns used by the
+        compaction-resume-parity takeover path. Idempotent and race-safe
+        via ``_add_column_if_missing``. Existing rows backfill to the
+        zero-UUID sentinel ``00000000-0000-0000-0000-000000000000`` per
+        the approved spec (line 61-63 + rollout line 397-401). Cleanup
+        predicates scope on ``operation_id = :target`` so zero-UUID rows
+        are invisible to cleanup — they never match a real compaction's
+        UUID.
+        """
+        zero_uuid = "00000000-0000-0000-0000-000000000000"
+        for table, column, definition in (
+            ("segments", "operation_id", "TEXT"),
+            ("facts", "operation_id", "TEXT"),
+            ("tag_summaries", "operation_id", "TEXT"),
+            ("tag_summary_embeddings", "operation_id", "TEXT"),
+            ("canonical_turns", "compaction_operation_id", "TEXT"),
+        ):
+            self._add_column_if_missing(conn, table, column, definition)
+            # Backfill pre-migration rows to the zero-UUID sentinel.
+            # Idempotent: UPDATE ... WHERE <col> IS NULL matches zero rows
+            # on second run.
+            conn.execute(
+                f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL",
+                (zero_uuid,),
+            )
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
         conn = self._get_conn()
