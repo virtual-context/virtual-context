@@ -231,6 +231,14 @@ class ProxyState:
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
 
+        # The operation_id of the currently-running compaction, or None when no
+        # compaction is in flight.  Set in _submit_compaction_request (before
+        # submit) when a preexisting_operation_id is provided (takeover path),
+        # and cleared in the _run_compact_wrapper finally block so the takeover
+        # predicate `self._active_compaction_op != claim.prev_operation_id` is
+        # always authoritative.
+        self._active_compaction_op: str | None = None
+
         # Wire this worker's identity into the compaction pipeline so the
         # per-write ownership guard on store_segment can scope each INSERT
         # to the live compaction_operation row.  Done here (post-_worker_id
@@ -1572,20 +1580,28 @@ class ProxyState:
         priority = str(getattr(signal, "priority", "soft") or "soft")
         with self._background_state_lock:
             self._active_compaction_target_end = target_end
-        self._pending_compact = self._compact_pool.submit(
-            self._run_compact_wrapper,
-            history,
-            signal,
-            turn,
-            target_end,
-            turn_id,
-            preexisting_operation_id=preexisting_operation_id,
-        )
+        if preexisting_operation_id is not None:
+            self._active_compaction_op = preexisting_operation_id
+        try:
+            self._pending_compact = self._compact_pool.submit(
+                self._run_compact_wrapper,
+                history,
+                signal,
+                turn,
+                target_end,
+                turn_id,
+                preexisting_operation_id=preexisting_operation_id,
+            )
+        except Exception:
+            if preexisting_operation_id is not None:
+                self._active_compaction_op = None
+            raise
         logger.info(
-            "T%d compaction submitted target_end=%d priority=%s",
+            "T%d compaction submitted target_end=%d priority=%s%s",
             turn,
             target_end,
             priority,
+            f" preexisting_op={preexisting_operation_id}" if preexisting_operation_id else "",
         )
 
     def _queue_compaction(
@@ -2268,6 +2284,8 @@ class ProxyState:
             self._run_compact(history, signal, turn, turn_id=turn_id,
                               preexisting_operation_id=preexisting_operation_id)
         finally:
+            # Always clear the active op so the takeover predicate is unblocked.
+            self._active_compaction_op = None
             follow_up: dict[str, object] | None = None
             with self._background_state_lock:
                 self._last_completed_compaction_target_end = max(
@@ -2488,6 +2506,7 @@ class ProxyState:
             self._queued_compaction_request = None
             self._active_compaction_target_end = -1
             self._last_completed_compaction_target_end = -1
+        self._active_compaction_op = None
         self._total_requests = 0
         self._last_model = ""
 
@@ -2550,6 +2569,7 @@ class ProxyState:
             self._queued_tag_turns = {}
             self._queued_compaction_request = None
             self._active_compaction_target_end = -1
+        self._active_compaction_op = None
 
     def _stop_ingestion_thread(
         self,
