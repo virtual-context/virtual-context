@@ -719,27 +719,80 @@ def test_takeover_on_same_proxystate_resets_compaction_cancelled(tmp_path):
 # Test P1: normal-path compaction must not be misclassified as dead
 # ---------------------------------------------------------------------------
 
-def test_same_worker_live_compaction_not_misclassified_as_dead(tmp_path):
-    """Regression: during a healthy compaction, a second POST on the
-    same worker must NOT classify our own running op as abandoned.
+def test_run_compact_sets_active_op_before_pipeline_runs(tmp_path):
+    """Regression: _run_compact's normal path (preexisting_operation_id=None)
+    must assign self._active_compaction_op immediately after finalizing the
+    operation_id — BEFORE enter_compaction and BEFORE the pipeline's
+    compact_if_needed runs.
 
-    Reproduces the P1 bug where _run_compact's normal path generated
-    operation_id locally but never set _active_compaction_op, leaving
-    the takeover predicate to treat our live op as dead.
+    Without this, a second POST arriving on the same worker sees
+    _active_compaction_op=None, the takeover predicate
+    (self._active_compaction_op == claim.prev_operation_id) mismatches,
+    cleanup_abandoned_compaction runs against our LIVE op, and
+    CompactionLeaseLost fires mid-healthy-compaction.
+
+    This test drives _run_compact directly with a mocked compact_if_needed
+    that captures _active_compaction_op at call time. Reverting the set at
+    state.py:2090 makes the captured value None and fails the assertion.
+    """
+    from tests.test_handle_prepare_payload import _make_proxy_state
+
+    state = _make_proxy_state(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _capture(*args, **kwargs):
+        captured["active_op"] = state._active_compaction_op
+        captured["invoked"] = True
+        return None  # mimic "no-op" compaction
+
+    # Also neutralize enter_compaction so we don't touch the DB lifecycle —
+    # the regression is purely about the in-memory attribute set that must
+    # land BEFORE compact_if_needed. Patch the progress snapshot too so the
+    # post-enter_compaction probe returns a benign value.
+    with patch.object(state.engine, "compact_if_needed", side_effect=_capture), \
+         patch.object(state, "enter_compaction", new_callable=MagicMock), \
+         patch.object(
+             state.engine._store, "read_progress_snapshot",
+             return_value=MagicMock(active_compaction=None),
+         ):
+        state._run_compact(
+            history=[], signal=None, turn=0, turn_id="",
+            preexisting_operation_id=None,
+        )
+
+    assert captured.get("invoked"), (
+        "compact_if_needed was never called — _run_compact exited before "
+        "the assignment could be observed"
+    )
+    assert captured["active_op"] is not None, (
+        "_active_compaction_op was None at compact_if_needed — normal-path "
+        "assignment at state.py:2090 is missing or misplaced. A second POST "
+        "would misclassify this live op as abandoned."
+    )
+    # And after _run_compact returns, it must be cleared (outer-finally).
+    assert state._active_compaction_op is None, (
+        "_run_compact's outer finally must clear _active_compaction_op so "
+        "no stale id leaks to the next compaction"
+    )
+
+
+def test_same_worker_live_compaction_not_misclassified_as_dead(tmp_path):
+    """End-to-end companion to the direct _run_compact test above: with
+    _active_compaction_op pre-set (as the fix ensures), a second POST on
+    the same worker must NOT classify our own running op as abandoned.
     """
     from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
-    from unittest.mock import MagicMock
     from virtual_context.core.canonical_turns import utcnow_iso
 
     state = _make_proxy_state(tmp_path)
     conv = state.engine.config.conversation_id
     inner = _inner_store(state.engine)
 
-    # Seed a healthy running compaction by directly setting _active_compaction_op
-    # and inserting the DB row — simulating _run_compact's normal-path init
-    # (the fix ensures _active_compaction_op is set before enter_compaction).
+    # Simulate _run_compact's post-line-2090 state: _active_compaction_op
+    # set, DB row inserted.
     operation_id = "live-op-xyz"
-    state._active_compaction_op = operation_id  # what the fix ensures
+    state._active_compaction_op = operation_id
     inner.set_phase(conversation_id=conv, lifecycle_epoch=1, phase="compacting")
     now = utcnow_iso()
     with inner._get_conn() as c:
@@ -771,7 +824,6 @@ def test_same_worker_live_compaction_not_misclassified_as_dead(tmp_path):
     assert submit_mock.call_count == 0, (
         "No fresh compaction should spawn — we already own a live one"
     )
-    # And the live compaction_operation row is untouched.
     with inner._get_conn() as c:
         status = c.execute(
             "SELECT status FROM compaction_operation WHERE operation_id=?",

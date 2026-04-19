@@ -81,7 +81,14 @@ class FalkorDBFactStore:
     # FactStore
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         if not facts:
             return 0
         count = 0
@@ -168,7 +175,16 @@ class FalkorDBFactStore:
         )
         return [self._node_to_fact(row[0]) for row in rows]
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
         rows = self._query(
             "MATCH (f:Fact {conversation_id: $conv_id, segment_ref: $seg_ref}) DETACH DELETE f RETURN count(f) as deleted",
             {"conv_id": conversation_id, "seg_ref": segment_ref},
