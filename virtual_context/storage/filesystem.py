@@ -272,7 +272,14 @@ class FilesystemStore(ContextStore):
         tag_dir.mkdir(parents=True, exist_ok=True)
         return tag_dir / f"seg-{safe_ref}.md"
 
-    def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,       # accepted + ignored (no compaction_operation table)
+        owner_worker_id: str | None = None,    # accepted + ignored
+        lifecycle_epoch: int | None = None,    # accepted + ignored
+    ) -> str:
         path = self._segment_path(segment.primary_tag, segment.ref)
         path.write_text(_segment_to_markdown(segment))
         with self._lock:
@@ -570,7 +577,15 @@ class FilesystemStore(ContextStore):
 
         return deleted
 
-    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
+    def save_tag_summary(
+        self,
+        tag_summary: TagSummary,
+        conversation_id: str = "",
+        *,
+        operation_id: str | None = None,       # accepted + ignored (no compaction_operation table)
+        owner_worker_id: str | None = None,    # accepted + ignored
+        lifecycle_epoch: int | None = None,    # accepted + ignored
+    ) -> None:
         ts_dir = self.root / "_tag_summaries"
         ts_dir.mkdir(parents=True, exist_ok=True)
         safe_tag = tag_summary.tag.replace("/", "_").replace("\\", "_").replace("..", "_")
@@ -1028,7 +1043,16 @@ class FilesystemStore(ContextStore):
     ) -> list:
         return []
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,       # accepted + ignored (no compaction_operation table)
+        owner_worker_id: str | None = None,    # accepted + ignored
+        lifecycle_epoch: int | None = None,    # accepted + ignored
+    ) -> tuple[int, int]:
         return 0, 0
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list:
