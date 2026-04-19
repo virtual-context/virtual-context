@@ -2154,265 +2154,285 @@ class ProxyState:
             if self.metrics:
                 self.metrics.record(evt)
 
-        if not self._compaction_lock.acquire(blocking=False):
-            logger.info("Compaction already running for %s — skipping", conversation_id)
-            self._update_compaction_state(
-                operation_id=operation_id,
-                status="skipped",
-                phase="skipped",
-                phase_name="skipped",
-                done=0,
-                total=0,
-                overall_percent=100,
-                phase_detail="compaction already running",
-            )
-            return
-
-        # Enter the DB-backed compaction lifecycle. ``enter_compaction``
-        # is itself epoch-guarded and silently no-ops on mismatch
-        # (leaving no ``compaction_operation`` row), which is why we
-        # observe whether the row was created via the progress snapshot
-        # before deciding to emit a terminal ``exit_compaction``.
-        # Otherwise a concurrent delete+resurrect that flipped our
-        # epoch mid-enter would leave us calling
-        # ``drain_compaction_exit`` against a phase we never owned.
-        #
-        # Takeover path: when preexisting_operation_id is set the caller
-        # has ALREADY inserted the compaction_operation row.  Skip
-        # enter_compaction() entirely and treat phase_index 0 as the
-        # baseline so advance_compaction_phase picks up from there.
-        if preexisting_operation_id is not None:
-            # Takeover path: the pre-inserted row is our responsibility to
-            # close, so we are unconditionally in the lifecycle — no snapshot
-            # probe needed.
-            last_advanced_phase_index = 0
-            entered_lifecycle = True
-        else:
-            try:
-                self.enter_compaction(
-                    phase_count=len(_COMPACT_PHASE_PLAN),
-                    initial_phase_name=_COMPACT_PHASE_PLAN[0],
-                    operation_id=operation_id,
-                )
-                last_advanced_phase_index = 0
-            except Exception:
-                logger.warning(
-                    "enter_compaction failed for %s — continuing legacy path only",
-                    conversation_id[:12],
-                    exc_info=True,
-                )
-            entered_lifecycle = False
-            try:
-                snap_after_enter = self.engine._store.read_progress_snapshot(
-                    conversation_id,
-                )
-                entered_lifecycle = snap_after_enter.active_compaction is not None
-            except Exception:
-                entered_lifecycle = False
-
-        # Spawn the heartbeat sidecar.  It refreshes the compaction_operation
-        # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor
-        # thread runs.  On a failed refresh (epoch mismatch, wrong owner, or
-        # status != 'running') it sets _compaction_cancelled so the progress
-        # callback raises InterruptedError and the compactor aborts cleanly.
-        # The sidecar is stopped (via _compaction_heartbeat_stop) in the
-        # finally block below — regardless of success, exception, or
-        # CompactionLeaseLost.
-        epoch_for_sidecar = int(self.engine._engine_state.lifecycle_epoch)
-        _compaction_heartbeat_stop = threading.Event()
-        _heartbeat_sidecar_thread = threading.Thread(
-            target=self._run_compaction_heartbeat_sidecar,
-            args=(conversation_id, epoch_for_sidecar, operation_id,
-                  _compaction_heartbeat_stop),
-            daemon=True,
-            name="vc-compact-heartbeat",
-        )
-        _heartbeat_sidecar_thread.start()
-
+        # Code-review P1 C1: acquire INSIDE the try so the finally-block's
+        # release is always reachable, even if Thread() or .start() raises
+        # (e.g. RuntimeError under thread exhaustion).  Without this, any
+        # exception between acquire() and the outer try would leave
+        # _compaction_lock permanently held, causing every subsequent
+        # _run_compact to skip via the blocking=False fast-path.
+        acquired = False
         try:
-            t0 = time.monotonic()
-            self._update_compaction_state(
-                operation_id=operation_id,
-                status="running",
-                phase="starting",
-                phase_name="starting",
-                overall_percent=0,
-                done=0,
-                total=0,
-                elapsed_ms=0.0,
-                phase_detail="starting compaction",
-            )
-            try:
-                compact_if_needed = self.engine.compact_if_needed
-                compact_target = getattr(compact_if_needed, "side_effect", None)
-                if not callable(compact_target):
-                    compact_target = compact_if_needed
-                supports_turn_id = True
+            if not self._compaction_lock.acquire(blocking=False):
+                logger.info("Compaction already running for %s — skipping", conversation_id)
+                self._update_compaction_state(
+                    operation_id=operation_id,
+                    status="skipped",
+                    phase="skipped",
+                    phase_name="skipped",
+                    done=0,
+                    total=0,
+                    overall_percent=100,
+                    phase_detail="compaction already running",
+                )
+                return
+            acquired = True
+
+            # Code-review P2.3: reset cancel state from any prior compaction on
+            # this ProxyState so a fresh run (e.g. a post-takeover retry) does
+            # not immediately raise InterruptedError against a stale cancel flag
+            # set by a prior sidecar (e.g. from a heartbeat refresh failure).
+            self._compaction_cancelled.clear()
+
+            # Enter the DB-backed compaction lifecycle. ``enter_compaction``
+            # is itself epoch-guarded and silently no-ops on mismatch
+            # (leaving no ``compaction_operation`` row), which is why we
+            # observe whether the row was created via the progress snapshot
+            # before deciding to emit a terminal ``exit_compaction``.
+            # Otherwise a concurrent delete+resurrect that flipped our
+            # epoch mid-enter would leave us calling
+            # ``drain_compaction_exit`` against a phase we never owned.
+            #
+            # Takeover path: when preexisting_operation_id is set the caller
+            # has ALREADY inserted the compaction_operation row.  Skip
+            # enter_compaction() entirely and treat phase_index 0 as the
+            # baseline so advance_compaction_phase picks up from there.
+            if preexisting_operation_id is not None:
+                # Takeover path: the pre-inserted row is our responsibility to
+                # close, so we are unconditionally in the lifecycle — no snapshot
+                # probe needed.
+                last_advanced_phase_index = 0
+                entered_lifecycle = True
+            else:
                 try:
-                    signature = inspect.signature(compact_target)
-                    supports_turn_id = (
-                        "turn_id" in signature.parameters
-                        or any(
-                            param.kind == inspect.Parameter.VAR_KEYWORD
-                            for param in signature.parameters.values()
-                        )
+                    self.enter_compaction(
+                        phase_count=len(_COMPACT_PHASE_PLAN),
+                        initial_phase_name=_COMPACT_PHASE_PLAN[0],
+                        operation_id=operation_id,
                     )
-                except (TypeError, ValueError):
+                    last_advanced_phase_index = 0
+                except Exception:
+                    logger.warning(
+                        "enter_compaction failed for %s — continuing legacy path only",
+                        conversation_id[:12],
+                        exc_info=True,
+                    )
+                entered_lifecycle = False
+                try:
+                    snap_after_enter = self.engine._store.read_progress_snapshot(
+                        conversation_id,
+                    )
+                    entered_lifecycle = snap_after_enter.active_compaction is not None
+                except Exception:
+                    entered_lifecycle = False
+
+            # Spawn the heartbeat sidecar.  It refreshes the compaction_operation
+            # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor
+            # thread runs.  On a failed refresh (epoch mismatch, wrong owner, or
+            # status != 'running') it sets _compaction_cancelled so the progress
+            # callback raises InterruptedError and the compactor aborts cleanly.
+            # The sidecar is stopped (via _compaction_heartbeat_stop) in the
+            # finally block below — regardless of success, exception, or
+            # CompactionLeaseLost.
+            epoch_for_sidecar = int(self.engine._engine_state.lifecycle_epoch)
+            _compaction_heartbeat_stop = threading.Event()
+            _heartbeat_sidecar_thread = threading.Thread(
+                target=self._run_compaction_heartbeat_sidecar,
+                args=(conversation_id, epoch_for_sidecar, operation_id,
+                      _compaction_heartbeat_stop),
+                daemon=True,
+                name="vc-compact-heartbeat",
+            )
+            _heartbeat_sidecar_thread.start()
+
+            try:
+                t0 = time.monotonic()
+                self._update_compaction_state(
+                    operation_id=operation_id,
+                    status="running",
+                    phase="starting",
+                    phase_name="starting",
+                    overall_percent=0,
+                    done=0,
+                    total=0,
+                    elapsed_ms=0.0,
+                    phase_detail="starting compaction",
+                )
+                try:
+                    compact_if_needed = self.engine.compact_if_needed
+                    compact_target = getattr(compact_if_needed, "side_effect", None)
+                    if not callable(compact_target):
+                        compact_target = compact_if_needed
                     supports_turn_id = True
+                    try:
+                        signature = inspect.signature(compact_target)
+                        supports_turn_id = (
+                            "turn_id" in signature.parameters
+                            or any(
+                                param.kind == inspect.Parameter.VAR_KEYWORD
+                                for param in signature.parameters.values()
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        supports_turn_id = True
 
-                if supports_turn_id:
-                    report = compact_if_needed(
-                        history, signal, progress_callback=_compact_progress,
-                        turn_id=turn_id, operation_id=operation_id,
-                    )
-                else:
-                    report = self.engine.compact_if_needed(
-                        history, signal, progress_callback=_compact_progress,
-                    )
-                compact_ms = round((time.monotonic() - t0) * 1000, 1)
+                    if supports_turn_id:
+                        report = compact_if_needed(
+                            history, signal, progress_callback=_compact_progress,
+                            turn_id=turn_id, operation_id=operation_id,
+                        )
+                    else:
+                        report = self.engine.compact_if_needed(
+                            history, signal, progress_callback=_compact_progress,
+                        )
+                    compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
-                if report is not None:
+                    if report is not None:
+                        logger.info(
+                            "T%d COMPACT %dms freed=%dt segments=%d",
+                            turn, int(compact_ms), report.tokens_freed,
+                            report.segments_compacted,
+                        )
+                        logger.info(
+                            "T%d compaction (%dms): %d segments, freed %d tokens, tags=%s, "
+                            "summaries_built=%d",
+                            turn, int(compact_ms),
+                            report.segments_compacted,
+                            report.tokens_freed,
+                            report.tags,
+                            report.tag_summaries_built,
+                        )
+
+                        # Emit compaction event
+                        if self.metrics:
+                            original_tokens = sum(
+                                r.original_tokens for r in report.results
+                            )
+                            summary_tokens = sum(
+                                r.summary_tokens for r in report.results
+                            )
+                            self.metrics.record({
+                                "type": "compaction",
+                                "turn": turn,
+                                "compact_ms": compact_ms,
+                                "segments": report.segments_compacted,
+                                "tokens_freed": report.tokens_freed,
+                                "original_tokens": original_tokens,
+                                "summary_tokens": summary_tokens,
+                                "tags": report.tags,
+                                "tag_summaries_built": report.tag_summaries_built,
+                                "compacted_prefix_messages": self.engine._engine_state.compacted_prefix_messages,
+                                "conversation_id": conversation_id,
+                                "operation_id": operation_id,
+                            })
+                        self._update_compaction_state(
+                            operation_id=operation_id,
+                            status="completed",
+                            phase="completed",
+                            phase_name="completed",
+                            done=report.segments_compacted,
+                            total=report.segments_compacted,
+                            overall_percent=100,
+                            elapsed_ms=compact_ms,
+                            primary_tag="",
+                            tag="",
+                            phase_detail=f"{report.segments_compacted} segments compacted",
+                            segments=report.segments_compacted,
+                            tokens_freed=report.tokens_freed,
+                            tag_summaries_built=report.tag_summaries_built,
+                        )
+                    else:
+                        logger.info("T%d compaction skipped (no messages to compact)", turn)
+                        self._update_compaction_state(
+                            operation_id=operation_id,
+                            status="skipped",
+                            phase="skipped",
+                            phase_name="skipped",
+                            done=0,
+                            total=0,
+                            overall_percent=100,
+                            elapsed_ms=compact_ms,
+                            phase_detail="no messages to compact",
+                        )
+                    if entered_lifecycle:
+                        try:
+                            self.exit_compaction(success=True)
+                        except Exception:
+                            logger.warning(
+                                "exit_compaction(success=True) failed for %s",
+                                conversation_id[:12],
+                                exc_info=True,
+                            )
+
+                except CompactionLeaseLost as e:
+                    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
                     logger.info(
-                        "T%d COMPACT %dms freed=%dt segments=%d",
-                        turn, int(compact_ms), report.tokens_freed,
-                        report.segments_compacted,
+                        "COMPACTION_WRITE_REJECTED op=%s site=%s elapsed_ms=%.1f",
+                        e.operation_id, e.write_site, elapsed_ms,
                     )
-                    logger.info(
-                        "T%d compaction (%dms): %d segments, freed %d tokens, tags=%s, "
-                        "summaries_built=%d",
-                        turn, int(compact_ms),
-                        report.segments_compacted,
-                        report.tokens_freed,
-                        report.tags,
-                        report.tag_summaries_built,
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="cancelled",
+                        phase="cancelled",
+                        phase_name="cancelled",
+                        overall_percent=None,
+                        elapsed_ms=elapsed_ms,
+                        error=f"lease_lost:{e.write_site}",
+                        phase_detail="compaction aborted on lease loss",
                     )
+                    if entered_lifecycle:
+                        try:
+                            self.exit_compaction(success=False, error_message=str(e))
+                        except Exception:
+                            logger.warning(
+                                "exit_compaction(success=False) failed after lease-lost for conv=%s",
+                                conversation_id[:12], exc_info=True,
+                            )
+                    return
 
-                    # Emit compaction event
+                except Exception as e:
+                    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="failed",
+                        phase="failed",
+                        phase_name="failed",
+                        overall_percent=None,
+                        elapsed_ms=elapsed_ms,
+                        error=str(e),
+                        phase_detail="compaction crashed",
+                    )
                     if self.metrics:
-                        original_tokens = sum(
-                            r.original_tokens for r in report.results
-                        )
-                        summary_tokens = sum(
-                            r.summary_tokens for r in report.results
-                        )
                         self.metrics.record({
-                            "type": "compaction",
+                            "type": "compaction_error",
                             "turn": turn,
-                            "compact_ms": compact_ms,
-                            "segments": report.segments_compacted,
-                            "tokens_freed": report.tokens_freed,
-                            "original_tokens": original_tokens,
-                            "summary_tokens": summary_tokens,
-                            "tags": report.tags,
-                            "tag_summaries_built": report.tag_summaries_built,
-                            "compacted_prefix_messages": self.engine._engine_state.compacted_prefix_messages,
                             "conversation_id": conversation_id,
                             "operation_id": operation_id,
+                            "error": str(e),
+                            "elapsed_ms": elapsed_ms,
                         })
-                    self._update_compaction_state(
-                        operation_id=operation_id,
-                        status="completed",
-                        phase="completed",
-                        phase_name="completed",
-                        done=report.segments_compacted,
-                        total=report.segments_compacted,
-                        overall_percent=100,
-                        elapsed_ms=compact_ms,
-                        primary_tag="",
-                        tag="",
-                        phase_detail=f"{report.segments_compacted} segments compacted",
-                        segments=report.segments_compacted,
-                        tokens_freed=report.tokens_freed,
-                        tag_summaries_built=report.tag_summaries_built,
-                    )
-                else:
-                    logger.info("T%d compaction skipped (no messages to compact)", turn)
-                    self._update_compaction_state(
-                        operation_id=operation_id,
-                        status="skipped",
-                        phase="skipped",
-                        phase_name="skipped",
-                        done=0,
-                        total=0,
-                        overall_percent=100,
-                        elapsed_ms=compact_ms,
-                        phase_detail="no messages to compact",
-                    )
-                if entered_lifecycle:
-                    try:
-                        self.exit_compaction(success=True)
-                    except Exception:
-                        logger.warning(
-                            "exit_compaction(success=True) failed for %s",
-                            conversation_id[:12],
-                            exc_info=True,
-                        )
-
-            except CompactionLeaseLost as e:
-                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-                logger.info(
-                    "COMPACTION_WRITE_REJECTED op=%s site=%s elapsed_ms=%.1f",
-                    e.operation_id, e.write_site, elapsed_ms,
-                )
-                self._update_compaction_state(
-                    operation_id=operation_id,
-                    status="cancelled",
-                    phase="cancelled",
-                    phase_name="cancelled",
-                    overall_percent=None,
-                    elapsed_ms=elapsed_ms,
-                    error=f"lease_lost:{e.write_site}",
-                    phase_detail="compaction aborted on lease loss",
-                )
-                if entered_lifecycle:
-                    try:
-                        self.exit_compaction(success=False, error_message=str(e))
-                    except Exception:
-                        logger.warning(
-                            "exit_compaction(success=False) failed after lease-lost for conv=%s",
-                            conversation_id[:12], exc_info=True,
-                        )
-                return
-
-            except Exception as e:
-                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-                self._update_compaction_state(
-                    operation_id=operation_id,
-                    status="failed",
-                    phase="failed",
-                    phase_name="failed",
-                    overall_percent=None,
-                    elapsed_ms=elapsed_ms,
-                    error=str(e),
-                    phase_detail="compaction crashed",
-                )
-                if self.metrics:
-                    self.metrics.record({
-                        "type": "compaction_error",
-                        "turn": turn,
-                        "conversation_id": conversation_id,
-                        "operation_id": operation_id,
-                        "error": str(e),
-                        "elapsed_ms": elapsed_ms,
-                    })
-                logger.error("compact_if_needed error: %s", e, exc_info=True)
-                if entered_lifecycle:
-                    try:
-                        self.exit_compaction(
-                            success=False, error_message=str(e),
-                        )
-                    except Exception:
-                        logger.warning(
-                            "exit_compaction(success=False) failed for %s",
-                            conversation_id[:12],
-                            exc_info=True,
-                        )
+                    logger.error("compact_if_needed error: %s", e, exc_info=True)
+                    if entered_lifecycle:
+                        try:
+                            self.exit_compaction(
+                                success=False, error_message=str(e),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "exit_compaction(success=False) failed for %s",
+                                conversation_id[:12],
+                                exc_info=True,
+                            )
+            finally:
+                # Signal and join the heartbeat sidecar before releasing the
+                # lock so it cannot fire a spurious cancel after the op ends.
+                _compaction_heartbeat_stop.set()
+                _heartbeat_sidecar_thread.join(timeout=5)
         finally:
-            # Signal and join the heartbeat sidecar before releasing the lock
-            # so it cannot fire a spurious cancel after the operation is done.
-            _compaction_heartbeat_stop.set()
-            _heartbeat_sidecar_thread.join(timeout=5)
-            self._compaction_lock.release()
+            # Outer finally: always release the lock if we acquired it.
+            # This fires even if Thread() or .start() raised before the inner
+            # try was entered (code-review P1 C1 fix).
+            if acquired:
+                self._compaction_lock.release()
 
     def _run_compact_wrapper(
         self,
