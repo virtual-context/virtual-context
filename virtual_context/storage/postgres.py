@@ -2145,32 +2145,58 @@ class PostgresStore(ContextStore):
         lifecycle_epoch: int,
         worker_id: str,
         lease_ttl_s: float,
-    ) -> bool:
-        """Claim the compaction lease for this (conversation, epoch).
+    ) -> "CompactionLeaseClaim":
+        """Postgres flavor — see SQLiteStore docstring for full semantics.
 
-        Works on queued OR running operations. Returns True iff:
-          - Caller already owns the row, OR
-          - Current heartbeat is stale (older than ``lease_ttl_s``).
-        Returns False if another worker holds a fresh lease or no
-        active row exists at the given ``lifecycle_epoch``.
+        Reads (operation_id, owner_worker_id) in a SELECT … FOR UPDATE before
+        applying the conditional UPDATE so the takeover path receives
+        prev_operation_id atomically without a second round-trip.
+
+        Returns a CompactionLeaseClaim with:
+          - claimed=True  iff caller already owns the row OR heartbeat is stale.
+          - prev_operation_id / prev_owner_worker_id from the pre-update row
+            (None when no active row existed at the given lifecycle_epoch).
         """
+        from ..types import CompactionLeaseClaim
+
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(seconds=lease_ttl_s)
         conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE compaction_operation
-               SET owner_worker_id = %s, heartbeat_ts = %s
-             WHERE conversation_id = %s AND status IN ('queued','running')
-               AND lifecycle_epoch = %s
-               AND (owner_worker_id = %s OR heartbeat_ts < %s)
-            """,
-            (
-                worker_id, now, conversation_id, lifecycle_epoch,
-                worker_id, cutoff,
-            ),
+        with conn.transaction():
+            pre = conn.execute(
+                """
+                SELECT operation_id, owner_worker_id
+                  FROM compaction_operation
+                 WHERE conversation_id = %s AND status IN ('queued','running')
+                   AND lifecycle_epoch = %s
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                 FOR UPDATE
+                """,
+                (conversation_id, lifecycle_epoch),
+            ).fetchone()
+            prev_op = str(pre["operation_id"]) if pre else None
+            prev_owner = str(pre["owner_worker_id"]) if pre else None
+
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET owner_worker_id = %s, heartbeat_ts = %s
+                 WHERE conversation_id = %s AND status IN ('queued','running')
+                   AND lifecycle_epoch = %s
+                   AND (owner_worker_id = %s OR heartbeat_ts < %s)
+                """,
+                (
+                    worker_id, now, conversation_id, lifecycle_epoch,
+                    worker_id, cutoff,
+                ),
+            )
+            claimed = (cur.rowcount or 0) > 0
+        return CompactionLeaseClaim(
+            claimed=claimed,
+            prev_operation_id=prev_op,
+            prev_owner_worker_id=prev_owner,
         )
-        return cur.rowcount == 1
 
     def advance_compaction_phase(
         self,
