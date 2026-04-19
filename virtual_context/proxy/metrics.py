@@ -398,7 +398,19 @@ class ProxyMetrics:
                 try:
                     self._on_event(event)
                 except Exception:
-                    pass
+                    # Previously silenced — swallowed SSE broadcast
+                    # failures that would make the dashboard badge stop
+                    # updating without any log trail. Observed 2026-04-19
+                    # on conv 77f110fc when legacy-tagger metrics events
+                    # landed but never reached the browser's SSE stream.
+                    # Log (don't raise) so the record path is unaffected.
+                    logger.warning(
+                        "ProxyMetrics.on_event broadcast failed for "
+                        "event type=%s conv=%s",
+                        event.get("type"),
+                        event.get("conversation_id", "")[:12],
+                        exc_info=True,
+                    )
 
     _STALE_EVENT_TYPES = frozenset((
         "ingested_turn", "history_ingestion",
