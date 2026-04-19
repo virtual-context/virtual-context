@@ -589,6 +589,26 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def cleanup_abandoned_compaction(
+        self,
+        *,
+        conversation_id: str,
+        dead_operation_id: str,
+        new_operation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+    ) -> bool:
+        """Atomic takeover-cleanup transaction.
+
+        Returns True iff this call performed the transition (dead_op was
+        'running' and we abandoned it + inserted new_op). Returns False
+        when the dead_op was already abandoned/completed — idempotent
+        re-run; the new-row INSERT is skipped to preserve the
+        one-active invariant enforced by ``idx_compaction_operation_active``.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Request metadata + phase helpers (epoch-guarded)
     # ------------------------------------------------------------------
