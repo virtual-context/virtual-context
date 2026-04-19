@@ -78,7 +78,14 @@ class Neo4jFactStore:
     # FactStore
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         if not facts:
             return 0
         with self._driver.session() as session:
@@ -178,7 +185,16 @@ class Neo4jFactStore:
             )
             return [self._record_to_fact(record["f"]) for record in result]
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
         with self._driver.session() as session:
             result = session.run(
                 "MATCH (f:Fact {conversation_id: $conv_id, segment_ref: $seg_ref}) DETACH DELETE f RETURN count(f) as deleted",
