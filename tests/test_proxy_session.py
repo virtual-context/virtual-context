@@ -966,10 +966,16 @@ class TestSessionStateMachine:
         engine.config.conversation_id = conversation_id
         engine._turn_tag_index = TurnTagIndex()
         engine._engine_state = EngineState()
+        engine._engine_state.compacted_prefix_messages = 0
         engine._store = MagicMock()
         engine._store.get_all_tags.return_value = []
+        engine._store.iter_untagged_canonical_rows.return_value = []
+        engine._store.complete_ingestion_episode.return_value = True
+        engine._store.set_phase.return_value = True
+        engine.verify_epoch.return_value = None
         engine.config.proxy.history_widening_threshold = 0.10
         engine.config.monitor.context_window = 200000
+        engine.config.monitor.protected_recent_turns = 6
         engine.config.tag_generator.context_lookback_pairs = 3
         engine.config.tag_generator.context_bleed_threshold = 0
         if metrics is None:
@@ -1298,7 +1304,7 @@ class TestSessionStateMachine:
             ),
         }
 
-        def ingest_gap(pairs, progress_callback=None, turn_offset=0):
+        def ingest_gap(pairs, progress_callback=None, turn_offset=0, **kwargs):
             for i in range(0, len(pairs), 2):
                 turn_number = turn_offset + (i // 2)
                 entry = TurnTagEntry(
@@ -1346,7 +1352,7 @@ class TestSessionStateMachine:
         ingestion_calls = []
         progress_events = []
 
-        def slow_ingest(pairs, progress_callback=None, turn_offset=0):
+        def slow_ingest(pairs, progress_callback=None, turn_offset=0, **kwargs):
             """Simulate slow ingestion — record each call's pair count."""
             ingestion_calls.append(len(pairs) // 2)
             # Simulate tagging each pair
@@ -1417,7 +1423,7 @@ class TestSessionStateMachine:
 
         ingestion_calls = []
 
-        def slow_ingest(pairs, progress_callback=None, turn_offset=0):
+        def slow_ingest(pairs, progress_callback=None, turn_offset=0, **kwargs):
             """Simulate slow ingestion — record each call's pair count."""
             ingestion_calls.append(len(pairs) // 2)
             n = len(pairs) // 2
