@@ -825,6 +825,64 @@ class CompositeStore:
             ))
         raise NotImplementedError
 
+    def claim_compaction_lease(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        lease_ttl_s: float,
+    ):
+        fn = getattr(self._segments, "claim_compaction_lease", None)
+        if callable(fn):
+            return fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                lease_ttl_s=lease_ttl_s,
+            )
+        raise NotImplementedError
+
+    def cleanup_abandoned_compaction(
+        self,
+        *,
+        conversation_id: str,
+        dead_operation_id: str,
+        new_operation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+    ) -> bool:
+        fn = getattr(self._segments, "cleanup_abandoned_compaction", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                dead_operation_id=dead_operation_id,
+                new_operation_id=new_operation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                phase_count=phase_count,
+            ))
+        raise NotImplementedError
+
+    def refresh_compaction_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        operation_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "refresh_compaction_heartbeat", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                operation_id=operation_id,
+            ))
+        raise NotImplementedError
+
     def upsert_ingestion_episode(
         self,
         *,
