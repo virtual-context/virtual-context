@@ -760,6 +760,7 @@ class SQLiteStore(ContextStore):
         # and the partial unique index treats both `queued` and `running`
         # as active — only one pending-or-in-flight compaction is allowed
         # per (conversation, lifecycle_epoch) at the DB layer.
+        # ``'abandoned'`` is added to the CHECK for the takeover cleanup path.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS compaction_operation (
                 operation_id      TEXT PRIMARY KEY,
@@ -769,11 +770,12 @@ class SQLiteStore(ContextStore):
                 phase_count       INTEGER NOT NULL,
                 phase_name        TEXT NOT NULL,
                 status            TEXT NOT NULL
-                                  CHECK (status IN ('queued','running','completed','cancelled','failed')),
+                                  CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
                 started_at        TEXT NOT NULL,
                 completed_at      TEXT NULL,
                 owner_worker_id   TEXT NOT NULL,
                 heartbeat_ts      TEXT NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT '',
                 error_message     TEXT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
             )
@@ -783,6 +785,50 @@ class SQLiteStore(ContextStore):
                 ON compaction_operation(conversation_id, lifecycle_epoch)
                 WHERE status IN ('queued','running')
         """)
+        # Migration: compaction_operation — add 'abandoned' to status CHECK
+        # and add created_at column. SQLite cannot ALTER a CHECK constraint
+        # in place, so we detect old schema (missing created_at column) and
+        # recreate the table via the standard rename dance. This is idempotent:
+        # if created_at already exists (new schema), the probe SELECT succeeds
+        # and the migration is skipped.
+        try:
+            conn.execute("SELECT created_at FROM compaction_operation LIMIT 0")
+        except sqlite3.OperationalError:
+            # Old schema: recreate with expanded CHECK + created_at column.
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS compaction_operation_new (
+                    operation_id      TEXT PRIMARY KEY,
+                    conversation_id   TEXT NOT NULL,
+                    lifecycle_epoch   INTEGER NOT NULL,
+                    phase_index       INTEGER NOT NULL DEFAULT 0,
+                    phase_count       INTEGER NOT NULL,
+                    phase_name        TEXT NOT NULL,
+                    status            TEXT NOT NULL
+                                      CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
+                    started_at        TEXT NOT NULL,
+                    completed_at      TEXT NULL,
+                    owner_worker_id   TEXT NOT NULL,
+                    heartbeat_ts      TEXT NOT NULL,
+                    created_at        TEXT NOT NULL DEFAULT '',
+                    error_message     TEXT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                );
+                INSERT INTO compaction_operation_new
+                    (operation_id, conversation_id, lifecycle_epoch,
+                     phase_index, phase_count, phase_name, status,
+                     started_at, completed_at, owner_worker_id, heartbeat_ts,
+                     created_at, error_message)
+                SELECT operation_id, conversation_id, lifecycle_epoch,
+                       phase_index, phase_count, phase_name, status,
+                       started_at, completed_at, owner_worker_id, heartbeat_ts,
+                       '', error_message
+                FROM compaction_operation;
+                DROP TABLE compaction_operation;
+                ALTER TABLE compaction_operation_new RENAME TO compaction_operation;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
+                    ON compaction_operation(conversation_id, lifecycle_epoch)
+                    WHERE status IN ('queued','running');
+            """)
         try:
             conn.executescript(FTS_SQL)
             conn.executescript(FTS_TRIGGER_SQL)
@@ -1249,6 +1295,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             logger.warning("request_context unique index setup failed", exc_info=True)
         try:
             self._ensure_canonical_turn_schema(conn)
+            self._ensure_compaction_scoping_columns(conn)
             self._ensure_canonical_turn_views(conn)
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
@@ -1424,6 +1471,33 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ON canonical_turns (conversation_id, tagged_at)
                    WHERE tagged_at IS NOT NULL"""
         )
+
+    def _ensure_compaction_scoping_columns(self, conn: sqlite3.Connection) -> None:
+        """Add operation_id / compaction_operation_id columns used by the
+        compaction-resume-parity takeover path. Idempotent and race-safe
+        via ``_add_column_if_missing``. Existing rows backfill to the
+        zero-UUID sentinel ``00000000-0000-0000-0000-000000000000`` per
+        the approved spec (line 61-63 + rollout line 397-401). Cleanup
+        predicates scope on ``operation_id = :target`` so zero-UUID rows
+        are invisible to cleanup — they never match a real compaction's
+        UUID.
+        """
+        zero_uuid = "00000000-0000-0000-0000-000000000000"
+        for table, column, definition in (
+            ("segments", "operation_id", "TEXT"),
+            ("facts", "operation_id", "TEXT"),
+            ("tag_summaries", "operation_id", "TEXT"),
+            ("tag_summary_embeddings", "operation_id", "TEXT"),
+            ("canonical_turns", "compaction_operation_id", "TEXT"),
+        ):
+            self._add_column_if_missing(conn, table, column, definition)
+            # Backfill pre-migration rows to the zero-UUID sentinel.
+            # Idempotent: UPDATE ... WHERE <col> IS NULL matches zero rows
+            # on second run.
+            conn.execute(
+                f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL",
+                (zero_uuid,),
+            )
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
         conn = self._get_conn()
@@ -1638,7 +1712,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 counter_rows,
             )
 
-    def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
+        from ..types import CompactionLeaseLost
         conn = self._get_conn()
         primary_tag = segment.primary_tag
         summary_text = segment.summary
@@ -1659,33 +1741,86 @@ CREATE TABLE IF NOT EXISTS request_captures (
             metadata_dict["session_date"] = segment.metadata.session_date
         metadata_json = json.dumps(metadata_dict)
 
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO segments
-                (ref, conversation_id, primary_tag, summary, full_text, messages_json,
-                 metadata_json, summary_tokens, full_tokens, compression_ratio,
-                 compaction_model, created_at, start_timestamp, end_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    segment.ref,
-                    segment.conversation_id,
-                    primary_tag,
-                    summary_text,
-                    full_text,
-                    json.dumps(segment.messages, default=str),
-                    metadata_json,
-                    segment.summary_tokens,
-                    segment.full_tokens,
-                    segment.compression_ratio,
-                    segment.compaction_model,
-                    _dt_to_str(segment.created_at),
-                    _dt_to_str(segment.start_timestamp),
-                    _dt_to_str(segment.end_timestamp),
-                ),
-            )
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                cur = conn.execute(
+                    """INSERT OR REPLACE INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp,
+                     operation_id)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                      FROM compaction_operation
+                     WHERE operation_id = ?
+                       AND conversation_id = ?
+                       AND status = 'running'
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?""",
+                    (
+                        segment.ref,
+                        segment.conversation_id,
+                        primary_tag,
+                        summary_text,
+                        full_text,
+                        json.dumps(segment.messages, default=str),
+                        metadata_json,
+                        segment.summary_tokens,
+                        segment.full_tokens,
+                        segment.compression_ratio,
+                        segment.compaction_model,
+                        _dt_to_str(segment.created_at),
+                        _dt_to_str(segment.start_timestamp),
+                        _dt_to_str(segment.end_timestamp),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id,
+                        segment.conversation_id,
+                        owner_worker_id,
+                        lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_segment",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT OR REPLACE INTO segments
+                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                     metadata_json, summary_tokens, full_tokens, compression_ratio,
+                     compaction_model, created_at, start_timestamp, end_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        segment.ref,
+                        segment.conversation_id,
+                        primary_tag,
+                        summary_text,
+                        full_text,
+                        json.dumps(segment.messages, default=str),
+                        metadata_json,
+                        segment.summary_tokens,
+                        segment.full_tokens,
+                        segment.compression_ratio,
+                        segment.compaction_model,
+                        _dt_to_str(segment.created_at),
+                        _dt_to_str(segment.start_timestamp),
+                        _dt_to_str(segment.end_timestamp),
+                    ),
+                )
 
-            # Update tags
+            # Update tags (same for both paths)
             conn.execute("DELETE FROM segment_tags WHERE segment_ref = ?", (segment.ref,))
             for tag in segment.tags:
                 conn.execute(
@@ -1694,6 +1829,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
 
             conn.execute("COMMIT")
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -2703,9 +2841,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
         worker_id: str,
         phase_count: int,
         phase_name: str,
+        operation_id: str | None = None,
     ) -> str:
         """Insert a fresh ``compaction_operation`` row in ``'queued'``
         status. Returns the new ``operation_id`` (UUID string).
+
+        If *operation_id* is provided the caller's value is used verbatim
+        (no auto-generation). This is required so that the row PK matches
+        the id already threaded into per-write guard kwargs by the caller.
 
         Raises ``sqlite3.IntegrityError`` (via the partial unique index
         on status IN ('queued','running')) if another active operation
@@ -2713,7 +2856,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         expected to retry or wait.
         """
         import uuid
-        op_id = str(uuid.uuid4())
+        op_id = operation_id if operation_id is not None else str(uuid.uuid4())
         now = utcnow_iso()
         with self._get_conn() as conn:
             conn.execute(
@@ -2738,20 +2881,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
         lifecycle_epoch: int,
         worker_id: str,
         lease_ttl_s: float,
-    ) -> bool:
+    ) -> "CompactionLeaseClaim":
         """Claim the compaction lease for this (conversation, epoch).
 
-        Works on queued OR running operations. Returns True iff:
-          - Caller already owns the row, OR
-          - Current heartbeat is stale (older than ``lease_ttl_s``).
-        Returns False if another worker holds a fresh lease or no active
-        row exists at the given ``lifecycle_epoch``.
+        Returns ``CompactionLeaseClaim`` carrying both the claim decision
+        AND the previous row's identity, so the takeover path can scope
+        cleanup on ``prev_operation_id`` without a second round-trip.
+
+        Atomic flow inside a single transaction:
+
+        1. Read the current `(operation_id, owner_worker_id, heartbeat_ts)`
+           of the unique queued/running row at this epoch.
+        2. If the caller already owns it OR heartbeat is older than TTL,
+           UPDATE to set owner=caller, heartbeat=NOW().
+        3. Return claim reflecting pre-update ``prev_operation_id`` /
+           ``prev_owner_worker_id`` and whether the UPDATE hit a row.
         """
+        from ..types import CompactionLeaseClaim
+        import datetime as _dt
+
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=lease_ttl_s)
         ).isoformat()
         now = utcnow_iso()
         with self._get_conn() as conn:
+            pre = conn.execute(
+                """
+                SELECT operation_id, owner_worker_id, heartbeat_ts
+                  FROM compaction_operation
+                 WHERE conversation_id = ? AND status IN ('queued','running')
+                   AND lifecycle_epoch = ?
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                (conversation_id, lifecycle_epoch),
+            ).fetchone()
+            prev_op = pre["operation_id"] if pre else None
+            prev_owner = pre["owner_worker_id"] if pre else None
+
             cur = conn.execute(
                 """
                 UPDATE compaction_operation
@@ -2765,7 +2932,121 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     worker_id, cutoff,
                 ),
             )
-            return cur.rowcount == 1
+            claimed = (cur.rowcount or 0) > 0
+            self._commit_if_unlocked(conn)
+
+        return CompactionLeaseClaim(
+            claimed=claimed,
+            prev_operation_id=prev_op,
+            prev_owner_worker_id=prev_owner,
+        )
+
+    def cleanup_abandoned_compaction(
+        self,
+        *,
+        conversation_id: str,
+        dead_operation_id: str,
+        new_operation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+    ) -> bool:
+        """Atomic takeover-cleanup transaction. Returns True iff this call
+        performed the transition (dead_op was 'running' and we abandoned
+        it + inserted new_op). Returns False when the dead_op was already
+        abandoned/completed — the caller (or a prior duplicate call) had
+        already handled the takeover; skip the new-row INSERT so the
+        one-active invariant holds.
+
+        Ordering inside the single transaction:
+
+        1. UPDATE dead_op to 'abandoned'. Use rowcount to decide whether
+           this is a fresh takeover (> 0) or an idempotent re-run (== 0).
+        2. DELETE scoped partial writes from segments/facts/tag_summaries/
+           tag_summary_embeddings. (Idempotent: no-ops on already-absent
+           rows. Safe to run even on the idempotent re-run path because
+           there's nothing left to delete.)
+        3. UPDATE canonical_turns to NULL compacted_at / compaction_operation_id
+           where compaction_operation_id = dead_op. (Also idempotent.)
+        4. ONLY IF the dead_op UPDATE in step 1 matched a row, INSERT a
+           fresh running row for new_operation_id. Skipping this INSERT
+           on the idempotent path preserves the unique-active-row
+           invariant (``idx_compaction_operation_active``) and prevents
+           two status='running' rows from coexisting at the same
+           (conversation_id, lifecycle_epoch).
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """UPDATE compaction_operation
+                      SET status = 'abandoned', completed_at = ?
+                    WHERE operation_id = ?
+                      AND conversation_id = ?
+                      AND lifecycle_epoch = ?
+                      AND status = 'running'""",
+                (now, dead_operation_id, conversation_id, lifecycle_epoch),
+            )
+            fresh_takeover = (cur.rowcount or 0) > 0
+            for table in (
+                "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} "
+                    f"WHERE operation_id = ? AND conversation_id = ?",
+                    (dead_operation_id, conversation_id),
+                )
+            conn.execute(
+                """UPDATE canonical_turns
+                      SET compacted_at = NULL,
+                          compaction_operation_id = NULL,
+                          updated_at = ?
+                    WHERE conversation_id = ?
+                      AND compaction_operation_id = ?""",
+                (now, conversation_id, dead_operation_id),
+            )
+            if fresh_takeover:
+                conn.execute(
+                    """INSERT INTO compaction_operation
+                       (operation_id, conversation_id, lifecycle_epoch,
+                        phase_index, phase_count, phase_name, status,
+                        started_at, heartbeat_ts, owner_worker_id, created_at)
+                       VALUES (?, ?, ?, 0, ?, 'starting', 'running',
+                               ?, ?, ?, ?)""",
+                    (
+                        new_operation_id, conversation_id, lifecycle_epoch,
+                        phase_count, now, now, worker_id, now,
+                    ),
+                )
+            self._commit_if_unlocked(conn)
+        return fresh_takeover
+
+    def refresh_compaction_heartbeat(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        operation_id: str,
+    ) -> bool:
+        """Refresh compaction_operation.heartbeat_ts atomically, scoped on
+        (operation_id, lifecycle_epoch, owner_worker_id). Returns True iff
+        the update hit a row. Sidecar callers interpret False as "our
+        claim was stolen" and signal the compactor to abort.
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """UPDATE compaction_operation
+                      SET heartbeat_ts = ?
+                    WHERE operation_id = ?
+                      AND conversation_id = ?
+                      AND lifecycle_epoch = ?
+                      AND owner_worker_id = ?
+                      AND status = 'running'""",
+                (now, operation_id, conversation_id, lifecycle_epoch, worker_id),
+            )
+            self._commit_if_unlocked(conn)
+        return (cur.rowcount or 0) > 0
 
     def advance_compaction_phase(
         self,
@@ -3167,32 +3448,119 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return deleted
 
-    def save_tag_summary(self, tag_summary: TagSummary, conversation_id: str = "") -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO tag_summaries
-            (tag, conversation_id, summary, description, code_refs, summary_tokens, source_segment_refs,
-             source_turn_numbers, source_canonical_turn_ids, covers_through_turn,
-             covers_through_canonical_turn_id, generated_by_turn_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                tag_summary.tag,
-                conversation_id,
-                tag_summary.summary,
-                tag_summary.description,
-                json.dumps(getattr(tag_summary, "code_refs", []) or []),
-                tag_summary.summary_tokens,
-                json.dumps(tag_summary.source_segment_refs),
-                json.dumps(tag_summary.source_turn_numbers),
-                json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
-                tag_summary.covers_through_turn,
-                getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
-                getattr(tag_summary, "generated_by_turn_id", "") or "",
-                _dt_to_str(tag_summary.created_at),
-                _dt_to_str(tag_summary.updated_at),
-            ),
+    def save_tag_summary(
+        self,
+        tag_summary: TagSummary,
+        conversation_id: str = "",
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
         )
-        conn.commit()
+
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                # a row candidate — i.e., when the guard passes.
+                cur = conn.execute(
+                    """INSERT INTO tag_summaries
+                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                     created_at, updated_at, operation_id)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                      FROM compaction_operation
+                     WHERE operation_id = ?
+                       AND conversation_id = ?
+                       AND status = 'running'
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        summary = excluded.summary,
+                        description = excluded.description,
+                        code_refs = excluded.code_refs,
+                        summary_tokens = excluded.summary_tokens,
+                        source_segment_refs = excluded.source_segment_refs,
+                        source_turn_numbers = excluded.source_turn_numbers,
+                        source_canonical_turn_ids = excluded.source_canonical_turn_ids,
+                        covers_through_turn = excluded.covers_through_turn,
+                        covers_through_canonical_turn_id = excluded.covers_through_canonical_turn_id,
+                        generated_by_turn_id = excluded.generated_by_turn_id,
+                        updated_at = excluded.updated_at,
+                        operation_id = excluded.operation_id""",
+                    (
+                        tag_summary.tag,
+                        conversation_id,
+                        tag_summary.summary,
+                        tag_summary.description,
+                        json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                        tag_summary.summary_tokens,
+                        json.dumps(tag_summary.source_segment_refs),
+                        json.dumps(tag_summary.source_turn_numbers),
+                        json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                        tag_summary.covers_through_turn,
+                        getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                        getattr(tag_summary, "generated_by_turn_id", "") or "",
+                        _dt_to_str(tag_summary.created_at),
+                        _dt_to_str(tag_summary.updated_at),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id,
+                        conversation_id,
+                        owner_worker_id,
+                        lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="save_tag_summary",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT OR REPLACE INTO tag_summaries
+                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        tag_summary.tag,
+                        conversation_id,
+                        tag_summary.summary,
+                        tag_summary.description,
+                        json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                        tag_summary.summary_tokens,
+                        json.dumps(tag_summary.source_segment_refs),
+                        json.dumps(tag_summary.source_turn_numbers),
+                        json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                        tag_summary.covers_through_turn,
+                        getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                        getattr(tag_summary, "generated_by_turn_id", "") or "",
+                        _dt_to_str(tag_summary.created_at),
+                        _dt_to_str(tag_summary.updated_at),
+                    ),
+                )
+            conn.execute("COMMIT")
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
         conn = self._get_conn()
@@ -4007,6 +4375,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         canonical_turn_ids: list[str],
         *,
         compacted_at: str | None = None,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> int:
         """Mark compacted_at on all physical rows whose turn_group_number
         matches any of the provided canonical_turn_ids.
@@ -4029,33 +4400,88 @@ CREATE TABLE IF NOT EXISTS request_captures (
         turn_group_number as one of the input ids. turn_group_number < 0
         (legacy rows without explicit grouping) falls back to id-only
         match so we don't accidentally mark unrelated legacy rows.
+
+        Ownership guard: when operation_id/owner_worker_id/lifecycle_epoch
+        are all provided, appends an EXISTS sub-select that verifies the
+        compaction_operation row is still 'running' and owned by this
+        worker. If rowcount == 0, raises CompactionLeaseLost. The
+        turn_group merge-expansion is preserved on BOTH paths.
+        Also sets compaction_operation_id on the guarded path so cleanup
+        can find these rows by operation.
         """
         if not canonical_turn_ids:
             return 0
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         timestamp = compacted_at or _dt_to_str(datetime.now(timezone.utc))
         placeholders = ",".join("?" for _ in canonical_turn_ids)
-        cur = conn.execute(
-            f"""UPDATE canonical_turns
-                SET compacted_at = ?, updated_at = ?
-                WHERE conversation_id = ?
-                  AND (
-                      canonical_turn_id IN ({placeholders})
-                      OR turn_group_number IN (
-                          SELECT DISTINCT turn_group_number
-                            FROM canonical_turns
-                           WHERE conversation_id = ?
-                             AND canonical_turn_id IN ({placeholders})
-                             AND turn_group_number >= 0
+
+        if guard_all:
+            cur = conn.execute(
+                f"""UPDATE canonical_turns
+                    SET compacted_at = ?, updated_at = ?,
+                        compaction_operation_id = ?
+                    WHERE conversation_id = ?
+                      AND (
+                          canonical_turn_id IN ({placeholders})
+                          OR turn_group_number IN (
+                              SELECT DISTINCT turn_group_number
+                                FROM canonical_turns
+                               WHERE conversation_id = ?
+                                 AND canonical_turn_id IN ({placeholders})
+                                 AND turn_group_number >= 0
+                          )
                       )
-                  )""",
-            [
-                timestamp, timestamp, conversation_id,
-                *canonical_turn_ids, conversation_id, *canonical_turn_ids,
-            ],
-        )
-        self._commit_if_unlocked(conn)
-        return int(cur.rowcount or 0)
+                      AND EXISTS (
+                          SELECT 1 FROM compaction_operation
+                           WHERE operation_id = ?
+                             AND conversation_id = ?
+                             AND status = 'running'
+                             AND owner_worker_id = ?
+                             AND lifecycle_epoch = ?
+                      )""",
+                [
+                    timestamp, timestamp, operation_id, conversation_id,
+                    *canonical_turn_ids, conversation_id, *canonical_turn_ids,
+                    operation_id, conversation_id, owner_worker_id, lifecycle_epoch,
+                ],
+            )
+            self._commit_if_unlocked(conn)
+            if (cur.rowcount or 0) == 0:
+                raise CompactionLeaseLost(
+                    operation_id=operation_id,
+                    write_site="mark_canonical_turns_compacted",
+                )
+            return int(cur.rowcount)
+        else:
+            cur = conn.execute(
+                f"""UPDATE canonical_turns
+                    SET compacted_at = ?, updated_at = ?
+                    WHERE conversation_id = ?
+                      AND (
+                          canonical_turn_id IN ({placeholders})
+                          OR turn_group_number IN (
+                              SELECT DISTINCT turn_group_number
+                                FROM canonical_turns
+                               WHERE conversation_id = ?
+                                 AND canonical_turn_id IN ({placeholders})
+                                 AND turn_group_number >= 0
+                          )
+                      )""",
+                [
+                    timestamp, timestamp, conversation_id,
+                    *canonical_turn_ids, conversation_id, *canonical_turn_ids,
+                ],
+            )
+            self._commit_if_unlocked(conn)
+            return int(cur.rowcount or 0)
 
     def delete_canonical_turns(
         self,
@@ -4177,42 +4603,112 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # D1: Fact Extraction
     # ------------------------------------------------------------------
 
-    def store_facts(self, facts: list[Fact]) -> int:
+    def store_facts(
+        self,
+        facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         if not facts:
             return 0
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             count = 0
             for fact in facts:
-                conn.execute(
-                    """INSERT OR REPLACE INTO facts
-                    (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                     turn_numbers_json, mentioned_at, session_date, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        fact.id,
-                        fact.subject,
-                        fact.verb,
-                        fact.object,
-                        fact.status,
-                        fact.what,
-                        fact.who,
-                        fact.when_date,
-                        fact.where,
-                        fact.why,
-                        fact.fact_type,
-                        json.dumps(fact.tags),
-                        fact.segment_ref,
-                        fact.conversation_id,
-                        json.dumps(fact.turn_numbers),
-                        _dt_to_str(fact.mentioned_at),
-                        fact.session_date or "",
-                        fact.superseded_by,
-                    ),
-                )
-                # Update fact_tags junction
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the
+                    # compaction_operation row no longer matches
+                    # (status != 'running', owner mismatch, epoch mismatch).
+                    # The same transaction holds the write lock for the entire
+                    # batch, so a concurrent takeover cannot interleave between
+                    # rows. However, a takeover that completes *before* the
+                    # first INSERT fires (at-rest stale) is caught here.
+                    cur = conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                          FROM compaction_operation
+                         WHERE operation_id = ?
+                           AND conversation_id = ?
+                           AND status = 'running'
+                           AND owner_worker_id = ?
+                           AND lifecycle_epoch = ?""",
+                        (
+                            fact.id,
+                            fact.subject,
+                            fact.verb,
+                            fact.object,
+                            fact.status,
+                            fact.what,
+                            fact.who,
+                            fact.when_date,
+                            fact.where,
+                            fact.why,
+                            fact.fact_type,
+                            json.dumps(fact.tags),
+                            fact.segment_ref,
+                            fact.conversation_id,
+                            json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at),
+                            fact.session_date or "",
+                            fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id,
+                            fact.conversation_id,
+                            owner_worker_id,
+                            lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        conn.execute("ROLLBACK")
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="store_facts",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and
+                    # non-compaction write sites.
+                    conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fact.id,
+                            fact.subject,
+                            fact.verb,
+                            fact.object,
+                            fact.status,
+                            fact.what,
+                            fact.who,
+                            fact.when_date,
+                            fact.where,
+                            fact.why,
+                            fact.fact_type,
+                            json.dumps(fact.tags),
+                            fact.segment_ref,
+                            fact.conversation_id,
+                            json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at),
+                            fact.session_date or "",
+                            fact.superseded_by,
+                        ),
+                    )
+                # Update fact_tags junction (same for both paths)
                 conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
                 for tag in fact.tags:
                     conn.execute(
@@ -4222,6 +4718,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 count += 1
             conn.execute("COMMIT")
             return count
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -4328,11 +4827,61 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
-    def replace_facts_for_segment(self, conversation_id: str, segment_ref: str, facts: list) -> tuple[int, int]:
+    def replace_facts_for_segment(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        facts: list,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> tuple[int, int]:
+        """Atomically replace all facts for a segment.
+
+        DELETE and INSERT are executed in a single ``BEGIN IMMEDIATE``
+        transaction so a mid-operation ``CompactionLeaseLost`` rolls back
+        the DELETE rather than leaving pre-existing facts permanently gone.
+
+        When guard kwargs are all provided, the ownership guard is probed
+        via a ``SELECT 1 … WHERE status='running'`` *before* the DELETE.
+        This means a stale worker never deletes facts it has no authority
+        to touch.
+
+        When called without guard kwargs (legacy / non-compaction path),
+        behaviour is unchanged: unconditional DELETE + INSERT.
+        """
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Delete fact_tags first (before facts are removed)
+            if guard_all:
+                # Probe ownership BEFORE the DELETE so we never commit a
+                # DELETE without a matching INSERT.
+                row = conn.execute(
+                    """SELECT 1 FROM compaction_operation
+                       WHERE operation_id = ?
+                         AND conversation_id = ?
+                         AND status = 'running'
+                         AND owner_worker_id = ?
+                         AND lifecycle_epoch = ?""",
+                    (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="replace_facts_for_segment",
+                    )
+
+            # DELETE existing facts (and their tag links) for this segment.
             conn.execute(
                 "DELETE FROM fact_tags WHERE fact_id IN "
                 "(SELECT id FROM facts WHERE conversation_id = ? AND segment_ref = ?)",
@@ -4343,46 +4892,72 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (conversation_id, segment_ref),
             )
             deleted = cursor.rowcount
-            # Insert new facts using same logic as store_facts
-            inserted = 0
+
+            # INSERT new facts inline (same transaction — rolls back the
+            # DELETE if the guard fires on any INSERT).
+            count = 0
             for fact in facts:
-                conn.execute(
-                    """INSERT OR REPLACE INTO facts
-                    (id, subject, verb, object, status, what, who, when_date,
-                     "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                     turn_numbers_json, mentioned_at, session_date, superseded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        fact.id,
-                        fact.subject,
-                        fact.verb,
-                        fact.object,
-                        fact.status,
-                        fact.what,
-                        fact.who,
-                        fact.when_date,
-                        fact.where,
-                        fact.why,
-                        fact.fact_type,
-                        json.dumps(fact.tags),
-                        fact.segment_ref,
-                        fact.conversation_id,
-                        json.dumps(fact.turn_numbers),
-                        _dt_to_str(fact.mentioned_at),
-                        fact.session_date or "",
-                        fact.superseded_by,
-                    ),
-                )
-                # Update fact_tags junction
+                if guard_all:
+                    cur = conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                          FROM compaction_operation
+                         WHERE operation_id = ?
+                           AND conversation_id = ?
+                           AND status = 'running'
+                           AND owner_worker_id = ?
+                           AND lifecycle_epoch = ?""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date or "",
+                            fact.superseded_by,
+                            # WHERE clause params:
+                            operation_id, fact.conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        conn.execute("ROLLBACK")
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="replace_facts_for_segment",
+                        )
+                else:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO facts
+                        (id, subject, verb, object, status, what, who, when_date,
+                         "where", why, fact_type, tags_json, segment_ref, conversation_id,
+                         turn_numbers_json, mentioned_at, session_date, superseded_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                            fact.conversation_id, json.dumps(fact.turn_numbers),
+                            _dt_to_str(fact.mentioned_at), fact.session_date or "",
+                            fact.superseded_by,
+                        ),
+                    )
+                # fact_tags junction (same for both paths)
                 conn.execute("DELETE FROM fact_tags WHERE fact_id = ?", (fact.id,))
                 for tag in fact.tags:
                     conn.execute(
                         "INSERT INTO fact_tags (fact_id, tag) VALUES (?, ?)",
                         (fact.id, tag),
                     )
-                inserted += 1
+                count += 1
+
             conn.execute("COMMIT")
-            return deleted, inserted
+            return deleted, count
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -5059,15 +5634,76 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return []
 
     def store_tag_summary_embedding(
-        self, tag: str, conversation_id: str, embedding: list[float],
+        self,
+        tag: str,
+        conversation_id: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
-            VALUES (?, ?, ?)""",
-            (tag, conversation_id, json.dumps(embedding)),
+        from ..types import CompactionLeaseLost
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
         )
-        conn.commit()
+
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the compaction_operation
+                # row no longer matches (status != 'running', owner mismatch, etc).
+                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                # a row candidate — i.e., when the guard passes.
+                cur = conn.execute(
+                    """INSERT INTO tag_summary_embeddings
+                    (tag, conversation_id, embedding_json, operation_id)
+                    SELECT ?, ?, ?, ?
+                      FROM compaction_operation
+                     WHERE operation_id = ?
+                       AND conversation_id = ?
+                       AND status = 'running'
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        embedding_json = excluded.embedding_json,
+                        operation_id = excluded.operation_id""",
+                    (
+                        tag,
+                        conversation_id,
+                        json.dumps(embedding),
+                        operation_id,
+                        # WHERE clause params:
+                        operation_id,
+                        conversation_id,
+                        owner_worker_id,
+                        lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_tag_summary_embedding",
+                    )
+            else:
+                # Legacy unconditional path — existing callers and test harnesses.
+                conn.execute(
+                    """INSERT OR REPLACE INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
+                    VALUES (?, ?, ?)""",
+                    (tag, conversation_id, json.dumps(embedding)),
+                )
+            conn.execute("COMMIT")
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def load_tag_summary_embeddings(
         self, conversation_id: str | None = None,

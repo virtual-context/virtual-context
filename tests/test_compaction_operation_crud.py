@@ -115,10 +115,11 @@ def test_claim_succeeds_when_caller_already_owns(tmp_path: Path):
         conversation_id="c", lifecycle_epoch=1, worker_id="w1",
         phase_count=3, phase_name="init",
     )
-    assert s.claim_compaction_lease(
+    claim = s.claim_compaction_lease(
         conversation_id="c", lifecycle_epoch=1, worker_id="w1",
         lease_ttl_s=30.0,
-    ) is True
+    )
+    assert claim.claimed is True
 
 
 def test_claim_fails_when_other_worker_holds_fresh_lease(tmp_path: Path):
@@ -127,10 +128,11 @@ def test_claim_fails_when_other_worker_holds_fresh_lease(tmp_path: Path):
         conversation_id="c", lifecycle_epoch=1, worker_id="w1",
         phase_count=3, phase_name="init",
     )
-    assert s.claim_compaction_lease(
+    claim = s.claim_compaction_lease(
         conversation_id="c", lifecycle_epoch=1, worker_id="w2",
         lease_ttl_s=30.0,
-    ) is False
+    )
+    assert claim.claimed is False
 
 
 def test_claim_succeeds_when_other_worker_lease_is_stale(tmp_path: Path):
@@ -145,10 +147,11 @@ def test_claim_succeeds_when_other_worker_lease_is_stale(tmp_path: Path):
             "UPDATE compaction_operation SET heartbeat_ts = '2000-01-01T00:00:00+00:00'"
             " WHERE conversation_id = 'c'"
         )
-    assert s.claim_compaction_lease(
+    claim = s.claim_compaction_lease(
         conversation_id="c", lifecycle_epoch=1, worker_id="w2",
         lease_ttl_s=30.0,
-    ) is True
+    )
+    assert claim.claimed is True
     with s._get_conn() as conn:
         owner = conn.execute(
             "SELECT owner_worker_id FROM compaction_operation WHERE conversation_id = 'c'"
@@ -163,10 +166,11 @@ def test_claim_fails_on_different_epoch(tmp_path: Path):
         phase_count=3, phase_name="init",
     )
     # Attempt to claim at epoch=2 — should fail (no active row at epoch 2).
-    assert s.claim_compaction_lease(
+    claim = s.claim_compaction_lease(
         conversation_id="c", lifecycle_epoch=2, worker_id="w1",
         lease_ttl_s=30.0,
-    ) is False
+    )
+    assert claim.claimed is False
 
 
 # ----------------------------------------------------------------------
