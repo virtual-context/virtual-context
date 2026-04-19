@@ -760,6 +760,7 @@ class SQLiteStore(ContextStore):
         # and the partial unique index treats both `queued` and `running`
         # as active — only one pending-or-in-flight compaction is allowed
         # per (conversation, lifecycle_epoch) at the DB layer.
+        # ``'abandoned'`` is added to the CHECK for the takeover cleanup path.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS compaction_operation (
                 operation_id      TEXT PRIMARY KEY,
@@ -769,11 +770,12 @@ class SQLiteStore(ContextStore):
                 phase_count       INTEGER NOT NULL,
                 phase_name        TEXT NOT NULL,
                 status            TEXT NOT NULL
-                                  CHECK (status IN ('queued','running','completed','cancelled','failed')),
+                                  CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
                 started_at        TEXT NOT NULL,
                 completed_at      TEXT NULL,
                 owner_worker_id   TEXT NOT NULL,
                 heartbeat_ts      TEXT NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT '',
                 error_message     TEXT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
             )
@@ -783,6 +785,50 @@ class SQLiteStore(ContextStore):
                 ON compaction_operation(conversation_id, lifecycle_epoch)
                 WHERE status IN ('queued','running')
         """)
+        # Migration: compaction_operation — add 'abandoned' to status CHECK
+        # and add created_at column. SQLite cannot ALTER a CHECK constraint
+        # in place, so we detect old schema (missing created_at column) and
+        # recreate the table via the standard rename dance. This is idempotent:
+        # if created_at already exists (new schema), the probe SELECT succeeds
+        # and the migration is skipped.
+        try:
+            conn.execute("SELECT created_at FROM compaction_operation LIMIT 0")
+        except sqlite3.OperationalError:
+            # Old schema: recreate with expanded CHECK + created_at column.
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS compaction_operation_new (
+                    operation_id      TEXT PRIMARY KEY,
+                    conversation_id   TEXT NOT NULL,
+                    lifecycle_epoch   INTEGER NOT NULL,
+                    phase_index       INTEGER NOT NULL DEFAULT 0,
+                    phase_count       INTEGER NOT NULL,
+                    phase_name        TEXT NOT NULL,
+                    status            TEXT NOT NULL
+                                      CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
+                    started_at        TEXT NOT NULL,
+                    completed_at      TEXT NULL,
+                    owner_worker_id   TEXT NOT NULL,
+                    heartbeat_ts      TEXT NOT NULL,
+                    created_at        TEXT NOT NULL DEFAULT '',
+                    error_message     TEXT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                );
+                INSERT INTO compaction_operation_new
+                    (operation_id, conversation_id, lifecycle_epoch,
+                     phase_index, phase_count, phase_name, status,
+                     started_at, completed_at, owner_worker_id, heartbeat_ts,
+                     created_at, error_message)
+                SELECT operation_id, conversation_id, lifecycle_epoch,
+                       phase_index, phase_count, phase_name, status,
+                       started_at, completed_at, owner_worker_id, heartbeat_ts,
+                       '', error_message
+                FROM compaction_operation;
+                DROP TABLE compaction_operation;
+                ALTER TABLE compaction_operation_new RENAME TO compaction_operation;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
+                    ON compaction_operation(conversation_id, lifecycle_epoch)
+                    WHERE status IN ('queued','running');
+            """)
         try:
             conn.executescript(FTS_SQL)
             conn.executescript(FTS_TRIGGER_SQL)
@@ -2825,6 +2871,85 @@ CREATE TABLE IF NOT EXISTS request_captures (
             prev_operation_id=prev_op,
             prev_owner_worker_id=prev_owner,
         )
+
+    def cleanup_abandoned_compaction(
+        self,
+        *,
+        conversation_id: str,
+        dead_operation_id: str,
+        new_operation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        phase_count: int,
+    ) -> bool:
+        """Atomic takeover-cleanup transaction. Returns True iff this call
+        performed the transition (dead_op was 'running' and we abandoned
+        it + inserted new_op). Returns False when the dead_op was already
+        abandoned/completed — the caller (or a prior duplicate call) had
+        already handled the takeover; skip the new-row INSERT so the
+        one-active invariant holds.
+
+        Ordering inside the single transaction:
+
+        1. UPDATE dead_op to 'abandoned'. Use rowcount to decide whether
+           this is a fresh takeover (> 0) or an idempotent re-run (== 0).
+        2. DELETE scoped partial writes from segments/facts/tag_summaries/
+           tag_summary_embeddings. (Idempotent: no-ops on already-absent
+           rows. Safe to run even on the idempotent re-run path because
+           there's nothing left to delete.)
+        3. UPDATE canonical_turns to NULL compacted_at / compaction_operation_id
+           where compaction_operation_id = dead_op. (Also idempotent.)
+        4. ONLY IF the dead_op UPDATE in step 1 matched a row, INSERT a
+           fresh running row for new_operation_id. Skipping this INSERT
+           on the idempotent path preserves the unique-active-row
+           invariant (``idx_compaction_operation_active``) and prevents
+           two status='running' rows from coexisting at the same
+           (conversation_id, lifecycle_epoch).
+        """
+        now = utcnow_iso()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """UPDATE compaction_operation
+                      SET status = 'abandoned', completed_at = ?
+                    WHERE operation_id = ?
+                      AND conversation_id = ?
+                      AND lifecycle_epoch = ?
+                      AND status = 'running'""",
+                (now, dead_operation_id, conversation_id, lifecycle_epoch),
+            )
+            fresh_takeover = (cur.rowcount or 0) > 0
+            for table in (
+                "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} "
+                    f"WHERE operation_id = ? AND conversation_id = ?",
+                    (dead_operation_id, conversation_id),
+                )
+            conn.execute(
+                """UPDATE canonical_turns
+                      SET compacted_at = NULL,
+                          compaction_operation_id = NULL,
+                          updated_at = ?
+                    WHERE conversation_id = ?
+                      AND compaction_operation_id = ?""",
+                (now, conversation_id, dead_operation_id),
+            )
+            if fresh_takeover:
+                conn.execute(
+                    """INSERT INTO compaction_operation
+                       (operation_id, conversation_id, lifecycle_epoch,
+                        phase_index, phase_count, phase_name, status,
+                        started_at, heartbeat_ts, owner_worker_id, created_at)
+                       VALUES (?, ?, ?, 0, ?, 'starting', 'running',
+                               ?, ?, ?, ?)""",
+                    (
+                        new_operation_id, conversation_id, lifecycle_epoch,
+                        phase_count, now, now, worker_id, now,
+                    ),
+                )
+            self._commit_if_unlocked(conn)
+        return fresh_takeover
 
     def advance_compaction_phase(
         self,
