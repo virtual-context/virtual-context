@@ -12,7 +12,7 @@ from pathlib import Path
 
 from virtual_context.core.canonical_turns import utcnow_iso
 from virtual_context.storage.sqlite import SQLiteStore
-from virtual_context.types import Fact, SegmentMetadata, StoredSegment
+from virtual_context.types import Fact, SegmentMetadata, StoredSegment, TagSummary
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -232,3 +232,92 @@ def test_store_facts_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path):
             "SELECT COUNT(*) FROM facts WHERE conversation_id='c'"
         ).fetchone()[0]
     assert n == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 12: per-write ownership guard on save_tag_summary
+# ---------------------------------------------------------------------------
+
+def _tag_summary(tag: str) -> TagSummary:
+    return TagSummary(
+        tag=tag,
+        summary="Summary of " + tag,
+        summary_tokens=10,
+        source_segment_refs=["seg-1"],
+        source_turn_numbers=[1],
+        covers_through_turn=1,
+    )
+
+
+def test_save_tag_summary_write_succeeds_while_operation_running(tmp_path: Path):
+    """UPSERT with guard kwargs succeeds when the operation is still running."""
+    store = SQLiteStore(tmp_path / "tag_summary_ok.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-ts-1", worker="w")
+
+    store.save_tag_summary(
+        _tag_summary("python"),
+        conversation_id="c",
+        operation_id="op-ts-1",
+        owner_worker_id="w",
+        lifecycle_epoch=1,
+    )
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summaries WHERE tag='python' AND conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 1
+
+
+def test_save_tag_summary_raises_lease_lost_when_operation_abandoned(tmp_path: Path):
+    """Guard raises CompactionLeaseLost with write_site=='save_tag_summary'
+    when the operation has been marked abandoned before the write.
+    """
+    import pytest
+    from virtual_context.types import CompactionLeaseLost
+
+    store = SQLiteStore(tmp_path / "tag_summary_abandon.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+    _seed_running(store, "c", "op-ts-2", worker="w")
+
+    # Simulate takeover: mark op as abandoned.
+    with store._get_conn() as conn:
+        conn.execute(
+            "UPDATE compaction_operation SET status='abandoned' "
+            "WHERE operation_id='op-ts-2'",
+        )
+
+    with pytest.raises(CompactionLeaseLost) as exc_info:
+        store.save_tag_summary(
+            _tag_summary("python-ghost"),
+            conversation_id="c",
+            operation_id="op-ts-2",
+            owner_worker_id="w",
+            lifecycle_epoch=1,
+        )
+    assert exc_info.value.operation_id == "op-ts-2"
+    assert exc_info.value.write_site == "save_tag_summary"
+
+    # Zero rows persisted.
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summaries WHERE tag='python-ghost'"
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_save_tag_summary_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path):
+    """Callers that omit guard kwargs use the unconditional UPSERT path.
+    Existing test harnesses and non-compaction call sites must not break.
+    """
+    store = SQLiteStore(tmp_path / "tag_summary_legacy.db")
+    store.upsert_conversation(tenant_id="t", conversation_id="c")
+
+    store.save_tag_summary(_tag_summary("legacy-tag"), conversation_id="c")
+
+    with store._get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tag_summaries WHERE tag='legacy-tag' AND conversation_id='c'"
+        ).fetchone()[0]
+    assert n == 1

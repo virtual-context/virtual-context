@@ -480,7 +480,17 @@ class CompactionPipeline:
                     )
 
                     for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(ts, conversation_id=self._config.conversation_id)
+                        self._store.save_tag_summary(
+                            ts,
+                            conversation_id=self._config.conversation_id,
+                            operation_id=operation_id,
+                            owner_worker_id=self._worker_id,
+                            lifecycle_epoch=(
+                                int(self._engine_state.lifecycle_epoch)
+                                if operation_id is not None and self._worker_id is not None
+                                else None
+                            ),
+                        )
                         # Compute and store tag summary embedding for RRF scoring
                         try:
                             embed_fn = self._semantic.get_embed_fn()
