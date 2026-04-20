@@ -575,6 +575,113 @@ class ProxyState:
             status=c.status,
         ))
 
+    def _finalize_ingestion_if_complete(self, conversation_id: str) -> bool:
+        """Self-heal an ingestion episode whose tagging completed but whose
+        finalization never ran.
+
+        Two failure modes this recovers from:
+
+        1. **REST single-turn flow** (e.g. cron POSTing
+           ``/api/v1/context/prepare`` + ``/api/v1/context/ingest``): the
+           REST handler tags the turn via
+           ``fire_turn_complete → _run_tag_turn`` and never enters the
+           legacy ingestion thread, so ``_finalize_legacy_ingestion``
+           never runs. ``conversations.phase`` stays at ``'ingesting'``
+           and ``ingestion_episode.status`` stays at ``'running'``
+           forever.
+
+        2. **Crashed worker mid-ingest, no further work arrives**: the
+           legacy thread finished tagging but the worker died before the
+           ``finally`` block called ``_finalize_legacy_ingestion``. The
+           next POST's ``handle_prepare_payload`` sees
+           ``total_ingestible == done_ingestible`` and short-circuits
+           back to the caller without finalizing, because the existing
+           init→active branch only fires on ``phase == 'init'``. The
+           lease eventually goes stale but nobody claims it because no
+           code path asks to.
+
+        Contract: callable anywhere, idempotent, logs and returns False
+        on any soft failure (stale epoch, another worker owns a fresh
+        lease, untagged rows still present, conversation already past
+        ingesting). Returns True iff this call observably flipped
+        ``phase`` to ``'active'``.
+        """
+        try:
+            epoch = int(self.engine._engine_state.lifecycle_epoch)
+        except Exception:
+            return False
+        store = self.engine._store
+        try:
+            phase = store.get_conversation_phase(conversation_id)
+        except (KeyError, AttributeError, NotImplementedError):
+            return False
+        if phase != "ingesting":
+            return False
+        try:
+            snap = store.read_progress_snapshot(conversation_id)
+        except Exception:
+            return False
+        if snap.total_ingestible != snap.done_ingestible:
+            return False
+        try:
+            claimed = store.claim_ingestion_lease(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                worker_id=self._worker_id,
+                lease_ttl_s=INGESTION_LEASE_TTL_S,
+            )
+        except (AttributeError, NotImplementedError):
+            return False
+        except Exception:
+            logger.warning(
+                "OPPORTUNISTIC_FINALIZE: claim_ingestion_lease raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+            return False
+        if not claimed:
+            return False
+        try:
+            completed = store.complete_ingestion_episode(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                worker_id=self._worker_id,
+            )
+        except Exception:
+            logger.warning(
+                "OPPORTUNISTIC_FINALIZE: complete_ingestion_episode raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+            return False
+        if not completed:
+            return False
+        try:
+            ok = store.set_phase(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                phase="active",
+            )
+        except Exception:
+            logger.warning(
+                "OPPORTUNISTIC_FINALIZE: set_phase raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+            return False
+        if not ok:
+            return False
+        try:
+            self._publish_phase_transition("ingesting", "active")
+        except Exception:
+            logger.warning(
+                "OPPORTUNISTIC_FINALIZE: _publish_phase_transition raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+        logger.info(
+            "OPPORTUNISTIC_FINALIZE conv=%s: stuck 'ingesting' episode finalized; "
+            "phase → 'active'",
+            conversation_id[:12],
+        )
+        return True
+
     def _tagger_run(self) -> bool:
         """Background tagger loop. Processes untagged canonical rows until
         none remain, then completes the episode. Exits cleanly on epoch
@@ -1192,6 +1299,14 @@ class ProxyState:
                     )
                 self._publish_phase_transition("init", "active")
                 phase = "active"
+            elif phase == "ingesting":
+                # Self-heal a stuck episode: tagging completed but no
+                # _finalize_legacy_ingestion ever ran (worker died, or
+                # the REST /prepare+/ingest path which never spawns the
+                # legacy thread). Claim the lease (takes over if stale),
+                # complete the episode, flip phase → active.
+                if self._finalize_ingestion_if_complete(conversation_id):
+                    phase = "active"
             return PhaseDecision(phase=phase, started_tagger=False)
 
         # total_ingestible > done_ingestible: there IS untagged work.
@@ -1962,6 +2077,20 @@ class ProxyState:
 
             self._queue_deferred_tag_split(history, turn)
 
+            # REST single-turn self-heal: the REST ``/api/v1/context/ingest``
+            # handler tags the turn via ``fire_turn_complete`` and never
+            # enters the legacy ingestion thread, so
+            # ``_finalize_legacy_ingestion`` never runs. Attempt
+            # opportunistic finalization here; no-ops when preconditions
+            # fail (phase != ingesting, untagged rows remain, lease taken).
+            try:
+                self._finalize_ingestion_if_complete(conversation_id)
+            except Exception:
+                logger.warning(
+                    "T%d opportunistic finalize raised for conv=%s",
+                    turn, conversation_id[:12], exc_info=True,
+                )
+
         except Exception as e:
             logger.error("tag_turn error: %s", e, exc_info=True)
         finally:
@@ -2075,7 +2204,11 @@ class ProxyState:
             # INSERT and could race or duplicate.
             operation_id = preexisting_operation_id
         else:
-            operation_id = uuid.uuid4().hex[:12]
+            # Full UUID string — Postgres compaction_operation.operation_id is
+            # UUID type and rejects truncated 12-char hex with
+            # InvalidTextRepresentation. SQLite accepts either but we keep the
+            # two backends in lockstep.
+            operation_id = str(uuid.uuid4())
 
         # P1 fix: set BEFORE enter_compaction so same-worker concurrent POSTs
         # see this as "our running compaction" via the takeover predicate
