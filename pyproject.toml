@@ -67,6 +67,15 @@ exclude = [
     ".virtualcontext/",
     "*.db",
     "*.log",
+    # Internal / private — never ship in sdist
+    "CLAUDE.md",
+    "tests_timing_report.md",
+    "tests_by_section.sh",
+    "specs/",
+    "virtual-context.yaml",
+    ".github/",
+    ".gitignore",
+    ".worktrees/",
 ]
 artifacts = [
     "virtual_context/proxy/static/*",
