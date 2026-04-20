@@ -8,6 +8,9 @@ build/
 # Virtual environment
 .venv/
 
+# Infrastructure configs (contains secrets — never commit)
+infrastructure/
+
 # Testing
 .pytest_cache/
 
@@ -27,15 +30,22 @@ scripts/*
 !scripts/install.ps1
 !scripts/install.sh
 
+# Environment files (API keys)
+.env
+
 # Config files (may contain API keys)
 virtual-context-*.yaml
 !virtual-context.yaml.example
 
 # Internal docs
 CHANGELOG.md
+CLAUDE.md
 docs/superpowers/
 docs/competitive-analysis.md
 diagnostics/
+specs/
+tests_timing_report.md
+tests_by_section.sh
 uv.lock
 extraneous/paper/virtual_context_paper_latest.md
 extraneous/paper/data/
