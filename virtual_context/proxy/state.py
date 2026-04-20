@@ -1116,6 +1116,41 @@ class ProxyState:
         # Step 4: phase gate.
         phase = self.engine._store.get_conversation_phase(conversation_id)
 
+        # Invariant repair: phase='compacting' with no active
+        # compaction_operation row is an illegal state. Historically arose
+        # from enter_compaction swallowing a DB INSERT exception (e.g. the
+        # pre-fix UUID schema mismatch where operation_id was 12-char hex
+        # against a Postgres UUID column). Without repair, the takeover
+        # logic below treats None prev_operation_id as "live owner on
+        # another worker" and leaves the conversation stuck forever.
+        # Flip back to 'active' and let normal phase handling continue.
+        if phase == "compacting":
+            try:
+                _snap = self.engine._store.read_progress_snapshot(conversation_id)
+                _has_active_op = _snap.active_compaction is not None
+            except Exception:
+                _has_active_op = True  # fail-safe: don't repair if we can't verify
+            if not _has_active_op:
+                try:
+                    ok = self.engine._store.set_phase(
+                        conversation_id=conversation_id,
+                        lifecycle_epoch=my_epoch,
+                        phase="active",
+                    )
+                except Exception:
+                    ok = False
+                if ok:
+                    try:
+                        self._publish_phase_transition("compacting", "active")
+                    except Exception:
+                        pass
+                    logger.info(
+                        "ORPHAN_COMPACTING_REPAIR conv=%s: phase='compacting' "
+                        "with no active compaction_operation row — flipped to 'active'",
+                        conversation_id[:12],
+                    )
+                    phase = "active"
+
         if phase == "deleted":
             # Resurrect bumps the lifecycle epoch and resets phase to 'init'.
             # Keep the engine's in-memory epoch in lockstep so subsequent
