@@ -2773,6 +2773,100 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             return cur.rowcount == 1
 
+    def find_stale_ingestion_episodes(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        """SQLite mirror of the Postgres helper. See postgres.py for the
+        full contract — returns running ingestion_episode rows whose
+        heartbeat is older than ``grace_s``, joined to a live
+        conversation at matching lifecycle_epoch.
+        """
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_s)).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT ie.episode_id, ie.conversation_id, ie.lifecycle_epoch,
+                       ie.owner_worker_id, ie.heartbeat_ts,
+                       c.tenant_id
+                  FROM ingestion_episode ie
+                  JOIN conversations c
+                    ON c.conversation_id = ie.conversation_id
+                   AND c.lifecycle_epoch = ie.lifecycle_epoch
+                   AND c.phase != 'deleted'
+                 WHERE ie.status = 'running'
+                   AND ie.heartbeat_ts < ?
+                 ORDER BY ie.heartbeat_ts ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            hb = r["heartbeat_ts"] if isinstance(r, sqlite3.Row) else r[4]
+            try:
+                hb_dt = datetime.fromisoformat(hb)
+                age = (datetime.fromisoformat(now_iso) - hb_dt).total_seconds()
+            except Exception:
+                age = 0.0
+            out.append({
+                "episode_id": str(r["episode_id"] if isinstance(r, sqlite3.Row) else r[0]),
+                "conversation_id": str(r["conversation_id"] if isinstance(r, sqlite3.Row) else r[1]),
+                "lifecycle_epoch": int(r["lifecycle_epoch"] if isinstance(r, sqlite3.Row) else r[2]),
+                "tenant_id": str((r["tenant_id"] if isinstance(r, sqlite3.Row) else r[5]) or ""),
+                "owner_worker_id": str((r["owner_worker_id"] if isinstance(r, sqlite3.Row) else r[3]) or ""),
+                "heartbeat_ts": hb,
+                "hb_age_s": float(age),
+            })
+        return out
+
+    def find_stale_compaction_operations(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        """SQLite mirror of the Postgres helper. See postgres.py."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_s)).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT co.operation_id, co.conversation_id, co.lifecycle_epoch,
+                       co.owner_worker_id, co.heartbeat_ts, co.phase_index,
+                       co.phase_count, co.phase_name,
+                       c.tenant_id
+                  FROM compaction_operation co
+                  JOIN conversations c
+                    ON c.conversation_id = co.conversation_id
+                   AND c.lifecycle_epoch = co.lifecycle_epoch
+                   AND c.phase != 'deleted'
+                 WHERE co.status = 'running'
+                   AND co.heartbeat_ts < ?
+                 ORDER BY co.heartbeat_ts ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            hb = r["heartbeat_ts"] if isinstance(r, sqlite3.Row) else r[4]
+            try:
+                hb_dt = datetime.fromisoformat(hb)
+                age = (datetime.fromisoformat(now_iso) - hb_dt).total_seconds()
+            except Exception:
+                age = 0.0
+            out.append({
+                "operation_id": str(r["operation_id"] if isinstance(r, sqlite3.Row) else r[0]),
+                "conversation_id": str(r["conversation_id"] if isinstance(r, sqlite3.Row) else r[1]),
+                "lifecycle_epoch": int(r["lifecycle_epoch"] if isinstance(r, sqlite3.Row) else r[2]),
+                "tenant_id": str((r["tenant_id"] if isinstance(r, sqlite3.Row) else r[8]) or ""),
+                "owner_worker_id": str((r["owner_worker_id"] if isinstance(r, sqlite3.Row) else r[3]) or ""),
+                "heartbeat_ts": hb,
+                "phase_index": int(r["phase_index"] if isinstance(r, sqlite3.Row) else r[5] or 0),
+                "phase_count": int(r["phase_count"] if isinstance(r, sqlite3.Row) else r[6] or 0),
+                "phase_name": str((r["phase_name"] if isinstance(r, sqlite3.Row) else r[7]) or ""),
+                "hb_age_s": float(age),
+            })
+        return out
+
     def complete_ingestion_episode(
         self,
         *,

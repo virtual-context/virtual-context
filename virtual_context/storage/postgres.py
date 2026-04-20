@@ -2171,6 +2171,106 @@ class PostgresStore(ContextStore):
         )
         return cur.rowcount == 1
 
+    def find_stale_ingestion_episodes(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        """List ingestion_episode rows whose heartbeat is older than
+        ``grace_s`` seconds. Used by the background stale-lease sweeper
+        to detect work that was abandoned by a dead worker, so takeover
+        can fire without waiting for a POST.
+
+        Only returns rows where both the episode AND its conversation
+        are live (status='running', conversation not deleted) and the
+        episode's lifecycle_epoch still matches the conversation's —
+        avoiding takeover against stale lifecycles that will be
+        rejected by the epoch guards anyway.
+
+        Returned dicts carry the minimal identifiers + age needed by
+        the sweeper to claim + spawn: ``conversation_id``,
+        ``lifecycle_epoch``, ``tenant_id``, ``episode_id``,
+        ``owner_worker_id``, ``heartbeat_ts``, ``hb_age_s``.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=grace_s)
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT ie.episode_id, ie.conversation_id, ie.lifecycle_epoch,
+                   ie.owner_worker_id, ie.heartbeat_ts,
+                   c.tenant_id,
+                   EXTRACT(EPOCH FROM (NOW() - ie.heartbeat_ts)) AS hb_age_s
+              FROM ingestion_episode ie
+              JOIN conversations c
+                ON c.conversation_id = ie.conversation_id
+               AND c.lifecycle_epoch = ie.lifecycle_epoch
+               AND c.phase <> 'deleted'
+             WHERE ie.status = 'running'
+               AND ie.heartbeat_ts < %s
+             ORDER BY ie.heartbeat_ts ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "episode_id": str(r["episode_id"]),
+                "conversation_id": str(r["conversation_id"]),
+                "lifecycle_epoch": int(r["lifecycle_epoch"]),
+                "tenant_id": str(r["tenant_id"] or ""),
+                "owner_worker_id": str(r["owner_worker_id"] or ""),
+                "heartbeat_ts": r["heartbeat_ts"],
+                "hb_age_s": float(r["hb_age_s"] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def find_stale_compaction_operations(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        """List compaction_operation rows whose heartbeat is older than
+        ``grace_s`` seconds. Symmetric to
+        ``find_stale_ingestion_episodes`` — used by the background
+        stale-lease sweeper to take over abandoned compactions.
+
+        Same liveness guards: only live conversations, matching
+        lifecycle_epoch, status='running' (not queued — queued rows have
+        no running workflow to resume, the start_compaction_operation
+        caller will catch them).
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=grace_s)
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT co.operation_id, co.conversation_id, co.lifecycle_epoch,
+                   co.owner_worker_id, co.heartbeat_ts, co.phase_index,
+                   co.phase_count, co.phase_name,
+                   c.tenant_id,
+                   EXTRACT(EPOCH FROM (NOW() - co.heartbeat_ts)) AS hb_age_s
+              FROM compaction_operation co
+              JOIN conversations c
+                ON c.conversation_id = co.conversation_id
+               AND c.lifecycle_epoch = co.lifecycle_epoch
+               AND c.phase <> 'deleted'
+             WHERE co.status = 'running'
+               AND co.heartbeat_ts < %s
+             ORDER BY co.heartbeat_ts ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "operation_id": str(r["operation_id"]),
+                "conversation_id": str(r["conversation_id"]),
+                "lifecycle_epoch": int(r["lifecycle_epoch"]),
+                "tenant_id": str(r["tenant_id"] or ""),
+                "owner_worker_id": str(r["owner_worker_id"] or ""),
+                "heartbeat_ts": r["heartbeat_ts"],
+                "phase_index": int(r["phase_index"] or 0),
+                "phase_count": int(r["phase_count"] or 0),
+                "phase_name": str(r["phase_name"] or ""),
+                "hb_age_s": float(r["hb_age_s"] or 0.0),
+            }
+            for r in rows
+        ]
+
     def complete_ingestion_episode(
         self,
         *,
