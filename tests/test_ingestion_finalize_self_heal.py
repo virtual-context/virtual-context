@@ -104,6 +104,60 @@ def test_handle_prepare_payload_finalizes_stuck_ingesting_phase(tmp_path: Path):
     assert row[1] is not None, "completed_at must be set"
 
 
+def test_finalize_transitions_session_state_to_active(tmp_path: Path):
+    """After finalize flips phase to 'active', self._state must also be
+    transitioned to SessionState.ACTIVE so the next save_session_state
+    writes 'active' to Redis. Otherwise the dashboard badge (which reads
+    session_state, not phase) stays stuck on 'ingesting' forever.
+    """
+    from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
+    from virtual_context.proxy.state import SessionState
+
+    state = _make_proxy_state(tmp_path)
+    conv = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(seconds=120)
+    inner.set_phase(conversation_id=conv, lifecycle_epoch=1, phase="ingesting")
+    with inner._get_conn() as c:
+        c.execute(
+            """INSERT INTO canonical_turns (
+                 canonical_turn_id, conversation_id, sort_key, turn_hash,
+                 hash_version, user_content, assistant_content,
+                 primary_tag, tags_json, session_date, sender,
+                 first_seen_at, last_seen_at, created_at, updated_at,
+                 turn_group_number, covered_ingestible_entries, tagged_at
+               ) VALUES (?, ?, 0, 'h0', 1, 'u', 'a', 'p', '["p"]',
+                         '2026-04-20', 'user', ?, ?, ?, ?, 0, 1, ?)""",
+            ("ct-0", conv, now.isoformat(), now.isoformat(),
+             now.isoformat(), now.isoformat(), now.isoformat()),
+        )
+        import uuid as _uuid
+        c.execute(
+            """INSERT INTO ingestion_episode (
+                 episode_id, conversation_id, lifecycle_epoch,
+                 raw_payload_entries, started_at, status,
+                 owner_worker_id, heartbeat_ts
+               ) VALUES (?, ?, 1, 1, ?, 'running', ?, ?)""",
+            (str(_uuid.uuid4()), conv, stale.isoformat(),
+             "old-worker-dead", stale.isoformat()),
+        )
+
+    # Simulate the tagger having set _state to INGESTING (the state that
+    # would leak to Redis without the transition fix).
+    state._state = SessionState.INGESTING
+
+    result = state._finalize_ingestion_if_complete(conv)
+
+    assert result is True
+    assert state._state == SessionState.ACTIVE, (
+        f"_state must be transitioned to ACTIVE; got {state._state!r}. "
+        f"Without this, save_session_state would write 'ingesting' to Redis "
+        f"and the dashboard badge would stay stuck."
+    )
+
+
 def test_handle_prepare_payload_skips_finalize_when_untagged_remains(tmp_path: Path):
     """Guard: finalize must NOT fire when there's still untagged work.
     That would complete an episode that isn't actually done.
