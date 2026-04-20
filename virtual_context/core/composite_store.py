@@ -951,6 +951,22 @@ class CompositeStore:
             ))
         raise NotImplementedError
 
+    def find_stale_ingestion_episodes(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        fn = getattr(self._segments, "find_stale_ingestion_episodes", None)
+        if callable(fn):
+            return list(fn(grace_s=grace_s))
+        return []
+
+    def find_stale_compaction_operations(
+        self, *, grace_s: float,
+    ) -> list[dict]:
+        fn = getattr(self._segments, "find_stale_compaction_operations", None)
+        if callable(fn):
+            return list(fn(grace_s=grace_s))
+        return []
+
     def iter_untagged_canonical_rows(
         self,
         *,
