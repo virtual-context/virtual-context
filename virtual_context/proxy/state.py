@@ -675,9 +675,22 @@ class ProxyState:
                 "OPPORTUNISTIC_FINALIZE: _publish_phase_transition raised for conv=%s",
                 conversation_id[:12], exc_info=True,
             )
+        # Sync in-memory session state so the next Redis save_session_state
+        # writes 'active' (dashboard badge source of truth) instead of the
+        # stale 'ingesting' left behind by the tagger. Without this, a REST
+        # single-turn conv shows phase='active' in Postgres but stays
+        # 'ingesting' in the session blob indefinitely.
+        try:
+            if self._state != SessionState.ACTIVE:
+                self._transition_to(SessionState.ACTIVE)
+        except Exception:
+            logger.warning(
+                "OPPORTUNISTIC_FINALIZE: _transition_to(ACTIVE) raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
         logger.info(
             "OPPORTUNISTIC_FINALIZE conv=%s: stuck 'ingesting' episode finalized; "
-            "phase → 'active'",
+            "phase → 'active', session_state → ACTIVE",
             conversation_id[:12],
         )
         return True
