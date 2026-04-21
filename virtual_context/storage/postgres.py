@@ -2308,10 +2308,14 @@ class PostgresStore(ContextStore):
                        c.updated_at,
                        (SELECT COUNT(*) FROM canonical_turns ct
                          WHERE ct.conversation_id = c.conversation_id) AS msg_count,
+                       -- canonical_turns.last_seen_at is TEXT in the
+                       -- post-cutover schema; conversations.*_at are
+                       -- TIMESTAMPTZ. Cast the canonical value up to
+                       -- timestamptz so GREATEST/COALESCE stay typed.
                        GREATEST(
                            c.updated_at,
                            COALESCE(
-                               (SELECT MAX(last_seen_at) FROM canonical_turns ct
+                               (SELECT MAX(last_seen_at)::timestamptz FROM canonical_turns ct
                                  WHERE ct.conversation_id = c.conversation_id),
                                c.created_at
                            )
