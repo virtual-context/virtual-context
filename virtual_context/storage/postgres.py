@@ -2271,6 +2271,88 @@ class PostgresStore(ContextStore):
             for r in rows
         ]
 
+    def find_idle_deletable_conversations(
+        self,
+        *,
+        max_msgs: int,
+        min_age_s: float,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """List conversations eligible for auto-deletion by the sweeper:
+
+          - canonical_turns count < ``max_msgs``
+          - last-activity timestamp older than now - ``min_age_s``
+          - phase NOT in ('deleted', 'compacting')
+          - deleted_at IS NULL
+          - no ``running`` ingestion_episode or compaction_operation
+
+        Intended for cleanup of transient cron/one-shot conversations
+        that never grew past a trivial turn count and are idle long
+        enough that the client's memory has rolled over to a fresh
+        session. Callers resolve the tenant (via conversations.tenant_id
+        or the CloudMetadataStore fallback) and invoke the canonical
+        delete path (``registry.delete_conversation``) per row.
+
+        Returns up to ``limit`` rows ordered oldest-activity-first so
+        the stalest candidates clear first under bounded work.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_age_s)
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            WITH activity AS (
+                SELECT c.conversation_id,
+                       c.tenant_id,
+                       c.phase,
+                       c.created_at,
+                       c.updated_at,
+                       (SELECT COUNT(*) FROM canonical_turns ct
+                         WHERE ct.conversation_id = c.conversation_id) AS msg_count,
+                       GREATEST(
+                           c.updated_at,
+                           COALESCE(
+                               (SELECT MAX(last_seen_at) FROM canonical_turns ct
+                                 WHERE ct.conversation_id = c.conversation_id),
+                               c.created_at
+                           )
+                       ) AS last_activity_at
+                  FROM conversations c
+                 WHERE c.phase NOT IN ('deleted', 'compacting')
+                   AND c.deleted_at IS NULL
+            )
+            SELECT a.conversation_id, a.tenant_id, a.phase,
+                   a.msg_count, a.last_activity_at,
+                   EXTRACT(EPOCH FROM (NOW() - a.last_activity_at)) AS age_s
+              FROM activity a
+             WHERE a.msg_count < %s
+               AND a.last_activity_at < %s
+               AND NOT EXISTS (
+                   SELECT 1 FROM ingestion_episode ie
+                    WHERE ie.conversation_id = a.conversation_id
+                      AND ie.status = 'running'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM compaction_operation co
+                    WHERE co.conversation_id = a.conversation_id
+                      AND co.status IN ('queued', 'running')
+               )
+             ORDER BY a.last_activity_at ASC
+             LIMIT %s
+            """,
+            (int(max_msgs), cutoff, int(limit)),
+        ).fetchall()
+        return [
+            {
+                "conversation_id": str(r["conversation_id"]),
+                "tenant_id": str(r["tenant_id"] or ""),
+                "phase": str(r["phase"] or ""),
+                "msg_count": int(r["msg_count"] or 0),
+                "last_activity_at": r["last_activity_at"],
+                "age_s": float(r["age_s"] or 0.0),
+            }
+            for r in rows
+        ]
+
     def complete_ingestion_episode(
         self,
         *,

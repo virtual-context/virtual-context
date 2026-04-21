@@ -2867,6 +2867,76 @@ CREATE TABLE IF NOT EXISTS request_captures (
             })
         return out
 
+    def find_idle_deletable_conversations(
+        self,
+        *,
+        max_msgs: int,
+        min_age_s: float,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """SQLite mirror of the Postgres helper — see that docstring
+        for the full contract. SQLite datetimes are text-based, so
+        the age computation happens in Python after the SQL select."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=min_age_s)).isoformat()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.conversation_id, c.tenant_id, c.phase,
+                       c.created_at, c.updated_at,
+                       (SELECT COUNT(*) FROM canonical_turns ct
+                         WHERE ct.conversation_id = c.conversation_id) AS msg_count,
+                       (SELECT MAX(last_seen_at) FROM canonical_turns ct
+                         WHERE ct.conversation_id = c.conversation_id) AS ct_last_seen
+                  FROM conversations c
+                 WHERE c.phase NOT IN ('deleted', 'compacting')
+                   AND c.deleted_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM ingestion_episode ie
+                        WHERE ie.conversation_id = c.conversation_id
+                          AND ie.status = 'running'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM compaction_operation co
+                        WHERE co.conversation_id = c.conversation_id
+                          AND co.status IN ('queued', 'running')
+                   )
+                """,
+            ).fetchall()
+
+        def _pick_last_activity(r) -> str:
+            ct_last = r["ct_last_seen"] if isinstance(r, sqlite3.Row) else r[6]
+            updated = r["updated_at"] if isinstance(r, sqlite3.Row) else r[4]
+            created = r["created_at"] if isinstance(r, sqlite3.Row) else r[3]
+            candidates = [x for x in (ct_last, updated, created) if x]
+            return max(candidates) if candidates else ""
+
+        out: list[dict] = []
+        for r in rows:
+            msg_count = int(r["msg_count"] if isinstance(r, sqlite3.Row) else r[5])
+            if msg_count >= max_msgs:
+                continue
+            last_activity = _pick_last_activity(r)
+            if not last_activity or last_activity >= cutoff:
+                continue
+            try:
+                last_dt = datetime.fromisoformat(last_activity)
+                age_s = (now - last_dt).total_seconds()
+            except Exception:
+                age_s = 0.0
+            out.append({
+                "conversation_id": str(r["conversation_id"] if isinstance(r, sqlite3.Row) else r[0]),
+                "tenant_id": str((r["tenant_id"] if isinstance(r, sqlite3.Row) else r[1]) or ""),
+                "phase": str((r["phase"] if isinstance(r, sqlite3.Row) else r[2]) or ""),
+                "msg_count": msg_count,
+                "last_activity_at": last_activity,
+                "age_s": float(age_s),
+            })
+        # Oldest first, bounded by limit.
+        out.sort(key=lambda d: d["age_s"], reverse=True)
+        return out[: int(limit)]
+
     def complete_ingestion_episode(
         self,
         *,

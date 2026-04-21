@@ -967,6 +967,14 @@ class CompositeStore:
             return list(fn(grace_s=grace_s))
         return []
 
+    def find_idle_deletable_conversations(
+        self, *, max_msgs: int, min_age_s: float, limit: int = 1000,
+    ) -> list[dict]:
+        fn = getattr(self._segments, "find_idle_deletable_conversations", None)
+        if callable(fn):
+            return list(fn(max_msgs=max_msgs, min_age_s=min_age_s, limit=limit))
+        return []
+
     def iter_untagged_canonical_rows(
         self,
         *,
