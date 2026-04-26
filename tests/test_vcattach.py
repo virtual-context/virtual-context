@@ -742,6 +742,62 @@ def test_rest_vcattach_clears_target_tombstone_via_undelete():
     assert ("old-conv",) in undelete_args
 
 
+def test_rest_vcattach_error_response_populates_both_error_and_message():
+    """Production-bug fix: REST VCATTACH error responses must populate BOTH
+    `error` (programmatic) AND `message` (human-readable).
+
+    Background: OpenClaw plugin clients render `prepareResult.message`, NOT
+    `prepareResult.error`. A 200 response with only `error` populated is
+    silently swallowed by the plugin. The user sees the LLM answer their
+    raw "VCATTACH X" prompt as if no command was issued.
+
+    Bug shipped via every CORE_CACHE_BUST since the prependContext
+    switchover (`4c89fd9`). Fix: dual-populate so plugin's
+    ``prepareResult.message`` rendering path lights up the error directly.
+
+    This contract applies prospectively to all VC-command error responses
+    (VCMERGE will follow the same shape per its spec §6.2).
+    """
+    import json as _json
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = None  # target has no engine state
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+
+    registry, _provider = _build_rest_registry(
+        labels={"deleted-conv": "Telegram DM"},
+        conv_ids=["old-conv", "deleted-conv"],
+        tombstone=True,
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    response = _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+    body = _json.loads(response.body)
+
+    assert body.get("error"), "expected `error` field for plugin-side / programmatic consumers"
+    assert body.get("message"), (
+        "expected `message` field for plugin clients (OpenClaw and any future "
+        "REST client) that render `prepareResult.message` via prependContext. "
+        "Without `message` the plugin silently swallows the error and the "
+        "user sees the LLM hallucinate as if no command was issued."
+    )
+    # Same content in both fields is acceptable for v1; future v2 may split
+    # `error` into a short code and `message` into prose. The contract is
+    # "both populated", not "byte-identical".
+    assert body["error"] == body["message"], (
+        "v1 contract: `error` and `message` carry the same human-readable "
+        "string. Future versions may diverge but must preserve both fields."
+    )
+
+
 def test_rest_vcattach_rejects_label_pointing_to_deleted_target():
     """Bug #3 in REST path: a label pointing to a tombstoned/no-data
     conversation must be rejected before any alias is written."""

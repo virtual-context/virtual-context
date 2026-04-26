@@ -2309,7 +2309,20 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
         )
 
         if error:
-            return JSONResponse({"conversation_id": conv_id, "vc_command": "attach", "error": error})
+            # Dual-populate `error` (programmatic, for dashboard / structured
+            # consumers) AND `message` (human-readable, for plugin clients
+            # that render `prepareResult.message` via prependContext).
+            # Without `message`, OpenClaw and any future REST client following
+            # the same convention silently swallow VCATTACH errors and the
+            # user sees the LLM hallucinate as if no command was issued.
+            # Bug shipped since `4c89fd9` (prependContext switchover); fixed
+            # via the post-2026-04-26 audit thread surfaced by openclaw.
+            return JSONResponse({
+                "conversation_id": conv_id,
+                "vc_command": "attach",
+                "error": error,
+                "message": error,
+            })
 
         def _invalidate(tid):
             """Non-destructive cache invalidation for a single conversation id.
