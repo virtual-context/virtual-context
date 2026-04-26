@@ -1825,8 +1825,27 @@ async def _handle_vcattach(
                             conv_ids.append(cid)
                 except Exception:
                     pass
+    # Defense-in-depth: reject labels pointing to deleted/nonexistent
+    # conversations. Mirrors the REST path's _target_exists guard so a
+    # stale labels.json entry can't graft an alias onto a corpse.
+    _store_proxy = state.engine._store if state else None
+    _inner_proxy = getattr(_store_proxy, '_store', _store_proxy) if _store_proxy else None
+
+    def _target_exists(tid):
+        if _inner_proxy is None:
+            return True
+        loader = getattr(_inner_proxy, "load_engine_state", None)
+        if not callable(loader):
+            return True
+        try:
+            return loader(tid) is not None
+        except Exception:
+            # Transient store error — fail open.
+            return True
+
     target_id, target_label, error = resolve_target(
         target_raw, result.conversation_id, conv_ids, labels=labels or {},
+        target_exists=_target_exists,
     )
 
     if error:
@@ -2240,25 +2259,108 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
     conv_id = vcconv or result.conversation_id
 
     if cmd == "attach":
-        # VCATTACH has special REST handling — alias, delete, reset
+        # VCATTACH: durable redirect, never destructive.
+        #
+        # Bug autopsy (incident 2026-04-26): the previous _invalidate called
+        # session_state_provider.delete(target_id), which calls
+        # PostgresStore.delete_conversation() — purging 21 tables (segments,
+        # canonical_turns, engine_state, ingest_batches, …) plus the per-conv
+        # media directory. This destroyed 358+ canonical turns of a labeled
+        # live conversation when the user VCATTACHed to it. The fix below
+        # matches the proxy path's non-destructive semantics: in-memory
+        # eviction + tombstone clearance, never row deletion.
         from .vcattach import resolve_target, execute_attach
 
         labels = registry.get_conversation_labels(tenant_id)
         conv_ids = registry.list_persisted_conversation_ids(tenant_id)
-        target_id, target_label, error = resolve_target(arg, conv_id, conv_ids, labels)
+
+        _store = state.engine._store if state else None
+        _inner = getattr(_store, '_store', _store) if _store else None
+
+        def _target_exists(tid):
+            """Defense-in-depth: reject labels that point to deleted convs.
+
+            Checks the Redis session-state tombstone first (fast path for
+            recently deleted conversations) and the durable engine_state
+            row second (catches anything missed by the tombstone TTL or
+            written by a different deletion code path).
+            """
+            provider = getattr(registry, "_session_state_provider", None)
+            if provider is not None:
+                try:
+                    sst = provider.load(tid)
+                    if sst is not None and getattr(sst, "deleted", False):
+                        return False
+                except Exception:
+                    # Fall through to the store-level check.
+                    pass
+            if _inner is not None:
+                loader = getattr(_inner, "load_engine_state", None)
+                if callable(loader):
+                    try:
+                        return loader(tid) is not None
+                    except Exception:
+                        # Transient store error — fail open below.
+                        return True
+            # No way to verify — don't block the user from a valid VCATTACH.
+            return True
+
+        target_id, target_label, error = resolve_target(
+            arg, conv_id, conv_ids, labels, target_exists=_target_exists,
+        )
 
         if error:
             return JSONResponse({"conversation_id": conv_id, "vc_command": "attach", "error": error})
 
-        _store = state.engine._store
-        _inner = getattr(_store, '_store', _store)
-
         def _invalidate(tid):
-            if registry._session_state_provider:
-                try:
-                    registry._session_state_provider.delete(tid)
-                except Exception:
-                    pass
+            """Non-destructive cache invalidation for a single conversation id.
+
+            (1) Pop the tenant-scoped in-memory ProxyState (the cloud's
+                TenantRegistry stores live engines under
+                ``_states[tenant_id][conv_id]``). This is the equivalent of
+                the proxy path's ``SessionRegistry.remove_conversation``.
+                Without this pop, the issuing chat's stale ProxyState keeps
+                serving requests routed by chat_id/sys_hash and ingestion
+                continues writing to the old conversation_id.
+            (2) Clear any Redis session-state tombstone via ``undelete``.
+                Important when re-attaching to a target whose state was
+                previously tombstoned (e.g. by the cloud's
+                tenant.delete_conversation flow): without the clear, the
+                tombstone (TTL 86400s, version 2**53) would block the next
+                load and keep ``_load_from_store`` from rebinding.
+
+            This callback MUST NOT call ``session_state_provider.delete``
+            or ``store.delete_conversation`` — both purge persisted rows,
+            which violates the VCATTACH "durable redirect" contract and
+            destroys user data.
+            """
+            lock = getattr(registry, "_lock", None)
+            states_map = getattr(registry, "_states", None)
+            popped = None
+            if lock is not None and isinstance(states_map, dict):
+                with lock:
+                    tenant_states = states_map.get(tenant_id)
+                    if isinstance(tenant_states, dict):
+                        popped = tenant_states.pop(tid, None)
+            if popped is not None:
+                shutdown = getattr(popped, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        logger.warning(
+                            "VCATTACH: shutdown of evicted state failed for %s",
+                            tid[:12],
+                        )
+            provider = getattr(registry, "_session_state_provider", None)
+            if provider is not None:
+                undelete = getattr(provider, "undelete", None)
+                if callable(undelete):
+                    try:
+                        undelete(tid)
+                    except Exception:
+                        # Idempotent best-effort; missing tombstone = no-op.
+                        pass
 
         execute_attach(
             old_id=conv_id,

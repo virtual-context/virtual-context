@@ -323,7 +323,10 @@ def test_vcattach_preserves_target_engine_state():
 
     assert response.status_code == 200
     assert inner.aliases == [("old-shell-conv", "target-conv")]
-    assert inner.load_called is False
+    # load_engine_state IS now called for the Bug #3 existence check
+    # (defense-in-depth against stale labels). That's a benign read; what
+    # we still guard against is target state being SAVED (i.e. mutated /
+    # restored / merged) by VCATTACH.
     assert inner.save_called is False
 
 
@@ -411,3 +414,401 @@ def test_delete_conversation_alias_missing_is_noop(sqlite_store):
     """Deleting an alias that doesn't exist must not error."""
     sqlite_store.delete_conversation_alias("never-existed")
     assert sqlite_store.resolve_conversation_alias("never-existed") is None
+
+
+# ---------------------------------------------------------------------
+# Regression: cross-team incident 2026-04-26 — VCATTACH destroyed 358+
+# canonical turns of a labeled live conversation. Three connected bugs:
+# (1) REST handler called session_state_provider.delete() which calls
+#     PostgresStore.delete_conversation() (purges 21 tables + media dir).
+# (2) execute_attach only invalidated target_id, never the issuing chat's
+#     stale ProxyState — so ingestion kept writing to old_id.
+# (3) resolve_target accepted any label, even when target had no
+#     persisted state.
+# ---------------------------------------------------------------------
+
+
+# --- Bug #2: execute_attach evicts BOTH old_id and target_id ---
+
+
+def test_execute_attach_invalidates_both_old_and_target():
+    """The registry_invalidate callback must be invoked for both old_id and
+    target_id — old_id so the issuing chat's stale ProxyState is evicted and
+    the next request falls through to alias resolution; target_id so any
+    cached target state cannot shadow a fresh load."""
+    from virtual_context.proxy.vcattach import execute_attach
+
+    invalidated = []
+    store = MagicMock()
+    execute_attach(
+        old_id="old-conv-aaaa",
+        target_id="target-conv-bbbb",
+        store=store,
+        registry_invalidate=lambda cid: invalidated.append(cid),
+    )
+
+    assert "old-conv-aaaa" in invalidated, (
+        "execute_attach must invalidate the issuing session (old_id) — without "
+        "this, the issuing chat's ProxyState keeps engine.config.conversation_id "
+        "== old_id and routing skips alias resolution."
+    )
+    assert "target-conv-bbbb" in invalidated
+
+
+def test_execute_attach_invalidate_failure_is_isolated_per_id():
+    """A failure invalidating one id must not block the other — both ids
+    must always get a chance to be invalidated."""
+    from virtual_context.proxy.vcattach import execute_attach
+
+    seen = []
+
+    def _invalidate(cid):
+        seen.append(cid)
+        if cid == "old-conv":
+            raise RuntimeError("simulated transient error")
+
+    store = MagicMock()
+    execute_attach(
+        old_id="old-conv",
+        target_id="target-conv",
+        store=store,
+        registry_invalidate=_invalidate,
+    )
+    assert "old-conv" in seen
+    assert "target-conv" in seen
+
+
+# --- Bug #3: resolve_target rejects deleted/nonexistent targets ---
+
+
+def test_resolve_target_rejects_nonexistent_target_via_label():
+    """A label pointing to a deleted/tombstoned conversation must be rejected
+    before any alias is written. Defends against stale labels.json entries."""
+    from virtual_context.proxy.vcattach import resolve_target
+
+    target_id, target_label, error = resolve_target(
+        target_raw="Telegram DM",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "deleted-conv"],
+        labels={"deleted-conv": "Telegram DM"},
+        target_exists=lambda tid: False,
+    )
+
+    assert target_id is None
+    assert error  # non-empty
+    # Label echoed back so user sees what failed
+    assert target_label == "Telegram DM"
+
+
+def test_resolve_target_accepts_existing_target_via_label():
+    from virtual_context.proxy.vcattach import resolve_target
+
+    target_id, target_label, error = resolve_target(
+        target_raw="Telegram DM",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "live-conv"],
+        labels={"live-conv": "Telegram DM"},
+        target_exists=lambda tid: True,
+    )
+
+    assert target_id == "live-conv"
+    assert target_label == "Telegram DM"
+    assert error == ""
+
+
+def test_resolve_target_rejects_nonexistent_target_via_uuid():
+    from virtual_context.proxy.vcattach import resolve_target
+
+    target_id, _label, error = resolve_target(
+        target_raw="deleted-conv",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "deleted-conv"],
+        labels={},
+        target_exists=lambda tid: False,
+    )
+    assert target_id is None
+    assert error
+
+
+def test_resolve_target_rejects_nonexistent_target_via_prefix():
+    from virtual_context.proxy.vcattach import resolve_target
+
+    target_id, _label, error = resolve_target(
+        target_raw="deleted",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "deleted-conv-aaa"],
+        labels={},
+        target_exists=lambda tid: False,
+    )
+    assert target_id is None
+    assert error
+
+
+def test_resolve_target_no_existence_check_preserves_old_behavior():
+    """When target_exists is None (default), no existence check happens —
+    backwards compat for existing callers."""
+    from virtual_context.proxy.vcattach import resolve_target
+
+    target_id, target_label, error = resolve_target(
+        target_raw="Telegram DM",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "any-conv"],
+        labels={"any-conv": "Telegram DM"},
+    )
+    assert target_id == "any-conv"
+    assert error == ""
+
+
+def test_resolve_target_existence_check_failsafe_open_on_exception():
+    """If target_exists raises, fail open so transient DB errors don't
+    block legitimate VCATTACHes."""
+    from virtual_context.proxy.vcattach import resolve_target
+
+    def _raises(tid):
+        raise RuntimeError("transient")
+
+    target_id, _label, error = resolve_target(
+        target_raw="Telegram DM",
+        current_id="old-conv",
+        conversation_ids=["old-conv", "live-conv"],
+        labels={"live-conv": "Telegram DM"},
+        target_exists=_raises,
+    )
+    assert target_id == "live-conv"
+    assert error == ""
+
+
+# --- Bug #1: REST handler must NOT destroy target conversation ---
+
+
+def _build_rest_registry(tenant_id="tenant-1", labels=None, conv_ids=None,
+                         in_memory_states=None, tombstone=None):
+    """Build a SimpleNamespace shaped like vc_cloud.tenant.TenantRegistry."""
+    import threading
+    provider = MagicMock()
+    if tombstone is None:
+        provider.load.return_value = None
+    else:
+        provider.load.return_value = SimpleNamespace(deleted=tombstone)
+    return SimpleNamespace(
+        _session_state_provider=provider,
+        _states={tenant_id: dict(in_memory_states or {})},
+        _lock=threading.Lock(),
+        get_conversation_labels=lambda tid: dict(labels or {}),
+        list_persisted_conversation_ids=lambda tid: list(conv_ids or []),
+    ), provider
+
+
+def test_rest_vcattach_does_not_call_session_state_provider_delete():
+    """REST VCATTACH must NEVER invoke session_state_provider.delete().
+
+    The provider's delete() calls store.delete_conversation() which purges
+    21 Postgres tables (segments, canonical_turns, engine_state, …) plus
+    the per-conversation media directory. VCATTACH is a durable redirect:
+    target data must be preserved.
+    """
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+
+    issuing_state = SimpleNamespace(shutdown=MagicMock())
+    registry, provider = _build_rest_registry(
+        labels={"target-conv": "Telegram DM"},
+        conv_ids=["old-conv", "target-conv"],
+        in_memory_states={"old-conv": issuing_state},
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+
+    # Bug #1 guard — destructive paths must NEVER fire from VCATTACH:
+    provider.delete.assert_not_called()
+    inner.delete_conversation.assert_not_called()
+    # Alias must be persisted (the durable redirect).
+    inner.save_conversation_alias.assert_called_once_with("old-conv", "target-conv")
+
+
+def test_rest_vcattach_evicts_issuing_chat_state():
+    """The issuing chat's in-memory ProxyState must be popped from
+    registry._states[tenant_id] so the next request from that chat falls
+    through to alias resolution instead of resolving back to the stale
+    ProxyState whose engine.config.conversation_id == old_id."""
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+
+    issuing_state = SimpleNamespace(shutdown=MagicMock())
+    registry, _provider = _build_rest_registry(
+        labels={"target-conv": "Telegram DM"},
+        conv_ids=["old-conv", "target-conv"],
+        in_memory_states={"old-conv": issuing_state},
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+
+    # Bug #2 fix: issuing chat's state evicted from in-memory map.
+    assert "old-conv" not in registry._states["tenant-1"], (
+        "issuing chat's stale ProxyState was not evicted; the next request "
+        "would route via chat_id/sys_hash back to the same state with the "
+        "old conversation_id."
+    )
+    # Evicted state had its shutdown() called for clean teardown.
+    issuing_state.shutdown.assert_called_once()
+
+
+def test_rest_vcattach_clears_target_tombstone_via_undelete():
+    """If the target had a prior Redis tombstone (e.g. from cloud's
+    tenant.delete_conversation flow), the VCATTACH must clear it via
+    undelete() so a fresh load can succeed against the alias resolver."""
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    # Note: load_engine_state still returns a row — undelete is called on
+    # the tombstone-clearing path regardless of whether one is present.
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+
+    registry, provider = _build_rest_registry(
+        labels={"target-conv": "Telegram DM"},
+        conv_ids=["old-conv", "target-conv"],
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+
+    # Both old_id and target_id receive an undelete (idempotent no-op when
+    # no tombstone is present).
+    undelete_args = [c.args for c in provider.undelete.call_args_list]
+    assert ("target-conv",) in undelete_args
+    assert ("old-conv",) in undelete_args
+
+
+def test_rest_vcattach_rejects_label_pointing_to_deleted_target():
+    """Bug #3 in REST path: a label pointing to a tombstoned/no-data
+    conversation must be rejected before any alias is written."""
+    import json as _json
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = None  # target has no engine state
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+
+    registry, provider = _build_rest_registry(
+        labels={"deleted-conv": "Telegram DM"},
+        conv_ids=["old-conv", "deleted-conv"],
+        tombstone=True,
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    response = _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+
+    # No alias was saved — the attach was rejected.
+    inner.save_conversation_alias.assert_not_called()
+    # Response carries an error string.
+    body = _json.loads(response.body)
+    assert body.get("error"), "expected error in JSONResponse for stale label"
+
+
+# --- Bug #2 / Bug #3: proxy path must also evict and validate ---
+
+
+def test_proxy_vcattach_rejects_label_pointing_to_deleted_target():
+    """Proxy path must reject labels pointing to deleted targets via the
+    same target_exists guard."""
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = None
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+    registry = SimpleNamespace(remove_conversation=lambda cid: None)
+    result = SimpleNamespace(
+        vcattach_label="Telegram DM",
+        conversation_id="old-conv",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH Telegram DM"}],
+    })
+
+    asyncio.run(
+        _handle_vcattach(
+            result, fmt, state, registry,
+            labels={"deleted-conv": "Telegram DM"},
+            conv_ids=["old-conv", "deleted-conv"],
+        )
+    )
+
+    # No alias saved when the target has no persisted state.
+    inner.save_conversation_alias.assert_not_called()
+
+
+def test_proxy_vcattach_evicts_issuing_chat_state():
+    """The proxy path must also invalidate the issuing chat's state via
+    registry.remove_conversation(old_id)."""
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
+    invalidated = []
+    registry = SimpleNamespace(remove_conversation=lambda cid: invalidated.append(cid))
+
+    result = SimpleNamespace(
+        vcattach_label="target-conv",
+        conversation_id="old-conv",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH target-conv"}],
+    })
+
+    asyncio.run(
+        _handle_vcattach(
+            result, fmt, state, registry,
+            labels={},
+            conv_ids=["old-conv", "target-conv"],
+        )
+    )
+
+    assert "old-conv" in invalidated, (
+        "proxy path must evict old_id (issuing chat) — without this, "
+        "the next request from this chat keeps routing to the stale state."
+    )
+    assert "target-conv" in invalidated

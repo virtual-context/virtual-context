@@ -12,6 +12,7 @@ def resolve_target(
     current_id: str,
     conversation_ids: list[str],
     labels: dict[str, str],
+    target_exists=None,
 ) -> tuple[str | None, str, str]:
     """Resolve VCATTACH target to a conversation ID.
 
@@ -20,37 +21,75 @@ def resolve_target(
         current_id: the current conversation ID
         conversation_ids: all known conversation IDs
         labels: {conversation_id: label} dict
+        target_exists: optional callable(conversation_id) -> bool. When
+            provided, a resolved target_id is rejected with an error if
+            the callable returns False. Defends against labels.json
+            entries pointing to deleted/tombstoned conversations
+            (defense-in-depth — a stale label must not let VCATTACH
+            silently graft onto a corpse).
+            Exceptions inside the callable fail open: a transient DB
+            blip must not block legitimate VCATTACHes.
 
     Returns (target_id, target_label, error_message).
     target_id is None on error; error_message is empty on success.
     """
+    # Resolve to (tid, tlabel) via one of three paths, then run common
+    # validations (same-conv, existence). Single return point keeps the
+    # validation chain DRY.
+    tid: str | None = None
+    tlabel: str = target_raw
+
     # 1. Label match (case-insensitive)
     label_to_id = {v.lower(): (k, v) for k, v in labels.items()}
     if target_raw.lower() in label_to_id:
         tid, tlabel = label_to_id[target_raw.lower()]
-        if tid == current_id:
-            return None, tlabel, f"Already on conversation {tlabel}."
-        return tid, tlabel, ""
-
     # 2. Exact UUID match
-    if target_raw in conversation_ids:
+    elif target_raw in conversation_ids:
+        tid = target_raw
         tlabel = labels.get(target_raw, target_raw)
-        if target_raw == current_id:
-            return None, tlabel, f"Already on conversation {tlabel}."
-        return target_raw, tlabel, ""
+    else:
+        # 3. UUID prefix match
+        matches = [c for c in conversation_ids if c.startswith(target_raw)]
+        if len(matches) == 1:
+            tid = matches[0]
+            tlabel = labels.get(tid, target_raw)
+        elif len(matches) > 1:
+            return (
+                None,
+                target_raw,
+                f"Ambiguous prefix '{target_raw}' matches {len(matches)} conversations.",
+            )
+        else:
+            return (
+                None,
+                target_raw,
+                f"No conversation found matching '{target_raw}'. "
+                "Use a conversation label or ID from the dashboard.",
+            )
 
-    # 3. UUID prefix match
-    matches = [c for c in conversation_ids if c.startswith(target_raw)]
-    if len(matches) == 1:
-        tid = matches[0]
-        tlabel = labels.get(tid, target_raw)
-        if tid == current_id:
-            return None, tlabel, f"Already on conversation {tlabel}."
-        return tid, tlabel, ""
-    if len(matches) > 1:
-        return None, target_raw, f"Ambiguous prefix '{target_raw}' matches {len(matches)} conversations."
+    # Same-conv check (caller is already on the target).
+    if tid == current_id:
+        return None, tlabel, f"Already on conversation {tlabel}."
 
-    return None, target_raw, f"No conversation found matching '{target_raw}'. Use a conversation label or ID from the dashboard."
+    # Existence check — defense-in-depth against stale labels pointing at
+    # deleted/tombstoned conversations.
+    if callable(target_exists):
+        try:
+            ok = bool(target_exists(tid))
+        except Exception:
+            # Fail open on transient errors so legitimate attaches don't break.
+            ok = True
+        if not ok:
+            return (
+                None,
+                tlabel,
+                f"Cannot attach to '{tlabel}' ({tid[:12]}) — "
+                "the conversation has no persisted state (deleted or never "
+                "existed). The label may be stale; remove it from the "
+                "dashboard or pick another target.",
+            )
+
+    return tid, tlabel, ""
 
 
 def execute_attach(
@@ -77,7 +116,16 @@ def execute_attach(
         old_id: conversation being abandoned (its alias row is updated)
         target_id: conversation being attached to
         store: unwrapped store (composite or concrete) for alias persistence
-        registry_invalidate: callable(conversation_id) to evict + Redis invalidate
+        registry_invalidate: callable(conversation_id) — invoked twice (once
+            for old_id, once for target_id) to evict any cached runtime
+            state. The two invocations cover (1) the issuing chat's
+            in-memory ProxyState whose engine.config.conversation_id still
+            equals old_id (without this eviction the next request from
+            the issuing chat keeps routing to the stale state and bypasses
+            alias resolution) and (2) any cached state for target_id so
+            it can be re-loaded fresh. The callback MUST NOT delete
+            persisted conversation data — VCATTACH preserves both rows.
+            A failure on one id does not prevent invocation for the other.
         reset_engine_state: callable(target_id) to reset target checkpoints
     """
     # 1. Clear any alias FROM target_id so target_id resolves to itself again.
@@ -100,9 +148,17 @@ def execute_attach(
         except Exception:
             logger.warning("VCATTACH: failed to reset target state %s", target_id[:12])
 
-    # 4. Invalidate target session (local eviction + Redis key)
+    # 4. Invalidate cached runtime state for BOTH ids. old_id eviction is
+    #    the critical fix for the routing bug: without it, the issuing
+    #    chat's ProxyState (whose engine.config.conversation_id == old_id)
+    #    keeps matching chat_id/sys_hash routing on subsequent requests,
+    #    so ingestion continues writing to old_id even though the alias
+    #    row redirects old_id -> target_id. target_id eviction is a
+    #    cache-coherence guard so a stale cached target state cannot
+    #    shadow a fresh load.
     if callable(registry_invalidate):
-        try:
-            registry_invalidate(target_id)
-        except Exception:
-            logger.warning("VCATTACH: failed to invalidate target session %s", target_id[:12])
+        for cid in (old_id, target_id):
+            try:
+                registry_invalidate(cid)
+            except Exception:
+                logger.warning("VCATTACH: failed to invalidate session %s", cid[:12])
