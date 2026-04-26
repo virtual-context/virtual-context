@@ -1241,6 +1241,81 @@ class TestSessionStateMachine:
         assert reason == "history_widening"
         assert conversation_id not in state._ingested_conversations
 
+    # -----------------------------------------------------------------
+    # F-1 audit: the widening handler is named to make destruction visible.
+    # -----------------------------------------------------------------
+    # The function previously called _check_history_widening. The `_check_*`
+    # prefix in Python idiom is a side-effect-free predicate; the body
+    # actually calls _store.delete_conversation (the same 21-table purge
+    # that bit VCATTACH on 2026-04-26). Renamed to
+    # _detect_and_reset_widened_history so both verbs are visible at every
+    # call site without reading the docstring.
+
+    def test_widening_handler_has_destructive_name(self):
+        """Name pins: the renamed handler must exist and the old _check_* name
+        must not. A future rename-back fails this test, forcing review."""
+        from virtual_context.proxy.state import ProxyState
+
+        assert hasattr(ProxyState, "_detect_and_reset_widened_history"), (
+            "F-1 rename: handler must be named to surface its destructive "
+            "behavior at every call site."
+        )
+        assert not hasattr(ProxyState, "_check_history_widening"), (
+            "F-1 rename: the old `_check_*` name reads as a predicate but "
+            "the body destroys; do not restore it."
+        )
+
+    def test_widening_handler_actually_calls_destructive_store_delete(self):
+        """The widening handler is documented as destructive (it calls
+        _store.delete_conversation on the renumbered conv to trigger a
+        full re-ingest from scratch). This test pins that contract: if a
+        future refactor moves the destruction elsewhere or makes it
+        conditional on a flag, this test fails and the documented
+        behavior is re-evaluated explicitly.
+        """
+        state = self._make_state()
+        for i in range(2):
+            state.engine._turn_tag_index.append(TurnTagEntry(
+                turn_number=i,
+                message_hash=f"h{i}",
+                tags=[f"tag-{i}"],
+                primary_tag=f"tag-{i}",
+            ))
+        state.engine._engine_state.last_indexed_turn = 1
+        state.engine._engine_state.last_completed_turn = 1
+        conversation_id = state.engine.config.conversation_id
+
+        original_pairs = [
+            Message(role="user", content="Original first"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+        ]
+        state._ingested_conversations.add(conversation_id)
+        state._record_ingestion_watermark(original_pairs, conversation_id)
+
+        widened_pairs = [
+            Message(role="user", content="Different first"),
+            Message(role="assistant", content="A0"),
+            Message(role="user", content="Q1"),
+            Message(role="assistant", content="A1"),
+            Message(role="user", content="Q2"),
+            Message(role="assistant", content="A2"),
+        ]
+        # Reset the mock so we can assert calls produced by THIS invocation.
+        state.engine._store.delete_conversation.reset_mock()
+
+        session_state, reason = state.resolve_prepare_state(widened_pairs)
+
+        assert reason == "history_widening"
+        assert session_state == SessionState.PASSTHROUGH
+        # Destructive contract: the widening handler MUST call
+        # _store.delete_conversation(conversation_id). Without this purge
+        # the re-ingest would graft new content onto stale rows.
+        state.engine._store.delete_conversation.assert_called_once_with(
+            conversation_id
+        )
+
     def test_manual_passthrough_wins_in_resolve_prepare_state(self):
         state = self._make_state()
         state.set_manual_passthrough(True)

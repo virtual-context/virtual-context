@@ -495,7 +495,7 @@ class ProxyState:
             return SessionState.ACTIVE, None
 
         if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
-            widened = self._check_history_widening(history_messages, conversation_id)
+            widened = self._detect_and_reset_widened_history(history_messages, conversation_id)
             if widened:
                 return SessionState.PASSTHROUGH, "history_widening"
             return SessionState.ACTIVE, None
@@ -509,7 +509,7 @@ class ProxyState:
 
         self._restore_readiness_pending = False
         if conversation_id in self._ingested_conversations:
-            widened = self._check_history_widening(history_messages, conversation_id)
+            widened = self._detect_and_reset_widened_history(history_messages, conversation_id)
             if widened:
                 return SessionState.PASSTHROUGH, "history_widening"
 
@@ -2728,10 +2728,31 @@ class ProxyState:
             self._record_ingestion_watermark(history_messages, conversation_id)
         return True
 
-    def _check_history_widening(self, history_messages: list[Message], conversation_id: str) -> bool:
-        """Detect if history prefix shifted (widening) and trigger full re-ingest.
+    def _detect_and_reset_widened_history(
+        self, history_messages: list[Message], conversation_id: str,
+    ) -> bool:
+        """Detect if the client's history prefix shifted (widening) and, when
+        it has, RESET the conversation by purging persisted state so the next
+        request re-ingests from scratch.
 
-        Returns True if widening was detected and state was cleared for re-ingestion.
+        DUAL-ACTION CONTRACT (F-1 audit, 2026-04-26): this function detects
+        AND mutates. It is NOT a side-effect-free predicate. When widening
+        is detected it calls ``_store.delete_conversation(conversation_id)``
+        which purges 21 Postgres tables for this conversation plus its
+        per-conversation media directory, invalidates the Redis session
+        cache, and clears in-memory runtime state via
+        ``_clear_runtime_state``. The function name is deliberately verbose
+        (``_detect_and_reset_*`` rather than ``_check_*``) so every call
+        site reads as "this might destroy persisted data" without requiring
+        the reader to open the docstring. The destructive behavior is
+        intentional: when the client's history buffer grew larger than the
+        prefix we previously ingested, the previous canonical rows do not
+        align with the new payload and grafting more turns onto them
+        produces incoherent state. A full re-ingest from scratch is the
+        correct response.
+
+        Returns True if widening was detected and state was reset for
+        re-ingestion.
         """
         import hashlib
         if not history_messages or conversation_id not in self._ingested_first_hash:
@@ -3069,7 +3090,7 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
-            self._check_history_widening(history_messages, conversation_id)
+            self._detect_and_reset_widened_history(history_messages, conversation_id)
             if conversation_id in self._ingested_conversations:
                 return  # No widening detected
         with self._ingestion_lock:
@@ -3145,7 +3166,7 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         if conversation_id in self._ingested_conversations and not self.has_pending_indexing():
             # Check for history widening even after ingestion is "done"
-            self._check_history_widening(history_messages, conversation_id)
+            self._detect_and_reset_widened_history(history_messages, conversation_id)
             if conversation_id in self._ingested_conversations:
                 return
         # Defense-in-depth: refuse to spawn the legacy thread if another
