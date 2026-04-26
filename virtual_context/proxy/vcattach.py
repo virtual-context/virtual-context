@@ -97,7 +97,6 @@ def execute_attach(
     target_id: str,
     store,
     registry_invalidate=None,
-    reset_engine_state=None,
 ) -> None:
     """Execute the attach: clear any reverse alias, register new alias, invalidate.
 
@@ -126,7 +125,16 @@ def execute_attach(
             it can be re-loaded fresh. The callback MUST NOT delete
             persisted conversation data — VCATTACH preserves both rows.
             A failure on one id does not prevent invocation for the other.
-        reset_engine_state: callable(target_id) to reset target checkpoints
+
+    Removed (F-2 audit, 2026-04-26):
+        ``reset_engine_state`` callable(target_id) was a dormant callback
+        slot. All call sites passed None and the slot was shape-identical
+        to the 2026-04-26 VCATTACH seam (a non-destructively-named
+        callback invoked on target_id). Removed structurally to prevent
+        a future PR from wiring a destructive primitive into it without
+        explicit review. If a real use case for an engine-state reset
+        hook appears later, re-introduce with an explicit name and a
+        docstring rule forbidding destructive primitives.
     """
     # 1. Clear any alias FROM target_id so target_id resolves to itself again.
     #    This unlocks "return to A" flows where A was previously aliased to B.
@@ -141,14 +149,7 @@ def execute_attach(
     store.save_conversation_alias(old_id, target_id)
     logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
 
-    # 3. Reset target checkpoint state (opt-in via caller)
-    if callable(reset_engine_state):
-        try:
-            reset_engine_state(target_id)
-        except Exception:
-            logger.warning("VCATTACH: failed to reset target state %s", target_id[:12])
-
-    # 4. Invalidate cached runtime state for BOTH ids. old_id eviction is
+    # 3. Invalidate cached runtime state for BOTH ids. old_id eviction is
     #    the critical fix for the routing bug: without it, the issuing
     #    chat's ProxyState (whose engine.config.conversation_id == old_id)
     #    keeps matching chat_id/sys_hash routing on subsequent requests,

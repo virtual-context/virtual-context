@@ -1869,7 +1869,6 @@ async def _handle_vcattach(
         # Core proxy: local eviction only. Cloud path: per-request Redis hydration
         # ensures all workers see the reset state on next request.
         registry_invalidate=registry.remove_conversation if registry else None,
-        reset_engine_state=None,
     )
 
     text = f"Conversation attached to {target_label} ({target_id}). History restored."
@@ -2367,7 +2366,6 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             target_id=target_id,
             store=_inner,
             registry_invalidate=_invalidate,
-            reset_engine_state=None,
         )
 
         marker = f"\n<!-- vc:conversation={target_id} -->"

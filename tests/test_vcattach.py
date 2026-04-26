@@ -402,6 +402,39 @@ def test_execute_attach_no_longer_accepts_delete_conversation():
     assert "delete_conversation" not in sig.parameters
 
 
+def test_execute_attach_no_longer_accepts_reset_engine_state():
+    """Dormant reset_engine_state callback slot has been removed (F-2 audit).
+
+    Background: the slot was a callable(target_id) callback documented as
+    "reset target checkpoints", but its naming convention ("reset") is a
+    historical synonym for "delete-and-rebuild" elsewhere in this codebase.
+    All three call sites passed None; the slot was the same call shape as
+    the 2026-04-26 VCATTACH seam (a non-destructively-named callback
+    invoked on target_id), and a future PR could have wired it to a
+    destructive primitive without explicit review.
+
+    Removing it structurally prevents that class of regression. If a real
+    use case for an engine-state reset hook appears later, it should be
+    re-introduced with an explicit name and a docstring rule forbidding
+    destructive primitives.
+    """
+    import inspect
+    from virtual_context.proxy.vcattach import execute_attach
+
+    sig = inspect.signature(execute_attach)
+    assert "reset_engine_state" not in sig.parameters
+
+    # Stronger guard: assert the entire parameter set is the expected
+    # non-destructive shape. Any new kwarg added here triggers explicit
+    # review.
+    assert set(sig.parameters.keys()) == {
+        "old_id",
+        "target_id",
+        "store",
+        "registry_invalidate",
+    }
+
+
 def test_delete_conversation_alias_sqlite_roundtrip(sqlite_store):
     """delete_conversation_alias removes the row so resolve returns None."""
     sqlite_store.save_conversation_alias("a", "b")
