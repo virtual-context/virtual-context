@@ -3239,51 +3239,45 @@ class PostgresStore(ContextStore):
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # v1.14-1 (codex iter-3 P1): bump target's request_turn_counter
-            # past the moved range. Without this UPSERT a future
-            # ``save_request_context()`` on target allocates from the stale
-            # ``next_request_turn``, colliding with the request_turns we just
-            # moved into target's namespace via UPDATE. The bumped value is
-            # ``MAX(existing_target_next, moved_max + 1)`` where ``moved_max``
-            # is the maximum request_turn that landed on target via this
-            # merge (origin = source). Per-conv-counter monotonicity
-            # invariant restored.
+            # v1.14-1 (codex iter-3 P1) + v1.15-2 (codex iter-4 P1): bump
+            # target's request_turn_counter past the maximum request_turn
+            # currently present on the target (regardless of origin). The
+            # v1.14 implementation filtered ``origin_conversation_id =
+            # source`` which under-counts on chained merges (A->B then
+            # B->C; A-origin rows on B carry origin = A and were preserved
+            # by COALESCE during the B->C move, so they don't match the
+            # most-recent-source filter).
             #
-            # The four request-turn-bearing per-conv tables (tool_calls,
-            # request_context, request_captures, tool_outputs.turn) were
-            # all UPDATEd with offset above, so the maximum request_turn
-            # under origin = source on target is ``request_turn_offset +
-            # (max source-side request_turn)``. We compute it directly via
-            # SELECT against the moved rows so the UPSERT gets the right
-            # value even if some tables have no rows (COALESCE to 0).
+            # The simplest correct query: ``MAX(request_turn)`` over ALL
+            # rows on the target across the four request-turn-bearing
+            # tables. Target's pre-merge next_request_turn was, by
+            # invariant, > the max request_turn of any pre-merge row on
+            # target; the post-move max captures both pre-merge rows AND
+            # rows just moved (any origin). The UPSERT preserves whichever
+            # is higher.
             moved_max_row = conn.execute(
                 """
                 SELECT GREATEST(
                     COALESCE((SELECT MAX(request_turn) FROM tool_calls
-                              WHERE conversation_id = %s
-                                AND origin_conversation_id = %s), 0),
+                              WHERE conversation_id = %s), 0),
                     COALESCE((SELECT MAX(request_turn) FROM request_context
-                              WHERE conversation_id = %s
-                                AND origin_conversation_id = %s), 0),
+                              WHERE conversation_id = %s), 0),
                     COALESCE((SELECT MAX(turn) FROM request_captures
-                              WHERE conversation_id = %s
-                                AND origin_conversation_id = %s), 0),
+                              WHERE conversation_id = %s), 0),
                     COALESCE((SELECT MAX(turn) FROM tool_outputs
-                              WHERE conversation_id = %s
-                                AND origin_conversation_id = %s), 0)
+                              WHERE conversation_id = %s), 0)
                 ) AS m
                 """,
-                (target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id),
+                (target_conversation_id, target_conversation_id,
+                 target_conversation_id, target_conversation_id),
             ).fetchone()
             moved_max_request_turn = int(moved_max_row["m"] or 0)
             if moved_max_request_turn > 0:
-                # UPSERT preserves whichever is higher: target's existing
-                # ``next_request_turn`` (no-op if already bumped past) or the
-                # post-move ``moved_max + 1``.
-                conn.execute(
+                # v1.15-7 (codex iter-4 P3): capture the ACTUAL post-UPSERT
+                # value via RETURNING so the stat reflects truth (prior
+                # implementation recorded ``moved_max + 1`` even when
+                # GREATEST kept the existing higher counter).
+                upsert_row = conn.execute(
                     """
                     INSERT INTO request_turn_counters
                         (conversation_id, next_request_turn, origin_conversation_id)
@@ -3293,11 +3287,12 @@ class PostgresStore(ContextStore):
                           request_turn_counters.next_request_turn,
                           EXCLUDED.next_request_turn
                       )
+                    RETURNING next_request_turn
                     """,
                     (target_conversation_id, moved_max_request_turn + 1),
-                )
-                rows_moved["request_turn_counters_target_bumped_to"] = (
-                    moved_max_request_turn + 1
+                ).fetchone()
+                rows_moved["request_turn_counters_target_bumped_to"] = int(
+                    upsert_row["next_request_turn"] or (moved_max_request_turn + 1)
                 )
 
             # B-D6 (codex iter-2 P1): capture conflict tag list BEFORE
@@ -6226,6 +6221,51 @@ class PostgresStore(ContextStore):
             count += 1
         return count
 
+    def _acquire_lifecycle_share_lock(
+        self, conn: psycopg.Connection, conversation_id: str,
+    ) -> None:
+        """v1.15-1 (codex iter-4 P1): acquire a SHARE lock on the
+        conversation_lifecycle row for ``conversation_id``. Coexists with
+        other SHARE locks (concurrent ``save_request_context`` calls all
+        proceed in parallel); BLOCKED by an EXCLUSIVE lock (FOR UPDATE)
+        held by the merge body in B-D2.
+
+        Caller MUST already be inside a transaction; the lock releases
+        on transaction commit/rollback. The lock contract:
+
+          * merge body holds ``conversation_lifecycle FOR UPDATE``
+            (exclusive) on both source + target rows.
+          * every request-turn allocator (i.e. ``save_request_context``)
+            takes ``conversation_lifecycle FOR SHARE`` (shared) on the
+            target row.
+          * SHARE blocks against EXCLUSIVE and vice versa, so concurrent
+            allocators wait until the merge body commits + has bumped
+            the counter past the moved range. The stale-offset race
+            window from v1.14-2 (which only locked inside the body) is
+            now closed across the entire write surface.
+
+        SQLite doesn't need this primitive: ``BEGIN IMMEDIATE`` already
+        acquires the database-level write lock, which is mutually
+        exclusive with any other writer. The merge body's BEGIN IMMEDIATE
+        and ``save_request_context``'s BEGIN IMMEDIATE serialize at the
+        DB level. PG's row-level locking is finer-grained, so we rely
+        on explicit lock acquisition there.
+        """
+        now = _dt_to_str(datetime.now(timezone.utc))
+        conn.execute(
+            """INSERT INTO conversation_lifecycle
+                (conversation_id, generation, deleted, updated_at)
+               VALUES (%s, 0, FALSE, %s)
+               ON CONFLICT (conversation_id) DO UPDATE
+               SET updated_at = EXCLUDED.updated_at""",
+            (conversation_id, now),
+        )
+        conn.execute(
+            "SELECT 1 FROM conversation_lifecycle "
+            "WHERE conversation_id = %s FOR SHARE",
+            (conversation_id,),
+        ).fetchone()
+
     def _allocate_request_turn(self, conn: psycopg.Connection, conversation_id: str) -> int:
         row = conn.execute(
             """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
@@ -6392,6 +6432,12 @@ class PostgresStore(ContextStore):
         conv_id = context.get("conversation_id", "")
         explicit_turn = int(context.get("request_turn", 0) or 0)
         with conn.transaction():
+            # v1.15-1 (codex iter-4 P1): acquire conversation_lifecycle
+            # SHARE lock so a concurrent merge body holding the EXCLUSIVE
+            # lock blocks us until it commits + has bumped the counter
+            # past the moved range. Closes the stale-offset race window
+            # that v1.14-2 left open for cross-transaction writes.
+            self._acquire_lifecycle_share_lock(conn, conv_id)
             request_turn = explicit_turn or self._allocate_request_turn(conn, conv_id)
             if explicit_turn:
                 self._bump_request_turn_counter(conn, conv_id, request_turn)

@@ -942,8 +942,12 @@ def test_body_resolves_tag_aliases_conflicts(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D5 (P1): request_turn_offset must avoid collision across all 4 tables
-# (engine-level check; the body just applies the offset.)
+# B-D5 (P1) + v1.14-2 + v1.14-6: request_turn_offset must avoid collision
+# across all 4 tables. Per v1.14-2 (codex iter-3 P1), the body computes
+# this offset INSIDE the conversation_lifecycle FOR UPDATE lock; the
+# engine no longer pre-computes. The test exercises the body path with
+# request_turn_offset=0 (no caller floor) so the recompute-under-lock
+# behavior is verified end-to-end.
 # ---------------------------------------------------------------------------
 
 def test_body_request_turn_offset_avoids_collision_across_tables(tmp_path):
@@ -1499,28 +1503,293 @@ def test_body_sql_inspection_tenant_aware_writes_predicate_on_tenant_id(tmp_path
     carry tenant_id; they're scoped on conversation_id only; tenant
     scoping is transitive via the body's source.tenant_id re-validation
     at body entry. This test pins the tenant-aware predicate invariant.
+
+    v1.15-3 (codex iter-4 P2): parametrized over BOTH SQLite + PostgreSQL
+    body method source code so PG predicate drift is also pinned.
     """
     import inspect
     from virtual_context.storage import sqlite as sqlite_mod
-    src = inspect.getsource(sqlite_mod.SQLiteStore.merge_conversation_data)
-    # Locate the tenant-aware operations and confirm tenant_id appears
-    # within ~120 chars of each. Looser than full-regex parsing of multi-
-    # line SQL strings; robust against quote/whitespace variation.
+    from virtual_context.storage import postgres as postgres_mod
+
     tenant_aware_keywords = (
         "UPDATE conversations",
         "UPDATE merge_audit",
         "FROM conversations",
         "FROM merge_audit",
     )
-    for kw in tenant_aware_keywords:
-        idx = 0
-        while True:
-            pos = src.find(kw, idx)
-            if pos < 0:
-                break
-            window = src[pos:pos + 600]
-            assert "tenant_id" in window, (
-                f"tenant-aware operation '{kw}' at offset {pos} lacks "
-                f"tenant_id predicate within 600-char window"
-            )
-            idx = pos + len(kw)
+
+    for mod, store_cls_name in (
+        (sqlite_mod, "SQLiteStore"),
+        (postgres_mod, "PostgresStore"),
+    ):
+        store_cls = getattr(mod, store_cls_name, None)
+        if store_cls is None:
+            continue
+        body = getattr(store_cls, "merge_conversation_data", None)
+        if body is None:
+            continue
+        src = inspect.getsource(body)
+        # Locate the tenant-aware operations and confirm tenant_id appears
+        # within a 600-char statement window. Looser than full-regex
+        # parsing of multi-line SQL strings; robust against quote /
+        # whitespace variation across PG (%s) and SQLite (?) parameter
+        # styles.
+        for kw in tenant_aware_keywords:
+            idx = 0
+            while True:
+                pos = src.find(kw, idx)
+                if pos < 0:
+                    break
+                window = src[pos:pos + 600]
+                assert "tenant_id" in window, (
+                    f"{store_cls_name}: tenant-aware operation '{kw}' at "
+                    f"offset {pos} lacks tenant_id predicate within "
+                    f"600-char window"
+                )
+                idx = pos + len(kw)
+
+
+# ---------------------------------------------------------------------------
+# v1.15-2 (P1): chained-merge counter bump uses MAX of all rows on target,
+# not just rows where origin_conversation_id = most-recent source. Origin
+# is preserved by COALESCE on subsequent merges, so an origin-filtered
+# bump under-counts when the target has rows from earlier merges.
+# ---------------------------------------------------------------------------
+
+def test_body_chained_merge_counter_bump_includes_earlier_origin_rows(tmp_path):
+    """v1.15-2: A->B->C chained merge. A's rows on B carry origin = A;
+    when B->C runs, those rows move to C with origin still = A (preserved
+    by COALESCE). The counter bump query must compute max over ALL rows
+    on C regardless of origin so the next allocation cannot collide with
+    A-origin rows.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "convA")
+    _seed_conversation(conn, "tA", "convB")
+    _seed_conversation(conn, "tA", "convC")
+    # Stage 1: A has tool_calls at request_turn 1, 2, 3.
+    for rt in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO tool_calls "
+            "(conversation_id, request_turn, round, group_id, tool_name, "
+            "tool_input, tool_result, result_length, duration_ms, timestamp) "
+            "VALUES ('convA', ?, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+            (rt, _now_iso()),
+        )
+    # B starts empty; counter at 1.
+    _seed_request_turn_counter(conn, "convB", 1)
+    _seed_request_turn_counter(conn, "convC", 1)
+    conn.commit()
+
+    # Merge A -> B
+    merge_id_ab = _reserve(store, source="convA", target="convB")
+    store.merge_conversation_data(
+        merge_id=merge_id_ab, tenant_id="tA",
+        source_conversation_id="convA", target_conversation_id="convB",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl-AB",
+    )
+    # Verify A's rows now on B with origin = A.
+    a_origin_count = conn.execute(
+        "SELECT COUNT(*) FROM tool_calls WHERE conversation_id = 'convB' "
+        "AND origin_conversation_id = 'convA'",
+    ).fetchone()[0]
+    assert a_origin_count == 3
+    # B's counter must be > the moved rows' max request_turn.
+    b_counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'convB'",
+    ).fetchone()["next_request_turn"]
+    b_max_rt = conn.execute(
+        "SELECT MAX(request_turn) FROM tool_calls WHERE conversation_id = 'convB'",
+    ).fetchone()[0]
+    assert b_counter > b_max_rt
+
+    # Stage 2: B->C. A-origin rows on B carry origin = A still; the move
+    # statement preserves their origin (COALESCE non-empty path).
+    # convB needs phase = 'active' to be merge-eligible (was set to 'merged' in stage 1).
+    # We'll create a fresh convD that takes A's slot for the next merge,
+    # OR we use a different chain. Simpler: merge convB into convC.
+    # But convB's phase is now 'merged' from stage 1's source-side flip.
+    # That means convB cannot be a source in another merge (phase check
+    # in B-D2 refuses 'merged' source).
+    # Workaround for this chained-merge test: reset convB to 'active' so
+    # we can simulate the chained-merge scenario the codex finding flagged.
+    conn.execute("UPDATE conversations SET phase = 'active' WHERE conversation_id = 'convB'")
+    conn.commit()
+
+    merge_id_bc = _reserve(store, source="convB", target="convC")
+    store.merge_conversation_data(
+        merge_id=merge_id_bc, tenant_id="tA",
+        source_conversation_id="convB", target_conversation_id="convC",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl-BC",
+    )
+
+    # Verify A-origin rows now on C with origin still = A (NOT 'convB').
+    a_origin_on_c = conn.execute(
+        "SELECT COUNT(*) FROM tool_calls WHERE conversation_id = 'convC' "
+        "AND origin_conversation_id = 'convA'",
+    ).fetchone()[0]
+    assert a_origin_on_c == 3, (
+        "Chained merge should preserve A's origin all the way to C "
+        "(COALESCE non-empty branch)"
+    )
+
+    # The critical assertion: C's counter must be > MAX request_turn of
+    # ALL rows on C, not just rows with origin = convB. With the v1.14
+    # origin-filtered query, A-origin rows would be excluded and the
+    # bump would under-count.
+    c_max_rt = conn.execute(
+        "SELECT MAX(request_turn) FROM tool_calls WHERE conversation_id = 'convC'",
+    ).fetchone()[0]
+    c_counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'convC'",
+    ).fetchone()["next_request_turn"]
+    assert c_counter >= c_max_rt + 1, (
+        f"C's counter ({c_counter}) must be >= max request_turn ({c_max_rt}) + 1"
+    )
+
+    # And the next allocation must not collide.
+    next_alloc = store._allocate_request_turn(conn, "convC")
+    all_existing = sorted(int(r["request_turn"]) for r in conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'convC'",
+    ).fetchall())
+    assert next_alloc not in all_existing
+    assert next_alloc > max(all_existing)
+
+
+# ---------------------------------------------------------------------------
+# v1.15-7 (P3): the bumped-counter stat reports the actual UPSERT result,
+# not just moved_max + 1. When target's existing counter is higher than
+# moved_max + 1, the stat should reflect the preserved-higher value.
+# ---------------------------------------------------------------------------
+
+def test_body_counter_stat_reflects_actual_upsert_value(tmp_path):
+    """v1.15-7: stat ``request_turn_counters_target_bumped_to`` is the
+    actual post-UPSERT next_request_turn (captured via RETURNING), NOT
+    just ``moved_max + 1``. When target's existing counter is higher,
+    GREATEST/MAX preserves it; the stat reflects that.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Target's pre-merge counter is at 100 (much higher than what source's
+    # rows will contribute post-offset).
+    _seed_request_turn_counter(conn, "tgt", 100)
+    # Source has tool_calls at request_turn 1, 2, 3.
+    for rt in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO tool_calls "
+            "(conversation_id, request_turn, round, group_id, tool_name, "
+            "tool_input, tool_result, result_length, duration_ms, timestamp) "
+            "VALUES ('src', ?, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+            (rt, _now_iso()),
+        )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Body's recomputed offset uses target's counter as floor (=100), so
+    # source rows at request_turn 1,2,3 land at 101,102,103. Max on
+    # target post-merge = 103. UPSERT proposes 104; GREATEST(100, 104) =
+    # 104; counter ends at 104.
+    final_counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'tgt'",
+    ).fetchone()["next_request_turn"]
+    assert "request_turn_counters_target_bumped_to" in stats.rows_moved
+    # Stat MUST equal the actual final_counter, not just moved_max + 1.
+    assert stats.rows_moved["request_turn_counters_target_bumped_to"] == final_counter
+
+
+# ---------------------------------------------------------------------------
+# v1.15-1 (P1): closer simulation of the cross-transaction stale-offset race.
+# SQLite cannot exhibit the PG race (BEGIN IMMEDIATE serializes writers at
+# the database level), so this test pins the SQLite-equivalent invariant:
+# a write that lands BEFORE the body call (no concurrent writers possible
+# under SQLite serialization) must still produce a non-colliding offset.
+# Real concurrency exercise lives in the PG smoke file (v1.15-1's PG path).
+# ---------------------------------------------------------------------------
+
+def test_body_offset_recomputes_after_write_to_target(tmp_path):
+    """v1.15-1 SQLite invariant: a write that lands on target's
+    request-turn-bearing tables BEFORE the body's offset recomputation
+    must be reflected in the recomputed offset. SQLite serializes via
+    BEGIN IMMEDIATE so no concurrent writer can race the body; this test
+    asserts the BEFORE-body case behaves as expected (which is what the
+    SQLite path can prove behaviorally; PG concurrency lives in smoke).
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Simulate save_request_context having written a high request_context
+    # row to target before the body sees it.
+    conn.execute(
+        "INSERT INTO request_context "
+        "(conversation_id, request_turn, timestamp, user_message, inbound_tags, "
+        "retrieval_method, candidates_found, candidates_selected, "
+        "segments_injected, facts_injected, facts_count, facts_tags, "
+        "pool_used, pool_budget, total_context_tokens, "
+        "non_virtualizable_floor) "
+        "VALUES ('tgt', 200, ?, '', '', '', 0, 0, '', '', 0, '', 0, 0, 0, 0)",
+        (_now_iso(),),
+    )
+    # Source has a tool_call at request_turn=1.
+    conn.execute(
+        "INSERT INTO tool_calls "
+        "(conversation_id, request_turn, round, group_id, tool_name, "
+        "tool_input, tool_result, result_length, duration_ms, timestamp) "
+        "VALUES ('src', 1, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+        (_now_iso(),),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Recomputed offset must be > 200 (target's request_context max).
+    assert stats.request_turn_offset >= 201
+    # Source's tool_call lands at 1 + offset.
+    moved_rt = conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt' "
+        "AND origin_conversation_id = 'src'",
+    ).fetchone()["request_turn"]
+    assert int(moved_rt) >= 202
+    # Counter bumped above the moved range.
+    counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'tgt'",
+    ).fetchone()["next_request_turn"]
+    assert counter >= int(moved_rt) + 1
+
+
+def test_pg_share_lock_helper_present_on_postgres_store(tmp_path):
+    """v1.15-1 structural pin: PostgresStore must expose the lifecycle
+    SHARE-lock helper used by save_request_context. This test catches
+    a regression that drops the helper or stops calling it.
+    """
+    from virtual_context.storage.postgres import PostgresStore
+    assert hasattr(PostgresStore, "_acquire_lifecycle_share_lock"), (
+        "v1.15-1: PostgresStore._acquire_lifecycle_share_lock helper missing; "
+        "stale-offset race re-opens without it"
+    )
+    # Confirm save_request_context calls the helper (text-level grep is
+    # the pragmatic invariant; behavioral smoke is in the PG body file).
+    import inspect
+    src = inspect.getsource(PostgresStore.save_request_context)
+    assert "_acquire_lifecycle_share_lock" in src, (
+        "v1.15-1: PostgresStore.save_request_context no longer invokes "
+        "_acquire_lifecycle_share_lock; lock contract regressed"
+    )

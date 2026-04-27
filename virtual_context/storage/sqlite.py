@@ -3646,37 +3646,42 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # v1.14-1 (codex iter-3 P1): bump target's request_turn_counter
-            # past the moved range. See PostgresStore docstring for the
-            # full rationale; this UPSERT preserves whichever is higher
-            # between target's existing counter and ``moved_max + 1``.
+            # v1.14-1 (codex iter-3 P1) + v1.15-2 (codex iter-4 P1): bump
+            # target's request_turn_counter past the maximum request_turn
+            # currently on the target across all four request-turn-bearing
+            # tables. NO origin filter (chained-merge correctness: A->B->C
+            # leaves A-origin rows preserved by COALESCE, which the
+            # origin = source filter would miss). See PostgresStore
+            # docstring for full rationale.
             moved_max_row = conn.execute(
                 """
                 SELECT MAX(m) AS m FROM (
                     SELECT COALESCE(MAX(request_turn), 0) AS m FROM tool_calls
-                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                      WHERE conversation_id = ?
                     UNION ALL
                     SELECT COALESCE(MAX(request_turn), 0) FROM request_context
-                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                      WHERE conversation_id = ?
                     UNION ALL
                     SELECT COALESCE(MAX(turn), 0) FROM request_captures
-                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                      WHERE conversation_id = ?
                     UNION ALL
                     SELECT COALESCE(MAX(turn), 0) FROM tool_outputs
-                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                      WHERE conversation_id = ?
                 )
                 """,
-                (target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id,
-                 target_conversation_id, source_conversation_id),
+                (target_conversation_id, target_conversation_id,
+                 target_conversation_id, target_conversation_id),
             ).fetchone()
             moved_max_request_turn = int(
                 (moved_max_row["m"] if isinstance(moved_max_row, sqlite3.Row)
                  else moved_max_row[0]) or 0
             )
             if moved_max_request_turn > 0:
-                conn.execute(
+                # v1.15-7 (codex iter-4 P3): capture the actual post-UPSERT
+                # value via RETURNING so the stat reflects truth even when
+                # MAX() preserves an existing higher target counter.
+                # SQLite supports RETURNING since 3.35.
+                upsert_row = conn.execute(
                     """
                     INSERT INTO request_turn_counters
                         (conversation_id, next_request_turn)
@@ -3686,12 +3691,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                           request_turn_counters.next_request_turn,
                           excluded.next_request_turn
                       )
+                    RETURNING next_request_turn
                     """,
                     (target_conversation_id, moved_max_request_turn + 1),
+                ).fetchone()
+                actual_next = int(
+                    (upsert_row["next_request_turn"]
+                     if isinstance(upsert_row, sqlite3.Row)
+                     else upsert_row[0]) or (moved_max_request_turn + 1)
                 )
-                rows_moved["request_turn_counters_target_bumped_to"] = (
-                    moved_max_request_turn + 1
-                )
+                rows_moved["request_turn_counters_target_bumped_to"] = actual_next
 
             # B-D6: capture conflict tag list with both sides'
             # source_canonical_turn_ids before the DELETE wipes source's

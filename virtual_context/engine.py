@@ -346,9 +346,11 @@ class VirtualContextEngine:
         source_label_at_merge: str,
     ):
         """Phase A merge entry. Called by cloud's handle_vc_merge_cloud
-        AFTER reservation succeeds; this method delegates to
-        ``Store.merge_conversation_data`` after computing offsets and
-        validating cross-tenant + same-source-as-target invariants.
+        AFTER reservation succeeds; this method validates cross-tenant +
+        same-source-as-target invariants and delegates to
+        ``Store.merge_conversation_data``. Offsets are computed by the
+        body INSIDE the conversation_lifecycle FOR UPDATE lock per
+        v1.14-2 (codex iter-3 P1); engine no longer pre-computes them.
 
         On exception this method DOES NOT mark the merge_audit row
         rolled back; the caller (cloud's REST handler) owns the
