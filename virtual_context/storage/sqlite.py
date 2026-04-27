@@ -701,7 +701,7 @@ class SQLiteStore(ContextStore):
                 tenant_id                      TEXT NOT NULL,
                 lifecycle_epoch                INTEGER NOT NULL DEFAULT 1,
                 phase                          TEXT NOT NULL DEFAULT 'init'
-                                               CHECK (phase IN ('init','ingesting','compacting','active','deleted')),
+                                               CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
                 pending_raw_payload_entries    INTEGER NOT NULL DEFAULT 0,
                 last_raw_payload_entries       INTEGER NOT NULL DEFAULT 0,
                 last_ingestible_payload_entries INTEGER NOT NULL DEFAULT 0,
@@ -710,6 +710,102 @@ class SQLiteStore(ContextStore):
                 deleted_at                     TEXT NULL,
                 UNIQUE (tenant_id, conversation_id)
             )
+        """)
+        # M0.3 + M0.5 (VCMERGE plan v1.11 sections 2.1 + 5.2): merge_audit
+        # table + the unique partial index that backs the
+        # try_reserve_merge_audit_in_progress reservation flow. SQLite is
+        # the test backend; production runs PG. Schema mirrors the PG
+        # form at virtual_context/storage/postgres.py with SQLite type
+        # adaptations (TEXT instead of UUID; TEXT instead of TIMESTAMPTZ).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS merge_audit (
+                merge_id                  TEXT PRIMARY KEY,
+                tenant_id                 TEXT NOT NULL,
+                source_conversation_id    TEXT NOT NULL,
+                target_conversation_id    TEXT NOT NULL,
+                source_label_at_merge     TEXT NOT NULL DEFAULT '',
+                status                    TEXT NOT NULL
+                                          CHECK (status IN ('in_progress','committed','rolled_back')),
+                started_at                TEXT NOT NULL,
+                completed_at              TEXT NULL,
+                rows_moved_json           TEXT NULL,
+                error_message             TEXT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
+                ON merge_audit (tenant_id, source_conversation_id)
+                WHERE status IN ('in_progress', 'committed')
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_merge_audit_target
+                ON merge_audit (tenant_id, target_conversation_id, completed_at DESC)
+                WHERE status = 'committed'
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_merge_audit_status_started
+                ON merge_audit (status, started_at)
+                WHERE status = 'in_progress'
+        """)
+        # M0.4 (VCMERGE plan v1.11 section 2.1): merge_post_commit_pending
+        # queue table + tenant-consistency triggers. SQLite supports
+        # BEFORE UPDATE OF column_list event filtering and WHEN clause
+        # expressions on row-level triggers per SQLite docs lang_createtrigger.
+        # Two-trigger split per the same plan rationale as PG (codex
+        # iter-2 v1.6-1 P1 fix).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
+                pending_id        TEXT PRIMARY KEY,
+                merge_id          TEXT NOT NULL REFERENCES merge_audit(merge_id),
+                tenant_id         TEXT NOT NULL,
+                kind              TEXT NOT NULL
+                                  CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
+                payload_json      TEXT NOT NULL,
+                status            TEXT NOT NULL
+                                  CHECK (status IN ('pending','done','failed')),
+                attempts          INTEGER NOT NULL DEFAULT 0,
+                created_at        TEXT NOT NULL,
+                last_attempt_at   TEXT NULL,
+                completed_at      TEXT NULL,
+                error_message     TEXT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_status
+                ON merge_post_commit_pending (status, created_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_tenant
+                ON merge_post_commit_pending (tenant_id, status, created_at)
+        """)
+        # SQLite INSERT trigger: always fires; consistency check inlined in
+        # WHEN. Uses IS NOT (SQLite NULL-safe inequality) rather than !=
+        # since merge_audit subquery could theoretically return NULL.
+        conn.execute("""
+            DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
+        """)
+        conn.execute("""
+            CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
+                BEFORE INSERT ON merge_post_commit_pending
+                FOR EACH ROW
+                WHEN (NEW.tenant_id IS NOT (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id))
+            BEGIN
+                SELECT RAISE(ABORT, 'merge_post_commit_pending.tenant_id must match merge_audit.tenant_id');
+            END
+        """)
+        # SQLite UPDATE trigger: fires on tenant_id change, then validates.
+        conn.execute("""
+            DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
+        """)
+        conn.execute("""
+            CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
+                BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
+                FOR EACH ROW
+                WHEN (NEW.tenant_id IS NOT OLD.tenant_id
+                      AND NEW.tenant_id IS NOT (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id))
+            BEGIN
+                SELECT RAISE(ABORT, 'merge_post_commit_pending.tenant_id must match merge_audit.tenant_id');
+            END
         """)
         # Drop-and-recreate keeps the partial-index clause in lockstep with
         # Postgres (see postgres.py). SQLite 3.8+ supports partial indexes;
@@ -2876,7 +2972,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[dict]:
         """SQLite mirror of the Postgres helper — see that docstring
         for the full contract. SQLite datetimes are text-based, so
-        the age computation happens in Python after the SQL select."""
+        the age computation happens in Python after the SQL select.
+
+        M0.6 (VCMERGE plan v1.11 section 2.1): rows with phase = 'merged'
+        are excluded from the candidate set; matches the PG path. See
+        PostgresStore.find_idle_deletable_conversations for rationale.
+        """
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(seconds=min_age_s)).isoformat()
@@ -2890,7 +2991,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                        (SELECT MAX(last_seen_at) FROM canonical_turns ct
                          WHERE ct.conversation_id = c.conversation_id) AS ct_last_seen
                   FROM conversations c
-                 WHERE c.phase NOT IN ('deleted', 'compacting')
+                 WHERE c.phase NOT IN ('deleted', 'compacting', 'merged')
                    AND c.deleted_at IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM ingestion_episode ie

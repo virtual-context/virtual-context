@@ -830,7 +830,7 @@ class PostgresStore(ContextStore):
                     tenant_id                      VARCHAR NOT NULL,
                     lifecycle_epoch                INT NOT NULL DEFAULT 1,
                     phase                          VARCHAR NOT NULL DEFAULT 'init'
-                                                   CHECK (phase IN ('init','ingesting','compacting','active','deleted')),
+                                                   CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
                     pending_raw_payload_entries    INT NOT NULL DEFAULT 0,
                     last_raw_payload_entries       INT NOT NULL DEFAULT 0,
                     last_ingestible_payload_entries INT NOT NULL DEFAULT 0,
@@ -845,8 +845,148 @@ class PostgresStore(ContextStore):
                     ON conversations(tenant_id, phase)
                      WHERE phase <> 'deleted'
             """)
+            # M0.1 (VCMERGE plan v1.11 section 2.1): relax the phase CHECK to
+            # admit the 'merged' value introduced by VCMERGE. The named-
+            # constraint pattern (DROP IF EXISTS + ADD CONSTRAINT) is
+            # idempotent re-runnable even after a partial-prior-state where
+            # the DROP succeeded but the ADD failed. The ADD does NOT
+            # validate existing rows (no rows can have phase='merged' yet),
+            # so the operation is fast even on populated tables. Brief
+            # ACCESS EXCLUSIVE during the swap; deploy in low-traffic window
+            # per plan section 8.1 step 1.
+            conn.execute("""
+                ALTER TABLE conversations
+                    DROP CONSTRAINT IF EXISTS conversations_phase_check
+            """)
+            conn.execute("""
+                ALTER TABLE conversations
+                    ADD CONSTRAINT conversations_phase_check
+                    CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged'))
+            """)
         except Exception:
             logger.warning("conversations table bootstrap failed", exc_info=True)
+        # M0.3 + M0.5 (VCMERGE plan v1.11 sections 2.1 + 5.2): merge_audit
+        # table + the unique partial index that backs the
+        # try_reserve_merge_audit_in_progress reservation flow. Spec section
+        # 9 schema; tenant_id column per v3.8-2 tenant-isolation. The
+        # partial index uses status IN ('in_progress','committed') per D4
+        # (committed rows must remain in the index so future re-merge
+        # attempts collide and resolve via the 5-state idempotency
+        # discriminator at spec section 12.7).
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS merge_audit (
+                    merge_id                  UUID PRIMARY KEY,
+                    tenant_id                 VARCHAR NOT NULL,
+                    source_conversation_id    TEXT NOT NULL,
+                    target_conversation_id    TEXT NOT NULL,
+                    source_label_at_merge     TEXT NOT NULL DEFAULT '',
+                    status                    VARCHAR NOT NULL
+                                              CHECK (status IN ('in_progress','committed','rolled_back')),
+                    started_at                TIMESTAMPTZ NOT NULL,
+                    completed_at              TIMESTAMPTZ NULL,
+                    rows_moved_json           TEXT NULL,
+                    error_message             TEXT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
+                    ON merge_audit (tenant_id, source_conversation_id)
+                    WHERE status IN ('in_progress', 'committed')
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_merge_audit_target
+                    ON merge_audit (tenant_id, target_conversation_id, completed_at DESC)
+                    WHERE status = 'committed'
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_merge_audit_status_started
+                    ON merge_audit (status, started_at)
+                    WHERE status = 'in_progress'
+            """)
+        except Exception:
+            logger.warning("merge_audit table bootstrap failed", exc_info=True)
+        # M0.4 (VCMERGE plan v1.11 section 2.1): merge_post_commit_pending
+        # queue table + tenant-consistency triggers. The two-trigger split
+        # (codex iter-2 v1.6-1 P1 corrected the DDL syntax: TG_OP is a
+        # PL/pgSQL function variable not available in trigger-level WHEN;
+        # combined BEFORE INSERT OR UPDATE leaves OLD undefined on INSERT)
+        # provides the same end-to-end invariant as the v1.5-4 single-
+        # trigger form intended but with valid PG syntax.
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
+                    pending_id        UUID PRIMARY KEY,
+                    merge_id          UUID NOT NULL REFERENCES merge_audit(merge_id),
+                    tenant_id         VARCHAR NOT NULL,
+                    kind              TEXT NOT NULL
+                                      CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
+                    payload_json      TEXT NOT NULL,
+                    status            TEXT NOT NULL
+                                      CHECK (status IN ('pending','done','failed')),
+                    attempts          INT NOT NULL DEFAULT 0,
+                    created_at        TIMESTAMPTZ NOT NULL,
+                    last_attempt_at   TIMESTAMPTZ NULL,
+                    completed_at      TIMESTAMPTZ NULL,
+                    error_message     TEXT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_status
+                    ON merge_post_commit_pending (status, created_at)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_tenant
+                    ON merge_post_commit_pending (tenant_id, status, created_at)
+            """)
+            # Trigger function: enforces NEW.tenant_id matches the parent
+            # merge_audit row's tenant_id. Raises check_violation on
+            # mismatch. CHECK constraints can't reference other tables
+            # in PG, so a BEFORE-trigger is the portable fix.
+            conn.execute("""
+                CREATE OR REPLACE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.tenant_id != (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id) THEN
+                        RAISE EXCEPTION 'merge_post_commit_pending.tenant_id (%) must match merge_audit.tenant_id for merge_id %',
+                            NEW.tenant_id, NEW.merge_id
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql
+            """)
+            # INSERT trigger: always fires; OLD is unavailable on INSERT,
+            # so no WHEN clause needed.
+            conn.execute("""
+                DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
+                    ON merge_post_commit_pending
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
+                    BEFORE INSERT ON merge_post_commit_pending
+                    FOR EACH ROW
+                    EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+            """)
+            # UPDATE trigger: fires only when an UPDATE statement touches
+            # tenant_id AND the new value differs from old. Phase B
+            # consumer's status-only UPDATEs short-circuit because the
+            # BEFORE UPDATE OF tenant_id clause filters by the SET
+            # column list; the WHEN clause adds a second filter for
+            # actual value change.
+            conn.execute("""
+                DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
+                    ON merge_post_commit_pending
+            """)
+            conn.execute("""
+                CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
+                    BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
+                    FOR EACH ROW
+                    WHEN (NEW.tenant_id IS DISTINCT FROM OLD.tenant_id)
+                    EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+            """)
+        except Exception:
+            logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
         # Progress-tracking columns for the DB-derived progress model.
         # Mirrors the SQLite schema (see sqlite.py):
         #   covered_ingestible_entries — how many ingestible payload entries
@@ -2282,7 +2422,7 @@ class PostgresStore(ContextStore):
 
           - canonical_turns count < ``max_msgs``
           - last-activity timestamp older than now - ``min_age_s``
-          - phase NOT in ('deleted', 'compacting')
+          - phase NOT in ('deleted', 'compacting', 'merged')
           - deleted_at IS NULL
           - no ``running`` ingestion_episode or compaction_operation
 
@@ -2292,6 +2432,14 @@ class PostgresStore(ContextStore):
         session. Callers resolve the tenant (via conversations.tenant_id
         or the CloudMetadataStore fallback) and invoke the canonical
         delete path (``registry.delete_conversation``) per row.
+
+        M0.6 (VCMERGE plan v1.11 section 2.1): rows with phase = 'merged'
+        are excluded from the auto-delete candidate set. A merged source
+        is the alias-resolution endpoint for any client that still
+        references the source's id; deleting it would lose the redirect
+        AND the audit-row reference. The merged source is intentionally
+        retained until cloud's redirect-cleanup branch (C2.21) explicitly
+        prunes it via the dashboard DELETE-on-merged-source flow.
 
         Returns up to ``limit`` rows ordered oldest-activity-first so
         the stalest candidates clear first under bounded work.
@@ -2321,7 +2469,7 @@ class PostgresStore(ContextStore):
                            )
                        ) AS last_activity_at
                   FROM conversations c
-                 WHERE c.phase NOT IN ('deleted', 'compacting')
+                 WHERE c.phase NOT IN ('deleted', 'compacting', 'merged')
                    AND c.deleted_at IS NULL
             )
             SELECT a.conversation_id, a.tenant_id, a.phase,
