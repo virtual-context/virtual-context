@@ -2826,7 +2826,7 @@ class PostgresStore(ContextStore):
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
-    # S1.3 — merge_conversation_data (PG body method per plan §3.3)
+    # S1.3 merge_conversation_data (PG body method per plan §3.3)
     # ------------------------------------------------------------------
     #
     # The Phase A body transaction. Moves all per-conv rows from source

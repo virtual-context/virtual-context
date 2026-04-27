@@ -331,7 +331,7 @@ class VirtualContextEngine:
         self._bootstrap_vocabulary()
 
     # ------------------------------------------------------------------
-    # E1.1 — Engine.merge_conversation entry point (per plan v1.11 §3.3)
+    # E1.1 Engine.merge_conversation entry point (per plan v1.11 §3.3)
     # ------------------------------------------------------------------
 
     def merge_conversation(

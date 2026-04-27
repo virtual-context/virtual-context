@@ -3321,7 +3321,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
-    # S1.4 — merge_conversation_data (SQLite body method, mirrors S1.3)
+    # S1.4 merge_conversation_data (SQLite body method, mirrors S1.3)
     # ------------------------------------------------------------------
     # SQLite path uses BEGIN IMMEDIATE (acquires the database write lock
     # at txn start, equivalent to PG's FOR UPDATE-via-row-lock pattern
