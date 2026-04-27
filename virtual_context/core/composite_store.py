@@ -975,6 +975,84 @@ class CompositeStore:
             return list(fn(max_msgs=max_msgs, min_age_s=min_age_s, limit=limit))
         return []
 
+    # ------------------------------------------------------------------
+    # VCMERGE storage forwarders (per cloud's v1.13 review of engine
+    # 11013f4: cloud's handle_vc_merge_cloud calls these methods through
+    # the Store protocol the engine hands to cloud, which is a
+    # CompositeStore in production. Without explicit forwarders, the
+    # graceful-fallback `getattr(self._segments, ..., None)` would still
+    # work, but a missing forwarder is a code-review smell — Phase 1
+    # body method (S1.3/S1.4) MUST resolve to PostgresStore in
+    # production and the forwarders pin that contract. See:
+    # PostgresStore.try_reserve_merge_audit_in_progress (S1.1),
+    # PostgresStore._mark_merge_rolled_back (S1.7),
+    # PostgresStore.lookup_committed_merge_audit_for_source (S1.5),
+    # PostgresStore.lookup_active_merge_audit_for_source (S1.6).
+    # ------------------------------------------------------------------
+
+    def try_reserve_merge_audit_in_progress(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        source_label_at_merge: str = "",
+    ):
+        """S1.1 forwarder. Returns ReservationResult per plan section 3.1
+        T1.3 (5-state discriminator). Raises NotImplementedError if the
+        underlying segments store doesn't implement the method (i.e. a
+        backend that predates Phase 0 schema).
+        """
+        fn = getattr(self._segments, "try_reserve_merge_audit_in_progress", None)
+        if callable(fn):
+            return fn(
+                merge_id=merge_id,
+                tenant_id=tenant_id,
+                source_conversation_id=source_conversation_id,
+                target_conversation_id=target_conversation_id,
+                source_label_at_merge=source_label_at_merge,
+            )
+        raise NotImplementedError(
+            "underlying segments store does not implement "
+            "try_reserve_merge_audit_in_progress; ensure Phase 0 schema "
+            "(M0.3 + M0.5) has been applied",
+        )
+
+    def lookup_committed_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.5 forwarder."""
+        fn = getattr(
+            self._segments, "lookup_committed_merge_audit_for_source", None,
+        )
+        if callable(fn):
+            return fn(tenant_id, source_conversation_id)
+        return None
+
+    def lookup_active_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.6 forwarder."""
+        fn = getattr(
+            self._segments, "lookup_active_merge_audit_for_source", None,
+        )
+        if callable(fn):
+            return fn(tenant_id, source_conversation_id)
+        return None
+
+    def _mark_merge_rolled_back(
+        self, tenant_id: str, merge_id: str, error_message: str,
+    ) -> bool:
+        """S1.7 forwarder. Returns True if the UPDATE flipped a row from
+        in_progress to rolled_back; False otherwise (already-completed,
+        already-rolled-back, or unknown merge_id).
+        """
+        fn = getattr(self._segments, "_mark_merge_rolled_back", None)
+        if callable(fn):
+            return bool(fn(tenant_id, merge_id, error_message))
+        return False
+
     def iter_untagged_canonical_rows(
         self,
         *,
