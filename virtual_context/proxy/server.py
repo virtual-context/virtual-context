@@ -654,8 +654,18 @@ async def prepare_payload(
         _after_fence = _vc_user_text[_last_fence + 3:].strip()
         if _after_fence:
             _vc_user_text = _after_fence
+    # VCMERGESTATUS comes BEFORE VCMERGE in the alternation because regex
+    # is greedy left-to-right at the alternation level (so "MERGESTATUS"
+    # would otherwise lose to "MERGE" with " STATUS" as arg). Per VCMerge
+    # plan v1.11 sections 3.4 P1.1-P1.3:
+    #   VCMERGE INTO <target>   -> vc_command="merge",       arg="INTO <target>"
+    #   VCMERGE PREVIEW <target>-> vc_command="merge",       arg="PREVIEW <target>"
+    #   VCMERGESTATUS <id>      -> vc_command="mergestatus", arg="<id>"
+    # The dispatcher (handlers._handle_vc_command_rest / _handle_vc_command)
+    # parses the arg to differentiate INTO vs PREVIEW; merge refuses with
+    # merge_routed_outside_cloud_* per the C1.0 dual-handler refuse pair.
     _vc_cmd_match = _re.match(
-        r"^VC(ATTACH|LABEL|STATUS|RECALL|COMPACT|LIST|FORGET)(?:\s+(.+))?$",
+        r"^VC(ATTACH|LABEL|STATUS|RECALL|COMPACT|LIST|FORGET|MERGESTATUS|MERGE)(?:\s+(.+))?$",
         _vc_user_text, _re.IGNORECASE,
     )
     _note_prep("parse_vc_command", _vc_parse_stage)

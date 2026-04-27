@@ -1908,6 +1908,68 @@ async def _handle_vc_command(
             tenant_registry=tenant_registry, tenant_id=tenant_id,
         )
 
+    # P1.8 — proxy-mode merge refuse (VCMerge plan v1.11 sections 3.4 + C1.0
+    # + 13.3 anti-subversion). Mirrors the REST refuse at
+    # _handle_vc_command_rest. The cloud-side intercept lands as a new
+    # VCMergeMiddleware in vc_cloud/main.py:build_app per C2.1b; if that
+    # middleware is missing or reverted the request lands here and we fail
+    # CLOSED with merge_routed_outside_cloud_proxy. The proxy and REST
+    # envelope codes differ so cloud ops can triage which transport's
+    # intercept failed. Without P1.8, today's else branch would silently
+    # return "Unknown VC command: merge" as a fake LLM text response,
+    # dropping the merge command without honoring the anti-subversion
+    # contract. Arg parsing matches the REST handler: INTO -> refuse,
+    # PREVIEW -> not-yet-implemented placeholder, else -> syntax help.
+    if cmd == "merge":
+        _arg_upper = (arg or "").upper().lstrip()
+        if _arg_upper.startswith("INTO ") or _arg_upper == "INTO":
+            _err_text = (
+                "VCMERGE must be intercepted at cloud's proxy entry "
+                "(the VCMergeMiddleware in vc_cloud/main.py:build_app per "
+                "plan section 4.1 C2.1b) before reaching the engine. "
+                "Receiving a merge command at the engine-side proxy "
+                "dispatcher indicates the cloud-side proxy intercept is "
+                "missing or reverted; no merge will run under this code path."
+            )
+            _payload = {
+                "conversation_id": conv_id,
+                "vc_command": cmd,
+                "error": "merge_routed_outside_cloud_proxy",
+                "message": _err_text,
+            }
+            if result.is_streaming:
+                return StreamingResponse(
+                    iter([fmt.emit_fake_response_sse(_err_text, conv_id)]),
+                    media_type="text/event-stream",
+                )
+            return JSONResponse(_payload)
+        if _arg_upper.startswith("PREVIEW ") or _arg_upper == "PREVIEW":
+            text = "VCMERGE PREVIEW: not yet implemented."
+            if result.is_streaming:
+                return StreamingResponse(
+                    iter([fmt.emit_fake_response_sse(text, conv_id)]),
+                    media_type="text/event-stream",
+                )
+            return JSONResponse(fmt.build_fake_response(text, conv_id))
+        text = (
+            "VCMERGE syntax: VCMERGE INTO <target_label_or_id> "
+            "or VCMERGE PREVIEW <target_label_or_id>."
+        )
+        if result.is_streaming:
+            return StreamingResponse(
+                iter([fmt.emit_fake_response_sse(text, conv_id)]),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(fmt.build_fake_response(text, conv_id))
+    if cmd == "mergestatus":
+        text = "VCMERGESTATUS: not yet implemented."
+        if result.is_streaming:
+            return StreamingResponse(
+                iter([fmt.emit_fake_response_sse(text, conv_id)]),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(fmt.build_fake_response(text, conv_id))
+
     if cmd == "label":
         text = _handle_vclabel(arg, conv_id, state, tenant_registry, tenant_id)
     elif cmd == "status":
@@ -2389,6 +2451,63 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             "label": target_label,
             "message": message,
             "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": message + marker}]}]},
+        })
+
+    # P1.4 + P1.8 dual-handler refuse pair (VCMerge plan v1.11 sections 3.4
+    # + C1.0 + 13.3 anti-subversion). Engine MUST NOT execute a merge body
+    # under any code path. Cloud's C2.1 (REST mode at vc_cloud/rest_api.py)
+    # and C2.1b (proxy mode VCMergeMiddleware in vc_cloud/main.py) intercept
+    # vc_command="merge" BEFORE the engine route handler runs and route to
+    # cloud's handle_vc_merge_cloud. If the merge command ever reaches the
+    # engine-side dispatcher (cloud intercept missing / reverted / route
+    # misconfigured), the engine fails CLOSED with an explicit error
+    # envelope. The dual envelope codes (merge_routed_outside_cloud_rest
+    # vs merge_routed_outside_cloud_proxy) let cloud ops triage WHICH
+    # transport's intercept failed.
+    #
+    # arg parsing: VCMERGE INTO <target> => arg="INTO <target>" -> refuse;
+    # VCMERGE PREVIEW <target> => arg="PREVIEW <target>" -> "not yet
+    # implemented" placeholder (per P1.2; engine-handled preview body is
+    # future work). Anything else => syntax help.
+    if cmd == "merge":
+        _arg_upper = (arg or "").upper().lstrip()
+        if _arg_upper.startswith("INTO ") or _arg_upper == "INTO":
+            return JSONResponse({
+                "conversation_id": conv_id,
+                "vc_command": cmd,
+                "error": "merge_routed_outside_cloud_rest",
+                "message": (
+                    "VCMERGE must be intercepted at cloud's REST entry "
+                    "(vc_cloud/rest_api.py per plan section 4.1 C2.1) "
+                    "before reaching the engine. Receiving a merge command "
+                    "at the engine-side REST dispatcher indicates the "
+                    "cloud-side merge intercept is missing or reverted; "
+                    "no merge will run under this code path."
+                ),
+            })
+        if _arg_upper.startswith("PREVIEW ") or _arg_upper == "PREVIEW":
+            return JSONResponse({
+                "conversation_id": conv_id,
+                "vc_command": cmd,
+                "message": "VCMERGE PREVIEW: not yet implemented.",
+                "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "VCMERGE PREVIEW: not yet implemented."}]}]},
+            })
+        return JSONResponse({
+            "conversation_id": conv_id,
+            "vc_command": cmd,
+            "error": "vcmerge_syntax",
+            "message": (
+                "VCMERGE syntax: VCMERGE INTO <target_label_or_id> "
+                "or VCMERGE PREVIEW <target_label_or_id>."
+            ),
+        })
+    if cmd == "mergestatus":
+        # P1.3 placeholder.
+        return JSONResponse({
+            "conversation_id": conv_id,
+            "vc_command": cmd,
+            "message": "VCMERGESTATUS: not yet implemented.",
+            "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "VCMERGESTATUS: not yet implemented."}]}]},
         })
 
     # All other commands: dispatch to shared handlers, return JSON
