@@ -241,6 +241,20 @@ def test_proxy_handler_refuses_streaming_request_too():
     """P1.8 streaming variant — the refuse must still fire when the
     request is streaming; engine returns a StreamingResponse with the
     error text.
+
+    Note: per VCMerge plan v1.12 §13.2 OI5 (deferred to v1.14), the
+    streaming response carries ONLY the human message text via
+    `fmt.emit_fake_response_sse`; the programmatic `error` code from
+    the dual-populated envelope is intentionally NOT preserved through
+    the SSE stream in the V0 implementation. This matches the existing
+    VCATTACH-error precedent at handlers.py:1853 and is acceptable
+    because: (a) the streaming refuse is a defense-in-depth path that
+    doesn't fire in normal flow (cloud always intercepts first per
+    C2.1b VCMergeMiddleware); (b) the non-streaming JSON path at
+    JSONResponse already carries the dual-populated envelope per spec
+    §12.9. This test asserts the StreamingResponse class is returned
+    but does NOT (yet) assert a structured error code in the stream;
+    that assertion will be added when v1.14 picks up OI5.
     """
     result = _make_proxy_result(
         "merge", arg="INTO target-conv", conv_id="src", streaming=True,
