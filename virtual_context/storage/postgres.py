@@ -2825,6 +2825,317 @@ class PostgresStore(ContextStore):
         )
         return cur.rowcount > 0
 
+    # ------------------------------------------------------------------
+    # S1.3 — merge_conversation_data (PG body method per plan §3.3)
+    # ------------------------------------------------------------------
+    #
+    # The Phase A body transaction. Moves all per-conv rows from source
+    # to target's namespace under one transaction, sets origin attribution,
+    # applies sort_key + request_turn offsets, resolves tag-summary
+    # conflicts, UPSERTs the alias row, finalizes merge_audit, and queues
+    # post-commit pendings.
+    #
+    # Caller (cloud's handle_vc_merge_cloud) MUST have already:
+    #   - Reserved merge_audit via try_reserve_merge_audit_in_progress (S1.1)
+    #   - Validated tenant + size + lifecycle_epoch
+    # Caller is responsible for marking merge_audit rolled_back on
+    # exception via _mark_merge_rolled_back (S1.7); this method raises
+    # through on failure without touching the audit row internally
+    # (single-owner rollback per codex iter-1 v1.4-3).
+
+    def merge_conversation_data(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        sort_key_offset: float,
+        request_turn_offset: int,
+        expected_target_lifecycle_epoch: int,
+        source_label_at_merge: str,
+    ):
+        """Move all per-conv data rows from source to target's namespace.
+
+        See class-level S1.3 docstring for the full body shape. Returns
+        ``MergeStats`` with the per-table move counts; caller writes
+        the SSE event / dashboard-badge from this.
+        """
+        from ..types import MergeStats
+        import json as _json
+
+        conn = self._get_conn()
+        started_at = datetime.now(timezone.utc)
+
+        # Per-table move plan. Dict shape: table -> action.
+        # action 'simple': UPDATE conversation_id = target WHERE conversation_id = source
+        # action 'offset': UPDATE conversation_id, sort_key/turn col += offset
+        # action 'transitive': scoped via FK; UPDATE origin_conversation_id only
+        #                       (parent row's conversation_id move handles re-routing)
+        # action 'delete_source': DELETE source's row (per-conv counter, etc.)
+        # action 'tag_conflict': special tag-summary conflict resolution
+        TABLES_SIMPLE = (
+            "segments", "canonical_turn_anchors", "canonical_turn_chunks",
+            "ingest_batches", "facts", "turn_tool_outputs",
+            "segment_tool_outputs", "chain_snapshots", "media_outputs",
+        )
+        TABLES_OFFSET_SORT_KEY = (
+            ("canonical_turns", "sort_key"),
+        )
+        TABLES_OFFSET_REQUEST_TURN = (
+            ("tool_outputs", "turn"),
+            ("tool_calls", "request_turn"),
+            ("request_captures", "turn"),
+            ("request_context", "request_turn"),
+        )
+        TABLES_TRANSITIVE = (
+            ("segment_tags", "segment_ref", "segments", "ref"),
+            ("fact_tags", "fact_id", "facts", "id"),
+        )
+        # fact_links has TWO endpoint cols (source_fact_id, target_fact_id);
+        # handled separately below.
+        rows_moved: dict[str, int] = {}
+
+        with conn.transaction():
+            # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
+            # Holds the row lock through the body's commit so the
+            # stale-reservation sweeper (C2.19) cannot roll it back
+            # mid-flight. Predicates on tenant_id per D3.
+            row = conn.execute(
+                """
+                SELECT 1 FROM merge_audit
+                 WHERE tenant_id = %s
+                   AND merge_id = %s
+                   AND status = 'in_progress'
+                 FOR UPDATE
+                """,
+                (tenant_id, merge_id),
+            ).fetchone()
+            if row is None:
+                from ..core.exceptions import MergeAuditMissing
+                raise MergeAuditMissing(
+                    f"No in_progress merge_audit row for tenant={tenant_id} "
+                    f"merge_id={merge_id}. Possible causes: stale-reservation "
+                    f"sweeper rolled back the reservation between step 1 and "
+                    f"step 2.5, or merge_conversation_data was called without "
+                    f"first calling try_reserve_merge_audit_in_progress.",
+                )
+
+            # Lifecycle-epoch consistency: target's epoch must match the
+            # caller-captured value. Refuses if epoch advanced (e.g. target
+            # was deleted+recreated between reserve and body).
+            tgt_epoch_row = conn.execute(
+                """
+                SELECT lifecycle_epoch
+                  FROM conversations
+                 WHERE tenant_id = %s AND conversation_id = %s
+                """,
+                (tenant_id, target_conversation_id),
+            ).fetchone()
+            if tgt_epoch_row is None:
+                from ..core.exceptions import LifecycleEpochMismatch
+                raise LifecycleEpochMismatch(
+                    f"Target conversation {target_conversation_id} not found "
+                    f"under tenant {tenant_id}",
+                )
+            if int(tgt_epoch_row["lifecycle_epoch"]) != int(expected_target_lifecycle_epoch):
+                from ..core.exceptions import LifecycleEpochMismatch
+                raise LifecycleEpochMismatch(
+                    f"Target lifecycle_epoch advanced "
+                    f"({tgt_epoch_row['lifecycle_epoch']} != {expected_target_lifecycle_epoch}); "
+                    f"source/target state has changed since reservation",
+                )
+
+            # Step 5: per-table moves.
+            for tbl in TABLES_SIMPLE:
+                cur = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET conversation_id = %s, "
+                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                    f" WHERE conversation_id = %s",
+                    (target_conversation_id, source_conversation_id, source_conversation_id),
+                )
+                rows_moved[tbl] = cur.rowcount
+
+            for tbl, col in TABLES_OFFSET_SORT_KEY:
+                cur = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET conversation_id = %s, "
+                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
+                    f"       {col} = {col} + %s "
+                    f" WHERE conversation_id = %s",
+                    (target_conversation_id, source_conversation_id,
+                     sort_key_offset, source_conversation_id),
+                )
+                rows_moved[tbl] = cur.rowcount
+
+            for tbl, col in TABLES_OFFSET_REQUEST_TURN:
+                cur = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET conversation_id = %s, "
+                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
+                    f"       {col} = {col} + %s "
+                    f" WHERE conversation_id = %s",
+                    (target_conversation_id, source_conversation_id,
+                     request_turn_offset, source_conversation_id),
+                )
+                rows_moved[tbl] = cur.rowcount
+
+            # Transitive tables: rows scoped via FK. UPDATE origin only;
+            # the parent row's conversation_id move is what re-routes them.
+            for tbl, fk_col, parent_tbl, parent_pk in TABLES_TRANSITIVE:
+                cur = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                    f" WHERE {fk_col} IN ("
+                    f"   SELECT {parent_pk} FROM {parent_tbl} "
+                    f"    WHERE origin_conversation_id = %s"
+                    f" )",
+                    (source_conversation_id, source_conversation_id),
+                )
+                rows_moved[tbl] = cur.rowcount
+
+            # fact_links: row moves if EITHER endpoint is in source's facts.
+            cur = conn.execute(
+                "UPDATE fact_links "
+                "   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                " WHERE source_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s) "
+                "    OR target_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s)",
+                (source_conversation_id, source_conversation_id, source_conversation_id),
+            )
+            rows_moved["fact_links"] = cur.rowcount
+
+            # request_turn_counters: source's row is per-conv state that
+            # doesn't make sense on the target (target has its own
+            # counter). DELETE source's row.
+            cur = conn.execute(
+                "DELETE FROM request_turn_counters WHERE conversation_id = %s",
+                (source_conversation_id,),
+            )
+            rows_moved["request_turn_counters"] = cur.rowcount
+
+            # Tag-summary conflict resolution. tag_summaries + tag_summary_embeddings
+            # have PK (tag, conversation_id). Source's row may collide with
+            # target's existing row for the same tag. Target wins; source's
+            # conflicting rows are DELETEd. Non-conflicting source rows
+            # are UPDATEd to target's namespace.
+            for tbl in ("tag_summaries", "tag_summary_embeddings"):
+                # Delete source rows whose tag already exists in target
+                cur = conn.execute(
+                    f"DELETE FROM {tbl} "
+                    f" WHERE conversation_id = %s "
+                    f"   AND tag IN ("
+                    f"     SELECT tag FROM {tbl} WHERE conversation_id = %s"
+                    f"   )",
+                    (source_conversation_id, target_conversation_id),
+                )
+                deleted_conflicts = cur.rowcount
+                # UPDATE remainder
+                cur2 = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET conversation_id = %s, "
+                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                    f" WHERE conversation_id = %s",
+                    (target_conversation_id, source_conversation_id, source_conversation_id),
+                )
+                rows_moved[tbl] = cur2.rowcount
+                rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
+
+            # conversation_aliases UPSERT (E-D5: epoch column). The alias
+            # makes a stale source_id resolve to the target post-merge;
+            # epoch matches the lifecycle epoch at merge time so a future
+            # delete+recreate can invalidate the alias if needed.
+            conn.execute(
+                """
+                INSERT INTO conversation_aliases (alias_id, target_id, epoch)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (alias_id) DO UPDATE
+                  SET target_id = EXCLUDED.target_id,
+                      epoch = EXCLUDED.epoch
+                """,
+                (source_conversation_id, target_conversation_id,
+                 expected_target_lifecycle_epoch),
+            )
+
+            # Source phase flip to 'merged'. M0.1 admits the value.
+            conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = 'merged',
+                       updated_at = %s
+                 WHERE tenant_id = %s
+                   AND conversation_id = %s
+                """,
+                (datetime.now(timezone.utc), tenant_id, source_conversation_id),
+            )
+
+            # merge_audit finalize. Predicates on tenant_id per D3.
+            completed_at = datetime.now(timezone.utc)
+            rows_moved_json = _json.dumps(rows_moved)
+            conn.execute(
+                """
+                UPDATE merge_audit
+                   SET status = 'committed',
+                       completed_at = %s,
+                       rows_moved_json = %s
+                 WHERE tenant_id = %s
+                   AND merge_id = %s
+                   AND status = 'in_progress'
+                """,
+                (completed_at, rows_moved_json, tenant_id, merge_id),
+            )
+
+            # merge_post_commit_pending INSERTs (B1.1 consumer picks these
+            # up post-commit; cloud's StaleLeaseSweeper 5th pass / C2.15).
+            # Three kinds per plan §3.5: sse_event, tag_regenerate,
+            # queue_resegment. JSON payload carries enough state for the
+            # consumer to fire each.
+            import uuid as _uuid
+            sse_payload = _json.dumps({
+                "merge_id": merge_id,
+                "source_conversation_id": source_conversation_id,
+                "target_conversation_id": target_conversation_id,
+                "rows_moved": rows_moved,
+                "source_label_at_merge": source_label_at_merge,
+            })
+            tag_regen_payload = _json.dumps({
+                "merge_id": merge_id,
+                "target_conversation_id": target_conversation_id,
+            })
+            queue_resegment_payload = _json.dumps({
+                "merge_id": merge_id,
+                "target_conversation_id": target_conversation_id,
+            })
+            for kind, payload in (
+                ("sse_event", sse_payload),
+                ("tag_regenerate", tag_regen_payload),
+                ("queue_resegment", queue_resegment_payload),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO merge_post_commit_pending
+                        (pending_id, merge_id, tenant_id, kind, payload_json,
+                         status, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                    """,
+                    (str(_uuid.uuid4()), merge_id, tenant_id, kind, payload,
+                     completed_at),
+                )
+
+        # Outer transaction commits here.
+
+        return MergeStats(
+            merge_id=merge_id,
+            source_conversation_id=source_conversation_id,
+            target_conversation_id=target_conversation_id,
+            tenant_id=tenant_id,
+            rows_moved=rows_moved,
+            sort_key_offset=sort_key_offset,
+            request_turn_offset=request_turn_offset,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+
     def complete_ingestion_episode(
         self,
         *,

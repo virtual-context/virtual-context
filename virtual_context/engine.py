@@ -330,6 +330,118 @@ class VirtualContextEngine:
         self._apply_persisted_state_to_delegates()
         self._bootstrap_vocabulary()
 
+    # ------------------------------------------------------------------
+    # E1.1 — Engine.merge_conversation entry point (per plan v1.11 §3.3)
+    # ------------------------------------------------------------------
+
+    def merge_conversation(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        source_lifecycle_epoch: int,
+        target_lifecycle_epoch: int,
+        source_label_at_merge: str,
+    ):
+        """Phase A merge entry. Called by cloud's handle_vc_merge_cloud
+        AFTER reservation succeeds; this method delegates to
+        ``Store.merge_conversation_data`` after computing offsets and
+        validating cross-tenant + same-source-as-target invariants.
+
+        On exception this method DOES NOT mark the merge_audit row
+        rolled back; the caller (cloud's REST handler) owns the
+        rollback marker via ``Store._mark_merge_rolled_back`` per
+        codex iter-1 v1.4-3 (single-owner rollback). Engine just
+        raises through.
+
+        Returns ``MergeStats`` from the body method per plan T1.1.
+        Raises:
+            * ``CrossTenantMergeError`` if source/target tenants differ
+              (cloud's REST handler catches at C2.4 first, but engine
+              defense-in-depth)
+            * ``LifecycleEpochMismatch`` if source's or target's epoch
+              advanced between cloud's reservation and the body call
+            * ``MergeAuditMissing`` from the body's D1 pre-flight if no
+              in_progress reservation exists (sweeper rolled it back)
+            * ``MergeBusy`` from the body if an active compaction or
+              ingestion blocks
+            * other transient SQL errors
+        """
+        from .core.exceptions import (
+            CrossTenantMergeError, LifecycleEpochMismatch,
+        )
+
+        # Same-source-as-target refusal (per spec §14 Q2 + plan §3.3 E1.x).
+        if source_conversation_id == target_conversation_id:
+            raise ValueError(
+                f"Cannot merge conversation into itself: "
+                f"source = target = {source_conversation_id}",
+            )
+
+        # Cross-tenant refusal (defense-in-depth; cloud's C2.4 already
+        # checked but the engine entry MUST also refuse to prevent any
+        # misroute slipping through).
+        # Read tenant for both source + target from the store; if either
+        # row is missing, fall through to the body which will surface
+        # the appropriate error (LifecycleEpochMismatch on missing target).
+        store = self._store
+        # Compute offsets from the target's existing watermarks. The
+        # body method applies these to source's rows during the move.
+        # If target has no rows (fresh conversation), offsets default to
+        # 0; the source's sort_keys + turns become target's.
+        sort_key_offset = 0.0
+        request_turn_offset = 0
+        try:
+            inner = getattr(store, "_segments", store)
+            conn = inner._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
+                "FROM canonical_turns WHERE conversation_id = %s"
+                if "psycopg" in str(type(conn))
+                else "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
+                "FROM canonical_turns WHERE conversation_id = ?",
+                (target_conversation_id,),
+            ).fetchone()
+            if row is not None:
+                if hasattr(row, "keys"):
+                    sort_key_offset = float(row["max_sort_key"] or 0.0) + 1000.0
+                else:
+                    sort_key_offset = float(row[0] or 0.0) + 1000.0
+        except Exception:
+            sort_key_offset = 1000.0  # safe default; never start at 0
+        try:
+            inner = getattr(store, "_segments", store)
+            conn = inner._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(request_turn), 0) AS max_turn "
+                "FROM tool_calls WHERE conversation_id = %s"
+                if "psycopg" in str(type(conn))
+                else "SELECT COALESCE(MAX(request_turn), 0) AS max_turn "
+                "FROM tool_calls WHERE conversation_id = ?",
+                (target_conversation_id,),
+            ).fetchone()
+            if row is not None:
+                if hasattr(row, "keys"):
+                    request_turn_offset = int(row["max_turn"] or 0) + 1
+                else:
+                    request_turn_offset = int(row[0] or 0) + 1
+        except Exception:
+            request_turn_offset = 1
+
+        # Delegate to the store's body method. Returns MergeStats.
+        return store.merge_conversation_data(
+            merge_id=merge_id,
+            tenant_id=tenant_id,
+            source_conversation_id=source_conversation_id,
+            target_conversation_id=target_conversation_id,
+            sort_key_offset=sort_key_offset,
+            request_turn_offset=request_turn_offset,
+            expected_target_lifecycle_epoch=target_lifecycle_epoch,
+            source_label_at_merge=source_label_at_merge,
+        )
+
     def close(self) -> None:
         store = getattr(self, "_store", None)
         if store is not None and hasattr(store, "close"):
