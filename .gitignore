@@ -64,3 +64,4 @@ extraneous/paper/*.png
 
 # OS
 .DS_Store
+.agent-prompt.md
