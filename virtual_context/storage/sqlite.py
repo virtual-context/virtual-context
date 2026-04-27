@@ -815,6 +815,58 @@ class SQLiteStore(ContextStore):
         # tag_summary_embeddings, turn_tool_outputs, segment_tool_outputs,
         # chain_snapshots, media_outputs) are CREATE'd later in this
         # method, AFTER this position.
+        # E-D4 fold (codex iter-1 P2): SQLite M0.1 table-rewrite for
+        # existing DBs whose conversations.phase CHECK predates the
+        # 'merged' value addition. SQLite has no ALTER CHECK syntax;
+        # we detect the old CHECK via sqlite_master.sql LIKE check and
+        # do a table-rewrite to install the new CHECK. Idempotent
+        # re-runnable (skips if 'merged' already in the CHECK).
+        try:
+            existing_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations'",
+            ).fetchone()
+            if existing_sql_row is not None:
+                existing_sql = existing_sql_row[0] or ""
+                if "'merged'" not in existing_sql and "phase IN" in existing_sql:
+                    # Old CHECK detected; rewrite the table.
+                    logger.info("E-D4: rewriting conversations to add 'merged' to CHECK")
+                    conn.execute("PRAGMA foreign_keys = OFF")
+                    conn.execute("""
+                        CREATE TABLE conversations_ed4_new (
+                            conversation_id                TEXT PRIMARY KEY,
+                            tenant_id                      TEXT NOT NULL,
+                            lifecycle_epoch                INTEGER NOT NULL DEFAULT 1,
+                            phase                          TEXT NOT NULL DEFAULT 'init'
+                                                           CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
+                            pending_raw_payload_entries    INTEGER NOT NULL DEFAULT 0,
+                            last_raw_payload_entries       INTEGER NOT NULL DEFAULT 0,
+                            last_ingestible_payload_entries INTEGER NOT NULL DEFAULT 0,
+                            created_at                     TEXT NOT NULL,
+                            updated_at                     TEXT NOT NULL,
+                            deleted_at                     TEXT NULL,
+                            UNIQUE (tenant_id, conversation_id)
+                        )
+                    """)
+                    conn.execute("""
+                        INSERT INTO conversations_ed4_new
+                            (conversation_id, tenant_id, lifecycle_epoch, phase,
+                             pending_raw_payload_entries, last_raw_payload_entries,
+                             last_ingestible_payload_entries, created_at, updated_at,
+                             deleted_at)
+                        SELECT conversation_id, tenant_id, lifecycle_epoch, phase,
+                               pending_raw_payload_entries, last_raw_payload_entries,
+                               last_ingestible_payload_entries, created_at, updated_at,
+                               deleted_at
+                          FROM conversations
+                    """)
+                    conn.execute("DROP TABLE conversations")
+                    conn.execute("ALTER TABLE conversations_ed4_new RENAME TO conversations")
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    logger.info("E-D4: conversations rewrite complete")
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet (fresh DB) or rewrite failed; the
+            # fresh CREATE below will produce the correct CHECK.
+            pass
         # Drop-and-recreate keeps the partial-index clause in lockstep with
         # Postgres (see postgres.py). SQLite 3.8+ supports partial indexes;
         # the `WHERE phase <> 'deleted'` predicate excludes tombstones so
