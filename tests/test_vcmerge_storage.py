@@ -44,7 +44,7 @@ def _store(tmp_path) -> SQLiteStore:
 
 
 # ---------------------------------------------------------------------------
-# S1.1 try_reserve_merge_audit_in_progress — 5-state discriminator
+# S1.1 try_reserve_merge_audit_in_progress: 5-state discriminator
 # ---------------------------------------------------------------------------
 
 def test_try_reserve_returns_reserved_on_first_call(tmp_path):
@@ -86,8 +86,10 @@ def test_try_reserve_returns_in_progress_on_concurrent_caller(tmp_path):
 
 
 def test_try_reserve_returns_committed_match_on_idempotent_retry(tmp_path):
-    """Caller re-tries with same (tenant, source, label) after prior commit
-    -> committed_match envelope (idempotent retry per spec section 12.7).
+    """Caller re-tries with same (tenant, source, target) after prior commit
+    -> committed_match envelope (idempotent retry per spec section 12.7 +
+    §6.1 idempotency contract). E-D3 fold: discriminator is
+    target_conversation_id, NOT source_label_at_merge.
     """
     store = _store(tmp_path)
     first_id = str(uuid.uuid4())
@@ -97,13 +99,12 @@ def test_try_reserve_returns_committed_match_on_idempotent_retry(tmp_path):
         source_label_at_merge="my-label",
     )
     assert r1.status == "reserved"
-    # Simulate body completion by directly UPDATEing the audit row.
     store._get_conn().execute(
         "UPDATE merge_audit SET status='committed', completed_at=? WHERE merge_id=?",
         (datetime.now(timezone.utc).isoformat(), first_id),
     )
     store._get_conn().commit()
-    # Retry with the same label -> committed_match.
+    # Retry with the same target -> committed_match.
     r2 = store.try_reserve_merge_audit_in_progress(
         merge_id=str(uuid.uuid4()), tenant_id="tA",
         source_conversation_id="src", target_conversation_id="tgt",
@@ -112,19 +113,45 @@ def test_try_reserve_returns_committed_match_on_idempotent_retry(tmp_path):
     assert r2.status == "committed_match"
     assert r2.existing is not None
     assert r2.existing.status == "committed"
-    assert r2.merge_id == first_id  # the canonical merge_id from the prior commit
+    assert r2.merge_id == first_id
 
 
-def test_try_reserve_returns_committed_mismatch_on_label_change(tmp_path):
-    """Caller re-tries with different label after prior commit ->
-    committed_mismatch envelope.
+def test_try_reserve_committed_match_when_label_changes_but_target_same(tmp_path):
+    """E-D3 fold (codex iter-1 P1): label can change between calls; if
+    the target is unchanged, the merge identity is the same -> match.
+    Pins the corrected discriminator behavior.
+    """
+    store = _store(tmp_path)
+    first_id = str(uuid.uuid4())
+    store.try_reserve_merge_audit_in_progress(
+        merge_id=first_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        source_label_at_merge="old-label",
+    )
+    store._get_conn().execute(
+        "UPDATE merge_audit SET status='committed', completed_at=? WHERE merge_id=?",
+        (datetime.now(timezone.utc).isoformat(), first_id),
+    )
+    store._get_conn().commit()
+    r2 = store.try_reserve_merge_audit_in_progress(
+        merge_id=str(uuid.uuid4()), tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        source_label_at_merge="NEW-label",  # label changed
+    )
+    # Same target = same merge intent = match.
+    assert r2.status == "committed_match"
+
+
+def test_try_reserve_returns_committed_mismatch_on_target_change(tmp_path):
+    """E-D3 fold (codex iter-1 P1): different target = different merge
+    intent -> committed_mismatch. Source label is irrelevant.
     """
     store = _store(tmp_path)
     first_id = str(uuid.uuid4())
     r1 = store.try_reserve_merge_audit_in_progress(
         merge_id=first_id, tenant_id="tA",
-        source_conversation_id="src", target_conversation_id="tgt",
-        source_label_at_merge="old-label",
+        source_conversation_id="src", target_conversation_id="tgt-1",
+        source_label_at_merge="lbl",
     )
     assert r1.status == "reserved"
     store._get_conn().execute(
@@ -134,12 +161,13 @@ def test_try_reserve_returns_committed_mismatch_on_label_change(tmp_path):
     store._get_conn().commit()
     r2 = store.try_reserve_merge_audit_in_progress(
         merge_id=str(uuid.uuid4()), tenant_id="tA",
-        source_conversation_id="src", target_conversation_id="tgt",
-        source_label_at_merge="NEW-label",
+        source_conversation_id="src",
+        target_conversation_id="tgt-2",  # different target
+        source_label_at_merge="lbl",  # same label
     )
     assert r2.status == "committed_mismatch"
     assert r2.existing is not None
-    assert r2.existing.source_label_at_merge == "old-label"
+    assert r2.existing.target_conversation_id == "tgt-1"
 
 
 def test_try_reserve_after_rolled_back_succeeds_with_reserved(tmp_path):
@@ -228,7 +256,7 @@ def test_lookup_committed_ignores_in_progress(tmp_path):
 
 
 def test_lookup_active_returns_in_progress_row(tmp_path):
-    """S1.6 — active includes both in_progress and committed."""
+    """S1.6: active includes both in_progress and committed."""
     store = _store(tmp_path)
     mid = str(uuid.uuid4())
     store.try_reserve_merge_audit_in_progress(
@@ -325,7 +353,7 @@ def test_mark_rolled_back_refuses_to_flip_committed(tmp_path):
 
 
 def test_mark_rolled_back_predicates_on_tenant_id(tmp_path):
-    """D3 — every user-routed write to merge_audit predicates on tenant_id.
+    """D3: every user-routed write to merge_audit predicates on tenant_id.
     Cross-tenant call returns False (no match) and does NOT flip the row.
     """
     store = _store(tmp_path)

@@ -1908,7 +1908,7 @@ async def _handle_vc_command(
             tenant_registry=tenant_registry, tenant_id=tenant_id,
         )
 
-    # P1.8 — proxy-mode merge refuse (VCMerge plan v1.11 sections 3.4 + C1.0
+    # P1.8: proxy-mode merge refuse (VCMerge plan v1.11 sections 3.4 + C1.0
     # + 13.3 anti-subversion). Mirrors the REST refuse at
     # _handle_vc_command_rest. The cloud-side intercept lands as a new
     # VCMergeMiddleware in vc_cloud/main.py:build_app per C2.1b; if that
@@ -1923,6 +1923,7 @@ async def _handle_vc_command(
     if cmd == "merge":
         _arg_upper = (arg or "").upper().lstrip()
         if _arg_upper.startswith("INTO ") or _arg_upper == "INTO":
+            _err_code = "merge_routed_outside_cloud_proxy"
             _err_text = (
                 "VCMERGE must be intercepted at cloud's proxy entry "
                 "(the VCMergeMiddleware in vc_cloud/main.py:build_app per "
@@ -1934,33 +1935,51 @@ async def _handle_vc_command(
             _payload = {
                 "conversation_id": conv_id,
                 "vc_command": cmd,
-                "error": "merge_routed_outside_cloud_proxy",
+                "error": _err_code,
                 "message": _err_text,
             }
             if result.is_streaming:
+                # E-D1 fix (codex iter-1 P1; cloud's preferred prefix shape):
+                # streaming SSE prepends `[error_code] ` to the human text so
+                # programmatic consumers can grep the code AND human readers
+                # see the message. REST JSON (below) keeps separate error +
+                # message fields. Both paths now carry both pieces; the
+                # transports differ in encoding only.
+                _streamed = f"[{_err_code}] {_err_text}"
                 return StreamingResponse(
-                    iter([fmt.emit_fake_response_sse(_err_text, conv_id)]),
+                    iter([fmt.emit_fake_response_sse(_streamed, conv_id)]),
                     media_type="text/event-stream",
                 )
             return JSONResponse(_payload)
         if _arg_upper.startswith("PREVIEW ") or _arg_upper == "PREVIEW":
             text = "VCMERGE PREVIEW: not yet implemented."
             if result.is_streaming:
+                # Placeholder paths have no error code; bare text matches
+                # the non-streaming JSON path's `message` field.
                 return StreamingResponse(
                     iter([fmt.emit_fake_response_sse(text, conv_id)]),
                     media_type="text/event-stream",
                 )
             return JSONResponse(fmt.build_fake_response(text, conv_id))
+        # Unknown VCMERGE subcommand: emit syntax help with vcmerge_syntax
+        # error code on both transports per E-D1 dual-populate rule.
+        _err_code = "vcmerge_syntax"
         text = (
             "VCMERGE syntax: VCMERGE INTO <target_label_or_id> "
             "or VCMERGE PREVIEW <target_label_or_id>."
         )
         if result.is_streaming:
+            _streamed = f"[{_err_code}] {text}"
             return StreamingResponse(
-                iter([fmt.emit_fake_response_sse(text, conv_id)]),
+                iter([fmt.emit_fake_response_sse(_streamed, conv_id)]),
                 media_type="text/event-stream",
             )
-        return JSONResponse(fmt.build_fake_response(text, conv_id))
+        return JSONResponse({
+            "conversation_id": conv_id,
+            "vc_command": cmd,
+            "error": _err_code,
+            "message": text,
+        })
     if cmd == "mergestatus":
         text = "VCMERGESTATUS: not yet implemented."
         if result.is_streaming:

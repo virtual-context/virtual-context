@@ -3041,7 +3041,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # ------------------------------------------------------------------
     # VCMERGE storage methods (S1.2, S1.5, S1.6, S1.7 per plan v1.11)
     # SQLite mirror of the PostgresStore methods. Body method (S1.4) is
-    # not implemented here either — see the corresponding PostgresStore
+    # not implemented here either: see the corresponding PostgresStore
     # comment block. SQLite is the test backend per project convention;
     # production runs PG.
     # ------------------------------------------------------------------
@@ -3141,7 +3141,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return ReservationResult(
                 status="in_progress", merge_id=view.merge_id, existing=view,
             )
-        if view.source_label_at_merge == source_label_at_merge:
+        # E-D3 fold (codex iter-1 P1): discriminator is target, not label.
+        # See PostgresStore.try_reserve_merge_audit_in_progress for the
+        # full rationale (spec §6.1 idempotency contract).
+        if view.target_conversation_id == target_conversation_id:
             return ReservationResult(
                 status="committed_match", merge_id=view.merge_id, existing=view,
             )

@@ -15,7 +15,7 @@ be reachable on a graceful-fallback path. These tests pin:
 - Lookup forwarders return None gracefully when the underlying store
   doesn't implement them (read-side, can't fail-loud safely).
 - _mark_merge_rolled_back returns False when forwarded (single-owner
-  semantics — matches the underlying PG/SQLite behavior).
+  semantics: matches the underlying PG/SQLite behavior).
 
 All tests use the SQLite backend per project convention; SQLiteStore's
 new S1.x methods (per commit 11013f4) are wrapped in a CompositeStore
@@ -41,7 +41,7 @@ pytestmark = pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26")
 
 def _composite(tmp_path) -> CompositeStore:
     """Build a CompositeStore wrapping a single SQLiteStore for all five
-    sub-stores. Mirrors the simplest production layering — cloud's actual
+    sub-stores. Mirrors the simplest production layering: cloud's actual
     setup uses Postgres for all five but the forwarder semantics are
     identical because CompositeStore dispatches on `self._segments` for
     the merge methods.
@@ -116,7 +116,7 @@ def test_composite_try_reserve_raises_when_underlying_lacks_method():
     AttributeError on a missing-attribute lookup.
     """
     class _StubNoMerge:
-        """Pre-Phase-0 stub — no merge methods."""
+        """Pre-Phase-0 stub: no merge methods."""
 
     composite = _composite_with_stub(_StubNoMerge())
     with pytest.raises(NotImplementedError) as exc_info:
@@ -160,7 +160,7 @@ def test_composite_lookup_committed_returns_none_for_missing_source(tmp_path):
 
 def test_composite_lookup_committed_returns_none_when_underlying_lacks_method():
     """Read-side forwarders return None gracefully when underlying store
-    doesn't implement them — matches the existing
+    doesn't implement them: matches the existing
     find_idle_deletable_conversations forwarder pattern.
     """
     class _StubNoMerge:
@@ -232,7 +232,7 @@ def test_composite_mark_rolled_back_returns_false_when_underlying_lacks_method()
 
 
 def test_composite_mark_rolled_back_returns_false_for_already_committed(tmp_path):
-    """Forwarder preserves the underlying single-owner predicate — refuses
+    """Forwarder preserves the underlying single-owner predicate: refuses
     to flip a row that's already committed.
     """
     composite = _composite(tmp_path)

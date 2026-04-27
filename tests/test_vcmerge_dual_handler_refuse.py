@@ -12,7 +12,7 @@ summary. Pins:
   programmatic consumers branch on the error code.
 - The proxy-mode regex in proxy/server.py admits the MERGE / MERGESTATUS
   alternations so result.vc_command can populate "merge" or
-  "mergestatus" — without this regex extension P1.4 / P1.8 would never
+  "mergestatus": without this regex extension P1.4 / P1.8 would never
   fire because the command would never parse.
 - VCMERGESTATUS returns the "not yet implemented" placeholder per P1.3
   (read-only status query, future work).
@@ -106,12 +106,12 @@ def _make_dummy_state():
 
 
 def _make_dummy_registry():
-    """REST path doesn't dispatch to attach for merge — no registry needed."""
+    """REST path doesn't dispatch to attach for merge: no registry needed."""
     return None
 
 
 def test_rest_handler_refuses_vcmerge_into_with_merge_routed_outside_cloud_rest():
-    """P1.4 — engine REST handler refuses cmd='merge' arg='INTO ...' with
+    """P1.4: engine REST handler refuses cmd='merge' arg='INTO ...' with
     the merge_routed_outside_cloud_rest envelope. No merge body fires;
     no merge_audit row is INSERTed.
     """
@@ -133,7 +133,7 @@ def test_rest_handler_refuses_vcmerge_into_with_merge_routed_outside_cloud_rest(
 
 
 def test_rest_handler_refuses_vcmerge_into_uppercased_arg():
-    """Case-insensitive arg parsing — INTO / into / Into all refuse."""
+    """Case-insensitive arg parsing: INTO / into / Into all refuse."""
     for arg_form in ("INTO foo", "into foo", "Into foo"):
         result = _make_rest_result("merge", arg=arg_form, conv_id="src")
         response = handlers._handle_vc_command_rest(
@@ -147,7 +147,7 @@ def test_rest_handler_refuses_vcmerge_into_uppercased_arg():
 
 
 def test_rest_handler_returns_preview_not_implemented():
-    """P1.2 placeholder — engine REST handler returns 'not yet
+    """P1.2 placeholder: engine REST handler returns 'not yet
     implemented' message for PREVIEW arg, NOT the refuse envelope.
     """
     result = _make_rest_result("merge", arg="PREVIEW target-conv", conv_id="src")
@@ -156,7 +156,7 @@ def test_rest_handler_returns_preview_not_implemented():
         tenant_id="tA", vcconv=None,
     )
     payload = json.loads(response.body)
-    # Not a refuse — no "error" key (the placeholder uses message-only).
+    # Not a refuse: no "error" key (the placeholder uses message-only).
     assert "error" not in payload
     assert "not yet implemented" in payload["message"].lower()
 
@@ -176,7 +176,7 @@ def test_rest_handler_returns_syntax_help_for_unknown_arg():
 
 
 def test_rest_handler_returns_mergestatus_not_implemented():
-    """P1.3 — VCMERGESTATUS returns the placeholder."""
+    """P1.3: VCMERGESTATUS returns the placeholder."""
     result = _make_rest_result("mergestatus", arg="merge-id-123", conv_id="src")
     response = handlers._handle_vc_command_rest(
         result, _make_dummy_state(), _make_dummy_registry(),
@@ -223,7 +223,7 @@ def _run_proxy_handler(result):
 
 
 def test_proxy_handler_refuses_vcmerge_into_with_merge_routed_outside_cloud_proxy():
-    """P1.8 (v1.10 C1.0) — engine proxy handler refuses cmd='merge'
+    """P1.8 (v1.10 C1.0): engine proxy handler refuses cmd='merge'
     arg='INTO ...' with the merge_routed_outside_cloud_proxy envelope.
     NOT the silent 'Unknown VC command: merge' fallback.
     """
@@ -238,30 +238,79 @@ def test_proxy_handler_refuses_vcmerge_into_with_merge_routed_outside_cloud_prox
 
 
 def test_proxy_handler_refuses_streaming_request_too():
-    """P1.8 streaming variant — the refuse must still fire when the
+    """P1.8 streaming variant: the refuse must still fire when the
     request is streaming; engine returns a StreamingResponse with the
     error text.
 
-    Note: per VCMerge plan v1.12 §13.2 OI5 (deferred to v1.14), the
-    streaming response carries ONLY the human message text via
-    `fmt.emit_fake_response_sse`; the programmatic `error` code from
-    the dual-populated envelope is intentionally NOT preserved through
-    the SSE stream in the V0 implementation. This matches the existing
-    VCATTACH-error precedent at handlers.py:1853 and is acceptable
-    because: (a) the streaming refuse is a defense-in-depth path that
-    doesn't fire in normal flow (cloud always intercepts first per
-    C2.1b VCMergeMiddleware); (b) the non-streaming JSON path at
-    JSONResponse already carries the dual-populated envelope per spec
-    §12.9. This test asserts the StreamingResponse class is returned
-    but does NOT (yet) assert a structured error code in the stream;
-    that assertion will be added when v1.14 picks up OI5.
+    Per E-D1 fold (codex iter-1 P1): the streaming SSE chunk now
+    carries BOTH the programmatic error code AND the human message
+    via cloud's preferred prefix shape `[error_code] message`. This
+    satisfies spec §12.9 dual-population on both transports. OI5 from
+    v1.12 §13.2 (deferred to v1.14) is now resolved by E-D1.
     """
+    import asyncio
     result = _make_proxy_result(
         "merge", arg="INTO target-conv", conv_id="src", streaming=True,
     )
     response = _run_proxy_handler(result)
     from starlette.responses import StreamingResponse
     assert isinstance(response, StreamingResponse)
+    body_iter = response.body_iterator
+    if hasattr(body_iter, "__aiter__"):
+        chunks = asyncio.run(_drain_async(body_iter))
+    else:
+        chunks = list(body_iter)
+    text = "".join(c if isinstance(c, str) else c.decode() for c in chunks)
+    assert "[merge_routed_outside_cloud_proxy]" in text, (
+        f"Streaming refuse missing error-code prefix; got: {text!r}"
+    )
+    assert "VCMERGE must be intercepted" in text, (
+        f"Streaming refuse missing human message; got: {text!r}"
+    )
+
+
+async def _drain_async(aiter):
+    out = []
+    async for chunk in aiter:
+        out.append(chunk)
+    return out
+
+
+def test_rest_and_proxy_refuse_envelopes_carry_both_fields_E_D1():
+    """E-D1 (codex iter-1 P1): REST JSON envelope and proxy SSE chunk
+    BOTH carry the programmatic error code AND the human message,
+    even though the wire formats differ. Asserts envelope-equivalence
+    across the dual-handler refuse pair per spec §12.9.
+
+    REST: structured JSON with separate `error` + `message` fields.
+    Proxy streaming: text payload prefixed `[error_code] message` so
+    plugin clients can grep the code while still reading the prose.
+    """
+    import asyncio
+    rest_result = _make_rest_result("merge", arg="INTO foo", conv_id="src")
+    rest_response = handlers._handle_vc_command_rest(
+        rest_result, None, None, tenant_id="tA", vcconv=None,
+    )
+    rest_payload = json.loads(rest_response.body)
+    assert rest_payload["error"] == "merge_routed_outside_cloud_rest"
+    assert "VCMERGE" in rest_payload["message"]
+
+    proxy_result = _make_proxy_result(
+        "merge", arg="INTO foo", conv_id="src", streaming=True,
+    )
+    proxy_response = _run_proxy_handler(proxy_result)
+    body_iter = proxy_response.body_iterator
+    if hasattr(body_iter, "__aiter__"):
+        chunks = asyncio.run(_drain_async(body_iter))
+    else:
+        chunks = list(body_iter)
+    proxy_text = "".join(
+        c if isinstance(c, str) else c.decode() for c in chunks
+    )
+    assert "merge_routed_outside_cloud_proxy" in proxy_text
+    assert "VCMERGE must be intercepted" in proxy_text
+    # Code distinct between transports per the C1.0 ops-triage invariant.
+    assert "merge_routed_outside_cloud_rest" != "merge_routed_outside_cloud_proxy"
 
 
 def test_proxy_handler_does_not_silently_no_op_on_merge():
@@ -288,7 +337,7 @@ def test_proxy_handler_returns_preview_not_implemented():
 
 
 # ---------------------------------------------------------------------------
-# Dual-error-code symmetry — the two transports MUST use distinct codes
+# Dual-error-code symmetry: the two transports MUST use distinct codes
 # ---------------------------------------------------------------------------
 
 def test_rest_and_proxy_refuse_codes_are_distinct():

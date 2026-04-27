@@ -981,7 +981,7 @@ class CompositeStore:
     # the Store protocol the engine hands to cloud, which is a
     # CompositeStore in production. Without explicit forwarders, the
     # graceful-fallback `getattr(self._segments, ..., None)` would still
-    # work, but a missing forwarder is a code-review smell — Phase 1
+    # work, but a missing forwarder is a code-review smell: Phase 1
     # body method (S1.3/S1.4) MUST resolve to PostgresStore in
     # production and the forwarders pin that contract. See:
     # PostgresStore.try_reserve_merge_audit_in_progress (S1.1),
