@@ -2867,8 +2867,8 @@ class PostgresStore(ContextStore):
         tenant_id: str,
         source_conversation_id: str,
         target_conversation_id: str,
-        sort_key_offset: float,
-        request_turn_offset: int,
+        sort_key_offset: float = 0.0,
+        request_turn_offset: int = 0,
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
         expected_source_lifecycle_epoch: int | None = None,
@@ -2878,6 +2878,15 @@ class PostgresStore(ContextStore):
         See class-level S1.3 docstring for the full body shape. Returns
         ``MergeStats`` with the per-table move counts; caller writes
         the SSE event / dashboard-badge from this.
+
+        Offsets policy (v1.14-2 codex iter-3 P1): ``sort_key_offset`` and
+        ``request_turn_offset`` are now hints / floors only. The body
+        re-computes both AFTER acquiring the conversation_lifecycle FOR
+        UPDATE locks and uses ``max(caller_value, recomputed)`` so a
+        concurrent ``save_request_context()`` writer that lands BETWEEN
+        engine-side computation and body lock acquisition cannot make
+        the offsets stale. Callers may pass 0 (let body decide) or pass
+        a higher floor for test predictability.
 
         Tenant-scoping contract (B-D1 codex iter-2 P0): per-conv data
         tables (segments, canonical_turns, facts, ...) DO NOT carry a
@@ -3064,47 +3073,96 @@ class PostgresStore(ContextStore):
             # compaction or a running ingestion episode. The conversation_lifecycle
             # row lock above blocks NEW compactions/ingests from STARTING during
             # the body, but pre-existing ones still need to finish before merge.
+            #
+            # v1.14-4 (codex iter-3 P2): NARROW exception type for the table-
+            # absent case so a real query regression / permission issue / schema
+            # drift cannot fail-open. Only ``UndefinedTable`` (table missing on
+            # minimal fixtures) is swallowed; everything else propagates and the
+            # outer transaction rolls back. SAVEPOINT-via-nested-transaction
+            # contains the UndefinedTable so the outer txn stays alive when the
+            # check is skipped.
+            cop_row = None
+            cop_table_present = True
             try:
-                cop_row = conn.execute(
-                    """
-                    SELECT 1 FROM compaction_operation
-                     WHERE conversation_id IN (%s, %s)
-                       AND status IN ('queued','running')
-                     LIMIT 1
-                    """,
-                    (source_conversation_id, target_conversation_id),
-                ).fetchone()
-                if cop_row is not None:
-                    raise MergeBusy(
-                        "Active compaction_operation on source or target; "
-                        "cannot merge until it completes",
-                        code="merge_busy_compact",
-                    )
-            except MergeBusy:
-                raise
-            except Exception:
-                # compaction_operation table absent on minimal fixtures
-                pass
+                with conn.transaction():
+                    cop_row = conn.execute(
+                        """
+                        SELECT 1 FROM compaction_operation
+                         WHERE conversation_id IN (%s, %s)
+                           AND status IN ('queued','running')
+                         LIMIT 1
+                        """,
+                        (source_conversation_id, target_conversation_id),
+                    ).fetchone()
+            except psycopg.errors.UndefinedTable:
+                cop_table_present = False
+            if cop_table_present and cop_row is not None:
+                raise MergeBusy(
+                    "Active compaction_operation on source or target; "
+                    "cannot merge until it completes",
+                    code="merge_busy_compact",
+                )
+
+            ing_row = None
+            ing_table_present = True
             try:
-                ing_row = conn.execute(
-                    """
-                    SELECT 1 FROM ingestion_episode
-                     WHERE conversation_id IN (%s, %s)
-                       AND status = 'running'
-                     LIMIT 1
-                    """,
-                    (source_conversation_id, target_conversation_id),
-                ).fetchone()
-                if ing_row is not None:
-                    raise MergeBusy(
-                        "Running ingestion_episode on source or target; "
-                        "cannot merge until it completes",
-                        code="merge_busy_ingest",
-                    )
-            except MergeBusy:
-                raise
-            except Exception:
-                pass
+                with conn.transaction():
+                    ing_row = conn.execute(
+                        """
+                        SELECT 1 FROM ingestion_episode
+                         WHERE conversation_id IN (%s, %s)
+                           AND status = 'running'
+                         LIMIT 1
+                        """,
+                        (source_conversation_id, target_conversation_id),
+                    ).fetchone()
+            except psycopg.errors.UndefinedTable:
+                ing_table_present = False
+            if ing_table_present and ing_row is not None:
+                raise MergeBusy(
+                    "Running ingestion_episode on source or target; "
+                    "cannot merge until it completes",
+                    code="merge_busy_ingest",
+                )
+
+            # v1.14-2 (codex iter-3 P1): recompute offsets UNDER the
+            # conversation_lifecycle FOR UPDATE lock acquired above, so a
+            # concurrent ``save_request_context()`` writer that lands BETWEEN
+            # the engine's pre-call offset computation and the body's lock
+            # acquisition cannot leave us with a stale offset. Caller-passed
+            # values are honored as a floor (``max(caller, recomputed)``) for
+            # test predictability; the recomputed value WINS when the writer
+            # raced ahead.
+            sk_row = conn.execute(
+                "SELECT COALESCE(MAX(sort_key), 0) AS m "
+                "FROM canonical_turns WHERE conversation_id = %s",
+                (target_conversation_id,),
+            ).fetchone()
+            recomputed_sort_key_offset = float(sk_row["m"] or 0.0) + 1000.0
+            sort_key_offset = max(float(sort_key_offset or 0.0),
+                                  recomputed_sort_key_offset)
+
+            # Combined-MAX across the four request-turn-bearing tables on the
+            # target. UNION ALL is cheap and produces a single row.
+            rt_row = conn.execute(
+                """
+                SELECT GREATEST(
+                    COALESCE((SELECT MAX(request_turn) + 1 FROM tool_calls
+                              WHERE conversation_id = %s), 1),
+                    COALESCE((SELECT MAX(request_turn) + 1 FROM request_context
+                              WHERE conversation_id = %s), 1),
+                    COALESCE((SELECT MAX(turn) + 1 FROM request_captures
+                              WHERE conversation_id = %s), 1),
+                    COALESCE((SELECT MAX(next_request_turn) FROM request_turn_counters
+                              WHERE conversation_id = %s), 1)
+                ) AS m
+                """,
+                (target_conversation_id, target_conversation_id,
+                 target_conversation_id, target_conversation_id),
+            ).fetchone()
+            recomputed_request_turn_offset = int(rt_row["m"] or 1)
+            request_turn_offset = max(int(request_turn_offset or 0),
+                                      recomputed_request_turn_offset)
 
             # Step 5: per-table moves.
             for tbl in TABLES_SIMPLE:
@@ -3180,6 +3238,67 @@ class PostgresStore(ContextStore):
                 (source_conversation_id,),
             )
             rows_moved["request_turn_counters"] = cur.rowcount
+
+            # v1.14-1 (codex iter-3 P1): bump target's request_turn_counter
+            # past the moved range. Without this UPSERT a future
+            # ``save_request_context()`` on target allocates from the stale
+            # ``next_request_turn``, colliding with the request_turns we just
+            # moved into target's namespace via UPDATE. The bumped value is
+            # ``MAX(existing_target_next, moved_max + 1)`` where ``moved_max``
+            # is the maximum request_turn that landed on target via this
+            # merge (origin = source). Per-conv-counter monotonicity
+            # invariant restored.
+            #
+            # The four request-turn-bearing per-conv tables (tool_calls,
+            # request_context, request_captures, tool_outputs.turn) were
+            # all UPDATEd with offset above, so the maximum request_turn
+            # under origin = source on target is ``request_turn_offset +
+            # (max source-side request_turn)``. We compute it directly via
+            # SELECT against the moved rows so the UPSERT gets the right
+            # value even if some tables have no rows (COALESCE to 0).
+            moved_max_row = conn.execute(
+                """
+                SELECT GREATEST(
+                    COALESCE((SELECT MAX(request_turn) FROM tool_calls
+                              WHERE conversation_id = %s
+                                AND origin_conversation_id = %s), 0),
+                    COALESCE((SELECT MAX(request_turn) FROM request_context
+                              WHERE conversation_id = %s
+                                AND origin_conversation_id = %s), 0),
+                    COALESCE((SELECT MAX(turn) FROM request_captures
+                              WHERE conversation_id = %s
+                                AND origin_conversation_id = %s), 0),
+                    COALESCE((SELECT MAX(turn) FROM tool_outputs
+                              WHERE conversation_id = %s
+                                AND origin_conversation_id = %s), 0)
+                ) AS m
+                """,
+                (target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id),
+            ).fetchone()
+            moved_max_request_turn = int(moved_max_row["m"] or 0)
+            if moved_max_request_turn > 0:
+                # UPSERT preserves whichever is higher: target's existing
+                # ``next_request_turn`` (no-op if already bumped past) or the
+                # post-move ``moved_max + 1``.
+                conn.execute(
+                    """
+                    INSERT INTO request_turn_counters
+                        (conversation_id, next_request_turn, origin_conversation_id)
+                    VALUES (%s, %s, '')
+                    ON CONFLICT (conversation_id) DO UPDATE
+                      SET next_request_turn = GREATEST(
+                          request_turn_counters.next_request_turn,
+                          EXCLUDED.next_request_turn
+                      )
+                    """,
+                    (target_conversation_id, moved_max_request_turn + 1),
+                )
+                rows_moved["request_turn_counters_target_bumped_to"] = (
+                    moved_max_request_turn + 1
+                )
 
             # B-D6 (codex iter-2 P1): capture conflict tag list BEFORE
             # deleting source's conflicting tag_summaries rows. The Phase

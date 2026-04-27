@@ -1217,10 +1217,11 @@ class MergeStats:
     caller (cloud's REST handler via `Engine.merge_conversation`). Counts
     the rows moved per per-conversation table during the body transaction.
 
-    The dict keys are table names from the 17-table per-conv set
-    (segments, segment_tags, canonical_turns, ingest_batches, facts,
-    fact_tags, fact_links, tool_outputs, tool_calls, request_captures,
-    request_turn_counters, request_context, tag_summary_embeddings,
+    The dict keys are table names from the 21-table per-conv set
+    (segments, segment_tags, canonical_turns, canonical_turn_anchors,
+    canonical_turn_chunks, ingest_batches, facts, fact_tags, fact_links,
+    tool_outputs, tool_calls, request_captures, request_turn_counters,
+    request_context, tag_summaries, tag_summary_embeddings, tag_aliases,
     turn_tool_outputs, segment_tool_outputs, chain_snapshots, media_outputs).
     Cloud surfaces the dict directly in the SSE `conversation_merged`
     event payload as `rows_moved` per spec section 12.2 (the v3 move-

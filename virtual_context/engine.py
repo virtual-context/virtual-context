@@ -381,9 +381,10 @@ class VirtualContextEngine:
 
         store = self._store
 
-        # B-D1 (codex iter-2 P0): cross-tenant validation at engine entry.
-        # SELECT source's conversations row and verify source.tenant_id ==
-        # passed tenant_id. A misroute that bypassed cloud's C2.4 would
+        # B-D1 (codex iter-2 P0) + v1.14-5 (codex iter-3 P2): cross-tenant
+        # validation at engine entry. SELECT BOTH source AND target
+        # conversations rows; verify source.tenant_id == target.tenant_id
+        # == passed tenant_id. A misroute that bypassed cloud's C2.4 would
         # otherwise let one tenant's caller move ANOTHER tenant's per-conv
         # rows under the calling tenant's namespace (data corruption +
         # cross-tenant exfiltration). Per-conv tables don't have a
@@ -393,7 +394,8 @@ class VirtualContextEngine:
         #
         # Defense layers:
         #   Layer A (cloud REST C2.4): rejects mismatched tenant pre-engine.
-        #   Layer B (this engine entry): catches misroutes that bypass A.
+        #   Layer B (this engine entry): pre-checks BOTH source + target
+        #          before reaching the body, fail-fast for misroutes.
         #   Layer C (body method, S1.3/S1.4): re-validates under the
         #          merge_audit FOR UPDATE row lock so the check fires
         #          inside the same txn that moves the rows.
@@ -420,85 +422,39 @@ class VirtualContextEngine:
                 f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
             )
 
-        # B-D5 (codex iter-2 P1): request_turn_offset must avoid collisions
-        # across ALL request-turn-bearing tables on the target, not just
-        # tool_calls. A target with request_context rows but no tool_calls
-        # would otherwise collide on (conversation_id, request_turn) when
-        # source's rows arrive. Single combined query is cheap; COALESCE
-        # to 0 for tables with no rows.
-        sort_key_offset = 0.0
-        request_turn_offset = 0
-        try:
-            row = conn.execute(
-                f"SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
-                f"FROM canonical_turns WHERE conversation_id = {param}",
-                (target_conversation_id,),
-            ).fetchone()
-            if row is not None:
-                if hasattr(row, "keys"):
-                    sort_key_offset = float(row["max_sort_key"] or 0.0) + 1000.0
-                else:
-                    sort_key_offset = float(row[0] or 0.0) + 1000.0
-        except Exception:
-            sort_key_offset = 1000.0  # safe default; never start at 0
-
-        # request_turn_offset: take MAX across the four request-turn-bearing
-        # tables, +1. Also include request_turn_counters.next_request_turn
-        # (which is already "next available", not "max used"). The offset
-        # we pick must be >= every existing turn number on the target.
-        try:
-            tc_row = conn.execute(
-                f"SELECT COALESCE(MAX(request_turn), 0) AS m "
-                f"FROM tool_calls WHERE conversation_id = {param}",
-                (target_conversation_id,),
-            ).fetchone()
-            rc_row = conn.execute(
-                f"SELECT COALESCE(MAX(request_turn), 0) AS m "
-                f"FROM request_context WHERE conversation_id = {param}",
-                (target_conversation_id,),
-            ).fetchone()
-            rcap_row = conn.execute(
-                f"SELECT COALESCE(MAX(turn), 0) AS m "
-                f"FROM request_captures WHERE conversation_id = {param}",
-                (target_conversation_id,),
-            ).fetchone()
-            rtc_row = conn.execute(
-                f"SELECT COALESCE(MAX(next_request_turn), 0) AS m "
-                f"FROM request_turn_counters WHERE conversation_id = {param}",
-                (target_conversation_id,),
-            ).fetchone()
-
-            def _v(row):
-                if row is None:
-                    return 0
-                if hasattr(row, "keys"):
-                    return int(row["m"] or 0)
-                return int(row[0] or 0)
-
-            tc_max = _v(tc_row)
-            rc_max = _v(rc_row)
-            rcap_max = _v(rcap_row)
-            rtc_next = _v(rtc_row)  # already "next", not "max"
-            request_turn_offset = max(
-                tc_max + 1, rc_max + 1, rcap_max + 1, rtc_next,
+        # v1.14-5: target-tenant pre-check. Body's FOR UPDATE re-validation
+        # remains as Layer C; engine fail-fast catches the misroute at the
+        # cheapest layer (no transaction, no lock acquisition).
+        tgt_row = conn.execute(
+            f"SELECT tenant_id FROM conversations WHERE conversation_id = {param}",
+            (target_conversation_id,),
+        ).fetchone()
+        if tgt_row is None:
+            raise CrossTenantMergeError(
+                f"Target conversation {target_conversation_id} not found "
+                f"under any tenant; refusing merge",
             )
-            if request_turn_offset < 1:
-                request_turn_offset = 1
-        except Exception:
-            request_turn_offset = 1
+        tgt_tenant = (tgt_row["tenant_id"]
+                      if hasattr(tgt_row, "keys") else tgt_row[0])
+        if str(tgt_tenant) != str(tenant_id):
+            raise CrossTenantMergeError(
+                f"Target conversation {target_conversation_id} belongs to "
+                f"tenant '{tgt_tenant}', not '{tenant_id}'; refusing merge",
+            )
 
+        # v1.14-2 (codex iter-3 P1): offsets are now computed BY THE BODY
+        # under the conversation_lifecycle FOR UPDATE lock to defeat the
+        # stale-offset race. Engine no longer pre-computes; passes 0 as a
+        # neutral floor and lets the body recompute.
+        #
         # B-D3 (codex iter-2 P1): pass expected source_lifecycle_epoch
         # through to the body so the body validates source's epoch under
-        # the merge_audit row lock. Source delete+recreate between cloud's
-        # reservation (which captured the epoch) and the body call must be
-        # rejected; otherwise we'd merge into a stale view.
+        # the merge_audit row lock.
         return store.merge_conversation_data(
             merge_id=merge_id,
             tenant_id=tenant_id,
             source_conversation_id=source_conversation_id,
             target_conversation_id=target_conversation_id,
-            sort_key_offset=sort_key_offset,
-            request_turn_offset=request_turn_offset,
             expected_source_lifecycle_epoch=source_lifecycle_epoch,
             expected_target_lifecycle_epoch=target_lifecycle_epoch,
             source_label_at_merge=source_label_at_merge,

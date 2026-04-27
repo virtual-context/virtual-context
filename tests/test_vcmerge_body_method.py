@@ -946,15 +946,17 @@ def test_body_resolves_tag_aliases_conflicts(tmp_path):
 # (engine-level check; the body just applies the offset.)
 # ---------------------------------------------------------------------------
 
-def test_engine_request_turn_offset_avoids_collision_across_tables(tmp_path):
-    """B-D5: Engine.merge_conversation must compute request_turn_offset
-    from MAX across all four request-turn-bearing tables: tool_calls,
-    request_context, request_captures, request_turn_counters. Seeding
-    target with request_context but no tool_calls must still produce an
-    offset > the request_context max.
+def test_body_request_turn_offset_avoids_collision_across_tables(tmp_path):
+    """v1.14-6 (codex iter-3 P2): the body computes request_turn_offset
+    UNDER the conversation_lifecycle FOR UPDATE lock from MAX across all
+    four request-turn-bearing tables (tool_calls, request_context,
+    request_captures, request_turn_counters). Seeding target with
+    request_context but no tool_calls must still produce a moved
+    request_turn that does NOT collide with target's existing range.
+    Calls into Store.merge_conversation_data with offset=0 (no caller-
+    supplied floor) so the body's own recomputation is exercised
+    end-to-end rather than via inline test arithmetic.
     """
-    from virtual_context.engine import VirtualContextEngine
-    from virtual_context.config import VirtualContextConfig
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -980,44 +982,311 @@ def test_engine_request_turn_offset_avoids_collision_across_tables(tmp_path):
     )
     conn.commit()
 
-    # Build a minimal engine that wraps the SQLiteStore directly.
-    class _MockStore:
-        def __init__(self, inner):
-            self._segments = inner
-        def __getattr__(self, name):
-            return getattr(self._segments, name)
-    mock = _MockStore(store)
-
-    # Inline the offset computation logic (don't need full engine bootstrap).
-    inner = mock._segments
-    c = inner._get_conn()
-    rc = c.execute("SELECT COALESCE(MAX(request_turn), 0) FROM request_context "
-                   "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
-    tc = c.execute("SELECT COALESCE(MAX(request_turn), 0) FROM tool_calls "
-                   "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
-    rcap = c.execute("SELECT COALESCE(MAX(turn), 0) FROM request_captures "
-                     "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
-    rtc = c.execute("SELECT COALESCE(MAX(next_request_turn), 0) "
-                    "FROM request_turn_counters WHERE conversation_id = ?",
-                    ("tgt",)).fetchone()[0]
-    offset = max(rc + 1, tc + 1, rcap + 1, rtc)
-    # Target's request_context max is 50, so offset must be >= 51.
-    assert offset >= 51
-
     merge_id = _reserve(store)
-    store.merge_conversation_data(
+    stats = store.merge_conversation_data(
         merge_id=merge_id, tenant_id="tA",
         source_conversation_id="src", target_conversation_id="tgt",
-        sort_key_offset=1000.0, request_turn_offset=offset,
+        # offset=0 forces the body to recompute under its lock.
+        sort_key_offset=0.0, request_turn_offset=0,
         expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
     )
-    # Source's tool_call with request_turn=2 + offset=51+ should land
-    # at request_turn >= 53; no collision with target's 50.
+    # Body's recomputed offset must be >= 51 (target's request_context max
+    # was 50, so any free slot is at >=51). Source's tool_call had
+    # request_turn=2; after offset, it lands at 2 + offset.
+    assert stats.request_turn_offset >= 51
     moved = conn.execute(
         "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt'",
     ).fetchone()
     assert moved is not None
     assert int(moved["request_turn"]) >= 53
+    # No collision: target's pre-existing request_context row at
+    # request_turn=50 still resolves uniquely.
+    rc = conn.execute(
+        "SELECT request_turn FROM request_context WHERE conversation_id = 'tgt' "
+        "AND request_turn = 50",
+    ).fetchone()
+    assert rc is not None
+
+
+# ---------------------------------------------------------------------------
+# v1.14-1 (P1): target request_turn_counter bumped past moved range
+# ---------------------------------------------------------------------------
+
+def test_body_bumps_target_request_turn_counter_past_moved_range(tmp_path):
+    """v1.14-1: after merge moves source's request-turn-bearing rows into
+    target's namespace, target's ``request_turn_counters.next_request_turn``
+    MUST be at least ``moved_max + 1``. Future ``save_request_context()``
+    calls allocate from target's counter; without this bump, allocations
+    would land IN the moved range and collide on
+    ``(conversation_id, request_turn)``.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # target's pre-existing counter is at 3 (next slot = 3).
+    _seed_request_turn_counter(conn, "tgt", 3)
+    # Source has tool_calls at high request_turns 1..5.
+    for rt in (1, 2, 3, 4, 5):
+        conn.execute(
+            "INSERT INTO tool_calls "
+            "(conversation_id, request_turn, round, group_id, tool_name, "
+            "tool_input, tool_result, result_length, duration_ms, timestamp) "
+            "VALUES ('src', ?, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+            (rt, _now_iso()),
+        )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Body recomputed offset under lock to >= max(target counter=3, MAX
+    # of all request-turn tables on target = 0) = 3. So source's
+    # request_turn=5 lands at offset+5 >= 8. moved_max should be at
+    # least 8.
+    moved_max = conn.execute(
+        "SELECT MAX(request_turn) FROM tool_calls WHERE conversation_id = 'tgt'",
+    ).fetchone()[0]
+    assert moved_max is not None
+    assert moved_max >= stats.request_turn_offset + 5
+    # Target's counter MUST have been bumped past moved_max.
+    new_counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'tgt'",
+    ).fetchone()["next_request_turn"]
+    assert new_counter >= moved_max + 1
+    # Stats record the bump.
+    assert "request_turn_counters_target_bumped_to" in stats.rows_moved
+    assert stats.rows_moved["request_turn_counters_target_bumped_to"] >= moved_max + 1
+
+
+def test_body_target_counter_unchanged_when_no_request_turn_rows_move(tmp_path):
+    """v1.14-1: when source has no request-turn-bearing rows, target's
+    counter is left as-is (the bump is conditional on moved_max > 0)."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_request_turn_counter(conn, "tgt", 7)
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    new_counter = conn.execute(
+        "SELECT next_request_turn FROM request_turn_counters "
+        "WHERE conversation_id = 'tgt'",
+    ).fetchone()["next_request_turn"]
+    assert new_counter == 7
+
+
+def test_body_post_merge_save_request_context_does_not_collide(tmp_path):
+    """v1.14-1 end-to-end: after merge, allocate a fresh request_turn via
+    the counter (simulating save_request_context()) and assert it does
+    NOT collide with any previously-moved request_turn on target.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_request_turn_counter(conn, "tgt", 1)
+    # Source rows at request_turns 1, 2, 3.
+    for rt in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO tool_calls "
+            "(conversation_id, request_turn, round, group_id, tool_name, "
+            "tool_input, tool_result, result_length, duration_ms, timestamp) "
+            "VALUES ('src', ?, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+            (rt, _now_iso()),
+        )
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Allocate a fresh turn via the underlying counter helper.
+    next_turn = store._allocate_request_turn(conn, "tgt")
+    # Existing request_turns on target after merge:
+    moved = sorted(int(r["request_turn"]) for r in conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt'",
+    ).fetchall())
+    assert next_turn not in moved
+    assert next_turn > max(moved)
+
+
+# ---------------------------------------------------------------------------
+# v1.14-2 (P1): offsets recomputed under the lock; concurrent-writer race
+# ---------------------------------------------------------------------------
+
+def test_body_recomputes_offset_under_lock_with_concurrent_writer_simulation(tmp_path):
+    """v1.14-2: the body must recompute offsets AFTER acquiring the
+    conversation_lifecycle FOR UPDATE lock. Simulate a concurrent writer
+    that lands a high-request_turn row between caller-passed offset (0)
+    and body lock acquisition; assert the body's recomputed offset rides
+    over it.
+
+    On SQLite the BEGIN IMMEDIATE serializes at the database level; we
+    simulate the race by injecting the new row BEFORE invoking the body
+    (after the caller-side offset would have been computed).
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # "Caller side" offset would have been 0 + 1 = 1.
+    # Now simulate a concurrent writer landing a request_context row at
+    # request_turn=99 BEFORE the body's recomputation.
+    conn.execute(
+        "INSERT INTO request_context "
+        "(conversation_id, request_turn, timestamp, user_message, inbound_tags, "
+        "retrieval_method, candidates_found, candidates_selected, "
+        "segments_injected, facts_injected, facts_count, facts_tags, "
+        "pool_used, pool_budget, total_context_tokens, "
+        "non_virtualizable_floor) "
+        "VALUES ('tgt', 99, ?, '', '', '', 0, 0, '', '', 0, '', 0, 0, 0, 0)",
+        (_now_iso(),),
+    )
+    # Source has a tool_call at request_turn=1.
+    conn.execute(
+        "INSERT INTO tool_calls "
+        "(conversation_id, request_turn, round, group_id, tool_name, "
+        "tool_input, tool_result, result_length, duration_ms, timestamp) "
+        "VALUES ('src', 1, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+        (_now_iso(),),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=0,  # caller used stale 0
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Body's recomputed offset must be >= 100 (>= request_context's 99 + 1).
+    assert stats.request_turn_offset >= 100
+    moved = conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt'",
+    ).fetchone()
+    assert int(moved["request_turn"]) >= 101
+
+
+def test_body_caller_offset_is_floor_not_ceiling(tmp_path):
+    """v1.14-2: caller-passed offset is honored as a floor; if recomputed
+    is lower, caller's value is used (test predictability preserved).
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute(
+        "INSERT INTO tool_calls "
+        "(conversation_id, request_turn, round, group_id, tool_name, "
+        "tool_input, tool_result, result_length, duration_ms, timestamp) "
+        "VALUES ('src', 3, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+        (_now_iso(),),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=0.0, request_turn_offset=100,  # caller's high floor
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Floor honored: offset >= 100 even though recomputed would be 1.
+    assert stats.request_turn_offset >= 100
+    moved = conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt'",
+    ).fetchone()
+    assert int(moved["request_turn"]) == 103
+
+
+# ---------------------------------------------------------------------------
+# v1.14-3 (P2): SQL inspection extended to verify DELETE WHERE-clause shape
+# ---------------------------------------------------------------------------
+
+def test_body_sql_inspection_delete_predicates_are_scope_bounded(tmp_path):
+    """v1.14-3 (codex iter-3 P2): the bounded-DELETE allowlist test by
+    name only is necessary but not sufficient. Scan each DELETE FROM in
+    the body method source code; assert the WHERE clause includes a
+    recognized scoping predicate. A future regression that adds
+    ``DELETE FROM tag_aliases`` (no WHERE / wide-open) would pass the
+    name-only check but fail this stricter shape check.
+    """
+    import inspect
+    import re
+    from virtual_context.storage import sqlite as sqlite_mod
+    from virtual_context.storage import postgres as postgres_mod
+
+    expected_predicates = {
+        # request_turn_counters: scoped on conversation_id = source.
+        "request_turn_counters": ("conversation_id",),
+        # tag_summaries / tag_summary_embeddings / tag_aliases: scoped on
+        # conversation_id = source AND collide-key IN target subselect.
+        "tag_summaries": ("conversation_id", "IN"),
+        "tag_summary_embeddings": ("conversation_id", "IN"),
+        "tag_aliases": ("conversation_id", "IN"),
+    }
+
+    for mod, store_cls_name in (
+        (sqlite_mod, "SQLiteStore"),
+        (postgres_mod, "PostgresStore"),
+    ):
+        store_cls = getattr(mod, store_cls_name, None)
+        if store_cls is None:
+            continue
+        body = getattr(store_cls, "merge_conversation_data", None)
+        if body is None:
+            continue
+        src = inspect.getsource(body)
+        # Find each DELETE FROM <table> ... and the next 400 chars (WHERE
+        # context). Extract the DELETE table + the next chunk of source
+        # to inspect WHERE-clause shape.
+        for match in re.finditer(
+            r"DELETE\s+FROM\s+(?:\{tbl\}|\w+)", src, re.IGNORECASE,
+        ):
+            window = src[match.start():match.start() + 500]
+            # Determine the table either from the literal or by scanning
+            # nearby f-string variable name.
+            literal_match = re.search(
+                r"DELETE\s+FROM\s+(\w+)", window, re.IGNORECASE,
+            )
+            if literal_match is None:
+                # f-string {tbl} indirection; scan nearby for the loop
+                # variable's allowlist
+                continue
+            tbl = literal_match.group(1)
+            if tbl.startswith("<") or tbl in ("tbl",):
+                continue
+            if tbl not in expected_predicates:
+                # Allowlist failure already covered by the name-only test.
+                continue
+            preds = expected_predicates[tbl]
+            for pred in preds:
+                assert pred in window, (
+                    f"{store_cls_name} DELETE FROM {tbl} missing required "
+                    f"predicate keyword '{pred}' in WHERE-clause window: "
+                    f"{window[:300]!r}"
+                )
+        # Also handle the f-string case (DELETE FROM {tbl}); the table
+        # name comes from a containing for-loop variable. Locate the
+        # for-loop allowlist (TABLES_TAG_CONFLICT) and inspect the
+        # template's WHERE shape.
+        for match in re.finditer(r"DELETE\s+FROM\s+\{tbl\}", src, re.IGNORECASE):
+            window = src[match.start():match.start() + 500]
+            assert "conversation_id" in window and "IN" in window, (
+                f"{store_cls_name} f-string DELETE FROM {{tbl}} block "
+                f"missing conversation_id + IN predicates: {window[:300]!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1496,7 @@ def test_body_sql_inspection_tenant_aware_writes_predicate_on_tenant_id(tmp_path
     """B-D11 / B-D1 invariant: every UPDATE/SELECT against a TENANT-AWARE
     table (conversations, merge_audit) in the body method must predicate
     on tenant_id. Per-conv tables (segments, canonical_turns, ...) don't
-    carry tenant_id; they're scoped on conversation_id only — tenant
+    carry tenant_id; they're scoped on conversation_id only; tenant
     scoping is transitive via the body's source.tenant_id re-validation
     at body entry. This test pins the tenant-aware predicate invariant.
     """

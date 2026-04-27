@@ -3351,8 +3351,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         tenant_id: str,
         source_conversation_id: str,
         target_conversation_id: str,
-        sort_key_offset: float,
-        request_turn_offset: int,
+        sort_key_offset: float = 0.0,
+        request_turn_offset: int = 0,
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
         expected_source_lifecycle_epoch: int | None = None,
@@ -3363,6 +3363,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         SQLite path uses BEGIN IMMEDIATE for serialization (single-writer
         model) in place of PG's row-level FOR UPDATE; the consistency
         invariants are equivalent at the database level.
+
+        Offsets policy (v1.14-2): see PostgresStore docstring.
         """
         from ..types import MergeStats
         from ..core.exceptions import (
@@ -3537,6 +3539,46 @@ CREATE TABLE IF NOT EXISTS request_captures (
             except sqlite3.OperationalError:
                 pass
 
+            # v1.14-2 (codex iter-3 P1): recompute offsets UNDER the
+            # BEGIN IMMEDIATE serialization (acquired above), so a concurrent
+            # save_request_context() that would have raced ahead cannot make
+            # the offsets stale. Caller-passed values used as floor.
+            sk_row = conn.execute(
+                "SELECT COALESCE(MAX(sort_key), 0) AS m "
+                "FROM canonical_turns WHERE conversation_id = ?",
+                (target_conversation_id,),
+            ).fetchone()
+            recomputed_sort_key_offset = float(
+                (sk_row["m"] if isinstance(sk_row, sqlite3.Row) else sk_row[0]) or 0.0
+            ) + 1000.0
+            sort_key_offset = max(float(sort_key_offset or 0.0),
+                                  recomputed_sort_key_offset)
+
+            rt_row = conn.execute(
+                """
+                SELECT MAX(m) AS m FROM (
+                    SELECT COALESCE(MAX(request_turn) + 1, 1) AS m FROM tool_calls
+                      WHERE conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(request_turn) + 1, 1) FROM request_context
+                      WHERE conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(turn) + 1, 1) FROM request_captures
+                      WHERE conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(next_request_turn), 1) FROM request_turn_counters
+                      WHERE conversation_id = ?
+                )
+                """,
+                (target_conversation_id, target_conversation_id,
+                 target_conversation_id, target_conversation_id),
+            ).fetchone()
+            recomputed_request_turn_offset = int(
+                (rt_row["m"] if isinstance(rt_row, sqlite3.Row) else rt_row[0]) or 1
+            )
+            request_turn_offset = max(int(request_turn_offset or 0),
+                                      recomputed_request_turn_offset)
+
             # Per-table moves
             for tbl in TABLES_SIMPLE:
                 cur = conn.execute(
@@ -3603,6 +3645,53 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (source_conversation_id,),
             )
             rows_moved["request_turn_counters"] = cur.rowcount
+
+            # v1.14-1 (codex iter-3 P1): bump target's request_turn_counter
+            # past the moved range. See PostgresStore docstring for the
+            # full rationale; this UPSERT preserves whichever is higher
+            # between target's existing counter and ``moved_max + 1``.
+            moved_max_row = conn.execute(
+                """
+                SELECT MAX(m) AS m FROM (
+                    SELECT COALESCE(MAX(request_turn), 0) AS m FROM tool_calls
+                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(request_turn), 0) FROM request_context
+                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(turn), 0) FROM request_captures
+                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                    UNION ALL
+                    SELECT COALESCE(MAX(turn), 0) FROM tool_outputs
+                      WHERE conversation_id = ? AND origin_conversation_id = ?
+                )
+                """,
+                (target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id,
+                 target_conversation_id, source_conversation_id),
+            ).fetchone()
+            moved_max_request_turn = int(
+                (moved_max_row["m"] if isinstance(moved_max_row, sqlite3.Row)
+                 else moved_max_row[0]) or 0
+            )
+            if moved_max_request_turn > 0:
+                conn.execute(
+                    """
+                    INSERT INTO request_turn_counters
+                        (conversation_id, next_request_turn)
+                    VALUES (?, ?)
+                    ON CONFLICT (conversation_id) DO UPDATE
+                      SET next_request_turn = MAX(
+                          request_turn_counters.next_request_turn,
+                          excluded.next_request_turn
+                      )
+                    """,
+                    (target_conversation_id, moved_max_request_turn + 1),
+                )
+                rows_moved["request_turn_counters_target_bumped_to"] = (
+                    moved_max_request_turn + 1
+                )
 
             # B-D6: capture conflict tag list with both sides'
             # source_canonical_turn_ids before the DELETE wipes source's
