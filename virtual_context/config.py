@@ -412,6 +412,11 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         cfg.conversation_id = raw["conversation_id"]
     elif "session_id" in raw:
         cfg.conversation_id = raw["session_id"]
+    # v1.16-1 (codex iter-5 prod blocker fold): tenant_id flows from yaml
+    # or from programmatic ``cfg.tenant_id = ...`` assignment by cloud's
+    # REST handler. Empty default is correct for single-user proxy / dev.
+    if "tenant_id" in raw:
+        cfg.tenant_id = raw["tenant_id"]
 
     if validate:
         errors = validate_config(cfg)

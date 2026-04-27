@@ -866,6 +866,38 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("conversations table bootstrap failed", exc_info=True)
+        # v1.16-1 (codex iter-5 prod blocker fold): one-time backfill of
+        # ``conversations.tenant_id`` from ``cloud_conversations.tenant_id``
+        # for rows created by older engine builds that passed
+        # ``tenant_id=""`` to ``upsert_conversation``. Idempotent:
+        # the WHERE clause filters on empty target AND non-empty source,
+        # so the migration is a no-op once backfilled. Best-effort:
+        # skipped silently when ``cloud_conversations`` is absent
+        # (engine-only deployments where there's no cloud wrapper to
+        # source from). Wrapped in nested ``conn.transaction()`` so an
+        # ``UndefinedTable`` raise rolls back ONLY the savepoint and
+        # leaves outer schema bootstrap alive.
+        try:
+            with conn.transaction():
+                conn.execute("""
+                    UPDATE conversations
+                       SET tenant_id = cc.tenant_id
+                      FROM cloud_conversations cc
+                     WHERE conversations.conversation_id = cc.conversation_id
+                       AND cc.tenant_id IS NOT NULL
+                       AND cc.tenant_id <> ''
+                       AND (conversations.tenant_id IS NULL
+                            OR conversations.tenant_id = '')
+                """)
+        except psycopg.errors.UndefinedTable:
+            # cloud_conversations not present (single-user / engine-only
+            # deploys); nothing to backfill.
+            pass
+        except Exception:
+            logger.warning(
+                "conversations.tenant_id backfill from cloud_conversations failed",
+                exc_info=True,
+            )
         # M0.3 + M0.5 (VCMERGE plan v1.11 sections 2.1 + 5.2): merge_audit
         # table + the unique partial index that backs the
         # try_reserve_merge_audit_in_progress reservation flow. Spec section

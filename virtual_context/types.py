@@ -1155,6 +1155,13 @@ class VirtualContextConfig:
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # tenant_id (codex iter-5 prod blocker fold v1.16-1): stamped on every
+    # ``conversations`` row at insert time so the body method's Layer C
+    # tenant scoping has data to compare against. Cloud's REST handler
+    # populates this from ``request.state.tenant_id`` before instantiating
+    # the engine; single-user proxy / dev paths leave it empty (the
+    # tenant-scoping invariant is single-tenant by definition there).
+    tenant_id: str = ""
 
     @property
     def cost_tracking(self) -> TelemetryConfig:

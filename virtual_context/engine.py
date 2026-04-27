@@ -491,11 +491,17 @@ class VirtualContextEngine:
           exposes no-op wrappers), silently default to 1. Progress-bar
           features require SQLite/Postgres; legacy backends simply skip.
 
-        Engine callers do not yet plumb a ``tenant_id`` through. Later tasks
-        (A22+) will wire the real tenant; for now we pass the empty string,
-        matching the pattern established in ``sync_turns_from_payload``.
+        Tenant scoping (v1.16-1 codex iter-5 prod blocker fold): the
+        upsert path now uses ``self.config.tenant_id`` instead of the
+        empty-string placeholder that earlier scaffolding used. Cloud's
+        REST handler MUST set ``cfg.tenant_id = request.state.tenant_id``
+        before instantiating the engine so the conversations row's
+        tenant_id matches cloud_conversations. Single-user proxy / dev
+        paths default to "" which is correct for those single-tenant
+        deployments.
         """
         conv_id = self.config.conversation_id
+        tenant_id = self.config.tenant_id or ""
         try:
             self._engine_state.lifecycle_epoch = int(
                 self._store.get_lifecycle_epoch(conv_id)
@@ -504,7 +510,7 @@ class VirtualContextEngine:
             # Conversations row absent — create it at epoch=1.
             try:
                 self._store.upsert_conversation(
-                    tenant_id="",
+                    tenant_id=tenant_id,
                     conversation_id=conv_id,
                 )
                 self._engine_state.lifecycle_epoch = 1
@@ -2074,14 +2080,19 @@ class VirtualContextEngine:
         if _inner is not None:
             store = _inner
         # Ensure a ``conversations`` row exists so the epoch check has
-        # something to read. ``upsert_conversation`` is idempotent — it
-        # creates the row at epoch=1 if missing, otherwise leaves the epoch
-        # intact. Engine callers don't yet plumb a tenant_id through, so we
-        # pass empty; later tasks (A22+) will wire the real tenant.
+        # something to read. ``upsert_conversation`` is idempotent: it
+        # creates the row at epoch=1 if missing, otherwise leaves the
+        # epoch intact. v1.16-1 (codex iter-5 prod blocker fold): tenant_id
+        # now sourced from ``self.config.tenant_id`` so the row's tenant
+        # column matches cloud_conversations + the body method's Layer C
+        # tenant-scoping check has populated data to compare against.
         upsert = getattr(store, "upsert_conversation", None)
         if callable(upsert):
             try:
-                upsert(tenant_id="", conversation_id=conv_id)
+                upsert(
+                    tenant_id=self.config.tenant_id or "",
+                    conversation_id=conv_id,
+                )
             except Exception:
                 logger.warning(
                     "CANONICAL_UPSERT_CONVERSATION_FAILED conv=%s",
