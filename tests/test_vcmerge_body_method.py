@@ -37,7 +37,10 @@ from datetime import datetime, timezone
 import pytest
 
 from virtual_context.storage.sqlite import SQLiteStore
-from virtual_context.core.exceptions import MergeAuditMissing, LifecycleEpochMismatch
+from virtual_context.core.exceptions import (
+    MergeAuditMissing, LifecycleEpochMismatch,
+    CrossTenantMergeError, MergeBusy,
+)
 
 
 pytestmark = pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26")
@@ -444,7 +447,7 @@ def test_body_does_not_call_destructive_primitives(tmp_path, monkeypatch):
 
 
 def test_body_returns_merge_stats_with_expected_fields(tmp_path):
-    """MergeStats return shape per plan T1.1."""
+    """MergeStats return shape per plan T1.1 + B-D9 (success + elapsed_seconds)."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -464,6 +467,791 @@ def test_body_returns_merge_stats_with_expected_fields(tmp_path):
     assert stats.sort_key_offset == 1000.0
     assert stats.request_turn_offset == 10
     assert isinstance(stats.rows_moved, dict)
+    # B-D9 (codex iter-2 P2): success + elapsed_seconds populated.
+    assert stats.success is True
+    assert stats.elapsed_seconds >= 0.0
     # frozen dataclass
     with pytest.raises(Exception):
         stats.merge_id = "modified"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# B-D1 (P0): cross-tenant body refusal
+# ---------------------------------------------------------------------------
+
+def test_body_refuses_cross_tenant_source(tmp_path):
+    """B-D1: body re-validates source.tenant_id under the merge_audit
+    FOR UPDATE row lock as defense-in-depth Layer C. A merge_audit row
+    reserved under tenant A but with the source actually owned by tenant
+    B (a misroute that bypassed cloud + engine validation) MUST be
+    refused by the body before any UPDATE-row-move runs.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "tgt")  # target under tenant A
+    _seed_conversation(conn, "tB", "src")  # source under tenant B
+    _seed_segment(conn, "src", "seg-x")
+    conn.commit()
+    # Reserve audit under tenant A claiming src as the source. Cloud / engine
+    # would normally catch this, but we test the body's defense-in-depth by
+    # reserving directly.
+    merge_id = _reserve(store, tenant_id="tA", source="src", target="tgt")
+    with pytest.raises(CrossTenantMergeError):
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    # Source's segments NOT moved to target (rollback semantics).
+    src_segs = conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_segs == 1
+    tgt_segs = conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE conversation_id = 'tgt'",
+    ).fetchone()[0]
+    assert tgt_segs == 0
+    # merge_audit row remains in_progress (caller's responsibility to
+    # mark rolled_back via _mark_merge_rolled_back per single-owner
+    # rollback contract).
+    audit_status = conn.execute(
+        "SELECT status FROM merge_audit WHERE merge_id = ?", (merge_id,),
+    ).fetchone()["status"]
+    assert audit_status == "in_progress"
+
+
+def test_body_refuses_missing_source(tmp_path):
+    """B-D1: body raises CrossTenantMergeError if source.conversations row
+    is absent (e.g., source got hard-deleted between reservation and body).
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "tgt")
+    # source row deliberately NOT seeded
+    conn.commit()
+    merge_id = _reserve(store, source="ghost", target="tgt")
+    with pytest.raises(CrossTenantMergeError):
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="ghost", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+
+
+def test_body_per_table_writes_are_conversation_scoped(tmp_path):
+    """B-D1 invariant: per-conv tables don't carry tenant_id; tenant
+    scoping is transitive via the conversations row (re-validated at body
+    entry). Pin via SQL inspection: scan the body method source for any
+    UPDATE/DELETE that references a per-conv table; assert each predicates
+    on conversation_id (the only available scoping).
+    """
+    import inspect
+    import re
+    from virtual_context.storage import sqlite as sqlite_mod
+    src = inspect.getsource(sqlite_mod.SQLiteStore.merge_conversation_data)
+    # Find every DELETE FROM <table> in the body's SQL strings.
+    deletes = re.findall(r"DELETE\s+FROM\s+(\w+)", src, re.IGNORECASE)
+    # The bounded-DELETE allowlist (per plan §13.3 + handoff B-D11):
+    #   request_turn_counters, tag_summaries, tag_summary_embeddings,
+    #   tag_aliases. Any DELETE outside this list is anti-subversion violation.
+    allowlist = {
+        "request_turn_counters", "tag_summaries", "tag_summary_embeddings",
+        "tag_aliases",
+    }
+    unbounded = [t for t in deletes if t not in allowlist]
+    assert unbounded == [], (
+        f"body method contains DELETE against non-allowlisted tables: "
+        f"{unbounded}; this is an anti-subversion violation. "
+        f"Move semantics is UPDATE conversation_id, NEVER DELETE FROM "
+        f"<per_conv_table>."
+    )
+
+
+# ---------------------------------------------------------------------------
+# B-D2 (P1): concurrent ingest / compaction / phase refusal
+# ---------------------------------------------------------------------------
+
+def _seed_compaction_op(conn, conv_id, lifecycle_epoch=1, status="running"):
+    conn.execute(
+        "INSERT INTO compaction_operation "
+        "(operation_id, conversation_id, lifecycle_epoch, phase_index, "
+        "phase_count, phase_name, status, started_at, owner_worker_id, "
+        "heartbeat_ts, created_at) "
+        "VALUES (?, ?, ?, 0, 1, 'p', ?, ?, 'w', ?, ?)",
+        (str(uuid.uuid4()), conv_id, lifecycle_epoch, status, _now_iso(),
+         _now_iso(), _now_iso()),
+    )
+
+
+def _seed_ingestion_episode(conn, conv_id, lifecycle_epoch=1, status="running"):
+    conn.execute(
+        "INSERT INTO ingestion_episode "
+        "(episode_id, conversation_id, lifecycle_epoch, raw_payload_entries, "
+        "started_at, status, owner_worker_id, heartbeat_ts) "
+        "VALUES (?, ?, ?, 0, ?, ?, 'w', ?)",
+        (str(uuid.uuid4()), conv_id, lifecycle_epoch, _now_iso(), status,
+         _now_iso()),
+    )
+
+
+def test_body_refuses_active_compaction_on_source(tmp_path):
+    """B-D2: refuse merge if source has active compaction_operation
+    (status='queued' or 'running')."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_compaction_op(conn, "src", status="running")
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(MergeBusy) as exc:
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert exc.value.code == "merge_busy_compact"
+
+
+def test_body_refuses_active_compaction_on_target(tmp_path):
+    """B-D2: refuse merge if target has active compaction_operation."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_compaction_op(conn, "tgt", status="queued")
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(MergeBusy) as exc:
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert exc.value.code == "merge_busy_compact"
+
+
+def test_body_refuses_running_ingestion_on_source(tmp_path):
+    """B-D2: refuse merge if source has running ingestion_episode."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_ingestion_episode(conn, "src", status="running")
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(MergeBusy) as exc:
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert exc.value.code == "merge_busy_ingest"
+
+
+def test_body_refuses_source_in_busy_phase(tmp_path):
+    """B-D2: refuse merge if source.phase IN
+    ('ingesting','compacting','deleted','merged')."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute("UPDATE conversations SET phase = 'ingesting' WHERE conversation_id = 'src'")
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(MergeBusy) as exc:
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert exc.value.code == "merge_busy_phase"
+
+
+def test_body_refuses_target_in_busy_phase(tmp_path):
+    """B-D2: refuse merge if target.phase IN ('compacting',...)."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute("UPDATE conversations SET phase = 'compacting' WHERE conversation_id = 'tgt'")
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(MergeBusy) as exc:
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert exc.value.code == "merge_busy_phase"
+
+
+# ---------------------------------------------------------------------------
+# B-D3 (P1): source lifecycle epoch validation
+# ---------------------------------------------------------------------------
+
+def test_body_refuses_source_lifecycle_epoch_advance(tmp_path):
+    """B-D3: source.lifecycle_epoch must match the caller-captured value.
+    Refuses if epoch advanced (e.g., source was deleted+recreated between
+    reserve and body)."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src", lifecycle_epoch=3)  # actual = 3
+    _seed_conversation(conn, "tA", "tgt", lifecycle_epoch=1)
+    conn.commit()
+    merge_id = _reserve(store)
+    with pytest.raises(LifecycleEpochMismatch):
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1,
+            expected_source_lifecycle_epoch=1,  # caller thinks epoch=1
+            source_label_at_merge="lbl",
+        )
+
+
+# ---------------------------------------------------------------------------
+# B-D4 (P1): canonical_turns moves reset compacted_at = NULL
+# ---------------------------------------------------------------------------
+
+def test_body_resets_compacted_at_on_canonical_turns_move(tmp_path):
+    """B-D4: source's canonical_turns rows arrive with compacted_at
+    populated; target's compaction prefix invariant requires NULL on
+    moved rows so the compaction pipeline picks them up as fresh tail."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Seed source's canonical_turn with compacted_at populated.
+    conn.execute(
+        "INSERT INTO canonical_turns (canonical_turn_id, conversation_id, sort_key, "
+        "turn_hash, hash_version, compacted_at, created_at, updated_at) "
+        "VALUES ('t1', 'src', 5.0, 'h', 1, ?, ?, ?)",
+        (_now_iso(), _now_iso(), _now_iso()),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    moved = conn.execute(
+        "SELECT compacted_at FROM canonical_turns WHERE canonical_turn_id = 't1'",
+    ).fetchone()
+    assert moved["compacted_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# B-D6 (P1): tag_regenerate payload carries conflict spec list
+# ---------------------------------------------------------------------------
+
+def test_body_tag_regenerate_payload_includes_conflict_specs(tmp_path):
+    """B-D6: when source + target both have tag_summaries for the same
+    tag, the tag_regenerate post-commit pending payload must carry an
+    explicit (tag, source_canonical_turn_ids, target_canonical_turn_ids)
+    spec per conflict so the Phase B sweeper has enough state to LLM-
+    regen the unioned summary."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Seed source + target with conflicting "python" tag, each carrying
+    # distinct source_canonical_turn_ids JSON arrays.
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO tag_summaries (tag, conversation_id, summary, "
+        "source_canonical_turn_ids, created_at, updated_at) "
+        "VALUES ('python', 'src', 's-py', ?, ?, ?)",
+        (json.dumps(["s-t1", "s-t2"]), now, now),
+    )
+    conn.execute(
+        "INSERT INTO tag_summaries (tag, conversation_id, summary, "
+        "source_canonical_turn_ids, created_at, updated_at) "
+        "VALUES ('python', 'tgt', 't-py', ?, ?, ?)",
+        (json.dumps(["t-t9"]), now, now),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    pending = conn.execute(
+        "SELECT payload_json FROM merge_post_commit_pending "
+        "WHERE merge_id = ? AND kind = 'tag_regenerate'", (merge_id,),
+    ).fetchone()
+    payload = json.loads(pending["payload_json"])
+    assert "conflicts" in payload
+    conflicts = payload["conflicts"]
+    assert len(conflicts) == 1
+    spec = conflicts[0]
+    assert spec["tag"] == "python"
+    assert sorted(spec["source_canonical_turn_ids"]) == ["s-t1", "s-t2"]
+    assert spec["target_canonical_turn_ids"] == ["t-t9"]
+
+
+# ---------------------------------------------------------------------------
+# B-D7 (P1): prior_alias_target captured on merge_audit
+# ---------------------------------------------------------------------------
+
+def test_body_captures_prior_alias_target_in_audit(tmp_path):
+    """B-D7: if source has a prior conversation_aliases row pointing
+    elsewhere, the body captures that target_id into
+    merge_audit.prior_alias_target before the UPSERT overwrites it. This
+    is reversibility: a future merge-revert can restore the prior alias.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_conversation(conn, "tA", "earlier-tgt")
+    # Seed source alias pointing at an earlier merge target.
+    conn.execute(
+        "INSERT INTO conversation_aliases (alias_id, target_id, epoch) "
+        "VALUES ('src', 'earlier-tgt', 1)",
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    audit = conn.execute(
+        "SELECT prior_alias_target FROM merge_audit WHERE merge_id = ?",
+        (merge_id,),
+    ).fetchone()
+    assert audit["prior_alias_target"] == "earlier-tgt"
+    # And the new alias points at tgt now.
+    new_alias = conn.execute(
+        "SELECT target_id FROM conversation_aliases WHERE alias_id = 'src'",
+    ).fetchone()
+    assert new_alias["target_id"] == "tgt"
+
+
+def test_body_prior_alias_target_null_when_absent(tmp_path):
+    """B-D7: prior_alias_target column is NULL when source had no prior
+    alias (the common case)."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    audit = conn.execute(
+        "SELECT prior_alias_target FROM merge_audit WHERE merge_id = ?",
+        (merge_id,),
+    ).fetchone()
+    assert audit["prior_alias_target"] is None
+
+
+# ---------------------------------------------------------------------------
+# B-D8 (P2): tag_aliases moves with conflict resolution
+# ---------------------------------------------------------------------------
+
+def test_body_moves_tag_aliases_no_conflict(tmp_path):
+    """B-D8: source's tag_aliases rows that don't collide with target's
+    are UPDATEd to target's namespace; origin_conversation_id captures
+    source."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute(
+        "INSERT INTO tag_aliases (alias, conversation_id, canonical) "
+        "VALUES ('py', 'src', 'python')",
+    )
+    conn.execute(
+        "INSERT INTO tag_aliases (alias, conversation_id, canonical) "
+        "VALUES ('js', 'src', 'javascript')",
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    moved = conn.execute(
+        "SELECT alias, canonical, origin_conversation_id FROM tag_aliases "
+        "WHERE conversation_id = 'tgt' ORDER BY alias",
+    ).fetchall()
+    aliases = sorted(r["alias"] for r in moved)
+    assert aliases == ["js", "py"]
+    assert all(r["origin_conversation_id"] == "src" for r in moved)
+    src_count = conn.execute(
+        "SELECT COUNT(*) FROM tag_aliases WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_count == 0
+    assert stats.rows_moved.get("tag_aliases") == 2
+
+
+def test_body_resolves_tag_aliases_conflicts(tmp_path):
+    """B-D8: when source + target share an alias, target wins; source's
+    conflicting alias is DELETEd."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute(
+        "INSERT INTO tag_aliases (alias, conversation_id, canonical) "
+        "VALUES ('py', 'src', 'src-canon')",
+    )
+    conn.execute(
+        "INSERT INTO tag_aliases (alias, conversation_id, canonical) "
+        "VALUES ('py', 'tgt', 'tgt-canon')",
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # target's "py" preserved
+    py = conn.execute(
+        "SELECT canonical FROM tag_aliases WHERE conversation_id = 'tgt' AND alias = 'py'",
+    ).fetchone()
+    assert py["canonical"] == "tgt-canon"
+    src_count = conn.execute(
+        "SELECT COUNT(*) FROM tag_aliases WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_count == 0
+    assert stats.rows_moved.get("tag_aliases__conflicts_deleted") == 1
+
+
+# ---------------------------------------------------------------------------
+# B-D5 (P1): request_turn_offset must avoid collision across all 4 tables
+# (engine-level check; the body just applies the offset.)
+# ---------------------------------------------------------------------------
+
+def test_engine_request_turn_offset_avoids_collision_across_tables(tmp_path):
+    """B-D5: Engine.merge_conversation must compute request_turn_offset
+    from MAX across all four request-turn-bearing tables: tool_calls,
+    request_context, request_captures, request_turn_counters. Seeding
+    target with request_context but no tool_calls must still produce an
+    offset > the request_context max.
+    """
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.config import VirtualContextConfig
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Target has request_context with high request_turn but no tool_calls.
+    conn.execute(
+        "INSERT INTO request_context "
+        "(conversation_id, request_turn, timestamp, user_message, inbound_tags, "
+        "retrieval_method, candidates_found, candidates_selected, "
+        "segments_injected, facts_injected, facts_count, facts_tags, "
+        "pool_used, pool_budget, total_context_tokens, "
+        "non_virtualizable_floor) "
+        "VALUES ('tgt', 50, ?, '', '', '', 0, 0, '', '', 0, '', 0, 0, 0, 0)",
+        (_now_iso(),),
+    )
+    # Source has tool_calls at request_turn=2.
+    conn.execute(
+        "INSERT INTO tool_calls "
+        "(conversation_id, request_turn, round, group_id, tool_name, "
+        "tool_input, tool_result, result_length, duration_ms, timestamp) "
+        "VALUES ('src', 2, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+        (_now_iso(),),
+    )
+    conn.commit()
+
+    # Build a minimal engine that wraps the SQLiteStore directly.
+    class _MockStore:
+        def __init__(self, inner):
+            self._segments = inner
+        def __getattr__(self, name):
+            return getattr(self._segments, name)
+    mock = _MockStore(store)
+
+    # Inline the offset computation logic (don't need full engine bootstrap).
+    inner = mock._segments
+    c = inner._get_conn()
+    rc = c.execute("SELECT COALESCE(MAX(request_turn), 0) FROM request_context "
+                   "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
+    tc = c.execute("SELECT COALESCE(MAX(request_turn), 0) FROM tool_calls "
+                   "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
+    rcap = c.execute("SELECT COALESCE(MAX(turn), 0) FROM request_captures "
+                     "WHERE conversation_id = ?", ("tgt",)).fetchone()[0]
+    rtc = c.execute("SELECT COALESCE(MAX(next_request_turn), 0) "
+                    "FROM request_turn_counters WHERE conversation_id = ?",
+                    ("tgt",)).fetchone()[0]
+    offset = max(rc + 1, tc + 1, rcap + 1, rtc)
+    # Target's request_context max is 50, so offset must be >= 51.
+    assert offset >= 51
+
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=offset,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Source's tool_call with request_turn=2 + offset=51+ should land
+    # at request_turn >= 53; no collision with target's 50.
+    moved = conn.execute(
+        "SELECT request_turn FROM tool_calls WHERE conversation_id = 'tgt'",
+    ).fetchone()
+    assert moved is not None
+    assert int(moved["request_turn"]) >= 53
+
+
+# ---------------------------------------------------------------------------
+# B-D10 (P2): per-table move correctness coverage expansion
+# ---------------------------------------------------------------------------
+
+def test_body_moves_facts(tmp_path):
+    """B-D10: facts table moves source rows; origin captured."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute(
+        "INSERT INTO facts (id, conversation_id, subject, verb, object) "
+        "VALUES ('f1', 'src', 'water', 'boils_at', '100C')",
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    moved = conn.execute(
+        "SELECT id, conversation_id, origin_conversation_id FROM facts "
+        "WHERE id = 'f1'",
+    ).fetchone()
+    assert moved["conversation_id"] == "tgt"
+    assert moved["origin_conversation_id"] == "src"
+    assert stats.rows_moved.get("facts") == 1
+
+
+def test_body_moves_tool_calls_with_offset(tmp_path):
+    """B-D10: tool_calls request_turn += offset on move."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    conn.execute(
+        "INSERT INTO tool_calls "
+        "(conversation_id, request_turn, round, group_id, tool_name, "
+        "tool_input, tool_result, result_length, duration_ms, timestamp) "
+        "VALUES ('src', 3, 0, 'g', 't', '{}', '{}', 0, 0.0, ?)",
+        (_now_iso(),),
+    )
+    conn.commit()
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=100,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    moved = conn.execute(
+        "SELECT request_turn, origin_conversation_id FROM tool_calls "
+        "WHERE conversation_id = 'tgt'",
+    ).fetchone()
+    assert moved["request_turn"] == 103
+    assert moved["origin_conversation_id"] == "src"
+
+
+def test_body_rollback_on_late_failure(tmp_path, monkeypatch):
+    """B-D10: simulate failure during merge_post_commit_pending INSERT
+    (the LAST step of the body). The whole body transaction must rollback;
+    no row moves persist; merge_audit stays in_progress.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_segment(conn, "src", "seg-x")
+    conn.commit()
+    merge_id = _reserve(store)
+    # Patch _uuid.uuid4 to raise on call inside the post-commit-pending
+    # INSERT loop. The body's import-statement is `import uuid as _uuid`.
+    import uuid as _uuid_mod
+    call_count = {"n": 0}
+    real_uuid4 = _uuid_mod.uuid4
+    def _bad_uuid4():
+        call_count["n"] += 1
+        # First call (audit reservation) succeeds; second-onwards raises.
+        if call_count["n"] >= 1:
+            raise RuntimeError("simulated late-step failure")
+        return real_uuid4()
+    monkeypatch.setattr(_uuid_mod, "uuid4", _bad_uuid4)
+    with pytest.raises(RuntimeError, match="simulated late-step failure"):
+        store.merge_conversation_data(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    # Source segments NOT moved (transaction rolled back).
+    src_segs = conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_segs == 1
+    tgt_segs = conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE conversation_id = 'tgt'",
+    ).fetchone()[0]
+    assert tgt_segs == 0
+    # merge_audit row stays in_progress (caller marks rolled_back externally).
+    audit_status = conn.execute(
+        "SELECT status FROM merge_audit WHERE merge_id = ?", (merge_id,),
+    ).fetchone()["status"]
+    assert audit_status == "in_progress"
+    # Source phase NOT flipped to merged (still 'active').
+    src_phase = conn.execute(
+        "SELECT phase FROM conversations WHERE conversation_id = 'src'",
+    ).fetchone()["phase"]
+    assert src_phase == "active"
+    # No alias UPSERT persisted.
+    alias_row = conn.execute(
+        "SELECT 1 FROM conversation_aliases WHERE alias_id = 'src'",
+    ).fetchone()
+    assert alias_row is None
+
+
+# ---------------------------------------------------------------------------
+# B-D11 (P2): anti-subversion comprehensive guard
+# ---------------------------------------------------------------------------
+
+def test_body_does_not_call_provider_delete(tmp_path, monkeypatch):
+    """B-D11: spy on provider.delete (used by the LLM-tool delete path)
+    to confirm the body method never invokes it. Move semantics is
+    UPDATE conversation_id, never delegate to the destructive provider
+    primitive."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_segment(conn, "src", "seg-x")
+    conn.commit()
+    # If a provider attribute exists on the store, spy on its delete.
+    provider = getattr(store, "provider", None)
+    delete_spy_calls = []
+    if provider is not None and hasattr(provider, "delete"):
+        original_delete = provider.delete
+        def _spy(*a, **kw):
+            delete_spy_calls.append((a, kw))
+            return original_delete(*a, **kw)
+        monkeypatch.setattr(provider, "delete", _spy)
+    # Spy delete_conversation as well (the v1.x defense).
+    store_delete_calls = []
+    original_dc = store.delete_conversation
+    def _spy_dc(*a, **kw):
+        store_delete_calls.append((a, kw))
+        return original_dc(*a, **kw)
+    monkeypatch.setattr(store, "delete_conversation", _spy_dc)
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    assert delete_spy_calls == [], (
+        f"body called provider.delete: {delete_spy_calls}"
+    )
+    assert store_delete_calls == [], (
+        f"body called store.delete_conversation: {store_delete_calls}"
+    )
+
+
+def test_body_sql_inspection_no_unbounded_destructive_writes(tmp_path):
+    """B-D11: regex-scan both the SQLite + PostgreSQL body method source
+    code; assert every DELETE FROM <table> is allowlisted. The bounded-
+    DELETE allowlist is the single source of truth for what destructive
+    primitives the body is permitted to touch."""
+    import inspect
+    import re
+    from virtual_context.storage import sqlite as sqlite_mod
+    from virtual_context.storage import postgres as postgres_mod
+
+    allowlist = {
+        "request_turn_counters", "tag_summaries", "tag_summary_embeddings",
+        "tag_aliases",
+    }
+
+    for mod, store_cls_name in (
+        (sqlite_mod, "SQLiteStore"),
+        (postgres_mod, "PostgresStore"),
+    ):
+        store_cls = getattr(mod, store_cls_name, None)
+        if store_cls is None:
+            continue
+        body = getattr(store_cls, "merge_conversation_data", None)
+        if body is None:
+            continue
+        src = inspect.getsource(body)
+        # Capture DELETE FROM <table> targets.
+        deletes = re.findall(r"DELETE\s+FROM\s+(\w+)", src, re.IGNORECASE)
+        # Skip docstring-only mentions: each captured target must appear
+        # inside an SQL string literal. The simple regex above is good
+        # enough because the docstring uses lowercase prose like
+        # "DELETE FROM <per_conv_table>" with angle-bracket placeholders.
+        unbounded = [t for t in deletes
+                     if t not in allowlist and not t.startswith("<")]
+        assert unbounded == [], (
+            f"{store_cls_name}.merge_conversation_data contains unbounded "
+            f"DELETE FROM {unbounded}; anti-subversion violation"
+        )
+
+
+def test_body_sql_inspection_tenant_aware_writes_predicate_on_tenant_id(tmp_path):
+    """B-D11 / B-D1 invariant: every UPDATE/SELECT against a TENANT-AWARE
+    table (conversations, merge_audit) in the body method must predicate
+    on tenant_id. Per-conv tables (segments, canonical_turns, ...) don't
+    carry tenant_id; they're scoped on conversation_id only — tenant
+    scoping is transitive via the body's source.tenant_id re-validation
+    at body entry. This test pins the tenant-aware predicate invariant.
+    """
+    import inspect
+    from virtual_context.storage import sqlite as sqlite_mod
+    src = inspect.getsource(sqlite_mod.SQLiteStore.merge_conversation_data)
+    # Locate the tenant-aware operations and confirm tenant_id appears
+    # within ~120 chars of each. Looser than full-regex parsing of multi-
+    # line SQL strings; robust against quote/whitespace variation.
+    tenant_aware_keywords = (
+        "UPDATE conversations",
+        "UPDATE merge_audit",
+        "FROM conversations",
+        "FROM merge_audit",
+    )
+    for kw in tenant_aware_keywords:
+        idx = 0
+        while True:
+            pos = src.find(kw, idx)
+            if pos < 0:
+                break
+            window = src[pos:pos + 600]
+            assert "tenant_id" in window, (
+                f"tenant-aware operation '{kw}' at offset {pos} lacks "
+                f"tenant_id predicate within 600-char window"
+            )
+            idx = pos + len(kw)

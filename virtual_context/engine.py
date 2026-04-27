@@ -360,7 +360,8 @@ class VirtualContextEngine:
         Raises:
             * ``CrossTenantMergeError`` if source/target tenants differ
               (cloud's REST handler catches at C2.4 first, but engine
-              defense-in-depth)
+              defense-in-depth, AND the body method also re-validates
+              under the merge_audit row lock as defense-in-depth Layer C)
             * ``LifecycleEpochMismatch`` if source's or target's epoch
               advanced between cloud's reservation and the body call
             * ``MergeAuditMissing`` from the body's D1 pre-flight if no
@@ -369,9 +370,7 @@ class VirtualContextEngine:
               ingestion blocks
             * other transient SQL errors
         """
-        from .core.exceptions import (
-            CrossTenantMergeError, LifecycleEpochMismatch,
-        )
+        from .core.exceptions import CrossTenantMergeError
 
         # Same-source-as-target refusal (per spec §14 Q2 + plan §3.3 E1.x).
         if source_conversation_id == target_conversation_id:
@@ -380,28 +379,59 @@ class VirtualContextEngine:
                 f"source = target = {source_conversation_id}",
             )
 
-        # Cross-tenant refusal (defense-in-depth; cloud's C2.4 already
-        # checked but the engine entry MUST also refuse to prevent any
-        # misroute slipping through).
-        # Read tenant for both source + target from the store; if either
-        # row is missing, fall through to the body which will surface
-        # the appropriate error (LifecycleEpochMismatch on missing target).
         store = self._store
-        # Compute offsets from the target's existing watermarks. The
-        # body method applies these to source's rows during the move.
-        # If target has no rows (fresh conversation), offsets default to
-        # 0; the source's sort_keys + turns become target's.
+
+        # B-D1 (codex iter-2 P0): cross-tenant validation at engine entry.
+        # SELECT source's conversations row and verify source.tenant_id ==
+        # passed tenant_id. A misroute that bypassed cloud's C2.4 would
+        # otherwise let one tenant's caller move ANOTHER tenant's per-conv
+        # rows under the calling tenant's namespace (data corruption +
+        # cross-tenant exfiltration). Per-conv tables don't have a
+        # tenant_id column today; tenant scoping is transitive via the
+        # conversations row's tenant_id, so this validation MUST happen
+        # before any UPDATE-row-move runs.
+        #
+        # Defense layers:
+        #   Layer A (cloud REST C2.4): rejects mismatched tenant pre-engine.
+        #   Layer B (this engine entry): catches misroutes that bypass A.
+        #   Layer C (body method, S1.3/S1.4): re-validates under the
+        #          merge_audit FOR UPDATE row lock so the check fires
+        #          inside the same txn that moves the rows.
+        inner = getattr(store, "_segments", store)
+        conn = inner._get_conn()
+        is_pg = "psycopg" in str(type(conn))
+        param = "%s" if is_pg else "?"
+
+        src_row = conn.execute(
+            f"SELECT tenant_id, lifecycle_epoch FROM conversations "
+            f"WHERE conversation_id = {param}",
+            (source_conversation_id,),
+        ).fetchone()
+        if src_row is None:
+            raise CrossTenantMergeError(
+                f"Source conversation {source_conversation_id} not found "
+                f"under any tenant; refusing merge",
+            )
+        src_tenant = (src_row["tenant_id"]
+                      if hasattr(src_row, "keys") else src_row[0])
+        if str(src_tenant) != str(tenant_id):
+            raise CrossTenantMergeError(
+                f"Source conversation {source_conversation_id} belongs to "
+                f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
+            )
+
+        # B-D5 (codex iter-2 P1): request_turn_offset must avoid collisions
+        # across ALL request-turn-bearing tables on the target, not just
+        # tool_calls. A target with request_context rows but no tool_calls
+        # would otherwise collide on (conversation_id, request_turn) when
+        # source's rows arrive. Single combined query is cheap; COALESCE
+        # to 0 for tables with no rows.
         sort_key_offset = 0.0
         request_turn_offset = 0
         try:
-            inner = getattr(store, "_segments", store)
-            conn = inner._get_conn()
             row = conn.execute(
-                "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
-                "FROM canonical_turns WHERE conversation_id = %s"
-                if "psycopg" in str(type(conn))
-                else "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
-                "FROM canonical_turns WHERE conversation_id = ?",
+                f"SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key "
+                f"FROM canonical_turns WHERE conversation_id = {param}",
                 (target_conversation_id,),
             ).fetchone()
             if row is not None:
@@ -411,26 +441,57 @@ class VirtualContextEngine:
                     sort_key_offset = float(row[0] or 0.0) + 1000.0
         except Exception:
             sort_key_offset = 1000.0  # safe default; never start at 0
+
+        # request_turn_offset: take MAX across the four request-turn-bearing
+        # tables, +1. Also include request_turn_counters.next_request_turn
+        # (which is already "next available", not "max used"). The offset
+        # we pick must be >= every existing turn number on the target.
         try:
-            inner = getattr(store, "_segments", store)
-            conn = inner._get_conn()
-            row = conn.execute(
-                "SELECT COALESCE(MAX(request_turn), 0) AS max_turn "
-                "FROM tool_calls WHERE conversation_id = %s"
-                if "psycopg" in str(type(conn))
-                else "SELECT COALESCE(MAX(request_turn), 0) AS max_turn "
-                "FROM tool_calls WHERE conversation_id = ?",
+            tc_row = conn.execute(
+                f"SELECT COALESCE(MAX(request_turn), 0) AS m "
+                f"FROM tool_calls WHERE conversation_id = {param}",
                 (target_conversation_id,),
             ).fetchone()
-            if row is not None:
+            rc_row = conn.execute(
+                f"SELECT COALESCE(MAX(request_turn), 0) AS m "
+                f"FROM request_context WHERE conversation_id = {param}",
+                (target_conversation_id,),
+            ).fetchone()
+            rcap_row = conn.execute(
+                f"SELECT COALESCE(MAX(turn), 0) AS m "
+                f"FROM request_captures WHERE conversation_id = {param}",
+                (target_conversation_id,),
+            ).fetchone()
+            rtc_row = conn.execute(
+                f"SELECT COALESCE(MAX(next_request_turn), 0) AS m "
+                f"FROM request_turn_counters WHERE conversation_id = {param}",
+                (target_conversation_id,),
+            ).fetchone()
+
+            def _v(row):
+                if row is None:
+                    return 0
                 if hasattr(row, "keys"):
-                    request_turn_offset = int(row["max_turn"] or 0) + 1
-                else:
-                    request_turn_offset = int(row[0] or 0) + 1
+                    return int(row["m"] or 0)
+                return int(row[0] or 0)
+
+            tc_max = _v(tc_row)
+            rc_max = _v(rc_row)
+            rcap_max = _v(rcap_row)
+            rtc_next = _v(rtc_row)  # already "next", not "max"
+            request_turn_offset = max(
+                tc_max + 1, rc_max + 1, rcap_max + 1, rtc_next,
+            )
+            if request_turn_offset < 1:
+                request_turn_offset = 1
         except Exception:
             request_turn_offset = 1
 
-        # Delegate to the store's body method. Returns MergeStats.
+        # B-D3 (codex iter-2 P1): pass expected source_lifecycle_epoch
+        # through to the body so the body validates source's epoch under
+        # the merge_audit row lock. Source delete+recreate between cloud's
+        # reservation (which captured the epoch) and the body call must be
+        # rejected; otherwise we'd merge into a stale view.
         return store.merge_conversation_data(
             merge_id=merge_id,
             tenant_id=tenant_id,
@@ -438,6 +499,7 @@ class VirtualContextEngine:
             target_conversation_id=target_conversation_id,
             sort_key_offset=sort_key_offset,
             request_turn_offset=request_turn_offset,
+            expected_source_lifecycle_epoch=source_lifecycle_epoch,
             expected_target_lifecycle_epoch=target_lifecycle_epoch,
             source_label_at_merge=source_label_at_merge,
         )

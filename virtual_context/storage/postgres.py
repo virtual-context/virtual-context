@@ -887,8 +887,19 @@ class PostgresStore(ContextStore):
                     started_at                TIMESTAMPTZ NOT NULL,
                     completed_at              TIMESTAMPTZ NULL,
                     rows_moved_json           TEXT NULL,
-                    error_message             TEXT NULL
+                    error_message             TEXT NULL,
+                    prior_alias_target        TEXT NULL
                 )
+            """)
+            # B-D7 (codex iter-2 P1): prior_alias_target column for merge
+            # reversibility. Captures the conversation_aliases.target_id that
+            # the source's alias_id pointed to BEFORE the body's UPSERT, so a
+            # future merge-revert can restore it. NULL when source had no
+            # prior alias (the common case). Idempotent ADD COLUMN for
+            # forward migration on tables created by an earlier engine.
+            conn.execute("""
+                ALTER TABLE merge_audit
+                    ADD COLUMN IF NOT EXISTS prior_alias_target TEXT NULL
             """)
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
@@ -996,6 +1007,12 @@ class PostgresStore(ContextStore):
         # for moved rows; does not affect query behavior on existing
         # rows. PG ≥9.6 supports IF NOT EXISTS on ADD COLUMN; the
         # migration is idempotent re-runnable.
+        # B-D8 (codex iter-2 P2): tag_aliases added to the M0.2 list. The
+        # table is per-conv (PK includes conversation_id) and was missing
+        # from the original list, leaving source's tag aliases stranded
+        # post-merge. The body method (S1.3) now moves these rows; the
+        # origin_conversation_id column captures provenance same as the
+        # other per-conv tables.
         _M0_2_TABLES = (
             "segments", "segment_tags", "canonical_turns",
             "canonical_turn_anchors", "canonical_turn_chunks",
@@ -1004,7 +1021,7 @@ class PostgresStore(ContextStore):
             "request_turn_counters", "request_context",
             "tag_summary_embeddings", "turn_tool_outputs",
             "segment_tool_outputs", "chain_snapshots", "media_outputs",
-            "tag_summaries",
+            "tag_summaries", "tag_aliases",
         )
         for _t in _M0_2_TABLES:
             try:
@@ -2854,14 +2871,38 @@ class PostgresStore(ContextStore):
         request_turn_offset: int,
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
+        expected_source_lifecycle_epoch: int | None = None,
     ):
         """Move all per-conv data rows from source to target's namespace.
 
         See class-level S1.3 docstring for the full body shape. Returns
         ``MergeStats`` with the per-table move counts; caller writes
         the SSE event / dashboard-badge from this.
+
+        Tenant-scoping contract (B-D1 codex iter-2 P0): per-conv data
+        tables (segments, canonical_turns, facts, ...) DO NOT carry a
+        tenant_id column. Tenant scoping is transitive via the
+        conversations row's tenant_id. The body therefore re-validates
+        BOTH source.tenant_id AND target.tenant_id under the merge_audit
+        FOR UPDATE row lock as defense-in-depth Layer C (Layer A = cloud
+        REST C2.4, Layer B = engine entry). After validation, the
+        per-conv UPDATE/DELETE statements are conversation-scoped (no
+        tenant_id predicate possible since the column is absent).
+
+        Bounded DELETE surface (anti-subversion): the body issues
+        DELETE statements ONLY against
+          (a) request_turn_counters by source conversation_id (per-conv
+              state that doesn't transfer);
+          (b) tag_summaries + tag_summary_embeddings on conflict resolution
+              (target wins);
+          (c) tag_aliases on conflict resolution (target wins);
+        i.e. NEVER against segments/canonical_turns/facts/etc. Move
+        semantics is UPDATE conversation_id, not DELETE FROM <table>.
         """
         from ..types import MergeStats
+        from ..core.exceptions import (
+            CrossTenantMergeError, LifecycleEpochMismatch, MergeBusy,
+        )
         import json as _json
 
         conn = self._get_conn()
@@ -2894,6 +2935,12 @@ class PostgresStore(ContextStore):
         )
         # fact_links has TWO endpoint cols (source_fact_id, target_fact_id);
         # handled separately below.
+        # B-D8 (codex iter-2 P2): tag_aliases is per-conv with PK
+        # (alias, conversation_id). Conflict resolution mirrors
+        # tag_summaries: target wins, source's conflicting aliases DELETEd,
+        # non-conflicting source aliases moved. Listed separately so the
+        # bounded-DELETE surface remains explicit.
+        TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
         rows_moved: dict[str, int] = {}
 
         with conn.transaction():
@@ -2921,30 +2968,143 @@ class PostgresStore(ContextStore):
                     f"first calling try_reserve_merge_audit_in_progress.",
                 )
 
+            # B-D2 (codex iter-2 P1): acquire conversation_lifecycle row
+            # locks for source + target before reading phase or moving rows.
+            # Sorted lexicographically to prevent deadlocks if two opposing
+            # merges race. The locks block concurrent VCATTACH ingest /
+            # compaction starts that hold the same per-conv lock; they
+            # release on transaction commit.
+            for cid in sorted({source_conversation_id, target_conversation_id}):
+                conn.execute(
+                    """
+                    INSERT INTO conversation_lifecycle
+                        (conversation_id, generation, deleted, updated_at)
+                    VALUES (%s, 0, FALSE, %s)
+                    ON CONFLICT (conversation_id) DO UPDATE
+                      SET updated_at = EXCLUDED.updated_at
+                    """,
+                    (cid, datetime.now(timezone.utc)),
+                )
+                conn.execute(
+                    """
+                    SELECT 1 FROM conversation_lifecycle
+                     WHERE conversation_id = %s
+                     FOR UPDATE
+                    """,
+                    (cid,),
+                ).fetchone()
+
+            # B-D1 + B-D3 (codex iter-2 P0+P1): re-validate source under
+            # the merge_audit row lock. Captures all three constraints in
+            # one row read: tenant ownership, lifecycle epoch consistency,
+            # and current phase (must NOT be in a busy or terminal state).
+            src_row = conn.execute(
+                """
+                SELECT tenant_id, lifecycle_epoch, phase
+                  FROM conversations
+                 WHERE conversation_id = %s
+                """,
+                (source_conversation_id,),
+            ).fetchone()
+            if src_row is None:
+                raise CrossTenantMergeError(
+                    f"Source conversation {source_conversation_id} not found "
+                    f"during body validation; refusing merge",
+                )
+            src_tenant = src_row["tenant_id"]
+            if str(src_tenant) != str(tenant_id):
+                raise CrossTenantMergeError(
+                    f"Source conversation {source_conversation_id} belongs to "
+                    f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
+                )
+            if expected_source_lifecycle_epoch is not None and (
+                int(src_row["lifecycle_epoch"]) != int(expected_source_lifecycle_epoch)
+            ):
+                raise LifecycleEpochMismatch(
+                    f"Source lifecycle_epoch advanced "
+                    f"({src_row['lifecycle_epoch']} != {expected_source_lifecycle_epoch}); "
+                    f"source state has changed since reservation",
+                )
+            if src_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
+                raise MergeBusy(
+                    f"Source conversation {source_conversation_id} phase = "
+                    f"'{src_row['phase']}'; cannot merge",
+                    code="merge_busy_phase",
+                )
+
             # Lifecycle-epoch consistency: target's epoch must match the
-            # caller-captured value. Refuses if epoch advanced (e.g. target
-            # was deleted+recreated between reserve and body).
+            # caller-captured value AND target must not be in a busy phase.
             tgt_epoch_row = conn.execute(
                 """
-                SELECT lifecycle_epoch
+                SELECT lifecycle_epoch, phase
                   FROM conversations
                  WHERE tenant_id = %s AND conversation_id = %s
                 """,
                 (tenant_id, target_conversation_id),
             ).fetchone()
             if tgt_epoch_row is None:
-                from ..core.exceptions import LifecycleEpochMismatch
                 raise LifecycleEpochMismatch(
                     f"Target conversation {target_conversation_id} not found "
                     f"under tenant {tenant_id}",
                 )
             if int(tgt_epoch_row["lifecycle_epoch"]) != int(expected_target_lifecycle_epoch):
-                from ..core.exceptions import LifecycleEpochMismatch
                 raise LifecycleEpochMismatch(
                     f"Target lifecycle_epoch advanced "
                     f"({tgt_epoch_row['lifecycle_epoch']} != {expected_target_lifecycle_epoch}); "
                     f"source/target state has changed since reservation",
                 )
+            if tgt_epoch_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
+                raise MergeBusy(
+                    f"Target conversation {target_conversation_id} phase = "
+                    f"'{tgt_epoch_row['phase']}'; cannot merge",
+                    code="merge_busy_phase",
+                )
+
+            # B-D2 active-op check: refuse if either side has a queued/running
+            # compaction or a running ingestion episode. The conversation_lifecycle
+            # row lock above blocks NEW compactions/ingests from STARTING during
+            # the body, but pre-existing ones still need to finish before merge.
+            try:
+                cop_row = conn.execute(
+                    """
+                    SELECT 1 FROM compaction_operation
+                     WHERE conversation_id IN (%s, %s)
+                       AND status IN ('queued','running')
+                     LIMIT 1
+                    """,
+                    (source_conversation_id, target_conversation_id),
+                ).fetchone()
+                if cop_row is not None:
+                    raise MergeBusy(
+                        "Active compaction_operation on source or target; "
+                        "cannot merge until it completes",
+                        code="merge_busy_compact",
+                    )
+            except MergeBusy:
+                raise
+            except Exception:
+                # compaction_operation table absent on minimal fixtures
+                pass
+            try:
+                ing_row = conn.execute(
+                    """
+                    SELECT 1 FROM ingestion_episode
+                     WHERE conversation_id IN (%s, %s)
+                       AND status = 'running'
+                     LIMIT 1
+                    """,
+                    (source_conversation_id, target_conversation_id),
+                ).fetchone()
+                if ing_row is not None:
+                    raise MergeBusy(
+                        "Running ingestion_episode on source or target; "
+                        "cannot merge until it completes",
+                        code="merge_busy_ingest",
+                    )
+            except MergeBusy:
+                raise
+            except Exception:
+                pass
 
             # Step 5: per-table moves.
             for tbl in TABLES_SIMPLE:
@@ -2957,12 +3117,19 @@ class PostgresStore(ContextStore):
                 )
                 rows_moved[tbl] = cur.rowcount
 
+            # B-D4 (codex iter-2 P1): canonical_turns rows arrive with
+            # source's compacted_at populated. Target's compaction prefix
+            # invariant requires uncompacted rows to have NULL compacted_at;
+            # reset on move so target's compaction pipeline picks them up
+            # as fresh tail. The merge_post_commit_pending queue_resegment
+            # fires re-compaction.
             for tbl, col in TABLES_OFFSET_SORT_KEY:
                 cur = conn.execute(
                     f"UPDATE {tbl} "
                     f"   SET conversation_id = %s, "
                     f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
-                    f"       {col} = {col} + %s "
+                    f"       {col} = {col} + %s, "
+                    f"       compacted_at = NULL "
                     f" WHERE conversation_id = %s",
                     (target_conversation_id, source_conversation_id,
                      sort_key_offset, source_conversation_id),
@@ -3007,25 +3174,62 @@ class PostgresStore(ContextStore):
 
             # request_turn_counters: source's row is per-conv state that
             # doesn't make sense on the target (target has its own
-            # counter). DELETE source's row.
+            # counter). DELETE source's row (bounded by conversation_id).
             cur = conn.execute(
                 "DELETE FROM request_turn_counters WHERE conversation_id = %s",
                 (source_conversation_id,),
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # Tag-summary conflict resolution. tag_summaries + tag_summary_embeddings
-            # have PK (tag, conversation_id). Source's row may collide with
-            # target's existing row for the same tag. Target wins; source's
-            # conflicting rows are DELETEd. Non-conflicting source rows
-            # are UPDATEd to target's namespace.
-            for tbl in ("tag_summaries", "tag_summary_embeddings"):
-                # Delete source rows whose tag already exists in target
+            # B-D6 (codex iter-2 P1): capture conflict tag list BEFORE
+            # deleting source's conflicting tag_summaries rows. The Phase
+            # B sweeper consumes tag_regenerate pendings to re-generate
+            # the unioned summary, so it needs (tag, source_canonical_turn_ids,
+            # target_canonical_turn_ids) per conflict. tag_summaries.
+            # source_canonical_turn_ids is JSON-encoded array of canonical
+            # turn UUIDs.
+            conflict_tag_specs: list[dict] = []
+            try:
+                for crow in conn.execute(
+                    """
+                    SELECT s.tag                            AS tag,
+                           s.source_canonical_turn_ids      AS src_ids,
+                           t.source_canonical_turn_ids      AS tgt_ids
+                      FROM tag_summaries s
+                      JOIN tag_summaries t
+                        ON t.tag = s.tag
+                       AND t.conversation_id = %s
+                     WHERE s.conversation_id = %s
+                    """,
+                    (target_conversation_id, source_conversation_id),
+                ).fetchall():
+                    conflict_tag_specs.append({
+                        "tag": crow["tag"],
+                        "source_canonical_turn_ids": _json.loads(
+                            crow["src_ids"] or "[]"),
+                        "target_canonical_turn_ids": _json.loads(
+                            crow["tgt_ids"] or "[]"),
+                    })
+            except Exception:
+                # Schema variant without source_canonical_turn_ids; the
+                # payload list is empty in that case (sweeper falls back
+                # to tag-only regeneration).
+                conflict_tag_specs = []
+
+            # Tag-conflict resolution. tag_summaries + tag_summary_embeddings
+            # + tag_aliases all have PK (X, conversation_id). Source's row
+            # may collide with target's existing row for the same key.
+            # Target wins; source's conflicting rows are DELETEd. Non-
+            # conflicting source rows are UPDATEd to target's namespace.
+            for tbl in TABLES_TAG_CONFLICT:
+                # tag_summaries / tag_summary_embeddings collide on `tag`.
+                # tag_aliases collides on `alias`.
+                conflict_col = "alias" if tbl == "tag_aliases" else "tag"
                 cur = conn.execute(
                     f"DELETE FROM {tbl} "
                     f" WHERE conversation_id = %s "
-                    f"   AND tag IN ("
-                    f"     SELECT tag FROM {tbl} WHERE conversation_id = %s"
+                    f"   AND {conflict_col} IN ("
+                    f"     SELECT {conflict_col} FROM {tbl} WHERE conversation_id = %s"
                     f"   )",
                     (source_conversation_id, target_conversation_id),
                 )
@@ -3040,6 +3244,18 @@ class PostgresStore(ContextStore):
                 )
                 rows_moved[tbl] = cur2.rowcount
                 rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
+
+            # B-D7 (codex iter-2 P1): capture prior alias target BEFORE
+            # the UPSERT overwrites it. NULL when source had no prior
+            # alias (the common case). Stored on merge_audit so a future
+            # merge-revert can restore the prior alias.
+            prior_alias_row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
+                (source_conversation_id,),
+            ).fetchone()
+            prior_alias_target: str | None = None
+            if prior_alias_row is not None:
+                prior_alias_target = prior_alias_row["target_id"]
 
             # conversation_aliases UPSERT (E-D5: epoch column). The alias
             # makes a stale source_id resolve to the target post-merge;
@@ -3058,6 +3274,8 @@ class PostgresStore(ContextStore):
             )
 
             # Source phase flip to 'merged'. M0.1 admits the value.
+            # Predicates on tenant_id (B-D1 invariant: every tenant-aware
+            # write includes tenant_id).
             conn.execute(
                 """
                 UPDATE conversations
@@ -3070,6 +3288,7 @@ class PostgresStore(ContextStore):
             )
 
             # merge_audit finalize. Predicates on tenant_id per D3.
+            # B-D7: capture prior_alias_target on the audit row.
             completed_at = datetime.now(timezone.utc)
             rows_moved_json = _json.dumps(rows_moved)
             conn.execute(
@@ -3077,19 +3296,23 @@ class PostgresStore(ContextStore):
                 UPDATE merge_audit
                    SET status = 'committed',
                        completed_at = %s,
-                       rows_moved_json = %s
+                       rows_moved_json = %s,
+                       prior_alias_target = %s
                  WHERE tenant_id = %s
                    AND merge_id = %s
                    AND status = 'in_progress'
                 """,
-                (completed_at, rows_moved_json, tenant_id, merge_id),
+                (completed_at, rows_moved_json, prior_alias_target,
+                 tenant_id, merge_id),
             )
 
             # merge_post_commit_pending INSERTs (B1.1 consumer picks these
             # up post-commit; cloud's StaleLeaseSweeper 5th pass / C2.15).
             # Three kinds per plan §3.5: sse_event, tag_regenerate,
             # queue_resegment. JSON payload carries enough state for the
-            # consumer to fire each.
+            # consumer to fire each. B-D6: tag_regenerate carries the
+            # explicit conflict tag specs (tag + source/target turn ids)
+            # so the sweeper has enough to call the LLM for each tag.
             import uuid as _uuid
             sse_payload = _json.dumps({
                 "merge_id": merge_id,
@@ -3101,6 +3324,7 @@ class PostgresStore(ContextStore):
             tag_regen_payload = _json.dumps({
                 "merge_id": merge_id,
                 "target_conversation_id": target_conversation_id,
+                "conflicts": conflict_tag_specs,
             })
             queue_resegment_payload = _json.dumps({
                 "merge_id": merge_id,
@@ -3124,6 +3348,7 @@ class PostgresStore(ContextStore):
 
         # Outer transaction commits here.
 
+        elapsed = max((completed_at - started_at).total_seconds(), 0.0)
         return MergeStats(
             merge_id=merge_id,
             source_conversation_id=source_conversation_id,
@@ -3134,6 +3359,8 @@ class PostgresStore(ContextStore):
             request_turn_offset=request_turn_offset,
             started_at=started_at,
             completed_at=completed_at,
+            success=True,
+            elapsed_seconds=elapsed,
         )
 
     def complete_ingestion_episode(

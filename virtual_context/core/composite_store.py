@@ -1064,6 +1064,7 @@ class CompositeStore:
         request_turn_offset: int,
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
+        expected_source_lifecycle_epoch: int | None = None,
     ):
         """S1.3 / S1.4 body method forwarder. Returns MergeStats per
         plan T1.1 (frozen dataclass with merge_id + rows_moved dict +
@@ -1096,6 +1097,7 @@ class CompositeStore:
                 request_turn_offset=request_turn_offset,
                 expected_target_lifecycle_epoch=expected_target_lifecycle_epoch,
                 source_label_at_merge=source_label_at_merge,
+                expected_source_lifecycle_epoch=expected_source_lifecycle_epoch,
             )
         raise NotImplementedError(
             "underlying segments store does not implement "

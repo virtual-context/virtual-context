@@ -730,9 +730,24 @@ class SQLiteStore(ContextStore):
                 started_at                TEXT NOT NULL,
                 completed_at              TEXT NULL,
                 rows_moved_json           TEXT NULL,
-                error_message             TEXT NULL
+                error_message             TEXT NULL,
+                prior_alias_target        TEXT NULL
             )
         """)
+        # B-D7 (codex iter-2 P1): prior_alias_target forward migration for
+        # tables created by an earlier engine. SQLite has no IF NOT EXISTS
+        # on ADD COLUMN; PRAGMA-then-ALTER pattern. See PG mirror.
+        try:
+            cols = {
+                r["name"] if isinstance(r, sqlite3.Row) else r[1]
+                for r in conn.execute("PRAGMA table_info(merge_audit)").fetchall()
+            }
+            if "prior_alias_target" not in cols:
+                conn.execute(
+                    "ALTER TABLE merge_audit ADD COLUMN prior_alias_target TEXT NULL"
+                )
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
                 ON merge_audit (tenant_id, source_conversation_id)
@@ -1467,7 +1482,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "request_turn_counters", "request_context",
             "tag_summary_embeddings", "turn_tool_outputs",
             "segment_tool_outputs", "chain_snapshots", "media_outputs",
-            "tag_summaries",
+            "tag_summaries", "tag_aliases",  # B-D8 (codex iter-2 P2)
         )
         for _t in _M0_2_TABLES:
             try:
@@ -3340,19 +3355,25 @@ CREATE TABLE IF NOT EXISTS request_captures (
         request_turn_offset: int,
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
+        expected_source_lifecycle_epoch: int | None = None,
     ):
         """SQLite mirror of PostgresStore.merge_conversation_data.
 
-        See that docstring for the full body shape + invariants.
+        See that docstring for the full body shape + invariants. The
+        SQLite path uses BEGIN IMMEDIATE for serialization (single-writer
+        model) in place of PG's row-level FOR UPDATE; the consistency
+        invariants are equivalent at the database level.
         """
         from ..types import MergeStats
-        from ..core.exceptions import MergeAuditMissing, LifecycleEpochMismatch
+        from ..core.exceptions import (
+            MergeAuditMissing, LifecycleEpochMismatch,
+            CrossTenantMergeError, MergeBusy,
+        )
         import json as _json
         import uuid as _uuid
 
         conn = self._get_conn()
         started_at = datetime.now(timezone.utc)
-        started_at_iso = started_at.isoformat()
 
         TABLES_SIMPLE = (
             "segments", "canonical_turn_anchors", "canonical_turn_chunks",
@@ -3370,13 +3391,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ("segment_tags", "segment_ref", "segments", "ref"),
             ("fact_tags", "fact_id", "facts", "id"),
         )
+        # B-D8 (codex iter-2 P2): tag_aliases joins tag-conflict resolution.
+        TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
         # fact_links has TWO endpoint cols (source_fact_id, target_fact_id)
         # rather than a single fact_id. Handled separately below.
         rows_moved: dict[str, int] = {}
 
         # SQLite explicit transaction. The python sqlite3 module uses
         # autocommit-per-statement by default; begin a deferred txn
-        # explicitly so all the body work is atomic.
+        # explicitly so all the body work is atomic. BEGIN IMMEDIATE
+        # acquires the database-level write lock; combined with the
+        # explicit conversation_lifecycle UPSERT pattern below, this
+        # serializes against any concurrent VCATTACH ingest / compaction
+        # start at the database level (B-D2).
         conn.execute("BEGIN IMMEDIATE")
         try:
             # D1 pre-flight: SELECT 1 (no FOR UPDATE on SQLite; the
@@ -3393,8 +3420,67 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     f"merge_id={merge_id}",
                 )
 
+            # B-D2: ensure conversation_lifecycle rows exist for both
+            # source + target (defensive; the UPSERT is harmless if they
+            # already exist). On SQLite the database-level write lock
+            # already serializes; the row presence is what compaction /
+            # ingest helpers expect.
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for cid in sorted({source_conversation_id, target_conversation_id}):
+                conn.execute(
+                    """
+                    INSERT INTO conversation_lifecycle
+                        (conversation_id, generation, deleted, updated_at)
+                    VALUES (?, 0, 0, ?)
+                    ON CONFLICT (conversation_id) DO UPDATE
+                      SET updated_at = excluded.updated_at
+                    """,
+                    (cid, now_iso),
+                )
+
+            # B-D1 + B-D3: source validation under the BEGIN IMMEDIATE
+            # write lock. tenant ownership, lifecycle epoch consistency,
+            # and current phase.
+            src_row = conn.execute(
+                "SELECT tenant_id, lifecycle_epoch, phase FROM conversations "
+                "WHERE conversation_id = ?",
+                (source_conversation_id,),
+            ).fetchone()
+            if src_row is None:
+                raise CrossTenantMergeError(
+                    f"Source conversation {source_conversation_id} not found "
+                    f"during body validation; refusing merge",
+                )
+
+            def _col(row, key, idx):
+                if isinstance(row, sqlite3.Row):
+                    return row[key]
+                return row[idx]
+
+            src_tenant = _col(src_row, "tenant_id", 0)
+            src_epoch = _col(src_row, "lifecycle_epoch", 1)
+            src_phase = _col(src_row, "phase", 2)
+            if str(src_tenant) != str(tenant_id):
+                raise CrossTenantMergeError(
+                    f"Source conversation {source_conversation_id} belongs to "
+                    f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
+                )
+            if expected_source_lifecycle_epoch is not None and (
+                int(src_epoch) != int(expected_source_lifecycle_epoch)
+            ):
+                raise LifecycleEpochMismatch(
+                    f"Source lifecycle_epoch advanced ({src_epoch} != "
+                    f"{expected_source_lifecycle_epoch})",
+                )
+            if src_phase in ("ingesting", "compacting", "deleted", "merged"):
+                raise MergeBusy(
+                    f"Source conversation {source_conversation_id} phase = "
+                    f"'{src_phase}'; cannot merge",
+                    code="merge_busy_phase",
+                )
+
             tgt_epoch_row = conn.execute(
-                "SELECT lifecycle_epoch FROM conversations "
+                "SELECT lifecycle_epoch, phase FROM conversations "
                 "WHERE tenant_id = ? AND conversation_id = ?",
                 (tenant_id, target_conversation_id),
             ).fetchone()
@@ -3403,14 +3489,53 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     f"Target conversation {target_conversation_id} not found "
                     f"under tenant {tenant_id}",
                 )
-            tgt_epoch = (tgt_epoch_row["lifecycle_epoch"]
-                        if isinstance(tgt_epoch_row, sqlite3.Row)
-                        else tgt_epoch_row[0])
+            tgt_epoch = _col(tgt_epoch_row, "lifecycle_epoch", 0)
+            tgt_phase = _col(tgt_epoch_row, "phase", 1)
             if int(tgt_epoch) != int(expected_target_lifecycle_epoch):
                 raise LifecycleEpochMismatch(
                     f"Target lifecycle_epoch advanced ({tgt_epoch} != "
                     f"{expected_target_lifecycle_epoch})",
                 )
+            if tgt_phase in ("ingesting", "compacting", "deleted", "merged"):
+                raise MergeBusy(
+                    f"Target conversation {target_conversation_id} phase = "
+                    f"'{tgt_phase}'; cannot merge",
+                    code="merge_busy_phase",
+                )
+
+            # B-D2 active-op check (mirrors PG path).
+            try:
+                cop_row = conn.execute(
+                    "SELECT 1 FROM compaction_operation "
+                    "WHERE conversation_id IN (?, ?) "
+                    "  AND status IN ('queued','running') LIMIT 1",
+                    (source_conversation_id, target_conversation_id),
+                ).fetchone()
+                if cop_row is not None:
+                    raise MergeBusy(
+                        "Active compaction_operation on source or target",
+                        code="merge_busy_compact",
+                    )
+            except MergeBusy:
+                raise
+            except sqlite3.OperationalError:
+                pass
+            try:
+                ing_row = conn.execute(
+                    "SELECT 1 FROM ingestion_episode "
+                    "WHERE conversation_id IN (?, ?) "
+                    "  AND status = 'running' LIMIT 1",
+                    (source_conversation_id, target_conversation_id),
+                ).fetchone()
+                if ing_row is not None:
+                    raise MergeBusy(
+                        "Running ingestion_episode on source or target",
+                        code="merge_busy_ingest",
+                    )
+            except MergeBusy:
+                raise
+            except sqlite3.OperationalError:
+                pass
 
             # Per-table moves
             for tbl in TABLES_SIMPLE:
@@ -3423,12 +3548,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 rows_moved[tbl] = cur.rowcount
 
+            # B-D4: canonical_turns moves reset compacted_at = NULL so
+            # target's compaction prefix invariant holds. The
+            # queue_resegment post-commit pending fires re-compaction.
             for tbl, col in TABLES_OFFSET_SORT_KEY:
                 cur = conn.execute(
                     f"UPDATE {tbl} "
                     f"   SET conversation_id = ?, "
                     f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), ?), "
-                    f"       {col} = {col} + ? "
+                    f"       {col} = {col} + ?, "
+                    f"       compacted_at = NULL "
                     f" WHERE conversation_id = ?",
                     (target_conversation_id, source_conversation_id,
                      sort_key_offset, source_conversation_id),
@@ -3475,12 +3604,42 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # Tag-summary conflict resolution (per-tag-per-conv PK).
-            for tbl in ("tag_summaries", "tag_summary_embeddings"):
+            # B-D6: capture conflict tag list with both sides'
+            # source_canonical_turn_ids before the DELETE wipes source's
+            # rows. Phase B sweeper consumes (tag, src_ids, tgt_ids) per
+            # conflict.
+            conflict_tag_specs: list[dict] = []
+            try:
+                for crow in conn.execute(
+                    """
+                    SELECT s.tag                            AS tag,
+                           s.source_canonical_turn_ids      AS src_ids,
+                           t.source_canonical_turn_ids      AS tgt_ids
+                      FROM tag_summaries s
+                      JOIN tag_summaries t
+                        ON t.tag = s.tag
+                       AND t.conversation_id = ?
+                     WHERE s.conversation_id = ?
+                    """,
+                    (target_conversation_id, source_conversation_id),
+                ).fetchall():
+                    src_ids = crow["src_ids"] if isinstance(crow, sqlite3.Row) else crow[1]
+                    tgt_ids = crow["tgt_ids"] if isinstance(crow, sqlite3.Row) else crow[2]
+                    conflict_tag_specs.append({
+                        "tag": crow["tag"] if isinstance(crow, sqlite3.Row) else crow[0],
+                        "source_canonical_turn_ids": _json.loads(src_ids or "[]"),
+                        "target_canonical_turn_ids": _json.loads(tgt_ids or "[]"),
+                    })
+            except sqlite3.OperationalError:
+                conflict_tag_specs = []
+
+            # Tag-conflict resolution (per-key-per-conv PK). Target wins.
+            for tbl in TABLES_TAG_CONFLICT:
+                conflict_col = "alias" if tbl == "tag_aliases" else "tag"
                 cur = conn.execute(
                     f"DELETE FROM {tbl} "
                     f" WHERE conversation_id = ? "
-                    f"   AND tag IN (SELECT tag FROM {tbl} WHERE conversation_id = ?)",
+                    f"   AND {conflict_col} IN (SELECT {conflict_col} FROM {tbl} WHERE conversation_id = ?)",
                     (source_conversation_id, target_conversation_id),
                 )
                 deleted_conflicts = cur.rowcount
@@ -3493,6 +3652,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 rows_moved[tbl] = cur2.rowcount
                 rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
+
+            # B-D7: capture prior alias target before UPSERT.
+            prior_alias_row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+                (source_conversation_id,),
+            ).fetchone()
+            prior_alias_target: str | None = None
+            if prior_alias_row is not None:
+                prior_alias_target = (
+                    prior_alias_row["target_id"]
+                    if isinstance(prior_alias_row, sqlite3.Row)
+                    else prior_alias_row[0]
+                )
 
             # conversation_aliases UPSERT (SQLite ON CONFLICT)
             conn.execute(
@@ -3514,7 +3686,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (datetime.now(timezone.utc).isoformat(), tenant_id, source_conversation_id),
             )
 
-            # merge_audit finalize
+            # merge_audit finalize. B-D7: capture prior_alias_target.
             completed_at = datetime.now(timezone.utc)
             rows_moved_json = _json.dumps(rows_moved)
             conn.execute(
@@ -3522,13 +3694,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 UPDATE merge_audit
                    SET status = 'committed',
                        completed_at = ?,
-                       rows_moved_json = ?
+                       rows_moved_json = ?,
+                       prior_alias_target = ?
                  WHERE tenant_id = ? AND merge_id = ? AND status = 'in_progress'
                 """,
-                (completed_at.isoformat(), rows_moved_json, tenant_id, merge_id),
+                (completed_at.isoformat(), rows_moved_json, prior_alias_target,
+                 tenant_id, merge_id),
             )
 
-            # merge_post_commit_pending INSERTs
+            # merge_post_commit_pending INSERTs. B-D6: tag_regenerate
+            # carries the explicit conflict tag specs so the sweeper has
+            # enough state to re-call the LLM per tag.
             sse_payload = _json.dumps({
                 "merge_id": merge_id,
                 "source_conversation_id": source_conversation_id,
@@ -3539,6 +3715,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             tag_regen_payload = _json.dumps({
                 "merge_id": merge_id,
                 "target_conversation_id": target_conversation_id,
+                "conflicts": conflict_tag_specs,
             })
             queue_resegment_payload = _json.dumps({
                 "merge_id": merge_id,
@@ -3565,6 +3742,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.execute("ROLLBACK")
             raise
 
+        elapsed = max((completed_at - started_at).total_seconds(), 0.0)
         return MergeStats(
             merge_id=merge_id,
             source_conversation_id=source_conversation_id,
@@ -3575,6 +3753,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             request_turn_offset=request_turn_offset,
             started_at=started_at,
             completed_at=completed_at,
+            success=True,
+            elapsed_seconds=elapsed,
         )
 
     def complete_ingestion_episode(

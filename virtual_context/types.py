@@ -1235,6 +1235,15 @@ class MergeStats:
     request_turn_offset: int
     started_at: datetime
     completed_at: datetime
+    # B-D9 (codex iter-2 P2): explicit success + elapsed_seconds. The body
+    # method only returns MergeStats on a successful commit, so success is
+    # always True here today; the field is reserved for future partial-
+    # success states (e.g., post-commit pendings failure that doesn't roll
+    # back the body). elapsed_seconds is wall-clock seconds between
+    # started_at and completed_at, surfaced for SSE / dashboard rendering
+    # without forcing readers to recompute the delta.
+    success: bool = True
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
