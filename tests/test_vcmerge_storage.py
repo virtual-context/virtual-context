@@ -1,15 +1,15 @@
-"""Storage method tests for VCMERGE (S1.1, S1.5, S1.6, S1.7).
+"""Storage method tests for VCMERGE (, , ).
 
-Per VCMerge plan v1.11 sections 3.2 + 11.4 (idempotency) + 11.3 (tenant
+ (idempotency) + 11.3 (tenant
 isolation). Pins:
 
 - try_reserve_merge_audit_in_progress correctly discriminates the 5
-  states from plan section 3.1 T1.3 (reserved / in_progress /
+  states from plan (reserved / in_progress /
   committed_match / committed_mismatch / race_retry).
-- The unique partial index (M0.5) backs the reservation correctness:
+- The unique partial index backs the reservation correctness:
   duplicate (tenant, source) at status IN ('in_progress', 'committed')
   collides; rolled_back rows do not collide.
-- Tenant isolation invariant (per spec section 13 v3.8-2): two tenants
+- Tenant isolation invariant (per ): two tenants
   with the same source_id can both reserve in_progress.
 - lookup_committed_merge_audit_for_source returns the committed row
   when present, None otherwise.
@@ -23,7 +23,7 @@ All tests use the SQLite backend per project convention. PG path uses
 the same SQL semantics; smoke covered by the schema test bundle.
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _store(tmp_path) -> SQLiteStore:
 
 
 # ---------------------------------------------------------------------------
-# S1.1 try_reserve_merge_audit_in_progress: 5-state discriminator
+# try_reserve_merge_audit_in_progress: 5-state discriminator
 # ---------------------------------------------------------------------------
 
 def test_try_reserve_returns_reserved_on_first_call(tmp_path):
@@ -87,8 +87,8 @@ def test_try_reserve_returns_in_progress_on_concurrent_caller(tmp_path):
 
 def test_try_reserve_returns_committed_match_on_idempotent_retry(tmp_path):
     """Caller re-tries with same (tenant, source, target) after prior commit
-    -> committed_match envelope (idempotent retry per spec section 12.7 +
-    §6.1 idempotency contract). E-D3 fold: discriminator is
+    -> committed_match envelope (idempotent retry per +
+     idempotency contract). fold: discriminator is
     target_conversation_id, NOT source_label_at_merge.
     """
     store = _store(tmp_path)
@@ -117,7 +117,7 @@ def test_try_reserve_returns_committed_match_on_idempotent_retry(tmp_path):
 
 
 def test_try_reserve_committed_match_when_label_changes_but_target_same(tmp_path):
-    """E-D3 fold (codex iter-1 P1): label can change between calls; if
+    """ fold label can change between calls; if
     the target is unchanged, the merge identity is the same -> match.
     Pins the corrected discriminator behavior.
     """
@@ -143,7 +143,7 @@ def test_try_reserve_committed_match_when_label_changes_but_target_same(tmp_path
 
 
 def test_try_reserve_returns_committed_mismatch_on_target_change(tmp_path):
-    """E-D3 fold (codex iter-1 P1): different target = different merge
+    """ fold different target = different merge
     intent -> committed_mismatch. Source label is irrelevant.
     """
     store = _store(tmp_path)
@@ -171,7 +171,7 @@ def test_try_reserve_returns_committed_mismatch_on_target_change(tmp_path):
 
 
 def test_try_reserve_after_rolled_back_succeeds_with_reserved(tmp_path):
-    """The unique partial index excludes rolled_back rows (per D4 + M0.5).
+    """The unique partial index excludes rolled_back rows (per D4 + ).
     A retry after a rolled_back attempt should succeed cleanly.
     """
     store = _store(tmp_path)
@@ -196,7 +196,7 @@ def test_try_reserve_after_rolled_back_succeeds_with_reserved(tmp_path):
 
 
 def test_try_reserve_tenant_isolation_two_tenants_same_source(tmp_path):
-    """Tenant isolation invariant (per spec section 13 v3.8-2): two
+    """Tenant isolation invariant (per ): two
     tenants with the same source_id can both reserve in_progress.
     """
     store = _store(tmp_path)
@@ -215,7 +215,7 @@ def test_try_reserve_tenant_isolation_two_tenants_same_source(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# S1.5 / S1.6 lookup helpers
+# / lookup helpers
 # ---------------------------------------------------------------------------
 
 def test_lookup_committed_returns_none_when_no_row(tmp_path):
@@ -245,7 +245,7 @@ def test_lookup_committed_returns_view_after_commit(tmp_path):
 
 
 def test_lookup_committed_ignores_in_progress(tmp_path):
-    """S1.5 is committed-only; in_progress rows must NOT be returned."""
+    """ is committed-only; in_progress rows must NOT be returned."""
     store = _store(tmp_path)
     store.try_reserve_merge_audit_in_progress(
         merge_id=str(uuid.uuid4()), tenant_id="tA",
@@ -256,7 +256,7 @@ def test_lookup_committed_ignores_in_progress(tmp_path):
 
 
 def test_lookup_active_returns_in_progress_row(tmp_path):
-    """S1.6: active includes both in_progress and committed."""
+    """: active includes both in_progress and committed."""
     store = _store(tmp_path)
     mid = str(uuid.uuid4())
     store.try_reserve_merge_audit_in_progress(
@@ -270,7 +270,7 @@ def test_lookup_active_returns_in_progress_row(tmp_path):
 
 
 def test_lookup_active_ignores_rolled_back(tmp_path):
-    """S1.6 explicitly excludes rolled_back; matches the partial index."""
+    """ explicitly excludes rolled_back; matches the partial index."""
     store = _store(tmp_path)
     mid = str(uuid.uuid4())
     store.try_reserve_merge_audit_in_progress(
@@ -307,7 +307,7 @@ def test_lookups_scoped_per_tenant(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# S1.7 _mark_merge_rolled_back
+# _mark_merge_rolled_back
 # ---------------------------------------------------------------------------
 
 def test_mark_rolled_back_flips_in_progress(tmp_path):

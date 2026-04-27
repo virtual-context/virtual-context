@@ -1,4 +1,4 @@
-"""PG smoke for v1.16-1 conversations.tenant_id backfill from cloud_conversations.
+"""PG smoke for conversations.tenant_id backfill from cloud_conversations.
 
 Skipped when DATABASE_URL is absent (the standard project pattern at
 tests/test_vcmerge_schema_postgres.py:28). Verifies the one-time
@@ -7,7 +7,7 @@ correctly populates ``conversations.tenant_id`` from
 ``cloud_conversations.tenant_id`` for rows that existed before the
 insertion-path fix landed.
 
-Per codex iter-5 prod blocker: 14 existing user convs in prod tenant
+Per prod blocker: 14 existing user convs in prod tenant
 ``43bd6d7f0f8d6798`` had ``conversations.tenant_id = ''`` (engine
 predecessor passed empty placeholder); cloud_conversations was correctly
 populated by TenantMiddleware. The migration needs to be idempotent so
@@ -69,15 +69,15 @@ def _ensure_cloud_conversations_table(conn):
         """
         CREATE TABLE IF NOT EXISTS cloud_conversations (
             conversation_id TEXT NOT NULL,
-            tenant_id       TEXT NOT NULL DEFAULT '',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            tenant_id TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """
     )
 
 
 def test_pg_backfill_populates_empty_tenant_id_from_cloud_conversations(pg_store):
-    """v1.16-1: simulate the prod state (conversations row with empty
+    """: simulate the prod state (conversations row with empty
     tenant_id; matching cloud_conversations row with the right tenant_id).
     Run schema bootstrap; assert backfill populated the empty cell.
     """
@@ -112,7 +112,7 @@ def test_pg_backfill_populates_empty_tenant_id_from_cloud_conversations(pg_store
 
 
 def test_pg_backfill_is_idempotent(pg_store):
-    """v1.16-1: second bootstrap run is a no-op (the WHERE filter on
+    """: second bootstrap run is a no-op (the WHERE filter on
     empty target makes the migration idempotent)."""
     conn = pg_store._get_conn()
     _ensure_cloud_conversations_table(conn)
@@ -149,7 +149,7 @@ def test_pg_backfill_is_idempotent(pg_store):
 
 
 def test_pg_backfill_skips_when_cloud_conversations_absent(pg_store, tmp_path):
-    """v1.16-1: when ``cloud_conversations`` is absent (engine-only deploy),
+    """: when ``cloud_conversations`` is absent (engine-only deploy),
     the backfill is silently skipped via the UndefinedTable narrow-catch.
     Bootstrap completes without raising.
 

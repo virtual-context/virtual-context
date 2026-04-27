@@ -1,4 +1,4 @@
-"""CompositeStore forwarder tests for VCMERGE storage methods (v1.13 / F-CR4).
+"""CompositeStore forwarder tests for VCMERGE storage methods ( / ).
 
 Per cloud's review of engine 11013f4: cloud's handle_vc_merge_cloud calls
 the Store protocol methods through whatever store the engine hands it,
@@ -22,7 +22,7 @@ new S1.x methods (per commit 11013f4) are wrapped in a CompositeStore
 to mirror production layering.
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def test_composite_forwards_try_reserve_returns_reserved(tmp_path):
 
 
 def test_composite_forwards_try_reserve_5_state_discriminator(tmp_path):
-    """Forwarder preserves the 5-state ReservationResult per plan T1.3."""
+    """Forwarder preserves the 5-state ReservationResult per plan ."""
     composite = _composite(tmp_path)
     first = str(uuid.uuid4())
     r1 = composite.try_reserve_merge_audit_in_progress(
@@ -132,7 +132,7 @@ def test_composite_try_reserve_raises_when_underlying_lacks_method():
 # ---------------------------------------------------------------------------
 
 def test_composite_forwards_lookup_committed(tmp_path):
-    """S1.5 forwarder returns the underlying view post-commit."""
+    """ forwarder returns the underlying view post-commit."""
     composite = _composite(tmp_path)
     mid = str(uuid.uuid4())
     composite.try_reserve_merge_audit_in_progress(
@@ -252,11 +252,11 @@ def test_composite_mark_rolled_back_returns_false_for_already_committed(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# merge_conversation_data forwarder (S1.3/S1.4 — caught by cloud's F-CR5)
+# merge_conversation_data forwarder (/ — caught by cloud's )
 # ---------------------------------------------------------------------------
 
 def test_composite_forwards_merge_conversation_data(tmp_path):
-    """Cloud F-CR5 (2026-04-27): the body method forwarder must be
+    """Cloud: the body method forwarder must be
     present on CompositeStore. Without it,
     ``Engine.merge_conversation`` reaches ``store.merge_conversation_data(...)``
     via ``ConversationStoreView(CompositeStore(...))`` and AttributeError's
@@ -264,7 +264,7 @@ def test_composite_forwards_merge_conversation_data(tmp_path):
 
     This test seeds source + target, reserves, runs the body via
     composite.merge_conversation_data, and asserts the merge committed
-    end-to-end. Catches the F-CR5 class of bug for any future S1.x
+    end-to-end. Catches the class of bug for any future S1.x
     additions.
     """
     composite = _composite(tmp_path)
@@ -288,7 +288,7 @@ def test_composite_forwards_merge_conversation_data(tmp_path):
         source_label_at_merge="lbl",
     )
     assert result.status == "reserved"
-    # Run body via composite forwarder (the F-CR5 fix path)
+    # Run body via composite forwarder (the fix path)
     stats = composite.merge_conversation_data(
         merge_id=merge_id, tenant_id="tA",
         source_conversation_id="src", target_conversation_id="tgt",
@@ -329,11 +329,11 @@ def test_composite_merge_conversation_data_raises_when_underlying_lacks_method()
 
 # ---------------------------------------------------------------------------
 # End-to-end Engine.merge_conversation through ConversationStoreView +
-# CompositeStore (catches the F-CR5 class for any future S1.x methods)
+# CompositeStore (catches the class for any future S1.x methods)
 # ---------------------------------------------------------------------------
 
 def test_engine_merge_conversation_through_full_layer(tmp_path):
-    """F-CR5 regression test (cloud's request, 2026-04-27): construct a
+    """ regression test (cloud's request, ): construct a
     real ``VirtualContextEngine`` and exercise ``engine.merge_conversation``
     end-to-end through ``ConversationStoreView(CompositeStore(...))``.
 
@@ -406,8 +406,8 @@ def test_engine_merge_conversation_through_full_layer(tmp_path):
 
 def test_engine_merge_rejects_same_source_as_target(tmp_path):
     """Engine.merge_conversation refuses same-source-as-target merges
-    (per spec §14 Q2 + plan §3.3 E1.x). Defense-in-depth on top of
-    cloud's C2.4 same-tenant check.
+    (per Q2 + plan E1.x). Defense-in-depth on top of
+    cloud's same-tenant check.
     """
     from virtual_context.config import load_config
     from virtual_context.engine import VirtualContextEngine

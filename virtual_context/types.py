@@ -120,7 +120,7 @@ class Fact:
         """Canonical one-line rendering for LLM prompts.
 
         Used by the assembler, curator, supersession checker, and any other
-        component that presents facts to an LLM.  All fields are included
+        component that presents facts to an LLM. All fields are included
         so no consumer silently drops dimensions.
         """
         prefix = f"[{include_index}] " if include_index is not None else "- "
@@ -333,9 +333,9 @@ class EngineState:
         ``compacted_prefix_messages >= history_len``:
 
         1. **Session restart** — history was rebuilt from scratch; everything
-           in the current history is genuinely new.  Return 0.
+           in the current history is genuinely new. Return 0.
         2. **Sliding window** — the proxy trimmed old messages from the
-           in-memory history, but the session is continuous.  We must skip
+           in-memory history, but the session is continuous. We must skip
            messages whose turns have already been compacted to avoid
            re-processing.
 
@@ -343,7 +343,7 @@ class EngineState:
         history as fresh and return 0 whenever ``compacted_prefix_messages >= history_len``.
 
         When *watermark* is provided, it overrides ``self.compacted_prefix_messages``
-        as the boundary.  This lets callers pass ``flushed_prefix_messages`` for
+        as the boundary. This lets callers pass ``flushed_prefix_messages`` for
         payload assembly while compaction/tagging callers keep using
         ``compacted_prefix_messages`` implicitly.
         """
@@ -767,7 +767,7 @@ class PagingConfig:
     """Configuration for virtual memory paging.
 
     ``autonomous_models`` lists model-name prefixes (case-insensitive) that
-    are trusted to manage their own context via tool calls.  When the request's
+    are trusted to manage their own context via tool calls. When the request's
     model matches any entry (prefix match), the proxy injects
     ``vc_expand_topic`` / ``vc_collapse_topic`` tools and a budget dashboard.
     Models that don't match run in *supervised* mode: VC manages paging
@@ -1155,7 +1155,7 @@ class VirtualContextConfig:
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    # tenant_id (codex iter-5 prod blocker fold v1.16-1): stamped on every
+    # tenant_id ( prod blocker fold ): stamped on every
     # ``conversations`` row at insert time so the body method's Layer C
     # tenant scoping has data to compare against. Cloud's REST handler
     # populates this from ``request.state.tenant_id`` before instantiating
@@ -1208,7 +1208,7 @@ class CompactionLeaseLost(Exception):
 
 
 # ---------------------------------------------------------------------------
-# VCMERGE typed contracts (T1.1-T1.3 per plan section 3.1)
+# VCMERGE typed contracts (- per plan )
 #
 # The merge surface uses three dataclasses across the cloud / engine boundary.
 # All three are stable wire-shape types: cloud's REST handler depends on the
@@ -1220,7 +1220,7 @@ class CompactionLeaseLost(Exception):
 
 @dataclass(frozen=True)
 class MergeStats:
-    """Returned by `Store.merge_conversation_data` (S1.3 / S1.4) to the
+    """Returned by `Store.merge_conversation_data` ( / ) to the
     caller (cloud's REST handler via `Engine.merge_conversation`). Counts
     the rows moved per per-conversation table during the body transaction.
 
@@ -1231,7 +1231,7 @@ class MergeStats:
     request_context, tag_summaries, tag_summary_embeddings, tag_aliases,
     turn_tool_outputs, segment_tool_outputs, chain_snapshots, media_outputs).
     Cloud surfaces the dict directly in the SSE `conversation_merged`
-    event payload as `rows_moved` per spec section 12.2 (the v3 move-
+    event payload as `rows_moved` per (the v3 move-
     semantics field name; `rows_copied` was the v2 name and is stale).
     """
     merge_id: str
@@ -1243,7 +1243,7 @@ class MergeStats:
     request_turn_offset: int
     started_at: datetime
     completed_at: datetime
-    # B-D9 (codex iter-2 P2): explicit success + elapsed_seconds. The body
+    # explicit success + elapsed_seconds. The body
     # method only returns MergeStats on a successful commit, so success is
     # always True here today; the field is reserved for future partial-
     # success states (e.g., post-commit pendings failure that doesn't roll
@@ -1257,11 +1257,11 @@ class MergeStats:
 @dataclass(frozen=True)
 class MergeAuditView:
     """Frozen view of a single `merge_audit` row, returned by the lookup
-    helpers (S1.5, S1.6) and by `try_reserve_merge_audit_in_progress`
-    (S1.1, S1.2) when an idempotent retry collides with an existing row.
+    helpers (, ) and by `try_reserve_merge_audit_in_progress`
+    (, ) when an idempotent retry collides with an existing row.
 
     Cloud's REST handler renders the 5-state idempotency envelope from
-    this view (per spec section 12.7's discriminator). Frozen so test
+    this view (per 's discriminator). Frozen so test
     assertions and cloud's response builder can rely on immutability.
     """
     merge_id: str
@@ -1278,8 +1278,8 @@ class MergeAuditView:
 
 @dataclass(frozen=True)
 class ReservationResult:
-    """Returned by `try_reserve_merge_audit_in_progress` (S1.1 / S1.2).
-    The 5-state `status` (per codex iter-1 v1.4-3 + spec section 12.7)
+    """Returned by `try_reserve_merge_audit_in_progress` ( / ).
+    The 5-state `status` (per + )
     discriminates the action cloud's REST handler should take:
 
     - "reserved": INSERT succeeded, this caller owns the merge body.

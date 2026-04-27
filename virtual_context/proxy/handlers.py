@@ -77,7 +77,7 @@ def _restore_tool_stub_in_place(body: dict, fmt, ref: str, full_content: str) ->
     """Replace a tool output stub containing *ref* with *full_content* in place.
 
     Walks all messages/items in *body* looking for tool output carriers whose
-    content contains the ref string.  When found, replaces the stub content
+    content contains the ref string. When found, replaces the stub content
     with the full stored tool output at the original position.
 
     Supports Anthropic (tool_result blocks), OpenAI Chat (role="tool" messages),
@@ -319,10 +319,10 @@ class _ProxyToolRuntime:
 
         # Rehydrate any stubbed tool results within the chain.
         # The chain snapshot stores messages from pre_filter_body, so tool
-        # results normally have their full content.  However, if stage 1
+        # results normally have their full content. However, if stage 1
         # (tool result stubbing) ran before stage 2 (chain collapse) in
         # the same request, some tool_result blocks may contain stub text
-        # with vc_restore_tool refs.  Rehydrate those from tool_outputs.
+        # with vc_restore_tool refs. Rehydrate those from tool_outputs.
         tool_output_refs_str = snapshot.get("tool_output_refs", "")
         if tool_output_refs_str:
             tool_refs = [
@@ -429,7 +429,7 @@ class _ProxyToolRuntime:
         """Replace any stubbed tool_result content in *msg* with full content.
 
         Checks if text in tool_result blocks contains ``vc_restore_tool``
-        and any of the known *tool_refs*.  If so, looks up the full content
+        and any of the known *tool_refs*. If so, looks up the full content
         from the store and replaces in place.
         """
         content = msg.get("content", [])
@@ -1908,7 +1908,7 @@ async def _handle_vc_command(
             tenant_registry=tenant_registry, tenant_id=tenant_id,
         )
 
-    # P1.8: proxy-mode merge refuse (VCMerge plan v1.11 sections 3.4 + C1.0
+    # P1.8: proxy-mode merge refuse (VCMerge plan v1.11 + C1.0
     # + 13.3 anti-subversion). Mirrors the REST refuse at
     # _handle_vc_command_rest. The cloud-side intercept lands as a new
     # VCMergeMiddleware in vc_cloud/main.py:build_app per C2.1b; if that
@@ -1939,7 +1939,7 @@ async def _handle_vc_command(
                 "message": _err_text,
             }
             if result.is_streaming:
-                # E-D1 fix (codex iter-1 P1; cloud's preferred prefix shape):
+                # fix (; cloud's preferred prefix shape):
                 # streaming SSE prepends `[error_code] ` to the human text so
                 # programmatic consumers can grep the code AND human readers
                 # see the message. REST JSON (below) keeps separate error +
@@ -1962,7 +1962,7 @@ async def _handle_vc_command(
                 )
             return JSONResponse(fmt.build_fake_response(text, conv_id))
         # Unknown VCMERGE subcommand: emit syntax help with vcmerge_syntax
-        # error code on both transports per E-D1 dual-populate rule.
+        # error code on both transports per dual-populate rule.
         _err_code = "vcmerge_syntax"
         text = (
             "VCMERGE syntax: VCMERGE INTO <target_label_or_id> "
@@ -2341,7 +2341,7 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
     if cmd == "attach":
         # VCATTACH: durable redirect, never destructive.
         #
-        # Bug autopsy (incident 2026-04-26): the previous _invalidate called
+        # Bug autopsy (incident ): the previous _invalidate called
         # session_state_provider.delete(target_id), which calls
         # PostgresStore.delete_conversation() — purging 21 tables (segments,
         # canonical_turns, engine_state, ingest_batches, …) plus the per-conv
@@ -2397,7 +2397,7 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             # the same convention silently swallow VCATTACH errors and the
             # user sees the LLM hallucinate as if no command was issued.
             # Bug shipped since `4c89fd9` (prependContext switchover); fixed
-            # via the post-2026-04-26 audit thread surfaced by openclaw.
+            # via the post- audit thread surfaced by openclaw.
             return JSONResponse({
                 "conversation_id": conv_id,
                 "vc_command": "attach",
@@ -2472,9 +2472,9 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
             "body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": message + marker}]}]},
         })
 
-    # P1.4 + P1.8 dual-handler refuse pair (VCMerge plan v1.11 sections 3.4
+    # P1.4 + P1.8 dual-handler refuse pair (VCMerge plan v1.11
     # + C1.0 + 13.3 anti-subversion). Engine MUST NOT execute a merge body
-    # under any code path. Cloud's C2.1 (REST mode at vc_cloud/rest_api.py)
+    # under any code path. Cloud's (REST mode at vc_cloud/rest_api.py)
     # and C2.1b (proxy mode VCMergeMiddleware in vc_cloud/main.py) intercept
     # vc_command="merge" BEFORE the engine route handler runs and route to
     # cloud's handle_vc_merge_cloud. If the merge command ever reaches the

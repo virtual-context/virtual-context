@@ -1,18 +1,18 @@
-"""PG-parametrized smoke for VCMERGE Phase 0 schema (E-D6 fold).
+"""PG-parametrized smoke for VCMERGE Phase 0 schema ( fold).
 
 Skipped when DATABASE_URL is absent (the standard project pattern at
 tests/test_cleanup_abandoned_compaction_postgres.py:24). Verifies that
-M0.1 + M0.3 + M0.4 + M0.5 + M0.7 + M0.2 + E-D5 migrations work against
+ + + + + + + migrations work against
 a real Postgres backend, not just SQLite.
 
-Per VCMerge plan v1.11 section 11.0 + cloud's E-D6 review:
+ + cloud's review:
 SQLite-only test coverage missed PG-specific concerns (FOR UPDATE,
 SAVEPOINT semantics, ADD COLUMN IF NOT EXISTS gating, trigger DDL
 syntax). This file is the PG mirror of test_vcmerge_schema.py's
 smoke set.
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def _now() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# M0.1: phase CHECK admits 'merged' on PG
+# : phase CHECK admits 'merged' on PG
 # ---------------------------------------------------------------------------
 
 def test_pg_conversations_phase_check_admits_merged(pg_store):
@@ -78,7 +78,7 @@ def test_pg_conversations_phase_check_admits_merged(pg_store):
 
 
 # ---------------------------------------------------------------------------
-# M0.3 + M0.5: merge_audit + unique partial index on PG
+# + : merge_audit + unique partial index on PG
 # ---------------------------------------------------------------------------
 
 def test_pg_merge_audit_unique_partial_index_rejects_duplicate_in_progress(pg_store):
@@ -103,11 +103,11 @@ def test_pg_merge_audit_unique_partial_index_rejects_duplicate_in_progress(pg_st
 
 
 # ---------------------------------------------------------------------------
-# M0.4: tenant-consistency triggers on PG
+# : tenant-consistency triggers on PG
 # ---------------------------------------------------------------------------
 
 def test_pg_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(pg_store):
-    """M0.4 INSERT trigger: tenant_id must match parent merge_audit row."""
+    """ INSERT trigger: tenant_id must match parent merge_audit row."""
     conn = pg_store._get_conn()
     tid = f"pgtest-{uuid.uuid4()}"
     merge_id = str(uuid.uuid4())
@@ -131,7 +131,7 @@ def test_pg_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(pg_
 
 
 # ---------------------------------------------------------------------------
-# E-D5: conversation_aliases.epoch column exists on PG
+# : conversation_aliases.epoch column exists on PG
 # ---------------------------------------------------------------------------
 
 def test_pg_conversation_aliases_has_epoch_column(pg_store):
@@ -145,7 +145,7 @@ def test_pg_conversation_aliases_has_epoch_column(pg_store):
 
 
 # ---------------------------------------------------------------------------
-# M0.2: origin_conversation_id columns on per-conv tables
+# : origin_conversation_id columns on per-conv tables
 # ---------------------------------------------------------------------------
 
 def test_pg_per_conv_tables_have_origin_conversation_id(pg_store):

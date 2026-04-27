@@ -284,7 +284,7 @@ def _sanitize_fts_query(query: str) -> str:
     """Quote user input so FTS5 treats it as a phrase, not operator syntax.
 
     FTS5 supports operators like AND, OR, NOT, NEAR, *, column filters (col:val),
-    etc.  Wrapping the query in double quotes forces phrase matching and prevents
+    etc. Wrapping the query in double quotes forces phrase matching and prevents
     users from injecting FTS5 syntax.
     """
     escaped = query.replace('"', '""')
@@ -698,21 +698,21 @@ class SQLiteStore(ContextStore):
         # reference this one.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
-                conversation_id                TEXT PRIMARY KEY,
-                tenant_id                      TEXT NOT NULL,
-                lifecycle_epoch                INTEGER NOT NULL DEFAULT 1,
-                phase                          TEXT NOT NULL DEFAULT 'init'
+                conversation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                lifecycle_epoch INTEGER NOT NULL DEFAULT 1,
+                phase TEXT NOT NULL DEFAULT 'init'
                                                CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
-                pending_raw_payload_entries    INTEGER NOT NULL DEFAULT 0,
-                last_raw_payload_entries       INTEGER NOT NULL DEFAULT 0,
+                pending_raw_payload_entries INTEGER NOT NULL DEFAULT 0,
+                last_raw_payload_entries INTEGER NOT NULL DEFAULT 0,
                 last_ingestible_payload_entries INTEGER NOT NULL DEFAULT 0,
-                created_at                     TEXT NOT NULL,
-                updated_at                     TEXT NOT NULL,
-                deleted_at                     TEXT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT NULL,
                 UNIQUE (tenant_id, conversation_id)
             )
         """)
-        # M0.3 + M0.5 (VCMERGE plan v1.11 sections 2.1 + 5.2): merge_audit
+        # + (VCMERGE plan v1.11 ): merge_audit
         # table + the unique partial index that backs the
         # try_reserve_merge_audit_in_progress reservation flow. SQLite is
         # the test backend; production runs PG. Schema mirrors the PG
@@ -720,21 +720,21 @@ class SQLiteStore(ContextStore):
         # adaptations (TEXT instead of UUID; TEXT instead of TIMESTAMPTZ).
         conn.execute("""
             CREATE TABLE IF NOT EXISTS merge_audit (
-                merge_id                  TEXT PRIMARY KEY,
-                tenant_id                 TEXT NOT NULL,
-                source_conversation_id    TEXT NOT NULL,
-                target_conversation_id    TEXT NOT NULL,
-                source_label_at_merge     TEXT NOT NULL DEFAULT '',
-                status                    TEXT NOT NULL
+                merge_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                target_conversation_id TEXT NOT NULL,
+                source_label_at_merge TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL
                                           CHECK (status IN ('in_progress','committed','rolled_back')),
-                started_at                TEXT NOT NULL,
-                completed_at              TEXT NULL,
-                rows_moved_json           TEXT NULL,
-                error_message             TEXT NULL,
-                prior_alias_target        TEXT NULL
+                started_at TEXT NOT NULL,
+                completed_at TEXT NULL,
+                rows_moved_json TEXT NULL,
+                error_message TEXT NULL,
+                prior_alias_target TEXT NULL
             )
         """)
-        # B-D7 (codex iter-2 P1): prior_alias_target forward migration for
+        # prior_alias_target forward migration for
         # tables created by an earlier engine. SQLite has no IF NOT EXISTS
         # on ADD COLUMN; PRAGMA-then-ALTER pattern. See PG mirror.
         try:
@@ -763,27 +763,26 @@ class SQLiteStore(ContextStore):
                 ON merge_audit (status, started_at)
                 WHERE status = 'in_progress'
         """)
-        # M0.4 (VCMERGE plan v1.11 section 2.1): merge_post_commit_pending
-        # queue table + tenant-consistency triggers. SQLite supports
-        # BEFORE UPDATE OF column_list event filtering and WHEN clause
-        # expressions on row-level triggers per SQLite docs lang_createtrigger.
-        # Two-trigger split per the same plan rationale as PG (codex
-        # iter-2 v1.6-1 P1 fix).
+        # merge_post_commit_pending queue table + tenant-consistency triggers.
+        # SQLite supports BEFORE UPDATE OF column_list event filtering and
+        # WHEN clause expressions on row-level triggers per SQLite docs
+        # lang_createtrigger. Two-trigger split (separate INSERT and UPDATE
+        # triggers) avoids referencing OLD inside an INSERT path.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
-                pending_id        TEXT PRIMARY KEY,
-                merge_id          TEXT NOT NULL REFERENCES merge_audit(merge_id),
-                tenant_id         TEXT NOT NULL,
-                kind              TEXT NOT NULL
+                pending_id TEXT PRIMARY KEY,
+                merge_id TEXT NOT NULL REFERENCES merge_audit(merge_id),
+                tenant_id TEXT NOT NULL,
+                kind TEXT NOT NULL
                                   CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
-                payload_json      TEXT NOT NULL,
-                status            TEXT NOT NULL
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL
                                   CHECK (status IN ('pending','done','failed')),
-                attempts          INTEGER NOT NULL DEFAULT 0,
-                created_at        TEXT NOT NULL,
-                last_attempt_at   TEXT NULL,
-                completed_at      TEXT NULL,
-                error_message     TEXT NULL
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_attempt_at TEXT NULL,
+                completed_at TEXT NULL,
+                error_message TEXT NULL
             )
         """)
         conn.execute("""
@@ -823,14 +822,14 @@ class SQLiteStore(ContextStore):
                 SELECT RAISE(ABORT, 'merge_post_commit_pending.tenant_id must match merge_audit.tenant_id');
             END
         """)
-        # M0.2 + E-D5 migrations are run at the END of _ensure_schema()
+        # + migrations are run at the END of _ensure_schema()
         # (see below, before conn.commit()) because some tables
         # (facts, fact_tags, fact_links, tool_outputs, tool_calls,
         # request_captures, request_turn_counters, request_context,
         # tag_summary_embeddings, turn_tool_outputs, segment_tool_outputs,
         # chain_snapshots, media_outputs) are CREATE'd later in this
         # method, AFTER this position.
-        # E-D4 fold (codex iter-1 P2): SQLite M0.1 table-rewrite for
+        # fold SQLite table-rewrite for
         # existing DBs whose conversations.phase CHECK predates the
         # 'merged' value addition. SQLite has no ALTER CHECK syntax;
         # we detect the old CHECK via sqlite_master.sql LIKE check and
@@ -848,17 +847,17 @@ class SQLiteStore(ContextStore):
                     conn.execute("PRAGMA foreign_keys = OFF")
                     conn.execute("""
                         CREATE TABLE conversations_ed4_new (
-                            conversation_id                TEXT PRIMARY KEY,
-                            tenant_id                      TEXT NOT NULL,
-                            lifecycle_epoch                INTEGER NOT NULL DEFAULT 1,
-                            phase                          TEXT NOT NULL DEFAULT 'init'
+                            conversation_id TEXT PRIMARY KEY,
+                            tenant_id TEXT NOT NULL,
+                            lifecycle_epoch INTEGER NOT NULL DEFAULT 1,
+                            phase TEXT NOT NULL DEFAULT 'init'
                                                            CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
-                            pending_raw_payload_entries    INTEGER NOT NULL DEFAULT 0,
-                            last_raw_payload_entries       INTEGER NOT NULL DEFAULT 0,
+                            pending_raw_payload_entries INTEGER NOT NULL DEFAULT 0,
+                            last_raw_payload_entries INTEGER NOT NULL DEFAULT 0,
                             last_ingestible_payload_entries INTEGER NOT NULL DEFAULT 0,
-                            created_at                     TEXT NOT NULL,
-                            updated_at                     TEXT NOT NULL,
-                            deleted_at                     TEXT NULL,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            deleted_at TEXT NULL,
                             UNIQUE (tenant_id, conversation_id)
                         )
                     """)
@@ -905,16 +904,16 @@ class SQLiteStore(ContextStore):
         # 'running' row collides at INSERT time.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ingestion_episode (
-                episode_id            TEXT PRIMARY KEY,
-                conversation_id       TEXT NOT NULL,
-                lifecycle_epoch       INTEGER NOT NULL,
-                raw_payload_entries   INTEGER NOT NULL DEFAULT 0,
-                started_at            TEXT NOT NULL,
-                completed_at          TEXT NULL,
-                status                TEXT NOT NULL
+                episode_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                lifecycle_epoch INTEGER NOT NULL,
+                raw_payload_entries INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NULL,
+                status TEXT NOT NULL
                                       CHECK (status IN ('running','completed','cancelled','abandoned')),
-                owner_worker_id       TEXT NOT NULL,
-                heartbeat_ts          TEXT NOT NULL,
+                owner_worker_id TEXT NOT NULL,
+                heartbeat_ts TEXT NOT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
             )
         """)
@@ -934,20 +933,20 @@ class SQLiteStore(ContextStore):
         # ``'abandoned'`` is added to the CHECK for the takeover cleanup path.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS compaction_operation (
-                operation_id      TEXT PRIMARY KEY,
-                conversation_id   TEXT NOT NULL,
-                lifecycle_epoch   INTEGER NOT NULL,
-                phase_index       INTEGER NOT NULL DEFAULT 0,
-                phase_count       INTEGER NOT NULL,
-                phase_name        TEXT NOT NULL,
-                status            TEXT NOT NULL
+                operation_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                lifecycle_epoch INTEGER NOT NULL,
+                phase_index INTEGER NOT NULL DEFAULT 0,
+                phase_count INTEGER NOT NULL,
+                phase_name TEXT NOT NULL,
+                status TEXT NOT NULL
                                   CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
-                started_at        TEXT NOT NULL,
-                completed_at      TEXT NULL,
-                owner_worker_id   TEXT NOT NULL,
-                heartbeat_ts      TEXT NOT NULL,
-                created_at        TEXT NOT NULL DEFAULT '',
-                error_message     TEXT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NULL,
+                owner_worker_id TEXT NOT NULL,
+                heartbeat_ts TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '',
+                error_message TEXT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
             )
         """)
@@ -968,20 +967,20 @@ class SQLiteStore(ContextStore):
             # Old schema: recreate with expanded CHECK + created_at column.
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS compaction_operation_new (
-                    operation_id      TEXT PRIMARY KEY,
-                    conversation_id   TEXT NOT NULL,
-                    lifecycle_epoch   INTEGER NOT NULL,
-                    phase_index       INTEGER NOT NULL DEFAULT 0,
-                    phase_count       INTEGER NOT NULL,
-                    phase_name        TEXT NOT NULL,
-                    status            TEXT NOT NULL
+                    operation_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    lifecycle_epoch INTEGER NOT NULL,
+                    phase_index INTEGER NOT NULL DEFAULT 0,
+                    phase_count INTEGER NOT NULL,
+                    phase_name TEXT NOT NULL,
+                    status TEXT NOT NULL
                                       CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned')),
-                    started_at        TEXT NOT NULL,
-                    completed_at      TEXT NULL,
-                    owner_worker_id   TEXT NOT NULL,
-                    heartbeat_ts      TEXT NOT NULL,
-                    created_at        TEXT NOT NULL DEFAULT '',
-                    error_message     TEXT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NULL,
+                    owner_worker_id TEXT NOT NULL,
+                    heartbeat_ts TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
                 );
                 INSERT INTO compaction_operation_new
@@ -1470,7 +1469,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._ensure_canonical_turn_views(conn)
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
-        # M0.2 + E-D5 migrations run HERE, after all CREATE TABLE statements
+        # + migrations run HERE, after all CREATE TABLE statements
         # have completed earlier in _ensure_schema. SQLite has no
         # ADD COLUMN IF NOT EXISTS; we PRAGMA table_info() to check then
         # unconditional ADD COLUMN if absent. Idempotent re-runnable.
@@ -1482,7 +1481,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "request_turn_counters", "request_context",
             "tag_summary_embeddings", "turn_tool_outputs",
             "segment_tool_outputs", "chain_snapshots", "media_outputs",
-            "tag_summaries", "tag_aliases",  # B-D8 (codex iter-2 P2)
+            "tag_summaries", "tag_aliases",
         )
         for _t in _M0_2_TABLES:
             try:
@@ -1497,7 +1496,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     )
             except sqlite3.OperationalError:
                 pass
-        # E-D5 conversation_aliases.epoch
+        # conversation_aliases.epoch
         try:
             cols = {
                 r["name"] if isinstance(r, sqlite3.Row) else r[1]
@@ -1651,12 +1650,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 except sqlite3.OperationalError:
                     pass
         # Progress-tracking columns for the DB-derived progress model:
-        #   covered_ingestible_entries — how many ingestible payload entries
-        #     this canonical row represents (set at insert time). The progress
-        #     denominator is SUM(covered_ingestible_entries).
-        #   tagged_at — ISO timestamp set when the tagger enriches the row.
-        #     The progress numerator is
-        #     SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
+        # covered_ingestible_entries — how many ingestible payload entries
+        # this canonical row represents (set at insert time). The progress
+        # denominator is SUM(covered_ingestible_entries).
+        # tagged_at — ISO timestamp set when the tagger enriches the row.
+        # The progress numerator is
+        # SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
         # The two partial indexes below make each SUM path an index-only scan.
         if "covered_ingestible_entries" not in by_name:
             self._add_column_if_missing(
@@ -1769,7 +1768,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
         FTS5 indexes can become inconsistent after a hard kill (SIGKILL,
         power loss) because the FTS internal structures aren't covered by
-        SQLite's main integrity check.  A quick ``integrity-check`` on each
+        SQLite's main integrity check. A quick ``integrity-check`` on each
         FTS table detects this; a full ``rebuild`` fixes it.
         """
         for fts_table in ("segments_fts", "segments_fts_full"):
@@ -3089,7 +3088,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         for the full contract. SQLite datetimes are text-based, so
         the age computation happens in Python after the SQL select.
 
-        M0.6 (VCMERGE plan v1.11 section 2.1): rows with phase = 'merged'
+         (VCMERGE plan v1.11 ): rows with phase = 'merged'
         are excluded from the candidate set; matches the PG path. See
         PostgresStore.find_idle_deletable_conversations for rationale.
         """
@@ -3154,15 +3153,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
         return out[: int(limit)]
 
     # ------------------------------------------------------------------
-    # VCMERGE storage methods (S1.2, S1.5, S1.6, S1.7 per plan v1.11)
-    # SQLite mirror of the PostgresStore methods. Body method (S1.4) is
+    # VCMERGE storage methods (, , per plan v1.11)
+    # SQLite mirror of the PostgresStore methods. Body method is
     # not implemented here either: see the corresponding PostgresStore
     # comment block. SQLite is the test backend per project convention;
     # production runs PG.
     # ------------------------------------------------------------------
 
     def _row_to_merge_audit_view(self, row):
-        """Convert a sqlite3.Row to a MergeAuditView. Helper for S1.5/S1.6
+        """Convert a sqlite3.Row to a MergeAuditView. Helper for /
         and the SELECT branch of try_reserve. SQLite stores datetimes as
         TEXT (ISO format); cloud's response builder accepts either str
         or datetime, but we parse to datetime for type-correctness so
@@ -3256,9 +3255,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return ReservationResult(
                 status="in_progress", merge_id=view.merge_id, existing=view,
             )
-        # E-D3 fold (codex iter-1 P1): discriminator is target, not label.
+        # fold discriminator is target, not label.
         # See PostgresStore.try_reserve_merge_audit_in_progress for the
-        # full rationale (spec §6.1 idempotency contract).
+        # full rationale ( idempotency contract).
         if view.target_conversation_id == target_conversation_id:
             return ReservationResult(
                 status="committed_match", merge_id=view.merge_id, existing=view,
@@ -3270,7 +3269,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     def lookup_committed_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.5 SQLite mirror."""
+        """ SQLite mirror."""
         row = self._get_conn().execute(
             """
             SELECT merge_id, tenant_id, source_conversation_id,
@@ -3291,7 +3290,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     def lookup_active_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.6 SQLite mirror."""
+        """ SQLite mirror."""
         row = self._get_conn().execute(
             """
             SELECT merge_id, tenant_id, source_conversation_id,
@@ -3316,7 +3315,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         merge_id: str,
         error_message: str,
     ) -> bool:
-        """S1.7 SQLite mirror. Single owner: cloud's REST handler."""
+        """ SQLite mirror. Single owner: cloud's REST handler."""
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         conn = self._get_conn()
@@ -3336,7 +3335,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
-    # S1.4 merge_conversation_data (SQLite body method, mirrors S1.3)
+    # merge_conversation_data (SQLite body method, mirrors )
     # ------------------------------------------------------------------
     # SQLite path uses BEGIN IMMEDIATE (acquires the database write lock
     # at txn start, equivalent to PG's FOR UPDATE-via-row-lock pattern
@@ -3364,7 +3363,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         model) in place of PG's row-level FOR UPDATE; the consistency
         invariants are equivalent at the database level.
 
-        Offsets policy (v1.14-2): see PostgresStore docstring.
+        Offsets policy: see PostgresStore docstring.
         """
         from ..types import MergeStats
         from ..core.exceptions import (
@@ -3393,7 +3392,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ("segment_tags", "segment_ref", "segments", "ref"),
             ("fact_tags", "fact_id", "facts", "id"),
         )
-        # B-D8 (codex iter-2 P2): tag_aliases joins tag-conflict resolution.
+        # tag_aliases joins tag-conflict resolution.
         TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
         # fact_links has TWO endpoint cols (source_fact_id, target_fact_id)
         # rather than a single fact_id. Handled separately below.
@@ -3405,7 +3404,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # acquires the database-level write lock; combined with the
         # explicit conversation_lifecycle UPSERT pattern below, this
         # serializes against any concurrent VCATTACH ingest / compaction
-        # start at the database level (B-D2).
+        # start at the database level.
         conn.execute("BEGIN IMMEDIATE")
         try:
             # D1 pre-flight: SELECT 1 (no FOR UPDATE on SQLite; the
@@ -3422,7 +3421,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     f"merge_id={merge_id}",
                 )
 
-            # B-D2: ensure conversation_lifecycle rows exist for both
+            # ensure conversation_lifecycle rows exist for both
             # source + target (defensive; the UPSERT is harmless if they
             # already exist). On SQLite the database-level write lock
             # already serializes; the row presence is what compaction /
@@ -3440,7 +3439,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     (cid, now_iso),
                 )
 
-            # B-D1 + B-D3: source validation under the BEGIN IMMEDIATE
+            # + source validation under the BEGIN IMMEDIATE
             # write lock. tenant ownership, lifecycle epoch consistency,
             # and current phase.
             src_row = conn.execute(
@@ -3505,7 +3504,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     code="merge_busy_phase",
                 )
 
-            # B-D2 active-op check (mirrors PG path).
+            # active-op check (mirrors PG path).
             try:
                 cop_row = conn.execute(
                     "SELECT 1 FROM compaction_operation "
@@ -3539,7 +3538,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             except sqlite3.OperationalError:
                 pass
 
-            # v1.14-2 (codex iter-3 P1): recompute offsets UNDER the
+            # recompute offsets UNDER the
             # BEGIN IMMEDIATE serialization (acquired above), so a concurrent
             # save_request_context() that would have raced ahead cannot make
             # the offsets stale. Caller-passed values used as floor.
@@ -3590,7 +3589,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 rows_moved[tbl] = cur.rowcount
 
-            # B-D4: canonical_turns moves reset compacted_at = NULL so
+            # canonical_turns moves reset compacted_at = NULL so
             # target's compaction prefix invariant holds. The
             # queue_resegment post-commit pending fires re-compaction.
             for tbl, col in TABLES_OFFSET_SORT_KEY:
@@ -3646,7 +3645,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # v1.14-1 (codex iter-3 P1) + v1.15-2 (codex iter-4 P1): bump
+            # + bump
             # target's request_turn_counter past the maximum request_turn
             # currently on the target across all four request-turn-bearing
             # tables. NO origin filter (chained-merge correctness: A->B->C
@@ -3677,7 +3676,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                  else moved_max_row[0]) or 0
             )
             if moved_max_request_turn > 0:
-                # v1.15-7 (codex iter-4 P3): capture the actual post-UPSERT
+                # capture the actual post-UPSERT
                 # value via RETURNING so the stat reflects truth even when
                 # MAX() preserves an existing higher target counter.
                 # SQLite supports RETURNING since 3.35.
@@ -3702,7 +3701,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 rows_moved["request_turn_counters_target_bumped_to"] = actual_next
 
-            # B-D6: capture conflict tag list with both sides'
+            # capture conflict tag list with both sides'
             # source_canonical_turn_ids before the DELETE wipes source's
             # rows. Phase B sweeper consumes (tag, src_ids, tgt_ids) per
             # conflict.
@@ -3710,9 +3709,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             try:
                 for crow in conn.execute(
                     """
-                    SELECT s.tag                            AS tag,
-                           s.source_canonical_turn_ids      AS src_ids,
-                           t.source_canonical_turn_ids      AS tgt_ids
+                    SELECT s.tag AS tag,
+                           s.source_canonical_turn_ids AS src_ids,
+                           t.source_canonical_turn_ids AS tgt_ids
                       FROM tag_summaries s
                       JOIN tag_summaries t
                         ON t.tag = s.tag
@@ -3751,7 +3750,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 rows_moved[tbl] = cur2.rowcount
                 rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
 
-            # B-D7: capture prior alias target before UPSERT.
+            # capture prior alias target before UPSERT.
             prior_alias_row = conn.execute(
                 "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
                 (source_conversation_id,),
@@ -3784,7 +3783,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (datetime.now(timezone.utc).isoformat(), tenant_id, source_conversation_id),
             )
 
-            # merge_audit finalize. B-D7: capture prior_alias_target.
+            # merge_audit finalize. capture prior_alias_target.
             completed_at = datetime.now(timezone.utc)
             rows_moved_json = _json.dumps(rows_moved)
             conn.execute(
@@ -3800,7 +3799,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                  tenant_id, merge_id),
             )
 
-            # merge_post_commit_pending INSERTs. B-D6: tag_regenerate
+            # merge_post_commit_pending INSERTs. tag_regenerate
             # carries the explicit conflict tag specs so the sweeper has
             # enough state to re-call the LLM per tag.
             sse_payload = _json.dumps({

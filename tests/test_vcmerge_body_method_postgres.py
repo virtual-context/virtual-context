@@ -1,4 +1,4 @@
-"""PG-parametrized smoke for VCMERGE S1.3 body method (v1.14-7 fold).
+"""PG-parametrized smoke for VCMERGE body method ( fold).
 
 Skipped when DATABASE_URL is absent (the standard project pattern at
 tests/test_vcmerge_schema_postgres.py:28). Mirrors the SQLite body-method
@@ -7,7 +7,7 @@ PG-specific concerns (FOR UPDATE row locks, SAVEPOINT semantics for the
 narrow-exception fail-closed gate, GREATEST/COALESCE arithmetic, ON
 CONFLICT DO UPDATE on UPSERTs) get direct exercise.
 
-Per VCMerge plan v1.14 codex iter-3 P2 (v1.14-7) + handoff section C8
+Per VCMerge plan + handoff section C8
 residual: SQL inspection tests scan both PG + SQLite source code, but
 only SQLite is exercised behaviorally on the dev machine. Real PG body
 smoke catches ``psycopg.errors.UndefinedTable`` SAVEPOINT recovery,
@@ -15,7 +15,7 @@ smoke catches ``psycopg.errors.UndefinedTable`` SAVEPOINT recovery,
 shape that SQLite cannot prove via syntax-equivalent execution.
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def test_pg_body_raises_merge_audit_missing_without_reservation(pg_store):
 
 
 def test_pg_body_refuses_cross_tenant_source(pg_store):
-    """v1.14-7: defense-in-depth Layer C fires under real PG FOR UPDATE
+    """: defense-in-depth Layer C fires under real PG FOR UPDATE
     row lock; CrossTenantMergeError raised when source.tenant_id mismatch."""
     tid_a = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     tid_b = f"pgsmoke-{uuid.uuid4().hex[:8]}"
@@ -214,7 +214,7 @@ def test_pg_body_moves_segments_and_canonical_turns(pg_store):
 
 
 def test_pg_body_bumps_target_request_turn_counter(pg_store):
-    """v1.14-1 (codex iter-3 P1) on real PG: UPSERT with GREATEST(...)
+    """ on real PG: UPSERT with GREATEST(...)
     correctly bumps target's next_request_turn past the moved range.
     """
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
@@ -264,7 +264,7 @@ def test_pg_body_bumps_target_request_turn_counter(pg_store):
 # ---------------------------------------------------------------------------
 
 def test_pg_body_captures_prior_alias_target_in_audit(pg_store):
-    """B-D7 on real PG: ON CONFLICT (alias_id) DO UPDATE preserves the
+    """ on real PG: ON CONFLICT (alias_id) DO UPDATE preserves the
     prior target_id snapshot in merge_audit.prior_alias_target.
     """
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
@@ -328,7 +328,7 @@ def test_pg_body_post_commit_pendings_written(pg_store):
 
 
 def test_pg_body_returns_merge_stats_with_v14_fields(pg_store):
-    """v1.14-1 + B-D9: MergeStats from real PG body has success +
+    """ + MergeStats from real PG body has success +
     elapsed_seconds + the bumped-counter rows_moved key (when applicable).
     """
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
@@ -352,15 +352,15 @@ def test_pg_body_returns_merge_stats_with_v14_fields(pg_store):
 
 
 # ---------------------------------------------------------------------------
-# v1.15-4 (codex iter-4 P2): PG fail-closed test for non-UndefinedTable
-# error. v1.14-4 narrowed the active-op gate to UndefinedTable specifically;
+# PG fail-closed test for non-UndefinedTable
+# error. narrowed the active-op gate to UndefinedTable specifically;
 # any OTHER error (permission denied, schema error, etc.) must propagate
 # and roll back the body transaction, NOT silently swallow into success.
 # ---------------------------------------------------------------------------
 
 def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, monkeypatch):
-    """v1.15-4: simulate a syntax / permission error inside the active-op
-    check. v1.14-4 SAVEPOINT pattern catches only UndefinedTable; any
+    """: simulate a syntax / permission error inside the active-op
+    check. SAVEPOINT pattern catches only UndefinedTable; any
     other psycopg error must propagate up and roll back the outer body
     transaction. Asserts the body raises (does NOT silently complete a
     merge under a broken safety gate).
@@ -375,7 +375,7 @@ def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, 
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
     # Patch psycopg.Connection.execute to raise SyntaxError specifically
     # when the active-op SELECT runs. This simulates a real PG syntax /
-    # permission error path that the v1.14-4 narrow-catch must NOT swallow.
+    # permission error path that the narrow-catch must NOT swallow.
     real_execute = type(conn).execute
     raised = {"flag": False}
     def _spy_execute(self, sql, params=None, *args, **kwargs):
@@ -422,7 +422,7 @@ def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, 
 
 
 # ---------------------------------------------------------------------------
-# v1.15-1 (codex iter-4 P1): PG concurrent-writer race against merge body.
+# PG concurrent-writer race against merge body.
 # A save_request_context() that runs concurrent with the body's lifecycle
 # FOR UPDATE lock must BLOCK until the body commits. After body commits +
 # bumps target counter, the queued save_request_context resumes and
@@ -430,9 +430,9 @@ def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, 
 # ---------------------------------------------------------------------------
 
 def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
-    """v1.15-1: real PG concurrency exercise. Two psycopg connections:
+    """: real PG concurrency exercise. Two psycopg connections:
     A holds the body's EXCLUSIVE lock + does the move; B tries
-    save_request_context (which now takes SHARE lock per v1.15-1) and
+    save_request_context (which now takes SHARE lock per ) and
     BLOCKS until A commits. Verifies B's allocated request_turn does not
     collide with the moved range.
 
@@ -487,7 +487,7 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
         "WHERE conversation_id = %s", (tgt,),
     ).fetchone()["m"]
     assert bumped >= moved_max + 1
-    # save_request_context (which takes the SHARE lock per v1.15-1)
+    # save_request_context (which takes the SHARE lock per )
     # allocates the next turn safely. Use a fresh psycopg connection so
     # the SHARE lock acquisition path is exercised end-to-end (not in
     # the same conn that just held FOR UPDATE).

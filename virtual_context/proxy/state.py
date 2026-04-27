@@ -232,7 +232,7 @@ class ProxyState:
         )
 
         # The operation_id of the currently-running compaction, or None when no
-        # compaction is in flight.  Set in _submit_compaction_request (before
+        # compaction is in flight. Set in _submit_compaction_request (before
         # submit) when a preexisting_operation_id is provided (takeover path),
         # and cleared in the _run_compact_wrapper finally block so the takeover
         # predicate `self._active_compaction_op != claim.prev_operation_id` is
@@ -241,7 +241,7 @@ class ProxyState:
 
         # Wire this worker's identity into the compaction pipeline so the
         # per-write ownership guard on store_segment can scope each INSERT
-        # to the live compaction_operation row.  Done here (post-_worker_id
+        # to the live compaction_operation row. Done here (post-_worker_id
         # assignment) rather than at CompactionPipeline construction time
         # because the engine is constructed before ProxyState initialises
         # _worker_id.
@@ -342,7 +342,7 @@ class ProxyState:
         """Starting turn number from persisted engine state.
 
         When the proxy restarts, conversation_history is empty but the
-        TurnTagIndex may have been restored from the store.  Use the
+        TurnTagIndex may have been restored from the store. Use the
         highest indexed turn + 1 as the offset so turn numbering
         continues from the previous session.
         """
@@ -772,10 +772,10 @@ class ProxyState:
                     # don't signal "drained for this caller's lifecycle".
                     return False
                 # complete_ingestion_episode returned False. Either:
-                #   (a) a new untagged row appeared between our scan and
-                #       the completion guard (race) — loop and drain it; OR
-                #   (b) the episode was already closed by another worker
-                #       or the lifecycle moved — not ours to finalize.
+                # (a) a new untagged row appeared between our scan and
+                # the completion guard (race) — loop and drain it; OR
+                # (b) the episode was already closed by another worker
+                # or the lifecycle moved — not ours to finalize.
                 if not _verify_or_exit():
                     return False
                 retry_batch = self.engine._store.iter_untagged_canonical_rows(
@@ -1041,7 +1041,7 @@ class ProxyState:
         body: dict,
         payload_accounting: dict,
     ) -> PhaseDecision:
-        """Run the ingestion flow (spec §5, steps 1-8) for one inbound request.
+        """Run the ingestion flow (, steps 1-8) for one inbound request.
 
         Manages the DB bookkeeping side of ingestion: canonical row
         persistence (IngestReconciler), per-request metadata, phase
@@ -1593,7 +1593,7 @@ class ProxyState:
         Ingestion progress is sourced from ``read_progress_snapshot`` (the
         DB-derived view over ``canonical_turns`` + ``ingestion_episode``) so
         the snapshot is always the single source of truth for ingestion
-        phase and counts.  The legacy per-process ``_payload_ingestion_progress``
+        phase and counts. The legacy per-process ``_payload_ingestion_progress``
         tuple has been removed — no fabricated (0, total) counters.
         """
         snapshot = self.engine.extract_session_state()
@@ -2247,7 +2247,7 @@ class ProxyState:
         conversation_id = self.engine.config.conversation_id
         if preexisting_operation_id is not None:
             # Takeover path: the caller pre-inserted the compaction_operation
-            # row (e.g. via cleanup_abandoned_compaction).  Use the supplied
+            # row (e.g. via cleanup_abandoned_compaction). Use the supplied
             # id; do NOT call enter_compaction() which would attempt a second
             # INSERT and could race or duplicate.
             operation_id = preexisting_operation_id
@@ -2265,9 +2265,9 @@ class ProxyState:
         # _active_compaction_op=None and the takeover logic would classify our
         # own live op as abandoned, calling cleanup_abandoned_compaction against
         # it and raising CompactionLeaseLost. Covers:
-        #   - takeover path (wrapper calls _run_compact with preexisting_id)
-        #   - normal async path (wrapper calls _run_compact, generates locally)
-        #   - synchronous direct path (_compact_after_ingestion → _run_compact)
+        # - takeover path (wrapper calls _run_compact with preexisting_id)
+        # - normal async path (wrapper calls _run_compact, generates locally)
+        # - synchronous direct path (_compact_after_ingestion → _run_compact)
         self._active_compaction_op = operation_id
 
         compaction_started = time.monotonic()
@@ -2350,7 +2350,7 @@ class ProxyState:
 
         # Code-review P1 C1: acquire INSIDE the try so the finally-block's
         # release is always reachable, even if Thread() or .start() raises
-        # (e.g. RuntimeError under thread exhaustion).  Without this, any
+        # (e.g. RuntimeError under thread exhaustion). Without this, any
         # exception between acquire() and the outer try would leave
         # _compaction_lock permanently held, causing every subsequent
         # _run_compact to skip via the blocking=False fast-path.
@@ -2387,7 +2387,7 @@ class ProxyState:
             # ``drain_compaction_exit`` against a phase we never owned.
             #
             # Takeover path: when preexisting_operation_id is set the caller
-            # has ALREADY inserted the compaction_operation row.  Skip
+            # has ALREADY inserted the compaction_operation row. Skip
             # enter_compaction() entirely and treat phase_index 0 as the
             # baseline so advance_compaction_phase picks up from there.
             if preexisting_operation_id is not None:
@@ -2419,9 +2419,9 @@ class ProxyState:
                 except Exception:
                     entered_lifecycle = False
 
-            # Spawn the heartbeat sidecar.  It refreshes the compaction_operation
+            # Spawn the heartbeat sidecar. It refreshes the compaction_operation
             # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor
-            # thread runs.  On a failed refresh (epoch mismatch, wrong owner, or
+            # thread runs. On a failed refresh (epoch mismatch, wrong owner, or
             # status != 'running') it sets _compaction_cancelled so the progress
             # callback raises InterruptedError and the compactor aborts cleanly.
             # The sidecar is stopped (via _compaction_heartbeat_stop) in the
@@ -2735,7 +2735,7 @@ class ProxyState:
         it has, RESET the conversation by purging persisted state so the next
         request re-ingests from scratch.
 
-        DUAL-ACTION CONTRACT (F-1 audit, 2026-04-26): this function detects
+        DUAL-ACTION CONTRACT (F-1 audit, ): this function detects
         AND mutates. It is NOT a side-effect-free predicate. When widening
         is detected it calls ``_store.delete_conversation(conversation_id)``
         which purges 21 Postgres tables for this conversation plus its
@@ -3159,7 +3159,7 @@ class ProxyState:
         """Start non-blocking history ingestion in a background thread.
 
         Returns immediately — the session stays in INGESTING while the
-        background thread tags historical turns.  If called while ingestion
+        background thread tags historical turns. If called while ingestion
         is already running, cancels the old thread and resumes from the
         last tagged turn (PROXY-013).
         """

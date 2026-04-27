@@ -112,13 +112,13 @@ class VirtualContextEngine:
 
     Threading contract:
         - ``tag_turn`` and ``on_message_inbound`` must NOT run concurrently
-          with each other.  They mutate shared state (TurnTagIndex, watermark)
+          with each other. They mutate shared state (TurnTagIndex, watermark)
           without internal locking.
         - ``compact_if_needed`` MAY run concurrently with inbound methods.
           Stale watermark reads are benign by design: worst case the assembler
           includes slightly extra context, never less.
         - Direct usage of the engine without the proxy's sequencing guarantees
-          is NOT thread-safe.  Callers are responsible for serializing calls.
+          is NOT thread-safe. Callers are responsible for serializing calls.
         - The proxy layer (``ProxyState``) enforces safe sequencing via
           ``wait_for_tag()`` -- each inbound request waits for the previous
           tag_turn to complete before proceeding.
@@ -331,7 +331,7 @@ class VirtualContextEngine:
         self._bootstrap_vocabulary()
 
     # ------------------------------------------------------------------
-    # E1.1 Engine.merge_conversation entry point (per plan v1.11 §3.3)
+    # E1.1 Engine.merge_conversation entry point (per )
     # ------------------------------------------------------------------
 
     def merge_conversation(
@@ -350,18 +350,18 @@ class VirtualContextEngine:
         same-source-as-target invariants and delegates to
         ``Store.merge_conversation_data``. Offsets are computed by the
         body INSIDE the conversation_lifecycle FOR UPDATE lock per
-        v1.14-2 (codex iter-3 P1); engine no longer pre-computes them.
+; engine no longer pre-computes them.
 
         On exception this method DOES NOT mark the merge_audit row
         rolled back; the caller (cloud's REST handler) owns the
         rollback marker via ``Store._mark_merge_rolled_back`` per
-        codex iter-1 v1.4-3 (single-owner rollback). Engine just
+          (single-owner rollback). Engine just
         raises through.
 
-        Returns ``MergeStats`` from the body method per plan T1.1.
+        Returns ``MergeStats`` from the body method per plan .
         Raises:
             * ``CrossTenantMergeError`` if source/target tenants differ
-              (cloud's REST handler catches at C2.4 first, but engine
+              (cloud's REST handler catches at first, but engine
               defense-in-depth, AND the body method also re-validates
               under the merge_audit row lock as defense-in-depth Layer C)
             * ``LifecycleEpochMismatch`` if source's or target's epoch
@@ -374,7 +374,7 @@ class VirtualContextEngine:
         """
         from .core.exceptions import CrossTenantMergeError
 
-        # Same-source-as-target refusal (per spec §14 Q2 + plan §3.3 E1.x).
+        # Same-source-as-target refusal (per Q2 + plan E1.x).
         if source_conversation_id == target_conversation_id:
             raise ValueError(
                 f"Cannot merge conversation into itself: "
@@ -383,10 +383,10 @@ class VirtualContextEngine:
 
         store = self._store
 
-        # B-D1 (codex iter-2 P0) + v1.14-5 (codex iter-3 P2): cross-tenant
+        # + cross-tenant
         # validation at engine entry. SELECT BOTH source AND target
         # conversations rows; verify source.tenant_id == target.tenant_id
-        # == passed tenant_id. A misroute that bypassed cloud's C2.4 would
+        # == passed tenant_id. A misroute that bypassed cloud's would
         # otherwise let one tenant's caller move ANOTHER tenant's per-conv
         # rows under the calling tenant's namespace (data corruption +
         # cross-tenant exfiltration). Per-conv tables don't have a
@@ -395,12 +395,12 @@ class VirtualContextEngine:
         # before any UPDATE-row-move runs.
         #
         # Defense layers:
-        #   Layer A (cloud REST C2.4): rejects mismatched tenant pre-engine.
-        #   Layer B (this engine entry): pre-checks BOTH source + target
-        #          before reaching the body, fail-fast for misroutes.
-        #   Layer C (body method, S1.3/S1.4): re-validates under the
-        #          merge_audit FOR UPDATE row lock so the check fires
-        #          inside the same txn that moves the rows.
+        # Layer A (cloud REST ): rejects mismatched tenant pre-engine.
+        # Layer B (this engine entry): pre-checks BOTH source + target
+        # before reaching the body, fail-fast for misroutes.
+        # Layer C (body method, /): re-validates under the
+        # merge_audit FOR UPDATE row lock so the check fires
+        # inside the same txn that moves the rows.
         inner = getattr(store, "_segments", store)
         conn = inner._get_conn()
         is_pg = "psycopg" in str(type(conn))
@@ -424,7 +424,7 @@ class VirtualContextEngine:
                 f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
             )
 
-        # v1.14-5: target-tenant pre-check. Body's FOR UPDATE re-validation
+        # : target-tenant pre-check. Body's FOR UPDATE re-validation
         # remains as Layer C; engine fail-fast catches the misroute at the
         # cheapest layer (no transaction, no lock acquisition).
         tgt_row = conn.execute(
@@ -444,12 +444,12 @@ class VirtualContextEngine:
                 f"tenant '{tgt_tenant}', not '{tenant_id}'; refusing merge",
             )
 
-        # v1.14-2 (codex iter-3 P1): offsets are now computed BY THE BODY
+        # offsets are now computed BY THE BODY
         # under the conversation_lifecycle FOR UPDATE lock to defeat the
         # stale-offset race. Engine no longer pre-computes; passes 0 as a
         # neutral floor and lets the body recompute.
         #
-        # B-D3 (codex iter-2 P1): pass expected source_lifecycle_epoch
+        # pass expected source_lifecycle_epoch
         # through to the body so the body validates source's epoch under
         # the merge_audit row lock.
         return store.merge_conversation_data(
@@ -491,7 +491,7 @@ class VirtualContextEngine:
           exposes no-op wrappers), silently default to 1. Progress-bar
           features require SQLite/Postgres; legacy backends simply skip.
 
-        Tenant scoping (v1.16-1 codex iter-5 prod blocker fold): the
+        Tenant scoping ( prod blocker fold): the
         upsert path now uses ``self.config.tenant_id`` instead of the
         empty-string placeholder that earlier scaffolding used. Cloud's
         REST handler MUST set ``cfg.tenant_id = request.state.tenant_id``
@@ -1202,7 +1202,7 @@ class VirtualContextEngine:
     def _bootstrap_vocabulary(self) -> None:
         """Load historical tag frequencies into the tagger's vocabulary.
 
-        Called once at init after ``_load_persisted_state()``.  Populates the
+        Called once at init after ``_load_persisted_state()``. Populates the
         LLM tagger's vocabulary from two sources:
 
         1. **Store tags** — cross-session tag statistics (``get_all_tags()``).
@@ -2082,7 +2082,7 @@ class VirtualContextEngine:
         # Ensure a ``conversations`` row exists so the epoch check has
         # something to read. ``upsert_conversation`` is idempotent: it
         # creates the row at epoch=1 if missing, otherwise leaves the
-        # epoch intact. v1.16-1 (codex iter-5 prod blocker fold): tenant_id
+        # epoch intact. tenant_id
         # now sourced from ``self.config.tenant_id`` so the row's tenant
         # column matches cloud_conversations + the body method's Layer C
         # tenant-scoping check has populated data to compare against.

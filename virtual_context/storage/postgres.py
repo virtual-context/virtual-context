@@ -827,17 +827,17 @@ class PostgresStore(ContextStore):
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
-                    conversation_id                TEXT PRIMARY KEY,
-                    tenant_id                      VARCHAR NOT NULL,
-                    lifecycle_epoch                INT NOT NULL DEFAULT 1,
-                    phase                          VARCHAR NOT NULL DEFAULT 'init'
+                    conversation_id TEXT PRIMARY KEY,
+                    tenant_id VARCHAR NOT NULL,
+                    lifecycle_epoch INT NOT NULL DEFAULT 1,
+                    phase VARCHAR NOT NULL DEFAULT 'init'
                                                    CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
-                    pending_raw_payload_entries    INT NOT NULL DEFAULT 0,
-                    last_raw_payload_entries       INT NOT NULL DEFAULT 0,
+                    pending_raw_payload_entries INT NOT NULL DEFAULT 0,
+                    last_raw_payload_entries INT NOT NULL DEFAULT 0,
                     last_ingestible_payload_entries INT NOT NULL DEFAULT 0,
-                    created_at                     TIMESTAMPTZ NOT NULL,
-                    updated_at                     TIMESTAMPTZ NOT NULL,
-                    deleted_at                     TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    deleted_at TIMESTAMPTZ NULL,
                     UNIQUE (tenant_id, conversation_id)
                 )
             """)
@@ -846,7 +846,7 @@ class PostgresStore(ContextStore):
                     ON conversations(tenant_id, phase)
                      WHERE phase <> 'deleted'
             """)
-            # M0.1 (VCMERGE plan v1.11 section 2.1): relax the phase CHECK to
+            # (VCMERGE plan v1.11 ): relax the phase CHECK to
             # admit the 'merged' value introduced by VCMERGE. The named-
             # constraint pattern (DROP IF EXISTS + ADD CONSTRAINT) is
             # idempotent re-runnable even after a partial-prior-state where
@@ -854,7 +854,7 @@ class PostgresStore(ContextStore):
             # validate existing rows (no rows can have phase='merged' yet),
             # so the operation is fast even on populated tables. Brief
             # ACCESS EXCLUSIVE during the swap; deploy in low-traffic window
-            # per plan section 8.1 step 1.
+            # per plan step 1.
             conn.execute("""
                 ALTER TABLE conversations
                     DROP CONSTRAINT IF EXISTS conversations_phase_check
@@ -866,7 +866,7 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("conversations table bootstrap failed", exc_info=True)
-        # v1.16-1 (codex iter-5 prod blocker fold): one-time backfill of
+        # one-time backfill of
         # ``conversations.tenant_id`` from ``cloud_conversations.tenant_id``
         # for rows created by older engine builds that passed
         # ``tenant_id=""`` to ``upsert_conversation``. Idempotent:
@@ -898,32 +898,32 @@ class PostgresStore(ContextStore):
                 "conversations.tenant_id backfill from cloud_conversations failed",
                 exc_info=True,
             )
-        # M0.3 + M0.5 (VCMERGE plan v1.11 sections 2.1 + 5.2): merge_audit
+        # + (VCMERGE plan v1.11 ): merge_audit
         # table + the unique partial index that backs the
         # try_reserve_merge_audit_in_progress reservation flow. Spec section
-        # 9 schema; tenant_id column per v3.8-2 tenant-isolation. The
+        # 9 schema; tenant_id column per tenant-isolation. The
         # partial index uses status IN ('in_progress','committed') per D4
         # (committed rows must remain in the index so future re-merge
         # attempts collide and resolve via the 5-state idempotency
-        # discriminator at spec section 12.7).
+        # discriminator at ).
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS merge_audit (
-                    merge_id                  UUID PRIMARY KEY,
-                    tenant_id                 VARCHAR NOT NULL,
-                    source_conversation_id    TEXT NOT NULL,
-                    target_conversation_id    TEXT NOT NULL,
-                    source_label_at_merge     TEXT NOT NULL DEFAULT '',
-                    status                    VARCHAR NOT NULL
+                    merge_id UUID PRIMARY KEY,
+                    tenant_id VARCHAR NOT NULL,
+                    source_conversation_id TEXT NOT NULL,
+                    target_conversation_id TEXT NOT NULL,
+                    source_label_at_merge TEXT NOT NULL DEFAULT '',
+                    status VARCHAR NOT NULL
                                               CHECK (status IN ('in_progress','committed','rolled_back')),
-                    started_at                TIMESTAMPTZ NOT NULL,
-                    completed_at              TIMESTAMPTZ NULL,
-                    rows_moved_json           TEXT NULL,
-                    error_message             TEXT NULL,
-                    prior_alias_target        TEXT NULL
+                    started_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ NULL,
+                    rows_moved_json TEXT NULL,
+                    error_message TEXT NULL,
+                    prior_alias_target TEXT NULL
                 )
             """)
-            # B-D7 (codex iter-2 P1): prior_alias_target column for merge
+            # prior_alias_target column for merge
             # reversibility. Captures the conversation_aliases.target_id that
             # the source's alias_id pointed to BEFORE the body's UPSERT, so a
             # future merge-revert can restore it. NULL when source had no
@@ -950,29 +950,29 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("merge_audit table bootstrap failed", exc_info=True)
-        # M0.4 (VCMERGE plan v1.11 section 2.1): merge_post_commit_pending
+        # (VCMERGE plan v1.11 ): merge_post_commit_pending
         # queue table + tenant-consistency triggers. The two-trigger split
-        # (codex iter-2 v1.6-1 P1 corrected the DDL syntax: TG_OP is a
+        # ( P1 corrected the DDL syntax: TG_OP is a
         # PL/pgSQL function variable not available in trigger-level WHEN;
         # combined BEFORE INSERT OR UPDATE leaves OLD undefined on INSERT)
-        # provides the same end-to-end invariant as the v1.5-4 single-
+        # provides the same end-to-end invariant as the single-
         # trigger form intended but with valid PG syntax.
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
-                    pending_id        UUID PRIMARY KEY,
-                    merge_id          UUID NOT NULL REFERENCES merge_audit(merge_id),
-                    tenant_id         VARCHAR NOT NULL,
-                    kind              TEXT NOT NULL
+                    pending_id UUID PRIMARY KEY,
+                    merge_id UUID NOT NULL REFERENCES merge_audit(merge_id),
+                    tenant_id VARCHAR NOT NULL,
+                    kind TEXT NOT NULL
                                       CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
-                    payload_json      TEXT NOT NULL,
-                    status            TEXT NOT NULL
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL
                                       CHECK (status IN ('pending','done','failed')),
-                    attempts          INT NOT NULL DEFAULT 0,
-                    created_at        TIMESTAMPTZ NOT NULL,
-                    last_attempt_at   TIMESTAMPTZ NULL,
-                    completed_at      TIMESTAMPTZ NULL,
-                    error_message     TEXT NULL
+                    attempts INT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    last_attempt_at TIMESTAMPTZ NULL,
+                    completed_at TIMESTAMPTZ NULL,
+                    error_message TEXT NULL
                 )
             """)
             conn.execute("""
@@ -1031,18 +1031,18 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
-        # M0.2 (VCMERGE plan v1.11 §2.1 / §5.3): origin_conversation_id
+        #: origin_conversation_id
         # column on the per-conv data tables. Set to '' (empty string)
-        # for rows that pre-date VCMERGE; the body method (S1.3) writes
+        # for rows that pre-date VCMERGE; the body method writes
         # the source's conversation_id when it UPDATEs a row's
         # conversation_id to point at the target. Provenance tracking
         # for moved rows; does not affect query behavior on existing
         # rows. PG ≥9.6 supports IF NOT EXISTS on ADD COLUMN; the
         # migration is idempotent re-runnable.
-        # B-D8 (codex iter-2 P2): tag_aliases added to the M0.2 list. The
+        # tag_aliases added to the list. The
         # table is per-conv (PK includes conversation_id) and was missing
         # from the original list, leaving source's tag aliases stranded
-        # post-merge. The body method (S1.3) now moves these rows; the
+        # post-merge. The body method now moves these rows; the
         # origin_conversation_id column captures provenance same as the
         # other per-conv tables.
         _M0_2_TABLES = (
@@ -1064,9 +1064,9 @@ class PostgresStore(ContextStore):
             except Exception:
                 # Table may not exist on this fixture; benign.
                 pass
-        # E-D5 (codex iter-1 P2): conversation_aliases.epoch column for
+        # conversation_aliases.epoch column for
         # chained-merge support (deferred to v2 but column landed now per
-        # plan v1.13 fold). Idempotent ADD COLUMN IF NOT EXISTS.
+        # plan fold). Idempotent ADD COLUMN IF NOT EXISTS.
         try:
             conn.execute(
                 "ALTER TABLE conversation_aliases "
@@ -1076,12 +1076,12 @@ class PostgresStore(ContextStore):
             logger.warning("conversation_aliases.epoch ADD COLUMN failed", exc_info=True)
         # Progress-tracking columns for the DB-derived progress model.
         # Mirrors the SQLite schema (see sqlite.py):
-        #   covered_ingestible_entries — how many ingestible payload entries
-        #     this canonical row represents (set at insert time). The progress
-        #     denominator is SUM(covered_ingestible_entries).
-        #   tagged_at — timestamp set when the tagger enriches the row. The
-        #     progress numerator is
-        #     SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
+        # covered_ingestible_entries — how many ingestible payload entries
+        # this canonical row represents (set at insert time). The progress
+        # denominator is SUM(covered_ingestible_entries).
+        # tagged_at — timestamp set when the tagger enriches the row. The
+        # progress numerator is
+        # SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
         # The two partial indexes below make each SUM path an index-only scan.
         # Postgres supports ADD COLUMN IF NOT EXISTS natively, so the ALTERs
         # are idempotent. Note: ``tagged_at`` already exists on the base
@@ -1123,16 +1123,16 @@ class PostgresStore(ContextStore):
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ingestion_episode (
-                    episode_id            UUID PRIMARY KEY,
-                    conversation_id       TEXT NOT NULL,
-                    lifecycle_epoch       INT NOT NULL,
-                    raw_payload_entries   INT NOT NULL DEFAULT 0,
-                    started_at            TIMESTAMPTZ NOT NULL,
-                    completed_at          TIMESTAMPTZ NULL,
-                    status                VARCHAR NOT NULL
+                    episode_id UUID PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    lifecycle_epoch INT NOT NULL,
+                    raw_payload_entries INT NOT NULL DEFAULT 0,
+                    started_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ NULL,
+                    status VARCHAR NOT NULL
                                           CHECK (status IN ('running','completed','cancelled','abandoned')),
-                    owner_worker_id       VARCHAR NOT NULL,
-                    heartbeat_ts          TIMESTAMPTZ NOT NULL,
+                    owner_worker_id VARCHAR NOT NULL,
+                    heartbeat_ts TIMESTAMPTZ NOT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
                 )
             """)
@@ -1155,19 +1155,19 @@ class PostgresStore(ContextStore):
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS compaction_operation (
-                    operation_id      UUID PRIMARY KEY,
-                    conversation_id   TEXT NOT NULL,
-                    lifecycle_epoch   INT NOT NULL,
-                    phase_index       INT NOT NULL DEFAULT 0,
-                    phase_count       INT NOT NULL,
-                    phase_name        VARCHAR NOT NULL,
-                    status            VARCHAR NOT NULL
+                    operation_id UUID PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    lifecycle_epoch INT NOT NULL,
+                    phase_index INT NOT NULL DEFAULT 0,
+                    phase_count INT NOT NULL,
+                    phase_name VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL
                                       CHECK (status IN ('queued','running','completed','cancelled','failed')),
-                    started_at        TIMESTAMPTZ NOT NULL,
-                    completed_at      TIMESTAMPTZ NULL,
-                    owner_worker_id   VARCHAR NOT NULL,
-                    heartbeat_ts      TIMESTAMPTZ NOT NULL,
-                    error_message     TEXT NULL,
+                    started_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ NULL,
+                    owner_worker_id VARCHAR NOT NULL,
+                    heartbeat_ts TIMESTAMPTZ NOT NULL,
+                    error_message TEXT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
                 )
             """)
@@ -1342,7 +1342,7 @@ class PostgresStore(ContextStore):
         # Advisory lock serializes concurrent workers. Without it, two
         # workers can both pass the DROP IF EXISTS step, then race on
         # CREATE VIEW and one loses with
-        #   duplicate key value violates unique constraint pg_type_typname_nsp_index.
+        # duplicate key value violates unique constraint pg_type_typname_nsp_index.
         # The connection runs in autocommit mode, so we wrap in an explicit
         # transaction to anchor pg_advisory_xact_lock (auto-releases on
         # commit).
@@ -1407,7 +1407,7 @@ class PostgresStore(ContextStore):
         sentinel per the approved spec (line 61-63, rollout line 397-401).
 
         Also adds:
-        - compaction_operation.created_at  (TIMESTAMPTZ NULL) — mirrors the
+        - compaction_operation.created_at (TIMESTAMPTZ NULL) — mirrors the
           SQLite column added in Task 7's migration.
         - 'abandoned' to the compaction_operation.status CHECK constraint —
           mirrors the SQLite constraint widening done in Task 7.
@@ -2520,12 +2520,12 @@ class PostgresStore(ContextStore):
         or the CloudMetadataStore fallback) and invoke the canonical
         delete path (``registry.delete_conversation``) per row.
 
-        M0.6 (VCMERGE plan v1.11 section 2.1): rows with phase = 'merged'
+         (VCMERGE plan v1.11 ): rows with phase = 'merged'
         are excluded from the auto-delete candidate set. A merged source
         is the alias-resolution endpoint for any client that still
         references the source's id; deleting it would lose the redirect
         AND the audit-row reference. The merged source is intentionally
-        retained until cloud's redirect-cleanup branch (C2.21) explicitly
+        retained until cloud's redirect-cleanup branch explicitly
         prunes it via the dashboard DELETE-on-merged-source flow.
 
         Returns up to ``limit`` rows ordered oldest-activity-first so
@@ -2593,28 +2593,28 @@ class PostgresStore(ContextStore):
         ]
 
     # ------------------------------------------------------------------
-    # VCMERGE storage methods (S1.1, S1.5, S1.6, S1.7 per plan v1.11)
+    # VCMERGE storage methods (, , per plan v1.11)
     # ------------------------------------------------------------------
     #
-    # The body method (S1.3) is intentionally NOT implemented yet: it
-    # depends on M0.2's origin_conversation_id columns landing first and
+    # The body method is intentionally NOT implemented yet: it
+    # depends on 's origin_conversation_id columns landing first and
     # is the bulk of Phase 1's risk (per-table moves across 17 tables
-    # under a body transaction). The reservation (S1.1), lookups (S1.5,
-    # S1.6) and rollback marker (S1.7) are the read+state-change primitives
+    # under a body transaction). The reservation, lookups (,
+    # ) and rollback marker are the read+state-change primitives
     # that cloud's REST handler at vc_cloud/rest_api.py needs to wire up
-    # the merge dispatcher (C2.1) plus the idempotency 5-state envelope
-    # (per plan section 4.1 + spec section 12.7).
+    # the merge dispatcher plus the idempotency 5-state envelope
+    # (per plan + ).
     #
     # The cloud handler's flow is:
-    #   1. C2.3/C2.4 pre-checks (size, tenant)
-    #   2. S1.1 try_reserve_merge_audit_in_progress -> ReservationResult
-    #   3. dispatch on result.status (5 states):
-    #        reserved        -> call engine body, then mark audit committed
-    #        in_progress     -> render in_progress envelope from existing
-    #        committed_match -> render success envelope from existing
-    #        committed_mismatch -> render mismatch envelope from existing
-    #        race_retry      -> recurse to step 2
-    #   4. on body exception -> S1.7 _mark_merge_rolled_back
+    # 1. / pre-checks (size, tenant)
+    # 2. try_reserve_merge_audit_in_progress -> ReservationResult
+    # 3. dispatch on result.status (5 states):
+    # reserved -> call engine body, then mark audit committed
+    # in_progress -> render in_progress envelope from existing
+    # committed_match -> render success envelope from existing
+    # committed_mismatch -> render mismatch envelope from existing
+    # race_retry -> recurse to step 2
+    # 4. on body exception -> _mark_merge_rolled_back
 
     def try_reserve_merge_audit_in_progress(
         self,
@@ -2628,28 +2628,28 @@ class PostgresStore(ContextStore):
         """Atomically reserve a merge_audit row in status='in_progress'.
 
         Returns a ReservationResult discriminated by the 5 states defined
-        in plan section 3.1 T1.3:
+        in plan :
 
-          reserved          -> this caller's INSERT succeeded; caller owns
+          reserved -> this caller's INSERT succeeded; caller owns
                                the merge body
-          in_progress       -> a prior INSERT is mid-body for the same
+          in_progress -> a prior INSERT is mid-body for the same
                                (tenant, source); cloud renders the
                                in-progress envelope
-          committed_match   -> a prior INSERT completed successfully AND
+          committed_match -> a prior INSERT completed successfully AND
                                the prior call's source_label_at_merge ==
                                this caller's label (idempotent retry)
           committed_mismatch-> a prior INSERT completed successfully AND
                                the labels differ (cloud renders the
                                mismatch envelope referencing the existing
                                row)
-          race_retry        -> the colliding row transitioned in_progress
+          race_retry -> the colliding row transitioned in_progress
                                -> rolled_back between INSERT-fail and
-                               SELECT (rare race per spec section 12.7);
+                               SELECT (rare race per );
                                cloud retries the reservation flow
 
         The reservation lands inside an explicit transaction so that on
         IntegrityError (the unique partial index at idx_merge_audit_active_source
-        per M0.5 catches duplicates per (tenant, source) where status IN
+        per catches duplicates per (tenant, source) where status IN
         ('in_progress','committed')), we can SELECT the existing row in
         the same transactional context. Postgres autocommit mode (the
         default for PostgresStore connections) doesn't allow SAVEPOINT
@@ -2661,8 +2661,8 @@ class PostgresStore(ContextStore):
         conn = self._get_conn()
         now = datetime.now(timezone.utc)
 
-        # E-D2 fold (codex iter-1 P1): proper SAVEPOINT pattern per spec
-        # §5.2 step 1. The OUTER `with conn.transaction()` opens an
+        # fold proper SAVEPOINT pattern per spec
+        # step 1. The OUTER `with conn.transaction()` opens an
         # explicit transaction; the INNER `with conn.transaction()` is a
         # SAVEPOINT inside that outer transaction (psycopg3 nests via
         # SAVEPOINT semantics). On UniqueViolation the inner SAVEPOINT
@@ -2697,11 +2697,11 @@ class PostgresStore(ContextStore):
 
             # SELECT the row that won the race, in the SAME outer txn.
             # Possible cases:
-            #   in_progress: prior caller is mid-body; in_progress envelope
-            #   committed:   committed_match OR committed_mismatch per E-D3
-            #                target-based discriminator below
-            #   rare race:   winner transitioned in_progress -> rolled_back
-            #                between INSERT-fail and SELECT (cloud retries)
+            # in_progress: prior caller is mid-body; in_progress envelope
+            # committed: committed_match OR committed_mismatch per
+            # target-based discriminator below
+            # rare race: winner transitioned in_progress -> rolled_back
+            # between INSERT-fail and SELECT (cloud retries)
             existing = conn.execute(
                 """
                 SELECT merge_id, tenant_id, source_conversation_id,
@@ -2738,9 +2738,9 @@ class PostgresStore(ContextStore):
             return ReservationResult(
                 status="in_progress", merge_id=view.merge_id, existing=view,
             )
-        # E-D3 fold (codex iter-1 P1): the idempotency discriminator for
+        # fold the idempotency discriminator for
         # status == 'committed' is target_conversation_id, NOT
-        # source_label_at_merge. Spec §6.1 idempotency contract: a merge
+        # source_label_at_merge. Spec idempotency contract: a merge
         # is idempotent on (tenant, source, target). Same target =
         # same merge intent (committed_match); different target = a
         # different merge was already committed against the same source
@@ -2760,7 +2760,7 @@ class PostgresStore(ContextStore):
     def lookup_committed_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.5: read-side lookup for the committed merge audit row of
+        """: read-side lookup for the committed merge audit row of
         a given (tenant, source). Returns MergeAuditView | None.
 
         Used by cloud's alias-resolution shim and dashboard endpoints
@@ -2799,11 +2799,11 @@ class PostgresStore(ContextStore):
     def lookup_active_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.6: read-side lookup for ANY active (in_progress or
+        """: read-side lookup for ANY active (in_progress or
         committed) merge audit row of a given (tenant, source).
         Returns MergeAuditView | None.
 
-        Distinct from S1.5 because the in_progress state is also
+        Distinct from because the in_progress state is also
         "active" for purposes of refusing concurrent merges or
         rendering UI status indicators.
         """
@@ -2844,15 +2844,15 @@ class PostgresStore(ContextStore):
         merge_id: str,
         error_message: str,
     ) -> bool:
-        """S1.7: body-failure recovery UPDATE. Single owner: cloud's
-        REST handler's except clause (per codex iter-1 v1.4-3 fix; the
-        engine NEVER calls this: pinned by §11.2
+        """: body-failure recovery UPDATE. Single owner: cloud's
+        REST handler's except clause (per fix; the
+        engine NEVER calls this: pinned by
         test_rollback_marking_single_owned_by_cloud).
 
         Predicates on tenant_id per D3 (every user-routed write to
         merge_audit includes tenant_id in the WHERE clause; the only
         carved-out exception is the cross-tenant stale-reservation
-        sweeper at C2.19: see plan section 4.4).
+        sweeper at : see plan ).
 
         Returns True if the UPDATE flipped a row from in_progress to
         rolled_back; False if no in_progress row matched (already
@@ -2875,7 +2875,7 @@ class PostgresStore(ContextStore):
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
-    # S1.3 merge_conversation_data (PG body method per plan §3.3)
+    # merge_conversation_data (PG body method per plan )
     # ------------------------------------------------------------------
     #
     # The Phase A body transaction. Moves all per-conv rows from source
@@ -2885,12 +2885,12 @@ class PostgresStore(ContextStore):
     # post-commit pendings.
     #
     # Caller (cloud's handle_vc_merge_cloud) MUST have already:
-    #   - Reserved merge_audit via try_reserve_merge_audit_in_progress (S1.1)
-    #   - Validated tenant + size + lifecycle_epoch
+    # - Reserved merge_audit via try_reserve_merge_audit_in_progress
+    # - Validated tenant + size + lifecycle_epoch
     # Caller is responsible for marking merge_audit rolled_back on
-    # exception via _mark_merge_rolled_back (S1.7); this method raises
+    # exception via _mark_merge_rolled_back; this method raises
     # through on failure without touching the audit row internally
-    # (single-owner rollback per codex iter-1 v1.4-3).
+    # (single-owner rollback per ).
 
     def merge_conversation_data(
         self,
@@ -2907,11 +2907,11 @@ class PostgresStore(ContextStore):
     ):
         """Move all per-conv data rows from source to target's namespace.
 
-        See class-level S1.3 docstring for the full body shape. Returns
+        See class-level docstring for the full body shape. Returns
         ``MergeStats`` with the per-table move counts; caller writes
         the SSE event / dashboard-badge from this.
 
-        Offsets policy (v1.14-2 codex iter-3 P1): ``sort_key_offset`` and
+        Offsets policy: ``sort_key_offset`` and
         ``request_turn_offset`` are now hints / floors only. The body
         re-computes both AFTER acquiring the conversation_lifecycle FOR
         UPDATE locks and uses ``max(caller_value, recomputed)`` so a
@@ -2920,13 +2920,13 @@ class PostgresStore(ContextStore):
         the offsets stale. Callers may pass 0 (let body decide) or pass
         a higher floor for test predictability.
 
-        Tenant-scoping contract (B-D1 codex iter-2 P0): per-conv data
+        Tenant-scoping contract: per-conv data
         tables (segments, canonical_turns, facts, ...) DO NOT carry a
         tenant_id column. Tenant scoping is transitive via the
         conversations row's tenant_id. The body therefore re-validates
         BOTH source.tenant_id AND target.tenant_id under the merge_audit
         FOR UPDATE row lock as defense-in-depth Layer C (Layer A = cloud
-        REST C2.4, Layer B = engine entry). After validation, the
+        REST , Layer B = engine entry). After validation, the
         per-conv UPDATE/DELETE statements are conversation-scoped (no
         tenant_id predicate possible since the column is absent).
 
@@ -2953,7 +2953,7 @@ class PostgresStore(ContextStore):
         # action 'simple': UPDATE conversation_id = target WHERE conversation_id = source
         # action 'offset': UPDATE conversation_id, sort_key/turn col += offset
         # action 'transitive': scoped via FK; UPDATE origin_conversation_id only
-        #                       (parent row's conversation_id move handles re-routing)
+        # (parent row's conversation_id move handles re-routing)
         # action 'delete_source': DELETE source's row (per-conv counter, etc.)
         # action 'tag_conflict': special tag-summary conflict resolution
         TABLES_SIMPLE = (
@@ -2976,7 +2976,7 @@ class PostgresStore(ContextStore):
         )
         # fact_links has TWO endpoint cols (source_fact_id, target_fact_id);
         # handled separately below.
-        # B-D8 (codex iter-2 P2): tag_aliases is per-conv with PK
+        # tag_aliases is per-conv with PK
         # (alias, conversation_id). Conflict resolution mirrors
         # tag_summaries: target wins, source's conflicting aliases DELETEd,
         # non-conflicting source aliases moved. Listed separately so the
@@ -2987,7 +2987,7 @@ class PostgresStore(ContextStore):
         with conn.transaction():
             # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
             # Holds the row lock through the body's commit so the
-            # stale-reservation sweeper (C2.19) cannot roll it back
+            # stale-reservation sweeper cannot roll it back
             # mid-flight. Predicates on tenant_id per D3.
             row = conn.execute(
                 """
@@ -3009,7 +3009,7 @@ class PostgresStore(ContextStore):
                     f"first calling try_reserve_merge_audit_in_progress.",
                 )
 
-            # B-D2 (codex iter-2 P1): acquire conversation_lifecycle row
+            # acquire conversation_lifecycle row
             # locks for source + target before reading phase or moving rows.
             # Sorted lexicographically to prevent deadlocks if two opposing
             # merges race. The locks block concurrent VCATTACH ingest /
@@ -3035,7 +3035,7 @@ class PostgresStore(ContextStore):
                     (cid,),
                 ).fetchone()
 
-            # B-D1 + B-D3 (codex iter-2 P0+P1): re-validate source under
+            # + (+P1): re-validate source under
             # the merge_audit row lock. Captures all three constraints in
             # one row read: tenant ownership, lifecycle epoch consistency,
             # and current phase (must NOT be in a busy or terminal state).
@@ -3101,12 +3101,12 @@ class PostgresStore(ContextStore):
                     code="merge_busy_phase",
                 )
 
-            # B-D2 active-op check: refuse if either side has a queued/running
+            # active-op check: refuse if either side has a queued/running
             # compaction or a running ingestion episode. The conversation_lifecycle
             # row lock above blocks NEW compactions/ingests from STARTING during
             # the body, but pre-existing ones still need to finish before merge.
             #
-            # v1.14-4 (codex iter-3 P2): NARROW exception type for the table-
+            # NARROW exception type for the table-
             # absent case so a real query regression / permission issue / schema
             # drift cannot fail-open. Only ``UndefinedTable`` (table missing on
             # minimal fixtures) is swallowed; everything else propagates and the
@@ -3157,7 +3157,7 @@ class PostgresStore(ContextStore):
                     code="merge_busy_ingest",
                 )
 
-            # v1.14-2 (codex iter-3 P1): recompute offsets UNDER the
+            # recompute offsets UNDER the
             # conversation_lifecycle FOR UPDATE lock acquired above, so a
             # concurrent ``save_request_context()`` writer that lands BETWEEN
             # the engine's pre-call offset computation and the body's lock
@@ -3207,7 +3207,7 @@ class PostgresStore(ContextStore):
                 )
                 rows_moved[tbl] = cur.rowcount
 
-            # B-D4 (codex iter-2 P1): canonical_turns rows arrive with
+            # canonical_turns rows arrive with
             # source's compacted_at populated. Target's compaction prefix
             # invariant requires uncompacted rows to have NULL compacted_at;
             # reset on move so target's compaction pipeline picks them up
@@ -3271,10 +3271,10 @@ class PostgresStore(ContextStore):
             )
             rows_moved["request_turn_counters"] = cur.rowcount
 
-            # v1.14-1 (codex iter-3 P1) + v1.15-2 (codex iter-4 P1): bump
+            # + bump
             # target's request_turn_counter past the maximum request_turn
             # currently present on the target (regardless of origin). The
-            # v1.14 implementation filtered ``origin_conversation_id =
+            # implementation filtered ``origin_conversation_id =
             # source`` which under-counts on chained merges (A->B then
             # B->C; A-origin rows on B carry origin = A and were preserved
             # by COALESCE during the B->C move, so they don't match the
@@ -3305,7 +3305,7 @@ class PostgresStore(ContextStore):
             ).fetchone()
             moved_max_request_turn = int(moved_max_row["m"] or 0)
             if moved_max_request_turn > 0:
-                # v1.15-7 (codex iter-4 P3): capture the ACTUAL post-UPSERT
+                # capture the ACTUAL post-UPSERT
                 # value via RETURNING so the stat reflects truth (prior
                 # implementation recorded ``moved_max + 1`` even when
                 # GREATEST kept the existing higher counter).
@@ -3327,7 +3327,7 @@ class PostgresStore(ContextStore):
                     upsert_row["next_request_turn"] or (moved_max_request_turn + 1)
                 )
 
-            # B-D6 (codex iter-2 P1): capture conflict tag list BEFORE
+            # capture conflict tag list BEFORE
             # deleting source's conflicting tag_summaries rows. The Phase
             # B sweeper consumes tag_regenerate pendings to re-generate
             # the unioned summary, so it needs (tag, source_canonical_turn_ids,
@@ -3338,9 +3338,9 @@ class PostgresStore(ContextStore):
             try:
                 for crow in conn.execute(
                     """
-                    SELECT s.tag                            AS tag,
-                           s.source_canonical_turn_ids      AS src_ids,
-                           t.source_canonical_turn_ids      AS tgt_ids
+                    SELECT s.tag AS tag,
+                           s.source_canonical_turn_ids AS src_ids,
+                           t.source_canonical_turn_ids AS tgt_ids
                       FROM tag_summaries s
                       JOIN tag_summaries t
                         ON t.tag = s.tag
@@ -3391,7 +3391,7 @@ class PostgresStore(ContextStore):
                 rows_moved[tbl] = cur2.rowcount
                 rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
 
-            # B-D7 (codex iter-2 P1): capture prior alias target BEFORE
+            # capture prior alias target BEFORE
             # the UPSERT overwrites it. NULL when source had no prior
             # alias (the common case). Stored on merge_audit so a future
             # merge-revert can restore the prior alias.
@@ -3403,7 +3403,7 @@ class PostgresStore(ContextStore):
             if prior_alias_row is not None:
                 prior_alias_target = prior_alias_row["target_id"]
 
-            # conversation_aliases UPSERT (E-D5: epoch column). The alias
+            # conversation_aliases UPSERT (: epoch column). The alias
             # makes a stale source_id resolve to the target post-merge;
             # epoch matches the lifecycle epoch at merge time so a future
             # delete+recreate can invalidate the alias if needed.
@@ -3419,8 +3419,8 @@ class PostgresStore(ContextStore):
                  expected_target_lifecycle_epoch),
             )
 
-            # Source phase flip to 'merged'. M0.1 admits the value.
-            # Predicates on tenant_id (B-D1 invariant: every tenant-aware
+            # Source phase flip to 'merged'. admits the value.
+            # Predicates on tenant_id ( invariant: every tenant-aware
             # write includes tenant_id).
             conn.execute(
                 """
@@ -3434,7 +3434,7 @@ class PostgresStore(ContextStore):
             )
 
             # merge_audit finalize. Predicates on tenant_id per D3.
-            # B-D7: capture prior_alias_target on the audit row.
+            # capture prior_alias_target on the audit row.
             completed_at = datetime.now(timezone.utc)
             rows_moved_json = _json.dumps(rows_moved)
             conn.execute(
@@ -3453,10 +3453,10 @@ class PostgresStore(ContextStore):
             )
 
             # merge_post_commit_pending INSERTs (B1.1 consumer picks these
-            # up post-commit; cloud's StaleLeaseSweeper 5th pass / C2.15).
-            # Three kinds per plan §3.5: sse_event, tag_regenerate,
+            # up post-commit; cloud's StaleLeaseSweeper 5th pass / ).
+            # Three kinds per plan : sse_event, tag_regenerate,
             # queue_resegment. JSON payload carries enough state for the
-            # consumer to fire each. B-D6: tag_regenerate carries the
+            # consumer to fire each. tag_regenerate carries the
             # explicit conflict tag specs (tag + source/target turn ids)
             # so the sweeper has enough to call the LLM for each tag.
             import uuid as _uuid
@@ -3623,7 +3623,7 @@ class PostgresStore(ContextStore):
         prev_operation_id atomically without a second round-trip.
 
         Returns a CompactionLeaseClaim with:
-          - claimed=True  iff caller already owns the row OR heartbeat is stale.
+          - claimed=True iff caller already owns the row OR heartbeat is stale.
           - prev_operation_id / prev_owner_worker_id from the pre-update row
             (None when no active row existed at the given lifecycle_epoch).
         """
@@ -6256,7 +6256,7 @@ class PostgresStore(ContextStore):
     def _acquire_lifecycle_share_lock(
         self, conn: psycopg.Connection, conversation_id: str,
     ) -> None:
-        """v1.15-1 (codex iter-4 P1): acquire a SHARE lock on the
+        """acquire a SHARE lock on the
         conversation_lifecycle row for ``conversation_id``. Coexists with
         other SHARE locks (concurrent ``save_request_context`` calls all
         proceed in parallel); BLOCKED by an EXCLUSIVE lock (FOR UPDATE)
@@ -6273,7 +6273,7 @@ class PostgresStore(ContextStore):
           * SHARE blocks against EXCLUSIVE and vice versa, so concurrent
             allocators wait until the merge body commits + has bumped
             the counter past the moved range. The stale-offset race
-            window from v1.14-2 (which only locked inside the body) is
+            window from the body-internal recompute (which only locked inside the body) is
             now closed across the entire write surface.
 
         SQLite doesn't need this primitive: ``BEGIN IMMEDIATE`` already
@@ -6464,11 +6464,11 @@ class PostgresStore(ContextStore):
         conv_id = context.get("conversation_id", "")
         explicit_turn = int(context.get("request_turn", 0) or 0)
         with conn.transaction():
-            # v1.15-1 (codex iter-4 P1): acquire conversation_lifecycle
+            # acquire conversation_lifecycle
             # SHARE lock so a concurrent merge body holding the EXCLUSIVE
             # lock blocks us until it commits + has bumped the counter
             # past the moved range. Closes the stale-offset race window
-            # that v1.14-2 left open for cross-transaction writes.
+            # that left open for cross-transaction writes.
             self._acquire_lifecycle_share_lock(conn, conv_id)
             request_turn = explicit_turn or self._allocate_request_turn(conn, conv_id)
             if explicit_turn:

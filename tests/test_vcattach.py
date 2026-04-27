@@ -409,7 +409,7 @@ def test_execute_attach_no_longer_accepts_reset_engine_state():
     "reset target checkpoints", but its naming convention ("reset") is a
     historical synonym for "delete-and-rebuild" elsewhere in this codebase.
     All three call sites passed None; the slot was the same call shape as
-    the 2026-04-26 VCATTACH seam (a non-destructively-named callback
+    the VCATTACH seam (a non-destructively-named callback
     invoked on target_id), and a future PR could have wired it to a
     destructive primitive without explicit review.
 
@@ -450,14 +450,14 @@ def test_delete_conversation_alias_missing_is_noop(sqlite_store):
 
 
 # ---------------------------------------------------------------------
-# Regression: cross-team incident 2026-04-26 — VCATTACH destroyed 358+
+# Regression: cross-team incident — VCATTACH destroyed 358+
 # canonical turns of a labeled live conversation. Three connected bugs:
 # (1) REST handler called session_state_provider.delete() which calls
-#     PostgresStore.delete_conversation() (purges 21 tables + media dir).
+# PostgresStore.delete_conversation() (purges 21 tables + media dir).
 # (2) execute_attach only invalidated target_id, never the issuing chat's
-#     stale ProxyState — so ingestion kept writing to old_id.
+# stale ProxyState — so ingestion kept writing to old_id.
 # (3) resolve_target accepted any label, even when target had no
-#     persisted state.
+# persisted state.
 # ---------------------------------------------------------------------
 
 
@@ -756,7 +756,7 @@ def test_rest_vcattach_error_response_populates_both_error_and_message():
     ``prepareResult.message`` rendering path lights up the error directly.
 
     This contract applies prospectively to all VC-command error responses
-    (VCMERGE will follow the same shape per its spec §6.2).
+    (VCMERGE will follow the same shape per its ).
     """
     import json as _json
     from virtual_context.proxy.handlers import _handle_vc_command_rest

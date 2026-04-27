@@ -333,7 +333,7 @@ class TestSessionRegistry:
         engine.config.conversation_id = "default-session"
         default = ProxyState(engine, metrics=metrics)
 
-        # Request N: 3 user messages.  Store hash of last user msg ("tell me more")
+        # Request N: 3 user messages. Store hash of last user msg ("tell me more")
         body_prev = {"messages": [
             {"role": "user", "content": "hello world"},
             {"role": "assistant", "content": "hi there"},
@@ -341,7 +341,7 @@ class TestSessionRegistry:
             {"role": "assistant", "content": "doing well"},
             {"role": "user", "content": "tell me more"},
         ]}
-        # Request N+1: one more turn.  Second-to-last user msg = "tell me more"
+        # Request N+1: one more turn. Second-to-last user msg = "tell me more"
         # which matches the hash stored from request N.
         body_next = {"messages": [
             {"role": "user", "content": "hello world"},
@@ -823,8 +823,8 @@ class TestSessionRouting:
     def test_last_msg_hash_matches_across_turns(self):
         """Core invariant: request N's position=0 == request N+1's position=1.
 
-        Request N:   user msgs = [u0, u1, u2].  position=0 → hash(u2).
-        Request N+1: user msgs = [u0, u1, u2, u3].  position=1 → hash(u2).
+        Request N: user msgs = [u0, u1, u2]. position=0 → hash(u2).
+        Request N+1: user msgs = [u0, u1, u2, u3]. position=1 → hash(u2).
         """
         body_n = self._make_body(["u0", "u1", "u2"])
         body_n1 = self._make_body(["u0", "u1", "u2", "u3"])
@@ -1088,7 +1088,7 @@ class TestSessionStateMachine:
     def test_extract_session_state_has_no_legacy_payload_ingestion_fields(self):
         """The ``payload_ingestion_done`` / ``payload_ingestion_total`` fields
         on the shared session snapshot have been removed — ingestion progress
-        is DB-derived via ``read_progress_snapshot``.  No fabricated (done=0,
+        is DB-derived via ``read_progress_snapshot``. No fabricated (done=0,
         total=N) counters should ever appear on the serialized snapshot.
         """
         state = self._make_state()
@@ -1247,7 +1247,7 @@ class TestSessionStateMachine:
     # The function previously called _check_history_widening. The `_check_*`
     # prefix in Python idiom is a side-effect-free predicate; the body
     # actually calls _store.delete_conversation (the same 21-table purge
-    # that bit VCATTACH on 2026-04-26). Renamed to
+    # that bit VCATTACH on ). Renamed to
     # _detect_and_reset_widened_history so both verbs are visible at every
     # call site without reading the docstring.
 
@@ -1476,7 +1476,7 @@ class TestSessionStateMachine:
         assert len(ingestion_calls) == 2, f"Expected 2 calls, got {ingestion_calls}"
 
         # 2. The second call should only ingest the REMAINING turns,
-        #    not restart from 0. Total across both should equal 6.
+        # not restart from 0. Total across both should equal 6.
         assert sum(ingestion_calls) < 12, (
             f"Second call restarted from 0: {ingestion_calls}"
         )
@@ -1542,7 +1542,7 @@ class TestSessionStateMachine:
         time.sleep(0.3)
 
         # KEY CHECK: the cancelled first thread's finally block should
-        # NOT have marked the session as ingested.  If it did, this call
+        # NOT have marked the session as ingested. If it did, this call
         # will silently return without cancelling the second thread.
         conversation_id = state.engine.config.conversation_id
         was_marked = conversation_id in state._ingested_conversations

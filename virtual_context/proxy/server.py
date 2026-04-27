@@ -8,7 +8,7 @@ Usage:
     virtual-context -c config.yaml proxy --upstream https://api.anthropic.com
 
 This module is the ``create_app`` factory that wires together:
-- ``state.py``    — ProxyState, SessionState, _IngestionCancelled
+- ``state.py`` — ProxyState, SessionState, _IngestionCancelled
 - ``registry.py`` — SessionRegistry
 - ``handlers.py`` — _handle_streaming, _handle_non_streaming, _passthrough*
 """
@@ -324,7 +324,7 @@ async def prepare_payload(
     """Enrich a request body with virtual-context, returning a PreparedPayload.
 
     Encapsulates the passthrough and active enrichment paths previously inline
-    in ``catch_all()``.  Pure extraction — identical behaviour to the original.
+    in ``catch_all()``. Pure extraction — identical behaviour to the original.
     """
     import asyncio
     import time
@@ -415,8 +415,8 @@ async def prepare_payload(
     # estimator. It composes shell + per-message counts, which closely tracks
     # the legacy whole-body estimator while allowing stable prefix reuse.
     # Verified against the legacy estimate on a live 3.9MB Anthropic payload:
-    #   - full-body estimator: 1,157,338t
-    #   - segmented estimator: 1,158,117t (+0.07%)
+    # - full-body estimator: 1,157,338t
+    # - segmented estimator: 1,158,117t (+0.07%)
     # This keeps media handling correct without re-tokenizing the entire raw
     # payload on every append-only turn.
     _payload_kb = round(len(body_bytes) / 1024, 1) if body_bytes else 0
@@ -657,10 +657,10 @@ async def prepare_payload(
     # VCMERGESTATUS comes BEFORE VCMERGE in the alternation because regex
     # is greedy left-to-right at the alternation level (so "MERGESTATUS"
     # would otherwise lose to "MERGE" with " STATUS" as arg). Per VCMerge
-    # plan v1.11 sections 3.4 P1.1-P1.3:
-    #   VCMERGE INTO <target>   -> vc_command="merge",       arg="INTO <target>"
-    #   VCMERGE PREVIEW <target>-> vc_command="merge",       arg="PREVIEW <target>"
-    #   VCMERGESTATUS <id>      -> vc_command="mergestatus", arg="<id>"
+    # plan v1.11 P1.1-P1.3:
+    # VCMERGE INTO <target> -> vc_command="merge", arg="INTO <target>"
+    # VCMERGE PREVIEW <target>-> vc_command="merge", arg="PREVIEW <target>"
+    # VCMERGESTATUS <id> -> vc_command="mergestatus", arg="<id>"
     # The dispatcher (handlers._handle_vc_command_rest / _handle_vc_command)
     # parses the arg to differentiate INTO vs PREVIEW; merge refuses with
     # merge_routed_outside_cloud_* per the C1.0 dual-handler refuse pair.
@@ -1222,7 +1222,7 @@ async def prepare_payload(
                     _ft = _ct
             else:
                 # 5d. Warm-cache — only defer mutations when there's
-                # pending compaction work (ct > ft).  When ct == ft the
+                # pending compaction work (ct > ft). When ct == ft the
                 # payload already reflects all compaction; mutations must
                 # still run to keep the payload within budget.
                 _flush_pending = _ct > _ft
@@ -1278,8 +1278,8 @@ async def prepare_payload(
         # PROXY-023: when paging is active, drop compacted turns so the
         # LLM relies on VC summaries + vc_expand_topic for old content.
         # NOTE: compacted_prefix_messages is a lifetime segment index, not a
-        # body-local pair index.  The stub filter already handles
-        # replacement of compacted turns via hash matching.  Passing
+        # body-local pair index. The stub filter already handles
+        # replacement of compacted turns via hash matching. Passing
         # the raw watermark to filter_body_messages would over-drop
         # because pair_idx (0..N) != turn_number, especially in proxy
         # mode where the client may have done its own compaction.
@@ -2416,10 +2416,10 @@ def create_app(
     app = FastAPI(title=_app_title, lifespan=lifespan)
     app.state.instance_label = instance_label
     # Pluggable session resolver: if set, called instead of the built-in
-    # SessionRegistry.  Signature:
-    #   (request, body, conversation_id) -> (ProxyState, is_new)
+    # SessionRegistry. Signature:
+    # (request, body, conversation_id) -> (ProxyState, is_new)
     # Cloud wrappers (e.g. virtual-context-cloud) set this to route
-    # requests to per-tenant engines.  Default None = use local registry.
+    # requests to per-tenant engines. Default None = use local registry.
     app.state.state_resolver = None
 
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed

@@ -425,9 +425,9 @@ def cmd_proxy(args):
         print("Run: pip install virtual-context[bridge]", file=sys.stderr)
         sys.exit(1)
 
-    # Suppress CancelledError tracebacks on shutdown.  Uvicorn force-cancels
+    # Suppress CancelledError tracebacks on shutdown. Uvicorn force-cancels
     # SSE streaming responses after the graceful-shutdown timeout, which
-    # triggers CancelledError inside Starlette internals.  This is expected
+    # triggers CancelledError inside Starlette internals. This is expected
     # and harmless — suppress the noisy traceback.
     import asyncio
     import logging as _logging
@@ -1033,7 +1033,7 @@ def _install_launchd_daemon(
     # Build optional EnvironmentVariables block
     env_block = ""
     if dashboard_token:
-        env_block = f"""  <key>EnvironmentVariables</key>
+        env_block = f""" <key>EnvironmentVariables</key>
   <dict>
     <key>VC_DASHBOARD_TOKEN</key>
     <string>{_xml_escape(dashboard_token)}</string>

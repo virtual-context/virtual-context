@@ -126,10 +126,10 @@ def execute_attach(
             persisted conversation data — VCATTACH preserves both rows.
             A failure on one id does not prevent invocation for the other.
 
-    Removed (F-2 audit, 2026-04-26):
+    Removed (F-2 audit, ):
         ``reset_engine_state`` callable(target_id) was a dormant callback
         slot. All call sites passed None and the slot was shape-identical
-        to the 2026-04-26 VCATTACH seam (a non-destructively-named
+        to the VCATTACH seam (a non-destructively-named
         callback invoked on target_id). Removed structurally to prevent
         a future PR from wiring a destructive primitive into it without
         explicit review. If a real use case for an engine-state reset
@@ -137,7 +137,7 @@ def execute_attach(
         docstring rule forbidding destructive primitives.
     """
     # 1. Clear any alias FROM target_id so target_id resolves to itself again.
-    #    This unlocks "return to A" flows where A was previously aliased to B.
+    # This unlocks "return to A" flows where A was previously aliased to B.
     delete_alias = getattr(store, "delete_conversation_alias", None)
     if callable(delete_alias):
         try:
@@ -150,13 +150,13 @@ def execute_attach(
     logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
 
     # 3. Invalidate cached runtime state for BOTH ids. old_id eviction is
-    #    the critical fix for the routing bug: without it, the issuing
-    #    chat's ProxyState (whose engine.config.conversation_id == old_id)
-    #    keeps matching chat_id/sys_hash routing on subsequent requests,
-    #    so ingestion continues writing to old_id even though the alias
-    #    row redirects old_id -> target_id. target_id eviction is a
-    #    cache-coherence guard so a stale cached target state cannot
-    #    shadow a fresh load.
+    # the critical fix for the routing bug: without it, the issuing
+    # chat's ProxyState (whose engine.config.conversation_id == old_id)
+    # keeps matching chat_id/sys_hash routing on subsequent requests,
+    # so ingestion continues writing to old_id even though the alias
+    # row redirects old_id -> target_id. target_id eviction is a
+    # cache-coherence guard so a stale cached target state cannot
+    # shadow a fresh load.
     if callable(registry_invalidate):
         for cid in (old_id, target_id):
             try:

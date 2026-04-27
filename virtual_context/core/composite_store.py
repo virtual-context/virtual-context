@@ -28,11 +28,11 @@ class CompositeStore:
 
     Each method is forwarded to whichever sub-store owns that concern:
 
-    * ``SegmentStore``  -- segments, summaries, tags, aliases, cleanup
-    * ``FactStore``     -- facts CRUD, querying, supersession
+    * ``SegmentStore`` -- segments, summaries, tags, aliases, cleanup
+    * ``FactStore`` -- facts CRUD, querying, supersession
     * ``FactLinkStore`` -- fact link CRUD and traversal
-    * ``StateStore``    -- engine state persistence
-    * ``SearchStore``   -- full-text search, embeddings, tool outputs
+    * ``StateStore`` -- engine state persistence
+    * ``SearchStore`` -- full-text search, embeddings, tool outputs
     """
 
     def __init__(
@@ -976,18 +976,18 @@ class CompositeStore:
         return []
 
     # ------------------------------------------------------------------
-    # VCMERGE storage forwarders (per cloud's v1.13 review of engine
+    # VCMERGE storage forwarders (per cloud's review of engine
     # 11013f4: cloud's handle_vc_merge_cloud calls these methods through
     # the Store protocol the engine hands to cloud, which is a
     # CompositeStore in production. Without explicit forwarders, the
     # graceful-fallback `getattr(self._segments, ..., None)` would still
     # work, but a missing forwarder is a code-review smell: Phase 1
-    # body method (S1.3/S1.4) MUST resolve to PostgresStore in
+    # body method (/) MUST resolve to PostgresStore in
     # production and the forwarders pin that contract. See:
-    # PostgresStore.try_reserve_merge_audit_in_progress (S1.1),
-    # PostgresStore._mark_merge_rolled_back (S1.7),
-    # PostgresStore.lookup_committed_merge_audit_for_source (S1.5),
-    # PostgresStore.lookup_active_merge_audit_for_source (S1.6).
+    # PostgresStore.try_reserve_merge_audit_in_progress,
+    # PostgresStore._mark_merge_rolled_back,
+    # PostgresStore.lookup_committed_merge_audit_for_source,
+    # PostgresStore.lookup_active_merge_audit_for_source.
     # ------------------------------------------------------------------
 
     def try_reserve_merge_audit_in_progress(
@@ -999,8 +999,8 @@ class CompositeStore:
         target_conversation_id: str,
         source_label_at_merge: str = "",
     ):
-        """S1.1 forwarder. Returns ReservationResult per plan section 3.1
-        T1.3 (5-state discriminator). Raises NotImplementedError if the
+        """ forwarder. Returns ReservationResult per plan
+         (5-state discriminator). Raises NotImplementedError if the
         underlying segments store doesn't implement the method (i.e. a
         backend that predates Phase 0 schema).
         """
@@ -1022,7 +1022,7 @@ class CompositeStore:
     def lookup_committed_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.5 forwarder."""
+        """ forwarder."""
         fn = getattr(
             self._segments, "lookup_committed_merge_audit_for_source", None,
         )
@@ -1033,7 +1033,7 @@ class CompositeStore:
     def lookup_active_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
     ):
-        """S1.6 forwarder."""
+        """ forwarder."""
         fn = getattr(
             self._segments, "lookup_active_merge_audit_for_source", None,
         )
@@ -1044,7 +1044,7 @@ class CompositeStore:
     def _mark_merge_rolled_back(
         self, tenant_id: str, merge_id: str, error_message: str,
     ) -> bool:
-        """S1.7 forwarder. Returns True if the UPDATE flipped a row from
+        """ forwarder. Returns True if the UPDATE flipped a row from
         in_progress to rolled_back; False otherwise (already-completed,
         already-rolled-back, or unknown merge_id).
         """
@@ -1066,11 +1066,11 @@ class CompositeStore:
         source_label_at_merge: str,
         expected_source_lifecycle_epoch: int | None = None,
     ):
-        """S1.3 / S1.4 body method forwarder. Returns MergeStats per
-        plan T1.1 (frozen dataclass with merge_id + rows_moved dict +
+        """ / body method forwarder. Returns MergeStats per
+        plan (frozen dataclass with merge_id + rows_moved dict +
         offsets + started_at + completed_at).
 
-        Caught by cloud's F-CR5 review (2026-04-27): the prior 4
+        Caught by cloud's review: the prior 4
         forwarders (try_reserve, lookups, _mark_rolled_back) covered
         the read+state-change primitives but missed the body method
         itself. Without this, ``Engine.merge_conversation`` reaches

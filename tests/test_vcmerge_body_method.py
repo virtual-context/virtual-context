@@ -1,6 +1,6 @@
-"""Body-method tests for VCMERGE S1.3 / S1.4 (merge_conversation_data).
+"""Body-method tests for VCMERGE / (merge_conversation_data).
 
-Per VCMerge plan v1.11 sections 3.3 + 11.1 (move semantics) + 11.2
+ (move semantics) + 11.2
 (audit row management). Pins the structural invariants of the body
 method:
 
@@ -25,7 +25,7 @@ path uses identical SQL semantics with FOR UPDATE row-lock + SAVEPOINT
 nesting in place of SQLite's BEGIN IMMEDIATE.
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -329,7 +329,7 @@ def test_body_upserts_conversation_alias_with_epoch(tmp_path):
 
 
 def test_body_flips_source_phase_to_merged(tmp_path):
-    """Source's phase column transitions to 'merged' (M0.1 admits)."""
+    """Source's phase column transitions to 'merged' ( admits)."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -416,11 +416,11 @@ def test_body_inserts_three_post_commit_pending_rows(tmp_path):
 
 # ---------------------------------------------------------------------------
 # Anti-subversion: body method does NOT call provider.delete or
-# _store.delete_conversation (post-2026-04-26 incident invariant)
+# _store.delete_conversation (anti-subversion invariant)
 # ---------------------------------------------------------------------------
 
 def test_body_does_not_call_destructive_primitives(tmp_path, monkeypatch):
-    """§11.7 hook + invalidate safety. The body method must NOT call any
+    """ hook + invalidate safety. The body method must NOT call any
     destructive store-level primitive that purges per-conv tables. Move
     semantics = UPDATE conversation_id, NEVER DELETE FROM segments etc.
     """
@@ -447,7 +447,7 @@ def test_body_does_not_call_destructive_primitives(tmp_path, monkeypatch):
 
 
 def test_body_returns_merge_stats_with_expected_fields(tmp_path):
-    """MergeStats return shape per plan T1.1 + B-D9 (success + elapsed_seconds)."""
+    """MergeStats return shape per plan + (success + elapsed_seconds)."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -467,7 +467,7 @@ def test_body_returns_merge_stats_with_expected_fields(tmp_path):
     assert stats.sort_key_offset == 1000.0
     assert stats.request_turn_offset == 10
     assert isinstance(stats.rows_moved, dict)
-    # B-D9 (codex iter-2 P2): success + elapsed_seconds populated.
+    # success + elapsed_seconds populated.
     assert stats.success is True
     assert stats.elapsed_seconds >= 0.0
     # frozen dataclass
@@ -476,11 +476,11 @@ def test_body_returns_merge_stats_with_expected_fields(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D1 (P0): cross-tenant body refusal
+# cross-tenant body refusal
 # ---------------------------------------------------------------------------
 
 def test_body_refuses_cross_tenant_source(tmp_path):
-    """B-D1: body re-validates source.tenant_id under the merge_audit
+    """body re-validates source.tenant_id under the merge_audit
     FOR UPDATE row lock as defense-in-depth Layer C. A merge_audit row
     reserved under tenant A but with the source actually owned by tenant
     B (a misroute that bypassed cloud + engine validation) MUST be
@@ -522,7 +522,7 @@ def test_body_refuses_cross_tenant_source(tmp_path):
 
 
 def test_body_refuses_missing_source(tmp_path):
-    """B-D1: body raises CrossTenantMergeError if source.conversations row
+    """body raises CrossTenantMergeError if source.conversations row
     is absent (e.g., source got hard-deleted between reservation and body).
     """
     store = _store(tmp_path)
@@ -541,7 +541,7 @@ def test_body_refuses_missing_source(tmp_path):
 
 
 def test_body_per_table_writes_are_conversation_scoped(tmp_path):
-    """B-D1 invariant: per-conv tables don't carry tenant_id; tenant
+    """ invariant: per-conv tables don't carry tenant_id; tenant
     scoping is transitive via the conversations row (re-validated at body
     entry). Pin via SQL inspection: scan the body method source for any
     UPDATE/DELETE that references a per-conv table; assert each predicates
@@ -553,9 +553,9 @@ def test_body_per_table_writes_are_conversation_scoped(tmp_path):
     src = inspect.getsource(sqlite_mod.SQLiteStore.merge_conversation_data)
     # Find every DELETE FROM <table> in the body's SQL strings.
     deletes = re.findall(r"DELETE\s+FROM\s+(\w+)", src, re.IGNORECASE)
-    # The bounded-DELETE allowlist (per plan §13.3 + handoff B-D11):
-    #   request_turn_counters, tag_summaries, tag_summary_embeddings,
-    #   tag_aliases. Any DELETE outside this list is anti-subversion violation.
+    # The bounded-DELETE allowlist (per plan + handoff ):
+    # request_turn_counters, tag_summaries, tag_summary_embeddings,
+    # tag_aliases. Any DELETE outside this list is anti-subversion violation.
     allowlist = {
         "request_turn_counters", "tag_summaries", "tag_summary_embeddings",
         "tag_aliases",
@@ -570,7 +570,7 @@ def test_body_per_table_writes_are_conversation_scoped(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D2 (P1): concurrent ingest / compaction / phase refusal
+# concurrent ingest / compaction / phase refusal
 # ---------------------------------------------------------------------------
 
 def _seed_compaction_op(conn, conv_id, lifecycle_epoch=1, status="running"):
@@ -597,7 +597,7 @@ def _seed_ingestion_episode(conn, conv_id, lifecycle_epoch=1, status="running"):
 
 
 def test_body_refuses_active_compaction_on_source(tmp_path):
-    """B-D2: refuse merge if source has active compaction_operation
+    """refuse merge if source has active compaction_operation
     (status='queued' or 'running')."""
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -617,7 +617,7 @@ def test_body_refuses_active_compaction_on_source(tmp_path):
 
 
 def test_body_refuses_active_compaction_on_target(tmp_path):
-    """B-D2: refuse merge if target has active compaction_operation."""
+    """refuse merge if target has active compaction_operation."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -636,7 +636,7 @@ def test_body_refuses_active_compaction_on_target(tmp_path):
 
 
 def test_body_refuses_running_ingestion_on_source(tmp_path):
-    """B-D2: refuse merge if source has running ingestion_episode."""
+    """refuse merge if source has running ingestion_episode."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -655,7 +655,7 @@ def test_body_refuses_running_ingestion_on_source(tmp_path):
 
 
 def test_body_refuses_source_in_busy_phase(tmp_path):
-    """B-D2: refuse merge if source.phase IN
+    """refuse merge if source.phase IN
     ('ingesting','compacting','deleted','merged')."""
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -675,7 +675,7 @@ def test_body_refuses_source_in_busy_phase(tmp_path):
 
 
 def test_body_refuses_target_in_busy_phase(tmp_path):
-    """B-D2: refuse merge if target.phase IN ('compacting',...)."""
+    """refuse merge if target.phase IN ('compacting',...)."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -694,11 +694,11 @@ def test_body_refuses_target_in_busy_phase(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D3 (P1): source lifecycle epoch validation
+# source lifecycle epoch validation
 # ---------------------------------------------------------------------------
 
 def test_body_refuses_source_lifecycle_epoch_advance(tmp_path):
-    """B-D3: source.lifecycle_epoch must match the caller-captured value.
+    """source.lifecycle_epoch must match the caller-captured value.
     Refuses if epoch advanced (e.g., source was deleted+recreated between
     reserve and body)."""
     store = _store(tmp_path)
@@ -719,11 +719,11 @@ def test_body_refuses_source_lifecycle_epoch_advance(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D4 (P1): canonical_turns moves reset compacted_at = NULL
+# canonical_turns moves reset compacted_at = NULL
 # ---------------------------------------------------------------------------
 
 def test_body_resets_compacted_at_on_canonical_turns_move(tmp_path):
-    """B-D4: source's canonical_turns rows arrive with compacted_at
+    """source's canonical_turns rows arrive with compacted_at
     populated; target's compaction prefix invariant requires NULL on
     moved rows so the compaction pipeline picks them up as fresh tail."""
     store = _store(tmp_path)
@@ -752,11 +752,11 @@ def test_body_resets_compacted_at_on_canonical_turns_move(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D6 (P1): tag_regenerate payload carries conflict spec list
+# tag_regenerate payload carries conflict spec list
 # ---------------------------------------------------------------------------
 
 def test_body_tag_regenerate_payload_includes_conflict_specs(tmp_path):
-    """B-D6: when source + target both have tag_summaries for the same
+    """when source + target both have tag_summaries for the same
     tag, the tag_regenerate post-commit pending payload must carry an
     explicit (tag, source_canonical_turn_ids, target_canonical_turn_ids)
     spec per conflict so the Phase B sweeper has enough state to LLM-
@@ -803,11 +803,11 @@ def test_body_tag_regenerate_payload_includes_conflict_specs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D7 (P1): prior_alias_target captured on merge_audit
+# prior_alias_target captured on merge_audit
 # ---------------------------------------------------------------------------
 
 def test_body_captures_prior_alias_target_in_audit(tmp_path):
-    """B-D7: if source has a prior conversation_aliases row pointing
+    """if source has a prior conversation_aliases row pointing
     elsewhere, the body captures that target_id into
     merge_audit.prior_alias_target before the UPSERT overwrites it. This
     is reversibility: a future merge-revert can restore the prior alias.
@@ -843,7 +843,7 @@ def test_body_captures_prior_alias_target_in_audit(tmp_path):
 
 
 def test_body_prior_alias_target_null_when_absent(tmp_path):
-    """B-D7: prior_alias_target column is NULL when source had no prior
+    """prior_alias_target column is NULL when source had no prior
     alias (the common case)."""
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -865,11 +865,11 @@ def test_body_prior_alias_target_null_when_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D8 (P2): tag_aliases moves with conflict resolution
+# tag_aliases moves with conflict resolution
 # ---------------------------------------------------------------------------
 
 def test_body_moves_tag_aliases_no_conflict(tmp_path):
-    """B-D8: source's tag_aliases rows that don't collide with target's
+    """source's tag_aliases rows that don't collide with target's
     are UPDATEd to target's namespace; origin_conversation_id captures
     source."""
     store = _store(tmp_path)
@@ -907,7 +907,7 @@ def test_body_moves_tag_aliases_no_conflict(tmp_path):
 
 
 def test_body_resolves_tag_aliases_conflicts(tmp_path):
-    """B-D8: when source + target share an alias, target wins; source's
+    """when source + target share an alias, target wins; source's
     conflicting alias is DELETEd."""
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -942,8 +942,8 @@ def test_body_resolves_tag_aliases_conflicts(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D5 (P1) + v1.14-2 + v1.14-6: request_turn_offset must avoid collision
-# across all 4 tables. Per v1.14-2 (codex iter-3 P1), the body computes
+# + + : request_turn_offset must avoid collision
+# across all 4 tables. Per, the body computes
 # this offset INSIDE the conversation_lifecycle FOR UPDATE lock; the
 # engine no longer pre-computes. The test exercises the body path with
 # request_turn_offset=0 (no caller floor) so the recompute-under-lock
@@ -951,7 +951,7 @@ def test_body_resolves_tag_aliases_conflicts(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_body_request_turn_offset_avoids_collision_across_tables(tmp_path):
-    """v1.14-6 (codex iter-3 P2): the body computes request_turn_offset
+    """the body computes request_turn_offset
     UNDER the conversation_lifecycle FOR UPDATE lock from MAX across all
     four request-turn-bearing tables (tool_calls, request_context,
     request_captures, request_turn_counters). Seeding target with
@@ -1013,11 +1013,11 @@ def test_body_request_turn_offset_avoids_collision_across_tables(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.14-1 (P1): target request_turn_counter bumped past moved range
+# (P1): target request_turn_counter bumped past moved range
 # ---------------------------------------------------------------------------
 
 def test_body_bumps_target_request_turn_counter_past_moved_range(tmp_path):
-    """v1.14-1: after merge moves source's request-turn-bearing rows into
+    """: after merge moves source's request-turn-bearing rows into
     target's namespace, target's ``request_turn_counters.next_request_turn``
     MUST be at least ``moved_max + 1``. Future ``save_request_context()``
     calls allocate from target's counter; without this bump, allocations
@@ -1068,7 +1068,7 @@ def test_body_bumps_target_request_turn_counter_past_moved_range(tmp_path):
 
 
 def test_body_target_counter_unchanged_when_no_request_turn_rows_move(tmp_path):
-    """v1.14-1: when source has no request-turn-bearing rows, target's
+    """: when source has no request-turn-bearing rows, target's
     counter is left as-is (the bump is conditional on moved_max > 0)."""
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -1091,7 +1091,7 @@ def test_body_target_counter_unchanged_when_no_request_turn_rows_move(tmp_path):
 
 
 def test_body_post_merge_save_request_context_does_not_collide(tmp_path):
-    """v1.14-1 end-to-end: after merge, allocate a fresh request_turn via
+    """ end-to-end: after merge, allocate a fresh request_turn via
     the counter (simulating save_request_context()) and assert it does
     NOT collide with any previously-moved request_turn on target.
     """
@@ -1128,11 +1128,11 @@ def test_body_post_merge_save_request_context_does_not_collide(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.14-2 (P1): offsets recomputed under the lock; concurrent-writer race
+# (P1): offsets recomputed under the lock; concurrent-writer race
 # ---------------------------------------------------------------------------
 
 def test_body_recomputes_offset_under_lock_with_concurrent_writer_simulation(tmp_path):
-    """v1.14-2: the body must recompute offsets AFTER acquiring the
+    """: the body must recompute offsets AFTER acquiring the
     conversation_lifecycle FOR UPDATE lock. Simulate a concurrent writer
     that lands a high-request_turn row between caller-passed offset (0)
     and body lock acquisition; assert the body's recomputed offset rides
@@ -1184,7 +1184,7 @@ def test_body_recomputes_offset_under_lock_with_concurrent_writer_simulation(tmp
 
 
 def test_body_caller_offset_is_floor_not_ceiling(tmp_path):
-    """v1.14-2: caller-passed offset is honored as a floor; if recomputed
+    """: caller-passed offset is honored as a floor; if recomputed
     is lower, caller's value is used (test predictability preserved).
     """
     store = _store(tmp_path)
@@ -1215,11 +1215,11 @@ def test_body_caller_offset_is_floor_not_ceiling(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.14-3 (P2): SQL inspection extended to verify DELETE WHERE-clause shape
+# (P2): SQL inspection extended to verify DELETE WHERE-clause shape
 # ---------------------------------------------------------------------------
 
 def test_body_sql_inspection_delete_predicates_are_scope_bounded(tmp_path):
-    """v1.14-3 (codex iter-3 P2): the bounded-DELETE allowlist test by
+    """the bounded-DELETE allowlist test by
     name only is necessary but not sufficient. Scan each DELETE FROM in
     the body method source code; assert the WHERE clause includes a
     recognized scoping predicate. A future regression that adds
@@ -1294,11 +1294,11 @@ def test_body_sql_inspection_delete_predicates_are_scope_bounded(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# B-D10 (P2): per-table move correctness coverage expansion
+# per-table move correctness coverage expansion
 # ---------------------------------------------------------------------------
 
 def test_body_moves_facts(tmp_path):
-    """B-D10: facts table moves source rows; origin captured."""
+    """facts table moves source rows; origin captured."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -1325,7 +1325,7 @@ def test_body_moves_facts(tmp_path):
 
 
 def test_body_moves_tool_calls_with_offset(tmp_path):
-    """B-D10: tool_calls request_turn += offset on move."""
+    """tool_calls request_turn += offset on move."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _seed_conversation(conn, "tA", "src")
@@ -1354,7 +1354,7 @@ def test_body_moves_tool_calls_with_offset(tmp_path):
 
 
 def test_body_rollback_on_late_failure(tmp_path, monkeypatch):
-    """B-D10: simulate failure during merge_post_commit_pending INSERT
+    """simulate failure during merge_post_commit_pending INSERT
     (the LAST step of the body). The whole body transaction must rollback;
     no row moves persist; merge_audit stays in_progress.
     """
@@ -1411,11 +1411,11 @@ def test_body_rollback_on_late_failure(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# B-D11 (P2): anti-subversion comprehensive guard
+# anti-subversion comprehensive guard
 # ---------------------------------------------------------------------------
 
 def test_body_does_not_call_provider_delete(tmp_path, monkeypatch):
-    """B-D11: spy on provider.delete (used by the LLM-tool delete path)
+    """spy on provider.delete (used by the LLM-tool delete path)
     to confirm the body method never invokes it. Move semantics is
     UPDATE conversation_id, never delegate to the destructive provider
     primitive."""
@@ -1457,7 +1457,7 @@ def test_body_does_not_call_provider_delete(tmp_path, monkeypatch):
 
 
 def test_body_sql_inspection_no_unbounded_destructive_writes(tmp_path):
-    """B-D11: regex-scan both the SQLite + PostgreSQL body method source
+    """regex-scan both the SQLite + PostgreSQL body method source
     code; assert every DELETE FROM <table> is allowlisted. The bounded-
     DELETE allowlist is the single source of truth for what destructive
     primitives the body is permitted to touch."""
@@ -1497,14 +1497,14 @@ def test_body_sql_inspection_no_unbounded_destructive_writes(tmp_path):
 
 
 def test_body_sql_inspection_tenant_aware_writes_predicate_on_tenant_id(tmp_path):
-    """B-D11 / B-D1 invariant: every UPDATE/SELECT against a TENANT-AWARE
+    """ / invariant: every UPDATE/SELECT against a TENANT-AWARE
     table (conversations, merge_audit) in the body method must predicate
     on tenant_id. Per-conv tables (segments, canonical_turns, ...) don't
     carry tenant_id; they're scoped on conversation_id only; tenant
     scoping is transitive via the body's source.tenant_id re-validation
     at body entry. This test pins the tenant-aware predicate invariant.
 
-    v1.15-3 (codex iter-4 P2): parametrized over BOTH SQLite + PostgreSQL
+    parametrized over BOTH SQLite + PostgreSQL
     body method source code so PG predicate drift is also pinned.
     """
     import inspect
@@ -1550,14 +1550,14 @@ def test_body_sql_inspection_tenant_aware_writes_predicate_on_tenant_id(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# v1.15-2 (P1): chained-merge counter bump uses MAX of all rows on target,
+# (P1): chained-merge counter bump uses MAX of all rows on target,
 # not just rows where origin_conversation_id = most-recent source. Origin
 # is preserved by COALESCE on subsequent merges, so an origin-filtered
 # bump under-counts when the target has rows from earlier merges.
 # ---------------------------------------------------------------------------
 
 def test_body_chained_merge_counter_bump_includes_earlier_origin_rows(tmp_path):
-    """v1.15-2: A->B->C chained merge. A's rows on B carry origin = A;
+    """: A->B->C chained merge. A's rows on B carry origin = A;
     when B->C runs, those rows move to C with origin still = A (preserved
     by COALESCE). The counter bump query must compute max over ALL rows
     on C regardless of origin so the next allocation cannot collide with
@@ -1613,9 +1613,9 @@ def test_body_chained_merge_counter_bump_includes_earlier_origin_rows(tmp_path):
     # OR we use a different chain. Simpler: merge convB into convC.
     # But convB's phase is now 'merged' from stage 1's source-side flip.
     # That means convB cannot be a source in another merge (phase check
-    # in B-D2 refuses 'merged' source).
+    # in refuses 'merged' source).
     # Workaround for this chained-merge test: reset convB to 'active' so
-    # we can simulate the chained-merge scenario the codex finding flagged.
+    # we can simulate the chained-merge scenario this test pins.
     conn.execute("UPDATE conversations SET phase = 'active' WHERE conversation_id = 'convB'")
     conn.commit()
 
@@ -1638,7 +1638,7 @@ def test_body_chained_merge_counter_bump_includes_earlier_origin_rows(tmp_path):
     )
 
     # The critical assertion: C's counter must be > MAX request_turn of
-    # ALL rows on C, not just rows with origin = convB. With the v1.14
+    # ALL rows on C, not just rows with origin = convB. With the
     # origin-filtered query, A-origin rows would be excluded and the
     # bump would under-count.
     c_max_rt = conn.execute(
@@ -1662,13 +1662,13 @@ def test_body_chained_merge_counter_bump_includes_earlier_origin_rows(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.15-7 (P3): the bumped-counter stat reports the actual UPSERT result,
+# (P3): the bumped-counter stat reports the actual UPSERT result,
 # not just moved_max + 1. When target's existing counter is higher than
 # moved_max + 1, the stat should reflect the preserved-higher value.
 # ---------------------------------------------------------------------------
 
 def test_body_counter_stat_reflects_actual_upsert_value(tmp_path):
-    """v1.15-7: stat ``request_turn_counters_target_bumped_to`` is the
+    """: stat ``request_turn_counters_target_bumped_to`` is the
     actual post-UPSERT next_request_turn (captured via RETURNING), NOT
     just ``moved_max + 1``. When target's existing counter is higher,
     GREATEST/MAX preserves it; the stat reflects that.
@@ -1711,16 +1711,16 @@ def test_body_counter_stat_reflects_actual_upsert_value(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.15-1 (P1): closer simulation of the cross-transaction stale-offset race.
+# (P1): closer simulation of the cross-transaction stale-offset race.
 # SQLite cannot exhibit the PG race (BEGIN IMMEDIATE serializes writers at
 # the database level), so this test pins the SQLite-equivalent invariant:
 # a write that lands BEFORE the body call (no concurrent writers possible
 # under SQLite serialization) must still produce a non-colliding offset.
-# Real concurrency exercise lives in the PG smoke file (v1.15-1's PG path).
+# Real concurrency exercise lives in the PG smoke file ('s PG path).
 # ---------------------------------------------------------------------------
 
 def test_body_offset_recomputes_after_write_to_target(tmp_path):
-    """v1.15-1 SQLite invariant: a write that lands on target's
+    """ SQLite invariant: a write that lands on target's
     request-turn-bearing tables BEFORE the body's offset recomputation
     must be reflected in the recomputed offset. SQLite serializes via
     BEGIN IMMEDIATE so no concurrent writer can race the body; this test
@@ -1776,13 +1776,13 @@ def test_body_offset_recomputes_after_write_to_target(tmp_path):
 
 
 def test_pg_share_lock_helper_present_on_postgres_store(tmp_path):
-    """v1.15-1 structural pin: PostgresStore must expose the lifecycle
+    """ structural pin: PostgresStore must expose the lifecycle
     SHARE-lock helper used by save_request_context. This test catches
     a regression that drops the helper or stops calling it.
     """
     from virtual_context.storage.postgres import PostgresStore
     assert hasattr(PostgresStore, "_acquire_lifecycle_share_lock"), (
-        "v1.15-1: PostgresStore._acquire_lifecycle_share_lock helper missing; "
+        "share-lock contract: PostgresStore._acquire_lifecycle_share_lock helper missing; "
         "stale-offset race re-opens without it"
     )
     # Confirm save_request_context calls the helper (text-level grep is
@@ -1790,6 +1790,6 @@ def test_pg_share_lock_helper_present_on_postgres_store(tmp_path):
     import inspect
     src = inspect.getsource(PostgresStore.save_request_context)
     assert "_acquire_lifecycle_share_lock" in src, (
-        "v1.15-1: PostgresStore.save_request_context no longer invokes "
+        "share-lock contract: PostgresStore.save_request_context no longer invokes "
         "_acquire_lifecycle_share_lock; lock contract regressed"
     )

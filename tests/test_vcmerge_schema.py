@@ -1,18 +1,18 @@
-"""Schema-smoke tests for VCMERGE Phase 0 migrations (M0.1, M0.3, M0.4, M0.5).
+"""Schema-smoke tests for VCMERGE Phase 0 migrations (, , ).
 
-Per VCMerge plan v1.11 sections 2.4 + 11.0. Pins:
-- conversations.phase CHECK admits the 'merged' value (M0.1)
-- merge_audit table exists with expected columns + tenant_id (M0.3)
+ Pins:
+- conversations.phase CHECK admits the 'merged' value
+- merge_audit table exists with expected columns + tenant_id
 - merge_post_commit_pending table exists with tenant_id + the two
-  tenant-consistency triggers (M0.4)
+  tenant-consistency triggers
 - idx_merge_audit_active_source rejects duplicate (tenant, source) at
-  status IN ('in_progress', 'committed') (M0.5)
+  status IN ('in_progress', 'committed')
 - _ensure_schema() is idempotent re-runnable
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue: every test in the anti-
+: every test in the anti-
 subversion bundle carries the marker because the bundle's existence
-traces to the 2026-04-26 VCATTACH data-loss anchor incident at
+traces to the VCATTACH data-loss anchor incident at
 commit 502db28. See tests/REGRESSION_MAP.md.
 """
 
@@ -72,11 +72,11 @@ def _insert_merge_audit(
 
 
 # ---------------------------------------------------------------------------
-# M0.1: conversations.phase CHECK admits 'merged'
+# : conversations.phase CHECK admits 'merged'
 # ---------------------------------------------------------------------------
 
 def test_conversations_phase_check_admits_merged(tmp_path):
-    """M0.1: the phase CHECK must accept the new 'merged' value."""
+    """: the phase CHECK must accept the new 'merged' value."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _insert_conversation(conn, "tenant-A", "conv-1", phase="merged")
@@ -89,7 +89,7 @@ def test_conversations_phase_check_admits_merged(tmp_path):
 
 
 def test_conversations_phase_check_rejects_invalid_value(tmp_path):
-    """M0.1: the CHECK still rejects unknown phase values."""
+    """: the CHECK still rejects unknown phase values."""
     store = _store(tmp_path)
     conn = store._get_conn()
     with pytest.raises(sqlite3.IntegrityError):
@@ -97,7 +97,7 @@ def test_conversations_phase_check_rejects_invalid_value(tmp_path):
 
 
 def test_conversations_phase_check_admits_existing_values(tmp_path):
-    """M0.1: every prior phase value (init/active/ingesting/compacting/deleted)
+    """: every prior phase value (init/active/ingesting/compacting/deleted)
     still accepted post-relaxation. Regression for accidental phase removal.
     """
     store = _store(tmp_path)
@@ -107,11 +107,11 @@ def test_conversations_phase_check_admits_existing_values(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# M0.3: merge_audit table
+# : merge_audit table
 # ---------------------------------------------------------------------------
 
 def test_merge_audit_table_exists_with_expected_columns(tmp_path):
-    """M0.3: table exists with all spec section 9 columns including tenant_id."""
+    """: table exists with all columns including tenant_id."""
     store = _store(tmp_path)
     conn = store._get_conn()
     cols = {
@@ -135,7 +135,7 @@ def test_merge_audit_table_exists_with_expected_columns(tmp_path):
 
 
 def test_merge_audit_status_check_admits_three_states(tmp_path):
-    """M0.3: status CHECK admits in_progress, committed, rolled_back."""
+    """: status CHECK admits in_progress, committed, rolled_back."""
     store = _store(tmp_path)
     conn = store._get_conn()
     for status in ("in_progress", "committed", "rolled_back"):
@@ -150,7 +150,7 @@ def test_merge_audit_status_check_admits_three_states(tmp_path):
 
 
 def test_merge_audit_status_check_rejects_invalid(tmp_path):
-    """M0.3: status CHECK rejects unknown values."""
+    """: status CHECK rejects unknown values."""
     store = _store(tmp_path)
     conn = store._get_conn()
     with pytest.raises(sqlite3.IntegrityError):
@@ -165,11 +165,11 @@ def test_merge_audit_status_check_rejects_invalid(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# M0.5: idx_merge_audit_active_source unique partial index
+# : idx_merge_audit_active_source unique partial index
 # ---------------------------------------------------------------------------
 
 def test_unique_partial_index_rejects_duplicate_in_progress(tmp_path):
-    """M0.5: second in_progress row for same (tenant, source) violates."""
+    """: second in_progress row for same (tenant, source) violates."""
     store = _store(tmp_path)
     conn = store._get_conn()
     _insert_merge_audit(
@@ -184,7 +184,7 @@ def test_unique_partial_index_rejects_duplicate_in_progress(tmp_path):
 
 
 def test_unique_partial_index_rejects_committed_after_in_progress(tmp_path):
-    """M0.5 + D4: committed rows MUST stay in the unique-index predicate so
+    """ + D4: committed rows MUST stay in the unique-index predicate so
     re-merge attempts collide and resolve via the 5-state idempotency
     discriminator.
     """
@@ -202,7 +202,7 @@ def test_unique_partial_index_rejects_committed_after_in_progress(tmp_path):
 
 
 def test_unique_partial_index_admits_rolled_back(tmp_path):
-    """M0.5 + D4: rolled_back rows are OUT of the partial index, so a fresh
+    """ + D4: rolled_back rows are OUT of the partial index, so a fresh
     in_progress row for the same (tenant, source) succeeds (retry path).
     """
     store = _store(tmp_path)
@@ -219,7 +219,7 @@ def test_unique_partial_index_admits_rolled_back(tmp_path):
 
 
 def test_unique_partial_index_scoped_per_tenant(tmp_path):
-    """M0.5 + tenant isolation (per spec section 13 v3.8-2): two tenants
+    """ + tenant isolation (per ): two tenants
     with the same source_id can both reserve in_progress.
     """
     store = _store(tmp_path)
@@ -235,11 +235,11 @@ def test_unique_partial_index_scoped_per_tenant(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# M0.4: merge_post_commit_pending + tenant-consistency triggers
+# : merge_post_commit_pending + tenant-consistency triggers
 # ---------------------------------------------------------------------------
 
 def test_merge_post_commit_pending_table_exists_with_tenant_id(tmp_path):
-    """M0.4 + D2: table exists with tenant_id column for tenant-isolated
+    """ + D2: table exists with tenant_id column for tenant-isolated
     consumer support.
     """
     store = _store(tmp_path)
@@ -260,7 +260,7 @@ def test_merge_post_commit_pending_table_exists_with_tenant_id(tmp_path):
 
 
 def test_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(tmp_path):
-    """M0.4 trigger (insert variant): INSERT with tenant_id != audit's
+    """ trigger (insert variant): INSERT with tenant_id != audit's
     tenant_id raises a constraint error.
     """
     store = _store(tmp_path)
@@ -283,7 +283,7 @@ def test_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(tmp_pa
 
 
 def test_merge_post_commit_pending_insert_trigger_accepts_tenant_match(tmp_path):
-    """M0.4 trigger: INSERT with matching tenant_id succeeds."""
+    """ trigger: INSERT with matching tenant_id succeeds."""
     store = _store(tmp_path)
     conn = store._get_conn()
     merge_id = str(uuid.uuid4())
@@ -303,7 +303,7 @@ def test_merge_post_commit_pending_insert_trigger_accepts_tenant_match(tmp_path)
 
 
 def test_merge_post_commit_pending_update_trigger_rejects_tenant_mutation(tmp_path):
-    """M0.4 trigger (update variant): UPDATE that mutates tenant_id to a
+    """ trigger (update variant): UPDATE that mutates tenant_id to a
     mismatching value raises.
     """
     store = _store(tmp_path)
@@ -331,7 +331,7 @@ def test_merge_post_commit_pending_update_trigger_rejects_tenant_mutation(tmp_pa
 
 
 def test_merge_post_commit_pending_update_trigger_admits_status_only_update(tmp_path):
-    """M0.4 trigger (update variant): status-only UPDATE does NOT fire the
+    """ trigger (update variant): status-only UPDATE does NOT fire the
     consistency check (the BEFORE UPDATE OF tenant_id event filter
     short-circuits). Validates that the trigger does not regress to
     firing on every UPDATE.

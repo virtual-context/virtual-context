@@ -1,6 +1,6 @@
-"""Tenant_id propagation tests for the conversations table (v1.16-1 prod fold).
+"""Tenant_id propagation tests for the conversations table ( prod fold).
 
-Per codex iter-5 prod blocker (cloud E2E surfaced: every existing user conv
+Per prod blocker (cloud E2E surfaced: every existing user conv
 plus every freshly-created conv had ``conversations.tenant_id = ''``,
 which broke VCMERGE Layer C tenant validation with HTTP 403):
 
@@ -80,7 +80,7 @@ def test_upsert_conversation_writes_tenant_id_from_caller(tmp_path):
 
 
 def test_engine_lifecycle_load_uses_config_tenant_id(tmp_path):
-    """Structural pin (v1.16-1): ``Engine._load_lifecycle_epoch_into_engine_state``
+    """Structural pin: ``Engine._load_lifecycle_epoch_into_engine_state``
     no longer hard-codes ``tenant_id=""`` in its upsert_conversation call;
     the call sources tenant_id from ``self.config.tenant_id``.
     """
@@ -91,29 +91,29 @@ def test_engine_lifecycle_load_uses_config_tenant_id(tmp_path):
     )
     # The literal hard-coded empty placeholder is gone.
     assert 'tenant_id=""' not in src, (
-        "v1.16-1: Engine._load_lifecycle_epoch_into_engine_state still "
+        "tenant_id-propagation: Engine._load_lifecycle_epoch_into_engine_state still "
         "hard-codes tenant_id=\"\"; tenant scoping regression"
     )
     # The config-derived form is present.
     assert "self.config.tenant_id" in src or "tenant_id=tenant_id" in src, (
-        "v1.16-1: Engine._load_lifecycle_epoch_into_engine_state should "
+        "tenant_id-propagation: Engine._load_lifecycle_epoch_into_engine_state should "
         "source tenant_id from self.config.tenant_id"
     )
 
 
 def test_engine_sync_turns_uses_config_tenant_id(tmp_path):
-    """Structural pin (v1.16-1): ``Engine.sync_turns_from_payload`` no
+    """Structural pin: ``Engine.sync_turns_from_payload`` no
     longer hard-codes ``tenant_id=""`` in its upsert_conversation call.
     """
     import inspect
     from virtual_context.engine import VirtualContextEngine
     src = inspect.getsource(VirtualContextEngine.sync_turns_from_payload)
     assert 'tenant_id=""' not in src, (
-        "v1.16-1: Engine.sync_turns_from_payload still hard-codes "
+        "tenant_id-propagation: Engine.sync_turns_from_payload still hard-codes "
         "tenant_id=\"\"; tenant scoping regression"
     )
     assert "self.config.tenant_id" in src, (
-        "v1.16-1: Engine.sync_turns_from_payload should source tenant_id "
+        "tenant_id-propagation: Engine.sync_turns_from_payload should source tenant_id "
         "from self.config.tenant_id"
     )
 
@@ -149,13 +149,13 @@ def test_engine_creates_conversations_row_with_config_tenant_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.16-1 backfill behavior: source tenant_id from cloud_conversations.
+# backfill behavior: source tenant_id from cloud_conversations.
 # Structural-only on SQLite (no cloud_conversations table); behavioral
 # in tests/test_conversations_tenant_id_backfill_postgres.py against PG.
 # ---------------------------------------------------------------------------
 
 def test_pg_backfill_sql_present_in_ensure_schema():
-    """v1.16-1 structural pin: ``PostgresStore._ensure_schema`` must contain
+    """ structural pin: ``PostgresStore._ensure_schema`` must contain
     the cloud_conversations backfill UPDATE. A future regression that drops
     the migration would fail this test before reaching staging."""
     import inspect
@@ -163,11 +163,11 @@ def test_pg_backfill_sql_present_in_ensure_schema():
     src = inspect.getsource(postgres_mod.PostgresStore._ensure_schema)
     # The backfill SQL fingerprint: "FROM cloud_conversations" + tenant_id update target.
     assert "FROM cloud_conversations" in src, (
-        "v1.16-1: PostgresStore._ensure_schema missing cloud_conversations "
+        "tenant_id-propagation: PostgresStore._ensure_schema missing cloud_conversations "
         "backfill UPDATE; existing prod convs would stay with empty tenant_id"
     )
     assert "UPDATE conversations" in src, (
-        "v1.16-1: PostgresStore._ensure_schema backfill missing UPDATE "
+        "tenant_id-propagation: PostgresStore._ensure_schema backfill missing UPDATE "
         "conversations target"
     )
     # Idempotency safeguard: WHERE filters on empty target.
@@ -175,12 +175,12 @@ def test_pg_backfill_sql_present_in_ensure_schema():
         "conversations.tenant_id = ''" in src
         or 'conversations.tenant_id IS NULL' in src
     ), (
-        "v1.16-1: backfill UPDATE missing the empty-source idempotency "
+        "tenant_id-propagation: backfill UPDATE missing the empty-source idempotency "
         "filter; would re-write tenant_id on every schema bootstrap"
     )
     # Best-effort gate: UndefinedTable swallowed.
     assert "UndefinedTable" in src, (
-        "v1.16-1: backfill should swallow only psycopg.errors.UndefinedTable "
+        "tenant_id-propagation: backfill should swallow only psycopg.errors.UndefinedTable "
         "(missing cloud_conversations on engine-only deploys); other "
         "exceptions must propagate"
     )

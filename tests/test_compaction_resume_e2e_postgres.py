@@ -167,7 +167,7 @@ def _age_heartbeat(pg_store, op_id: str, age_s: float = 600) -> None:
 def test_compaction_resume_e2e_postgres():
     """Full takeover flow against real Postgres.
 
-    Worker-death simulation: simple heartbeat back-dating (plan §5 "go with
+    Worker-death simulation: simple heartbeat back-dating (plan "go with
     the simple approach"). No subprocess spawning required.
 
     LLM stubbing: compact_if_needed is replaced with a MagicMock that
@@ -314,10 +314,10 @@ def test_compaction_resume_e2e_postgres():
             )
 
         # 7d. ALL canonical_turns have compacted_at NOT NULL
-        #     and compaction_operation_id = new_op
-        #     (compact_if_needed is mocked to return None so no mark_canonical
-        #      call fires inside the pipeline — skip these assertions when
-        #      the mock swallows them, but assert the zero-dead-op invariant)
+        # and compaction_operation_id = new_op
+        # (compact_if_needed is mocked to return None so no mark_canonical
+        # call fires inside the pipeline — skip these assertions when
+        # the mock swallows them, but assert the zero-dead-op invariant)
         dead_ct_count = conn.execute(
             """
             SELECT COUNT(*) AS cnt FROM canonical_turns

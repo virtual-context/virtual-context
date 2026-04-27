@@ -1,14 +1,14 @@
 """Dual-handler refuse pair tests for VCMERGE (P1.4 + P1.8 / C1.0 closure).
 
-Per VCMerge plan v1.11 sections 3.4 + 4.1 + 11.2 + 13.3 anti-subversion
+ anti-subversion
 summary. Pins:
 
 - _handle_vc_command_rest at handlers.py:2253 refuses cmd == "merge"
-  with a `merge_routed_outside_cloud_rest` error envelope (P1.4 / v1.4-1).
+  with a `merge_routed_outside_cloud_rest` error envelope (P1.4 / ).
 - _handle_vc_command at handlers.py:1883 refuses cmd == "merge" with a
   `merge_routed_outside_cloud_proxy` error envelope (P1.8 / v1.10 C1.0).
 - Both refuses preserve the dual-populated error+message envelope shape
-  (per spec section 12.9) so plugin clients render the message and
+  (per ) so plugin clients render the message and
   programmatic consumers branch on the error code.
 - The proxy-mode regex in proxy/server.py admits the MERGE / MERGESTATUS
   alternations so result.vc_command can populate "merge" or
@@ -20,7 +20,7 @@ summary. Pins:
   P1.2 (engine-handled preview body, future work).
 
 Marked @pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26") per
-VCMerge plan v1.11 section 11 prologue.
+.
 """
 
 from __future__ import annotations
@@ -122,12 +122,12 @@ def test_rest_handler_refuses_vcmerge_into_with_merge_routed_outside_cloud_rest(
     )
     payload = json.loads(response.body)
     assert payload["error"] == "merge_routed_outside_cloud_rest"
-    # Dual-populated envelope per spec section 12.9.
+    # Dual-populated envelope per .
     assert "message" in payload
     assert "VCMERGE" in payload["message"]
     assert "vc_cloud/rest_api.py" in payload["message"]
     assert payload["vc_command"] == "merge"
-    # Source's id stays bound (per spec section 6.2 codex P2-10 pattern;
+    # Source's id stays bound (refuse-pair pattern;
     # PREVIEW would also bind to source).
     assert payload["conversation_id"] == "src-conv"
 
@@ -242,11 +242,11 @@ def test_proxy_handler_refuses_streaming_request_too():
     request is streaming; engine returns a StreamingResponse with the
     error text.
 
-    Per E-D1 fold (codex iter-1 P1): the streaming SSE chunk now
+    Per fold the streaming SSE chunk now
     carries BOTH the programmatic error code AND the human message
     via cloud's preferred prefix shape `[error_code] message`. This
-    satisfies spec §12.9 dual-population on both transports. OI5 from
-    v1.12 §13.2 (deferred to v1.14) is now resolved by E-D1.
+    satisfies dual-population on both transports. from
+    v1.12 (deferred to ) is now resolved by .
     """
     import asyncio
     result = _make_proxy_result(
@@ -277,10 +277,10 @@ async def _drain_async(aiter):
 
 
 def test_rest_and_proxy_refuse_envelopes_carry_both_fields_E_D1():
-    """E-D1 (codex iter-1 P1): REST JSON envelope and proxy SSE chunk
+    """ REST JSON envelope and proxy SSE chunk
     BOTH carry the programmatic error code AND the human message,
     even though the wire formats differ. Asserts envelope-equivalence
-    across the dual-handler refuse pair per spec §12.9.
+    across the dual-handler refuse pair per .
 
     REST: structured JSON with separate `error` + `message` fields.
     Proxy streaming: text payload prefixed `[error_code] message` so
@@ -341,7 +341,7 @@ def test_proxy_handler_returns_preview_not_implemented():
 # ---------------------------------------------------------------------------
 
 def test_rest_and_proxy_refuse_codes_are_distinct():
-    """The C1.0 anti-subversion summary at plan section 13.3 specifies
+    """The C1.0 anti-subversion summary at plan specifies
     distinct error codes for each transport so cloud ops can triage
     WHICH transport's intercept failed. A regression that conflates the
     two codes loses that diagnostic signal.
