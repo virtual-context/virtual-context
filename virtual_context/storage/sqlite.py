@@ -3038,6 +3038,185 @@ CREATE TABLE IF NOT EXISTS request_captures (
         out.sort(key=lambda d: d["age_s"], reverse=True)
         return out[: int(limit)]
 
+    # ------------------------------------------------------------------
+    # VCMERGE storage methods (S1.2, S1.5, S1.6, S1.7 per plan v1.11)
+    # SQLite mirror of the PostgresStore methods. Body method (S1.4) is
+    # not implemented here either — see the corresponding PostgresStore
+    # comment block. SQLite is the test backend per project convention;
+    # production runs PG.
+    # ------------------------------------------------------------------
+
+    def _row_to_merge_audit_view(self, row):
+        """Convert a sqlite3.Row to a MergeAuditView. Helper for S1.5/S1.6
+        and the SELECT branch of try_reserve. SQLite stores datetimes as
+        TEXT (ISO format); cloud's response builder accepts either str
+        or datetime, but we parse to datetime for type-correctness so
+        the dataclass annotation matches.
+        """
+        from ..types import MergeAuditView
+        from datetime import datetime
+        def _parse(v):
+            if v is None:
+                return None
+            if isinstance(v, datetime):
+                return v
+            try:
+                return datetime.fromisoformat(str(v))
+            except Exception:
+                return None
+        return MergeAuditView(
+            merge_id=str(row["merge_id"]),
+            tenant_id=str(row["tenant_id"]),
+            source_conversation_id=str(row["source_conversation_id"]),
+            target_conversation_id=str(row["target_conversation_id"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            started_at=_parse(row["started_at"]) or datetime.now(timezone.utc),
+            completed_at=_parse(row["completed_at"]),
+            source_label_at_merge=str(row["source_label_at_merge"] or ""),
+            rows_moved_json=row["rows_moved_json"],
+            error_message=row["error_message"],
+        )
+
+    def try_reserve_merge_audit_in_progress(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        source_label_at_merge: str = "",
+    ):
+        """SQLite mirror of PostgresStore.try_reserve_merge_audit_in_progress.
+
+        SQLite uses autocommit-per-statement (per the existing
+        SQLiteStore convention; tests run single-threaded so the
+        SAVEPOINT pattern's race-window guarantees aren't exercised).
+        On IntegrityError we SELECT the colliding row in a fresh
+        implicit transaction.
+        """
+        from ..types import ReservationResult
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO merge_audit
+                    (merge_id, tenant_id, source_conversation_id,
+                     target_conversation_id, source_label_at_merge,
+                     status, started_at)
+                VALUES (?, ?, ?, ?, ?, 'in_progress', ?)
+                """,
+                (
+                    merge_id, tenant_id, source_conversation_id,
+                    target_conversation_id, source_label_at_merge, now,
+                ),
+            )
+            conn.commit()
+            return ReservationResult(
+                status="reserved", merge_id=merge_id, existing=None,
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+        existing = conn.execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = ?
+               AND source_conversation_id = ?
+               AND status IN ('in_progress', 'committed')
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+        if existing is None:
+            return ReservationResult(
+                status="race_retry", merge_id=merge_id, existing=None,
+            )
+        view = self._row_to_merge_audit_view(existing)
+        if view.status == "in_progress":
+            return ReservationResult(
+                status="in_progress", merge_id=view.merge_id, existing=view,
+            )
+        if view.source_label_at_merge == source_label_at_merge:
+            return ReservationResult(
+                status="committed_match", merge_id=view.merge_id, existing=view,
+            )
+        return ReservationResult(
+            status="committed_mismatch", merge_id=view.merge_id, existing=view,
+        )
+
+    def lookup_committed_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.5 SQLite mirror."""
+        row = self._get_conn().execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = ?
+               AND source_conversation_id = ?
+               AND status = 'committed'
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_merge_audit_view(row)
+
+    def lookup_active_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.6 SQLite mirror."""
+        row = self._get_conn().execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = ?
+               AND source_conversation_id = ?
+               AND status IN ('in_progress', 'committed')
+             ORDER BY started_at DESC
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_merge_audit_view(row)
+
+    def _mark_merge_rolled_back(
+        self,
+        tenant_id: str,
+        merge_id: str,
+        error_message: str,
+    ) -> bool:
+        """S1.7 SQLite mirror. Single owner: cloud's REST handler."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        cur = conn.execute(
+            """
+            UPDATE merge_audit
+               SET status = 'rolled_back',
+                   error_message = ?,
+                   completed_at = ?
+             WHERE tenant_id = ?
+               AND merge_id = ?
+               AND status = 'in_progress'
+            """,
+            (error_message, now, tenant_id, merge_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
     def complete_ingestion_episode(
         self,
         *,

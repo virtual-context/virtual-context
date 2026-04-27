@@ -2505,6 +2505,277 @@ class PostgresStore(ContextStore):
             for r in rows
         ]
 
+    # ------------------------------------------------------------------
+    # VCMERGE storage methods (S1.1, S1.5, S1.6, S1.7 per plan v1.11)
+    # ------------------------------------------------------------------
+    #
+    # The body method (S1.3) is intentionally NOT implemented yet — it
+    # depends on M0.2's origin_conversation_id columns landing first and
+    # is the bulk of Phase 1's risk (per-table moves across 17 tables
+    # under a body transaction). The reservation (S1.1), lookups (S1.5,
+    # S1.6) and rollback marker (S1.7) are the read+state-change primitives
+    # that cloud's REST handler at vc_cloud/rest_api.py needs to wire up
+    # the merge dispatcher (C2.1) plus the idempotency 5-state envelope
+    # (per plan section 4.1 + spec section 12.7).
+    #
+    # The cloud handler's flow is:
+    #   1. C2.3/C2.4 pre-checks (size, tenant)
+    #   2. S1.1 try_reserve_merge_audit_in_progress -> ReservationResult
+    #   3. dispatch on result.status (5 states):
+    #        reserved        -> call engine body, then mark audit committed
+    #        in_progress     -> render in_progress envelope from existing
+    #        committed_match -> render success envelope from existing
+    #        committed_mismatch -> render mismatch envelope from existing
+    #        race_retry      -> recurse to step 2
+    #   4. on body exception -> S1.7 _mark_merge_rolled_back
+
+    def try_reserve_merge_audit_in_progress(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        source_label_at_merge: str = "",
+    ):
+        """Atomically reserve a merge_audit row in status='in_progress'.
+
+        Returns a ReservationResult discriminated by the 5 states defined
+        in plan section 3.1 T1.3:
+
+          reserved          -> this caller's INSERT succeeded; caller owns
+                               the merge body
+          in_progress       -> a prior INSERT is mid-body for the same
+                               (tenant, source); cloud renders the
+                               in-progress envelope
+          committed_match   -> a prior INSERT completed successfully AND
+                               the prior call's source_label_at_merge ==
+                               this caller's label (idempotent retry)
+          committed_mismatch-> a prior INSERT completed successfully AND
+                               the labels differ (cloud renders the
+                               mismatch envelope referencing the existing
+                               row)
+          race_retry        -> the colliding row transitioned in_progress
+                               -> rolled_back between INSERT-fail and
+                               SELECT (rare race per spec section 12.7);
+                               cloud retries the reservation flow
+
+        The reservation lands inside an explicit transaction so that on
+        IntegrityError (the unique partial index at idx_merge_audit_active_source
+        per M0.5 catches duplicates per (tenant, source) where status IN
+        ('in_progress','committed')), we can SELECT the existing row in
+        the same transactional context. Postgres autocommit mode (the
+        default for PostgresStore connections) doesn't allow SAVEPOINT
+        outside an explicit transaction; the with-transaction context
+        manager handles that bracketing.
+        """
+        from ..types import ReservationResult, MergeAuditView
+
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc)
+
+        try:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO merge_audit
+                        (merge_id, tenant_id, source_conversation_id,
+                         target_conversation_id, source_label_at_merge,
+                         status, started_at)
+                    VALUES (%s, %s, %s, %s, %s, 'in_progress', %s)
+                    """,
+                    (
+                        merge_id, tenant_id, source_conversation_id,
+                        target_conversation_id, source_label_at_merge, now,
+                    ),
+                )
+            # INSERT succeeded -> we own this merge.
+            return ReservationResult(
+                status="reserved", merge_id=merge_id, existing=None,
+            )
+        except psycopg.errors.UniqueViolation:
+            pass  # Fall through to SELECT-the-winner.
+        except Exception:
+            logger.warning(
+                "try_reserve_merge_audit_in_progress unexpected error",
+                exc_info=True,
+            )
+            raise
+
+        # SELECT the row that won the race. The unique partial index covers
+        # status IN ('in_progress', 'committed'); a duplicate INSERT is one
+        # of three cases:
+        #   - the existing row has status='in_progress' (a prior caller is
+        #     mid-body; we render the in_progress envelope)
+        #   - the existing row has status='committed' (prior caller's body
+        #     succeeded; either committed_match or committed_mismatch)
+        #   - the existing row was status='in_progress' at INSERT-fail time
+        #     but transitioned to 'rolled_back' between INSERT and SELECT
+        #     (rare race; cloud retries)
+        existing = conn.execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = %s
+               AND source_conversation_id = %s
+               AND status IN ('in_progress', 'committed')
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+
+        if existing is None:
+            # The winner row transitioned to 'rolled_back' between our
+            # INSERT-fail and this SELECT. Rare race; cloud retries.
+            return ReservationResult(
+                status="race_retry", merge_id=merge_id, existing=None,
+            )
+
+        view = MergeAuditView(
+            merge_id=str(existing["merge_id"]),
+            tenant_id=str(existing["tenant_id"]),
+            source_conversation_id=str(existing["source_conversation_id"]),
+            target_conversation_id=str(existing["target_conversation_id"]),
+            status=str(existing["status"]),  # type: ignore[arg-type]
+            started_at=existing["started_at"],
+            completed_at=existing["completed_at"],
+            source_label_at_merge=str(existing["source_label_at_merge"] or ""),
+            rows_moved_json=existing["rows_moved_json"],
+            error_message=existing["error_message"],
+        )
+
+        if view.status == "in_progress":
+            return ReservationResult(
+                status="in_progress", merge_id=view.merge_id, existing=view,
+            )
+        # status == 'committed'
+        if view.source_label_at_merge == source_label_at_merge:
+            return ReservationResult(
+                status="committed_match", merge_id=view.merge_id, existing=view,
+            )
+        return ReservationResult(
+            status="committed_mismatch", merge_id=view.merge_id, existing=view,
+        )
+
+    def lookup_committed_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.5 — read-side lookup for the committed merge audit row of
+        a given (tenant, source). Returns MergeAuditView | None.
+
+        Used by cloud's alias-resolution shim and dashboard endpoints
+        that need to surface "merged from X" provenance.
+        """
+        from ..types import MergeAuditView
+
+        row = self._get_conn().execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = %s
+               AND source_conversation_id = %s
+               AND status = 'committed'
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return MergeAuditView(
+            merge_id=str(row["merge_id"]),
+            tenant_id=str(row["tenant_id"]),
+            source_conversation_id=str(row["source_conversation_id"]),
+            target_conversation_id=str(row["target_conversation_id"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            source_label_at_merge=str(row["source_label_at_merge"] or ""),
+            rows_moved_json=row["rows_moved_json"],
+            error_message=row["error_message"],
+        )
+
+    def lookup_active_merge_audit_for_source(
+        self, tenant_id: str, source_conversation_id: str,
+    ):
+        """S1.6 — read-side lookup for ANY active (in_progress or
+        committed) merge audit row of a given (tenant, source).
+        Returns MergeAuditView | None.
+
+        Distinct from S1.5 because the in_progress state is also
+        "active" for purposes of refusing concurrent merges or
+        rendering UI status indicators.
+        """
+        from ..types import MergeAuditView
+
+        row = self._get_conn().execute(
+            """
+            SELECT merge_id, tenant_id, source_conversation_id,
+                   target_conversation_id, source_label_at_merge, status,
+                   started_at, completed_at, rows_moved_json, error_message
+              FROM merge_audit
+             WHERE tenant_id = %s
+               AND source_conversation_id = %s
+               AND status IN ('in_progress', 'committed')
+             ORDER BY started_at DESC
+             LIMIT 1
+            """,
+            (tenant_id, source_conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return MergeAuditView(
+            merge_id=str(row["merge_id"]),
+            tenant_id=str(row["tenant_id"]),
+            source_conversation_id=str(row["source_conversation_id"]),
+            target_conversation_id=str(row["target_conversation_id"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            source_label_at_merge=str(row["source_label_at_merge"] or ""),
+            rows_moved_json=row["rows_moved_json"],
+            error_message=row["error_message"],
+        )
+
+    def _mark_merge_rolled_back(
+        self,
+        tenant_id: str,
+        merge_id: str,
+        error_message: str,
+    ) -> bool:
+        """S1.7 — body-failure recovery UPDATE. Single owner: cloud's
+        REST handler's except clause (per codex iter-1 v1.4-3 fix; the
+        engine NEVER calls this — pinned by §11.2
+        test_rollback_marking_single_owned_by_cloud).
+
+        Predicates on tenant_id per D3 (every user-routed write to
+        merge_audit includes tenant_id in the WHERE clause; the only
+        carved-out exception is the cross-tenant stale-reservation
+        sweeper at C2.19 — see plan section 4.4).
+
+        Returns True if the UPDATE flipped a row from in_progress to
+        rolled_back; False if no in_progress row matched (already
+        completed, already rolled back, or the stale-reservation sweeper
+        beat us to it).
+        """
+        now = datetime.now(timezone.utc)
+        cur = self._get_conn().execute(
+            """
+            UPDATE merge_audit
+               SET status = 'rolled_back',
+                   error_message = %s,
+                   completed_at = %s
+             WHERE tenant_id = %s
+               AND merge_id = %s
+               AND status = 'in_progress'
+            """,
+            (error_message, now, tenant_id, merge_id),
+        )
+        return cur.rowcount > 0
+
     def complete_ingestion_episode(
         self,
         *,
