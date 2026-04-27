@@ -1198,3 +1198,90 @@ class CompactionLeaseLost(Exception):
         )
         self.operation_id = operation_id
         self.write_site = write_site
+
+
+# ---------------------------------------------------------------------------
+# VCMERGE typed contracts (T1.1-T1.3 per plan section 3.1)
+#
+# The merge surface uses three dataclasses across the cloud / engine boundary.
+# All three are stable wire-shape types: cloud's REST handler depends on the
+# field names + types in `MergeAuditView` and `ReservationResult`; the
+# engine's body method returns a `MergeStats` to the caller for response
+# shaping. Renames or field-removals here are wire-breaking. Additions are
+# safe (default-defaulted in the cloud envelope renderer).
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MergeStats:
+    """Returned by `Store.merge_conversation_data` (S1.3 / S1.4) to the
+    caller (cloud's REST handler via `Engine.merge_conversation`). Counts
+    the rows moved per per-conversation table during the body transaction.
+
+    The dict keys are table names from the 17-table per-conv set
+    (segments, segment_tags, canonical_turns, ingest_batches, facts,
+    fact_tags, fact_links, tool_outputs, tool_calls, request_captures,
+    request_turn_counters, request_context, tag_summary_embeddings,
+    turn_tool_outputs, segment_tool_outputs, chain_snapshots, media_outputs).
+    Cloud surfaces the dict directly in the SSE `conversation_merged`
+    event payload as `rows_moved` per spec section 12.2 (the v3 move-
+    semantics field name; `rows_copied` was the v2 name and is stale).
+    """
+    merge_id: str
+    source_conversation_id: str
+    target_conversation_id: str
+    tenant_id: str
+    rows_moved: dict[str, int]
+    sort_key_offset: float
+    request_turn_offset: int
+    started_at: datetime
+    completed_at: datetime
+
+
+@dataclass(frozen=True)
+class MergeAuditView:
+    """Frozen view of a single `merge_audit` row, returned by the lookup
+    helpers (S1.5, S1.6) and by `try_reserve_merge_audit_in_progress`
+    (S1.1, S1.2) when an idempotent retry collides with an existing row.
+
+    Cloud's REST handler renders the 5-state idempotency envelope from
+    this view (per spec section 12.7's discriminator). Frozen so test
+    assertions and cloud's response builder can rely on immutability.
+    """
+    merge_id: str
+    tenant_id: str
+    source_conversation_id: str
+    target_conversation_id: str
+    status: Literal["in_progress", "committed", "rolled_back"]
+    started_at: datetime
+    completed_at: datetime | None
+    source_label_at_merge: str
+    rows_moved_json: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class ReservationResult:
+    """Returned by `try_reserve_merge_audit_in_progress` (S1.1 / S1.2).
+    The 5-state `status` (per codex iter-1 v1.4-3 + spec section 12.7)
+    discriminates the action cloud's REST handler should take:
+
+    - "reserved": INSERT succeeded, this caller owns the merge body.
+      `merge_id` is the freshly-generated UUID; `existing` is None.
+    - "in_progress": prior INSERT succeeded with status='in_progress';
+      another caller is mid-body. `existing` is populated; cloud renders
+      the in-progress envelope.
+    - "committed_match": prior INSERT succeeded with status='committed'
+      AND the prior call's source_label_at_merge MATCHES this caller's
+      label. Idempotent retry; cloud renders success envelope from
+      `existing`.
+    - "committed_mismatch": prior INSERT succeeded with status='committed'
+      AND the prior call's source_label_at_merge DIFFERS. Cloud renders
+      a label-mismatch error envelope referencing `existing`.
+    - "race_retry": rare race where the winner row transitioned
+      `in_progress -> rolled_back` between this caller's INSERT-fail and
+      its SELECT. Cloud retries the reservation flow.
+    """
+    status: Literal["reserved", "in_progress", "committed_match",
+                    "committed_mismatch", "race_retry"]
+    merge_id: str
+    existing: MergeAuditView | None
