@@ -249,3 +249,185 @@ def test_composite_mark_rolled_back_returns_false_for_already_committed(tmp_path
     composite._segments._get_conn().commit()
     flipped = composite._mark_merge_rolled_back("tA", mid, "stale rollback")
     assert flipped is False
+
+
+# ---------------------------------------------------------------------------
+# merge_conversation_data forwarder (S1.3/S1.4 — caught by cloud's F-CR5)
+# ---------------------------------------------------------------------------
+
+def test_composite_forwards_merge_conversation_data(tmp_path):
+    """Cloud F-CR5 (2026-04-27): the body method forwarder must be
+    present on CompositeStore. Without it,
+    ``Engine.merge_conversation`` reaches ``store.merge_conversation_data(...)``
+    via ``ConversationStoreView(CompositeStore(...))`` and AttributeError's
+    before any work happens.
+
+    This test seeds source + target, reserves, runs the body via
+    composite.merge_conversation_data, and asserts the merge committed
+    end-to-end. Catches the F-CR5 class of bug for any future S1.x
+    additions.
+    """
+    composite = _composite(tmp_path)
+    inner = composite._segments
+    conn = inner._get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    # Seed conversations
+    for conv_id in ("src", "tgt"):
+        conn.execute(
+            "INSERT INTO conversations (conversation_id, tenant_id, phase, "
+            "lifecycle_epoch, created_at, updated_at) "
+            "VALUES (?, ?, 'active', 1, ?, ?)",
+            (conv_id, "tA", now, now),
+        )
+    conn.commit()
+    # Reserve via composite forwarder
+    merge_id = str(uuid.uuid4())
+    result = composite.try_reserve_merge_audit_in_progress(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        source_label_at_merge="lbl",
+    )
+    assert result.status == "reserved"
+    # Run body via composite forwarder (the F-CR5 fix path)
+    stats = composite.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        sort_key_offset=1000.0, request_turn_offset=10,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    # Assert MergeStats returned + audit committed + alias written
+    assert stats.merge_id == merge_id
+    audit_status = conn.execute(
+        "SELECT status FROM merge_audit WHERE merge_id = ?", (merge_id,),
+    ).fetchone()["status"]
+    assert audit_status == "committed"
+    alias = conn.execute(
+        "SELECT target_id FROM conversation_aliases WHERE alias_id = 'src'",
+    ).fetchone()
+    assert alias is not None
+    assert alias["target_id"] == "tgt"
+
+
+def test_composite_merge_conversation_data_raises_when_underlying_lacks_method():
+    """If the underlying segments store doesn't implement
+    merge_conversation_data, CompositeStore raises NotImplementedError
+    (mirrors the try_reserve forwarder's defense-in-depth contract).
+    """
+    class _StubNoMerge:
+        pass
+
+    composite = _composite_with_stub(_StubNoMerge())
+    with pytest.raises(NotImplementedError) as exc_info:
+        composite.merge_conversation_data(
+            merge_id="m1", tenant_id="tA",
+            source_conversation_id="src", target_conversation_id="tgt",
+            sort_key_offset=1000.0, request_turn_offset=10,
+            expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+        )
+    assert "Phase 0 schema" in str(exc_info.value) or "Phase 1" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end Engine.merge_conversation through ConversationStoreView +
+# CompositeStore (catches the F-CR5 class for any future S1.x methods)
+# ---------------------------------------------------------------------------
+
+def test_engine_merge_conversation_through_full_layer(tmp_path):
+    """F-CR5 regression test (cloud's request, 2026-04-27): construct a
+    real ``VirtualContextEngine`` and exercise ``engine.merge_conversation``
+    end-to-end through ``ConversationStoreView(CompositeStore(...))``.
+
+    Body tests at test_vcmerge_body_method.py construct ``SQLiteStore``
+    directly, bypassing the wrapper. That's how the missing
+    ``merge_conversation_data`` forwarder slipped through. This test
+    closes the gap by going through the full layer.
+    """
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+
+    db_path = str(tmp_path / "engine.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+    })
+    engine = VirtualContextEngine(config=config)
+    try:
+        # Reach into the engine's underlying SQLiteStore to seed conversations.
+        # ConversationStoreView -> CompositeStore -> SQLiteStore at _segments.
+        view = engine._store
+        composite = getattr(view, "_store", view)
+        inner = getattr(composite, "_segments", composite)
+        conn = inner._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        for conv_id in ("src-engine", "tgt-engine"):
+            conn.execute(
+                "INSERT INTO conversations (conversation_id, tenant_id, phase, "
+                "lifecycle_epoch, created_at, updated_at) "
+                "VALUES (?, ?, 'active', 1, ?, ?)",
+                (conv_id, "tA", now, now),
+            )
+        conn.commit()
+        # Reserve via the engine's store (which goes through CompositeStore).
+        merge_id = str(uuid.uuid4())
+        reservation = engine._store.try_reserve_merge_audit_in_progress(
+            merge_id=merge_id, tenant_id="tA",
+            source_conversation_id="src-engine",
+            target_conversation_id="tgt-engine",
+            source_label_at_merge="engine-test",
+        )
+        assert reservation.status == "reserved"
+        # Call engine.merge_conversation — this is the call path cloud's
+        # handle_vc_merge_cloud uses. Without the forwarder it AttributeError's.
+        stats = engine.merge_conversation(
+            merge_id=merge_id,
+            tenant_id="tA",
+            source_conversation_id="src-engine",
+            target_conversation_id="tgt-engine",
+            source_lifecycle_epoch=1,
+            target_lifecycle_epoch=1,
+            source_label_at_merge="engine-test",
+        )
+        assert stats.merge_id == merge_id
+        assert stats.tenant_id == "tA"
+        # Verify merge committed end-to-end
+        audit_status = conn.execute(
+            "SELECT status FROM merge_audit WHERE merge_id = ?", (merge_id,),
+        ).fetchone()["status"]
+        assert audit_status == "committed"
+        # Verify source phase flipped
+        src_phase = conn.execute(
+            "SELECT phase FROM conversations WHERE conversation_id = 'src-engine'",
+        ).fetchone()["phase"]
+        assert src_phase == "merged"
+    finally:
+        engine.close()
+
+
+def test_engine_merge_rejects_same_source_as_target(tmp_path):
+    """Engine.merge_conversation refuses same-source-as-target merges
+    (per spec §14 Q2 + plan §3.3 E1.x). Defense-in-depth on top of
+    cloud's C2.4 same-tenant check.
+    """
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "e.db")}},
+        "tag_generator": {"type": "keyword"},
+    })
+    engine = VirtualContextEngine(config=config)
+    try:
+        with pytest.raises(ValueError, match="merge conversation into itself"):
+            engine.merge_conversation(
+                merge_id=str(uuid.uuid4()),
+                tenant_id="tA",
+                source_conversation_id="same-id",
+                target_conversation_id="same-id",
+                source_lifecycle_epoch=1,
+                target_lifecycle_epoch=1,
+                source_label_at_merge="x",
+            )
+    finally:
+        engine.close()

@@ -1053,6 +1053,56 @@ class CompositeStore:
             return bool(fn(tenant_id, merge_id, error_message))
         return False
 
+    def merge_conversation_data(
+        self,
+        *,
+        merge_id: str,
+        tenant_id: str,
+        source_conversation_id: str,
+        target_conversation_id: str,
+        sort_key_offset: float,
+        request_turn_offset: int,
+        expected_target_lifecycle_epoch: int,
+        source_label_at_merge: str,
+    ):
+        """S1.3 / S1.4 body method forwarder. Returns MergeStats per
+        plan T1.1 (frozen dataclass with merge_id + rows_moved dict +
+        offsets + started_at + completed_at).
+
+        Caught by cloud's F-CR5 review (2026-04-27): the prior 4
+        forwarders (try_reserve, lookups, _mark_rolled_back) covered
+        the read+state-change primitives but missed the body method
+        itself. Without this, ``Engine.merge_conversation`` reaches
+        ``store.merge_conversation_data(...)`` and AttributeError's
+        before any work happens because the engine's ``_store`` is a
+        ``ConversationStoreView(CompositeStore(...))`` in production,
+        and CompositeStore doesn't auto-forward through to its
+        ``_segments`` sub-store.
+
+        Raises ``NotImplementedError`` if the underlying segments store
+        doesn't implement ``merge_conversation_data`` (i.e. a backend
+        that predates Phase 0 schema or Phase 1 storage). Cloud's
+        ``handle_vc_merge_cloud`` catches and renders a clean envelope
+        rather than seeing the AttributeError surface.
+        """
+        fn = getattr(self._segments, "merge_conversation_data", None)
+        if callable(fn):
+            return fn(
+                merge_id=merge_id,
+                tenant_id=tenant_id,
+                source_conversation_id=source_conversation_id,
+                target_conversation_id=target_conversation_id,
+                sort_key_offset=sort_key_offset,
+                request_turn_offset=request_turn_offset,
+                expected_target_lifecycle_epoch=expected_target_lifecycle_epoch,
+                source_label_at_merge=source_label_at_merge,
+            )
+        raise NotImplementedError(
+            "underlying segments store does not implement "
+            "merge_conversation_data; ensure Phase 0 schema (M0.3 + M0.4) "
+            "and Phase 1 storage (S1.3/S1.4) have been applied",
+        )
+
     def iter_untagged_canonical_rows(
         self,
         *,
