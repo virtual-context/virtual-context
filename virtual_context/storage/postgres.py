@@ -192,7 +192,8 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
 
 CREATE TABLE IF NOT EXISTS conversation_aliases (
     alias_id TEXT PRIMARY KEY,
-    target_id TEXT NOT NULL
+    target_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS segment_chunks (
@@ -987,6 +988,43 @@ class PostgresStore(ContextStore):
             """)
         except Exception:
             logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
+        # M0.2 (VCMERGE plan v1.11 §2.1 / §5.3): origin_conversation_id
+        # column on the per-conv data tables. Set to '' (empty string)
+        # for rows that pre-date VCMERGE; the body method (S1.3) writes
+        # the source's conversation_id when it UPDATEs a row's
+        # conversation_id to point at the target. Provenance tracking
+        # for moved rows; does not affect query behavior on existing
+        # rows. PG ≥9.6 supports IF NOT EXISTS on ADD COLUMN; the
+        # migration is idempotent re-runnable.
+        _M0_2_TABLES = (
+            "segments", "segment_tags", "canonical_turns",
+            "canonical_turn_anchors", "canonical_turn_chunks",
+            "ingest_batches", "facts", "fact_tags", "fact_links",
+            "tool_outputs", "tool_calls", "request_captures",
+            "request_turn_counters", "request_context",
+            "tag_summary_embeddings", "turn_tool_outputs",
+            "segment_tool_outputs", "chain_snapshots", "media_outputs",
+            "tag_summaries",
+        )
+        for _t in _M0_2_TABLES:
+            try:
+                conn.execute(
+                    f'ALTER TABLE {_t} '
+                    f"ADD COLUMN IF NOT EXISTS origin_conversation_id TEXT NOT NULL DEFAULT ''",
+                )
+            except Exception:
+                # Table may not exist on this fixture; benign.
+                pass
+        # E-D5 (codex iter-1 P2): conversation_aliases.epoch column for
+        # chained-merge support (deferred to v2 but column landed now per
+        # plan v1.13 fold). Idempotent ADD COLUMN IF NOT EXISTS.
+        try:
+            conn.execute(
+                "ALTER TABLE conversation_aliases "
+                "ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 1",
+            )
+        except Exception:
+            logger.warning("conversation_aliases.epoch ADD COLUMN failed", exc_info=True)
         # Progress-tracking columns for the DB-derived progress model.
         # Mirrors the SQLite schema (see sqlite.py):
         #   covered_ingestible_entries — how many ingestible payload entries

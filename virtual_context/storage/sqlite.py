@@ -191,7 +191,8 @@ CREATE TABLE IF NOT EXISTS canonical_turn_chunks (
 
 CREATE TABLE IF NOT EXISTS conversation_aliases (
     alias_id TEXT PRIMARY KEY,
-    target_id TEXT NOT NULL
+    target_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
@@ -807,6 +808,48 @@ class SQLiteStore(ContextStore):
                 SELECT RAISE(ABORT, 'merge_post_commit_pending.tenant_id must match merge_audit.tenant_id');
             END
         """)
+        # M0.2 (VCMERGE plan v1.11 §2.1 / §5.3): origin_conversation_id
+        # column on per-conv data tables. SQLite has no ADD COLUMN IF
+        # NOT EXISTS; PRAGMA table_info(<table>) column-presence check
+        # then unconditional ADD COLUMN if absent. Idempotent re-runnable.
+        # E-D5 also: conversation_aliases.epoch column.
+        _M0_2_TABLES = (
+            "segments", "segment_tags", "canonical_turns",
+            "canonical_turn_anchors", "canonical_turn_chunks",
+            "ingest_batches", "facts", "fact_tags", "fact_links",
+            "tool_outputs", "tool_calls", "request_captures",
+            "request_turn_counters", "request_context",
+            "tag_summary_embeddings", "turn_tool_outputs",
+            "segment_tool_outputs", "chain_snapshots", "media_outputs",
+            "tag_summaries",
+        )
+        for _t in _M0_2_TABLES:
+            try:
+                cols = {
+                    r["name"] if isinstance(r, sqlite3.Row) else r[1]
+                    for r in conn.execute(f"PRAGMA table_info({_t})").fetchall()
+                }
+                if "origin_conversation_id" not in cols:
+                    conn.execute(
+                        f"ALTER TABLE {_t} "
+                        "ADD COLUMN origin_conversation_id TEXT NOT NULL DEFAULT ''",
+                    )
+            except sqlite3.OperationalError:
+                # Table doesn't exist on this fixture; benign.
+                pass
+        # E-D5 conversation_aliases.epoch
+        try:
+            cols = {
+                r["name"] if isinstance(r, sqlite3.Row) else r[1]
+                for r in conn.execute("PRAGMA table_info(conversation_aliases)").fetchall()
+            }
+            if "epoch" not in cols:
+                conn.execute(
+                    "ALTER TABLE conversation_aliases "
+                    "ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1",
+                )
+        except sqlite3.OperationalError:
+            pass
         # Drop-and-recreate keeps the partial-index clause in lockstep with
         # Postgres (see postgres.py). SQLite 3.8+ supports partial indexes;
         # the `WHERE phase <> 'deleted'` predicate excludes tombstones so
