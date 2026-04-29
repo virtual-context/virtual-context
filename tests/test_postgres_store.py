@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-
-
 class _FakeConn:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -43,38 +40,60 @@ class _FakeRowsResult:
         return self._rows
 
 
-def test_postgres_store_uses_thread_local_connections(monkeypatch):
+class _ConnCheckout:
+    def __init__(self, conn: _FakeConn) -> None:
+        self.conn = conn
+
+    def __enter__(self) -> _FakeConn:
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakePool:
+    instances: list["_FakePool"] = []
+
+    def __init__(self, conninfo: str, **kwargs) -> None:
+        self.conninfo = conninfo
+        self.kwargs = kwargs
+        self.conn = _FakeConn(f"conn-{len(self.instances)}")
+        self.checkouts = 0
+        self.closed = False
+        self.instances.append(self)
+
+    def connection(self) -> _ConnCheckout:
+        self.checkouts += 1
+        return _ConnCheckout(self.conn)
+
+    def close(self) -> None:
+        self.closed = True
+        self.conn.close()
+
+
+def test_postgres_store_uses_bounded_connection_pool(monkeypatch):
     from virtual_context.storage import postgres as pg
 
-    created: list[_FakeConn] = []
-
-    def _fake_connect(*args, **kwargs):
-        conn = _FakeConn(f"conn-{len(created)}")
-        created.append(conn)
-        return conn
-
-    monkeypatch.setattr(pg.psycopg, "connect", _fake_connect)
+    _FakePool.instances.clear()
+    monkeypatch.setattr(pg, "ConnectionPool", _FakePool)
 
     store = pg.PostgresStore("postgresql://example")
-    main_conn = store._get_conn()
+    pool = _FakePool.instances[0]
 
-    from_worker: list[_FakeConn] = []
-
-    def _worker() -> None:
-        from_worker.append(store._get_conn())
-
-    worker = threading.Thread(target=_worker)
-    worker.start()
-    worker.join()
-
-    assert store._get_conn() is main_conn
-    assert from_worker == [created[1]]
-    assert from_worker[0] is not main_conn
-    assert len(created) == 2
+    assert pool.conninfo == "postgresql://example"
+    assert pool.kwargs == {
+        "min_size": 1,
+        "max_size": 8,
+        "timeout": 30.0,
+        "max_idle": 300.0,
+        "kwargs": {"row_factory": pg.dict_row, "autocommit": True},
+    }
+    assert pool.checkouts > 0
 
     store.close()
 
-    assert all(conn.closed for conn in created)
+    assert pool.closed
+    assert pool.conn.closed
 
 
 def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
@@ -106,7 +125,12 @@ def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
 
     conn = _RowsConn("conn-0")
 
-    monkeypatch.setattr(pg.psycopg, "connect", lambda *args, **kwargs: conn)
+    class _RowsPool(_FakePool):
+        def __init__(self, conninfo: str, **kwargs) -> None:
+            super().__init__(conninfo, **kwargs)
+            self.conn = conn
+
+    monkeypatch.setattr(pg, "ConnectionPool", _RowsPool)
 
     store = pg.PostgresStore("postgresql://example")
     monkeypatch.setattr(store, "_batch_get_tags", lambda refs: {"seg-1": ["tag-a", "tag-b"]})
@@ -151,7 +175,13 @@ def test_normalize_request_turn_sequences_works_without_executemany(monkeypatch)
             return _FakeRowsResult([])
 
     conn = _NormalizeConn("conn-0")
-    monkeypatch.setattr(pg.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    class _NormalizePool(_FakePool):
+        def __init__(self, conninfo: str, **kwargs) -> None:
+            super().__init__(conninfo, **kwargs)
+            self.conn = conn
+
+    monkeypatch.setattr(pg, "ConnectionPool", _NormalizePool)
 
     store = pg.PostgresStore("postgresql://example")
     conn.executed.clear()

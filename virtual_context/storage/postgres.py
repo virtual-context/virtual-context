@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from ..core.store import ContextStore
 from ..core.canonical_turns import (
@@ -770,548 +770,540 @@ class PostgresStore(ContextStore):
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self._conn_local = threading.local()
-        self._conn_lock = threading.Lock()
-        self._connections: dict[int, psycopg.Connection] = {}
+        self.pool = ConnectionPool(
+            self.dsn,
+            min_size=1,
+            max_size=8,
+            timeout=30.0,
+            max_idle=300.0,
+            kwargs={"row_factory": dict_row, "autocommit": True},
+        )
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
 
-    def _get_conn(self) -> psycopg.Connection:
-        conn = getattr(self._conn_local, "conn", None)
-        if conn is not None and not conn.closed:
-            return conn
-
-        thread_id = threading.get_ident()
-        with self._conn_lock:
-            conn = self._connections.get(thread_id)
-            if conn is None or conn.closed:
-                conn = psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
-                self._connections[thread_id] = conn
-            self._conn_local.conn = conn
-            return conn
-
     @contextmanager
     def conversation_reconcile(self, conversation_id: str):
-        conn = self._get_conn()
-        now = _dt_to_str(datetime.now(timezone.utc))
-        with conn.transaction():
-            conn.execute(
-                """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
-                VALUES (%s, 0, FALSE, %s)
-                ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
-                (conversation_id, now),
-            )
-            conn.execute(
-                "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
-                (conversation_id,),
-            ).fetchone()
-            yield
+        with self.pool.connection() as conn:
+            now = _dt_to_str(datetime.now(timezone.utc))
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+                    VALUES (%s, 0, FALSE, %s)
+                    ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
+                    (conversation_id, now),
+                )
+                conn.execute(
+                    "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
+                    (conversation_id,),
+                ).fetchone()
+                yield
 
     def _ensure_schema(self) -> None:
-        conn = self._get_conn()
-        # Split SCHEMA_SQL by statements and execute individually
-        for stmt in SCHEMA_SQL.split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                try:
-                    conn.execute(stmt)
-                except Exception:
-                    pass  # Table/index already exists
-        # Lifecycle/phase-tracked conversations table. Mirrors the SQLite
-        # schema (see sqlite.py) — carries lifecycle_epoch (for
-        # delete+resurrect invariants), a phase state machine
-        # (init/ingesting/compacting/active/deleted), and per-request
-        # metadata counters consumed by the progress tracker. The partial
-        # index on (tenant_id, phase) excludes deleted rows so tenant-scoped
-        # phase queries never scan tombstones.
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    conversation_id TEXT PRIMARY KEY,
-                    tenant_id VARCHAR NOT NULL,
-                    lifecycle_epoch INT NOT NULL DEFAULT 1,
-                    phase VARCHAR NOT NULL DEFAULT 'init'
-                                                   CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
-                    pending_raw_payload_entries INT NOT NULL DEFAULT 0,
-                    last_raw_payload_entries INT NOT NULL DEFAULT 0,
-                    last_ingestible_payload_entries INT NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    deleted_at TIMESTAMPTZ NULL,
-                    UNIQUE (tenant_id, conversation_id)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_conversations_tenant_phase
-                    ON conversations(tenant_id, phase)
-                     WHERE phase <> 'deleted'
-            """)
-            # (VCMERGE plan v1.11 ): relax the phase CHECK to
-            # admit the 'merged' value introduced by VCMERGE. The named-
-            # constraint pattern (DROP IF EXISTS + ADD CONSTRAINT) is
-            # idempotent re-runnable even after a partial-prior-state where
-            # the DROP succeeded but the ADD failed. The ADD does NOT
-            # validate existing rows (no rows can have phase='merged' yet),
-            # so the operation is fast even on populated tables. Brief
-            # ACCESS EXCLUSIVE during the swap; deploy in low-traffic window
-            # per plan step 1.
-            conn.execute("""
-                ALTER TABLE conversations
-                    DROP CONSTRAINT IF EXISTS conversations_phase_check
-            """)
-            conn.execute("""
-                ALTER TABLE conversations
-                    ADD CONSTRAINT conversations_phase_check
-                    CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged'))
-            """)
-        except Exception:
-            logger.warning("conversations table bootstrap failed", exc_info=True)
-        # one-time backfill of
-        # ``conversations.tenant_id`` from ``cloud_conversations.tenant_id``
-        # for rows created by older engine builds that passed
-        # ``tenant_id=""`` to ``upsert_conversation``. Idempotent:
-        # the WHERE clause filters on empty target AND non-empty source,
-        # so the migration is a no-op once backfilled. Best-effort:
-        # skipped silently when ``cloud_conversations`` is absent
-        # (engine-only deployments where there's no cloud wrapper to
-        # source from). Wrapped in nested ``conn.transaction()`` so an
-        # ``UndefinedTable`` raise rolls back ONLY the savepoint and
-        # leaves outer schema bootstrap alive.
-        try:
-            with conn.transaction():
+        with self.pool.connection() as conn:
+            # Split SCHEMA_SQL by statements and execute individually
+            for stmt in SCHEMA_SQL.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    try:
+                        conn.execute(stmt)
+                    except Exception:
+                        pass  # Table/index already exists
+            # Lifecycle/phase-tracked conversations table. Mirrors the SQLite
+            # schema (see sqlite.py) — carries lifecycle_epoch (for
+            # delete+resurrect invariants), a phase state machine
+            # (init/ingesting/compacting/active/deleted), and per-request
+            # metadata counters consumed by the progress tracker. The partial
+            # index on (tenant_id, phase) excludes deleted rows so tenant-scoped
+            # phase queries never scan tombstones.
+            try:
                 conn.execute("""
-                    UPDATE conversations
-                       SET tenant_id = cc.tenant_id
-                      FROM cloud_conversations cc
-                     WHERE conversations.conversation_id = cc.conversation_id
-                       AND cc.tenant_id IS NOT NULL
-                       AND cc.tenant_id <> ''
-                       AND (conversations.tenant_id IS NULL
-                            OR conversations.tenant_id = '')
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        conversation_id TEXT PRIMARY KEY,
+                        tenant_id VARCHAR NOT NULL,
+                        lifecycle_epoch INT NOT NULL DEFAULT 1,
+                        phase VARCHAR NOT NULL DEFAULT 'init'
+                                                       CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged')),
+                        pending_raw_payload_entries INT NOT NULL DEFAULT 0,
+                        last_raw_payload_entries INT NOT NULL DEFAULT 0,
+                        last_ingestible_payload_entries INT NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        deleted_at TIMESTAMPTZ NULL,
+                        UNIQUE (tenant_id, conversation_id)
+                    )
                 """)
-        except psycopg.errors.UndefinedTable:
-            # cloud_conversations not present (single-user / engine-only
-            # deploys); nothing to backfill.
-            pass
-        except Exception:
-            logger.warning(
-                "conversations.tenant_id backfill from cloud_conversations failed",
-                exc_info=True,
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_conversations_tenant_phase
+                        ON conversations(tenant_id, phase)
+                         WHERE phase <> 'deleted'
+                """)
+                # (VCMERGE plan v1.11 ): relax the phase CHECK to
+                # admit the 'merged' value introduced by VCMERGE. The named-
+                # constraint pattern (DROP IF EXISTS + ADD CONSTRAINT) is
+                # idempotent re-runnable even after a partial-prior-state where
+                # the DROP succeeded but the ADD failed. The ADD does NOT
+                # validate existing rows (no rows can have phase='merged' yet),
+                # so the operation is fast even on populated tables. Brief
+                # ACCESS EXCLUSIVE during the swap; deploy in low-traffic window
+                # per plan step 1.
+                conn.execute("""
+                    ALTER TABLE conversations
+                        DROP CONSTRAINT IF EXISTS conversations_phase_check
+                """)
+                conn.execute("""
+                    ALTER TABLE conversations
+                        ADD CONSTRAINT conversations_phase_check
+                        CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged'))
+                """)
+            except Exception:
+                logger.warning("conversations table bootstrap failed", exc_info=True)
+            # one-time backfill of
+            # ``conversations.tenant_id`` from ``cloud_conversations.tenant_id``
+            # for rows created by older engine builds that passed
+            # ``tenant_id=""`` to ``upsert_conversation``. Idempotent:
+            # the WHERE clause filters on empty target AND non-empty source,
+            # so the migration is a no-op once backfilled. Best-effort:
+            # skipped silently when ``cloud_conversations`` is absent
+            # (engine-only deployments where there's no cloud wrapper to
+            # source from). Wrapped in nested ``conn.transaction()`` so an
+            # ``UndefinedTable`` raise rolls back ONLY the savepoint and
+            # leaves outer schema bootstrap alive.
+            try:
+                with conn.transaction():
+                    conn.execute("""
+                        UPDATE conversations
+                           SET tenant_id = cc.tenant_id
+                          FROM cloud_conversations cc
+                         WHERE conversations.conversation_id = cc.conversation_id
+                           AND cc.tenant_id IS NOT NULL
+                           AND cc.tenant_id <> ''
+                           AND (conversations.tenant_id IS NULL
+                                OR conversations.tenant_id = '')
+                    """)
+            except psycopg.errors.UndefinedTable:
+                # cloud_conversations not present (single-user / engine-only
+                # deploys); nothing to backfill.
+                pass
+            except Exception:
+                logger.warning(
+                    "conversations.tenant_id backfill from cloud_conversations failed",
+                    exc_info=True,
+                )
+            # + (VCMERGE plan v1.11 ): merge_audit
+            # table + the unique partial index that backs the
+            # try_reserve_merge_audit_in_progress reservation flow. Spec section
+            # 9 schema; tenant_id column per tenant-isolation. The
+            # partial index uses status IN ('in_progress','committed') per D4
+            # (committed rows must remain in the index so future re-merge
+            # attempts collide and resolve via the 5-state idempotency
+            # discriminator at ).
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS merge_audit (
+                        merge_id UUID PRIMARY KEY,
+                        tenant_id VARCHAR NOT NULL,
+                        source_conversation_id TEXT NOT NULL,
+                        target_conversation_id TEXT NOT NULL,
+                        source_label_at_merge TEXT NOT NULL DEFAULT '',
+                        status VARCHAR NOT NULL
+                                                  CHECK (status IN ('in_progress','committed','rolled_back')),
+                        started_at TIMESTAMPTZ NOT NULL,
+                        completed_at TIMESTAMPTZ NULL,
+                        rows_moved_json TEXT NULL,
+                        error_message TEXT NULL,
+                        prior_alias_target TEXT NULL
+                    )
+                """)
+                # prior_alias_target column for merge
+                # reversibility. Captures the conversation_aliases.target_id that
+                # the source's alias_id pointed to BEFORE the body's UPSERT, so a
+                # future merge-revert can restore it. NULL when source had no
+                # prior alias (the common case). Idempotent ADD COLUMN for
+                # forward migration on tables created by an earlier engine.
+                conn.execute("""
+                    ALTER TABLE merge_audit
+                        ADD COLUMN IF NOT EXISTS prior_alias_target TEXT NULL
+                """)
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
+                        ON merge_audit (tenant_id, source_conversation_id)
+                        WHERE status IN ('in_progress', 'committed')
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_merge_audit_target
+                        ON merge_audit (tenant_id, target_conversation_id, completed_at DESC)
+                        WHERE status = 'committed'
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_merge_audit_status_started
+                        ON merge_audit (status, started_at)
+                        WHERE status = 'in_progress'
+                """)
+            except Exception:
+                logger.warning("merge_audit table bootstrap failed", exc_info=True)
+            # (VCMERGE plan v1.11 ): merge_post_commit_pending
+            # queue table + tenant-consistency triggers. The two-trigger split
+            # ( P1 corrected the DDL syntax: TG_OP is a
+            # PL/pgSQL function variable not available in trigger-level WHEN;
+            # combined BEFORE INSERT OR UPDATE leaves OLD undefined on INSERT)
+            # provides the same end-to-end invariant as the single-
+            # trigger form intended but with valid PG syntax.
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
+                        pending_id UUID PRIMARY KEY,
+                        merge_id UUID NOT NULL REFERENCES merge_audit(merge_id),
+                        tenant_id VARCHAR NOT NULL,
+                        kind TEXT NOT NULL
+                                          CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
+                        payload_json TEXT NOT NULL,
+                        status TEXT NOT NULL
+                                          CHECK (status IN ('pending','done','failed')),
+                        attempts INT NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        last_attempt_at TIMESTAMPTZ NULL,
+                        completed_at TIMESTAMPTZ NULL,
+                        error_message TEXT NULL
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_status
+                        ON merge_post_commit_pending (status, created_at)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_tenant
+                        ON merge_post_commit_pending (tenant_id, status, created_at)
+                """)
+                # Trigger function: enforces NEW.tenant_id matches the parent
+                # merge_audit row's tenant_id. Raises check_violation on
+                # mismatch. CHECK constraints can't reference other tables
+                # in PG, so a BEFORE-trigger is the portable fix.
+                conn.execute("""
+                    CREATE OR REPLACE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                        IF NEW.tenant_id != (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id) THEN
+                            RAISE EXCEPTION 'merge_post_commit_pending.tenant_id (%) must match merge_audit.tenant_id for merge_id %',
+                                NEW.tenant_id, NEW.merge_id
+                                USING ERRCODE = 'check_violation';
+                        END IF;
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                """)
+                # INSERT trigger: always fires; OLD is unavailable on INSERT,
+                # so no WHEN clause needed.
+                conn.execute("""
+                    DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
+                        ON merge_post_commit_pending
+                """)
+                conn.execute("""
+                    CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
+                        BEFORE INSERT ON merge_post_commit_pending
+                        FOR EACH ROW
+                        EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                """)
+                # UPDATE trigger: fires only when an UPDATE statement touches
+                # tenant_id AND the new value differs from old. Phase B
+                # consumer's status-only UPDATEs short-circuit because the
+                # BEFORE UPDATE OF tenant_id clause filters by the SET
+                # column list; the WHEN clause adds a second filter for
+                # actual value change.
+                conn.execute("""
+                    DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
+                        ON merge_post_commit_pending
+                """)
+                conn.execute("""
+                    CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
+                        BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
+                        FOR EACH ROW
+                        WHEN (NEW.tenant_id IS DISTINCT FROM OLD.tenant_id)
+                        EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                """)
+            except Exception:
+                logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
+            #: origin_conversation_id
+            # column on the per-conv data tables. Set to '' (empty string)
+            # for rows that pre-date VCMERGE; the body method writes
+            # the source's conversation_id when it UPDATEs a row's
+            # conversation_id to point at the target. Provenance tracking
+            # for moved rows; does not affect query behavior on existing
+            # rows. PG ≥9.6 supports IF NOT EXISTS on ADD COLUMN; the
+            # migration is idempotent re-runnable.
+            # tag_aliases added to the list. The
+            # table is per-conv (PK includes conversation_id) and was missing
+            # from the original list, leaving source's tag aliases stranded
+            # post-merge. The body method now moves these rows; the
+            # origin_conversation_id column captures provenance same as the
+            # other per-conv tables.
+            _M0_2_TABLES = (
+                "segments", "segment_tags", "canonical_turns",
+                "canonical_turn_anchors", "canonical_turn_chunks",
+                "ingest_batches", "facts", "fact_tags", "fact_links",
+                "tool_outputs", "tool_calls", "request_captures",
+                "request_turn_counters", "request_context",
+                "tag_summary_embeddings", "turn_tool_outputs",
+                "segment_tool_outputs", "chain_snapshots", "media_outputs",
+                "tag_summaries", "tag_aliases",
             )
-        # + (VCMERGE plan v1.11 ): merge_audit
-        # table + the unique partial index that backs the
-        # try_reserve_merge_audit_in_progress reservation flow. Spec section
-        # 9 schema; tenant_id column per tenant-isolation. The
-        # partial index uses status IN ('in_progress','committed') per D4
-        # (committed rows must remain in the index so future re-merge
-        # attempts collide and resolve via the 5-state idempotency
-        # discriminator at ).
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS merge_audit (
-                    merge_id UUID PRIMARY KEY,
-                    tenant_id VARCHAR NOT NULL,
-                    source_conversation_id TEXT NOT NULL,
-                    target_conversation_id TEXT NOT NULL,
-                    source_label_at_merge TEXT NOT NULL DEFAULT '',
-                    status VARCHAR NOT NULL
-                                              CHECK (status IN ('in_progress','committed','rolled_back')),
-                    started_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ NULL,
-                    rows_moved_json TEXT NULL,
-                    error_message TEXT NULL,
-                    prior_alias_target TEXT NULL
-                )
-            """)
-            # prior_alias_target column for merge
-            # reversibility. Captures the conversation_aliases.target_id that
-            # the source's alias_id pointed to BEFORE the body's UPSERT, so a
-            # future merge-revert can restore it. NULL when source had no
-            # prior alias (the common case). Idempotent ADD COLUMN for
-            # forward migration on tables created by an earlier engine.
-            conn.execute("""
-                ALTER TABLE merge_audit
-                    ADD COLUMN IF NOT EXISTS prior_alias_target TEXT NULL
-            """)
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_audit_active_source
-                    ON merge_audit (tenant_id, source_conversation_id)
-                    WHERE status IN ('in_progress', 'committed')
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_merge_audit_target
-                    ON merge_audit (tenant_id, target_conversation_id, completed_at DESC)
-                    WHERE status = 'committed'
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_merge_audit_status_started
-                    ON merge_audit (status, started_at)
-                    WHERE status = 'in_progress'
-            """)
-        except Exception:
-            logger.warning("merge_audit table bootstrap failed", exc_info=True)
-        # (VCMERGE plan v1.11 ): merge_post_commit_pending
-        # queue table + tenant-consistency triggers. The two-trigger split
-        # ( P1 corrected the DDL syntax: TG_OP is a
-        # PL/pgSQL function variable not available in trigger-level WHEN;
-        # combined BEFORE INSERT OR UPDATE leaves OLD undefined on INSERT)
-        # provides the same end-to-end invariant as the single-
-        # trigger form intended but with valid PG syntax.
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS merge_post_commit_pending (
-                    pending_id UUID PRIMARY KEY,
-                    merge_id UUID NOT NULL REFERENCES merge_audit(merge_id),
-                    tenant_id VARCHAR NOT NULL,
-                    kind TEXT NOT NULL
-                                      CHECK (kind IN ('sse_event','tag_regenerate','queue_resegment')),
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL
-                                      CHECK (status IN ('pending','done','failed')),
-                    attempts INT NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    last_attempt_at TIMESTAMPTZ NULL,
-                    completed_at TIMESTAMPTZ NULL,
-                    error_message TEXT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_status
-                    ON merge_post_commit_pending (status, created_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_merge_post_commit_pending_tenant
-                    ON merge_post_commit_pending (tenant_id, status, created_at)
-            """)
-            # Trigger function: enforces NEW.tenant_id matches the parent
-            # merge_audit row's tenant_id. Raises check_violation on
-            # mismatch. CHECK constraints can't reference other tables
-            # in PG, so a BEFORE-trigger is the portable fix.
-            conn.execute("""
-                CREATE OR REPLACE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    IF NEW.tenant_id != (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id) THEN
-                        RAISE EXCEPTION 'merge_post_commit_pending.tenant_id (%) must match merge_audit.tenant_id for merge_id %',
-                            NEW.tenant_id, NEW.merge_id
-                            USING ERRCODE = 'check_violation';
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql
-            """)
-            # INSERT trigger: always fires; OLD is unavailable on INSERT,
-            # so no WHEN clause needed.
-            conn.execute("""
-                DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
-                    ON merge_post_commit_pending
-            """)
-            conn.execute("""
-                CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
-                    BEFORE INSERT ON merge_post_commit_pending
-                    FOR EACH ROW
-                    EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
-            """)
-            # UPDATE trigger: fires only when an UPDATE statement touches
-            # tenant_id AND the new value differs from old. Phase B
-            # consumer's status-only UPDATEs short-circuit because the
-            # BEFORE UPDATE OF tenant_id clause filters by the SET
-            # column list; the WHEN clause adds a second filter for
-            # actual value change.
-            conn.execute("""
-                DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
-                    ON merge_post_commit_pending
-            """)
-            conn.execute("""
-                CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
-                    BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
-                    FOR EACH ROW
-                    WHEN (NEW.tenant_id IS DISTINCT FROM OLD.tenant_id)
-                    EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
-            """)
-        except Exception:
-            logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
-        #: origin_conversation_id
-        # column on the per-conv data tables. Set to '' (empty string)
-        # for rows that pre-date VCMERGE; the body method writes
-        # the source's conversation_id when it UPDATEs a row's
-        # conversation_id to point at the target. Provenance tracking
-        # for moved rows; does not affect query behavior on existing
-        # rows. PG ≥9.6 supports IF NOT EXISTS on ADD COLUMN; the
-        # migration is idempotent re-runnable.
-        # tag_aliases added to the list. The
-        # table is per-conv (PK includes conversation_id) and was missing
-        # from the original list, leaving source's tag aliases stranded
-        # post-merge. The body method now moves these rows; the
-        # origin_conversation_id column captures provenance same as the
-        # other per-conv tables.
-        _M0_2_TABLES = (
-            "segments", "segment_tags", "canonical_turns",
-            "canonical_turn_anchors", "canonical_turn_chunks",
-            "ingest_batches", "facts", "fact_tags", "fact_links",
-            "tool_outputs", "tool_calls", "request_captures",
-            "request_turn_counters", "request_context",
-            "tag_summary_embeddings", "turn_tool_outputs",
-            "segment_tool_outputs", "chain_snapshots", "media_outputs",
-            "tag_summaries", "tag_aliases",
-        )
-        for _t in _M0_2_TABLES:
+            for _t in _M0_2_TABLES:
+                try:
+                    conn.execute(
+                        f'ALTER TABLE {_t} '
+                        f"ADD COLUMN IF NOT EXISTS origin_conversation_id TEXT NOT NULL DEFAULT ''",
+                    )
+                except Exception:
+                    # Table may not exist on this fixture; benign.
+                    pass
+            # conversation_aliases.epoch column for
+            # chained-merge support (deferred to v2 but column landed now per
+            # plan fold). Idempotent ADD COLUMN IF NOT EXISTS.
             try:
                 conn.execute(
-                    f'ALTER TABLE {_t} '
-                    f"ADD COLUMN IF NOT EXISTS origin_conversation_id TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE conversation_aliases "
+                    "ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 1",
                 )
             except Exception:
-                # Table may not exist on this fixture; benign.
+                logger.warning("conversation_aliases.epoch ADD COLUMN failed", exc_info=True)
+            # Progress-tracking columns for the DB-derived progress model.
+            # Mirrors the SQLite schema (see sqlite.py):
+            # covered_ingestible_entries — how many ingestible payload entries
+            # this canonical row represents (set at insert time). The progress
+            # denominator is SUM(covered_ingestible_entries).
+            # tagged_at — timestamp set when the tagger enriches the row. The
+            # progress numerator is
+            # SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
+            # The two partial indexes below make each SUM path an index-only scan.
+            # Postgres supports ADD COLUMN IF NOT EXISTS natively, so the ALTERs
+            # are idempotent. Note: ``tagged_at`` already exists on the base
+            # canonical_turns schema (as TEXT) — the ADD COLUMN IF NOT EXISTS is
+            # defensive parity with SQLite. The partial indexes use sort_key
+            # (not turn_number) because turn_number is view-derived on both
+            # backends; sort_key is the physical ordering column.
+            try:
+                conn.execute("""
+                    ALTER TABLE canonical_turns
+                        ADD COLUMN IF NOT EXISTS covered_ingestible_entries INT NOT NULL DEFAULT 1
+                """)
+                conn.execute("""
+                    ALTER TABLE canonical_turns
+                        ADD COLUMN IF NOT EXISTS tagged_at TIMESTAMPTZ NULL
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_untagged
+                        ON canonical_turns (conversation_id, sort_key)
+                        WHERE tagged_at IS NULL
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_tagged
+                        ON canonical_turns (conversation_id, tagged_at)
+                        WHERE tagged_at IS NOT NULL
+                """)
+            except Exception:
+                logger.warning("canonical_turns progress columns bootstrap failed", exc_info=True)
+            # Ownership + lifecycle record for an ingestion episode. Mirrors the
+            # SQLite schema (see sqlite.py). Progress counters (done/total) are
+            # DERIVED from canonical_turns SUMs at read time — this row only
+            # tracks ownership (`owner_worker_id`, `heartbeat_ts`), the largest
+            # raw payload observed during the episode (`raw_payload_entries`),
+            # and the status transitions. The partial unique index below
+            # enforces at-most-one running episode per
+            # (conversation, lifecycle_epoch) at the DB layer without requiring
+            # a distributed lock — a concurrent worker attempting to INSERT a
+            # second 'running' row collides at INSERT time.
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ingestion_episode (
+                        episode_id UUID PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        lifecycle_epoch INT NOT NULL,
+                        raw_payload_entries INT NOT NULL DEFAULT 0,
+                        started_at TIMESTAMPTZ NOT NULL,
+                        completed_at TIMESTAMPTZ NULL,
+                        status VARCHAR NOT NULL
+                                              CHECK (status IN ('running','completed','cancelled','abandoned')),
+                        owner_worker_id VARCHAR NOT NULL,
+                        heartbeat_ts TIMESTAMPTZ NOT NULL,
+                        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                    )
+                """)
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_ingestion_episode_active
+                        ON ingestion_episode(conversation_id, lifecycle_epoch)
+                        WHERE status = 'running'
+                """)
+            except Exception:
+                logger.warning("ingestion_episode table bootstrap failed", exc_info=True)
+            # Ownership + lifecycle record for a compaction operation. Mirrors
+            # the SQLite schema (see sqlite.py). Sibling to ingestion_episode
+            # but tracks the multi-phase compaction pipeline
+            # (phase_index/phase_count/phase_name) rather than raw payload
+            # counts. `status` carries a `queued` state in addition to the
+            # episode lifecycle so workers can enqueue work ahead of execution,
+            # and the partial unique index treats both `queued` and `running`
+            # as active — only one pending-or-in-flight compaction is allowed
+            # per (conversation, lifecycle_epoch) at the DB layer.
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS compaction_operation (
+                        operation_id UUID PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        lifecycle_epoch INT NOT NULL,
+                        phase_index INT NOT NULL DEFAULT 0,
+                        phase_count INT NOT NULL,
+                        phase_name VARCHAR NOT NULL,
+                        status VARCHAR NOT NULL
+                                          CHECK (status IN ('queued','running','completed','cancelled','failed')),
+                        started_at TIMESTAMPTZ NOT NULL,
+                        completed_at TIMESTAMPTZ NULL,
+                        owner_worker_id VARCHAR NOT NULL,
+                        heartbeat_ts TIMESTAMPTZ NOT NULL,
+                        error_message TEXT NULL,
+                        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+                    )
+                """)
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
+                        ON compaction_operation(conversation_id, lifecycle_epoch)
+                        WHERE status IN ('queued','running')
+                """)
+            except Exception:
+                logger.warning("compaction_operation table bootstrap failed", exc_info=True)
+            # FTS setup
+            try:
+                conn.execute(FTS_SQL)
+            except Exception as e:
+                logger.warning("FTS setup issue (non-fatal): %s", e)
+            # Backfill tsvector columns for existing rows
+            try:
+                conn.execute("UPDATE segments SET summary_tsv = to_tsvector('english', COALESCE(summary, '')) WHERE summary_tsv IS NULL")
+                conn.execute("UPDATE segments SET full_text_tsv = to_tsvector('english', COALESCE(full_text, '')) WHERE full_text_tsv IS NULL")
+                conn.execute("UPDATE facts SET facts_tsv = to_tsvector('english', COALESCE(subject,'') || ' ' || COALESCE(verb,'') || ' ' || COALESCE(object,'') || ' ' || COALESCE(what,'')) WHERE facts_tsv IS NULL")
+            except Exception:
                 pass
-        # conversation_aliases.epoch column for
-        # chained-merge support (deferred to v2 but column landed now per
-        # plan fold). Idempotent ADD COLUMN IF NOT EXISTS.
-        try:
-            conn.execute(
-                "ALTER TABLE conversation_aliases "
-                "ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 1",
-            )
-        except Exception:
-            logger.warning("conversation_aliases.epoch ADD COLUMN failed", exc_info=True)
-        # Progress-tracking columns for the DB-derived progress model.
-        # Mirrors the SQLite schema (see sqlite.py):
-        # covered_ingestible_entries — how many ingestible payload entries
-        # this canonical row represents (set at insert time). The progress
-        # denominator is SUM(covered_ingestible_entries).
-        # tagged_at — timestamp set when the tagger enriches the row. The
-        # progress numerator is
-        # SUM(covered_ingestible_entries WHERE tagged_at IS NOT NULL).
-        # The two partial indexes below make each SUM path an index-only scan.
-        # Postgres supports ADD COLUMN IF NOT EXISTS natively, so the ALTERs
-        # are idempotent. Note: ``tagged_at`` already exists on the base
-        # canonical_turns schema (as TEXT) — the ADD COLUMN IF NOT EXISTS is
-        # defensive parity with SQLite. The partial indexes use sort_key
-        # (not turn_number) because turn_number is view-derived on both
-        # backends; sort_key is the physical ordering column.
-        try:
-            conn.execute("""
-                ALTER TABLE canonical_turns
-                    ADD COLUMN IF NOT EXISTS covered_ingestible_entries INT NOT NULL DEFAULT 1
-            """)
-            conn.execute("""
-                ALTER TABLE canonical_turns
-                    ADD COLUMN IF NOT EXISTS tagged_at TIMESTAMPTZ NULL
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_untagged
-                    ON canonical_turns (conversation_id, sort_key)
-                    WHERE tagged_at IS NULL
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_tagged
-                    ON canonical_turns (conversation_id, tagged_at)
-                    WHERE tagged_at IS NOT NULL
-            """)
-        except Exception:
-            logger.warning("canonical_turns progress columns bootstrap failed", exc_info=True)
-        # Ownership + lifecycle record for an ingestion episode. Mirrors the
-        # SQLite schema (see sqlite.py). Progress counters (done/total) are
-        # DERIVED from canonical_turns SUMs at read time — this row only
-        # tracks ownership (`owner_worker_id`, `heartbeat_ts`), the largest
-        # raw payload observed during the episode (`raw_payload_entries`),
-        # and the status transitions. The partial unique index below
-        # enforces at-most-one running episode per
-        # (conversation, lifecycle_epoch) at the DB layer without requiring
-        # a distributed lock — a concurrent worker attempting to INSERT a
-        # second 'running' row collides at INSERT time.
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ingestion_episode (
-                    episode_id UUID PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    lifecycle_epoch INT NOT NULL,
-                    raw_payload_entries INT NOT NULL DEFAULT 0,
-                    started_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ NULL,
-                    status VARCHAR NOT NULL
-                                          CHECK (status IN ('running','completed','cancelled','abandoned')),
-                    owner_worker_id VARCHAR NOT NULL,
-                    heartbeat_ts TIMESTAMPTZ NOT NULL,
-                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
-                )
-            """)
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_ingestion_episode_active
-                    ON ingestion_episode(conversation_id, lifecycle_epoch)
-                    WHERE status = 'running'
-            """)
-        except Exception:
-            logger.warning("ingestion_episode table bootstrap failed", exc_info=True)
-        # Ownership + lifecycle record for a compaction operation. Mirrors
-        # the SQLite schema (see sqlite.py). Sibling to ingestion_episode
-        # but tracks the multi-phase compaction pipeline
-        # (phase_index/phase_count/phase_name) rather than raw payload
-        # counts. `status` carries a `queued` state in addition to the
-        # episode lifecycle so workers can enqueue work ahead of execution,
-        # and the partial unique index treats both `queued` and `running`
-        # as active — only one pending-or-in-flight compaction is allowed
-        # per (conversation, lifecycle_epoch) at the DB layer.
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS compaction_operation (
-                    operation_id UUID PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    lifecycle_epoch INT NOT NULL,
-                    phase_index INT NOT NULL DEFAULT 0,
-                    phase_count INT NOT NULL,
-                    phase_name VARCHAR NOT NULL,
-                    status VARCHAR NOT NULL
-                                      CHECK (status IN ('queued','running','completed','cancelled','failed')),
-                    started_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ NULL,
-                    owner_worker_id VARCHAR NOT NULL,
-                    heartbeat_ts TIMESTAMPTZ NOT NULL,
-                    error_message TEXT NULL,
-                    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
-                )
-            """)
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_compaction_operation_active
-                    ON compaction_operation(conversation_id, lifecycle_epoch)
-                    WHERE status IN ('queued','running')
-            """)
-        except Exception:
-            logger.warning("compaction_operation table bootstrap failed", exc_info=True)
-        # FTS setup
-        try:
-            conn.execute(FTS_SQL)
-        except Exception as e:
-            logger.warning("FTS setup issue (non-fatal): %s", e)
-        # Backfill tsvector columns for existing rows
-        try:
-            conn.execute("UPDATE segments SET summary_tsv = to_tsvector('english', COALESCE(summary, '')) WHERE summary_tsv IS NULL")
-            conn.execute("UPDATE segments SET full_text_tsv = to_tsvector('english', COALESCE(full_text, '')) WHERE full_text_tsv IS NULL")
-            conn.execute("UPDATE facts SET facts_tsv = to_tsvector('english', COALESCE(subject,'') || ' ' || COALESCE(verb,'') || ' ' || COALESCE(object,'') || ' ' || COALESCE(what,'')) WHERE facts_tsv IS NULL")
-        except Exception:
-            pass
-        try:
-            conn.execute("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='tag_summaries' AND column_name='code_refs') THEN
-                        ALTER TABLE tag_summaries ADD COLUMN code_refs TEXT NOT NULL DEFAULT '[]';
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                                   WHERE table_name='tag_summaries' AND column_name='generated_by_turn_id') THEN
-                        ALTER TABLE tag_summaries ADD COLUMN generated_by_turn_id TEXT NOT NULL DEFAULT '';
-                    END IF;
-                END $$;
-            """)
-        except Exception:
-            pass
-        try:
-            conn.execute("""
-                DO $$ DECLARE
-                    pk_cols text[];
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_name = 'request_captures'
-                    ) THEN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_name='request_captures' AND column_name='conversation_id'
-                        ) THEN
-                            ALTER TABLE request_captures
-                                ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
-                            UPDATE request_captures
-                            SET conversation_id = COALESCE(data_json::jsonb->>'conversation_id', '');
+            try:
+                conn.execute("""
+                    DO $$ BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='tag_summaries' AND column_name='code_refs') THEN
+                            ALTER TABLE tag_summaries ADD COLUMN code_refs TEXT NOT NULL DEFAULT '[]';
                         END IF;
-
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_name='request_captures' AND column_name='turn_id'
-                        ) THEN
-                            ALTER TABLE request_captures
-                                ADD COLUMN turn_id TEXT NOT NULL DEFAULT '';
-                            UPDATE request_captures
-                            SET turn_id = COALESCE(data_json::jsonb->>'turn_id', '');
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='tag_summaries' AND column_name='generated_by_turn_id') THEN
+                            ALTER TABLE tag_summaries ADD COLUMN generated_by_turn_id TEXT NOT NULL DEFAULT '';
                         END IF;
-
-                        SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
-                        INTO pk_cols
-                        FROM information_schema.table_constraints tc
-                        JOIN information_schema.key_column_usage kcu
-                          ON tc.constraint_name = kcu.constraint_name
-                         AND tc.table_schema = kcu.table_schema
-                         AND tc.table_name = kcu.table_name
-                        WHERE tc.table_name = 'request_captures'
-                          AND tc.constraint_type = 'PRIMARY KEY';
-
-                        IF pk_cols IS NULL OR pk_cols <> ARRAY['conversation_id', 'turn', 'turn_id'] THEN
-                            IF EXISTS (
-                                SELECT 1 FROM information_schema.table_constraints
-                                WHERE table_name='request_captures'
-                                  AND constraint_type='PRIMARY KEY'
+                    END $$;
+                """)
+            except Exception:
+                pass
+            try:
+                conn.execute("""
+                    DO $$ DECLARE
+                        pk_cols text[];
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_name = 'request_captures'
+                        ) THEN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name='request_captures' AND column_name='conversation_id'
                             ) THEN
-                                ALTER TABLE request_captures DROP CONSTRAINT request_captures_pkey;
+                                ALTER TABLE request_captures
+                                    ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
+                                UPDATE request_captures
+                                SET conversation_id = COALESCE(data_json::jsonb->>'conversation_id', '');
                             END IF;
-                            ALTER TABLE request_captures
-                                ADD PRIMARY KEY (conversation_id, turn, turn_id);
-                        END IF;
-                    END IF;
-                END $$;
-            """)
-        except Exception:
-            pass
-        try:
-            conn.execute("""
-                DO $$ DECLARE
-                    pk_cols text[];
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_name = 'tag_aliases'
-                    ) THEN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_name='tag_aliases' AND column_name='conversation_id'
-                        ) THEN
-                            ALTER TABLE tag_aliases
-                                ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
-                        END IF;
 
-                        SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
-                        INTO pk_cols
-                        FROM information_schema.table_constraints tc
-                        JOIN information_schema.key_column_usage kcu
-                          ON tc.constraint_name = kcu.constraint_name
-                         AND tc.table_schema = kcu.table_schema
-                         AND tc.table_name = kcu.table_name
-                        WHERE tc.table_name = 'tag_aliases'
-                          AND tc.constraint_type = 'PRIMARY KEY';
-
-                        IF pk_cols IS NULL OR pk_cols <> ARRAY['alias', 'conversation_id'] THEN
-                            IF EXISTS (
-                                SELECT 1 FROM information_schema.table_constraints
-                                WHERE table_name='tag_aliases'
-                                  AND constraint_type='PRIMARY KEY'
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name='request_captures' AND column_name='turn_id'
                             ) THEN
-                                ALTER TABLE tag_aliases DROP CONSTRAINT tag_aliases_pkey;
+                                ALTER TABLE request_captures
+                                    ADD COLUMN turn_id TEXT NOT NULL DEFAULT '';
+                                UPDATE request_captures
+                                SET turn_id = COALESCE(data_json::jsonb->>'turn_id', '');
                             END IF;
-                            ALTER TABLE tag_aliases
-                                ADD PRIMARY KEY (alias, conversation_id);
+
+                            SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+                            INTO pk_cols
+                            FROM information_schema.table_constraints tc
+                            JOIN information_schema.key_column_usage kcu
+                              ON tc.constraint_name = kcu.constraint_name
+                             AND tc.table_schema = kcu.table_schema
+                             AND tc.table_name = kcu.table_name
+                            WHERE tc.table_name = 'request_captures'
+                              AND tc.constraint_type = 'PRIMARY KEY';
+
+                            IF pk_cols IS NULL OR pk_cols <> ARRAY['conversation_id', 'turn', 'turn_id'] THEN
+                                IF EXISTS (
+                                    SELECT 1 FROM information_schema.table_constraints
+                                    WHERE table_name='request_captures'
+                                      AND constraint_type='PRIMARY KEY'
+                                ) THEN
+                                    ALTER TABLE request_captures DROP CONSTRAINT request_captures_pkey;
+                                END IF;
+                                ALTER TABLE request_captures
+                                    ADD PRIMARY KEY (conversation_id, turn, turn_id);
+                            END IF;
                         END IF;
-                    END IF;
-                END $$;
-            """)
-        except Exception:
-            pass
+                    END $$;
+                """)
+            except Exception:
+                pass
+            try:
+                conn.execute("""
+                    DO $$ DECLARE
+                        pk_cols text[];
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_name = 'tag_aliases'
+                        ) THEN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name='tag_aliases' AND column_name='conversation_id'
+                            ) THEN
+                                ALTER TABLE tag_aliases
+                                    ADD COLUMN conversation_id TEXT NOT NULL DEFAULT '';
+                            END IF;
+
+                            SELECT array_agg(kcu.column_name ORDER BY kcu.ordinal_position)
+                            INTO pk_cols
+                            FROM information_schema.table_constraints tc
+                            JOIN information_schema.key_column_usage kcu
+                              ON tc.constraint_name = kcu.constraint_name
+                             AND tc.table_schema = kcu.table_schema
+                             AND tc.table_name = kcu.table_name
+                            WHERE tc.table_name = 'tag_aliases'
+                              AND tc.constraint_type = 'PRIMARY KEY';
+
+                            IF pk_cols IS NULL OR pk_cols <> ARRAY['alias', 'conversation_id'] THEN
+                                IF EXISTS (
+                                    SELECT 1 FROM information_schema.table_constraints
+                                    WHERE table_name='tag_aliases'
+                                      AND constraint_type='PRIMARY KEY'
+                                ) THEN
+                                    ALTER TABLE tag_aliases DROP CONSTRAINT tag_aliases_pkey;
+                                END IF;
+                                ALTER TABLE tag_aliases
+                                    ADD PRIMARY KEY (alias, conversation_id);
+                            END IF;
+                        END IF;
+                    END $$;
+                """)
+            except Exception:
+                pass
         try:
             self._normalize_request_turn_sequences()
         except Exception:
             logger.warning("request turn normalization failed", exc_info=True)
         try:
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_request_context_conv_turn_unique "
-                "ON request_context(conversation_id, request_turn)"
-            )
+            with self.pool.connection() as conn:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_request_context_conv_turn_unique "
+                    "ON request_context(conversation_id, request_turn)"
+                )
         except Exception:
             logger.warning("request_context unique index setup failed", exc_info=True)
         try:
@@ -1333,72 +1325,72 @@ class PostgresStore(ContextStore):
     _VIEW_MIGRATION_LOCK_KEY = 0x7663566965777331  # "vcViews1"
 
     def _ensure_canonical_turn_views(self) -> None:
-        conn = self._get_conn()
-        # DROP + CREATE instead of CREATE OR REPLACE VIEW: the view selects
-        # ``ct.*`` from canonical_turns, so whenever the underlying table
-        # gains a column the implicit column order changes. Postgres rejects
-        # that as a column-rename under CREATE OR REPLACE VIEW.
-        #
-        # Advisory lock serializes concurrent workers. Without it, two
-        # workers can both pass the DROP IF EXISTS step, then race on
-        # CREATE VIEW and one loses with
-        # duplicate key value violates unique constraint pg_type_typname_nsp_index.
-        # The connection runs in autocommit mode, so we wrap in an explicit
-        # transaction to anchor pg_advisory_xact_lock (auto-releases on
-        # commit).
-        with conn.transaction():
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(%s)",
-                (self._VIEW_MIGRATION_LOCK_KEY,),
-            )
-            conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
-            conn.execute(
-                """CREATE VIEW canonical_turns_ordinal AS
-                   SELECT
-                       ct.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ct.conversation_id
-                           ORDER BY ct.sort_key, ct.first_seen_at, ct.canonical_turn_id
-                       ) - 1 AS turn_number
-                   FROM canonical_turns ct"""
-            )
+        with self.pool.connection() as conn:
+            # DROP + CREATE instead of CREATE OR REPLACE VIEW: the view selects
+            # ``ct.*`` from canonical_turns, so whenever the underlying table
+            # gains a column the implicit column order changes. Postgres rejects
+            # that as a column-rename under CREATE OR REPLACE VIEW.
+            #
+            # Advisory lock serializes concurrent workers. Without it, two
+            # workers can both pass the DROP IF EXISTS step, then race on
+            # CREATE VIEW and one loses with
+            # duplicate key value violates unique constraint pg_type_typname_nsp_index.
+            # The connection runs in autocommit mode, so we wrap in an explicit
+            # transaction to anchor pg_advisory_xact_lock (auto-releases on
+            # commit).
+            with conn.transaction():
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (self._VIEW_MIGRATION_LOCK_KEY,),
+                )
+                conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
+                conn.execute(
+                    """CREATE VIEW canonical_turns_ordinal AS
+                       SELECT
+                           ct.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ct.conversation_id
+                               ORDER BY ct.sort_key, ct.first_seen_at, ct.canonical_turn_id
+                           ) - 1 AS turn_number
+                       FROM canonical_turns ct"""
+                )
 
     def _ensure_canonical_turn_schema(self) -> None:
-        conn = self._get_conn()
-        for column in ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at"):
-            try:
-                conn.execute(
-                    f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP NOT NULL"
-                )
-            except Exception:
-                pass
-            try:
-                conn.execute(
-                    f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP DEFAULT"
-                )
-            except Exception:
-                pass
-            try:
-                conn.execute(
-                    f"UPDATE canonical_turns SET {column} = NULL WHERE {column} = ''"
-                )
-            except Exception:
-                pass
+        with self.pool.connection() as conn:
+            for column in ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP NOT NULL"
+                    )
+                except Exception:
+                    pass
+                try:
+                    conn.execute(
+                        f"ALTER TABLE canonical_turns ALTER COLUMN {column} DROP DEFAULT"
+                    )
+                except Exception:
+                    pass
+                try:
+                    conn.execute(
+                        f"UPDATE canonical_turns SET {column} = NULL WHERE {column} = ''"
+                    )
+                except Exception:
+                    pass
 
     def _ensure_tag_summary_schema(self) -> None:
-        conn = self._get_conn()
-        try:
-            conn.execute(
-                "ALTER TABLE tag_summaries ADD COLUMN source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]'"
-            )
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
-            )
-        except Exception:
-            pass
+        with self.pool.connection() as conn:
+            try:
+                conn.execute(
+                    "ALTER TABLE tag_summaries ADD COLUMN source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]'"
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
+                )
+            except Exception:
+                pass
 
     def _ensure_compaction_scoping_columns(self) -> None:
         """Add operation_id / compaction_operation_id columns used by the
@@ -1413,105 +1405,105 @@ class PostgresStore(ContextStore):
           mirrors the SQLite constraint widening done in Task 7.
         """
         zero_uuid = "00000000-0000-0000-0000-000000000000"
-        conn = self._get_conn()
-        for table, column in (
-            ("segments", "operation_id"),
-            ("facts", "operation_id"),
-            ("tag_summaries", "operation_id"),
-            ("tag_summary_embeddings", "operation_id"),
-            ("canonical_turns", "compaction_operation_id"),
-        ):
+        with self.pool.connection() as conn:
+            for table, column in (
+                ("segments", "operation_id"),
+                ("facts", "operation_id"),
+                ("tag_summaries", "operation_id"),
+                ("tag_summary_embeddings", "operation_id"),
+                ("canonical_turns", "compaction_operation_id"),
+            ):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} UUID"
+                    )
+                except Exception:
+                    pass
+                try:
+                    # Idempotent backfill. Matches zero rows on second run.
+                    conn.execute(
+                        f"UPDATE {table} SET {column} = %s WHERE {column} IS NULL",
+                        (zero_uuid,),
+                    )
+                except Exception:
+                    pass
+
+            # Add created_at to compaction_operation if not already present.
+            # The CREATE TABLE above (Task 4) did not include this column; Task 7
+            # added it to SQLite and we mirror it here. NULL is acceptable for
+            # pre-existing rows.
             try:
                 conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} UUID"
-                )
-            except Exception:
-                pass
-            try:
-                # Idempotent backfill. Matches zero rows on second run.
-                conn.execute(
-                    f"UPDATE {table} SET {column} = %s WHERE {column} IS NULL",
-                    (zero_uuid,),
+                    "ALTER TABLE compaction_operation "
+                    "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NULL"
                 )
             except Exception:
                 pass
 
-        # Add created_at to compaction_operation if not already present.
-        # The CREATE TABLE above (Task 4) did not include this column; Task 7
-        # added it to SQLite and we mirror it here. NULL is acceptable for
-        # pre-existing rows.
-        try:
-            conn.execute(
-                "ALTER TABLE compaction_operation "
-                "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NULL"
-            )
-        except Exception:
-            pass
-
-        # Widen the status CHECK constraint to include 'abandoned'.
-        # Postgres CHECK constraints cannot be modified in-place; we must
-        # drop the existing one and add a replacement. The constraint name
-        # was auto-generated by Postgres as compaction_operation_status_check.
-        # Both the DROP and ADD are wrapped in individual try/except so the
-        # method remains idempotent (second run: DROP fails on missing
-        # constraint, ADD fails on duplicate — both silent).
-        try:
-            conn.execute(
-                "ALTER TABLE compaction_operation "
-                "DROP CONSTRAINT IF EXISTS compaction_operation_status_check"
-            )
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                "ALTER TABLE compaction_operation "
-                "ADD CONSTRAINT compaction_operation_status_check "
-                "CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned'))"
-            )
-        except Exception:
-            pass
+            # Widen the status CHECK constraint to include 'abandoned'.
+            # Postgres CHECK constraints cannot be modified in-place; we must
+            # drop the existing one and add a replacement. The constraint name
+            # was auto-generated by Postgres as compaction_operation_status_check.
+            # Both the DROP and ADD are wrapped in individual try/except so the
+            # method remains idempotent (second run: DROP fails on missing
+            # constraint, ADD fails on duplicate — both silent).
+            try:
+                conn.execute(
+                    "ALTER TABLE compaction_operation "
+                    "DROP CONSTRAINT IF EXISTS compaction_operation_status_check"
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE compaction_operation "
+                    "ADD CONSTRAINT compaction_operation_status_check "
+                    "CHECK (status IN ('queued','running','completed','cancelled','failed','abandoned'))"
+                )
+            except Exception:
+                pass
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT tag FROM segment_tags WHERE segment_ref = %s ORDER BY tag", (ref,)
-        ).fetchall()
-        return [r["tag"] for r in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT tag FROM segment_tags WHERE segment_ref = %s ORDER BY tag", (ref,)
+            ).fetchall()
+            return [r["tag"] for r in rows]
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            """SELECT canonical_turn_id
-               FROM canonical_turns_ordinal
-               WHERE conversation_id = %s AND turn_number = %s""",
-            (conversation_id, turn_number),
-        ).fetchone()
-        return str(row["canonical_turn_id"]) if row else None
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT canonical_turn_id
+                   FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s AND turn_number = %s""",
+                (conversation_id, turn_number),
+            ).fetchone()
+            return str(row["canonical_turn_id"]) if row else None
 
     def _lookup_ordinal_for_canonical_turn_id(self, conversation_id: str, canonical_turn_id: str) -> int:
-        conn = self._get_conn()
-        row = conn.execute(
-            """SELECT turn_number
-               FROM canonical_turns_ordinal
-               WHERE conversation_id = %s AND canonical_turn_id = %s""",
-            (conversation_id, canonical_turn_id),
-        ).fetchone()
-        return int(row["turn_number"]) if row else -1
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT turn_number
+                   FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s AND canonical_turn_id = %s""",
+                (conversation_id, canonical_turn_id),
+            ).fetchone()
+            return int(row["turn_number"]) if row else -1
 
     def _load_canonical_turn_rows_raw(self, conversation_id: str) -> list[CanonicalTurnRow]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
-                      normalized_user_text, normalized_assistant_text, user_content, assistant_content,
-                      user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
-                      sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
-                      last_seen_at, source_batch_id, created_at, updated_at
-               FROM canonical_turns_ordinal
-               WHERE conversation_id = %s
-               ORDER BY sort_key, canonical_turn_id""",
-            (conversation_id,),
-        ).fetchall()
-        return [_row_to_canonical_turn(row) for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
+                          normalized_user_text, normalized_assistant_text, user_content, assistant_content,
+                          user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
+                          sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
+                          last_seen_at, source_batch_id, created_at, updated_at
+                   FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s
+                   ORDER BY sort_key, canonical_turn_id""",
+                (conversation_id,),
+            ).fetchall()
+            return [_row_to_canonical_turn(row) for row in rows]
 
     def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
         # Lazy backfill: conversations ingested before turn_group_number was
@@ -1535,15 +1527,15 @@ class PostgresStore(ContextStore):
     def _batch_get_tags(self, refs: list[str]) -> dict[str, list[str]]:
         if not refs:
             return {}
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT segment_ref, tag FROM segment_tags WHERE segment_ref = ANY(%s) ORDER BY segment_ref, tag",
-            (refs,),
-        ).fetchall()
-        result: dict[str, list[str]] = {ref: [] for ref in refs}
-        for row in rows:
-            result[row["segment_ref"]].append(row["tag"])
-        return result
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT segment_ref, tag FROM segment_tags WHERE segment_ref = ANY(%s) ORDER BY segment_ref, tag",
+                (refs,),
+            ).fetchall()
+            result: dict[str, list[str]] = {ref: [] for ref in refs}
+            for row in rows:
+                result[row["segment_ref"]].append(row["tag"])
+            return result
 
     def _row_to_fact(self, row: dict) -> Fact:
         return Fact.from_dict(row, dt_parser=_str_to_dt)
@@ -1573,137 +1565,137 @@ class PostgresStore(ContextStore):
         lifecycle_epoch: int | None = None,
     ) -> str:
         from ..types import CompactionLeaseLost
-        conn = self._get_conn()
-        primary_tag = segment.primary_tag
-        summary_text = segment.summary
-        full_text = segment.full_text
-        metadata_dict = {
-            "entities": segment.metadata.entities,
-            "key_decisions": segment.metadata.key_decisions,
-            "action_items": segment.metadata.action_items,
-            "date_references": segment.metadata.date_references,
-            "code_refs": getattr(segment.metadata, "code_refs", []),
-            "turn_count": segment.metadata.turn_count,
-            "canonical_turn_ids": getattr(segment.metadata, "canonical_turn_ids", []),
-            "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
-            "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
-            "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
-        }
-        if segment.metadata.session_date:
-            metadata_dict["session_date"] = segment.metadata.session_date
+        with self.pool.connection() as conn:
+            primary_tag = segment.primary_tag
+            summary_text = segment.summary
+            full_text = segment.full_text
+            metadata_dict = {
+                "entities": segment.metadata.entities,
+                "key_decisions": segment.metadata.key_decisions,
+                "action_items": segment.metadata.action_items,
+                "date_references": segment.metadata.date_references,
+                "code_refs": getattr(segment.metadata, "code_refs", []),
+                "turn_count": segment.metadata.turn_count,
+                "canonical_turn_ids": getattr(segment.metadata, "canonical_turn_ids", []),
+                "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
+                "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
+                "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
+            }
+            if segment.metadata.session_date:
+                metadata_dict["session_date"] = segment.metadata.session_date
 
-        guard_all = (
-            operation_id is not None
-            and owner_worker_id is not None
-            and lifecycle_epoch is not None
-        )
+            guard_all = (
+                operation_id is not None
+                and owner_worker_id is not None
+                and lifecycle_epoch is not None
+            )
 
-        with conn.transaction():
-            if guard_all:
-                # INSERT-SELECT form: writes zero rows if the compaction_operation
-                # row no longer matches (status != 'running', owner mismatch, etc).
-                cur = conn.execute(
-                    """INSERT INTO segments
-                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
-                     metadata_json, summary_tokens, full_tokens, compression_ratio,
-                     compaction_model, created_at, start_timestamp, end_timestamp,
-                     operation_id)
-                    SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                      FROM compaction_operation
-                     WHERE operation_id = %s
-                       AND conversation_id = %s
-                       AND status = 'running'
-                       AND owner_worker_id = %s
-                       AND lifecycle_epoch = %s
-                    ON CONFLICT (ref) DO UPDATE SET
-                        conversation_id=EXCLUDED.conversation_id,
-                        primary_tag=EXCLUDED.primary_tag,
-                        summary=EXCLUDED.summary,
-                        full_text=EXCLUDED.full_text,
-                        messages_json=EXCLUDED.messages_json,
-                        metadata_json=EXCLUDED.metadata_json,
-                        summary_tokens=EXCLUDED.summary_tokens,
-                        full_tokens=EXCLUDED.full_tokens,
-                        compression_ratio=EXCLUDED.compression_ratio,
-                        compaction_model=EXCLUDED.compaction_model,
-                        created_at=EXCLUDED.created_at,
-                        start_timestamp=EXCLUDED.start_timestamp,
-                        end_timestamp=EXCLUDED.end_timestamp,
-                        operation_id=EXCLUDED.operation_id""",
-                    (
-                        segment.ref, segment.conversation_id, primary_tag, summary_text,
-                        full_text, json.dumps(segment.messages, default=str),
-                        json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
-                        segment.compression_ratio, segment.compaction_model,
-                        _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
-                        _dt_to_str(segment.end_timestamp),
-                        operation_id,
-                        # WHERE clause params:
-                        operation_id, segment.conversation_id,
-                        owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
-                        operation_id=operation_id,
-                        write_site="store_segment",
+            with conn.transaction():
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the compaction_operation
+                    # row no longer matches (status != 'running', owner mismatch, etc).
+                    cur = conn.execute(
+                        """INSERT INTO segments
+                        (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                         metadata_json, summary_tokens, full_tokens, compression_ratio,
+                         compaction_model, created_at, start_timestamp, end_timestamp,
+                         operation_id)
+                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (ref) DO UPDATE SET
+                            conversation_id=EXCLUDED.conversation_id,
+                            primary_tag=EXCLUDED.primary_tag,
+                            summary=EXCLUDED.summary,
+                            full_text=EXCLUDED.full_text,
+                            messages_json=EXCLUDED.messages_json,
+                            metadata_json=EXCLUDED.metadata_json,
+                            summary_tokens=EXCLUDED.summary_tokens,
+                            full_tokens=EXCLUDED.full_tokens,
+                            compression_ratio=EXCLUDED.compression_ratio,
+                            compaction_model=EXCLUDED.compaction_model,
+                            created_at=EXCLUDED.created_at,
+                            start_timestamp=EXCLUDED.start_timestamp,
+                            end_timestamp=EXCLUDED.end_timestamp,
+                            operation_id=EXCLUDED.operation_id""",
+                        (
+                            segment.ref, segment.conversation_id, primary_tag, summary_text,
+                            full_text, json.dumps(segment.messages, default=str),
+                            json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
+                            segment.compression_ratio, segment.compaction_model,
+                            _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
+                            _dt_to_str(segment.end_timestamp),
+                            operation_id,
+                            # WHERE clause params:
+                            operation_id, segment.conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
                     )
-            else:
-                # Legacy unconditional path — existing callers and test harnesses.
-                conn.execute(
-                    """INSERT INTO segments
-                    (ref, conversation_id, primary_tag, summary, full_text, messages_json,
-                     metadata_json, summary_tokens, full_tokens, compression_ratio,
-                     compaction_model, created_at, start_timestamp, end_timestamp)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (ref) DO UPDATE SET
-                        conversation_id=EXCLUDED.conversation_id, primary_tag=EXCLUDED.primary_tag,
-                        summary=EXCLUDED.summary, full_text=EXCLUDED.full_text,
-                        messages_json=EXCLUDED.messages_json, metadata_json=EXCLUDED.metadata_json,
-                        summary_tokens=EXCLUDED.summary_tokens, full_tokens=EXCLUDED.full_tokens,
-                        compression_ratio=EXCLUDED.compression_ratio, compaction_model=EXCLUDED.compaction_model,
-                        created_at=EXCLUDED.created_at, start_timestamp=EXCLUDED.start_timestamp,
-                        end_timestamp=EXCLUDED.end_timestamp""",
-                    (segment.ref, segment.conversation_id, primary_tag, summary_text,
-                     full_text, json.dumps(segment.messages, default=str),
-                     json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
-                     segment.compression_ratio, segment.compaction_model,
-                     _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
-                     _dt_to_str(segment.end_timestamp)),
-                )
-            conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (segment.ref,))
-            for tag in segment.tags:
-                conn.execute(
-                    "INSERT INTO segment_tags (segment_ref, tag) VALUES (%s, %s)",
-                    (segment.ref, tag),
-                )
-        return segment.ref
+                    if (cur.rowcount or 0) == 0:
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="store_segment",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and test harnesses.
+                    conn.execute(
+                        """INSERT INTO segments
+                        (ref, conversation_id, primary_tag, summary, full_text, messages_json,
+                         metadata_json, summary_tokens, full_tokens, compression_ratio,
+                         compaction_model, created_at, start_timestamp, end_timestamp)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (ref) DO UPDATE SET
+                            conversation_id=EXCLUDED.conversation_id, primary_tag=EXCLUDED.primary_tag,
+                            summary=EXCLUDED.summary, full_text=EXCLUDED.full_text,
+                            messages_json=EXCLUDED.messages_json, metadata_json=EXCLUDED.metadata_json,
+                            summary_tokens=EXCLUDED.summary_tokens, full_tokens=EXCLUDED.full_tokens,
+                            compression_ratio=EXCLUDED.compression_ratio, compaction_model=EXCLUDED.compaction_model,
+                            created_at=EXCLUDED.created_at, start_timestamp=EXCLUDED.start_timestamp,
+                            end_timestamp=EXCLUDED.end_timestamp""",
+                        (segment.ref, segment.conversation_id, primary_tag, summary_text,
+                         full_text, json.dumps(segment.messages, default=str),
+                         json.dumps(metadata_dict), segment.summary_tokens, segment.full_tokens,
+                         segment.compression_ratio, segment.compaction_model,
+                         _dt_to_str(segment.created_at), _dt_to_str(segment.start_timestamp),
+                         _dt_to_str(segment.end_timestamp)),
+                    )
+                conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (segment.ref,))
+                for tag in segment.tags:
+                    conn.execute(
+                        "INSERT INTO segment_tags (segment_ref, tag) VALUES (%s, %s)",
+                        (segment.ref, tag),
+                    )
+            return segment.ref
 
     def get_segment(self, ref: str, conversation_id: str | None = None) -> StoredSegment | None:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            row = conn.execute(
-                "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
-                (ref, conversation_id),
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
-        if not row:
-            return None
-        return _row_to_segment(row, self._get_tags_for_ref(ref))
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
+                    (ref, conversation_id),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
+            if not row:
+                return None
+            return _row_to_segment(row, self._get_tags_for_ref(ref))
 
     def get_summary(self, ref: str, conversation_id: str | None = None) -> StoredSummary | None:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            row = conn.execute(
-                "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
-                (ref, conversation_id),
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
-        if not row:
-            return None
-        return _row_to_summary(row, self._get_tags_for_ref(ref))
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM segments WHERE ref = %s AND conversation_id = %s",
+                    (ref, conversation_id),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM segments WHERE ref = %s", (ref,)).fetchone()
+            if not row:
+                return None
+            return _row_to_summary(row, self._get_tags_for_ref(ref))
 
     def get_all_segments(
         self,
@@ -1711,29 +1703,29 @@ class PostgresStore(ContextStore):
         conversation_id: str | None = None,
         limit: int | None = None,
     ) -> list[StoredSegment]:
-        conn = self._get_conn()
-        if conversation_id is not None and limit is not None and limit > 0:
-            rows = conn.execute(
-                "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC LIMIT %s",
-                (conversation_id, limit),
-            ).fetchall()
-        elif conversation_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC",
-                (conversation_id,),
-            ).fetchall()
-        elif limit is not None and limit > 0:
-            rows = conn.execute(
-                "SELECT * FROM segments ORDER BY created_at DESC LIMIT %s",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM segments ORDER BY created_at DESC").fetchall()
-        if not rows:
-            return []
-        refs = [row["ref"] for row in rows]
-        tags_map = self._batch_get_tags(refs)
-        return [_row_to_segment(row, tags_map.get(row["ref"], [])) for row in rows]
+        with self.pool.connection() as conn:
+            if conversation_id is not None and limit is not None and limit > 0:
+                rows = conn.execute(
+                    "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC LIMIT %s",
+                    (conversation_id, limit),
+                ).fetchall()
+            elif conversation_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC",
+                    (conversation_id,),
+                ).fetchall()
+            elif limit is not None and limit > 0:
+                rows = conn.execute(
+                    "SELECT * FROM segments ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM segments ORDER BY created_at DESC").fetchall()
+            if not rows:
+                return []
+            refs = [row["ref"] for row in rows]
+            tags_map = self._batch_get_tags(refs)
+            return [_row_to_segment(row, tags_map.get(row["ref"], [])) for row in rows]
 
     def get_summaries_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 10,
@@ -1742,161 +1734,161 @@ class PostgresStore(ContextStore):
     ) -> list[StoredSummary]:
         if not tags:
             return []
-        conn = self._get_conn()
-        query = """
-            SELECT s.*, COUNT(st.tag) as overlap_count
-            FROM segments s
-            JOIN segment_tags st ON s.ref = st.segment_ref
-            WHERE st.tag = ANY(%s)
-        """
-        params: list = [tags]
-        if conversation_id is not None:
-            query += " AND s.conversation_id = %s"
-            params.append(conversation_id)
-        if before:
-            query += " AND s.created_at < %s"
-            params.append(_dt_to_str(before))
-        if after:
-            query += " AND s.created_at > %s"
-            params.append(_dt_to_str(after))
-        query += """
-            GROUP BY s.ref
-            HAVING COUNT(st.tag) >= %s
-            ORDER BY COUNT(st.tag) DESC, s.created_at DESC
-            LIMIT %s
-        """
-        params.extend([min_overlap, limit])
-        rows = conn.execute(query, params).fetchall()
-        refs = [row["ref"] for row in rows]
-        tags_map = self._batch_get_tags(refs)
-        return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
+        with self.pool.connection() as conn:
+            query = """
+                SELECT s.*, COUNT(st.tag) as overlap_count
+                FROM segments s
+                JOIN segment_tags st ON s.ref = st.segment_ref
+                WHERE st.tag = ANY(%s)
+            """
+            params: list = [tags]
+            if conversation_id is not None:
+                query += " AND s.conversation_id = %s"
+                params.append(conversation_id)
+            if before:
+                query += " AND s.created_at < %s"
+                params.append(_dt_to_str(before))
+            if after:
+                query += " AND s.created_at > %s"
+                params.append(_dt_to_str(after))
+            query += """
+                GROUP BY s.ref
+                HAVING COUNT(st.tag) >= %s
+                ORDER BY COUNT(st.tag) DESC, s.created_at DESC
+                LIMIT %s
+            """
+            params.extend([min_overlap, limit])
+            rows = conn.execute(query, params).fetchall()
+            refs = [row["ref"] for row in rows]
+            tags_map = self._batch_get_tags(refs)
+            return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
 
     def search(self, query: str, tags: list[str] | None = None, limit: int = 5, conversation_id: str | None = None) -> list[StoredSummary]:
-        conn = self._get_conn()
-        tsquery = " & ".join(query.split())
-        if tags:
-            sql = """SELECT DISTINCT s.* FROM segments s
-                JOIN segment_tags st ON s.ref = st.segment_ref
-                WHERE s.summary_tsv @@ to_tsquery('english', %s)
-                AND st.tag = ANY(%s)"""
-            params: list = [tsquery, tags]
-            if conversation_id is not None:
-                sql += " AND s.conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY s.created_at DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-        else:
-            sql = """SELECT * FROM segments
-                WHERE summary_tsv @@ to_tsquery('english', %s)"""
-            params = [tsquery]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY created_at DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-        refs = [row["ref"] for row in rows]
-        tags_map = self._batch_get_tags(refs)
-        return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
+        with self.pool.connection() as conn:
+            tsquery = " & ".join(query.split())
+            if tags:
+                sql = """SELECT DISTINCT s.* FROM segments s
+                    JOIN segment_tags st ON s.ref = st.segment_ref
+                    WHERE s.summary_tsv @@ to_tsquery('english', %s)
+                    AND st.tag = ANY(%s)"""
+                params: list = [tsquery, tags]
+                if conversation_id is not None:
+                    sql += " AND s.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " ORDER BY s.created_at DESC LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+            else:
+                sql = """SELECT * FROM segments
+                    WHERE summary_tsv @@ to_tsquery('english', %s)"""
+                params = [tsquery]
+                if conversation_id is not None:
+                    sql += " AND conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " ORDER BY created_at DESC LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+            refs = [row["ref"] for row in rows]
+            tags_map = self._batch_get_tags(refs)
+            return [_row_to_summary(row, tags_map[row["ref"]]) for row in rows]
 
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            rows = conn.execute("""
-                SELECT st.tag,
-                       COUNT(DISTINCT st.segment_ref) as usage_count,
-                       COALESCE(SUM(s.full_tokens), 0) as total_full,
-                       COALESCE(SUM(s.summary_tokens), 0) as total_summary,
-                       MIN(s.created_at) as oldest,
-                       MAX(s.created_at) as newest
-                FROM segment_tags st
-                JOIN segments s ON s.ref = st.segment_ref
-                WHERE s.conversation_id = %s
-                GROUP BY st.tag
-                ORDER BY usage_count DESC
-            """, (conversation_id,)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT st.tag,
-                       COUNT(DISTINCT st.segment_ref) as usage_count,
-                       COALESCE(SUM(s.full_tokens), 0) as total_full,
-                       COALESCE(SUM(s.summary_tokens), 0) as total_summary,
-                       MIN(s.created_at) as oldest,
-                       MAX(s.created_at) as newest
-                FROM segment_tags st
-                JOIN segments s ON s.ref = st.segment_ref
-                GROUP BY st.tag
-                ORDER BY usage_count DESC
-            """).fetchall()
-        return [
-            TagStats(
-                tag=row["tag"],
-                usage_count=row["usage_count"],
-                total_full_tokens=row["total_full"],
-                total_summary_tokens=row["total_summary"],
-                oldest_segment=_str_to_dt(row["oldest"]),
-                newest_segment=_str_to_dt(row["newest"]),
-            )
-            for row in rows
-        ]
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                rows = conn.execute("""
+                    SELECT st.tag,
+                           COUNT(DISTINCT st.segment_ref) as usage_count,
+                           COALESCE(SUM(s.full_tokens), 0) as total_full,
+                           COALESCE(SUM(s.summary_tokens), 0) as total_summary,
+                           MIN(s.created_at) as oldest,
+                           MAX(s.created_at) as newest
+                    FROM segment_tags st
+                    JOIN segments s ON s.ref = st.segment_ref
+                    WHERE s.conversation_id = %s
+                    GROUP BY st.tag
+                    ORDER BY usage_count DESC
+                """, (conversation_id,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT st.tag,
+                           COUNT(DISTINCT st.segment_ref) as usage_count,
+                           COALESCE(SUM(s.full_tokens), 0) as total_full,
+                           COALESCE(SUM(s.summary_tokens), 0) as total_summary,
+                           MIN(s.created_at) as oldest,
+                           MAX(s.created_at) as newest
+                    FROM segment_tags st
+                    JOIN segments s ON s.ref = st.segment_ref
+                    GROUP BY st.tag
+                    ORDER BY usage_count DESC
+                """).fetchall()
+            return [
+                TagStats(
+                    tag=row["tag"],
+                    usage_count=row["usage_count"],
+                    total_full_tokens=row["total_full"],
+                    total_summary_tokens=row["total_summary"],
+                    oldest_segment=_str_to_dt(row["oldest"]),
+                    newest_segment=_str_to_dt(row["newest"]),
+                )
+                for row in rows
+            ]
 
     def get_conversation_stats(self) -> list[ConversationStats]:
-        conn = self._get_conn()
-        rows = conn.execute("""
-            SELECT conversation_id, COUNT(*) as seg_count,
-                   SUM(full_tokens) as total_full, SUM(summary_tokens) as total_summary,
-                   MIN(created_at) as oldest, MAX(created_at) as newest,
-                   compaction_model
-            FROM segments WHERE conversation_id != ''
-            GROUP BY conversation_id, compaction_model
-            ORDER BY MAX(created_at) DESC
-        """).fetchall()
-        # Batch-fetch distinct tags per conversation (avoids N+1)
-        conv_ids = [row["conversation_id"] for row in rows]
-        tags_by_conv: dict[str, list[str]] = {cid: [] for cid in conv_ids}
-        if conv_ids:
-            tag_rows = conn.execute(
-                """SELECT s.conversation_id, st.tag
-                FROM segment_tags st
-                JOIN segments s ON s.ref = st.segment_ref
-                WHERE s.conversation_id = ANY(%s)
-                GROUP BY s.conversation_id, st.tag
-                ORDER BY st.tag""",
-                (conv_ids,),
-            ).fetchall()
-            for tr in tag_rows:
-                tags_by_conv[tr["conversation_id"]].append(tr["tag"])
+        with self.pool.connection() as conn:
+            rows = conn.execute("""
+                SELECT conversation_id, COUNT(*) as seg_count,
+                       SUM(full_tokens) as total_full, SUM(summary_tokens) as total_summary,
+                       MIN(created_at) as oldest, MAX(created_at) as newest,
+                       compaction_model
+                FROM segments WHERE conversation_id != ''
+                GROUP BY conversation_id, compaction_model
+                ORDER BY MAX(created_at) DESC
+            """).fetchall()
+            # Batch-fetch distinct tags per conversation (avoids N+1)
+            conv_ids = [row["conversation_id"] for row in rows]
+            tags_by_conv: dict[str, list[str]] = {cid: [] for cid in conv_ids}
+            if conv_ids:
+                tag_rows = conn.execute(
+                    """SELECT s.conversation_id, st.tag
+                    FROM segment_tags st
+                    JOIN segments s ON s.ref = st.segment_ref
+                    WHERE s.conversation_id = ANY(%s)
+                    GROUP BY s.conversation_id, st.tag
+                    ORDER BY st.tag""",
+                    (conv_ids,),
+                ).fetchall()
+                for tr in tag_rows:
+                    tags_by_conv[tr["conversation_id"]].append(tr["tag"])
 
-        results = []
-        for row in rows:
-            results.append(ConversationStats(
-                conversation_id=row["conversation_id"],
-                segment_count=row["seg_count"],
-                total_full_tokens=row["total_full"],
-                total_summary_tokens=row["total_summary"],
-                oldest_segment=_str_to_dt(row["oldest"]),
-                newest_segment=_str_to_dt(row["newest"]),
-                distinct_tags=tags_by_conv.get(row["conversation_id"], []),
-                compaction_model=row["compaction_model"],
-            ))
-        return results
+            results = []
+            for row in rows:
+                results.append(ConversationStats(
+                    conversation_id=row["conversation_id"],
+                    segment_count=row["seg_count"],
+                    total_full_tokens=row["total_full"],
+                    total_summary_tokens=row["total_summary"],
+                    oldest_segment=_str_to_dt(row["oldest"]),
+                    newest_segment=_str_to_dt(row["newest"]),
+                    distinct_tags=tags_by_conv.get(row["conversation_id"], []),
+                    compaction_model=row["compaction_model"],
+                ))
+            return results
 
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:
-        conn = self._get_conn()
-        params: list[object] = []
-        query = "SELECT alias, canonical, conversation_id FROM tag_aliases"
-        if conversation_id:
-            query += " WHERE conversation_id IN ('', %s)"
-            params.append(conversation_id)
-        else:
-            query += " WHERE conversation_id = ''"
-        query += " ORDER BY CASE WHEN conversation_id = '' THEN 0 ELSE 1 END, alias"
-        rows = conn.execute(query, params).fetchall()
-        aliases: dict[str, str] = {}
-        for row in rows:
-            aliases[row["alias"]] = row["canonical"]
-        return aliases
+        with self.pool.connection() as conn:
+            params: list[object] = []
+            query = "SELECT alias, canonical, conversation_id FROM tag_aliases"
+            if conversation_id:
+                query += " WHERE conversation_id IN ('', %s)"
+                params.append(conversation_id)
+            else:
+                query += " WHERE conversation_id = ''"
+            query += " ORDER BY CASE WHEN conversation_id = '' THEN 0 ELSE 1 END, alias"
+            rows = conn.execute(query, params).fetchall()
+            aliases: dict[str, str] = {}
+            for row in rows:
+                aliases[row["alias"]] = row["canonical"]
+            return aliases
 
     def set_tag_alias(
         self,
@@ -1904,39 +1896,39 @@ class PostgresStore(ContextStore):
         canonical: str,
         conversation_id: str = "",
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO tag_aliases (alias, conversation_id, canonical)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (alias, conversation_id)
-            DO UPDATE SET canonical = EXCLUDED.canonical""",
-            (alias, conversation_id or "", canonical),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO tag_aliases (alias, conversation_id, canonical)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (alias, conversation_id)
+                DO UPDATE SET canonical = EXCLUDED.canonical""",
+                (alias, conversation_id or "", canonical),
+            )
 
     def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
-        conn = self._get_conn()
-        cur = conn.execute(
-            "DELETE FROM tag_aliases WHERE conversation_id = %s",
-            (conversation_id,),
-        )
-        return int(cur.rowcount or 0)
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM tag_aliases WHERE conversation_id = %s",
+                (conversation_id,),
+            )
+            return int(cur.rowcount or 0)
 
     def delete_segment(self, ref: str) -> bool:
-        conn = self._get_conn()
-        with conn.transaction():
-            conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (ref,))
-            conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (ref,))
-            conn.execute("DELETE FROM facts WHERE segment_ref = %s", (ref,))
-            cur = conn.execute("DELETE FROM segments WHERE ref = %s", (ref,))
-        return cur.rowcount > 0
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("DELETE FROM segment_tags WHERE segment_ref = %s", (ref,))
+                conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (ref,))
+                conn.execute("DELETE FROM facts WHERE segment_ref = %s", (ref,))
+                cur = conn.execute("DELETE FROM segments WHERE ref = %s", (ref,))
+            return cur.rowcount > 0
 
     def cleanup(self, max_age: timedelta | None = None, max_total_tokens: int | None = None) -> int:
         if not max_age:
             return 0
-        conn = self._get_conn()
-        cutoff = _dt_to_str(datetime.now(timezone.utc) - max_age)
-        cur = conn.execute("DELETE FROM segments WHERE created_at < %s", (cutoff,))
-        return cur.rowcount
+        with self.pool.connection() as conn:
+            cutoff = _dt_to_str(datetime.now(timezone.utc) - max_age)
+            cur = conn.execute("DELETE FROM segments WHERE created_at < %s", (cutoff,))
+            return cur.rowcount
 
     def _table_exists(self, conn, table: str) -> bool:
         row = conn.execute(
@@ -1959,57 +1951,57 @@ class PostgresStore(ContextStore):
         return int(cur.rowcount or 0)
 
     def activate_conversation(self, conversation_id: str) -> int:
-        conn = self._get_conn()
-        row = conn.execute(
-            """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
-            VALUES (%s, 0, FALSE, %s)
-            ON CONFLICT (conversation_id) DO UPDATE SET
-                deleted = FALSE,
-                updated_at = EXCLUDED.updated_at
-            RETURNING generation""",
-            (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
-        ).fetchone()
-        return int(row["generation"] if isinstance(row, dict) else row[0])
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+                VALUES (%s, 0, FALSE, %s)
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    deleted = FALSE,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING generation""",
+                (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
+            ).fetchone()
+            return int(row["generation"] if isinstance(row, dict) else row[0])
 
     def begin_conversation_deletion(self, conversation_id: str) -> int:
-        conn = self._get_conn()
-        row = conn.execute(
-            """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
-            VALUES (%s, 1, TRUE, %s)
-            ON CONFLICT (conversation_id) DO UPDATE SET
-                generation = conversation_lifecycle.generation + 1,
-                deleted = TRUE,
-                updated_at = EXCLUDED.updated_at
-            RETURNING generation""",
-            (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
-        ).fetchone()
-        return int(row["generation"] if isinstance(row, dict) else row[0])
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+                VALUES (%s, 1, TRUE, %s)
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    generation = conversation_lifecycle.generation + 1,
+                    deleted = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING generation""",
+                (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
+            ).fetchone()
+            return int(row["generation"] if isinstance(row, dict) else row[0])
 
     def get_conversation_generation(self, conversation_id: str) -> int:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        if not row:
-            return 0
-        return int(row["generation"] if isinstance(row, dict) else row[0])
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT generation FROM conversation_lifecycle WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            return int(row["generation"] if isinstance(row, dict) else row[0])
 
     def is_conversation_generation_current(
         self,
         conversation_id: str,
         generation: int,
     ) -> bool:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT generation, deleted FROM conversation_lifecycle WHERE conversation_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        if not row:
-            return int(generation or 0) == 0
-        current = int(row["generation"] if isinstance(row, dict) else row[0])
-        deleted = bool(row["deleted"] if isinstance(row, dict) else row[1])
-        return current == int(generation or 0) and not deleted
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT generation, deleted FROM conversation_lifecycle WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if not row:
+                return int(generation or 0) == 0
+            current = int(row["generation"] if isinstance(row, dict) else row[0])
+            deleted = bool(row["deleted"] if isinstance(row, dict) else row[1])
+            return current == int(generation or 0) and not deleted
 
     # ------------------------------------------------------------------
     # Conversation row lifecycle (progress-bar redesign `conversations` table)
@@ -2026,28 +2018,28 @@ class PostgresStore(ContextStore):
         Epoch starts at 1 on new rows; never bumped by this method.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        conn.execute(
-            """
-            INSERT INTO conversations (
-                conversation_id, tenant_id, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s)
-            ON CONFLICT (conversation_id) DO UPDATE SET
-                updated_at = EXCLUDED.updated_at
-            """,
-            (conversation_id, tenant_id, now, now),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    conversation_id, tenant_id, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (conversation_id, tenant_id, now, now),
+            )
 
     def get_lifecycle_epoch(self, conversation_id: str) -> int:
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(conversation_id)
-        return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
 
     def get_conversation_phase(self, conversation_id: str) -> str:
         """Return the current phase for the conversation.
@@ -2055,14 +2047,14 @@ class PostgresStore(ContextStore):
         Returns one of ``"init" | "ingesting" | "compacting" | "active" |
         "deleted"``. Raises ``KeyError`` if no row exists.
         """
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT phase FROM conversations WHERE conversation_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(conversation_id)
-        return str(row["phase"] if isinstance(row, dict) else row[0])
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT phase FROM conversations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            return str(row["phase"] if isinstance(row, dict) else row[0])
 
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
@@ -2072,39 +2064,39 @@ class PostgresStore(ContextStore):
         symmetric signaling with ``increment_lifecycle_epoch_on_resurrect``.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE conversations
-               SET phase = 'deleted',
-                   deleted_at = %s,
-                   updated_at = %s
-             WHERE conversation_id = %s
-            """,
-            (now, now, conversation_id),
-        )
-        if cur.rowcount == 0:
-            raise KeyError(conversation_id)
-        conn.execute(
-            """
-            UPDATE ingestion_episode
-               SET status = 'abandoned',
-                   completed_at = COALESCE(completed_at, %s)
-             WHERE conversation_id = %s
-               AND status = 'running'
-            """,
-            (now, conversation_id),
-        )
-        conn.execute(
-            """
-            UPDATE compaction_operation
-               SET status = 'cancelled',
-                   completed_at = COALESCE(completed_at, %s)
-             WHERE conversation_id = %s
-               AND status IN ('queued', 'running')
-            """,
-            (now, conversation_id),
-        )
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = 'deleted',
+                       deleted_at = %s,
+                       updated_at = %s
+                 WHERE conversation_id = %s
+                """,
+                (now, now, conversation_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(conversation_id)
+            conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET status = 'abandoned',
+                       completed_at = COALESCE(completed_at, %s)
+                 WHERE conversation_id = %s
+                   AND status = 'running'
+                """,
+                (now, conversation_id),
+            )
+            conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'cancelled',
+                       completed_at = COALESCE(completed_at, %s)
+                 WHERE conversation_id = %s
+                   AND status IN ('queued', 'running')
+                """,
+                (now, conversation_id),
+            )
 
     def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
         """Bump lifecycle_epoch ONLY when phase == 'deleted'.
@@ -2117,53 +2109,53 @@ class PostgresStore(ContextStore):
         exists.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        row = conn.execute(
-            """
-            UPDATE conversations
-               SET lifecycle_epoch = lifecycle_epoch + 1,
-                   phase = 'init',
-                   deleted_at = NULL,
-                   updated_at = %s
-             WHERE conversation_id = %s
-               AND phase = 'deleted'
-            RETURNING lifecycle_epoch
-            """,
-            (now, conversation_id),
-        ).fetchone()
-        if row is not None:
-            new_epoch = int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
-            conn.execute(
+        with self.pool.connection() as conn:
+            row = conn.execute(
                 """
-                UPDATE ingestion_episode
-                   SET status = 'abandoned',
-                       completed_at = COALESCE(completed_at, %s)
+                UPDATE conversations
+                   SET lifecycle_epoch = lifecycle_epoch + 1,
+                       phase = 'init',
+                       deleted_at = NULL,
+                       updated_at = %s
                  WHERE conversation_id = %s
-                   AND lifecycle_epoch < %s
-                   AND status = 'running'
+                   AND phase = 'deleted'
+                RETURNING lifecycle_epoch
                 """,
-                (now, conversation_id, new_epoch),
-            )
-            conn.execute(
-                """
-                UPDATE compaction_operation
-                   SET status = 'cancelled',
-                       completed_at = COALESCE(completed_at, %s)
-                 WHERE conversation_id = %s
-                   AND lifecycle_epoch < %s
-                   AND status IN ('queued', 'running')
-                """,
-                (now, conversation_id, new_epoch),
-            )
-            return new_epoch
-        # Not deleted (already init/active or unknown) — read current epoch.
-        row = conn.execute(
-            "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(conversation_id)
-        return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+                (now, conversation_id),
+            ).fetchone()
+            if row is not None:
+                new_epoch = int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+                conn.execute(
+                    """
+                    UPDATE ingestion_episode
+                       SET status = 'abandoned',
+                           completed_at = COALESCE(completed_at, %s)
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch < %s
+                       AND status = 'running'
+                    """,
+                    (now, conversation_id, new_epoch),
+                )
+                conn.execute(
+                    """
+                    UPDATE compaction_operation
+                       SET status = 'cancelled',
+                           completed_at = COALESCE(completed_at, %s)
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch < %s
+                       AND status IN ('queued', 'running')
+                    """,
+                    (now, conversation_id, new_epoch),
+                )
+                return new_epoch
+            # Not deleted (already init/active or unknown) — read current epoch.
+            row = conn.execute(
+                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
 
     def read_progress_snapshot(self, conversation_id: str) -> ProgressSnapshot:
         """Derive the current progress state for a conversation.
@@ -2178,98 +2170,98 @@ class PostgresStore(ContextStore):
 
         Raises ``KeyError`` if the conversation row does not exist.
         """
-        conn = self._get_conn()
-        with conn.transaction():
-            row = conn.execute(
-                """
-                SELECT lifecycle_epoch, phase,
-                       last_raw_payload_entries, last_ingestible_payload_entries
-                  FROM conversations
-                 WHERE conversation_id = %s
-                """,
-                (conversation_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(conversation_id)
-            epoch = row["lifecycle_epoch"]
-            phase = row["phase"]
-            last_raw = row["last_raw_payload_entries"]
-            last_ing = row["last_ingestible_payload_entries"]
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT lifecycle_epoch, phase,
+                           last_raw_payload_entries, last_ingestible_payload_entries
+                      FROM conversations
+                     WHERE conversation_id = %s
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(conversation_id)
+                epoch = row["lifecycle_epoch"]
+                phase = row["phase"]
+                last_raw = row["last_raw_payload_entries"]
+                last_ing = row["last_ingestible_payload_entries"]
 
-            totals = conn.execute(
-                """
-                SELECT COALESCE(SUM(covered_ingestible_entries), 0) AS total_ing,
-                       COALESCE(SUM(CASE WHEN tagged_at IS NOT NULL
-                                         THEN covered_ingestible_entries ELSE 0 END), 0) AS done_ing
-                  FROM canonical_turns
-                 WHERE conversation_id = %s
-                """,
-                (conversation_id,),
-            ).fetchone()
-            total_ing = totals["total_ing"]
-            done_ing = totals["done_ing"]
+                totals = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(covered_ingestible_entries), 0) AS total_ing,
+                           COALESCE(SUM(CASE WHEN tagged_at IS NOT NULL
+                                             THEN covered_ingestible_entries ELSE 0 END), 0) AS done_ing
+                      FROM canonical_turns
+                     WHERE conversation_id = %s
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                total_ing = totals["total_ing"]
+                done_ing = totals["done_ing"]
 
-            ep_row = conn.execute(
-                """
-                SELECT episode_id, raw_payload_entries, owner_worker_id, heartbeat_ts
-                  FROM ingestion_episode
-                 WHERE conversation_id = %s
-                   AND lifecycle_epoch = %s
-                   AND status = 'running'
-                 ORDER BY started_at DESC, episode_id DESC
-                 LIMIT 1
-                """,
-                (conversation_id, epoch),
-            ).fetchone()
-            active_episode = (
-                ActiveEpisodeSnapshot(
-                    episode_id=str(ep_row["episode_id"]),
-                    raw_payload_entries=int(ep_row["raw_payload_entries"]),
-                    owner_worker_id=str(ep_row["owner_worker_id"]),
-                    heartbeat_ts=str(ep_row["heartbeat_ts"]),
+                ep_row = conn.execute(
+                    """
+                    SELECT episode_id, raw_payload_entries, owner_worker_id, heartbeat_ts
+                      FROM ingestion_episode
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch = %s
+                       AND status = 'running'
+                     ORDER BY started_at DESC, episode_id DESC
+                     LIMIT 1
+                    """,
+                    (conversation_id, epoch),
+                ).fetchone()
+                active_episode = (
+                    ActiveEpisodeSnapshot(
+                        episode_id=str(ep_row["episode_id"]),
+                        raw_payload_entries=int(ep_row["raw_payload_entries"]),
+                        owner_worker_id=str(ep_row["owner_worker_id"]),
+                        heartbeat_ts=str(ep_row["heartbeat_ts"]),
+                    )
+                    if ep_row is not None
+                    else None
                 )
-                if ep_row is not None
-                else None
-            )
 
-            cop_row = conn.execute(
-                """
-                SELECT operation_id, phase_name, phase_index, phase_count, status
-                  FROM compaction_operation
-                 WHERE conversation_id = %s
-                   AND lifecycle_epoch = %s
-                   AND status IN ('queued','running')
-                 ORDER BY
-                     CASE status WHEN 'running' THEN 0 ELSE 1 END,
-                     started_at DESC,
-                     operation_id DESC
-                 LIMIT 1
-                """,
-                (conversation_id, epoch),
-            ).fetchone()
-            active_compaction = (
-                ActiveCompactionSnapshot(
-                    operation_id=str(cop_row["operation_id"]),
-                    phase_name=str(cop_row["phase_name"]),
-                    phase_index=int(cop_row["phase_index"]),
-                    phase_count=int(cop_row["phase_count"]),
-                    status=str(cop_row["status"]),
+                cop_row = conn.execute(
+                    """
+                    SELECT operation_id, phase_name, phase_index, phase_count, status
+                      FROM compaction_operation
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch = %s
+                       AND status IN ('queued','running')
+                     ORDER BY
+                         CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                         started_at DESC,
+                         operation_id DESC
+                     LIMIT 1
+                    """,
+                    (conversation_id, epoch),
+                ).fetchone()
+                active_compaction = (
+                    ActiveCompactionSnapshot(
+                        operation_id=str(cop_row["operation_id"]),
+                        phase_name=str(cop_row["phase_name"]),
+                        phase_index=int(cop_row["phase_index"]),
+                        phase_count=int(cop_row["phase_count"]),
+                        status=str(cop_row["status"]),
+                    )
+                    if cop_row is not None
+                    else None
                 )
-                if cop_row is not None
-                else None
-            )
 
-        return ProgressSnapshot(
-            conversation_id=conversation_id,
-            lifecycle_epoch=int(epoch),
-            phase=str(phase),
-            total_ingestible=int(total_ing),
-            done_ingestible=int(done_ing),
-            last_raw_payload_entries=int(last_raw),
-            last_ingestible_payload_entries=int(last_ing),
-            active_episode=active_episode,
-            active_compaction=active_compaction,
-        )
+            return ProgressSnapshot(
+                conversation_id=conversation_id,
+                lifecycle_epoch=int(epoch),
+                phase=str(phase),
+                total_ingestible=int(total_ing),
+                done_ingestible=int(done_ing),
+                last_raw_payload_entries=int(last_raw),
+                last_ingestible_payload_entries=int(last_ing),
+                active_episode=active_episode,
+                active_compaction=active_compaction,
+            )
 
     # ------------------------------------------------------------------
     # Ingestion episode CRUD (epoch-guarded)
@@ -2310,24 +2302,24 @@ class PostgresStore(ContextStore):
         """
         import uuid
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        conn.execute(
-            """
-            INSERT INTO ingestion_episode (
-                episode_id, conversation_id, lifecycle_epoch,
-                raw_payload_entries, started_at, status,
-                owner_worker_id, heartbeat_ts
-            ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
-            ON CONFLICT (conversation_id, lifecycle_epoch) WHERE status = 'running'
-            DO UPDATE SET
-                raw_payload_entries =
-                    GREATEST(ingestion_episode.raw_payload_entries, EXCLUDED.raw_payload_entries)
-            """,
-            (
-                uuid.uuid4(), conversation_id, lifecycle_epoch,
-                raw_payload_entries, now, worker_id, now,
-            ),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_episode (
+                    episode_id, conversation_id, lifecycle_epoch,
+                    raw_payload_entries, started_at, status,
+                    owner_worker_id, heartbeat_ts
+                ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
+                ON CONFLICT (conversation_id, lifecycle_epoch) WHERE status = 'running'
+                DO UPDATE SET
+                    raw_payload_entries =
+                        GREATEST(ingestion_episode.raw_payload_entries, EXCLUDED.raw_payload_entries)
+                """,
+                (
+                    uuid.uuid4(), conversation_id, lifecycle_epoch,
+                    raw_payload_entries, now, worker_id, now,
+                ),
+            )
 
     def claim_ingestion_lease(
         self,
@@ -2349,21 +2341,21 @@ class PostgresStore(ContextStore):
         """
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(seconds=lease_ttl_s)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE ingestion_episode
-               SET owner_worker_id = %s, heartbeat_ts = %s
-             WHERE conversation_id = %s AND status = 'running'
-               AND lifecycle_epoch = %s
-               AND (owner_worker_id = %s OR heartbeat_ts < %s)
-            """,
-            (
-                worker_id, now, conversation_id, lifecycle_epoch,
-                worker_id, cutoff,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET owner_worker_id = %s, heartbeat_ts = %s
+                 WHERE conversation_id = %s AND status = 'running'
+                   AND lifecycle_epoch = %s
+                   AND (owner_worker_id = %s OR heartbeat_ts < %s)
+                """,
+                (
+                    worker_id, now, conversation_id, lifecycle_epoch,
+                    worker_id, cutoff,
+                ),
+            )
+            return cur.rowcount == 1
 
     def refresh_ingestion_heartbeat(
         self,
@@ -2382,21 +2374,21 @@ class PostgresStore(ContextStore):
         conversation was resurrected to epoch N+1 is rejected at SQL level.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE ingestion_episode SET heartbeat_ts = %s
-             WHERE conversation_id = %s AND status = 'running'
-               AND lifecycle_epoch = %s
-               AND lifecycle_epoch = (
-                   SELECT lifecycle_epoch FROM conversations
-                    WHERE conversation_id = %s
-               )
-               AND owner_worker_id = %s
-            """,
-            (now, conversation_id, lifecycle_epoch, conversation_id, worker_id),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode SET heartbeat_ts = %s
+                 WHERE conversation_id = %s AND status = 'running'
+                   AND lifecycle_epoch = %s
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = %s
+                   )
+                   AND owner_worker_id = %s
+                """,
+                (now, conversation_id, lifecycle_epoch, conversation_id, worker_id),
+            )
+            return cur.rowcount == 1
 
     def find_stale_ingestion_episodes(
         self, *, grace_s: float,
@@ -2418,36 +2410,36 @@ class PostgresStore(ContextStore):
         ``owner_worker_id``, ``heartbeat_ts``, ``hb_age_s``.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=grace_s)
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT ie.episode_id, ie.conversation_id, ie.lifecycle_epoch,
-                   ie.owner_worker_id, ie.heartbeat_ts,
-                   c.tenant_id,
-                   EXTRACT(EPOCH FROM (NOW() - ie.heartbeat_ts)) AS hb_age_s
-              FROM ingestion_episode ie
-              JOIN conversations c
-                ON c.conversation_id = ie.conversation_id
-               AND c.lifecycle_epoch = ie.lifecycle_epoch
-               AND c.phase <> 'deleted'
-             WHERE ie.status = 'running'
-               AND ie.heartbeat_ts < %s
-             ORDER BY ie.heartbeat_ts ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-        return [
-            {
-                "episode_id": str(r["episode_id"]),
-                "conversation_id": str(r["conversation_id"]),
-                "lifecycle_epoch": int(r["lifecycle_epoch"]),
-                "tenant_id": str(r["tenant_id"] or ""),
-                "owner_worker_id": str(r["owner_worker_id"] or ""),
-                "heartbeat_ts": r["heartbeat_ts"],
-                "hb_age_s": float(r["hb_age_s"] or 0.0),
-            }
-            for r in rows
-        ]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ie.episode_id, ie.conversation_id, ie.lifecycle_epoch,
+                       ie.owner_worker_id, ie.heartbeat_ts,
+                       c.tenant_id,
+                       EXTRACT(EPOCH FROM (NOW() - ie.heartbeat_ts)) AS hb_age_s
+                  FROM ingestion_episode ie
+                  JOIN conversations c
+                    ON c.conversation_id = ie.conversation_id
+                   AND c.lifecycle_epoch = ie.lifecycle_epoch
+                   AND c.phase <> 'deleted'
+                 WHERE ie.status = 'running'
+                   AND ie.heartbeat_ts < %s
+                 ORDER BY ie.heartbeat_ts ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [
+                {
+                    "episode_id": str(r["episode_id"]),
+                    "conversation_id": str(r["conversation_id"]),
+                    "lifecycle_epoch": int(r["lifecycle_epoch"]),
+                    "tenant_id": str(r["tenant_id"] or ""),
+                    "owner_worker_id": str(r["owner_worker_id"] or ""),
+                    "heartbeat_ts": r["heartbeat_ts"],
+                    "hb_age_s": float(r["hb_age_s"] or 0.0),
+                }
+                for r in rows
+            ]
 
     def find_stale_compaction_operations(
         self, *, grace_s: float,
@@ -2463,40 +2455,40 @@ class PostgresStore(ContextStore):
         caller will catch them).
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=grace_s)
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT co.operation_id, co.conversation_id, co.lifecycle_epoch,
-                   co.owner_worker_id, co.heartbeat_ts, co.phase_index,
-                   co.phase_count, co.phase_name,
-                   c.tenant_id,
-                   EXTRACT(EPOCH FROM (NOW() - co.heartbeat_ts)) AS hb_age_s
-              FROM compaction_operation co
-              JOIN conversations c
-                ON c.conversation_id = co.conversation_id
-               AND c.lifecycle_epoch = co.lifecycle_epoch
-               AND c.phase <> 'deleted'
-             WHERE co.status = 'running'
-               AND co.heartbeat_ts < %s
-             ORDER BY co.heartbeat_ts ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-        return [
-            {
-                "operation_id": str(r["operation_id"]),
-                "conversation_id": str(r["conversation_id"]),
-                "lifecycle_epoch": int(r["lifecycle_epoch"]),
-                "tenant_id": str(r["tenant_id"] or ""),
-                "owner_worker_id": str(r["owner_worker_id"] or ""),
-                "heartbeat_ts": r["heartbeat_ts"],
-                "phase_index": int(r["phase_index"] or 0),
-                "phase_count": int(r["phase_count"] or 0),
-                "phase_name": str(r["phase_name"] or ""),
-                "hb_age_s": float(r["hb_age_s"] or 0.0),
-            }
-            for r in rows
-        ]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT co.operation_id, co.conversation_id, co.lifecycle_epoch,
+                       co.owner_worker_id, co.heartbeat_ts, co.phase_index,
+                       co.phase_count, co.phase_name,
+                       c.tenant_id,
+                       EXTRACT(EPOCH FROM (NOW() - co.heartbeat_ts)) AS hb_age_s
+                  FROM compaction_operation co
+                  JOIN conversations c
+                    ON c.conversation_id = co.conversation_id
+                   AND c.lifecycle_epoch = co.lifecycle_epoch
+                   AND c.phase <> 'deleted'
+                 WHERE co.status = 'running'
+                   AND co.heartbeat_ts < %s
+                 ORDER BY co.heartbeat_ts ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [
+                {
+                    "operation_id": str(r["operation_id"]),
+                    "conversation_id": str(r["conversation_id"]),
+                    "lifecycle_epoch": int(r["lifecycle_epoch"]),
+                    "tenant_id": str(r["tenant_id"] or ""),
+                    "owner_worker_id": str(r["owner_worker_id"] or ""),
+                    "heartbeat_ts": r["heartbeat_ts"],
+                    "phase_index": int(r["phase_index"] or 0),
+                    "phase_count": int(r["phase_count"] or 0),
+                    "phase_name": str(r["phase_name"] or ""),
+                    "hb_age_s": float(r["hb_age_s"] or 0.0),
+                }
+                for r in rows
+            ]
 
     def find_idle_deletable_conversations(
         self,
@@ -2532,65 +2524,65 @@ class PostgresStore(ContextStore):
         the stalest candidates clear first under bounded work.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_age_s)
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            WITH activity AS (
-                SELECT c.conversation_id,
-                       c.tenant_id,
-                       c.phase,
-                       c.created_at,
-                       c.updated_at,
-                       (SELECT COUNT(*) FROM canonical_turns ct
-                         WHERE ct.conversation_id = c.conversation_id) AS msg_count,
-                       -- canonical_turns.last_seen_at is TEXT in the
-                       -- post-cutover schema; conversations.*_at are
-                       -- TIMESTAMPTZ. Cast the canonical value up to
-                       -- timestamptz so GREATEST/COALESCE stay typed.
-                       GREATEST(
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                WITH activity AS (
+                    SELECT c.conversation_id,
+                           c.tenant_id,
+                           c.phase,
+                           c.created_at,
                            c.updated_at,
-                           COALESCE(
-                               (SELECT MAX(last_seen_at)::timestamptz FROM canonical_turns ct
-                                 WHERE ct.conversation_id = c.conversation_id),
-                               c.created_at
-                           )
-                       ) AS last_activity_at
-                  FROM conversations c
-                 WHERE c.phase NOT IN ('deleted', 'compacting', 'merged')
-                   AND c.deleted_at IS NULL
-            )
-            SELECT a.conversation_id, a.tenant_id, a.phase,
-                   a.msg_count, a.last_activity_at,
-                   EXTRACT(EPOCH FROM (NOW() - a.last_activity_at)) AS age_s
-              FROM activity a
-             WHERE a.msg_count < %s
-               AND a.last_activity_at < %s
-               AND NOT EXISTS (
-                   SELECT 1 FROM ingestion_episode ie
-                    WHERE ie.conversation_id = a.conversation_id
-                      AND ie.status = 'running'
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM compaction_operation co
-                    WHERE co.conversation_id = a.conversation_id
-                      AND co.status IN ('queued', 'running')
-               )
-             ORDER BY a.last_activity_at ASC
-             LIMIT %s
-            """,
-            (int(max_msgs), cutoff, int(limit)),
-        ).fetchall()
-        return [
-            {
-                "conversation_id": str(r["conversation_id"]),
-                "tenant_id": str(r["tenant_id"] or ""),
-                "phase": str(r["phase"] or ""),
-                "msg_count": int(r["msg_count"] or 0),
-                "last_activity_at": r["last_activity_at"],
-                "age_s": float(r["age_s"] or 0.0),
-            }
-            for r in rows
-        ]
+                           (SELECT COUNT(*) FROM canonical_turns ct
+                             WHERE ct.conversation_id = c.conversation_id) AS msg_count,
+                           -- canonical_turns.last_seen_at is TEXT in the
+                           -- post-cutover schema; conversations.*_at are
+                           -- TIMESTAMPTZ. Cast the canonical value up to
+                           -- timestamptz so GREATEST/COALESCE stay typed.
+                           GREATEST(
+                               c.updated_at,
+                               COALESCE(
+                                   (SELECT MAX(last_seen_at)::timestamptz FROM canonical_turns ct
+                                     WHERE ct.conversation_id = c.conversation_id),
+                                   c.created_at
+                               )
+                           ) AS last_activity_at
+                      FROM conversations c
+                     WHERE c.phase NOT IN ('deleted', 'compacting', 'merged')
+                       AND c.deleted_at IS NULL
+                )
+                SELECT a.conversation_id, a.tenant_id, a.phase,
+                       a.msg_count, a.last_activity_at,
+                       EXTRACT(EPOCH FROM (NOW() - a.last_activity_at)) AS age_s
+                  FROM activity a
+                 WHERE a.msg_count < %s
+                   AND a.last_activity_at < %s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM ingestion_episode ie
+                        WHERE ie.conversation_id = a.conversation_id
+                          AND ie.status = 'running'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM compaction_operation co
+                        WHERE co.conversation_id = a.conversation_id
+                          AND co.status IN ('queued', 'running')
+                   )
+                 ORDER BY a.last_activity_at ASC
+                 LIMIT %s
+                """,
+                (int(max_msgs), cutoff, int(limit)),
+            ).fetchall()
+            return [
+                {
+                    "conversation_id": str(r["conversation_id"]),
+                    "tenant_id": str(r["tenant_id"] or ""),
+                    "phase": str(r["phase"] or ""),
+                    "msg_count": int(r["msg_count"] or 0),
+                    "last_activity_at": r["last_activity_at"],
+                    "age_s": float(r["age_s"] or 0.0),
+                }
+                for r in rows
+            ]
 
     # ------------------------------------------------------------------
     # VCMERGE storage methods (, , per plan v1.11)
@@ -2658,104 +2650,104 @@ class PostgresStore(ContextStore):
         """
         from ..types import ReservationResult, MergeAuditView
 
-        conn = self._get_conn()
-        now = datetime.now(timezone.utc)
+        with self.pool.connection() as conn:
+            now = datetime.now(timezone.utc)
 
-        # fold proper SAVEPOINT pattern per spec
-        # step 1. The OUTER `with conn.transaction()` opens an
-        # explicit transaction; the INNER `with conn.transaction()` is a
-        # SAVEPOINT inside that outer transaction (psycopg3 nests via
-        # SAVEPOINT semantics). On UniqueViolation the inner SAVEPOINT
-        # rolls back, but the OUTER transaction is still alive, so the
-        # disambiguating SELECT reads in the SAME isolation context as
-        # the failed INSERT. Without the outer wrapper the SELECT runs in
-        # a separate (autocommit) transaction and the race-window
-        # guarantee differs from spec.
-        with conn.transaction():
-            try:
-                with conn.transaction():
-                    conn.execute(
-                        """
-                        INSERT INTO merge_audit
-                            (merge_id, tenant_id, source_conversation_id,
-                             target_conversation_id, source_label_at_merge,
-                             status, started_at)
-                        VALUES (%s, %s, %s, %s, %s, 'in_progress', %s)
-                        """,
-                        (
-                            merge_id, tenant_id, source_conversation_id,
-                            target_conversation_id, source_label_at_merge, now,
-                        ),
+            # fold proper SAVEPOINT pattern per spec
+            # step 1. The OUTER `with conn.transaction()` opens an
+            # explicit transaction; the INNER `with conn.transaction()` is a
+            # SAVEPOINT inside that outer transaction (psycopg3 nests via
+            # SAVEPOINT semantics). On UniqueViolation the inner SAVEPOINT
+            # rolls back, but the OUTER transaction is still alive, so the
+            # disambiguating SELECT reads in the SAME isolation context as
+            # the failed INSERT. Without the outer wrapper the SELECT runs in
+            # a separate (autocommit) transaction and the race-window
+            # guarantee differs from spec.
+            with conn.transaction():
+                try:
+                    with conn.transaction():
+                        conn.execute(
+                            """
+                            INSERT INTO merge_audit
+                                (merge_id, tenant_id, source_conversation_id,
+                                 target_conversation_id, source_label_at_merge,
+                                 status, started_at)
+                            VALUES (%s, %s, %s, %s, %s, 'in_progress', %s)
+                            """,
+                            (
+                                merge_id, tenant_id, source_conversation_id,
+                                target_conversation_id, source_label_at_merge, now,
+                            ),
+                        )
+                    # INSERT succeeded; SAVEPOINT released. We own this merge.
+                    return ReservationResult(
+                        status="reserved", merge_id=merge_id, existing=None,
                     )
-                # INSERT succeeded; SAVEPOINT released. We own this merge.
+                except psycopg.errors.UniqueViolation:
+                    # SAVEPOINT auto-rolled-back; outer tx still alive for SELECT.
+                    pass
+
+                # SELECT the row that won the race, in the SAME outer txn.
+                # Possible cases:
+                # in_progress: prior caller is mid-body; in_progress envelope
+                # committed: committed_match OR committed_mismatch per
+                # target-based discriminator below
+                # rare race: winner transitioned in_progress -> rolled_back
+                # between INSERT-fail and SELECT (cloud retries)
+                existing = conn.execute(
+                    """
+                    SELECT merge_id, tenant_id, source_conversation_id,
+                           target_conversation_id, source_label_at_merge, status,
+                           started_at, completed_at, rows_moved_json, error_message
+                      FROM merge_audit
+                     WHERE tenant_id = %s
+                       AND source_conversation_id = %s
+                       AND status IN ('in_progress', 'committed')
+                     LIMIT 1
+                    """,
+                    (tenant_id, source_conversation_id),
+                ).fetchone()
+
+            if existing is None:
                 return ReservationResult(
-                    status="reserved", merge_id=merge_id, existing=None,
+                    status="race_retry", merge_id=merge_id, existing=None,
                 )
-            except psycopg.errors.UniqueViolation:
-                # SAVEPOINT auto-rolled-back; outer tx still alive for SELECT.
-                pass
 
-            # SELECT the row that won the race, in the SAME outer txn.
-            # Possible cases:
-            # in_progress: prior caller is mid-body; in_progress envelope
-            # committed: committed_match OR committed_mismatch per
-            # target-based discriminator below
-            # rare race: winner transitioned in_progress -> rolled_back
-            # between INSERT-fail and SELECT (cloud retries)
-            existing = conn.execute(
-                """
-                SELECT merge_id, tenant_id, source_conversation_id,
-                       target_conversation_id, source_label_at_merge, status,
-                       started_at, completed_at, rows_moved_json, error_message
-                  FROM merge_audit
-                 WHERE tenant_id = %s
-                   AND source_conversation_id = %s
-                   AND status IN ('in_progress', 'committed')
-                 LIMIT 1
-                """,
-                (tenant_id, source_conversation_id),
-            ).fetchone()
-
-        if existing is None:
-            return ReservationResult(
-                status="race_retry", merge_id=merge_id, existing=None,
+            view = MergeAuditView(
+                merge_id=str(existing["merge_id"]),
+                tenant_id=str(existing["tenant_id"]),
+                source_conversation_id=str(existing["source_conversation_id"]),
+                target_conversation_id=str(existing["target_conversation_id"]),
+                status=str(existing["status"]),  # type: ignore[arg-type]
+                started_at=existing["started_at"],
+                completed_at=existing["completed_at"],
+                source_label_at_merge=str(existing["source_label_at_merge"] or ""),
+                rows_moved_json=existing["rows_moved_json"],
+                error_message=existing["error_message"],
             )
 
-        view = MergeAuditView(
-            merge_id=str(existing["merge_id"]),
-            tenant_id=str(existing["tenant_id"]),
-            source_conversation_id=str(existing["source_conversation_id"]),
-            target_conversation_id=str(existing["target_conversation_id"]),
-            status=str(existing["status"]),  # type: ignore[arg-type]
-            started_at=existing["started_at"],
-            completed_at=existing["completed_at"],
-            source_label_at_merge=str(existing["source_label_at_merge"] or ""),
-            rows_moved_json=existing["rows_moved_json"],
-            error_message=existing["error_message"],
-        )
-
-        if view.status == "in_progress":
+            if view.status == "in_progress":
+                return ReservationResult(
+                    status="in_progress", merge_id=view.merge_id, existing=view,
+                )
+            # fold the idempotency discriminator for
+            # status == 'committed' is target_conversation_id, NOT
+            # source_label_at_merge. Spec idempotency contract: a merge
+            # is idempotent on (tenant, source, target). Same target =
+            # same merge intent (committed_match); different target = a
+            # different merge was already committed against the same source
+            # (committed_mismatch). Source label is cosmetic metadata that
+            # can change over time without changing merge identity; using
+            # it as the discriminator misclassified "same source different
+            # target same label" as match (wrong) and "same target label
+            # changed" as mismatch (wrong).
+            if view.target_conversation_id == target_conversation_id:
+                return ReservationResult(
+                    status="committed_match", merge_id=view.merge_id, existing=view,
+                )
             return ReservationResult(
-                status="in_progress", merge_id=view.merge_id, existing=view,
+                status="committed_mismatch", merge_id=view.merge_id, existing=view,
             )
-        # fold the idempotency discriminator for
-        # status == 'committed' is target_conversation_id, NOT
-        # source_label_at_merge. Spec idempotency contract: a merge
-        # is idempotent on (tenant, source, target). Same target =
-        # same merge intent (committed_match); different target = a
-        # different merge was already committed against the same source
-        # (committed_mismatch). Source label is cosmetic metadata that
-        # can change over time without changing merge identity; using
-        # it as the discriminator misclassified "same source different
-        # target same label" as match (wrong) and "same target label
-        # changed" as mismatch (wrong).
-        if view.target_conversation_id == target_conversation_id:
-            return ReservationResult(
-                status="committed_match", merge_id=view.merge_id, existing=view,
-            )
-        return ReservationResult(
-            status="committed_mismatch", merge_id=view.merge_id, existing=view,
-        )
 
     def lookup_committed_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
@@ -2768,33 +2760,34 @@ class PostgresStore(ContextStore):
         """
         from ..types import MergeAuditView
 
-        row = self._get_conn().execute(
-            """
-            SELECT merge_id, tenant_id, source_conversation_id,
-                   target_conversation_id, source_label_at_merge, status,
-                   started_at, completed_at, rows_moved_json, error_message
-              FROM merge_audit
-             WHERE tenant_id = %s
-               AND source_conversation_id = %s
-               AND status = 'committed'
-             LIMIT 1
-            """,
-            (tenant_id, source_conversation_id),
-        ).fetchone()
-        if row is None:
-            return None
-        return MergeAuditView(
-            merge_id=str(row["merge_id"]),
-            tenant_id=str(row["tenant_id"]),
-            source_conversation_id=str(row["source_conversation_id"]),
-            target_conversation_id=str(row["target_conversation_id"]),
-            status=str(row["status"]),  # type: ignore[arg-type]
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
-            source_label_at_merge=str(row["source_label_at_merge"] or ""),
-            rows_moved_json=row["rows_moved_json"],
-            error_message=row["error_message"],
-        )
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT merge_id, tenant_id, source_conversation_id,
+                       target_conversation_id, source_label_at_merge, status,
+                       started_at, completed_at, rows_moved_json, error_message
+                  FROM merge_audit
+                 WHERE tenant_id = %s
+                   AND source_conversation_id = %s
+                   AND status = 'committed'
+                 LIMIT 1
+                """,
+                (tenant_id, source_conversation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return MergeAuditView(
+                merge_id=str(row["merge_id"]),
+                tenant_id=str(row["tenant_id"]),
+                source_conversation_id=str(row["source_conversation_id"]),
+                target_conversation_id=str(row["target_conversation_id"]),
+                status=str(row["status"]),  # type: ignore[arg-type]
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                source_label_at_merge=str(row["source_label_at_merge"] or ""),
+                rows_moved_json=row["rows_moved_json"],
+                error_message=row["error_message"],
+            )
 
     def lookup_active_merge_audit_for_source(
         self, tenant_id: str, source_conversation_id: str,
@@ -2809,34 +2802,35 @@ class PostgresStore(ContextStore):
         """
         from ..types import MergeAuditView
 
-        row = self._get_conn().execute(
-            """
-            SELECT merge_id, tenant_id, source_conversation_id,
-                   target_conversation_id, source_label_at_merge, status,
-                   started_at, completed_at, rows_moved_json, error_message
-              FROM merge_audit
-             WHERE tenant_id = %s
-               AND source_conversation_id = %s
-               AND status IN ('in_progress', 'committed')
-             ORDER BY started_at DESC
-             LIMIT 1
-            """,
-            (tenant_id, source_conversation_id),
-        ).fetchone()
-        if row is None:
-            return None
-        return MergeAuditView(
-            merge_id=str(row["merge_id"]),
-            tenant_id=str(row["tenant_id"]),
-            source_conversation_id=str(row["source_conversation_id"]),
-            target_conversation_id=str(row["target_conversation_id"]),
-            status=str(row["status"]),  # type: ignore[arg-type]
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
-            source_label_at_merge=str(row["source_label_at_merge"] or ""),
-            rows_moved_json=row["rows_moved_json"],
-            error_message=row["error_message"],
-        )
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT merge_id, tenant_id, source_conversation_id,
+                       target_conversation_id, source_label_at_merge, status,
+                       started_at, completed_at, rows_moved_json, error_message
+                  FROM merge_audit
+                 WHERE tenant_id = %s
+                   AND source_conversation_id = %s
+                   AND status IN ('in_progress', 'committed')
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                (tenant_id, source_conversation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return MergeAuditView(
+                merge_id=str(row["merge_id"]),
+                tenant_id=str(row["tenant_id"]),
+                source_conversation_id=str(row["source_conversation_id"]),
+                target_conversation_id=str(row["target_conversation_id"]),
+                status=str(row["status"]),  # type: ignore[arg-type]
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                source_label_at_merge=str(row["source_label_at_merge"] or ""),
+                rows_moved_json=row["rows_moved_json"],
+                error_message=row["error_message"],
+            )
 
     def _mark_merge_rolled_back(
         self,
@@ -2860,19 +2854,20 @@ class PostgresStore(ContextStore):
         beat us to it).
         """
         now = datetime.now(timezone.utc)
-        cur = self._get_conn().execute(
-            """
-            UPDATE merge_audit
-               SET status = 'rolled_back',
-                   error_message = %s,
-                   completed_at = %s
-             WHERE tenant_id = %s
-               AND merge_id = %s
-               AND status = 'in_progress'
-            """,
-            (error_message, now, tenant_id, merge_id),
-        )
-        return cur.rowcount > 0
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE merge_audit
+                   SET status = 'rolled_back',
+                       error_message = %s,
+                       completed_at = %s
+                 WHERE tenant_id = %s
+                   AND merge_id = %s
+                   AND status = 'in_progress'
+                """,
+                (error_message, now, tenant_id, merge_id),
+            )
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # merge_conversation_data (PG body method per plan )
@@ -2946,568 +2941,568 @@ class PostgresStore(ContextStore):
         )
         import json as _json
 
-        conn = self._get_conn()
-        started_at = datetime.now(timezone.utc)
+        with self.pool.connection() as conn:
+            started_at = datetime.now(timezone.utc)
 
-        # Per-table move plan. Dict shape: table -> action.
-        # action 'simple': UPDATE conversation_id = target WHERE conversation_id = source
-        # action 'offset': UPDATE conversation_id, sort_key/turn col += offset
-        # action 'transitive': scoped via FK; UPDATE origin_conversation_id only
-        # (parent row's conversation_id move handles re-routing)
-        # action 'delete_source': DELETE source's row (per-conv counter, etc.)
-        # action 'tag_conflict': special tag-summary conflict resolution
-        TABLES_SIMPLE = (
-            "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-            "ingest_batches", "facts", "turn_tool_outputs",
-            "segment_tool_outputs", "chain_snapshots", "media_outputs",
-        )
-        TABLES_OFFSET_SORT_KEY = (
-            ("canonical_turns", "sort_key"),
-        )
-        TABLES_OFFSET_REQUEST_TURN = (
-            ("tool_outputs", "turn"),
-            ("tool_calls", "request_turn"),
-            ("request_captures", "turn"),
-            ("request_context", "request_turn"),
-        )
-        TABLES_TRANSITIVE = (
-            ("segment_tags", "segment_ref", "segments", "ref"),
-            ("fact_tags", "fact_id", "facts", "id"),
-        )
-        # fact_links has TWO endpoint cols (source_fact_id, target_fact_id);
-        # handled separately below.
-        # tag_aliases is per-conv with PK
-        # (alias, conversation_id). Conflict resolution mirrors
-        # tag_summaries: target wins, source's conflicting aliases DELETEd,
-        # non-conflicting source aliases moved. Listed separately so the
-        # bounded-DELETE surface remains explicit.
-        TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
-        rows_moved: dict[str, int] = {}
+            # Per-table move plan. Dict shape: table -> action.
+            # action 'simple': UPDATE conversation_id = target WHERE conversation_id = source
+            # action 'offset': UPDATE conversation_id, sort_key/turn col += offset
+            # action 'transitive': scoped via FK; UPDATE origin_conversation_id only
+            # (parent row's conversation_id move handles re-routing)
+            # action 'delete_source': DELETE source's row (per-conv counter, etc.)
+            # action 'tag_conflict': special tag-summary conflict resolution
+            TABLES_SIMPLE = (
+                "segments", "canonical_turn_anchors", "canonical_turn_chunks",
+                "ingest_batches", "facts", "turn_tool_outputs",
+                "segment_tool_outputs", "chain_snapshots", "media_outputs",
+            )
+            TABLES_OFFSET_SORT_KEY = (
+                ("canonical_turns", "sort_key"),
+            )
+            TABLES_OFFSET_REQUEST_TURN = (
+                ("tool_outputs", "turn"),
+                ("tool_calls", "request_turn"),
+                ("request_captures", "turn"),
+                ("request_context", "request_turn"),
+            )
+            TABLES_TRANSITIVE = (
+                ("segment_tags", "segment_ref", "segments", "ref"),
+                ("fact_tags", "fact_id", "facts", "id"),
+            )
+            # fact_links has TWO endpoint cols (source_fact_id, target_fact_id);
+            # handled separately below.
+            # tag_aliases is per-conv with PK
+            # (alias, conversation_id). Conflict resolution mirrors
+            # tag_summaries: target wins, source's conflicting aliases DELETEd,
+            # non-conflicting source aliases moved. Listed separately so the
+            # bounded-DELETE surface remains explicit.
+            TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
+            rows_moved: dict[str, int] = {}
 
-        with conn.transaction():
-            # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
-            # Holds the row lock through the body's commit so the
-            # stale-reservation sweeper cannot roll it back
-            # mid-flight. Predicates on tenant_id per D3.
-            row = conn.execute(
-                """
-                SELECT 1 FROM merge_audit
-                 WHERE tenant_id = %s
-                   AND merge_id = %s
-                   AND status = 'in_progress'
-                 FOR UPDATE
-                """,
-                (tenant_id, merge_id),
-            ).fetchone()
-            if row is None:
-                from ..core.exceptions import MergeAuditMissing
-                raise MergeAuditMissing(
-                    f"No in_progress merge_audit row for tenant={tenant_id} "
-                    f"merge_id={merge_id}. Possible causes: stale-reservation "
-                    f"sweeper rolled back the reservation between step 1 and "
-                    f"step 2.5, or merge_conversation_data was called without "
-                    f"first calling try_reserve_merge_audit_in_progress.",
-                )
-
-            # acquire conversation_lifecycle row
-            # locks for source + target before reading phase or moving rows.
-            # Sorted lexicographically to prevent deadlocks if two opposing
-            # merges race. The locks block concurrent VCATTACH ingest /
-            # compaction starts that hold the same per-conv lock; they
-            # release on transaction commit.
-            for cid in sorted({source_conversation_id, target_conversation_id}):
-                conn.execute(
+            with conn.transaction():
+                # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
+                # Holds the row lock through the body's commit so the
+                # stale-reservation sweeper cannot roll it back
+                # mid-flight. Predicates on tenant_id per D3.
+                row = conn.execute(
                     """
-                    INSERT INTO conversation_lifecycle
-                        (conversation_id, generation, deleted, updated_at)
-                    VALUES (%s, 0, FALSE, %s)
-                    ON CONFLICT (conversation_id) DO UPDATE
-                      SET updated_at = EXCLUDED.updated_at
-                    """,
-                    (cid, datetime.now(timezone.utc)),
-                )
-                conn.execute(
-                    """
-                    SELECT 1 FROM conversation_lifecycle
-                     WHERE conversation_id = %s
+                    SELECT 1 FROM merge_audit
+                     WHERE tenant_id = %s
+                       AND merge_id = %s
+                       AND status = 'in_progress'
                      FOR UPDATE
                     """,
-                    (cid,),
+                    (tenant_id, merge_id),
                 ).fetchone()
+                if row is None:
+                    from ..core.exceptions import MergeAuditMissing
+                    raise MergeAuditMissing(
+                        f"No in_progress merge_audit row for tenant={tenant_id} "
+                        f"merge_id={merge_id}. Possible causes: stale-reservation "
+                        f"sweeper rolled back the reservation between step 1 and "
+                        f"step 2.5, or merge_conversation_data was called without "
+                        f"first calling try_reserve_merge_audit_in_progress.",
+                    )
 
-            # + (+P1): re-validate source under
-            # the merge_audit row lock. Captures all three constraints in
-            # one row read: tenant ownership, lifecycle epoch consistency,
-            # and current phase (must NOT be in a busy or terminal state).
-            src_row = conn.execute(
-                """
-                SELECT tenant_id, lifecycle_epoch, phase
-                  FROM conversations
-                 WHERE conversation_id = %s
-                """,
-                (source_conversation_id,),
-            ).fetchone()
-            if src_row is None:
-                raise CrossTenantMergeError(
-                    f"Source conversation {source_conversation_id} not found "
-                    f"during body validation; refusing merge",
-                )
-            src_tenant = src_row["tenant_id"]
-            if str(src_tenant) != str(tenant_id):
-                raise CrossTenantMergeError(
-                    f"Source conversation {source_conversation_id} belongs to "
-                    f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
-                )
-            if expected_source_lifecycle_epoch is not None and (
-                int(src_row["lifecycle_epoch"]) != int(expected_source_lifecycle_epoch)
-            ):
-                raise LifecycleEpochMismatch(
-                    f"Source lifecycle_epoch advanced "
-                    f"({src_row['lifecycle_epoch']} != {expected_source_lifecycle_epoch}); "
-                    f"source state has changed since reservation",
-                )
-            if src_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
-                raise MergeBusy(
-                    f"Source conversation {source_conversation_id} phase = "
-                    f"'{src_row['phase']}'; cannot merge",
-                    code="merge_busy_phase",
-                )
-
-            # Lifecycle-epoch consistency: target's epoch must match the
-            # caller-captured value AND target must not be in a busy phase.
-            tgt_epoch_row = conn.execute(
-                """
-                SELECT lifecycle_epoch, phase
-                  FROM conversations
-                 WHERE tenant_id = %s AND conversation_id = %s
-                """,
-                (tenant_id, target_conversation_id),
-            ).fetchone()
-            if tgt_epoch_row is None:
-                raise LifecycleEpochMismatch(
-                    f"Target conversation {target_conversation_id} not found "
-                    f"under tenant {tenant_id}",
-                )
-            if int(tgt_epoch_row["lifecycle_epoch"]) != int(expected_target_lifecycle_epoch):
-                raise LifecycleEpochMismatch(
-                    f"Target lifecycle_epoch advanced "
-                    f"({tgt_epoch_row['lifecycle_epoch']} != {expected_target_lifecycle_epoch}); "
-                    f"source/target state has changed since reservation",
-                )
-            if tgt_epoch_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
-                raise MergeBusy(
-                    f"Target conversation {target_conversation_id} phase = "
-                    f"'{tgt_epoch_row['phase']}'; cannot merge",
-                    code="merge_busy_phase",
-                )
-
-            # active-op check: refuse if either side has a queued/running
-            # compaction or a running ingestion episode. The conversation_lifecycle
-            # row lock above blocks NEW compactions/ingests from STARTING during
-            # the body, but pre-existing ones still need to finish before merge.
-            #
-            # NARROW exception type for the table-
-            # absent case so a real query regression / permission issue / schema
-            # drift cannot fail-open. Only ``UndefinedTable`` (table missing on
-            # minimal fixtures) is swallowed; everything else propagates and the
-            # outer transaction rolls back. SAVEPOINT-via-nested-transaction
-            # contains the UndefinedTable so the outer txn stays alive when the
-            # check is skipped.
-            cop_row = None
-            cop_table_present = True
-            try:
-                with conn.transaction():
-                    cop_row = conn.execute(
+                # acquire conversation_lifecycle row
+                # locks for source + target before reading phase or moving rows.
+                # Sorted lexicographically to prevent deadlocks if two opposing
+                # merges race. The locks block concurrent VCATTACH ingest /
+                # compaction starts that hold the same per-conv lock; they
+                # release on transaction commit.
+                for cid in sorted({source_conversation_id, target_conversation_id}):
+                    conn.execute(
                         """
-                        SELECT 1 FROM compaction_operation
-                         WHERE conversation_id IN (%s, %s)
-                           AND status IN ('queued','running')
-                         LIMIT 1
+                        INSERT INTO conversation_lifecycle
+                            (conversation_id, generation, deleted, updated_at)
+                        VALUES (%s, 0, FALSE, %s)
+                        ON CONFLICT (conversation_id) DO UPDATE
+                          SET updated_at = EXCLUDED.updated_at
                         """,
-                        (source_conversation_id, target_conversation_id),
-                    ).fetchone()
-            except psycopg.errors.UndefinedTable:
-                cop_table_present = False
-            if cop_table_present and cop_row is not None:
-                raise MergeBusy(
-                    "Active compaction_operation on source or target; "
-                    "cannot merge until it completes",
-                    code="merge_busy_compact",
-                )
-
-            ing_row = None
-            ing_table_present = True
-            try:
-                with conn.transaction():
-                    ing_row = conn.execute(
+                        (cid, datetime.now(timezone.utc)),
+                    )
+                    conn.execute(
                         """
-                        SELECT 1 FROM ingestion_episode
-                         WHERE conversation_id IN (%s, %s)
-                           AND status = 'running'
-                         LIMIT 1
+                        SELECT 1 FROM conversation_lifecycle
+                         WHERE conversation_id = %s
+                         FOR UPDATE
                         """,
-                        (source_conversation_id, target_conversation_id),
+                        (cid,),
                     ).fetchone()
-            except psycopg.errors.UndefinedTable:
-                ing_table_present = False
-            if ing_table_present and ing_row is not None:
-                raise MergeBusy(
-                    "Running ingestion_episode on source or target; "
-                    "cannot merge until it completes",
-                    code="merge_busy_ingest",
-                )
 
-            # recompute offsets UNDER the
-            # conversation_lifecycle FOR UPDATE lock acquired above, so a
-            # concurrent ``save_request_context()`` writer that lands BETWEEN
-            # the engine's pre-call offset computation and the body's lock
-            # acquisition cannot leave us with a stale offset. Caller-passed
-            # values are honored as a floor (``max(caller, recomputed)``) for
-            # test predictability; the recomputed value WINS when the writer
-            # raced ahead.
-            sk_row = conn.execute(
-                "SELECT COALESCE(MAX(sort_key), 0) AS m "
-                "FROM canonical_turns WHERE conversation_id = %s",
-                (target_conversation_id,),
-            ).fetchone()
-            recomputed_sort_key_offset = float(sk_row["m"] or 0.0) + 1000.0
-            sort_key_offset = max(float(sort_key_offset or 0.0),
-                                  recomputed_sort_key_offset)
-
-            # Combined-MAX across the four request-turn-bearing tables on the
-            # target. UNION ALL is cheap and produces a single row.
-            rt_row = conn.execute(
-                """
-                SELECT GREATEST(
-                    COALESCE((SELECT MAX(request_turn) + 1 FROM tool_calls
-                              WHERE conversation_id = %s), 1),
-                    COALESCE((SELECT MAX(request_turn) + 1 FROM request_context
-                              WHERE conversation_id = %s), 1),
-                    COALESCE((SELECT MAX(turn) + 1 FROM request_captures
-                              WHERE conversation_id = %s), 1),
-                    COALESCE((SELECT MAX(next_request_turn) FROM request_turn_counters
-                              WHERE conversation_id = %s), 1)
-                ) AS m
-                """,
-                (target_conversation_id, target_conversation_id,
-                 target_conversation_id, target_conversation_id),
-            ).fetchone()
-            recomputed_request_turn_offset = int(rt_row["m"] or 1)
-            request_turn_offset = max(int(request_turn_offset or 0),
-                                      recomputed_request_turn_offset)
-
-            # Step 5: per-table moves.
-            for tbl in TABLES_SIMPLE:
-                cur = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET conversation_id = %s, "
-                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
-                    f" WHERE conversation_id = %s",
-                    (target_conversation_id, source_conversation_id, source_conversation_id),
-                )
-                rows_moved[tbl] = cur.rowcount
-
-            # canonical_turns rows arrive with
-            # source's compacted_at populated. Target's compaction prefix
-            # invariant requires uncompacted rows to have NULL compacted_at;
-            # reset on move so target's compaction pipeline picks them up
-            # as fresh tail. The merge_post_commit_pending queue_resegment
-            # fires re-compaction.
-            for tbl, col in TABLES_OFFSET_SORT_KEY:
-                cur = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET conversation_id = %s, "
-                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
-                    f"       {col} = {col} + %s, "
-                    f"       compacted_at = NULL "
-                    f" WHERE conversation_id = %s",
-                    (target_conversation_id, source_conversation_id,
-                     sort_key_offset, source_conversation_id),
-                )
-                rows_moved[tbl] = cur.rowcount
-
-            for tbl, col in TABLES_OFFSET_REQUEST_TURN:
-                cur = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET conversation_id = %s, "
-                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
-                    f"       {col} = {col} + %s "
-                    f" WHERE conversation_id = %s",
-                    (target_conversation_id, source_conversation_id,
-                     request_turn_offset, source_conversation_id),
-                )
-                rows_moved[tbl] = cur.rowcount
-
-            # Transitive tables: rows scoped via FK. UPDATE origin only;
-            # the parent row's conversation_id move is what re-routes them.
-            for tbl, fk_col, parent_tbl, parent_pk in TABLES_TRANSITIVE:
-                cur = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
-                    f" WHERE {fk_col} IN ("
-                    f"   SELECT {parent_pk} FROM {parent_tbl} "
-                    f"    WHERE origin_conversation_id = %s"
-                    f" )",
-                    (source_conversation_id, source_conversation_id),
-                )
-                rows_moved[tbl] = cur.rowcount
-
-            # fact_links: row moves if EITHER endpoint is in source's facts.
-            cur = conn.execute(
-                "UPDATE fact_links "
-                "   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
-                " WHERE source_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s) "
-                "    OR target_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s)",
-                (source_conversation_id, source_conversation_id, source_conversation_id),
-            )
-            rows_moved["fact_links"] = cur.rowcount
-
-            # request_turn_counters: source's row is per-conv state that
-            # doesn't make sense on the target (target has its own
-            # counter). DELETE source's row (bounded by conversation_id).
-            cur = conn.execute(
-                "DELETE FROM request_turn_counters WHERE conversation_id = %s",
-                (source_conversation_id,),
-            )
-            rows_moved["request_turn_counters"] = cur.rowcount
-
-            # + bump
-            # target's request_turn_counter past the maximum request_turn
-            # currently present on the target (regardless of origin). The
-            # implementation filtered ``origin_conversation_id =
-            # source`` which under-counts on chained merges (A->B then
-            # B->C; A-origin rows on B carry origin = A and were preserved
-            # by COALESCE during the B->C move, so they don't match the
-            # most-recent-source filter).
-            #
-            # The simplest correct query: ``MAX(request_turn)`` over ALL
-            # rows on the target across the four request-turn-bearing
-            # tables. Target's pre-merge next_request_turn was, by
-            # invariant, > the max request_turn of any pre-merge row on
-            # target; the post-move max captures both pre-merge rows AND
-            # rows just moved (any origin). The UPSERT preserves whichever
-            # is higher.
-            moved_max_row = conn.execute(
-                """
-                SELECT GREATEST(
-                    COALESCE((SELECT MAX(request_turn) FROM tool_calls
-                              WHERE conversation_id = %s), 0),
-                    COALESCE((SELECT MAX(request_turn) FROM request_context
-                              WHERE conversation_id = %s), 0),
-                    COALESCE((SELECT MAX(turn) FROM request_captures
-                              WHERE conversation_id = %s), 0),
-                    COALESCE((SELECT MAX(turn) FROM tool_outputs
-                              WHERE conversation_id = %s), 0)
-                ) AS m
-                """,
-                (target_conversation_id, target_conversation_id,
-                 target_conversation_id, target_conversation_id),
-            ).fetchone()
-            moved_max_request_turn = int(moved_max_row["m"] or 0)
-            if moved_max_request_turn > 0:
-                # capture the ACTUAL post-UPSERT
-                # value via RETURNING so the stat reflects truth (prior
-                # implementation recorded ``moved_max + 1`` even when
-                # GREATEST kept the existing higher counter).
-                upsert_row = conn.execute(
+                # + (+P1): re-validate source under
+                # the merge_audit row lock. Captures all three constraints in
+                # one row read: tenant ownership, lifecycle epoch consistency,
+                # and current phase (must NOT be in a busy or terminal state).
+                src_row = conn.execute(
                     """
-                    INSERT INTO request_turn_counters
-                        (conversation_id, next_request_turn, origin_conversation_id)
-                    VALUES (%s, %s, '')
-                    ON CONFLICT (conversation_id) DO UPDATE
-                      SET next_request_turn = GREATEST(
-                          request_turn_counters.next_request_turn,
-                          EXCLUDED.next_request_turn
-                      )
-                    RETURNING next_request_turn
+                    SELECT tenant_id, lifecycle_epoch, phase
+                      FROM conversations
+                     WHERE conversation_id = %s
                     """,
-                    (target_conversation_id, moved_max_request_turn + 1),
+                    (source_conversation_id,),
                 ).fetchone()
-                rows_moved["request_turn_counters_target_bumped_to"] = int(
-                    upsert_row["next_request_turn"] or (moved_max_request_turn + 1)
-                )
+                if src_row is None:
+                    raise CrossTenantMergeError(
+                        f"Source conversation {source_conversation_id} not found "
+                        f"during body validation; refusing merge",
+                    )
+                src_tenant = src_row["tenant_id"]
+                if str(src_tenant) != str(tenant_id):
+                    raise CrossTenantMergeError(
+                        f"Source conversation {source_conversation_id} belongs to "
+                        f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
+                    )
+                if expected_source_lifecycle_epoch is not None and (
+                    int(src_row["lifecycle_epoch"]) != int(expected_source_lifecycle_epoch)
+                ):
+                    raise LifecycleEpochMismatch(
+                        f"Source lifecycle_epoch advanced "
+                        f"({src_row['lifecycle_epoch']} != {expected_source_lifecycle_epoch}); "
+                        f"source state has changed since reservation",
+                    )
+                if src_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
+                    raise MergeBusy(
+                        f"Source conversation {source_conversation_id} phase = "
+                        f"'{src_row['phase']}'; cannot merge",
+                        code="merge_busy_phase",
+                    )
 
-            # capture conflict tag list BEFORE
-            # deleting source's conflicting tag_summaries rows. The Phase
-            # B sweeper consumes tag_regenerate pendings to re-generate
-            # the unioned summary, so it needs (tag, source_canonical_turn_ids,
-            # target_canonical_turn_ids) per conflict. tag_summaries.
-            # source_canonical_turn_ids is JSON-encoded array of canonical
-            # turn UUIDs.
-            conflict_tag_specs: list[dict] = []
-            try:
-                for crow in conn.execute(
+                # Lifecycle-epoch consistency: target's epoch must match the
+                # caller-captured value AND target must not be in a busy phase.
+                tgt_epoch_row = conn.execute(
                     """
-                    SELECT s.tag AS tag,
-                           s.source_canonical_turn_ids AS src_ids,
-                           t.source_canonical_turn_ids AS tgt_ids
-                      FROM tag_summaries s
-                      JOIN tag_summaries t
-                        ON t.tag = s.tag
-                       AND t.conversation_id = %s
-                     WHERE s.conversation_id = %s
+                    SELECT lifecycle_epoch, phase
+                      FROM conversations
+                     WHERE tenant_id = %s AND conversation_id = %s
                     """,
-                    (target_conversation_id, source_conversation_id),
-                ).fetchall():
-                    conflict_tag_specs.append({
-                        "tag": crow["tag"],
-                        "source_canonical_turn_ids": _json.loads(
-                            crow["src_ids"] or "[]"),
-                        "target_canonical_turn_ids": _json.loads(
-                            crow["tgt_ids"] or "[]"),
-                    })
-            except Exception:
-                # Schema variant without source_canonical_turn_ids; the
-                # payload list is empty in that case (sweeper falls back
-                # to tag-only regeneration).
-                conflict_tag_specs = []
+                    (tenant_id, target_conversation_id),
+                ).fetchone()
+                if tgt_epoch_row is None:
+                    raise LifecycleEpochMismatch(
+                        f"Target conversation {target_conversation_id} not found "
+                        f"under tenant {tenant_id}",
+                    )
+                if int(tgt_epoch_row["lifecycle_epoch"]) != int(expected_target_lifecycle_epoch):
+                    raise LifecycleEpochMismatch(
+                        f"Target lifecycle_epoch advanced "
+                        f"({tgt_epoch_row['lifecycle_epoch']} != {expected_target_lifecycle_epoch}); "
+                        f"source/target state has changed since reservation",
+                    )
+                if tgt_epoch_row["phase"] in ("ingesting", "compacting", "deleted", "merged"):
+                    raise MergeBusy(
+                        f"Target conversation {target_conversation_id} phase = "
+                        f"'{tgt_epoch_row['phase']}'; cannot merge",
+                        code="merge_busy_phase",
+                    )
 
-            # Tag-conflict resolution. tag_summaries + tag_summary_embeddings
-            # + tag_aliases all have PK (X, conversation_id). Source's row
-            # may collide with target's existing row for the same key.
-            # Target wins; source's conflicting rows are DELETEd. Non-
-            # conflicting source rows are UPDATEd to target's namespace.
-            for tbl in TABLES_TAG_CONFLICT:
-                # tag_summaries / tag_summary_embeddings collide on `tag`.
-                # tag_aliases collides on `alias`.
-                conflict_col = "alias" if tbl == "tag_aliases" else "tag"
+                # active-op check: refuse if either side has a queued/running
+                # compaction or a running ingestion episode. The conversation_lifecycle
+                # row lock above blocks NEW compactions/ingests from STARTING during
+                # the body, but pre-existing ones still need to finish before merge.
+                #
+                # NARROW exception type for the table-
+                # absent case so a real query regression / permission issue / schema
+                # drift cannot fail-open. Only ``UndefinedTable`` (table missing on
+                # minimal fixtures) is swallowed; everything else propagates and the
+                # outer transaction rolls back. SAVEPOINT-via-nested-transaction
+                # contains the UndefinedTable so the outer txn stays alive when the
+                # check is skipped.
+                cop_row = None
+                cop_table_present = True
+                try:
+                    with conn.transaction():
+                        cop_row = conn.execute(
+                            """
+                            SELECT 1 FROM compaction_operation
+                             WHERE conversation_id IN (%s, %s)
+                               AND status IN ('queued','running')
+                             LIMIT 1
+                            """,
+                            (source_conversation_id, target_conversation_id),
+                        ).fetchone()
+                except psycopg.errors.UndefinedTable:
+                    cop_table_present = False
+                if cop_table_present and cop_row is not None:
+                    raise MergeBusy(
+                        "Active compaction_operation on source or target; "
+                        "cannot merge until it completes",
+                        code="merge_busy_compact",
+                    )
+
+                ing_row = None
+                ing_table_present = True
+                try:
+                    with conn.transaction():
+                        ing_row = conn.execute(
+                            """
+                            SELECT 1 FROM ingestion_episode
+                             WHERE conversation_id IN (%s, %s)
+                               AND status = 'running'
+                             LIMIT 1
+                            """,
+                            (source_conversation_id, target_conversation_id),
+                        ).fetchone()
+                except psycopg.errors.UndefinedTable:
+                    ing_table_present = False
+                if ing_table_present and ing_row is not None:
+                    raise MergeBusy(
+                        "Running ingestion_episode on source or target; "
+                        "cannot merge until it completes",
+                        code="merge_busy_ingest",
+                    )
+
+                # recompute offsets UNDER the
+                # conversation_lifecycle FOR UPDATE lock acquired above, so a
+                # concurrent ``save_request_context()`` writer that lands BETWEEN
+                # the engine's pre-call offset computation and the body's lock
+                # acquisition cannot leave us with a stale offset. Caller-passed
+                # values are honored as a floor (``max(caller, recomputed)``) for
+                # test predictability; the recomputed value WINS when the writer
+                # raced ahead.
+                sk_row = conn.execute(
+                    "SELECT COALESCE(MAX(sort_key), 0) AS m "
+                    "FROM canonical_turns WHERE conversation_id = %s",
+                    (target_conversation_id,),
+                ).fetchone()
+                recomputed_sort_key_offset = float(sk_row["m"] or 0.0) + 1000.0
+                sort_key_offset = max(float(sort_key_offset or 0.0),
+                                      recomputed_sort_key_offset)
+
+                # Combined-MAX across the four request-turn-bearing tables on the
+                # target. UNION ALL is cheap and produces a single row.
+                rt_row = conn.execute(
+                    """
+                    SELECT GREATEST(
+                        COALESCE((SELECT MAX(request_turn) + 1 FROM tool_calls
+                                  WHERE conversation_id = %s), 1),
+                        COALESCE((SELECT MAX(request_turn) + 1 FROM request_context
+                                  WHERE conversation_id = %s), 1),
+                        COALESCE((SELECT MAX(turn) + 1 FROM request_captures
+                                  WHERE conversation_id = %s), 1),
+                        COALESCE((SELECT MAX(next_request_turn) FROM request_turn_counters
+                                  WHERE conversation_id = %s), 1)
+                    ) AS m
+                    """,
+                    (target_conversation_id, target_conversation_id,
+                     target_conversation_id, target_conversation_id),
+                ).fetchone()
+                recomputed_request_turn_offset = int(rt_row["m"] or 1)
+                request_turn_offset = max(int(request_turn_offset or 0),
+                                          recomputed_request_turn_offset)
+
+                # Step 5: per-table moves.
+                for tbl in TABLES_SIMPLE:
+                    cur = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = %s, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                        f" WHERE conversation_id = %s",
+                        (target_conversation_id, source_conversation_id, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur.rowcount
+
+                # canonical_turns rows arrive with
+                # source's compacted_at populated. Target's compaction prefix
+                # invariant requires uncompacted rows to have NULL compacted_at;
+                # reset on move so target's compaction pipeline picks them up
+                # as fresh tail. The merge_post_commit_pending queue_resegment
+                # fires re-compaction.
+                for tbl, col in TABLES_OFFSET_SORT_KEY:
+                    cur = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = %s, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
+                        f"       {col} = {col} + %s, "
+                        f"       compacted_at = NULL "
+                        f" WHERE conversation_id = %s",
+                        (target_conversation_id, source_conversation_id,
+                         sort_key_offset, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur.rowcount
+
+                for tbl, col in TABLES_OFFSET_REQUEST_TURN:
+                    cur = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = %s, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
+                        f"       {col} = {col} + %s "
+                        f" WHERE conversation_id = %s",
+                        (target_conversation_id, source_conversation_id,
+                         request_turn_offset, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur.rowcount
+
+                # Transitive tables: rows scoped via FK. UPDATE origin only;
+                # the parent row's conversation_id move is what re-routes them.
+                for tbl, fk_col, parent_tbl, parent_pk in TABLES_TRANSITIVE:
+                    cur = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                        f" WHERE {fk_col} IN ("
+                        f"   SELECT {parent_pk} FROM {parent_tbl} "
+                        f"    WHERE origin_conversation_id = %s"
+                        f" )",
+                        (source_conversation_id, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur.rowcount
+
+                # fact_links: row moves if EITHER endpoint is in source's facts.
                 cur = conn.execute(
-                    f"DELETE FROM {tbl} "
-                    f" WHERE conversation_id = %s "
-                    f"   AND {conflict_col} IN ("
-                    f"     SELECT {conflict_col} FROM {tbl} WHERE conversation_id = %s"
-                    f"   )",
-                    (source_conversation_id, target_conversation_id),
+                    "UPDATE fact_links "
+                    "   SET origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                    " WHERE source_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s) "
+                    "    OR target_fact_id IN (SELECT id FROM facts WHERE origin_conversation_id = %s)",
+                    (source_conversation_id, source_conversation_id, source_conversation_id),
                 )
-                deleted_conflicts = cur.rowcount
-                # UPDATE remainder
-                cur2 = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET conversation_id = %s, "
-                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
-                    f" WHERE conversation_id = %s",
-                    (target_conversation_id, source_conversation_id, source_conversation_id),
+                rows_moved["fact_links"] = cur.rowcount
+
+                # request_turn_counters: source's row is per-conv state that
+                # doesn't make sense on the target (target has its own
+                # counter). DELETE source's row (bounded by conversation_id).
+                cur = conn.execute(
+                    "DELETE FROM request_turn_counters WHERE conversation_id = %s",
+                    (source_conversation_id,),
                 )
-                rows_moved[tbl] = cur2.rowcount
-                rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
+                rows_moved["request_turn_counters"] = cur.rowcount
 
-            # capture prior alias target BEFORE
-            # the UPSERT overwrites it. NULL when source had no prior
-            # alias (the common case). Stored on merge_audit so a future
-            # merge-revert can restore the prior alias.
-            prior_alias_row = conn.execute(
-                "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
-                (source_conversation_id,),
-            ).fetchone()
-            prior_alias_target: str | None = None
-            if prior_alias_row is not None:
-                prior_alias_target = prior_alias_row["target_id"]
+                # + bump
+                # target's request_turn_counter past the maximum request_turn
+                # currently present on the target (regardless of origin). The
+                # implementation filtered ``origin_conversation_id =
+                # source`` which under-counts on chained merges (A->B then
+                # B->C; A-origin rows on B carry origin = A and were preserved
+                # by COALESCE during the B->C move, so they don't match the
+                # most-recent-source filter).
+                #
+                # The simplest correct query: ``MAX(request_turn)`` over ALL
+                # rows on the target across the four request-turn-bearing
+                # tables. Target's pre-merge next_request_turn was, by
+                # invariant, > the max request_turn of any pre-merge row on
+                # target; the post-move max captures both pre-merge rows AND
+                # rows just moved (any origin). The UPSERT preserves whichever
+                # is higher.
+                moved_max_row = conn.execute(
+                    """
+                    SELECT GREATEST(
+                        COALESCE((SELECT MAX(request_turn) FROM tool_calls
+                                  WHERE conversation_id = %s), 0),
+                        COALESCE((SELECT MAX(request_turn) FROM request_context
+                                  WHERE conversation_id = %s), 0),
+                        COALESCE((SELECT MAX(turn) FROM request_captures
+                                  WHERE conversation_id = %s), 0),
+                        COALESCE((SELECT MAX(turn) FROM tool_outputs
+                                  WHERE conversation_id = %s), 0)
+                    ) AS m
+                    """,
+                    (target_conversation_id, target_conversation_id,
+                     target_conversation_id, target_conversation_id),
+                ).fetchone()
+                moved_max_request_turn = int(moved_max_row["m"] or 0)
+                if moved_max_request_turn > 0:
+                    # capture the ACTUAL post-UPSERT
+                    # value via RETURNING so the stat reflects truth (prior
+                    # implementation recorded ``moved_max + 1`` even when
+                    # GREATEST kept the existing higher counter).
+                    upsert_row = conn.execute(
+                        """
+                        INSERT INTO request_turn_counters
+                            (conversation_id, next_request_turn, origin_conversation_id)
+                        VALUES (%s, %s, '')
+                        ON CONFLICT (conversation_id) DO UPDATE
+                          SET next_request_turn = GREATEST(
+                              request_turn_counters.next_request_turn,
+                              EXCLUDED.next_request_turn
+                          )
+                        RETURNING next_request_turn
+                        """,
+                        (target_conversation_id, moved_max_request_turn + 1),
+                    ).fetchone()
+                    rows_moved["request_turn_counters_target_bumped_to"] = int(
+                        upsert_row["next_request_turn"] or (moved_max_request_turn + 1)
+                    )
 
-            # conversation_aliases UPSERT (: epoch column). The alias
-            # makes a stale source_id resolve to the target post-merge;
-            # epoch matches the lifecycle epoch at merge time so a future
-            # delete+recreate can invalidate the alias if needed.
-            conn.execute(
-                """
-                INSERT INTO conversation_aliases (alias_id, target_id, epoch)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (alias_id) DO UPDATE
-                  SET target_id = EXCLUDED.target_id,
-                      epoch = EXCLUDED.epoch
-                """,
-                (source_conversation_id, target_conversation_id,
-                 expected_target_lifecycle_epoch),
-            )
+                # capture conflict tag list BEFORE
+                # deleting source's conflicting tag_summaries rows. The Phase
+                # B sweeper consumes tag_regenerate pendings to re-generate
+                # the unioned summary, so it needs (tag, source_canonical_turn_ids,
+                # target_canonical_turn_ids) per conflict. tag_summaries.
+                # source_canonical_turn_ids is JSON-encoded array of canonical
+                # turn UUIDs.
+                conflict_tag_specs: list[dict] = []
+                try:
+                    for crow in conn.execute(
+                        """
+                        SELECT s.tag AS tag,
+                               s.source_canonical_turn_ids AS src_ids,
+                               t.source_canonical_turn_ids AS tgt_ids
+                          FROM tag_summaries s
+                          JOIN tag_summaries t
+                            ON t.tag = s.tag
+                           AND t.conversation_id = %s
+                         WHERE s.conversation_id = %s
+                        """,
+                        (target_conversation_id, source_conversation_id),
+                    ).fetchall():
+                        conflict_tag_specs.append({
+                            "tag": crow["tag"],
+                            "source_canonical_turn_ids": _json.loads(
+                                crow["src_ids"] or "[]"),
+                            "target_canonical_turn_ids": _json.loads(
+                                crow["tgt_ids"] or "[]"),
+                        })
+                except Exception:
+                    # Schema variant without source_canonical_turn_ids; the
+                    # payload list is empty in that case (sweeper falls back
+                    # to tag-only regeneration).
+                    conflict_tag_specs = []
 
-            # Source phase flip to 'merged'. admits the value.
-            # Predicates on tenant_id ( invariant: every tenant-aware
-            # write includes tenant_id).
-            conn.execute(
-                """
-                UPDATE conversations
-                   SET phase = 'merged',
-                       updated_at = %s
-                 WHERE tenant_id = %s
-                   AND conversation_id = %s
-                """,
-                (datetime.now(timezone.utc), tenant_id, source_conversation_id),
-            )
+                # Tag-conflict resolution. tag_summaries + tag_summary_embeddings
+                # + tag_aliases all have PK (X, conversation_id). Source's row
+                # may collide with target's existing row for the same key.
+                # Target wins; source's conflicting rows are DELETEd. Non-
+                # conflicting source rows are UPDATEd to target's namespace.
+                for tbl in TABLES_TAG_CONFLICT:
+                    # tag_summaries / tag_summary_embeddings collide on `tag`.
+                    # tag_aliases collides on `alias`.
+                    conflict_col = "alias" if tbl == "tag_aliases" else "tag"
+                    cur = conn.execute(
+                        f"DELETE FROM {tbl} "
+                        f" WHERE conversation_id = %s "
+                        f"   AND {conflict_col} IN ("
+                        f"     SELECT {conflict_col} FROM {tbl} WHERE conversation_id = %s"
+                        f"   )",
+                        (source_conversation_id, target_conversation_id),
+                    )
+                    deleted_conflicts = cur.rowcount
+                    # UPDATE remainder
+                    cur2 = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = %s, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                        f" WHERE conversation_id = %s",
+                        (target_conversation_id, source_conversation_id, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur2.rowcount
+                    rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
 
-            # merge_audit finalize. Predicates on tenant_id per D3.
-            # capture prior_alias_target on the audit row.
-            completed_at = datetime.now(timezone.utc)
-            rows_moved_json = _json.dumps(rows_moved)
-            conn.execute(
-                """
-                UPDATE merge_audit
-                   SET status = 'committed',
-                       completed_at = %s,
-                       rows_moved_json = %s,
-                       prior_alias_target = %s
-                 WHERE tenant_id = %s
-                   AND merge_id = %s
-                   AND status = 'in_progress'
-                """,
-                (completed_at, rows_moved_json, prior_alias_target,
-                 tenant_id, merge_id),
-            )
+                # capture prior alias target BEFORE
+                # the UPSERT overwrites it. NULL when source had no prior
+                # alias (the common case). Stored on merge_audit so a future
+                # merge-revert can restore the prior alias.
+                prior_alias_row = conn.execute(
+                    "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
+                    (source_conversation_id,),
+                ).fetchone()
+                prior_alias_target: str | None = None
+                if prior_alias_row is not None:
+                    prior_alias_target = prior_alias_row["target_id"]
 
-            # merge_post_commit_pending INSERTs (B1.1 consumer picks these
-            # up post-commit; cloud's StaleLeaseSweeper 5th pass / ).
-            # Three kinds per plan : sse_event, tag_regenerate,
-            # queue_resegment. JSON payload carries enough state for the
-            # consumer to fire each. tag_regenerate carries the
-            # explicit conflict tag specs (tag + source/target turn ids)
-            # so the sweeper has enough to call the LLM for each tag.
-            import uuid as _uuid
-            sse_payload = _json.dumps({
-                "merge_id": merge_id,
-                "source_conversation_id": source_conversation_id,
-                "target_conversation_id": target_conversation_id,
-                "rows_moved": rows_moved,
-                "source_label_at_merge": source_label_at_merge,
-            })
-            tag_regen_payload = _json.dumps({
-                "merge_id": merge_id,
-                "target_conversation_id": target_conversation_id,
-                "conflicts": conflict_tag_specs,
-            })
-            queue_resegment_payload = _json.dumps({
-                "merge_id": merge_id,
-                "target_conversation_id": target_conversation_id,
-            })
-            for kind, payload in (
-                ("sse_event", sse_payload),
-                ("tag_regenerate", tag_regen_payload),
-                ("queue_resegment", queue_resegment_payload),
-            ):
+                # conversation_aliases UPSERT (: epoch column). The alias
+                # makes a stale source_id resolve to the target post-merge;
+                # epoch matches the lifecycle epoch at merge time so a future
+                # delete+recreate can invalidate the alias if needed.
                 conn.execute(
                     """
-                    INSERT INTO merge_post_commit_pending
-                        (pending_id, merge_id, tenant_id, kind, payload_json,
-                         status, created_at)
-                    VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                    INSERT INTO conversation_aliases (alias_id, target_id, epoch)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (alias_id) DO UPDATE
+                      SET target_id = EXCLUDED.target_id,
+                          epoch = EXCLUDED.epoch
                     """,
-                    (str(_uuid.uuid4()), merge_id, tenant_id, kind, payload,
-                     completed_at),
+                    (source_conversation_id, target_conversation_id,
+                     expected_target_lifecycle_epoch),
                 )
 
-        # Outer transaction commits here.
+                # Source phase flip to 'merged'. admits the value.
+                # Predicates on tenant_id ( invariant: every tenant-aware
+                # write includes tenant_id).
+                conn.execute(
+                    """
+                    UPDATE conversations
+                       SET phase = 'merged',
+                           updated_at = %s
+                     WHERE tenant_id = %s
+                       AND conversation_id = %s
+                    """,
+                    (datetime.now(timezone.utc), tenant_id, source_conversation_id),
+                )
 
-        elapsed = max((completed_at - started_at).total_seconds(), 0.0)
-        return MergeStats(
-            merge_id=merge_id,
-            source_conversation_id=source_conversation_id,
-            target_conversation_id=target_conversation_id,
-            tenant_id=tenant_id,
-            rows_moved=rows_moved,
-            sort_key_offset=sort_key_offset,
-            request_turn_offset=request_turn_offset,
-            started_at=started_at,
-            completed_at=completed_at,
-            success=True,
-            elapsed_seconds=elapsed,
-        )
+                # merge_audit finalize. Predicates on tenant_id per D3.
+                # capture prior_alias_target on the audit row.
+                completed_at = datetime.now(timezone.utc)
+                rows_moved_json = _json.dumps(rows_moved)
+                conn.execute(
+                    """
+                    UPDATE merge_audit
+                       SET status = 'committed',
+                           completed_at = %s,
+                           rows_moved_json = %s,
+                           prior_alias_target = %s
+                     WHERE tenant_id = %s
+                       AND merge_id = %s
+                       AND status = 'in_progress'
+                    """,
+                    (completed_at, rows_moved_json, prior_alias_target,
+                     tenant_id, merge_id),
+                )
+
+                # merge_post_commit_pending INSERTs (B1.1 consumer picks these
+                # up post-commit; cloud's StaleLeaseSweeper 5th pass / ).
+                # Three kinds per plan : sse_event, tag_regenerate,
+                # queue_resegment. JSON payload carries enough state for the
+                # consumer to fire each. tag_regenerate carries the
+                # explicit conflict tag specs (tag + source/target turn ids)
+                # so the sweeper has enough to call the LLM for each tag.
+                import uuid as _uuid
+                sse_payload = _json.dumps({
+                    "merge_id": merge_id,
+                    "source_conversation_id": source_conversation_id,
+                    "target_conversation_id": target_conversation_id,
+                    "rows_moved": rows_moved,
+                    "source_label_at_merge": source_label_at_merge,
+                })
+                tag_regen_payload = _json.dumps({
+                    "merge_id": merge_id,
+                    "target_conversation_id": target_conversation_id,
+                    "conflicts": conflict_tag_specs,
+                })
+                queue_resegment_payload = _json.dumps({
+                    "merge_id": merge_id,
+                    "target_conversation_id": target_conversation_id,
+                })
+                for kind, payload in (
+                    ("sse_event", sse_payload),
+                    ("tag_regenerate", tag_regen_payload),
+                    ("queue_resegment", queue_resegment_payload),
+                ):
+                    conn.execute(
+                        """
+                        INSERT INTO merge_post_commit_pending
+                            (pending_id, merge_id, tenant_id, kind, payload_json,
+                             status, created_at)
+                        VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                        """,
+                        (str(_uuid.uuid4()), merge_id, tenant_id, kind, payload,
+                         completed_at),
+                    )
+
+            # Outer transaction commits here.
+
+            elapsed = max((completed_at - started_at).total_seconds(), 0.0)
+            return MergeStats(
+                merge_id=merge_id,
+                source_conversation_id=source_conversation_id,
+                target_conversation_id=target_conversation_id,
+                tenant_id=tenant_id,
+                rows_moved=rows_moved,
+                sort_key_offset=sort_key_offset,
+                request_turn_offset=request_turn_offset,
+                started_at=started_at,
+                completed_at=completed_at,
+                success=True,
+                elapsed_seconds=elapsed,
+            )
 
     def complete_ingestion_episode(
         self,
@@ -3526,29 +3521,29 @@ class PostgresStore(ContextStore):
         Returns False if any condition fails.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE ingestion_episode
-               SET status = 'completed', completed_at = %s
-             WHERE conversation_id = %s AND status = 'running'
-               AND lifecycle_epoch = %s
-               AND lifecycle_epoch = (
-                   SELECT lifecycle_epoch FROM conversations
-                    WHERE conversation_id = %s
-               )
-               AND owner_worker_id = %s
-               AND NOT EXISTS (
-                   SELECT 1 FROM canonical_turns
-                    WHERE conversation_id = %s AND tagged_at IS NULL
-               )
-            """,
-            (
-                now, conversation_id, lifecycle_epoch, conversation_id,
-                worker_id, conversation_id,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingestion_episode
+                   SET status = 'completed', completed_at = %s
+                 WHERE conversation_id = %s AND status = 'running'
+                   AND lifecycle_epoch = %s
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = %s
+                   )
+                   AND owner_worker_id = %s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM canonical_turns
+                        WHERE conversation_id = %s AND tagged_at IS NULL
+                   )
+                """,
+                (
+                    now, conversation_id, lifecycle_epoch, conversation_id,
+                    worker_id, conversation_id,
+                ),
+            )
+            return cur.rowcount == 1
 
     # ------------------------------------------------------------------
     # Compaction operation CRUD (epoch-guarded)
@@ -3592,21 +3587,21 @@ class PostgresStore(ContextStore):
         import uuid
         op_id = operation_id if operation_id is not None else uuid.uuid4()
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        conn.execute(
-            """
-            INSERT INTO compaction_operation (
-                operation_id, conversation_id, lifecycle_epoch,
-                phase_index, phase_count, phase_name, status,
-                started_at, owner_worker_id, heartbeat_ts
-            ) VALUES (%s, %s, %s, 0, %s, %s, 'queued', %s, %s, %s)
-            """,
-            (
-                op_id, conversation_id, lifecycle_epoch,
-                phase_count, phase_name, now, worker_id, now,
-            ),
-        )
-        return str(op_id)
+        with self.pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO compaction_operation (
+                    operation_id, conversation_id, lifecycle_epoch,
+                    phase_index, phase_count, phase_name, status,
+                    started_at, owner_worker_id, heartbeat_ts
+                ) VALUES (%s, %s, %s, 0, %s, %s, 'queued', %s, %s, %s)
+                """,
+                (
+                    op_id, conversation_id, lifecycle_epoch,
+                    phase_count, phase_name, now, worker_id, now,
+                ),
+            )
+            return str(op_id)
 
     def claim_compaction_lease(
         self,
@@ -3631,42 +3626,42 @@ class PostgresStore(ContextStore):
 
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_s)
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        with conn.transaction():
-            pre = conn.execute(
-                """
-                SELECT operation_id, owner_worker_id
-                  FROM compaction_operation
-                 WHERE conversation_id = %s AND status IN ('queued','running')
-                   AND lifecycle_epoch = %s
-                 ORDER BY started_at DESC
-                 LIMIT 1
-                 FOR UPDATE
-                """,
-                (conversation_id, lifecycle_epoch),
-            ).fetchone()
-            prev_op = str(pre["operation_id"]) if pre else None
-            prev_owner = str(pre["owner_worker_id"]) if pre else None
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                pre = conn.execute(
+                    """
+                    SELECT operation_id, owner_worker_id
+                      FROM compaction_operation
+                     WHERE conversation_id = %s AND status IN ('queued','running')
+                       AND lifecycle_epoch = %s
+                     ORDER BY started_at DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """,
+                    (conversation_id, lifecycle_epoch),
+                ).fetchone()
+                prev_op = str(pre["operation_id"]) if pre else None
+                prev_owner = str(pre["owner_worker_id"]) if pre else None
 
-            cur = conn.execute(
-                """
-                UPDATE compaction_operation
-                   SET owner_worker_id = %s, heartbeat_ts = %s
-                 WHERE conversation_id = %s AND status IN ('queued','running')
-                   AND lifecycle_epoch = %s
-                   AND (owner_worker_id = %s OR heartbeat_ts < %s)
-                """,
-                (
-                    worker_id, now, conversation_id, lifecycle_epoch,
-                    worker_id, cutoff,
-                ),
+                cur = conn.execute(
+                    """
+                    UPDATE compaction_operation
+                       SET owner_worker_id = %s, heartbeat_ts = %s
+                     WHERE conversation_id = %s AND status IN ('queued','running')
+                       AND lifecycle_epoch = %s
+                       AND (owner_worker_id = %s OR heartbeat_ts < %s)
+                    """,
+                    (
+                        worker_id, now, conversation_id, lifecycle_epoch,
+                        worker_id, cutoff,
+                    ),
+                )
+                claimed = (cur.rowcount or 0) > 0
+            return CompactionLeaseClaim(
+                claimed=claimed,
+                prev_operation_id=prev_op,
+                prev_owner_worker_id=prev_owner,
             )
-            claimed = (cur.rowcount or 0) > 0
-        return CompactionLeaseClaim(
-            claimed=claimed,
-            prev_operation_id=prev_op,
-            prev_owner_worker_id=prev_owner,
-        )
 
     def cleanup_abandoned_compaction(
         self,
@@ -3700,49 +3695,49 @@ class PostgresStore(ContextStore):
            one status='running' row per (conversation_id, lifecycle_epoch).
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        with conn.transaction():
-            cur = conn.execute(
-                """UPDATE compaction_operation
-                      SET status = 'abandoned', completed_at = %s
-                    WHERE operation_id = %s
-                      AND conversation_id = %s
-                      AND lifecycle_epoch = %s
-                      AND status = 'running'""",
-                (now, dead_operation_id, conversation_id, lifecycle_epoch),
-            )
-            fresh_takeover = (cur.rowcount or 0) > 0
-            for table in (
-                "segments", "facts", "tag_summaries", "tag_summary_embeddings",
-            ):
-                conn.execute(
-                    f"DELETE FROM {table} "
-                    f"WHERE operation_id = %s AND conversation_id = %s",
-                    (dead_operation_id, conversation_id),
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                cur = conn.execute(
+                    """UPDATE compaction_operation
+                          SET status = 'abandoned', completed_at = %s
+                        WHERE operation_id = %s
+                          AND conversation_id = %s
+                          AND lifecycle_epoch = %s
+                          AND status = 'running'""",
+                    (now, dead_operation_id, conversation_id, lifecycle_epoch),
                 )
-            conn.execute(
-                """UPDATE canonical_turns
-                      SET compacted_at = NULL,
-                          compaction_operation_id = NULL,
-                          updated_at = %s
-                    WHERE conversation_id = %s
-                      AND compaction_operation_id = %s""",
-                (_dt_to_str(now), conversation_id, dead_operation_id),
-            )
-            if fresh_takeover:
+                fresh_takeover = (cur.rowcount or 0) > 0
+                for table in (
+                    "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+                ):
+                    conn.execute(
+                        f"DELETE FROM {table} "
+                        f"WHERE operation_id = %s AND conversation_id = %s",
+                        (dead_operation_id, conversation_id),
+                    )
                 conn.execute(
-                    """INSERT INTO compaction_operation
-                       (operation_id, conversation_id, lifecycle_epoch,
-                        phase_index, phase_count, phase_name, status,
-                        started_at, heartbeat_ts, owner_worker_id, created_at)
-                       VALUES (%s, %s, %s, 0, %s, 'starting', 'running',
-                               %s, %s, %s, %s)""",
-                    (
-                        new_operation_id, conversation_id, lifecycle_epoch,
-                        phase_count, now, now, worker_id, now,
-                    ),
+                    """UPDATE canonical_turns
+                          SET compacted_at = NULL,
+                              compaction_operation_id = NULL,
+                              updated_at = %s
+                        WHERE conversation_id = %s
+                          AND compaction_operation_id = %s""",
+                    (_dt_to_str(now), conversation_id, dead_operation_id),
                 )
-        return fresh_takeover
+                if fresh_takeover:
+                    conn.execute(
+                        """INSERT INTO compaction_operation
+                           (operation_id, conversation_id, lifecycle_epoch,
+                            phase_index, phase_count, phase_name, status,
+                            started_at, heartbeat_ts, owner_worker_id, created_at)
+                           VALUES (%s, %s, %s, 0, %s, 'starting', 'running',
+                                   %s, %s, %s, %s)""",
+                        (
+                            new_operation_id, conversation_id, lifecycle_epoch,
+                            phase_count, now, now, worker_id, now,
+                        ),
+                    )
+            return fresh_takeover
 
     def refresh_compaction_heartbeat(
         self,
@@ -3753,21 +3748,21 @@ class PostgresStore(ContextStore):
         operation_id: str,
     ) -> bool:
         from datetime import datetime, timezone
-        conn = self._get_conn()
-        cur = conn.execute(
-            """UPDATE compaction_operation
-                  SET heartbeat_ts = %s
-                WHERE operation_id = %s
-                  AND conversation_id = %s
-                  AND lifecycle_epoch = %s
-                  AND owner_worker_id = %s
-                  AND status = 'running'""",
-            (
-                datetime.now(timezone.utc),
-                operation_id, conversation_id, lifecycle_epoch, worker_id,
-            ),
-        )
-        return (cur.rowcount or 0) > 0
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """UPDATE compaction_operation
+                      SET heartbeat_ts = %s
+                    WHERE operation_id = %s
+                      AND conversation_id = %s
+                      AND lifecycle_epoch = %s
+                      AND owner_worker_id = %s
+                      AND status = 'running'""",
+                (
+                    datetime.now(timezone.utc),
+                    operation_id, conversation_id, lifecycle_epoch, worker_id,
+                ),
+            )
+            return (cur.rowcount or 0) > 0
 
     def advance_compaction_phase(
         self,
@@ -3786,26 +3781,26 @@ class PostgresStore(ContextStore):
         ``conversations.lifecycle_epoch``) both hold.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE compaction_operation
-               SET phase_index = %s, phase_name = %s, heartbeat_ts = %s,
-                   status = 'running'
-             WHERE conversation_id = %s AND status IN ('queued','running')
-               AND lifecycle_epoch = %s
-               AND lifecycle_epoch = (
-                   SELECT lifecycle_epoch FROM conversations
-                    WHERE conversation_id = %s
-               )
-               AND owner_worker_id = %s
-            """,
-            (
-                phase_index, phase_name, now,
-                conversation_id, lifecycle_epoch, conversation_id, worker_id,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET phase_index = %s, phase_name = %s, heartbeat_ts = %s,
+                       status = 'running'
+                 WHERE conversation_id = %s AND status IN ('queued','running')
+                   AND lifecycle_epoch = %s
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = %s
+                   )
+                   AND owner_worker_id = %s
+                """,
+                (
+                    phase_index, phase_name, now,
+                    conversation_id, lifecycle_epoch, conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
 
     def complete_compaction_operation(
         self,
@@ -3822,25 +3817,25 @@ class PostgresStore(ContextStore):
         ``completed_at``.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE compaction_operation
-               SET status = 'completed', completed_at = %s
-             WHERE conversation_id = %s AND status IN ('queued','running')
-               AND lifecycle_epoch = %s
-               AND lifecycle_epoch = (
-                   SELECT lifecycle_epoch FROM conversations
-                    WHERE conversation_id = %s
-               )
-               AND owner_worker_id = %s
-            """,
-            (
-                now, conversation_id, lifecycle_epoch,
-                conversation_id, worker_id,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'completed', completed_at = %s
+                 WHERE conversation_id = %s AND status IN ('queued','running')
+                   AND lifecycle_epoch = %s
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = %s
+                   )
+                   AND owner_worker_id = %s
+                """,
+                (
+                    now, conversation_id, lifecycle_epoch,
+                    conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
 
     def fail_compaction_operation(
         self,
@@ -3856,26 +3851,26 @@ class PostgresStore(ContextStore):
         ``complete_compaction_operation`` pass.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE compaction_operation
-               SET status = 'failed', completed_at = %s,
-                   error_message = %s
-             WHERE conversation_id = %s AND status IN ('queued','running')
-               AND lifecycle_epoch = %s
-               AND lifecycle_epoch = (
-                   SELECT lifecycle_epoch FROM conversations
-                    WHERE conversation_id = %s
-               )
-               AND owner_worker_id = %s
-            """,
-            (
-                now, error_message, conversation_id, lifecycle_epoch,
-                conversation_id, worker_id,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE compaction_operation
+                   SET status = 'failed', completed_at = %s,
+                       error_message = %s
+                 WHERE conversation_id = %s AND status IN ('queued','running')
+                   AND lifecycle_epoch = %s
+                   AND lifecycle_epoch = (
+                       SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = %s
+                   )
+                   AND owner_worker_id = %s
+                """,
+                (
+                    now, error_message, conversation_id, lifecycle_epoch,
+                    conversation_id, worker_id,
+                ),
+            )
+            return cur.rowcount == 1
 
     # ------------------------------------------------------------------
     # Request metadata + phase helpers (epoch-guarded)
@@ -3905,25 +3900,25 @@ class PostgresStore(ContextStore):
         UPDATE matched a row at the caller's ``lifecycle_epoch``.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE conversations
-               SET last_raw_payload_entries = %s,
-                   last_ingestible_payload_entries = %s,
-                   updated_at = %s
-             WHERE conversation_id = %s
-               AND lifecycle_epoch = %s
-            """,
-            (
-                last_raw_payload_entries,
-                last_ingestible_payload_entries,
-                now,
-                conversation_id,
-                lifecycle_epoch,
-            ),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET last_raw_payload_entries = %s,
+                       last_ingestible_payload_entries = %s,
+                       updated_at = %s
+                 WHERE conversation_id = %s
+                   AND lifecycle_epoch = %s
+                """,
+                (
+                    last_raw_payload_entries,
+                    last_ingestible_payload_entries,
+                    now,
+                    conversation_id,
+                    lifecycle_epoch,
+                ),
+            )
+            return cur.rowcount == 1
 
     def widen_pending_raw_payload_entries(
         self,
@@ -3937,18 +3932,18 @@ class PostgresStore(ContextStore):
         forwards. Epoch-guarded: returns ``True`` iff the UPDATE matched
         a row at the caller's ``lifecycle_epoch``.
         """
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE conversations
-               SET pending_raw_payload_entries =
-                   GREATEST(pending_raw_payload_entries, %s)
-             WHERE conversation_id = %s
-               AND lifecycle_epoch = %s
-            """,
-            (value, conversation_id, lifecycle_epoch),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET pending_raw_payload_entries =
+                       GREATEST(pending_raw_payload_entries, %s)
+                 WHERE conversation_id = %s
+                   AND lifecycle_epoch = %s
+                """,
+                (value, conversation_id, lifecycle_epoch),
+            )
+            return cur.rowcount == 1
 
     def set_phase(
         self,
@@ -3962,17 +3957,17 @@ class PostgresStore(ContextStore):
         stomp a new lifecycle's phase.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE conversations
-               SET phase = %s, updated_at = %s
-             WHERE conversation_id = %s
-               AND lifecycle_epoch = %s
-            """,
-            (phase, now, conversation_id, lifecycle_epoch),
-        )
-        return cur.rowcount == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE conversations
+                   SET phase = %s, updated_at = %s
+                 WHERE conversation_id = %s
+                   AND lifecycle_epoch = %s
+                """,
+                (phase, now, conversation_id, lifecycle_epoch),
+            )
+            return cur.rowcount == 1
 
     def set_phase_and_drain_pending_raw(
         self,
@@ -3990,37 +3985,37 @@ class PostgresStore(ContextStore):
         conversations row.
         """
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        with conn.transaction():
-            row = conn.execute(
-                """
-                SELECT pending_raw_payload_entries, lifecycle_epoch
-                  FROM conversations WHERE conversation_id = %s
-                """,
-                (conversation_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            if isinstance(row, dict):
-                current_epoch = int(row["lifecycle_epoch"])
-                drained = int(row["pending_raw_payload_entries"])
-            else:
-                current_epoch = int(row[1])
-                drained = int(row[0])
-            if current_epoch != lifecycle_epoch:
-                return None
-            conn.execute(
-                """
-                UPDATE conversations
-                   SET phase = %s,
-                       pending_raw_payload_entries = 0,
-                       updated_at = %s
-                 WHERE conversation_id = %s
-                   AND lifecycle_epoch = %s
-                """,
-                (new_phase, now, conversation_id, lifecycle_epoch),
-            )
-        return drained
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT pending_raw_payload_entries, lifecycle_epoch
+                      FROM conversations WHERE conversation_id = %s
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if isinstance(row, dict):
+                    current_epoch = int(row["lifecycle_epoch"])
+                    drained = int(row["pending_raw_payload_entries"])
+                else:
+                    current_epoch = int(row[1])
+                    drained = int(row[0])
+                if current_epoch != lifecycle_epoch:
+                    return None
+                conn.execute(
+                    """
+                    UPDATE conversations
+                       SET phase = %s,
+                           pending_raw_payload_entries = 0,
+                           updated_at = %s
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch = %s
+                    """,
+                    (new_phase, now, conversation_id, lifecycle_epoch),
+                )
+            return drained
 
     def drain_compaction_exit(
         self,
@@ -4045,40 +4040,65 @@ class PostgresStore(ContextStore):
         import uuid
 
         now = datetime.now(timezone.utc)
-        conn = self._get_conn()
-        with conn.transaction():
-            row = conn.execute(
-                """
-                SELECT pending_raw_payload_entries, lifecycle_epoch,
-                       EXISTS (
-                         SELECT 1 FROM canonical_turns
-                          WHERE conversation_id = %s AND tagged_at IS NULL
-                       )
-                  FROM conversations
-                 WHERE conversation_id = %s
-                """,
-                (conversation_id, conversation_id),
-            ).fetchone()
-            if row is None:
-                return None
-            if isinstance(row, dict):
-                current_epoch = int(row["lifecycle_epoch"])
-                pending_raw = int(row["pending_raw_payload_entries"])
-                # When psycopg row factory returns dict rows, the
-                # unnamed EXISTS expression is keyed by its auto-generated
-                # alias "exists".
-                has_untagged = bool(row.get("exists"))
-            else:
-                pending_raw = int(row[0])
-                current_epoch = int(row[1])
-                has_untagged = bool(row[2])
-            if current_epoch != lifecycle_epoch:
-                return None
-            if has_untagged:
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT pending_raw_payload_entries, lifecycle_epoch,
+                           EXISTS (
+                             SELECT 1 FROM canonical_turns
+                              WHERE conversation_id = %s AND tagged_at IS NULL
+                           )
+                      FROM conversations
+                     WHERE conversation_id = %s
+                    """,
+                    (conversation_id, conversation_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                if isinstance(row, dict):
+                    current_epoch = int(row["lifecycle_epoch"])
+                    pending_raw = int(row["pending_raw_payload_entries"])
+                    # When psycopg row factory returns dict rows, the
+                    # unnamed EXISTS expression is keyed by its auto-generated
+                    # alias "exists".
+                    has_untagged = bool(row.get("exists"))
+                else:
+                    pending_raw = int(row[0])
+                    current_epoch = int(row[1])
+                    has_untagged = bool(row[2])
+                if current_epoch != lifecycle_epoch:
+                    return None
+                if has_untagged:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting',
+                               pending_raw_payload_entries = 0,
+                               updated_at = %s
+                         WHERE conversation_id = %s
+                           AND lifecycle_epoch = %s
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO ingestion_episode (
+                            episode_id, conversation_id, lifecycle_epoch,
+                            raw_payload_entries, started_at, status,
+                            owner_worker_id, heartbeat_ts
+                        ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
+                        """,
+                        (
+                            uuid.uuid4(), conversation_id, lifecycle_epoch,
+                            pending_raw, now, worker_id, now,
+                        ),
+                    )
+                    return "ingesting"
                 conn.execute(
                     """
                     UPDATE conversations
-                       SET phase = 'ingesting',
+                       SET phase = 'active',
                            pending_raw_payload_entries = 0,
                            updated_at = %s
                      WHERE conversation_id = %s
@@ -4086,71 +4106,46 @@ class PostgresStore(ContextStore):
                     """,
                     (now, conversation_id, lifecycle_epoch),
                 )
-                conn.execute(
-                    """
-                    INSERT INTO ingestion_episode (
-                        episode_id, conversation_id, lifecycle_epoch,
-                        raw_payload_entries, started_at, status,
-                        owner_worker_id, heartbeat_ts
-                    ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
-                    """,
-                    (
-                        uuid.uuid4(), conversation_id, lifecycle_epoch,
-                        pending_raw, now, worker_id, now,
-                    ),
-                )
-                return "ingesting"
-            conn.execute(
-                """
-                UPDATE conversations
-                   SET phase = 'active',
-                       pending_raw_payload_entries = 0,
-                       updated_at = %s
-                 WHERE conversation_id = %s
-                   AND lifecycle_epoch = %s
-                """,
-                (now, conversation_id, lifecycle_epoch),
-            )
-            return "active"
+                return "active"
 
     def delete_conversation(self, conversation_id: str) -> int:
-        conn = self._get_conn()
-        with conn.transaction():
-            deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
-            for table in (
-                "engine_state",
-                "facts",
-                "canonical_turns",
-                "canonical_turn_chunks",
-                "canonical_turn_anchors",
-                "ingest_batches",
-                "tag_summaries",
-                "tag_aliases",
-                "request_captures",
-                "tool_outputs",
-                "tool_calls",
-                "request_context",
-                "request_turn_counters",
-                "tag_summary_embeddings",
-                "turn_tool_outputs",
-                "segment_tool_outputs",
-                "chain_snapshots",
-                "media_outputs",
-                "ingestion_episode",
-                "compaction_operation",
-                "conversations",
-            ):
-                self._delete_conversation_rows(conn, table, conversation_id)
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
+                for table in (
+                    "engine_state",
+                    "facts",
+                    "canonical_turns",
+                    "canonical_turn_chunks",
+                    "canonical_turn_anchors",
+                    "ingest_batches",
+                    "tag_summaries",
+                    "tag_aliases",
+                    "request_captures",
+                    "tool_outputs",
+                    "tool_calls",
+                    "request_context",
+                    "request_turn_counters",
+                    "tag_summary_embeddings",
+                    "turn_tool_outputs",
+                    "segment_tool_outputs",
+                    "chain_snapshots",
+                    "media_outputs",
+                    "ingestion_episode",
+                    "compaction_operation",
+                    "conversations",
+                ):
+                    self._delete_conversation_rows(conn, table, conversation_id)
 
-        # Disk cleanup: remove media files for this conversation
-        import os
-        import shutil
-        _data_dir = os.environ.get("VC_DATA_DIR", "/data/tenants")
-        media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
-        if media_dir and os.path.isdir(media_dir):
-            shutil.rmtree(media_dir, ignore_errors=True)
+            # Disk cleanup: remove media files for this conversation
+            import os
+            import shutil
+            _data_dir = os.environ.get("VC_DATA_DIR", "/data/tenants")
+            media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
+            if media_dir and os.path.isdir(media_dir):
+                shutil.rmtree(media_dir, ignore_errors=True)
 
-        return deleted
+            return deleted
 
     def save_tag_summary(
         self,
@@ -4169,123 +4164,98 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
         )
 
-        conn = self._get_conn()
-        with conn.transaction():
-            if guard_all:
-                # INSERT-SELECT form: writes zero rows if the compaction_operation
-                # row no longer matches (status != 'running', owner mismatch, etc).
-                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
-                # a row candidate — i.e., when the guard passes.
-                cur = conn.execute(
-                    """INSERT INTO tag_summaries
-                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
-                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
-                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
-                     created_at, updated_at, operation_id)
-                    SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                      FROM compaction_operation
-                     WHERE operation_id = %s
-                       AND conversation_id = %s
-                       AND status = 'running'
-                       AND owner_worker_id = %s
-                       AND lifecycle_epoch = %s
-                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
-                        summary=EXCLUDED.summary, description=EXCLUDED.description,
-                        code_refs=EXCLUDED.code_refs,
-                        summary_tokens=EXCLUDED.summary_tokens,
-                        source_segment_refs=EXCLUDED.source_segment_refs,
-                        source_turn_numbers=EXCLUDED.source_turn_numbers,
-                        source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
-                        covers_through_turn=EXCLUDED.covers_through_turn,
-                        covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
-                        generated_by_turn_id=EXCLUDED.generated_by_turn_id,
-                        updated_at=EXCLUDED.updated_at,
-                        operation_id=EXCLUDED.operation_id""",
-                    (
-                        tag_summary.tag, conversation_id, tag_summary.summary,
-                        getattr(tag_summary, "description", ""),
-                        json.dumps(getattr(tag_summary, "code_refs", []) or []),
-                        tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
-                        json.dumps(tag_summary.source_turn_numbers),
-                        json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
-                        tag_summary.covers_through_turn,
-                        getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
-                        getattr(tag_summary, "generated_by_turn_id", "") or "",
-                        _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at),
-                        operation_id,
-                        # WHERE clause params:
-                        operation_id, conversation_id,
-                        owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
-                        operation_id=operation_id,
-                        write_site="save_tag_summary",
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the compaction_operation
+                    # row no longer matches (status != 'running', owner mismatch, etc).
+                    # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                    # a row candidate — i.e., when the guard passes.
+                    cur = conn.execute(
+                        """INSERT INTO tag_summaries
+                        (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                         source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                         covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                         created_at, updated_at, operation_id)
+                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                            summary=EXCLUDED.summary, description=EXCLUDED.description,
+                            code_refs=EXCLUDED.code_refs,
+                            summary_tokens=EXCLUDED.summary_tokens,
+                            source_segment_refs=EXCLUDED.source_segment_refs,
+                            source_turn_numbers=EXCLUDED.source_turn_numbers,
+                            source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                            covers_through_turn=EXCLUDED.covers_through_turn,
+                            covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
+                            generated_by_turn_id=EXCLUDED.generated_by_turn_id,
+                            updated_at=EXCLUDED.updated_at,
+                            operation_id=EXCLUDED.operation_id""",
+                        (
+                            tag_summary.tag, conversation_id, tag_summary.summary,
+                            getattr(tag_summary, "description", ""),
+                            json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                            tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
+                            json.dumps(tag_summary.source_turn_numbers),
+                            json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                            tag_summary.covers_through_turn,
+                            getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                            getattr(tag_summary, "generated_by_turn_id", "") or "",
+                            _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at),
+                            operation_id,
+                            # WHERE clause params:
+                            operation_id, conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
                     )
-            else:
-                # Legacy unconditional path — existing callers and test harnesses.
-                conn.execute(
-                    """INSERT INTO tag_summaries
-                    (tag, conversation_id, summary, description, code_refs, summary_tokens,
-                     source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
-                     covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
-                     created_at, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
-                        summary=EXCLUDED.summary, description=EXCLUDED.description,
-                        code_refs=EXCLUDED.code_refs,
-                        summary_tokens=EXCLUDED.summary_tokens,
-                        source_segment_refs=EXCLUDED.source_segment_refs,
-                        source_turn_numbers=EXCLUDED.source_turn_numbers,
-                        source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
-                        covers_through_turn=EXCLUDED.covers_through_turn,
-                        covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
-                        generated_by_turn_id=EXCLUDED.generated_by_turn_id,
-                        updated_at=EXCLUDED.updated_at""",
-                    (tag_summary.tag, conversation_id, tag_summary.summary,
-                     getattr(tag_summary, "description", ""),
-                     json.dumps(getattr(tag_summary, "code_refs", []) or []),
-                     tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
-                     json.dumps(tag_summary.source_turn_numbers),
-                     json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
-                     tag_summary.covers_through_turn,
-                     getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
-                     getattr(tag_summary, "generated_by_turn_id", "") or "",
-                     _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
-                )
+                    if (cur.rowcount or 0) == 0:
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="save_tag_summary",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and test harnesses.
+                    conn.execute(
+                        """INSERT INTO tag_summaries
+                        (tag, conversation_id, summary, description, code_refs, summary_tokens,
+                         source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                         covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
+                         created_at, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                            summary=EXCLUDED.summary, description=EXCLUDED.description,
+                            code_refs=EXCLUDED.code_refs,
+                            summary_tokens=EXCLUDED.summary_tokens,
+                            source_segment_refs=EXCLUDED.source_segment_refs,
+                            source_turn_numbers=EXCLUDED.source_turn_numbers,
+                            source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                            covers_through_turn=EXCLUDED.covers_through_turn,
+                            covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
+                            generated_by_turn_id=EXCLUDED.generated_by_turn_id,
+                            updated_at=EXCLUDED.updated_at""",
+                        (tag_summary.tag, conversation_id, tag_summary.summary,
+                         getattr(tag_summary, "description", ""),
+                         json.dumps(getattr(tag_summary, "code_refs", []) or []),
+                         tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
+                         json.dumps(tag_summary.source_turn_numbers),
+                         json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                         tag_summary.covers_through_turn,
+                         getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
+                         getattr(tag_summary, "generated_by_turn_id", "") or "",
+                         _dt_to_str(tag_summary.created_at), _dt_to_str(tag_summary.updated_at)),
+                    )
 
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM tag_summaries WHERE tag = %s AND conversation_id = %s", (tag, conversation_id)).fetchone()
-        if not row:
-            return None
-        return TagSummary(
-            tag=row["tag"], summary=row["summary"],
-            description=row.get("description", ""),
-            code_refs=json.loads(row.get("code_refs", "[]") or "[]"),
-            summary_tokens=row["summary_tokens"],
-            source_segment_refs=json.loads(row["source_segment_refs"]),
-            source_turn_numbers=json.loads(row["source_turn_numbers"]),
-            source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
-            covers_through_turn=row["covers_through_turn"],
-            covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
-            generated_by_turn_id=row.get("generated_by_turn_id", ""),
-            created_at=_str_to_dt(row["created_at"]),
-            updated_at=_str_to_dt(row["updated_at"]),
-        )
-
-    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM tag_summaries WHERE conversation_id = %s ORDER BY updated_at DESC",
-                (conversation_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM tag_summaries ORDER BY updated_at DESC").fetchall()
-        return [
-            TagSummary(
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM tag_summaries WHERE tag = %s AND conversation_id = %s", (tag, conversation_id)).fetchone()
+            if not row:
+                return None
+            return TagSummary(
                 tag=row["tag"], summary=row["summary"],
                 description=row.get("description", ""),
                 code_refs=json.loads(row.get("code_refs", "[]") or "[]"),
@@ -4299,96 +4269,121 @@ class PostgresStore(ContextStore):
                 created_at=_str_to_dt(row["created_at"]),
                 updated_at=_str_to_dt(row["updated_at"]),
             )
-            for row in rows
-        ]
+
+    def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM tag_summaries WHERE conversation_id = %s ORDER BY updated_at DESC",
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM tag_summaries ORDER BY updated_at DESC").fetchall()
+            return [
+                TagSummary(
+                    tag=row["tag"], summary=row["summary"],
+                    description=row.get("description", ""),
+                    code_refs=json.loads(row.get("code_refs", "[]") or "[]"),
+                    summary_tokens=row["summary_tokens"],
+                    source_segment_refs=json.loads(row["source_segment_refs"]),
+                    source_turn_numbers=json.loads(row["source_turn_numbers"]),
+                    source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
+                    covers_through_turn=row["covers_through_turn"],
+                    covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
+                    generated_by_turn_id=row.get("generated_by_turn_id", ""),
+                    created_at=_str_to_dt(row["created_at"]),
+                    updated_at=_str_to_dt(row["updated_at"]),
+                )
+                for row in rows
+            ]
 
     def get_segments_by_tags(self, tags: list[str], min_overlap: int = 1, limit: int = 20, conversation_id: str | None = None) -> list[StoredSegment]:
         if not tags:
             return []
-        conn = self._get_conn()
-        sql = """SELECT s.*, COUNT(st.tag) as overlap_count
-            FROM segments s JOIN segment_tags st ON s.ref = st.segment_ref
-            WHERE st.tag = ANY(%s)"""
-        params: list = [tags]
-        if conversation_id is not None:
-            sql += " AND s.conversation_id = %s"
-            params.append(conversation_id)
-        sql += """ GROUP BY s.ref HAVING COUNT(st.tag) >= %s
-            ORDER BY COUNT(st.tag) DESC, s.created_at DESC LIMIT %s"""
-        params.extend([min_overlap, limit])
-        rows = conn.execute(sql, params).fetchall()
-        refs = [row["ref"] for row in rows]
-        tags_map = self._batch_get_tags(refs)
-        return [_row_to_segment(row, tags_map[row["ref"]]) for row in rows]
+        with self.pool.connection() as conn:
+            sql = """SELECT s.*, COUNT(st.tag) as overlap_count
+                FROM segments s JOIN segment_tags st ON s.ref = st.segment_ref
+                WHERE st.tag = ANY(%s)"""
+            params: list = [tags]
+            if conversation_id is not None:
+                sql += " AND s.conversation_id = %s"
+                params.append(conversation_id)
+            sql += """ GROUP BY s.ref HAVING COUNT(st.tag) >= %s
+                ORDER BY COUNT(st.tag) DESC, s.created_at DESC LIMIT %s"""
+            params.extend([min_overlap, limit])
+            rows = conn.execute(sql, params).fetchall()
+            refs = [row["ref"] for row in rows]
+            tags_map = self._batch_get_tags(refs)
+            return [_row_to_segment(row, tags_map[row["ref"]]) for row in rows]
 
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT st.tag, substring(s.summary from 1 for 100) as snippet
-            FROM segment_tags st JOIN segments s ON s.ref = st.segment_ref
-            WHERE st.tag NOT IN (SELECT tag FROM tag_summaries)
-            GROUP BY st.tag, substring(s.summary from 1 for 100) LIMIT %s""",
-            (limit,),
-        ).fetchall()
-        return [{"tag": row["tag"], "snippet": row["snippet"]} for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT st.tag, substring(s.summary from 1 for 100) as snippet
+                FROM segment_tags st JOIN segments s ON s.ref = st.segment_ref
+                WHERE st.tag NOT IN (SELECT tag FROM tag_summaries)
+                GROUP BY st.tag, substring(s.summary from 1 for 100) LIMIT %s""",
+                (limit,),
+            ).fetchall()
+            return [{"tag": row["tag"], "snippet": row["snippet"]} for row in rows]
 
     # ------------------------------------------------------------------
     # SearchStore
     # ------------------------------------------------------------------
 
     def search_full_text(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list[QuoteResult]:
-        conn = self._get_conn()
-        _sc = self.search_config
-        _pg_words = _sc.postgres_max_words if _sc else 100
-        tsquery = " & ".join(query.split())
-        try:
-            sql = """SELECT s.ref, s.primary_tag, s.metadata_json,
-                    ts_headline('english', s.full_text, to_tsquery('english', %s),
-                                'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=""" + str(_pg_words) + """') as excerpt,
-                    s.created_at
-                FROM segments s
-                WHERE s.full_text_tsv @@ to_tsquery('english', %s)"""
-            params: list = [tsquery, tsquery]
-            if conversation_id is not None:
-                sql += " AND s.conversation_id = %s"
-                params.append(conversation_id)
-            sql += """
-                ORDER BY ts_rank(s.full_text_tsv, to_tsquery('english', %s)) DESC
-                LIMIT %s"""
-            params.extend([tsquery, limit])
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            # Fallback to ILIKE
-            _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
-            sql = "SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments WHERE full_text ILIKE %s"
-            params = [f"%{query}%"]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
-            sql += " LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
+        with self.pool.connection() as conn:
+            _sc = self.search_config
+            _pg_words = _sc.postgres_max_words if _sc else 100
+            tsquery = " & ".join(query.split())
+            try:
+                sql = """SELECT s.ref, s.primary_tag, s.metadata_json,
+                        ts_headline('english', s.full_text, to_tsquery('english', %s),
+                                    'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=""" + str(_pg_words) + """') as excerpt,
+                        s.created_at
+                    FROM segments s
+                    WHERE s.full_text_tsv @@ to_tsquery('english', %s)"""
+                params: list = [tsquery, tsquery]
+                if conversation_id is not None:
+                    sql += " AND s.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += """
+                    ORDER BY ts_rank(s.full_text_tsv, to_tsquery('english', %s)) DESC
+                    LIMIT %s"""
+                params.extend([tsquery, limit])
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:
+                # Fallback to ILIKE
+                _excerpt_chars = _sc.excerpt_context_chars if _sc else 200
+                sql = "SELECT ref, primary_tag, full_text, metadata_json, created_at FROM segments WHERE full_text ILIKE %s"
+                params = [f"%{query}%"]
+                if conversation_id is not None:
+                    sql += " AND conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+                results = []
+                for row in rows:
+                    meta = json.loads(row["metadata_json"])
+                    results.append(QuoteResult(
+                        text=_extract_excerpt(row["full_text"], query, context_chars=_excerpt_chars),
+                        tag=row["primary_tag"], segment_ref=row["ref"],
+                        session_date=meta.get("session_date", ""),
+                        match_type="text_search",
+                    ))
+                return results
+
             results = []
             for row in rows:
                 meta = json.loads(row["metadata_json"])
                 results.append(QuoteResult(
-                    text=_extract_excerpt(row["full_text"], query, context_chars=_excerpt_chars),
-                    tag=row["primary_tag"], segment_ref=row["ref"],
+                    text=row["excerpt"], tag=row["primary_tag"],
+                    segment_ref=row["ref"],
                     session_date=meta.get("session_date", ""),
-                    match_type="text_search",
+                    match_type="fts",
                 ))
             return results
-
-        results = []
-        for row in rows:
-            meta = json.loads(row["metadata_json"])
-            results.append(QuoteResult(
-                text=row["excerpt"], tag=row["primary_tag"],
-                segment_ref=row["ref"],
-                session_date=meta.get("session_date", ""),
-                match_type="fts",
-            ))
-        return results
 
     def search_canonical_turn_text(
         self,
@@ -4396,76 +4391,76 @@ class PostgresStore(ContextStore):
         limit: int = 5,
         conversation_id: str | None = None,
     ) -> list[QuoteResult]:
-        conn = self._get_conn()
-        pattern = f"%{query}%"
-        sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
-                        primary_tag, tags_json, session_date
-                 FROM canonical_turns_ordinal
-                 WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
-        params: list[object] = [pattern, pattern]
-        if conversation_id is not None:
-            sql += " AND conversation_id = %s"
-            params.append(conversation_id)
-        sql += " ORDER BY sort_key DESC LIMIT %s"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+        with self.pool.connection() as conn:
+            pattern = f"%{query}%"
+            sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
+                            primary_tag, tags_json, session_date
+                     FROM canonical_turns_ordinal
+                     WHERE (user_content ILIKE %s OR assistant_content ILIKE %s)"""
+            params: list[object] = [pattern, pattern]
+            if conversation_id is not None:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY sort_key DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
 
-        results = []
-        _sc = getattr(self, "search_config", None)
-        _ctx = _sc.excerpt_context_chars if _sc else 200
-        for row in rows:
-            turn = row["turn_number"]
-            u = row["user_content"] or ""
-            a = row["assistant_content"] or ""
-            primary_tag = row.get("primary_tag", "_general") or "_general"
-            try:
-                tags = json.loads(row.get("tags_json", "[]") or "[]")
-            except Exception:
-                tags = []
-            session_date = row.get("session_date", "") or ""
-            matched_side = _matched_turn_side(query, u, a)
-            excerpt = _build_turn_excerpt(
-                query,
-                u,
-                a,
-                matched_side,
-                context_chars=_ctx,
-            )
-            results.append(QuoteResult(
-                text=excerpt,
-                tag=primary_tag,
-                segment_ref=f"canonical_turn_{row.get('canonical_turn_id', '') or turn}",
-                tags=list(tags or []),
-                match_type="full_text_search",
-                session_date=session_date,
-                source_scope="turn",
-                turn_number=turn,
-                matched_side=matched_side,
-            ))
-        return results
+            results = []
+            _sc = getattr(self, "search_config", None)
+            _ctx = _sc.excerpt_context_chars if _sc else 200
+            for row in rows:
+                turn = row["turn_number"]
+                u = row["user_content"] or ""
+                a = row["assistant_content"] or ""
+                primary_tag = row.get("primary_tag", "_general") or "_general"
+                try:
+                    tags = json.loads(row.get("tags_json", "[]") or "[]")
+                except Exception:
+                    tags = []
+                session_date = row.get("session_date", "") or ""
+                matched_side = _matched_turn_side(query, u, a)
+                excerpt = _build_turn_excerpt(
+                    query,
+                    u,
+                    a,
+                    matched_side,
+                    context_chars=_ctx,
+                )
+                results.append(QuoteResult(
+                    text=excerpt,
+                    tag=primary_tag,
+                    segment_ref=f"canonical_turn_{row.get('canonical_turn_id', '') or turn}",
+                    tags=list(tags or []),
+                    match_type="full_text_search",
+                    session_date=session_date,
+                    source_scope="turn",
+                    turn_number=turn,
+                    matched_side=matched_side,
+                ))
+            return results
 
     def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
-        conn = self._get_conn()
-        with conn.transaction():
-            conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (segment_ref,))
-            for chunk in chunks:
-                conn.execute(
-                    "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (%s,%s,%s,%s)",
-                    (segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
-                )
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (segment_ref,))
+                for chunk in chunks:
+                    conn.execute(
+                        "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (%s,%s,%s,%s)",
+                        (segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
+                    )
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT segment_ref, chunk_index, text, embedding_json FROM segment_chunks ORDER BY segment_ref, chunk_index"
-        ).fetchall()
-        return [
-            ChunkEmbedding(
-                segment_ref=row["segment_ref"], chunk_index=row["chunk_index"],
-                text=row["text"], embedding=json.loads(row["embedding_json"]),
-            )
-            for row in rows
-        ]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT segment_ref, chunk_index, text, embedding_json FROM segment_chunks ORDER BY segment_ref, chunk_index"
+            ).fetchall()
+            return [
+                ChunkEmbedding(
+                    segment_ref=row["segment_ref"], chunk_index=row["chunk_index"],
+                    text=row["text"], embedding=json.loads(row["embedding_json"]),
+                )
+                for row in rows
+            ]
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -4475,67 +4470,67 @@ class PostgresStore(ContextStore):
         chunks: list[CanonicalTurnChunkEmbedding],
         canonical_turn_id: str | None = None,
     ) -> None:
-        conn = self._get_conn()
-        canonical_turn_id = canonical_turn_id or self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
-        if canonical_turn_id is None:
-            return
-        with conn.transaction():
-            conn.execute(
-                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s AND side = %s",
-                (conversation_id, canonical_turn_id, side),
-            )
-            for chunk in chunks:
+        with self.pool.connection() as conn:
+            canonical_turn_id = canonical_turn_id or self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+            if canonical_turn_id is None:
+                return
+            with conn.transaction():
                 conn.execute(
-                    """INSERT INTO canonical_turn_chunks
-                    (conversation_id, canonical_turn_id, side, chunk_index, text, embedding_json)
-                    VALUES (%s,%s,%s,%s,%s,%s)""",
-                    (
-                        chunk.conversation_id,
-                        canonical_turn_id,
-                        chunk.side,
-                        chunk.chunk_index,
-                        chunk.text,
-                        json.dumps(chunk.embedding),
-                    ),
+                    "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s AND side = %s",
+                    (conversation_id, canonical_turn_id, side),
                 )
+                for chunk in chunks:
+                    conn.execute(
+                        """INSERT INTO canonical_turn_chunks
+                        (conversation_id, canonical_turn_id, side, chunk_index, text, embedding_json)
+                        VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (
+                            chunk.conversation_id,
+                            canonical_turn_id,
+                            chunk.side,
+                            chunk.chunk_index,
+                            chunk.text,
+                            json.dumps(chunk.embedding),
+                        ),
+                    )
 
     def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
     ) -> list[CanonicalTurnChunkEmbedding]:
-        conn = self._get_conn()
-        if conversation_id is None:
-            rows = conn.execute(
-                """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
-                FROM canonical_turn_chunks ctc
-                JOIN canonical_turns_ordinal cto
-                  ON cto.conversation_id = ctc.conversation_id
-                 AND cto.canonical_turn_id = ctc.canonical_turn_id
-                ORDER BY ctc.conversation_id, cto.turn_number, ctc.side, ctc.chunk_index"""
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
-                FROM canonical_turn_chunks ctc
-                JOIN canonical_turns_ordinal cto
-                  ON cto.conversation_id = ctc.conversation_id
-                 AND cto.canonical_turn_id = ctc.canonical_turn_id
-                WHERE ctc.conversation_id = %s
-                ORDER BY cto.turn_number, ctc.side, ctc.chunk_index""",
-                (conversation_id,),
-            ).fetchall()
-        return [
-            CanonicalTurnChunkEmbedding(
-                conversation_id=row["conversation_id"],
-                canonical_turn_id=str(row.get("canonical_turn_id", "") or ""),
-                turn_number=row["turn_number"],
-                side=row["side"],
-                chunk_index=row["chunk_index"],
-                text=row["text"],
-                embedding=json.loads(row["embedding_json"]),
-            )
-            for row in rows
-        ]
+        with self.pool.connection() as conn:
+            if conversation_id is None:
+                rows = conn.execute(
+                    """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
+                    FROM canonical_turn_chunks ctc
+                    JOIN canonical_turns_ordinal cto
+                      ON cto.conversation_id = ctc.conversation_id
+                     AND cto.canonical_turn_id = ctc.canonical_turn_id
+                    ORDER BY ctc.conversation_id, cto.turn_number, ctc.side, ctc.chunk_index"""
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT ctc.conversation_id, ctc.canonical_turn_id, cto.turn_number, ctc.side, ctc.chunk_index, ctc.text, ctc.embedding_json
+                    FROM canonical_turn_chunks ctc
+                    JOIN canonical_turns_ordinal cto
+                      ON cto.conversation_id = ctc.conversation_id
+                     AND cto.canonical_turn_id = ctc.canonical_turn_id
+                    WHERE ctc.conversation_id = %s
+                    ORDER BY cto.turn_number, ctc.side, ctc.chunk_index""",
+                    (conversation_id,),
+                ).fetchall()
+            return [
+                CanonicalTurnChunkEmbedding(
+                    conversation_id=row["conversation_id"],
+                    canonical_turn_id=str(row.get("canonical_turn_id", "") or ""),
+                    turn_number=row["turn_number"],
+                    side=row["side"],
+                    chunk_index=row["chunk_index"],
+                    text=row["text"],
+                    embedding=json.loads(row["embedding_json"]),
+                )
+                for row in rows
+            ]
 
     def delete_canonical_turn_chunk_embeddings(
         self,
@@ -4543,117 +4538,117 @@ class PostgresStore(ContextStore):
         turn_number: int | None = None,
         canonical_turn_id: str | None = None,
     ) -> int:
-        conn = self._get_conn()
-        if canonical_turn_id is None and turn_number is not None:
-            canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
-        if turn_number is None and canonical_turn_id is None:
-            cur = conn.execute(
-                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s",
-                (conversation_id,),
-            )
-        else:
-            if canonical_turn_id is None:
-                return 0
-            cur = conn.execute(
-                "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s",
-                (conversation_id, canonical_turn_id),
-            )
-        return int(cur.rowcount or 0)
+        with self.pool.connection() as conn:
+            if canonical_turn_id is None and turn_number is not None:
+                canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+            if turn_number is None and canonical_turn_id is None:
+                cur = conn.execute(
+                    "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s",
+                    (conversation_id,),
+                )
+            else:
+                if canonical_turn_id is None:
+                    return 0
+                cur = conn.execute(
+                    "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s",
+                    (conversation_id, canonical_turn_id),
+                )
+            return int(cur.rowcount or 0)
 
     def store_tool_output(self, ref: str, conversation_id: str, tool_name: str, command: str, turn: int, content: str, original_bytes: int) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO tool_outputs (ref, conversation_id, tool_name, command, turn, content, original_bytes, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (ref) DO UPDATE SET content=EXCLUDED.content, original_bytes=EXCLUDED.original_bytes""",
-            (ref, conversation_id, tool_name, command, turn, content, original_bytes, _dt_to_str(datetime.now(timezone.utc))),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO tool_outputs (ref, conversation_id, tool_name, command, turn, content, original_bytes, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (ref) DO UPDATE SET content=EXCLUDED.content, original_bytes=EXCLUDED.original_bytes""",
+                (ref, conversation_id, tool_name, command, turn, content, original_bytes, _dt_to_str(datetime.now(timezone.utc))),
+            )
 
     def search_tool_outputs(self, query: str, limit: int = 5, conversation_id: str | None = None) -> list:
-        conn = self._get_conn()
-        tsquery = " & ".join(query.split())
-        try:
-            sql = """SELECT t.ref, t.tool_name,
-                    ts_headline('english', t.content, to_tsquery('english', %s),
-                                'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=20') as excerpt
-                FROM tool_outputs t
-                WHERE t.content_tsv @@ to_tsquery('english', %s)"""
-            params: list = [tsquery, tsquery]
-            if conversation_id is not None:
-                sql += " AND t.conversation_id = %s"
-                params.append(conversation_id)
-            sql += """
-                ORDER BY ts_rank(t.content_tsv, to_tsquery('english', %s)) DESC
-                LIMIT %s"""
-            params.extend([tsquery, limit])
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            return []
-        return [
-            QuoteResult(
-                text=row["excerpt"],
-                tag=row["tool_name"],
-                segment_ref=row["ref"],
-                session_date="",
-                match_type="tool_output",
-                source_scope="tool_output",
-            )
-            for row in rows
-        ]
+        with self.pool.connection() as conn:
+            tsquery = " & ".join(query.split())
+            try:
+                sql = """SELECT t.ref, t.tool_name,
+                        ts_headline('english', t.content, to_tsquery('english', %s),
+                                    'StartSel=>>>, StopSel=<<<, MaxFragments=1, MaxWords=20') as excerpt
+                    FROM tool_outputs t
+                    WHERE t.content_tsv @@ to_tsquery('english', %s)"""
+                params: list = [tsquery, tsquery]
+                if conversation_id is not None:
+                    sql += " AND t.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += """
+                    ORDER BY ts_rank(t.content_tsv, to_tsquery('english', %s)) DESC
+                    LIMIT %s"""
+                params.extend([tsquery, limit])
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:
+                return []
+            return [
+                QuoteResult(
+                    text=row["excerpt"],
+                    tag=row["tool_name"],
+                    segment_ref=row["ref"],
+                    session_date="",
+                    match_type="tool_output",
+                    source_scope="tool_output",
+                )
+                for row in rows
+            ]
 
     # ------------------------------------------------------------------
     # Turn / Segment ↔ Tool Output linkage
     # ------------------------------------------------------------------
 
     def link_turn_tool_output(self, conversation_id: str, turn_number: int, tool_output_ref: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref)
-            VALUES (%s, %s, %s)
-            ON CONFLICT DO NOTHING""",
-            (conversation_id, turn_number, tool_output_ref),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING""",
+                (conversation_id, turn_number, tool_output_ref),
+            )
 
     def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT tool_output_ref FROM turn_tool_outputs WHERE conversation_id = %s AND turn_number = %s",
-            (conversation_id, turn_number),
-        ).fetchall()
-        return [row["tool_output_ref"] for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT tool_output_ref FROM turn_tool_outputs WHERE conversation_id = %s AND turn_number = %s",
+                (conversation_id, turn_number),
+            ).fetchall()
+            return [row["tool_output_ref"] for row in rows]
 
     def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
-            VALUES (%s, %s, %s)
-            ON CONFLICT DO NOTHING""",
-            (conversation_id, segment_ref, tool_output_ref),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING""",
+                (conversation_id, segment_ref, tool_output_ref),
+            )
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT tool_output_ref FROM segment_tool_outputs WHERE conversation_id = %s AND segment_ref = %s",
-            (conversation_id, segment_ref),
-        ).fetchall()
-        return [row["tool_output_ref"] for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT tool_output_ref FROM segment_tool_outputs WHERE conversation_id = %s AND segment_ref = %s",
+                (conversation_id, segment_ref),
+            ).fetchall()
+            return [row["tool_output_ref"] for row in rows]
 
     def get_tool_output_refs_for_turn(self, conversation_id: str, turn: int) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT ref FROM tool_outputs WHERE conversation_id = %s AND turn = %s",
-            (conversation_id, turn),
-        ).fetchall()
-        return [row["ref"] for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT ref FROM tool_outputs WHERE conversation_id = %s AND turn = %s",
+                (conversation_id, turn),
+            ).fetchall()
+            return [row["ref"] for row in rows]
 
     def get_tool_output_by_ref(self, conversation_id: str, ref: str) -> str | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT content FROM tool_outputs WHERE conversation_id = %s AND ref = %s",
-            (conversation_id, ref),
-        ).fetchone()
-        return row["content"] if row else None
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT content FROM tool_outputs WHERE conversation_id = %s AND ref = %s",
+                (conversation_id, ref),
+            ).fetchone()
+            return row["content"] if row else None
 
     # ------------------------------------------------------------------
     # Media Output Storage
@@ -4670,35 +4665,35 @@ class PostgresStore(ContextStore):
         compressed_bytes: int,
         file_path: str,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO media_outputs (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (conversation_id, ref) DO UPDATE SET
-                media_type=EXCLUDED.media_type, width=EXCLUDED.width, height=EXCLUDED.height,
-                original_bytes=EXCLUDED.original_bytes, compressed_bytes=EXCLUDED.compressed_bytes,
-                file_path=EXCLUDED.file_path""",
-            (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, _dt_to_str(datetime.now(timezone.utc))),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO media_outputs (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (conversation_id, ref) DO UPDATE SET
+                    media_type=EXCLUDED.media_type, width=EXCLUDED.width, height=EXCLUDED.height,
+                    original_bytes=EXCLUDED.original_bytes, compressed_bytes=EXCLUDED.compressed_bytes,
+                    file_path=EXCLUDED.file_path""",
+                (ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path, _dt_to_str(datetime.now(timezone.utc))),
+            )
 
     def get_media_output(self, conversation_id: str, ref: str) -> dict | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path FROM media_outputs WHERE conversation_id = %s AND ref = %s",
-            (conversation_id, ref),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "ref": row["ref"],
-            "conversation_id": row["conversation_id"],
-            "media_type": row["media_type"],
-            "width": row["width"],
-            "height": row["height"],
-            "original_bytes": row["original_bytes"],
-            "compressed_bytes": row["compressed_bytes"],
-            "file_path": row["file_path"],
-        }
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT ref, conversation_id, media_type, width, height, original_bytes, compressed_bytes, file_path FROM media_outputs WHERE conversation_id = %s AND ref = %s",
+                (conversation_id, ref),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "ref": row["ref"],
+                "conversation_id": row["conversation_id"],
+                "media_type": row["media_type"],
+                "width": row["width"],
+                "height": row["height"],
+                "original_bytes": row["original_bytes"],
+                "compressed_bytes": row["compressed_bytes"],
+                "file_path": row["file_path"],
+            }
 
     # ------------------------------------------------------------------
     # Chain Snapshots (turn chain collapse)
@@ -4713,223 +4708,223 @@ class PostgresStore(ContextStore):
         message_count: int,
         tool_output_refs: str = "",
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO chain_snapshots
-            (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ref) DO UPDATE SET
-                chain_json=EXCLUDED.chain_json, message_count=EXCLUDED.message_count,
-                tool_output_refs=EXCLUDED.tool_output_refs""",
-            (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs,
-             _dt_to_str(datetime.now(timezone.utc))),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO chain_snapshots
+                (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ref) DO UPDATE SET
+                    chain_json=EXCLUDED.chain_json, message_count=EXCLUDED.message_count,
+                    tool_output_refs=EXCLUDED.tool_output_refs""",
+                (ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs,
+                 _dt_to_str(datetime.now(timezone.utc))),
+            )
 
     def get_chain_snapshot(self, conversation_id: str, ref: str) -> dict | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            """SELECT ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs
-            FROM chain_snapshots WHERE conversation_id = %s AND ref = %s""",
-            (conversation_id, ref),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "ref": row["ref"],
-            "conversation_id": row["conversation_id"],
-            "turn_number": row["turn_number"],
-            "chain_json": row["chain_json"],
-            "message_count": row["message_count"],
-            "tool_output_refs": row["tool_output_refs"],
-        }
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT ref, conversation_id, turn_number, chain_json, message_count, tool_output_refs
+                FROM chain_snapshots WHERE conversation_id = %s AND ref = %s""",
+                (conversation_id, ref),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "ref": row["ref"],
+                "conversation_id": row["conversation_id"],
+                "turn_number": row["turn_number"],
+                "chain_json": row["chain_json"],
+                "message_count": row["message_count"],
+                "tool_output_refs": row["tool_output_refs"],
+            }
 
     def get_chain_snapshots_for_conversation(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT ref, turn_number, tool_output_refs, message_count
-            FROM chain_snapshots WHERE conversation_id = %s AND turn_number >= %s
-            ORDER BY turn_number""",
-            (conversation_id, min_turn),
-        ).fetchall()
-        return [{"ref": r["ref"], "turn_number": r["turn_number"],
-                 "tool_output_refs": r["tool_output_refs"], "message_count": r["message_count"]} for r in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT ref, turn_number, tool_output_refs, message_count
+                FROM chain_snapshots WHERE conversation_id = %s AND turn_number >= %s
+                ORDER BY turn_number""",
+                (conversation_id, min_turn),
+            ).fetchall()
+            return [{"ref": r["ref"], "turn_number": r["turn_number"],
+                     "tool_output_refs": r["tool_output_refs"], "message_count": r["message_count"]} for r in rows]
 
     def get_chain_recovery_manifest(self, conversation_id: str, min_turn: int = 0) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT
-                s.ref,
-                s.turn_number,
-                s.tool_output_refs,
-                s.message_count,
-                COALESCE(
-                    STRING_AGG(DISTINCT t.tool_name, ', ' ORDER BY t.tool_name)
-                        FILTER (WHERE t.tool_name != ''),
-                    ''
-                ) AS tool_names
-            FROM chain_snapshots s
-            LEFT JOIN tool_outputs t
-                ON t.ref = ANY(string_to_array(NULLIF(s.tool_output_refs, ''), ','))
-            WHERE s.conversation_id = %s
-              AND s.turn_number >= %s
-            GROUP BY s.ref, s.turn_number, s.tool_output_refs, s.message_count
-            ORDER BY s.turn_number
-            """,
-            (conversation_id, min_turn),
-        ).fetchall()
-        return [
-            {
-                "ref": row["ref"],
-                "turn_number": row["turn_number"],
-                "tool_output_refs": row["tool_output_refs"],
-                "message_count": row["message_count"],
-                "tool_names": row["tool_names"] or "",
-            }
-            for row in rows
-        ]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.ref,
+                    s.turn_number,
+                    s.tool_output_refs,
+                    s.message_count,
+                    COALESCE(
+                        STRING_AGG(DISTINCT t.tool_name, ', ' ORDER BY t.tool_name)
+                            FILTER (WHERE t.tool_name != ''),
+                        ''
+                    ) AS tool_names
+                FROM chain_snapshots s
+                LEFT JOIN tool_outputs t
+                    ON t.ref = ANY(string_to_array(NULLIF(s.tool_output_refs, ''), ','))
+                WHERE s.conversation_id = %s
+                  AND s.turn_number >= %s
+                GROUP BY s.ref, s.turn_number, s.tool_output_refs, s.message_count
+                ORDER BY s.turn_number
+                """,
+                (conversation_id, min_turn),
+            ).fetchall()
+            return [
+                {
+                    "ref": row["ref"],
+                    "turn_number": row["turn_number"],
+                    "tool_output_refs": row["tool_output_refs"],
+                    "message_count": row["message_count"],
+                    "tool_names": row["tool_names"] or "",
+                }
+                for row in rows
+            ]
 
     def get_tool_names_for_refs(self, refs: list[str]) -> list[str]:
         if not refs:
             return []
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT DISTINCT tool_name FROM tool_outputs WHERE ref = ANY(%s) AND tool_name != ''",
-            (refs,),
-        ).fetchall()
-        return [row["tool_name"] for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT tool_name FROM tool_outputs WHERE ref = ANY(%s) AND tool_name != ''",
+                (refs,),
+            ).fetchall()
+            return [row["tool_name"] for row in rows]
 
     def get_tool_names_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT DISTINCT t.tool_name
-            FROM segment_tool_outputs s
-            JOIN tool_outputs t ON t.ref = s.tool_output_ref AND t.conversation_id = s.conversation_id
-            WHERE s.conversation_id = %s AND s.segment_ref = %s
-            ORDER BY t.tool_name""",
-            (conversation_id, segment_ref),
-        ).fetchall()
-        return [row["tool_name"] for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT t.tool_name
+                FROM segment_tool_outputs s
+                JOIN tool_outputs t ON t.ref = s.tool_output_ref AND t.conversation_id = s.conversation_id
+                WHERE s.conversation_id = %s AND s.segment_ref = %s
+                ORDER BY t.tool_name""",
+                (conversation_id, segment_ref),
+            ).fetchall()
+            return [row["tool_name"] for row in rows]
 
     def save_request_capture(self, capture: dict) -> None:
-        conn = self._get_conn()
-        import time as _time
-        conversation_id = capture.get("conversation_id", "") or ""
-        turn_id = capture.get("turn_id", "") or ""
-        conn.execute(
-            """INSERT INTO request_captures
-            (conversation_id, turn, turn_id, ts, recorded_at, data_json)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (conversation_id, turn, turn_id) DO UPDATE SET
-                ts=EXCLUDED.ts,
-                recorded_at=EXCLUDED.recorded_at,
-                data_json=EXCLUDED.data_json""",
-            (
-                conversation_id,
-                capture["turn"],
-                turn_id,
-                capture.get("ts", ""),
-                _time.time(),
-                json.dumps(capture),
-            ),
-        )
-        conn.execute(
-            """DELETE FROM request_captures
-            WHERE conversation_id = %s
-              AND (conversation_id, turn, turn_id) NOT IN (
-                SELECT conversation_id, turn, turn_id
-                FROM request_captures
+        with self.pool.connection() as conn:
+            import time as _time
+            conversation_id = capture.get("conversation_id", "") or ""
+            turn_id = capture.get("turn_id", "") or ""
+            conn.execute(
+                """INSERT INTO request_captures
+                (conversation_id, turn, turn_id, ts, recorded_at, data_json)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (conversation_id, turn, turn_id) DO UPDATE SET
+                    ts=EXCLUDED.ts,
+                    recorded_at=EXCLUDED.recorded_at,
+                    data_json=EXCLUDED.data_json""",
+                (
+                    conversation_id,
+                    capture["turn"],
+                    turn_id,
+                    capture.get("ts", ""),
+                    _time.time(),
+                    json.dumps(capture),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM request_captures
                 WHERE conversation_id = %s
-                ORDER BY recorded_at DESC LIMIT 50
-            )""",
-            (conversation_id, conversation_id),
-        )
+                  AND (conversation_id, turn, turn_id) NOT IN (
+                    SELECT conversation_id, turn, turn_id
+                    FROM request_captures
+                    WHERE conversation_id = %s
+                    ORDER BY recorded_at DESC LIMIT 50
+                )""",
+                (conversation_id, conversation_id),
+            )
 
     def load_request_captures(
         self,
         limit: int = 50,
         conversation_id: str | None = None,
     ) -> list[dict]:
-        conn = self._get_conn()
-        try:
-            if conversation_id is None:
-                rows = conn.execute(
-                    "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT %s",
-                    (limit,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT data_json FROM request_captures
-                    WHERE conversation_id = %s
-                    ORDER BY recorded_at ASC LIMIT %s""",
-                    (conversation_id, limit),
-                ).fetchall()
-        except Exception:
-            return []
-        result = []
-        for row in rows:
+        with self.pool.connection() as conn:
             try:
-                result.append(json.loads(row["data_json"]))
-            except (json.JSONDecodeError, TypeError, KeyError):
-                pass
-        return result
+                if conversation_id is None:
+                    rows = conn.execute(
+                        "SELECT data_json FROM request_captures ORDER BY recorded_at ASC LIMIT %s",
+                        (limit,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT data_json FROM request_captures
+                        WHERE conversation_id = %s
+                        ORDER BY recorded_at ASC LIMIT %s""",
+                        (conversation_id, limit),
+                    ).fetchall()
+            except Exception:
+                return []
+            result = []
+            for row in rows:
+                try:
+                    result.append(json.loads(row["data_json"]))
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+            return result
 
     # ------------------------------------------------------------------
     # StateStore
     # ------------------------------------------------------------------
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
-        conn = self._get_conn()
-        entries_data = {
-            "entries": [
-                {
-                    "turn_number": e.turn_number,
-                    "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
-                    "tags": e.tags,
-                    "primary_tag": e.primary_tag,
-                    "message_hash": e.message_hash,
-                    "sender": e.sender,
-                    "fact_signals": [
-                        {"subject": fs.subject, "verb": fs.verb, "object": fs.object,
-                         "status": fs.status, "fact_type": fs.fact_type, "what": fs.what}
-                        for fs in (e.fact_signals or [])
-                    ] if e.fact_signals else [],
-                    "code_refs": list(getattr(e, "code_refs", []) or []),
-                }
-                for e in state.turn_tag_entries
-            ],
-            "split_processed_tags": list(state.split_processed_tags) if state.split_processed_tags else [],
-            "working_set": [
-                {
-                    "tag": ws.tag,
-                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
-                    "tokens": ws.tokens,
-                    "last_accessed_turn": ws.last_accessed_turn,
-                }
-                for ws in (state.working_set or [])
-            ],
-            "trailing_fingerprint": state.trailing_fingerprint or "",
-            "request_captures": state.request_captures,
-            "provider": state.provider,
-            "flushed_prefix_messages": state.flushed_prefix_messages,
-            "last_request_time": state.last_request_time,
-            "tool_tag_counter": state.tool_tag_counter,
-            "last_compacted_turn": state.last_compacted_turn,
-            "last_completed_turn": state.last_completed_turn,
-            "last_indexed_turn": state.last_indexed_turn,
-            "checkpoint_version": state.checkpoint_version,
-        }
-        conn.execute(
-            """INSERT INTO engine_state (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at, flushed_prefix_messages, last_request_time)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (conversation_id) DO UPDATE SET
-                compacted_prefix_messages=EXCLUDED.compacted_prefix_messages, turn_count=EXCLUDED.turn_count,
-                turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at,
-                flushed_prefix_messages=EXCLUDED.flushed_prefix_messages, last_request_time=EXCLUDED.last_request_time""",
-            (state.conversation_id, state.compacted_prefix_messages, state.turn_count,
-             json.dumps(entries_data), _dt_to_str(state.saved_at),
-             state.flushed_prefix_messages, state.last_request_time),
-        )
+        with self.pool.connection() as conn:
+            entries_data = {
+                "entries": [
+                    {
+                        "turn_number": e.turn_number,
+                        "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
+                        "tags": e.tags,
+                        "primary_tag": e.primary_tag,
+                        "message_hash": e.message_hash,
+                        "sender": e.sender,
+                        "fact_signals": [
+                            {"subject": fs.subject, "verb": fs.verb, "object": fs.object,
+                             "status": fs.status, "fact_type": fs.fact_type, "what": fs.what}
+                            for fs in (e.fact_signals or [])
+                        ] if e.fact_signals else [],
+                        "code_refs": list(getattr(e, "code_refs", []) or []),
+                    }
+                    for e in state.turn_tag_entries
+                ],
+                "split_processed_tags": list(state.split_processed_tags) if state.split_processed_tags else [],
+                "working_set": [
+                    {
+                        "tag": ws.tag,
+                        "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                        "tokens": ws.tokens,
+                        "last_accessed_turn": ws.last_accessed_turn,
+                    }
+                    for ws in (state.working_set or [])
+                ],
+                "trailing_fingerprint": state.trailing_fingerprint or "",
+                "request_captures": state.request_captures,
+                "provider": state.provider,
+                "flushed_prefix_messages": state.flushed_prefix_messages,
+                "last_request_time": state.last_request_time,
+                "tool_tag_counter": state.tool_tag_counter,
+                "last_compacted_turn": state.last_compacted_turn,
+                "last_completed_turn": state.last_completed_turn,
+                "last_indexed_turn": state.last_indexed_turn,
+                "checkpoint_version": state.checkpoint_version,
+            }
+            conn.execute(
+                """INSERT INTO engine_state (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at, flushed_prefix_messages, last_request_time)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    compacted_prefix_messages=EXCLUDED.compacted_prefix_messages, turn_count=EXCLUDED.turn_count,
+                    turn_tag_entries=EXCLUDED.turn_tag_entries, saved_at=EXCLUDED.saved_at,
+                    flushed_prefix_messages=EXCLUDED.flushed_prefix_messages, last_request_time=EXCLUDED.last_request_time""",
+                (state.conversation_id, state.compacted_prefix_messages, state.turn_count,
+                 json.dumps(entries_data), _dt_to_str(state.saved_at),
+                 state.flushed_prefix_messages, state.last_request_time),
+            )
 
     def _parse_engine_state_row(self, row: dict) -> EngineStateSnapshot:
         raw = json.loads(row["turn_tag_entries"])
@@ -5053,54 +5048,54 @@ class PostgresStore(ContextStore):
         )
 
     def load_engine_state(self, conversation_id: str) -> EngineStateSnapshot | None:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM engine_state WHERE conversation_id = %s", (conversation_id,)).fetchone()
-        if not row:
-            return None
-        return self._parse_engine_state_row(row)
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM engine_state WHERE conversation_id = %s", (conversation_id,)).fetchone()
+            if not row:
+                return None
+            return self._parse_engine_state_row(row)
 
     def load_latest_engine_state(self) -> EngineStateSnapshot | None:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM engine_state ORDER BY compacted_prefix_messages DESC, saved_at DESC LIMIT 1").fetchone()
-        if not row:
-            return None
-        return self._parse_engine_state_row(row)
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM engine_state ORDER BY compacted_prefix_messages DESC, saved_at DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            return self._parse_engine_state_row(row)
 
     def list_engine_state_fingerprints(self) -> dict[str, str]:
-        conn = self._get_conn()
-        rows = conn.execute("SELECT conversation_id, turn_tag_entries FROM engine_state").fetchall()
-        result: dict[str, str] = {}
-        for row in rows:
-            raw = json.loads(row["turn_tag_entries"])
-            fp = raw.get("trailing_fingerprint", "") if isinstance(raw, dict) else ""
-            if fp:
-                result[fp] = row["conversation_id"]
-        return result
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT conversation_id, turn_tag_entries FROM engine_state").fetchall()
+            result: dict[str, str] = {}
+            for row in rows:
+                raw = json.loads(row["turn_tag_entries"])
+                fp = raw.get("trailing_fingerprint", "") if isinstance(raw, dict) else ""
+                if fp:
+                    result[fp] = row["conversation_id"]
+            return result
 
     # ------------------------------------------------------------------
     def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO conversation_aliases (alias_id, target_id)
-            VALUES (%s, %s)
-            ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id""",
-            (alias_id, target_id),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO conversation_aliases (alias_id, target_id)
+                VALUES (%s, %s)
+                ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id""",
+                (alias_id, target_id),
+            )
 
     def resolve_conversation_alias(self, alias_id: str) -> str | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
-            (alias_id,),
-        ).fetchone()
-        return row["target_id"] if row else None
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
+                (alias_id,),
+            ).fetchone()
+            return row["target_id"] if row else None
 
     def delete_conversation_alias(self, alias_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "DELETE FROM conversation_aliases WHERE alias_id = %s",
-            (alias_id,),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM conversation_aliases WHERE alias_id = %s",
+                (alias_id,),
+            )
 
     def save_canonical_turn(
         self,
@@ -5155,92 +5150,92 @@ class PostgresStore(ContextStore):
             }
             for fs in (fact_signals or [])
         ]
-        conn = self._get_conn()
-        if canonical_turn_id is None and turn_number >= 0:
-            slot_row = conn.execute(
-                "SELECT canonical_turn_id FROM canonical_turns WHERE conversation_id = %s AND sort_key = %s",
-                (conversation_id, float((turn_number + 1) * 1000.0)),
-            ).fetchone()
-            canonical_turn_id = str(slot_row["canonical_turn_id"]) if slot_row else None
-        existing_sort_key = None
-        if canonical_turn_id:
-            existing = conn.execute(
-                "SELECT sort_key FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
-                (conversation_id, canonical_turn_id),
-            ).fetchone()
-            if existing:
-                existing_sort_key = float(existing["sort_key"])
-        if canonical_turn_id is None:
-            canonical_turn_id = generate_canonical_turn_id()
-        if sort_key is None:
-            if existing_sort_key is not None:
-                sort_key = existing_sort_key
-            elif turn_number >= 0:
-                sort_key = float((turn_number + 1) * 1000.0)
-            else:
-                tail = conn.execute(
-                    "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key FROM canonical_turns WHERE conversation_id = %s",
-                    (conversation_id,),
+        with self.pool.connection() as conn:
+            if canonical_turn_id is None and turn_number >= 0:
+                slot_row = conn.execute(
+                    "SELECT canonical_turn_id FROM canonical_turns WHERE conversation_id = %s AND sort_key = %s",
+                    (conversation_id, float((turn_number + 1) * 1000.0)),
                 ).fetchone()
-                sort_key = float((tail["max_sort_key"] or 0.0) + 1000.0)
-        conn.execute(
-            """INSERT INTO canonical_turns
-            (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
-             normalized_user_text, normalized_assistant_text, user_content, assistant_content,
-             user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
-             fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
-             source_batch_id, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (canonical_turn_id) DO UPDATE SET
-                turn_group_number=EXCLUDED.turn_group_number,
-                sort_key=EXCLUDED.sort_key,
-                turn_hash=EXCLUDED.turn_hash,
-                hash_version=EXCLUDED.hash_version,
-                normalized_user_text=EXCLUDED.normalized_user_text,
-                normalized_assistant_text=EXCLUDED.normalized_assistant_text,
-                user_content=EXCLUDED.user_content,
-                assistant_content=EXCLUDED.assistant_content,
-                user_raw_content=EXCLUDED.user_raw_content,
-                assistant_raw_content=EXCLUDED.assistant_raw_content,
-                primary_tag=EXCLUDED.primary_tag,
-                tags_json=EXCLUDED.tags_json,
-                session_date=EXCLUDED.session_date,
-                sender=EXCLUDED.sender,
-                fact_signals_json=EXCLUDED.fact_signals_json,
-                code_refs_json=EXCLUDED.code_refs_json,
-                tagged_at=EXCLUDED.tagged_at,
-                compacted_at=EXCLUDED.compacted_at,
-                last_seen_at=EXCLUDED.last_seen_at,
-                source_batch_id=EXCLUDED.source_batch_id,
-                updated_at=EXCLUDED.updated_at""",
-            (
-                canonical_turn_id,
-                conversation_id,
-                int(turn_group_number),
-                sort_key,
-                turn_hash,
-                hash_version,
-                normalized_user_text,
-                normalized_assistant_text,
-                user_content,
-                assistant_content,
-                user_raw_content,
-                assistant_raw_content,
-                primary_tag or "_general",
-                json.dumps(list(tags or [])),
-                session_date or "",
-                sender or "",
-                json.dumps(fact_signal_payload),
-                json.dumps(list(code_refs or [])),
-                tagged_at,
-                compacted_at,
-                first_seen,
-                last_seen,
-                source_batch_id,
-                created,
-                updated,
-            ),
-        )
+                canonical_turn_id = str(slot_row["canonical_turn_id"]) if slot_row else None
+            existing_sort_key = None
+            if canonical_turn_id:
+                existing = conn.execute(
+                    "SELECT sort_key FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
+                    (conversation_id, canonical_turn_id),
+                ).fetchone()
+                if existing:
+                    existing_sort_key = float(existing["sort_key"])
+            if canonical_turn_id is None:
+                canonical_turn_id = generate_canonical_turn_id()
+            if sort_key is None:
+                if existing_sort_key is not None:
+                    sort_key = existing_sort_key
+                elif turn_number >= 0:
+                    sort_key = float((turn_number + 1) * 1000.0)
+                else:
+                    tail = conn.execute(
+                        "SELECT COALESCE(MAX(sort_key), 0) AS max_sort_key FROM canonical_turns WHERE conversation_id = %s",
+                        (conversation_id,),
+                    ).fetchone()
+                    sort_key = float((tail["max_sort_key"] or 0.0) + 1000.0)
+            conn.execute(
+                """INSERT INTO canonical_turns
+                (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
+                 normalized_user_text, normalized_assistant_text, user_content, assistant_content,
+                 user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
+                 fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
+                 source_batch_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (canonical_turn_id) DO UPDATE SET
+                    turn_group_number=EXCLUDED.turn_group_number,
+                    sort_key=EXCLUDED.sort_key,
+                    turn_hash=EXCLUDED.turn_hash,
+                    hash_version=EXCLUDED.hash_version,
+                    normalized_user_text=EXCLUDED.normalized_user_text,
+                    normalized_assistant_text=EXCLUDED.normalized_assistant_text,
+                    user_content=EXCLUDED.user_content,
+                    assistant_content=EXCLUDED.assistant_content,
+                    user_raw_content=EXCLUDED.user_raw_content,
+                    assistant_raw_content=EXCLUDED.assistant_raw_content,
+                    primary_tag=EXCLUDED.primary_tag,
+                    tags_json=EXCLUDED.tags_json,
+                    session_date=EXCLUDED.session_date,
+                    sender=EXCLUDED.sender,
+                    fact_signals_json=EXCLUDED.fact_signals_json,
+                    code_refs_json=EXCLUDED.code_refs_json,
+                    tagged_at=EXCLUDED.tagged_at,
+                    compacted_at=EXCLUDED.compacted_at,
+                    last_seen_at=EXCLUDED.last_seen_at,
+                    source_batch_id=EXCLUDED.source_batch_id,
+                    updated_at=EXCLUDED.updated_at""",
+                (
+                    canonical_turn_id,
+                    conversation_id,
+                    int(turn_group_number),
+                    sort_key,
+                    turn_hash,
+                    hash_version,
+                    normalized_user_text,
+                    normalized_assistant_text,
+                    user_content,
+                    assistant_content,
+                    user_raw_content,
+                    assistant_raw_content,
+                    primary_tag or "_general",
+                    json.dumps(list(tags or [])),
+                    session_date or "",
+                    sender or "",
+                    json.dumps(fact_signal_payload),
+                    json.dumps(list(code_refs or [])),
+                    tagged_at,
+                    compacted_at,
+                    first_seen,
+                    last_seen,
+                    source_batch_id,
+                    created,
+                    updated,
+                ),
+            )
 
     def recompute_canonical_turn_groups(
         self,
@@ -5280,19 +5275,19 @@ class PostgresStore(ContextStore):
             pending_user_group = -1
             assignments.append((current_group, row.canonical_turn_id))
 
-        conn = self._get_conn()
-        changed = 0
-        for turn_group_number, canonical_turn_id in assignments:
-            cursor = conn.execute(
-                """UPDATE canonical_turns
-                   SET turn_group_number = %s
-                   WHERE conversation_id = %s
-                     AND canonical_turn_id = %s
-                     AND turn_group_number <> %s""",
-                (turn_group_number, conversation_id, canonical_turn_id, turn_group_number),
-            )
-            changed += int(cursor.rowcount or 0)
-        return changed
+        with self.pool.connection() as conn:
+            changed = 0
+            for turn_group_number, canonical_turn_id in assignments:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                       SET turn_group_number = %s
+                       WHERE conversation_id = %s
+                         AND canonical_turn_id = %s
+                         AND turn_group_number <> %s""",
+                    (turn_group_number, conversation_id, canonical_turn_id, turn_group_number),
+                )
+                changed += int(cursor.rowcount or 0)
+            return changed
 
     def get_canonical_turn_rows(
         self,
@@ -5337,15 +5332,15 @@ class PostgresStore(ContextStore):
     ) -> int:
         if not canonical_turn_ids:
             return 0
-        conn = self._get_conn()
-        timestamp = tagged_at or _dt_to_str(datetime.now(timezone.utc))
-        rows = conn.execute(
-            """UPDATE canonical_turns
-               SET tagged_at = %s, updated_at = %s
-               WHERE conversation_id = %s AND canonical_turn_id = ANY(%s)""",
-            (timestamp, timestamp, conversation_id, canonical_turn_ids),
-        )
-        return int(rows.rowcount or 0)
+        with self.pool.connection() as conn:
+            timestamp = tagged_at or _dt_to_str(datetime.now(timezone.utc))
+            rows = conn.execute(
+                """UPDATE canonical_turns
+                   SET tagged_at = %s, updated_at = %s
+                   WHERE conversation_id = %s AND canonical_turn_id = ANY(%s)""",
+                (timestamp, timestamp, conversation_id, canonical_turn_ids),
+            )
+            return int(rows.rowcount or 0)
 
     def iter_untagged_canonical_rows(
         self,
@@ -5372,32 +5367,32 @@ class PostgresStore(ContextStore):
         Ordering uses ``sort_key`` — the same column the partial index is
         sorted on.
         """
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
-                   ct.sort_key, ct.turn_hash, ct.hash_version,
-                   ct.normalized_user_text, ct.normalized_assistant_text,
-                   ct.user_content, ct.assistant_content,
-                   ct.user_raw_content, ct.assistant_raw_content,
-                   ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
-                   ct.fact_signals_json, ct.code_refs_json,
-                   ct.covered_ingestible_entries,
-                   ct.tagged_at, ct.compacted_at,
-                   ct.first_seen_at, ct.last_seen_at,
-                   ct.source_batch_id, ct.created_at, ct.updated_at
-              FROM canonical_turns AS ct
-              JOIN conversations AS c
-                ON c.conversation_id = ct.conversation_id
-             WHERE ct.conversation_id = %s
-               AND ct.tagged_at IS NULL
-               AND c.lifecycle_epoch = %s
-             ORDER BY ct.sort_key ASC
-             LIMIT %s
-            """,
-            (conversation_id, expected_lifecycle_epoch, batch_size),
-        ).fetchall()
-        return [_row_to_canonical_turn(row) for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
+                       ct.sort_key, ct.turn_hash, ct.hash_version,
+                       ct.normalized_user_text, ct.normalized_assistant_text,
+                       ct.user_content, ct.assistant_content,
+                       ct.user_raw_content, ct.assistant_raw_content,
+                       ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                       ct.fact_signals_json, ct.code_refs_json,
+                       ct.covered_ingestible_entries,
+                       ct.tagged_at, ct.compacted_at,
+                       ct.first_seen_at, ct.last_seen_at,
+                       ct.source_batch_id, ct.created_at, ct.updated_at
+                  FROM canonical_turns AS ct
+                  JOIN conversations AS c
+                    ON c.conversation_id = ct.conversation_id
+                 WHERE ct.conversation_id = %s
+                   AND ct.tagged_at IS NULL
+                   AND c.lifecycle_epoch = %s
+                 ORDER BY ct.sort_key ASC
+                 LIMIT %s
+                """,
+                (conversation_id, expected_lifecycle_epoch, batch_size),
+            ).fetchall()
+            return [_row_to_canonical_turn(row) for row in rows]
 
     def mark_canonical_row_tagged(
         self,
@@ -5417,24 +5412,24 @@ class PostgresStore(ContextStore):
         retry on an already-tagged row is ``False`` (no-op).
         """
         now = _dt_to_str(datetime.now(timezone.utc))
-        conn = self._get_conn()
-        cur = conn.execute(
-            """
-            UPDATE canonical_turns
-               SET tagged_at = %s, updated_at = %s
-             WHERE canonical_turn_id = %s
-               AND conversation_id = %s
-               AND tagged_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM conversations c
-                    WHERE c.conversation_id = %s
-                      AND c.lifecycle_epoch = %s
-               )
-            """,
-            (now, now, canonical_turn_id, conversation_id,
-             conversation_id, expected_lifecycle_epoch),
-        )
-        return int(cur.rowcount or 0) == 1
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE canonical_turns
+                   SET tagged_at = %s, updated_at = %s
+                 WHERE canonical_turn_id = %s
+                   AND conversation_id = %s
+                   AND tagged_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM conversations c
+                        WHERE c.conversation_id = %s
+                          AND c.lifecycle_epoch = %s
+                   )
+                """,
+                (now, now, canonical_turn_id, conversation_id,
+                 conversation_id, expected_lifecycle_epoch),
+            )
+            return int(cur.rowcount or 0) == 1
 
     def mark_canonical_turns_compacted(
         self,
@@ -5486,87 +5481,87 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
         )
 
-        conn = self._get_conn()
-        timestamp = compacted_at or _dt_to_str(datetime.now(timezone.utc))
+        with self.pool.connection() as conn:
+            timestamp = compacted_at or _dt_to_str(datetime.now(timezone.utc))
 
-        if guard_all:
-            rows = conn.execute(
-                """UPDATE canonical_turns
-                   SET compacted_at = %s, updated_at = %s,
-                       compaction_operation_id = %s
-                   WHERE conversation_id = %s
-                     AND (
-                         canonical_turn_id = ANY(%s)
-                         OR turn_group_number IN (
-                             SELECT DISTINCT turn_group_number
-                               FROM canonical_turns
-                              WHERE conversation_id = %s
-                                AND canonical_turn_id = ANY(%s)
-                                AND turn_group_number >= 0
+            if guard_all:
+                rows = conn.execute(
+                    """UPDATE canonical_turns
+                       SET compacted_at = %s, updated_at = %s,
+                           compaction_operation_id = %s
+                       WHERE conversation_id = %s
+                         AND (
+                             canonical_turn_id = ANY(%s)
+                             OR turn_group_number IN (
+                                 SELECT DISTINCT turn_group_number
+                                   FROM canonical_turns
+                                  WHERE conversation_id = %s
+                                    AND canonical_turn_id = ANY(%s)
+                                    AND turn_group_number >= 0
+                             )
                          )
-                     )
-                     AND EXISTS (
-                         SELECT 1 FROM compaction_operation
-                          WHERE operation_id = %s
-                            AND conversation_id = %s
-                            AND status = 'running'
-                            AND owner_worker_id = %s
-                            AND lifecycle_epoch = %s
-                     )""",
-                (
-                    timestamp, timestamp, operation_id, conversation_id,
-                    canonical_turn_ids, conversation_id, canonical_turn_ids,
-                    operation_id, conversation_id, owner_worker_id, lifecycle_epoch,
-                ),
-            )
-            if (rows.rowcount or 0) == 0:
-                raise CompactionLeaseLost(
-                    operation_id=operation_id,
-                    write_site="mark_canonical_turns_compacted",
+                         AND EXISTS (
+                             SELECT 1 FROM compaction_operation
+                              WHERE operation_id = %s
+                                AND conversation_id = %s
+                                AND status = 'running'
+                                AND owner_worker_id = %s
+                                AND lifecycle_epoch = %s
+                         )""",
+                    (
+                        timestamp, timestamp, operation_id, conversation_id,
+                        canonical_turn_ids, conversation_id, canonical_turn_ids,
+                        operation_id, conversation_id, owner_worker_id, lifecycle_epoch,
+                    ),
                 )
-            return int(rows.rowcount)
-        else:
-            rows = conn.execute(
-                """UPDATE canonical_turns
-                   SET compacted_at = %s, updated_at = %s
-                   WHERE conversation_id = %s
-                     AND (
-                         canonical_turn_id = ANY(%s)
-                         OR turn_group_number IN (
-                             SELECT DISTINCT turn_group_number
-                               FROM canonical_turns
-                              WHERE conversation_id = %s
-                                AND canonical_turn_id = ANY(%s)
-                                AND turn_group_number >= 0
-                         )
-                     )""",
-                (
-                    timestamp, timestamp, conversation_id,
-                    canonical_turn_ids, conversation_id, canonical_turn_ids,
-                ),
-            )
-            return int(rows.rowcount or 0)
+                if (rows.rowcount or 0) == 0:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="mark_canonical_turns_compacted",
+                    )
+                return int(rows.rowcount)
+            else:
+                rows = conn.execute(
+                    """UPDATE canonical_turns
+                       SET compacted_at = %s, updated_at = %s
+                       WHERE conversation_id = %s
+                         AND (
+                             canonical_turn_id = ANY(%s)
+                             OR turn_group_number IN (
+                                 SELECT DISTINCT turn_group_number
+                                   FROM canonical_turns
+                                  WHERE conversation_id = %s
+                                    AND canonical_turn_id = ANY(%s)
+                                    AND turn_group_number >= 0
+                             )
+                         )""",
+                    (
+                        timestamp, timestamp, conversation_id,
+                        canonical_turn_ids, conversation_id, canonical_turn_ids,
+                    ),
+                )
+                return int(rows.rowcount or 0)
 
     def delete_canonical_turns(
         self,
         conversation_id: str,
         turn_number: int | None = None,
     ) -> int:
-        conn = self._get_conn()
-        if turn_number is None:
-            cur = conn.execute(
-                "DELETE FROM canonical_turns WHERE conversation_id = %s",
-                (conversation_id,),
-            )
-        else:
-            canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
-            if canonical_turn_id is None:
-                return 0
-            cur = conn.execute(
-                "DELETE FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
-                (conversation_id, canonical_turn_id),
-            )
-        return int(cur.rowcount or 0)
+        with self.pool.connection() as conn:
+            if turn_number is None:
+                cur = conn.execute(
+                    "DELETE FROM canonical_turns WHERE conversation_id = %s",
+                    (conversation_id,),
+                )
+            else:
+                canonical_turn_id = self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
+                if canonical_turn_id is None:
+                    return 0
+                cur = conn.execute(
+                    "DELETE FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
+                    (conversation_id, canonical_turn_id),
+                )
+            return int(cur.rowcount or 0)
 
     def delete_canonical_turns_by_batch_id(
         self,
@@ -5577,84 +5572,84 @@ class PostgresStore(ContextStore):
         """Delete rows from ``canonical_turns`` matching both ``conversation_id``
         AND ``source_batch_id``. Used by ``IngestReconciler`` for commit-time
         rollback on epoch race. Returns rows deleted."""
-        conn = self._get_conn()
-        cur = conn.execute(
-            "DELETE FROM canonical_turns WHERE conversation_id = %s AND source_batch_id = %s",
-            (conversation_id, batch_id),
-        )
-        return int(cur.rowcount or 0)
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM canonical_turns WHERE conversation_id = %s AND source_batch_id = %s",
+                (conversation_id, batch_id),
+            )
+            return int(cur.rowcount or 0)
 
     def replace_canonical_turn_anchors(
         self,
         conversation_id: str,
         anchors: list[tuple[int, str, str]],
     ) -> int:
-        conn = self._get_conn()
-        conn.execute(
-            "DELETE FROM canonical_turn_anchors WHERE conversation_id = %s",
-            (conversation_id,),
-        )
-        rows = [
-            (conversation_id, anchor_hash, start_turn_id, int(window_size))
-            for window_size, anchor_hash, start_turn_id in anchors
-            if anchor_hash and start_turn_id
-        ]
-        if not rows:
-            return 0
-        with conn.cursor() as cur:
-            cur.executemany(
-                """INSERT INTO canonical_turn_anchors
-                   (conversation_id, anchor_hash, start_turn_id, window_size)
-                   VALUES (%s, %s, %s, %s)""",
-                rows,
+        with self.pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM canonical_turn_anchors WHERE conversation_id = %s",
+                (conversation_id,),
             )
-        return len(rows)
+            rows = [
+                (conversation_id, anchor_hash, start_turn_id, int(window_size))
+                for window_size, anchor_hash, start_turn_id in anchors
+                if anchor_hash and start_turn_id
+            ]
+            if not rows:
+                return 0
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO canonical_turn_anchors
+                       (conversation_id, anchor_hash, start_turn_id, window_size)
+                       VALUES (%s, %s, %s, %s)""",
+                    rows,
+                )
+            return len(rows)
 
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,
         window_size: int,
     ) -> dict[str, list[int]]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT cta.anchor_hash, cto.turn_number
-               FROM canonical_turn_anchors cta
-               JOIN canonical_turns_ordinal cto
-                 ON cto.conversation_id = cta.conversation_id
-                AND cto.canonical_turn_id = cta.start_turn_id
-               WHERE cta.conversation_id = %s
-                 AND cta.window_size = %s
-               ORDER BY cto.turn_number""",
-            (conversation_id, int(window_size)),
-        ).fetchall()
-        anchors: dict[str, list[int]] = {}
-        for row in rows:
-            digest = str(row["anchor_hash"] or "")
-            if not digest:
-                continue
-            anchors.setdefault(digest, []).append(int(row["turn_number"]))
-        return anchors
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT cta.anchor_hash, cto.turn_number
+                   FROM canonical_turn_anchors cta
+                   JOIN canonical_turns_ordinal cto
+                     ON cto.conversation_id = cta.conversation_id
+                    AND cto.canonical_turn_id = cta.start_turn_id
+                   WHERE cta.conversation_id = %s
+                     AND cta.window_size = %s
+                   ORDER BY cto.turn_number""",
+                (conversation_id, int(window_size)),
+            ).fetchall()
+            anchors: dict[str, list[int]] = {}
+            for row in rows:
+                digest = str(row["anchor_hash"] or "")
+                if not digest:
+                    continue
+                anchors.setdefault(digest, []).append(int(row["turn_number"]))
+            return anchors
 
     def search_tag_summaries_fts(
         self, query: str, limit: int = 20, conversation_id: str | None = None,
     ) -> list[tuple[str, float]]:
-        conn = self._get_conn()
-        tsquery = " & ".join(query.split()[:10])
-        try:
-            sql = """SELECT ts.tag,
-                    ts_rank(to_tsvector('english', ts.summary), to_tsquery('english', %s)) as score
-                FROM tag_summaries ts
-                WHERE to_tsvector('english', ts.summary) @@ to_tsquery('english', %s)"""
-            params: list = [tsquery, tsquery]
-            if conversation_id is not None:
-                sql += " AND ts.conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY score DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-            return [(row["tag"], float(row["score"])) for row in rows]
-        except Exception:
-            return []
+        with self.pool.connection() as conn:
+            tsquery = " & ".join(query.split()[:10])
+            try:
+                sql = """SELECT ts.tag,
+                        ts_rank(to_tsvector('english', ts.summary), to_tsquery('english', %s)) as score
+                    FROM tag_summaries ts
+                    WHERE to_tsvector('english', ts.summary) @@ to_tsquery('english', %s)"""
+                params: list = [tsquery, tsquery]
+                if conversation_id is not None:
+                    sql += " AND ts.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " ORDER BY score DESC LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+                return [(row["tag"], float(row["score"])) for row in rows]
+            except Exception:
+                return []
 
     def store_tag_summary_embedding(
         self,
@@ -5674,91 +5669,91 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
         )
 
-        conn = self._get_conn()
-        with conn.transaction():
-            if guard_all:
-                # INSERT-SELECT form: writes zero rows if the compaction_operation
-                # row no longer matches (status != 'running', owner mismatch, etc).
-                # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
-                # a row candidate — i.e., when the guard passes.
-                cur = conn.execute(
-                    """INSERT INTO tag_summary_embeddings
-                    (tag, conversation_id, embedding_json, operation_id)
-                    SELECT %s,%s,%s,%s
-                      FROM compaction_operation
-                     WHERE operation_id = %s
-                       AND conversation_id = %s
-                       AND status = 'running'
-                       AND owner_worker_id = %s
-                       AND lifecycle_epoch = %s
-                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
-                        embedding_json = EXCLUDED.embedding_json,
-                        operation_id = EXCLUDED.operation_id""",
-                    (
-                        tag, conversation_id, json.dumps(embedding), operation_id,
-                        # WHERE clause params:
-                        operation_id, conversation_id,
-                        owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
-                        operation_id=operation_id,
-                        write_site="store_tag_summary_embedding",
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the compaction_operation
+                    # row no longer matches (status != 'running', owner mismatch, etc).
+                    # The ON CONFLICT DO UPDATE clause only fires when the SELECT produces
+                    # a row candidate — i.e., when the guard passes.
+                    cur = conn.execute(
+                        """INSERT INTO tag_summary_embeddings
+                        (tag, conversation_id, embedding_json, operation_id)
+                        SELECT %s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                            embedding_json = EXCLUDED.embedding_json,
+                            operation_id = EXCLUDED.operation_id""",
+                        (
+                            tag, conversation_id, json.dumps(embedding), operation_id,
+                            # WHERE clause params:
+                            operation_id, conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
                     )
-            else:
-                # Legacy unconditional path — existing callers and test harnesses.
-                conn.execute(
-                    """INSERT INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
-                        embedding_json = EXCLUDED.embedding_json""",
-                    (tag, conversation_id, json.dumps(embedding)),
-                )
+                    if (cur.rowcount or 0) == 0:
+                        raise CompactionLeaseLost(
+                            operation_id=operation_id,
+                            write_site="store_tag_summary_embedding",
+                        )
+                else:
+                    # Legacy unconditional path — existing callers and test harnesses.
+                    conn.execute(
+                        """INSERT INTO tag_summary_embeddings (tag, conversation_id, embedding_json)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                            embedding_json = EXCLUDED.embedding_json""",
+                        (tag, conversation_id, json.dumps(embedding)),
+                    )
 
     def load_tag_summary_embeddings(
         self, conversation_id: str | None = None,
     ) -> dict[str, list[float]]:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            rows = conn.execute(
-                "SELECT tag, embedding_json FROM tag_summary_embeddings WHERE conversation_id = %s",
-                (conversation_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT tag, embedding_json FROM tag_summary_embeddings").fetchall()
-        result = {}
-        for row in rows:
-            try:
-                result[row["tag"]] = json.loads(row["embedding_json"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return result
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                rows = conn.execute(
+                    "SELECT tag, embedding_json FROM tag_summary_embeddings WHERE conversation_id = %s",
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT tag, embedding_json FROM tag_summary_embeddings").fetchall()
+            result = {}
+            for row in rows:
+                try:
+                    result[row["tag"]] = json.loads(row["embedding_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
 
     def get_actionable_fact_tags(
         self, tags: list[str], conversation_id: str | None = None,
     ) -> set[str]:
         if not tags:
             return set()
-        conn = self._get_conn()
-        placeholders = ",".join("%s" for _ in tags)
-        params: list = list(tags)
-        conv_clause = ""
-        if conversation_id is not None:
-            conv_clause = " AND f.conversation_id = %s"
-            params.append(conversation_id)
-        try:
-            rows = conn.execute(
-                f"""SELECT DISTINCT ft.tag FROM fact_tags ft
-                JOIN facts f ON f.id = ft.fact_id
-                WHERE ft.tag IN ({placeholders})
-                AND f.superseded_by IS NULL
-                AND (f.status IN ('active', 'completed') OR f.fact_type = 'personal'){conv_clause}""",
-                params,
-            ).fetchall()
-            return {row["tag"] for row in rows}
-        except Exception:
-            return set()
+        with self.pool.connection() as conn:
+            placeholders = ",".join("%s" for _ in tags)
+            params: list = list(tags)
+            conv_clause = ""
+            if conversation_id is not None:
+                conv_clause = " AND f.conversation_id = %s"
+                params.append(conversation_id)
+            try:
+                rows = conn.execute(
+                    f"""SELECT DISTINCT ft.tag FROM fact_tags ft
+                    JOIN facts f ON f.id = ft.fact_id
+                    WHERE ft.tag IN ({placeholders})
+                    AND f.superseded_by IS NULL
+                    AND (f.status IN ('active', 'completed') OR f.fact_type = 'personal'){conv_clause}""",
+                    params,
+                ).fetchall()
+                return {row["tag"] for row in rows}
+            except Exception:
+                return set()
 
     # ------------------------------------------------------------------
     # FactStore
@@ -5782,78 +5777,78 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
         )
 
-        conn = self._get_conn()
-        count = 0
-        with conn.transaction():
-            for fact in facts:
-                if guard_all:
-                    # INSERT-SELECT form: writes zero rows if the
-                    # compaction_operation row no longer matches
-                    # (status != 'running', owner mismatch, epoch mismatch).
-                    cur = conn.execute(
-                        """INSERT INTO facts
-                        (id, subject, verb, object, status, what, who, when_date, "where", why,
-                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                         mentioned_at, session_date, superseded_by)
-                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                          FROM compaction_operation
-                         WHERE operation_id = %s
-                           AND conversation_id = %s
-                           AND status = 'running'
-                           AND owner_worker_id = %s
-                           AND lifecycle_epoch = %s
-                        ON CONFLICT (id) DO UPDATE SET
-                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
-                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
-                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
-                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
-                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
-                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
-                        (
-                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
-                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
-                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
-                            fact.conversation_id, json.dumps(fact.turn_numbers),
-                            _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
-                            # WHERE clause params:
-                            operation_id, fact.conversation_id,
-                            owner_worker_id, lifecycle_epoch,
-                        ),
-                    )
-                    if (cur.rowcount or 0) == 0:
-                        raise CompactionLeaseLost(
-                            operation_id=operation_id,
-                            write_site="store_facts",
+        with self.pool.connection() as conn:
+            count = 0
+            with conn.transaction():
+                for fact in facts:
+                    if guard_all:
+                        # INSERT-SELECT form: writes zero rows if the
+                        # compaction_operation row no longer matches
+                        # (status != 'running', owner mismatch, epoch mismatch).
+                        cur = conn.execute(
+                            """INSERT INTO facts
+                            (id, subject, verb, object, status, what, who, when_date, "where", why,
+                             fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                             mentioned_at, session_date, superseded_by)
+                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                              FROM compaction_operation
+                             WHERE operation_id = %s
+                               AND conversation_id = %s
+                               AND status = 'running'
+                               AND owner_worker_id = %s
+                               AND lifecycle_epoch = %s
+                            ON CONFLICT (id) DO UPDATE SET
+                                subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                                status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                                when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                                fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                                segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                                turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                            (
+                                fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                                fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                                fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                                fact.conversation_id, json.dumps(fact.turn_numbers),
+                                _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                                # WHERE clause params:
+                                operation_id, fact.conversation_id,
+                                owner_worker_id, lifecycle_epoch,
+                            ),
                         )
-                else:
-                    # Legacy unconditional path — existing callers and
-                    # non-compaction write sites.
-                    conn.execute(
-                        """INSERT INTO facts
-                        (id, subject, verb, object, status, what, who, when_date, "where", why,
-                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                         mentioned_at, session_date, superseded_by)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
-                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
-                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
-                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
-                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
-                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
-                        (fact.id, fact.subject, fact.verb, fact.object, fact.status,
-                         fact.what, fact.who, fact.when_date, fact.where, fact.why,
-                         fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
-                         fact.conversation_id, json.dumps(fact.turn_numbers),
-                         _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
-                    )
-                conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
-                for tag in fact.tags:
-                    conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
-                count += 1
-        return count
+                        if (cur.rowcount or 0) == 0:
+                            raise CompactionLeaseLost(
+                                operation_id=operation_id,
+                                write_site="store_facts",
+                            )
+                    else:
+                        # Legacy unconditional path — existing callers and
+                        # non-compaction write sites.
+                        conn.execute(
+                            """INSERT INTO facts
+                            (id, subject, verb, object, status, what, who, when_date, "where", why,
+                             fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                             mentioned_at, session_date, superseded_by)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                                status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                                when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                                fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                                segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                                turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                            (fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                             fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                             fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                             fact.conversation_id, json.dumps(fact.turn_numbers),
+                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                        )
+                    conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
+                    for tag in fact.tags:
+                        conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
+                    count += 1
+            return count
 
     def query_facts(
         self, *, subject: str | None = None, verb: str | None = None,
@@ -5862,67 +5857,67 @@ class PostgresStore(ContextStore):
         tags: list[str] | None = None, limit: int = 50,
         conversation_id: str | None = None,
     ) -> list[Fact]:
-        conn = self._get_conn()
-        conditions: list[str] = []
-        params: list = []
+        with self.pool.connection() as conn:
+            conditions: list[str] = []
+            params: list = []
 
-        if conversation_id is not None:
-            conditions.append("f.conversation_id = %s")
-            params.append(conversation_id)
-        if subject:
-            conditions.append("f.subject = %s")
-            params.append(subject)
-        if verbs is not None:
-            like_clauses = [f"f.verb ILIKE %s" for _ in verbs]
-            conditions.append("(" + " OR ".join(like_clauses) + ")")
-            params.extend(f"%{_escape_like(v)}%" for v in verbs)
-        elif verb is not None:
-            conditions.append("f.verb ILIKE %s")
-            params.append(f"%{_escape_like(verb)}%")
-        if object_contains:
-            conditions.append("f.object ILIKE %s")
-            params.append(f"%{_escape_like(object_contains)}%")
-        if status:
-            conditions.append("f.status = %s")
-            params.append(status)
-        if fact_type:
-            conditions.append("f.fact_type = %s")
-            params.append(fact_type)
-        conditions.append("f.superseded_by IS NULL")
+            if conversation_id is not None:
+                conditions.append("f.conversation_id = %s")
+                params.append(conversation_id)
+            if subject:
+                conditions.append("f.subject = %s")
+                params.append(subject)
+            if verbs is not None:
+                like_clauses = [f"f.verb ILIKE %s" for _ in verbs]
+                conditions.append("(" + " OR ".join(like_clauses) + ")")
+                params.extend(f"%{_escape_like(v)}%" for v in verbs)
+            elif verb is not None:
+                conditions.append("f.verb ILIKE %s")
+                params.append(f"%{_escape_like(verb)}%")
+            if object_contains:
+                conditions.append("f.object ILIKE %s")
+                params.append(f"%{_escape_like(object_contains)}%")
+            if status:
+                conditions.append("f.status = %s")
+                params.append(status)
+            if fact_type:
+                conditions.append("f.fact_type = %s")
+                params.append(fact_type)
+            conditions.append("f.superseded_by IS NULL")
 
-        if tags:
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            sql = f"""
-                SELECT DISTINCT f.* FROM facts f
-                JOIN fact_tags ft ON f.id = ft.fact_id
-                WHERE ft.tag = ANY(%s) AND {where}
-                ORDER BY f.mentioned_at DESC LIMIT %s
-            """
-            params_list = [tags] + params + [limit]
-            rows = conn.execute(sql, params_list).fetchall()
-        else:
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            sql = f"SELECT * FROM facts f WHERE {where} ORDER BY f.mentioned_at DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
+            if tags:
+                where = " AND ".join(conditions) if conditions else "TRUE"
+                sql = f"""
+                    SELECT DISTINCT f.* FROM facts f
+                    JOIN fact_tags ft ON f.id = ft.fact_id
+                    WHERE ft.tag = ANY(%s) AND {where}
+                    ORDER BY f.mentioned_at DESC LIMIT %s
+                """
+                params_list = [tags] + params + [limit]
+                rows = conn.execute(sql, params_list).fetchall()
+            else:
+                where = " AND ".join(conditions) if conditions else "TRUE"
+                sql = f"SELECT * FROM facts f WHERE {where} ORDER BY f.mentioned_at DESC LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
 
-        return [self._row_to_fact(row) for row in rows]
+            return [self._row_to_fact(row) for row in rows]
 
     def get_unique_fact_verbs(self, *, conversation_id: str | None = None) -> list[str]:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            rows = conn.execute(
-                "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL AND conversation_id = %s",
-                (conversation_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL").fetchall()
-        return [row["verb"] for row in rows]
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                rows = conn.execute(
+                    "SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL AND conversation_id = %s",
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT DISTINCT verb FROM facts WHERE verb != '' AND superseded_by IS NULL").fetchall()
+            return [row["verb"] for row in rows]
 
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
-        conn = self._get_conn()
-        rows = conn.execute("SELECT * FROM facts WHERE segment_ref = %s ORDER BY mentioned_at", (segment_ref,)).fetchall()
-        return [self._row_to_fact(row) for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM facts WHERE segment_ref = %s ORDER BY mentioned_at", (segment_ref,)).fetchall()
+            return [self._row_to_fact(row) for row in rows]
 
     def replace_facts_for_segment(
         self,
@@ -5956,157 +5951,157 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
         )
 
-        conn = self._get_conn()
-        with conn.transaction():
-            if guard_all:
-                # Probe ownership BEFORE the DELETE.
-                row = conn.execute(
-                    """SELECT 1 FROM compaction_operation
-                       WHERE operation_id = %s
-                         AND conversation_id = %s
-                         AND status = 'running'
-                         AND owner_worker_id = %s
-                         AND lifecycle_epoch = %s""",
-                    (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
-                ).fetchone()
-                if row is None:
-                    raise CompactionLeaseLost(
-                        operation_id=operation_id,
-                        write_site="replace_facts_for_segment",
-                    )
-
-            result = conn.execute(
-                "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
-                (conversation_id, segment_ref),
-            )
-            deleted = result.rowcount
-
-            # INSERT new facts inline within the same transaction.
-            count = 0
-            for fact in facts:
+        with self.pool.connection() as conn:
+            with conn.transaction():
                 if guard_all:
-                    cur = conn.execute(
-                        """INSERT INTO facts
-                        (id, subject, verb, object, status, what, who, when_date, "where", why,
-                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                         mentioned_at, session_date, superseded_by)
-                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                          FROM compaction_operation
-                         WHERE operation_id = %s
-                           AND conversation_id = %s
-                           AND status = 'running'
-                           AND owner_worker_id = %s
-                           AND lifecycle_epoch = %s
-                        ON CONFLICT (id) DO UPDATE SET
-                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
-                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
-                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
-                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
-                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
-                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
-                        (
-                            fact.id, fact.subject, fact.verb, fact.object, fact.status,
-                            fact.what, fact.who, fact.when_date, fact.where, fact.why,
-                            fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
-                            fact.conversation_id, json.dumps(fact.turn_numbers),
-                            _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
-                            # WHERE clause params:
-                            operation_id, fact.conversation_id,
-                            owner_worker_id, lifecycle_epoch,
-                        ),
-                    )
-                    if (cur.rowcount or 0) == 0:
+                    # Probe ownership BEFORE the DELETE.
+                    row = conn.execute(
+                        """SELECT 1 FROM compaction_operation
+                           WHERE operation_id = %s
+                             AND conversation_id = %s
+                             AND status = 'running'
+                             AND owner_worker_id = %s
+                             AND lifecycle_epoch = %s""",
+                        (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
+                    ).fetchone()
+                    if row is None:
                         raise CompactionLeaseLost(
                             operation_id=operation_id,
                             write_site="replace_facts_for_segment",
                         )
-                else:
-                    conn.execute(
-                        """INSERT INTO facts
-                        (id, subject, verb, object, status, what, who, when_date, "where", why,
-                         fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                         mentioned_at, session_date, superseded_by)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
-                            status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
-                            when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
-                            fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
-                            segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
-                            turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                            session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
-                        (fact.id, fact.subject, fact.verb, fact.object, fact.status,
-                         fact.what, fact.who, fact.when_date, fact.where, fact.why,
-                         fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
-                         fact.conversation_id, json.dumps(fact.turn_numbers),
-                         _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
-                    )
-                conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
-                for tag in fact.tags:
-                    conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
-                count += 1
 
-        return deleted, count
+                result = conn.execute(
+                    "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
+                    (conversation_id, segment_ref),
+                )
+                deleted = result.rowcount
+
+                # INSERT new facts inline within the same transaction.
+                count = 0
+                for fact in facts:
+                    if guard_all:
+                        cur = conn.execute(
+                            """INSERT INTO facts
+                            (id, subject, verb, object, status, what, who, when_date, "where", why,
+                             fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                             mentioned_at, session_date, superseded_by)
+                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                              FROM compaction_operation
+                             WHERE operation_id = %s
+                               AND conversation_id = %s
+                               AND status = 'running'
+                               AND owner_worker_id = %s
+                               AND lifecycle_epoch = %s
+                            ON CONFLICT (id) DO UPDATE SET
+                                subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                                status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                                when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                                fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                                segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                                turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                            (
+                                fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                                fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                                fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                                fact.conversation_id, json.dumps(fact.turn_numbers),
+                                _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                                # WHERE clause params:
+                                operation_id, fact.conversation_id,
+                                owner_worker_id, lifecycle_epoch,
+                            ),
+                        )
+                        if (cur.rowcount or 0) == 0:
+                            raise CompactionLeaseLost(
+                                operation_id=operation_id,
+                                write_site="replace_facts_for_segment",
+                            )
+                    else:
+                        conn.execute(
+                            """INSERT INTO facts
+                            (id, subject, verb, object, status, what, who, when_date, "where", why,
+                             fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
+                             mentioned_at, session_date, superseded_by)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
+                                status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
+                                when_date=EXCLUDED.when_date, "where"=EXCLUDED."where", why=EXCLUDED.why,
+                                fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
+                                segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
+                                turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                            (fact.id, fact.subject, fact.verb, fact.object, fact.status,
+                             fact.what, fact.who, fact.when_date, fact.where, fact.why,
+                             fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
+                             fact.conversation_id, json.dumps(fact.turn_numbers),
+                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                        )
+                    conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
+                    for tag in fact.tags:
+                        conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
+                    count += 1
+
+            return deleted, count
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
-        conn = self._get_conn()
-        tsquery = " & ".join(query.split())
-        try:
-            sql = """SELECT f.* FROM facts f
-                WHERE f.facts_tsv @@ to_tsquery('english', %s) AND f.superseded_by IS NULL"""
-            params: list = [tsquery]
-            if conversation_id is not None:
-                sql += " AND f.conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY ts_rank(f.facts_tsv, to_tsquery('english', %s)) DESC LIMIT %s"
-            params.extend([tsquery, limit])
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            like = f"%{query}%"
-            sql = """SELECT * FROM facts f
-                WHERE (f.subject ILIKE %s OR f.verb ILIKE %s OR f.object ILIKE %s OR f.what ILIKE %s)
-                AND f.superseded_by IS NULL"""
-            params = [like, like, like, like]
-            if conversation_id is not None:
-                sql += " AND f.conversation_id = %s"
-                params.append(conversation_id)
-            sql += " ORDER BY f.mentioned_at DESC LIMIT %s"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_fact(row) for row in rows]
+        with self.pool.connection() as conn:
+            tsquery = " & ".join(query.split())
+            try:
+                sql = """SELECT f.* FROM facts f
+                    WHERE f.facts_tsv @@ to_tsquery('english', %s) AND f.superseded_by IS NULL"""
+                params: list = [tsquery]
+                if conversation_id is not None:
+                    sql += " AND f.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " ORDER BY ts_rank(f.facts_tsv, to_tsquery('english', %s)) DESC LIMIT %s"
+                params.extend([tsquery, limit])
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:
+                like = f"%{query}%"
+                sql = """SELECT * FROM facts f
+                    WHERE (f.subject ILIKE %s OR f.verb ILIKE %s OR f.object ILIKE %s OR f.what ILIKE %s)
+                    AND f.superseded_by IS NULL"""
+                params = [like, like, like, like]
+                if conversation_id is not None:
+                    sql += " AND f.conversation_id = %s"
+                    params.append(conversation_id)
+                sql += " ORDER BY f.mentioned_at DESC LIMIT %s"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_fact(row) for row in rows]
 
     def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute("UPDATE facts SET superseded_by = %s WHERE id = %s", (new_fact_id, old_fact_id))
+        with self.pool.connection() as conn:
+            conn.execute("UPDATE facts SET superseded_by = %s WHERE id = %s", (new_fact_id, old_fact_id))
 
     def update_fact_fields(self, fact_id: str, verb: str, object: str, status: str, what: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
-            (verb, object, status, what, fact_id),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
+                (verb, object, status, what, fact_id),
+            )
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
-        conn = self._get_conn()
-        if conversation_id is not None:
-            rows = conn.execute(
-                "SELECT ft.tag, COUNT(*) as cnt FROM fact_tags ft JOIN facts f ON f.id = ft.fact_id WHERE f.conversation_id = %s GROUP BY ft.tag",
-                (conversation_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag").fetchall()
-        return {row["tag"]: row["cnt"] for row in rows}
+        with self.pool.connection() as conn:
+            if conversation_id is not None:
+                rows = conn.execute(
+                    "SELECT ft.tag, COUNT(*) as cnt FROM fact_tags ft JOIN facts f ON f.id = ft.fact_id WHERE f.conversation_id = %s GROUP BY ft.tag",
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT tag, COUNT(*) as cnt FROM fact_tags GROUP BY tag").fetchall()
+            return {row["tag"]: row["cnt"] for row in rows}
 
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]:
         if not fact_ids:
             return []
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT superseded_by, subject, verb, object FROM facts WHERE superseded_by = ANY(%s)",
-            (fact_ids,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT superseded_by, subject, verb, object FROM facts WHERE superseded_by = ANY(%s)",
+                (fact_ids,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def query_experience_facts_by_date(
         self,
@@ -6115,17 +6110,17 @@ class PostgresStore(ContextStore):
         limit: int = 50,
         conversation_id: str | None = None,
     ) -> list[Fact]:
-        conn = self._get_conn()
-        sql = """SELECT * FROM facts
-                 WHERE when_date >= %s AND when_date <= %s"""
-        params: list = [start_date, end_date + "~"]
-        if conversation_id:
-            sql += " AND conversation_id = %s"
-            params.append(conversation_id)
-        sql += " ORDER BY when_date ASC LIMIT %s"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_fact(row) for row in rows]
+        with self.pool.connection() as conn:
+            sql = """SELECT * FROM facts
+                     WHERE when_date >= %s AND when_date <= %s"""
+            params: list = [start_date, end_date + "~"]
+            if conversation_id:
+                sql += " AND conversation_id = %s"
+                params.append(conversation_id)
+            sql += " ORDER BY when_date ASC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_fact(row) for row in rows]
 
     # ------------------------------------------------------------------
     # FactLinkStore
@@ -6134,124 +6129,124 @@ class PostgresStore(ContextStore):
     def store_fact_links(self, links: list[FactLink]) -> int:
         if not links:
             return 0
-        conn = self._get_conn()
-        count = 0
-        with conn.transaction():
-            for link in links:
-                conn.execute(
-                    """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,
-                       confidence, context, created_at, created_by)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        source_fact_id=EXCLUDED.source_fact_id, target_fact_id=EXCLUDED.target_fact_id,
-                        relation_type=EXCLUDED.relation_type, confidence=EXCLUDED.confidence,
-                        context=EXCLUDED.context""",
-                    (link.id, link.source_fact_id, link.target_fact_id, link.relation_type,
-                     link.confidence, link.context, _dt_to_str(link.created_at), link.created_by),
-                )
-                count += 1
-        return count
+        with self.pool.connection() as conn:
+            count = 0
+            with conn.transaction():
+                for link in links:
+                    conn.execute(
+                        """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,
+                           confidence, context, created_at, created_by)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            source_fact_id=EXCLUDED.source_fact_id, target_fact_id=EXCLUDED.target_fact_id,
+                            relation_type=EXCLUDED.relation_type, confidence=EXCLUDED.confidence,
+                            context=EXCLUDED.context""",
+                        (link.id, link.source_fact_id, link.target_fact_id, link.relation_type,
+                         link.confidence, link.context, _dt_to_str(link.created_at), link.created_by),
+                    )
+                    count += 1
+            return count
 
     def get_fact_links(self, fact_id: str, direction: str = "both") -> list[FactLink]:
-        conn = self._get_conn()
-        if direction == "outgoing":
-            rows = conn.execute("SELECT * FROM fact_links WHERE source_fact_id = %s", (fact_id,)).fetchall()
-        elif direction == "incoming":
-            rows = conn.execute("SELECT * FROM fact_links WHERE target_fact_id = %s", (fact_id,)).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM fact_links WHERE source_fact_id = %s OR target_fact_id = %s",
-                (fact_id, fact_id),
-            ).fetchall()
-        return [self._row_to_fact_link(row) for row in rows]
+        with self.pool.connection() as conn:
+            if direction == "outgoing":
+                rows = conn.execute("SELECT * FROM fact_links WHERE source_fact_id = %s", (fact_id,)).fetchall()
+            elif direction == "incoming":
+                rows = conn.execute("SELECT * FROM fact_links WHERE target_fact_id = %s", (fact_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM fact_links WHERE source_fact_id = %s OR target_fact_id = %s",
+                    (fact_id, fact_id),
+                ).fetchall()
+            return [self._row_to_fact_link(row) for row in rows]
 
     def get_linked_facts(self, fact_ids: list[str], depth: int = 1) -> list[LinkedFact]:
         if not fact_ids:
             return []
-        conn = self._get_conn()
-        visited = set(fact_ids)
-        result: list[LinkedFact] = []
-        current_layer = set(fact_ids)
+        with self.pool.connection() as conn:
+            visited = set(fact_ids)
+            result: list[LinkedFact] = []
+            current_layer = set(fact_ids)
 
-        for _hop in range(depth):
-            if not current_layer:
-                break
-            layer_list = list(current_layer)
-            visited_list = list(visited)
-            rows = conn.execute(
-                """SELECT fl.source_fact_id, fl.target_fact_id, fl.relation_type, fl.confidence, fl.context,
-                    f.id AS fact_id, f.subject, f.verb, f.object, f.status, f.what, f.who,
-                    f.when_date, f."where", f.why, f.fact_type, f.tags_json, f.segment_ref,
-                    f.conversation_id, f.turn_numbers_json, f.mentioned_at, f.session_date, f.superseded_by
-                FROM fact_links fl
-                JOIN facts f ON (
-                    (fl.source_fact_id = ANY(%s) AND f.id = fl.target_fact_id)
-                    OR (fl.target_fact_id = ANY(%s) AND f.id = fl.source_fact_id)
-                )
-                WHERE f.superseded_by IS NULL
-                AND f.id != ALL(%s)""",
-                (layer_list, layer_list, visited_list),
-            ).fetchall()
+            for _hop in range(depth):
+                if not current_layer:
+                    break
+                layer_list = list(current_layer)
+                visited_list = list(visited)
+                rows = conn.execute(
+                    """SELECT fl.source_fact_id, fl.target_fact_id, fl.relation_type, fl.confidence, fl.context,
+                        f.id AS fact_id, f.subject, f.verb, f.object, f.status, f.what, f.who,
+                        f.when_date, f."where", f.why, f.fact_type, f.tags_json, f.segment_ref,
+                        f.conversation_id, f.turn_numbers_json, f.mentioned_at, f.session_date, f.superseded_by
+                    FROM fact_links fl
+                    JOIN facts f ON (
+                        (fl.source_fact_id = ANY(%s) AND f.id = fl.target_fact_id)
+                        OR (fl.target_fact_id = ANY(%s) AND f.id = fl.source_fact_id)
+                    )
+                    WHERE f.superseded_by IS NULL
+                    AND f.id != ALL(%s)""",
+                    (layer_list, layer_list, visited_list),
+                ).fetchall()
 
-            next_layer: set[str] = set()
-            for row in rows:
-                fact = Fact(
-                    id=row["fact_id"], subject=row["subject"], verb=row["verb"],
-                    object=row["object"], status=row["status"], what=row["what"],
-                    who=row["who"], when_date=row["when_date"], where=row["where"],
-                    why=row["why"], fact_type=row.get("fact_type", "personal"),
-                    tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
-                    segment_ref=row["segment_ref"], conversation_id=row["conversation_id"],
-                    turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
-                    mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
-                    session_date=row.get("session_date", ""), superseded_by=row["superseded_by"],
-                )
-                src = row["source_fact_id"]
-                tgt = row["target_fact_id"]
-                linked_from = src if src in current_layer else tgt
-                result.append(LinkedFact(
-                    fact=fact, linked_from_fact_id=linked_from,
-                    relation_type=row["relation_type"], confidence=row["confidence"],
-                    link_context=row["context"],
-                ))
-                visited.add(fact.id)
-                next_layer.add(fact.id)
-            current_layer = next_layer
+                next_layer: set[str] = set()
+                for row in rows:
+                    fact = Fact(
+                        id=row["fact_id"], subject=row["subject"], verb=row["verb"],
+                        object=row["object"], status=row["status"], what=row["what"],
+                        who=row["who"], when_date=row["when_date"], where=row["where"],
+                        why=row["why"], fact_type=row.get("fact_type", "personal"),
+                        tags=json.loads(row["tags_json"]) if row["tags_json"] else [],
+                        segment_ref=row["segment_ref"], conversation_id=row["conversation_id"],
+                        turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
+                        mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
+                        session_date=row.get("session_date", ""), superseded_by=row["superseded_by"],
+                    )
+                    src = row["source_fact_id"]
+                    tgt = row["target_fact_id"]
+                    linked_from = src if src in current_layer else tgt
+                    result.append(LinkedFact(
+                        fact=fact, linked_from_fact_id=linked_from,
+                        relation_type=row["relation_type"], confidence=row["confidence"],
+                        link_context=row["context"],
+                    ))
+                    visited.add(fact.id)
+                    next_layer.add(fact.id)
+                current_layer = next_layer
 
-        return result
+            return result
 
     def delete_fact_links(self, fact_id: str) -> int:
-        conn = self._get_conn()
-        cur = conn.execute(
-            "DELETE FROM fact_links WHERE source_fact_id = %s OR target_fact_id = %s",
-            (fact_id, fact_id),
-        )
-        return cur.rowcount
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM fact_links WHERE source_fact_id = %s OR target_fact_id = %s",
+                (fact_id, fact_id),
+            )
+            return cur.rowcount
 
     def migrate_supersession_to_links(self) -> int:
-        conn = self._get_conn()
-        rows = conn.execute("SELECT id, superseded_by FROM facts WHERE superseded_by IS NOT NULL").fetchall()
-        if not rows:
-            return 0
-        count = 0
-        for row in rows:
-            old_id, new_id = row["id"], row["superseded_by"]
-            existing = conn.execute(
-                "SELECT 1 FROM fact_links WHERE source_fact_id = %s AND target_fact_id = %s AND relation_type = 'supersedes'",
-                (new_id, old_id),
-            ).fetchone()
-            if existing:
-                continue
-            link = FactLink(source_fact_id=new_id, target_fact_id=old_id, relation_type="supersedes",
-                            confidence=1.0, context="Migrated from superseded_by column", created_by="migration")
-            conn.execute(
-                """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,
-                   confidence, context, created_at, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (link.id, link.source_fact_id, link.target_fact_id, link.relation_type,
-                 link.confidence, link.context, _dt_to_str(link.created_at), link.created_by),
-            )
-            count += 1
-        return count
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT id, superseded_by FROM facts WHERE superseded_by IS NOT NULL").fetchall()
+            if not rows:
+                return 0
+            count = 0
+            for row in rows:
+                old_id, new_id = row["id"], row["superseded_by"]
+                existing = conn.execute(
+                    "SELECT 1 FROM fact_links WHERE source_fact_id = %s AND target_fact_id = %s AND relation_type = 'supersedes'",
+                    (new_id, old_id),
+                ).fetchone()
+                if existing:
+                    continue
+                link = FactLink(source_fact_id=new_id, target_fact_id=old_id, relation_type="supersedes",
+                                confidence=1.0, context="Migrated from superseded_by column", created_by="migration")
+                conn.execute(
+                    """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,
+                       confidence, context, created_at, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (link.id, link.source_fact_id, link.target_fact_id, link.relation_type,
+                     link.confidence, link.context, _dt_to_str(link.created_at), link.created_by),
+                )
+                count += 1
+            return count
 
     def _acquire_lifecycle_share_lock(
         self, conn: psycopg.Connection, conversation_id: str,
@@ -6328,261 +6323,255 @@ class PostgresStore(ContextStore):
         )
 
     def _normalize_request_turn_sequences(self) -> None:
-        conn = self._get_conn()
-        with conn.transaction():
-            context_rows = conn.execute(
-                "SELECT id, conversation_id, request_turn, timestamp FROM request_context "
-                "ORDER BY conversation_id, id"
-            ).fetchall()
-            if not context_rows:
-                return
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                context_rows = conn.execute(
+                    "SELECT id, conversation_id, request_turn, timestamp FROM request_context "
+                    "ORDER BY conversation_id, id"
+                ).fetchall()
+                if not context_rows:
+                    return
 
-            grouped_contexts: dict[str, list[dict]] = {}
-            context_updates: list[tuple[int, int]] = []
-            for row in context_rows:
-                conversation_id = row["conversation_id"]
-                seq = len(grouped_contexts.setdefault(conversation_id, [])) + 1
-                timestamp = _parse_sequence_timestamp(row.get("timestamp"))
-                grouped_contexts[conversation_id].append({
-                    "id": int(row["id"]),
-                    "request_turn": seq,
-                    "timestamp": timestamp,
-                })
-                if int(row.get("request_turn", 0) or 0) != seq:
-                    context_updates.append((seq, int(row["id"])))
+                grouped_contexts: dict[str, list[dict]] = {}
+                context_updates: list[tuple[int, int]] = []
+                for row in context_rows:
+                    conversation_id = row["conversation_id"]
+                    seq = len(grouped_contexts.setdefault(conversation_id, [])) + 1
+                    timestamp = _parse_sequence_timestamp(row.get("timestamp"))
+                    grouped_contexts[conversation_id].append({
+                        "id": int(row["id"]),
+                        "request_turn": seq,
+                        "timestamp": timestamp,
+                    })
+                    if int(row.get("request_turn", 0) or 0) != seq:
+                        context_updates.append((seq, int(row["id"])))
 
-            if context_updates:
-                for params in context_updates:
-                    conn.execute(
-                        "UPDATE request_context SET request_turn = %s WHERE id = %s",
-                        params,
-                    )
+                if context_updates:
+                    for params in context_updates:
+                        conn.execute(
+                            "UPDATE request_context SET request_turn = %s WHERE id = %s",
+                            params,
+                        )
 
-            tool_rows = conn.execute(
-                "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
-                "ORDER BY conversation_id, id"
-            ).fetchall()
-            tool_updates: list[tuple[int, int]] = []
-            for row in tool_rows:
-                conversation_id = row["conversation_id"]
-                contexts = grouped_contexts.get(conversation_id)
-                if not contexts:
-                    continue
-                tool_ts = _parse_sequence_timestamp(row.get("timestamp"))
-                assigned_turn = contexts[0]["request_turn"]
-                if tool_ts is not None:
-                    for ctx in contexts:
-                        ctx_ts = ctx["timestamp"]
-                        if ctx_ts is None or ctx_ts <= tool_ts:
-                            assigned_turn = ctx["request_turn"]
-                        else:
-                            break
-                else:
-                    assigned_turn = contexts[-1]["request_turn"]
-                if int(row.get("request_turn", 0) or 0) != assigned_turn:
-                    tool_updates.append((assigned_turn, int(row["id"])))
+                tool_rows = conn.execute(
+                    "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
+                    "ORDER BY conversation_id, id"
+                ).fetchall()
+                tool_updates: list[tuple[int, int]] = []
+                for row in tool_rows:
+                    conversation_id = row["conversation_id"]
+                    contexts = grouped_contexts.get(conversation_id)
+                    if not contexts:
+                        continue
+                    tool_ts = _parse_sequence_timestamp(row.get("timestamp"))
+                    assigned_turn = contexts[0]["request_turn"]
+                    if tool_ts is not None:
+                        for ctx in contexts:
+                            ctx_ts = ctx["timestamp"]
+                            if ctx_ts is None or ctx_ts <= tool_ts:
+                                assigned_turn = ctx["request_turn"]
+                            else:
+                                break
+                    else:
+                        assigned_turn = contexts[-1]["request_turn"]
+                    if int(row.get("request_turn", 0) or 0) != assigned_turn:
+                        tool_updates.append((assigned_turn, int(row["id"])))
 
-            if tool_updates:
-                for params in tool_updates:
-                    conn.execute(
-                        "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
-                        params,
-                    )
+                if tool_updates:
+                    for params in tool_updates:
+                        conn.execute(
+                            "UPDATE tool_calls SET request_turn = %s WHERE id = %s",
+                            params,
+                        )
 
-            counter_rows = [
-                (conversation_id, contexts[-1]["request_turn"])
-                for conversation_id, contexts in grouped_contexts.items()
-                if contexts
-            ]
-            if counter_rows:
-                for params in counter_rows:
-                    conn.execute(
-                        """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
-                           VALUES (%s, %s)
-                           ON CONFLICT (conversation_id)
-                           DO UPDATE
-                           SET next_request_turn = GREATEST(
-                               request_turn_counters.next_request_turn,
-                               EXCLUDED.next_request_turn
-                           )""",
-                        params,
-                    )
+                counter_rows = [
+                    (conversation_id, contexts[-1]["request_turn"])
+                    for conversation_id, contexts in grouped_contexts.items()
+                    if contexts
+                ]
+                if counter_rows:
+                    for params in counter_rows:
+                        conn.execute(
+                            """INSERT INTO request_turn_counters (conversation_id, next_request_turn)
+                               VALUES (%s, %s)
+                               ON CONFLICT (conversation_id)
+                               DO UPDATE
+                               SET next_request_turn = GREATEST(
+                                   request_turn_counters.next_request_turn,
+                                   EXCLUDED.next_request_turn
+                               )""",
+                            params,
+                        )
 
     # ------------------------------------------------------------------
     # Tool calls
     # ------------------------------------------------------------------
 
     def save_tool_call(self, call: dict) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO tool_calls
-            (conversation_id, request_turn, round, group_id, tool_name,
-             tool_input, tool_result, result_length, duration_ms, found, timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                call.get("conversation_id", ""),
-                call.get("request_turn", 0),
-                call.get("round", 1),
-                call.get("group_id", ""),
-                call.get("tool_name", ""),
-                json.dumps(call.get("tool_input", {})),
-                call.get("tool_result", ""),
-                call.get("result_length", 0),
-                call.get("duration_ms", 0),
-                call.get("found"),
-                call.get("timestamp", ""),
-            ),
-        )
-        conv_id = call.get("conversation_id", "")
-        conn.execute(
-            """DELETE FROM tool_calls WHERE id NOT IN (
-                SELECT id FROM tool_calls WHERE conversation_id = %s
-                ORDER BY id DESC LIMIT 50
-            ) AND conversation_id = %s""",
-            (conv_id, conv_id),
-        )
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO tool_calls
+                (conversation_id, request_turn, round, group_id, tool_name,
+                 tool_input, tool_result, result_length, duration_ms, found, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    call.get("conversation_id", ""),
+                    call.get("request_turn", 0),
+                    call.get("round", 1),
+                    call.get("group_id", ""),
+                    call.get("tool_name", ""),
+                    json.dumps(call.get("tool_input", {})),
+                    call.get("tool_result", ""),
+                    call.get("result_length", 0),
+                    call.get("duration_ms", 0),
+                    call.get("found"),
+                    call.get("timestamp", ""),
+                ),
+            )
+            conv_id = call.get("conversation_id", "")
+            conn.execute(
+                """DELETE FROM tool_calls WHERE id NOT IN (
+                    SELECT id FROM tool_calls WHERE conversation_id = %s
+                    ORDER BY id DESC LIMIT 50
+                ) AND conversation_id = %s""",
+                (conv_id, conv_id),
+            )
 
     def load_tool_calls(self, conversation_id: str, limit: int = 50) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM tool_calls WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
-            (conversation_id, limit),
-        ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tool_calls WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
+                (conversation_id, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
 
     def load_tool_call(self, call_id: int) -> dict | None:
-        conn = self._get_conn()
-        row = conn.execute("SELECT * FROM tool_calls WHERE id = %s", (call_id,)).fetchone()
-        return dict(row) if row else None
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM tool_calls WHERE id = %s", (call_id,)).fetchone()
+            return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # Request context persistence (dashboard recall page)
     # ------------------------------------------------------------------
 
     def save_request_context(self, context: dict) -> int:
-        conn = self._get_conn()
-        conv_id = context.get("conversation_id", "")
-        explicit_turn = int(context.get("request_turn", 0) or 0)
-        with conn.transaction():
-            # acquire conversation_lifecycle
-            # SHARE lock so a concurrent merge body holding the EXCLUSIVE
-            # lock blocks us until it commits + has bumped the counter
-            # past the moved range. Closes the stale-offset race window
-            # that left open for cross-transaction writes.
-            self._acquire_lifecycle_share_lock(conn, conv_id)
-            request_turn = explicit_turn or self._allocate_request_turn(conn, conv_id)
-            if explicit_turn:
-                self._bump_request_turn_counter(conn, conv_id, request_turn)
-            conn.execute(
-                """INSERT INTO request_context
-                (conversation_id, request_turn, timestamp, user_message, inbound_tags,
-                 retrieval_method, candidates_found, candidates_selected,
-                 segments_injected, facts_injected, facts_count, facts_tags,
-                 pool_used, pool_budget, total_context_tokens,
-                 non_virtualizable_floor, tool_call_count)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    conv_id,
-                    request_turn,
-                    context.get("timestamp", ""),
-                    context.get("user_message", ""),
-                    json.dumps(context.get("inbound_tags", [])),
-                    context.get("retrieval_method", ""),
-                    context.get("candidates_found", 0),
-                    context.get("candidates_selected", 0),
-                    json.dumps(context.get("segments_injected", [])),
-                    json.dumps(context.get("facts_injected", [])),
-                    context.get("facts_count", 0),
-                    json.dumps(context.get("facts_tags", [])),
-                    context.get("pool_used", 0),
-                    context.get("pool_budget", 0),
-                    context.get("total_context_tokens", 0),
-                    context.get("non_virtualizable_floor", 0),
-                    context.get("tool_call_count", 0),
-                ),
-            )
-            conn.execute(
-                """DELETE FROM request_context WHERE id NOT IN (
-                    SELECT id FROM request_context WHERE conversation_id = %s
-                    ORDER BY id DESC LIMIT 50
-                ) AND conversation_id = %s""",
-                (conv_id, conv_id),
-            )
-        return request_turn
+        with self.pool.connection() as conn:
+            conv_id = context.get("conversation_id", "")
+            explicit_turn = int(context.get("request_turn", 0) or 0)
+            with conn.transaction():
+                # acquire conversation_lifecycle
+                # SHARE lock so a concurrent merge body holding the EXCLUSIVE
+                # lock blocks us until it commits + has bumped the counter
+                # past the moved range. Closes the stale-offset race window
+                # that left open for cross-transaction writes.
+                self._acquire_lifecycle_share_lock(conn, conv_id)
+                request_turn = explicit_turn or self._allocate_request_turn(conn, conv_id)
+                if explicit_turn:
+                    self._bump_request_turn_counter(conn, conv_id, request_turn)
+                conn.execute(
+                    """INSERT INTO request_context
+                    (conversation_id, request_turn, timestamp, user_message, inbound_tags,
+                     retrieval_method, candidates_found, candidates_selected,
+                     segments_injected, facts_injected, facts_count, facts_tags,
+                     pool_used, pool_budget, total_context_tokens,
+                     non_virtualizable_floor, tool_call_count)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        conv_id,
+                        request_turn,
+                        context.get("timestamp", ""),
+                        context.get("user_message", ""),
+                        json.dumps(context.get("inbound_tags", [])),
+                        context.get("retrieval_method", ""),
+                        context.get("candidates_found", 0),
+                        context.get("candidates_selected", 0),
+                        json.dumps(context.get("segments_injected", [])),
+                        json.dumps(context.get("facts_injected", [])),
+                        context.get("facts_count", 0),
+                        json.dumps(context.get("facts_tags", [])),
+                        context.get("pool_used", 0),
+                        context.get("pool_budget", 0),
+                        context.get("total_context_tokens", 0),
+                        context.get("non_virtualizable_floor", 0),
+                        context.get("tool_call_count", 0),
+                    ),
+                )
+                conn.execute(
+                    """DELETE FROM request_context WHERE id NOT IN (
+                        SELECT id FROM request_context WHERE conversation_id = %s
+                        ORDER BY id DESC LIMIT 50
+                    ) AND conversation_id = %s""",
+                    (conv_id, conv_id),
+                )
+            return request_turn
 
     def load_request_contexts(self, conversation_id: str, limit: int = 50) -> list[dict]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT * FROM (
-                SELECT
-                    rc.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY rc.conversation_id
-                        ORDER BY rc.id
-                    ) AS sequence_number
-                FROM request_context rc
-                WHERE rc.conversation_id = %s
-            ) ranked
-            ORDER BY id DESC
-            LIMIT %s""",
-            (conversation_id, limit),
-        ).fetchall()
-        result = []
-        for row in reversed(rows):
-            d = dict(row)
-            for json_field in ("inbound_tags", "segments_injected", "facts_injected", "facts_tags"):
-                try:
-                    d[json_field] = json.loads(d.get(json_field, "[]"))
-                except (json.JSONDecodeError, TypeError):
-                    d[json_field] = []
-            result.append(d)
-        return result
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM (
+                    SELECT
+                        rc.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY rc.conversation_id
+                            ORDER BY rc.id
+                        ) AS sequence_number
+                    FROM request_context rc
+                    WHERE rc.conversation_id = %s
+                ) ranked
+                ORDER BY id DESC
+                LIMIT %s""",
+                (conversation_id, limit),
+            ).fetchall()
+            result = []
+            for row in reversed(rows):
+                d = dict(row)
+                for json_field in ("inbound_tags", "segments_injected", "facts_injected", "facts_tags"):
+                    try:
+                        d[json_field] = json.loads(d.get(json_field, "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        d[json_field] = []
+                result.append(d)
+            return result
 
     def save_ingest_batch(self, batch: dict) -> str:
-        conn = self._get_conn()
-        batch_id = str(batch.get("batch_id", "") or generate_canonical_turn_id())
-        conn.execute(
-            """INSERT INTO ingest_batches
-            (batch_id, conversation_id, received_at, raw_turn_count, merge_mode,
-             turns_matched, turns_appended, turns_prepended, turns_inserted,
-             first_turn_hash, last_turn_hash)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (batch_id) DO UPDATE SET
-                merge_mode = EXCLUDED.merge_mode,
-                turns_matched = EXCLUDED.turns_matched,
-                turns_appended = EXCLUDED.turns_appended,
-                turns_prepended = EXCLUDED.turns_prepended,
-                turns_inserted = EXCLUDED.turns_inserted,
-                first_turn_hash = EXCLUDED.first_turn_hash,
-                last_turn_hash = EXCLUDED.last_turn_hash""",
-            (
-                batch_id,
-                batch.get("conversation_id", ""),
-                batch.get("received_at", "") or utcnow_iso(),
-                int(batch.get("raw_turn_count", 0) or 0),
-                batch.get("merge_mode", "") or "",
-                int(batch.get("turns_matched", 0) or 0),
-                int(batch.get("turns_appended", 0) or 0),
-                int(batch.get("turns_prepended", 0) or 0),
-                int(batch.get("turns_inserted", 0) or 0),
-                batch.get("first_turn_hash", "") or "",
-                batch.get("last_turn_hash", "") or "",
-            ),
-        )
-        return batch_id
+        with self.pool.connection() as conn:
+            batch_id = str(batch.get("batch_id", "") or generate_canonical_turn_id())
+            conn.execute(
+                """INSERT INTO ingest_batches
+                (batch_id, conversation_id, received_at, raw_turn_count, merge_mode,
+                 turns_matched, turns_appended, turns_prepended, turns_inserted,
+                 first_turn_hash, last_turn_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (batch_id) DO UPDATE SET
+                    merge_mode = EXCLUDED.merge_mode,
+                    turns_matched = EXCLUDED.turns_matched,
+                    turns_appended = EXCLUDED.turns_appended,
+                    turns_prepended = EXCLUDED.turns_prepended,
+                    turns_inserted = EXCLUDED.turns_inserted,
+                    first_turn_hash = EXCLUDED.first_turn_hash,
+                    last_turn_hash = EXCLUDED.last_turn_hash""",
+                (
+                    batch_id,
+                    batch.get("conversation_id", ""),
+                    batch.get("received_at", "") or utcnow_iso(),
+                    int(batch.get("raw_turn_count", 0) or 0),
+                    batch.get("merge_mode", "") or "",
+                    int(batch.get("turns_matched", 0) or 0),
+                    int(batch.get("turns_appended", 0) or 0),
+                    int(batch.get("turns_prepended", 0) or 0),
+                    int(batch.get("turns_inserted", 0) or 0),
+                    batch.get("first_turn_hash", "") or "",
+                    batch.get("last_turn_hash", "") or "",
+                ),
+            )
+            return batch_id
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        with self._conn_lock:
-            conns = list(self._connections.values())
-            self._connections.clear()
-        for conn in conns:
-            if not conn.closed:
-                conn.close()
-        self._conn_local.conn = None
+        self.pool.close()
 
     def __del__(self) -> None:
         try:
