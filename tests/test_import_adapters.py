@@ -6,6 +6,9 @@ import pytest
 
 from virtual_context.import_adapters import get_adapter, ADAPTERS
 from virtual_context.import_adapters.chatgpt import ChatGPTAdapter
+from virtual_context.import_adapters.claude import ClaudeAdapter
+from virtual_context.import_adapters.devin import DevinAdapter
+from virtual_context.import_adapters.grok import GrokAdapter
 
 
 class TestAdapterRegistry:
@@ -62,3 +65,125 @@ class TestChatGPTAdapter:
         messages = adapter.extract_messages(data)
         assert len(messages) == 1
         assert messages[0].timestamp is None
+
+
+class TestClaudeAdapter:
+    """Tests for Claude export adapter."""
+
+    def test_extract_messages_normalizes_human_role(self):
+        adapter = ClaudeAdapter()
+        data = {
+            "uuid": "abc-123",
+            "messages": [
+                {"role": "human", "text": "Hello", "created_at": "2025-09-28T16:41:19.245108Z"},
+                {"role": "assistant", "text": "Hi!", "created_at": "2025-09-28T16:41:20.000000Z"},
+            ],
+        }
+        messages = adapter.extract_messages(data)
+        assert messages[0].role == "user"  # normalized from "human"
+        assert messages[1].role == "assistant"
+
+    def test_extract_messages_parses_iso_timestamp(self):
+        adapter = ClaudeAdapter()
+        data = {
+            "uuid": "abc-123",
+            "messages": [{"role": "human", "text": "Hi", "created_at": "2025-09-28T16:41:19.245108Z"}],
+        }
+        messages = adapter.extract_messages(data)
+        assert messages[0].timestamp is not None
+        assert messages[0].timestamp.year == 2025
+
+    def test_extract_conversation_id(self):
+        adapter = ClaudeAdapter()
+        data = {"uuid": "abc-123-uuid"}
+        assert adapter.extract_conversation_id(data) == "abc-123-uuid"
+
+
+class TestDevinAdapter:
+    """Tests for Devin export adapter."""
+
+    def test_extract_messages_unix_int_timestamp(self):
+        adapter = DevinAdapter()
+        data = {
+            "conversation_id": "abc123hex",
+            "messages": [{"role": "user", "text": "Hello", "create_time": 1754256914}],
+        }
+        messages = adapter.extract_messages(data)
+        assert len(messages) == 1
+        assert messages[0].timestamp == datetime.fromtimestamp(1754256914)
+
+    def test_extract_conversation_id(self):
+        adapter = DevinAdapter()
+        data = {"conversation_id": "abc123hex"}
+        assert adapter.extract_conversation_id(data) == "abc123hex"
+
+
+class TestGrokAdapter:
+    """Tests for Grok export adapter."""
+
+    def test_extract_messages_two_key_envelope(self):
+        adapter = GrokAdapter()
+        data = {
+            "conversation": {"id": "conv-uuid"},
+            "responses": [
+                {
+                    "response": {
+                        "sender": "human",
+                        "message": "Hello",
+                        "create_time": {"$date": {"$numberLong": "1753841416257"}},
+                    }
+                },
+                {
+                    "response": {
+                        "sender": "ASSISTANT",
+                        "message": "Hi there!",
+                        "create_time": {"$date": {"$numberLong": "1753841417000"}},
+                    }
+                },
+            ],
+        }
+        messages = adapter.extract_messages(data)
+        assert len(messages) == 2
+        assert messages[0].role == "user"  # normalized from "human"
+        assert messages[1].role == "assistant"  # normalized from "ASSISTANT"
+
+    def test_extract_messages_mongodb_timestamp(self):
+        adapter = GrokAdapter()
+        data = {
+            "conversation": {"id": "conv-uuid"},
+            "responses": [
+                {
+                    "response": {
+                        "sender": "human",
+                        "message": "Hi",
+                        "create_time": {"$date": {"$numberLong": "1753841416257"}},
+                    }
+                }
+            ],
+        }
+        messages = adapter.extract_messages(data)
+        assert messages[0].timestamp == datetime.fromtimestamp(1753841416257 / 1000)
+
+    def test_extract_conversation_id(self):
+        adapter = GrokAdapter()
+        data = {"conversation": {"id": "conv-uuid"}}
+        assert adapter.extract_conversation_id(data) == "conv-uuid"
+
+    def test_thinking_trace_not_in_content(self):
+        adapter = GrokAdapter()
+        data = {
+            "conversation": {"id": "conv-uuid"},
+            "responses": [
+                {
+                    "response": {
+                        "sender": "ASSISTANT",
+                        "message": "The answer is 42",
+                        "thinking_trace": "Let me reason through this...",
+                        "steps": [{"type": "reasoning", "text": "First..."}],
+                    }
+                }
+            ],
+        }
+        messages = adapter.extract_messages(data)
+        assert messages[0].content == "The answer is 42"
+        assert "thinking" not in messages[0].content.lower()

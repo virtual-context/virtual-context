@@ -1581,7 +1581,7 @@ def main():
     import_parser.add_argument(
         "--provider", "-p",
         required=True,
-        choices=["chatgpt"],
+        choices=["chatgpt", "claude", "devin", "grok"],
         help="Export provider format",
     )
     import_parser.add_argument(

@@ -2,11 +2,17 @@
 
 from virtual_context.import_adapters.base import ExportAdapter
 from virtual_context.import_adapters.chatgpt import ChatGPTAdapter
+from virtual_context.import_adapters.claude import ClaudeAdapter
+from virtual_context.import_adapters.devin import DevinAdapter
+from virtual_context.import_adapters.grok import GrokAdapter
 
-__all__ = ["ExportAdapter", "get_adapter", "ADAPTERS"]
+__all__ = ["ExportAdapter", "get_adapter", "ADAPTERS", "ChatGPTAdapter", "ClaudeAdapter", "DevinAdapter", "GrokAdapter"]
 
 ADAPTERS: dict[str, type[ExportAdapter]] = {
     "chatgpt": ChatGPTAdapter,
+    "claude": ClaudeAdapter,
+    "devin": DevinAdapter,
+    "grok": GrokAdapter,
 }
 
 
