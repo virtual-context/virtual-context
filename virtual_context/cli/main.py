@@ -1576,6 +1576,20 @@ def main():
         help="Install daemon but do not start it (for install)",
     )
 
+    # import
+    import_parser = subparsers.add_parser("import", help="Import conversation history from exports")
+    import_parser.add_argument(
+        "--provider", "-p",
+        required=True,
+        choices=["chatgpt"],
+        help="Export provider format",
+    )
+    import_parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Input file path",
+    )
+
     # config validate
     config_parser = subparsers.add_parser("config", help="Config operations")
     config_sub = config_parser.add_subparsers(dest="config_command")
@@ -1615,6 +1629,9 @@ def main():
         cmd_presets(args)
     elif args.command == "daemon":
         cmd_daemon(args)
+    elif args.command == "import":
+        from virtual_context.cli.import_cmd import run_import
+        sys.exit(run_import(args))
     elif args.command == "config":
         if args.config_command == "validate":
             cmd_config_validate(args)
