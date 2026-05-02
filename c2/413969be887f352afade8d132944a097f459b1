@@ -1,0 +1,29 @@
+virtual_context/import_adapters/loader.py
+  32229f92f97564e5 1-65
+virtual_context/cli/import_cmd.py
+  32229f92f97564e5 12,19,35,37-73
+virtual_context/cli/main.py
+  32229f92f97564e5 1590-1595
+tests/test_import_adapters.py
+  32229f92f97564e5 3,5,14,193-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "c2413969be887f352afade8d132944a097f459b1",
+  "prompts": {
+    "32229f92f97564e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73b9db41-8827-4ec7-8c35-6ce46f6e65f1",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Dominic Dones",
+      "messages": [],
+      "total_additions": 178,
+      "total_deletions": 36,
+      "accepted_lines": 178,
+      "overriden_lines": 1
+    }
+  }
+}
