@@ -1587,7 +1587,12 @@ def main():
     import_parser.add_argument(
         "--input", "-i",
         required=True,
-        help="Input file path",
+        help="Input file or directory path",
+    )
+    import_parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Run compaction after import (default: off)",
     )
 
     # config validate

@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from virtual_context.config import load_config
 from virtual_context.engine import VirtualContextEngine
 from virtual_context.import_adapters import get_adapter
+from virtual_context.import_adapters.loader import load_from_path
 
 
 def run_import(args: argparse.Namespace) -> int:
     """Execute the import command.
 
     Args:
-        args: Parsed command-line arguments with provider, input, config.
+        args: Parsed command-line arguments with provider, input, config, compact.
 
     Returns:
         Exit code (0 for success, 1 for failure).
@@ -32,39 +32,44 @@ def run_import(args: argparse.Namespace) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Load config from path or auto-discover
+    # Load base config
     config_path = args.config if hasattr(args, "config") and args.config else None
-    config = load_config(config_path=config_path)
+    base_config = load_config(config_path=config_path)
 
-    if not input_path.is_file():
-        print(f"Error: Input must be a file: {input_path}", file=sys.stderr)
-        return 1
+    total_turns = 0
+    files_processed = 0
+    files_skipped = 0
 
-    try:
-        data = json.loads(input_path.read_text())
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in {input_path}: {e}", file=sys.stderr)
-        return 1
+    for conversation_id, messages in load_from_path(input_path, adapter):
+        if not messages:
+            files_skipped += 1
+            continue
 
-    messages = adapter.extract_messages(data)
-    conversation_id = adapter.extract_conversation_id(data)
+        print(f"Importing {len(messages)} messages from conversation {conversation_id[:8]}...")
 
-    if not messages:
-        print(f"Warning: No messages found in {input_path}", file=sys.stderr)
-        return 0
+        # Override conversation_id on the loaded config so engine writes to the
+        # correct conversation row without discarding the user's storage settings.
+        base_config.conversation_id = conversation_id
+        engine = VirtualContextEngine(config=base_config)
 
-    print(f"Importing {len(messages)} messages from {adapter.name} export...")
+        def progress(done: int, total: int, entry: object) -> None:
+            print(f"  Ingested {done}/{total} turns", end="\r")
 
-    # Override conversation_id on the loaded config so engine writes to the
-    # correct conversation row without discarding the user's storage settings.
-    config.conversation_id = conversation_id
+        turns_ingested = engine.ingest_history(messages, progress_callback=progress)
+        total_turns += turns_ingested
+        files_processed += 1
+        print(f"  Imported {turns_ingested} turns")
 
-    engine = VirtualContextEngine(config=config)
+        # Optional compaction
+        if getattr(args, "compact", False):
+            print("  Running compaction...")
+            compact_count = 0
+            while engine.compact_manual(messages):
+                compact_count += 1
+            print(f"  Compaction complete ({compact_count} rounds)")
 
-    def progress(done: int, total: int, entry: object) -> None:
-        print(f"  Ingested {done}/{total} turns", end="\r")
-
-    turns_ingested = engine.ingest_history(messages, progress_callback=progress)
-    print(f"\nSuccessfully imported {turns_ingested} turns from {input_path.name}")
+    print(f"\nSummary: {files_processed} files processed, {total_turns} total turns imported")
+    if files_skipped:
+        print(f"  ({files_skipped} files skipped due to errors)")
 
     return 0

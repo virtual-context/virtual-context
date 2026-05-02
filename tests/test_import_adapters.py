@@ -1,6 +1,8 @@
 """Tests for conversation export adapters."""
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +11,7 @@ from virtual_context.import_adapters.chatgpt import ChatGPTAdapter
 from virtual_context.import_adapters.claude import ClaudeAdapter
 from virtual_context.import_adapters.devin import DevinAdapter
 from virtual_context.import_adapters.grok import GrokAdapter
+from virtual_context.import_adapters.loader import load_from_path
 
 
 class TestAdapterRegistry:
@@ -187,3 +190,67 @@ class TestGrokAdapter:
         messages = adapter.extract_messages(data)
         assert messages[0].content == "The answer is 42"
         assert "thinking" not in messages[0].content.lower()
+
+
+class TestLoader:
+    """Tests for file/directory loading utilities."""
+
+    def test_load_single_file(self, tmp_path: Path) -> None:
+        test_file = tmp_path / "chat.json"
+        test_file.write_text(json.dumps({
+            "conversation_id": "test-123",
+            "messages": [
+                {"role": "user", "text": "Hello", "create_time": 1715848606.0},
+            ],
+        }))
+
+        adapter = ChatGPTAdapter()
+        results = list(load_from_path(test_file, adapter))
+
+        assert len(results) == 1
+        conv_id, messages = results[0]
+        assert conv_id == "test-123"
+        assert len(messages) == 1
+
+    def test_load_directory(self, tmp_path: Path) -> None:
+        for i in range(3):
+            test_file = tmp_path / f"chat_{i}.json"
+            test_file.write_text(json.dumps({
+                "conversation_id": f"conv-{i}",
+                "messages": [
+                    {"role": "user", "text": f"Hello {i}", "create_time": 1715848606.0},
+                ],
+            }))
+
+        adapter = ChatGPTAdapter()
+        results = list(load_from_path(tmp_path, adapter))
+
+        assert len(results) == 3
+
+    def test_load_directory_skips_invalid_json(self, tmp_path: Path) -> None:
+        valid_file = tmp_path / "valid.json"
+        valid_file.write_text(json.dumps({
+            "conversation_id": "valid",
+            "messages": [{"role": "user", "text": "Hi", "create_time": 1.0}],
+        }))
+
+        invalid_file = tmp_path / "invalid.json"
+        invalid_file.write_text("not valid json{{{")
+
+        adapter = ChatGPTAdapter()
+        results = list(load_from_path(tmp_path, adapter))
+
+        assert len(results) == 1
+        assert results[0][0] == "valid"
+
+    def test_load_directory_skips_empty_messages(self, tmp_path: Path) -> None:
+        empty_file = tmp_path / "empty.json"
+        empty_file.write_text(json.dumps({
+            "conversation_id": "empty",
+            "messages": [],
+        }))
+
+        adapter = ChatGPTAdapter()
+        results = list(load_from_path(tmp_path, adapter))
+
+        assert len(results) == 0
