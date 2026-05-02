@@ -3,15 +3,13 @@
 from virtual_context.import_adapters.base import ExportAdapter
 from virtual_context.import_adapters.chatgpt import ChatGPTAdapter
 from virtual_context.import_adapters.claude import ClaudeAdapter
-from virtual_context.import_adapters.devin import DevinAdapter
 from virtual_context.import_adapters.grok import GrokAdapter
 
-__all__ = ["ExportAdapter", "get_adapter", "ADAPTERS", "ChatGPTAdapter", "ClaudeAdapter", "DevinAdapter", "GrokAdapter"]
+__all__ = ["ExportAdapter", "get_adapter", "ADAPTERS", "ChatGPTAdapter", "ClaudeAdapter", "GrokAdapter"]
 
 ADAPTERS: dict[str, type[ExportAdapter]] = {
     "chatgpt": ChatGPTAdapter,
     "claude": ClaudeAdapter,
-    "devin": DevinAdapter,
     "grok": GrokAdapter,
 }
 
@@ -20,7 +18,7 @@ def get_adapter(provider: str) -> ExportAdapter:
     """Get adapter instance for the specified provider.
 
     Args:
-        provider: Provider name (chatgpt, claude, devin, grok).
+        provider: Provider name (chatgpt, claude, grok).
 
     Returns:
         Instantiated adapter for the provider.

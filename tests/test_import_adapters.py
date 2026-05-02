@@ -9,7 +9,6 @@ import pytest
 from virtual_context.import_adapters import get_adapter, ADAPTERS
 from virtual_context.import_adapters.chatgpt import ChatGPTAdapter
 from virtual_context.import_adapters.claude import ClaudeAdapter
-from virtual_context.import_adapters.devin import DevinAdapter
 from virtual_context.import_adapters.grok import GrokAdapter
 from virtual_context.import_adapters.loader import load_from_path
 
@@ -100,25 +99,6 @@ class TestClaudeAdapter:
         adapter = ClaudeAdapter()
         data = {"uuid": "abc-123-uuid"}
         assert adapter.extract_conversation_id(data) == "abc-123-uuid"
-
-
-class TestDevinAdapter:
-    """Tests for Devin export adapter."""
-
-    def test_extract_messages_unix_int_timestamp(self):
-        adapter = DevinAdapter()
-        data = {
-            "conversation_id": "abc123hex",
-            "messages": [{"role": "user", "text": "Hello", "create_time": 1754256914}],
-        }
-        messages = adapter.extract_messages(data)
-        assert len(messages) == 1
-        assert messages[0].timestamp == datetime.fromtimestamp(1754256914)
-
-    def test_extract_conversation_id(self):
-        adapter = DevinAdapter()
-        data = {"conversation_id": "abc123hex"}
-        assert adapter.extract_conversation_id(data) == "abc123hex"
 
 
 class TestGrokAdapter:
