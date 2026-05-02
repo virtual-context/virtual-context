@@ -1,0 +1,35 @@
+virtual_context/cli/main.py
+  32229f92f97564e5 1579-1592,1632-1634
+virtual_context/import_adapters/__init__.py
+  32229f92f97564e5 1-28
+tests/test_import_adapters.py
+  32229f92f97564e5 1-64
+virtual_context/cli/import_cmd.py
+  32229f92f97564e5 1-70
+virtual_context/core/tagging_pipeline.py
+  32229f92f97564e5 320-321
+virtual_context/import_adapters/base.py
+  32229f92f97564e5 1-48
+virtual_context/import_adapters/chatgpt.py
+  32229f92f97564e5 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "dbecda156263139d935ef1c4cfe18bd5a1d1b9c6",
+  "prompts": {
+    "32229f92f97564e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73b9db41-8827-4ec7-8c35-6ce46f6e65f1",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Dominic Dones",
+      "messages": [],
+      "total_additions": 293,
+      "total_deletions": 1,
+      "accepted_lines": 293,
+      "overriden_lines": 0
+    }
+  }
+}
