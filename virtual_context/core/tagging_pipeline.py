@@ -317,6 +317,8 @@ class TaggingPipeline:
             if idx not in search_order:
                 search_order.append(idx)
         for idx in search_order:
+            if idx + 1 >= len(rows):
+                continue
             first = rows[idx]
             second = rows[idx + 1]
             if first.turn_hash == user_hash and second.turn_hash == assistant_hash:
