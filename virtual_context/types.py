@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, TypedDict, Union, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Default models
@@ -1302,3 +1302,72 @@ class ReservationResult:
                     "committed_mismatch", "race_retry"]
     merge_id: str
     existing: MergeAuditView | None
+
+
+# ---------------------------------------------------------------------------
+# Cross-worker invalidation event payloads (engine-side AliasEvent)
+# ---------------------------------------------------------------------------
+#
+# Engine-side AliasEvent shape produced by SQLiteStore / PostgresStore /
+# FilesystemStore inside ``save_conversation_alias`` and
+# ``delete_conversation_alias`` once the row commits. Cloud's
+# tenant-aware adapter wraps the engine-side callback, captures
+# ``tenant_id`` from the request / registry context, and adds it to the
+# event before publishing the Redis payload. Engine NEVER sets
+# ``tenant_id`` because the store does not own the tenant binding;
+# callers do.
+
+
+class AliasCreatedEvent(TypedDict):
+    """Cross-worker invalidation event emitted when a
+    ``conversation_aliases`` row was inserted or its ``target_id``
+    updated.
+
+    Fields:
+        type: Discriminator. Always ``"alias_created"``.
+        source: The ``alias_id`` whose outgoing alias just changed
+            (i.e., the source side of the new redirect).
+        target: The terminal target after walking the alias chain from
+            ``target_id``. Stores walk it via
+            ``walk_conversation_alias_chain`` so subscribers always
+            evict the resolved tip.
+        reverse_dependents: Other ``alias_id`` rows that already point
+            at ``source`` and therefore become transitively stale when
+            ``source``'s outgoing edge changes. Populated via
+            ``compute_reverse_dependents``; subscribers evict each id
+            in the list in addition to ``source`` and ``target``.
+        timestamp: ISO8601 UTC string captured at row commit time.
+    """
+
+    type: Literal["alias_created"]
+    source: str
+    target: str
+    reverse_dependents: list[str]
+    timestamp: str
+
+
+class AliasDeletedEvent(TypedDict):
+    """Cross-worker invalidation event emitted when a
+    ``conversation_aliases`` row was deleted.
+
+    Fields:
+        type: Discriminator. Always ``"alias_deleted"``.
+        alias_id: The ``alias_id`` whose outgoing edge was cleared.
+        reverse_dependents: Other ``alias_id`` rows that pointed at
+            ``alias_id`` (the cleared row's incoming-edge graph).
+            Populated before the DELETE so the BFS captures pre-delete
+            state. Subscribers evict each id; clearing ``alias_id``'s
+            outgoing edge does not affect its incoming edges, so both
+            orderings (pre / post DELETE) are equivalent.
+        timestamp: ISO8601 UTC string captured at row commit time.
+    """
+
+    type: Literal["alias_deleted"]
+    alias_id: str
+    reverse_dependents: list[str]
+    timestamp: str
+
+
+# Type alias for either flavor of cross-worker invalidation event.
+# Subscribers discriminate via ``event["type"]``.
+AliasEvent = Union[AliasCreatedEvent, AliasDeletedEvent]

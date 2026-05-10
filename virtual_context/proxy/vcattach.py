@@ -97,6 +97,7 @@ def execute_attach(
     target_id: str,
     store,
     registry_invalidate=None,
+    cross_worker_invalidate=None,
 ) -> None:
     """Execute the attach: clear any reverse alias, register new alias, invalidate.
 
@@ -125,6 +126,19 @@ def execute_attach(
             it can be re-loaded fresh. The callback MUST NOT delete
             persisted conversation data — VCATTACH preserves both rows.
             A failure on one id does not prevent invocation for the other.
+        cross_worker_invalidate: callable(``AliasEvent``) — engine-side
+            cross-worker invalidation callback. Forwarded to BOTH the
+            ``delete_conversation_alias`` and ``save_conversation_alias``
+            calls as ``on_committed=``. Cloud's adapter wraps this to
+            capture ``tenant_id`` and publish a Redis event so cached
+            engine instances on sibling workers evict their stale
+            source-bound state on every alias write. Per spec S9
+            at-least-once contract: callback failures raise
+            ``InvalidationFailedError`` which propagates back through
+            this function so the REST handler can return a retryable
+            503 to the user. The alias row is already committed when
+            the callback fires; retrying the request fires the
+            callback again.
 
     Removed (F-2 audit, ):
         ``reset_engine_state`` callable(target_id) was a dormant callback
@@ -140,13 +154,37 @@ def execute_attach(
     # This unlocks "return to A" flows where A was previously aliased to B.
     delete_alias = getattr(store, "delete_conversation_alias", None)
     if callable(delete_alias):
+        # ``cross_worker_invalidate`` propagates as ``on_committed=`` so
+        # the AliasDeletedEvent fires once after the row commits. Failures
+        # raise ``InvalidationFailedError`` and propagate to the REST
+        # handler (per spec S9 at-least-once).
+        kwargs = (
+            {"on_committed": cross_worker_invalidate}
+            if cross_worker_invalidate is not None else {}
+        )
         try:
-            delete_alias(target_id)
-        except Exception:
-            logger.warning("VCATTACH: failed to clear existing alias for %s", target_id[:12])
+            delete_alias(target_id, **kwargs)
+        except Exception as exc:
+            from ..core.exceptions import InvalidationFailedError
+            if isinstance(exc, InvalidationFailedError):
+                # At-least-once contract: surface to the caller as
+                # retryable. Row is already committed; retry will
+                # refire the callback.
+                raise
+            logger.warning(
+                "VCATTACH: failed to clear existing alias for %s",
+                target_id[:12],
+            )
 
-    # 2. Register new alias old_id -> target_id
-    store.save_conversation_alias(old_id, target_id)
+    # 2. Register new alias old_id -> target_id. Same on_committed
+    # plumbing as above — fires AliasCreatedEvent once after the row
+    # commits; failures propagate as InvalidationFailedError so the
+    # REST handler can return a retryable 503.
+    save_kwargs = (
+        {"on_committed": cross_worker_invalidate}
+        if cross_worker_invalidate is not None else {}
+    )
+    store.save_conversation_alias(old_id, target_id, **save_kwargs)
     logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
 
     # 3. Invalidate cached runtime state for BOTH ids. old_id eviction is

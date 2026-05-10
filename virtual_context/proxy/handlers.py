@@ -2334,8 +2334,22 @@ def _handle_vclist(tenant_registry, tenant_id):
     return "\n".join(lines)
 
 
-def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
-    """REST endpoint handler for all VC commands. Returns JSONResponse."""
+def _handle_vc_command_rest(
+    result, state, registry, tenant_id, vcconv,
+    *,
+    cross_worker_invalidate=None,
+):
+    """REST endpoint handler for all VC commands. Returns JSONResponse.
+
+    ``cross_worker_invalidate`` is the engine-side cross-worker
+    invalidation callback (per spec S9). Cloud's REST adapter passes
+    a tenant-aware closure built from the active TenantRegistry +
+    Redis publisher; single-process / no-Redis runs leave it ``None``.
+    Forwarded to ``execute_attach`` for the VCATTACH path so the alias
+    write fires the callback after commit. Other VC commands (label,
+    status, recall, etc.) ignore the parameter — only the alias-write
+    path needs it.
+    """
     from starlette.responses import JSONResponse
     cmd = result.vc_command
     arg = result.vc_command_arg
@@ -2467,12 +2481,83 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
                         # Idempotent best-effort; missing tombstone = no-op.
                         pass
 
-        execute_attach(
-            old_id=conv_id,
-            target_id=target_id,
-            store=_inner,
-            registry_invalidate=_invalidate,
-        )
+        # Source-tenant gate per spec S10. Reuse ``is_attachable_target``
+        # against the SOURCE conversation_id so a misroute or replayed
+        # request that bypassed cloud's tenant scoping cannot land an
+        # alias whose source belongs to a different tenant. The same
+        # predicate already gates the target via ``_target_exists``;
+        # gating the source closes the W6 invariant. Single-tenant proxy
+        # mode passes ``tenant_id=None`` and the predicate skips the
+        # tenant filter (matching the d2691c7 contract).
+        if _inner is not None:
+            is_attachable = getattr(_inner, "is_attachable_target", None)
+            if callable(is_attachable):
+                try:
+                    source_ok = bool(is_attachable(
+                        conversation_id=conv_id,
+                        tenant_id=tenant_id,
+                    ))
+                except Exception:
+                    # Transient store error — fail open so a DB blip
+                    # cannot block every VCATTACH for the tenant. Same
+                    # policy as ``_target_exists``.
+                    source_ok = True
+                if not source_ok:
+                    return JSONResponse({
+                        "conversation_id": conv_id,
+                        "vc_command": "attach",
+                        "error": "source conversation does not belong to this tenant",
+                        "message": "source conversation does not belong to this tenant",
+                    })
+
+        # Cross-worker invalidation callback — engine fires once per
+        # alias write (delete leg + save leg). Cloud's REST adapter
+        # passes a tenant-aware closure built from the active
+        # TenantRegistry + Redis publisher; single-process / no-Redis
+        # runs leave it None. Forwarded to ``execute_attach`` so the
+        # alias write fires the callback after commit.
+        try:
+            execute_attach(
+                old_id=conv_id,
+                target_id=target_id,
+                store=_inner,
+                registry_invalidate=_invalidate,
+                cross_worker_invalidate=cross_worker_invalidate,
+            )
+        except Exception as exc:
+            from ..core.exceptions import InvalidationFailedError
+            if isinstance(exc, InvalidationFailedError):
+                # At-least-once contract per spec S9: alias row already
+                # committed; surface as retryable 503 so the user
+                # retries (which fires the callback again until it
+                # succeeds or the operator restores the eviction
+                # transport). Log + emit
+                # ``vcattach_invalidation_failed`` metric for ops
+                # symmetry with ``vcmerge_invalidation_failed``.
+                logger.warning(
+                    "vcattach invalidation failed",
+                    extra={
+                        "metric": "vcattach_invalidation_failed",
+                        "tenant_id": tenant_id or "",
+                        "source": conv_id[:12],
+                        "target": target_id[:12],
+                        "callback_error": repr(exc.__cause__),
+                    },
+                )
+                return JSONResponse(
+                    {
+                        "conversation_id": target_id,
+                        "vc_command": "attach",
+                        "error": "alias eviction transport unavailable; retry",
+                        "message": (
+                            "alias eviction transport unavailable; "
+                            "retry the VCATTACH"
+                        ),
+                        "retryable": True,
+                    },
+                    status_code=503,
+                )
+            raise
 
         marker = f"\n<!-- vc:conversation={target_id} -->"
         message = f"Conversation attached to {target_label} ({target_id}). History restored."

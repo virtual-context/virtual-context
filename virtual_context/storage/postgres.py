@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -195,6 +196,9 @@ CREATE TABLE IF NOT EXISTS conversation_aliases (
     target_id TEXT NOT NULL,
     epoch INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE INDEX IF NOT EXISTS idx_conversation_aliases_target_id
+    ON conversation_aliases(target_id);
 
 CREATE TABLE IF NOT EXISTS segment_chunks (
     segment_ref TEXT NOT NULL,
@@ -767,6 +771,18 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
 
 class PostgresStore(ContextStore):
     """PostgreSQL storage backend with tsvector FTS and full protocol support."""
+
+    # Per-async-task post-commit scope for the alias write seam. When the
+    # merge body opens an outer transaction it activates a scope so
+    # ``save_conversation_alias`` / ``delete_conversation_alias`` defer
+    # their ``on_committed`` callbacks until the merge body commits; the
+    # merge body then flushes the queue. ``contextvars.ContextVar``
+    # mirrors the SQLite ``threading.local`` shape one-for-one, with the
+    # added property of propagating cleanly through ``with`` nesting and
+    # surviving a future async migration of the merge body. Per spec S8.
+    _alias_post_commit_scope: contextvars.ContextVar = contextvars.ContextVar(
+        "vc_alias_post_commit_scope", default=None,
+    )
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
@@ -2942,6 +2958,7 @@ class PostgresStore(ContextStore):
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
         expected_source_lifecycle_epoch: int | None = None,
+        cross_worker_invalidate=None,
     ):
         """Move all per-conv data rows from source to target's namespace.
 
@@ -2981,6 +2998,7 @@ class PostgresStore(ContextStore):
         from ..types import MergeStats
         from ..core.exceptions import (
             CrossTenantMergeError, LifecycleEpochMismatch, MergeBusy,
+            InvalidationFailedError as _InvalidationFailedError,
         )
         import json as _json
 
@@ -3022,7 +3040,24 @@ class PostgresStore(ContextStore):
             TABLES_TAG_CONFLICT = ("tag_summaries", "tag_summary_embeddings", "tag_aliases")
             rows_moved: dict[str, int] = {}
 
-            with conn.transaction():
+            # Open a post-commit scope on this connection so the alias
+            # UPSERT inside the transaction registers
+            # ``cross_worker_invalidate`` as a deferred callback rather
+            # than firing it mid-transaction. The merge body owns the
+            # transaction lifecycle; on rollback the hooks queue is
+            # abandoned (callback never fires for an aborted merge).
+            # On commit success we flush the queue best-effort —
+            # callback failure logs WARNING + emits
+            # ``vcmerge_invalidation_failed`` (per spec S8 / VCMERGE
+            # invalidation policy) but does NOT change merge success
+            # because the merge is durable and cache eviction heals on
+            # next state-construct via the engine resolver. Combined-
+            # with syntax keeps the existing transaction-body indent
+            # untouched while ensuring the scope contextvar is reset
+            # on both happy + rollback paths via the contextmanager's
+            # built-in try/finally.
+            with self._alias_post_commit_scope_cm(conn) as post_commit_scope, \
+                    conn.transaction():
                 # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
                 # Holds the row lock through the body's commit so the
                 # stale-reservation sweeper cannot roll it back
@@ -3441,20 +3476,21 @@ class PostgresStore(ContextStore):
                 if prior_alias_row is not None:
                     prior_alias_target = prior_alias_row["target_id"]
 
-                # conversation_aliases UPSERT (: epoch column). The alias
-                # makes a stale source_id resolve to the target post-merge;
-                # epoch matches the lifecycle epoch at merge time so a future
-                # delete+recreate can invalidate the alias if needed.
-                conn.execute(
-                    """
-                    INSERT INTO conversation_aliases (alias_id, target_id, epoch)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (alias_id) DO UPDATE
-                      SET target_id = EXCLUDED.target_id,
-                          epoch = EXCLUDED.epoch
-                    """,
-                    (source_conversation_id, target_conversation_id,
-                     expected_target_lifecycle_epoch),
+                # conversation_aliases UPSERT delegated to
+                # ``save_conversation_alias`` so the active post-commit
+                # scope captures ``cross_worker_invalidate`` as a
+                # deferred callback. The DML runs on the merge body's
+                # connection without committing; the outer
+                # ``conn.transaction()`` makes the alias durable, and
+                # the post-commit flush after the with-block fires the
+                # callback. ``epoch`` matches the lifecycle epoch at
+                # merge time so a future delete+recreate can invalidate
+                # the alias if needed.
+                self.save_conversation_alias(
+                    source_conversation_id,
+                    target_conversation_id,
+                    epoch=expected_target_lifecycle_epoch,
+                    on_committed=cross_worker_invalidate,
                 )
 
                 # Source phase flip to 'merged'. admits the value.
@@ -3530,7 +3566,38 @@ class PostgresStore(ContextStore):
                          completed_at),
                     )
 
-            # Outer transaction commits here.
+            # Outer transaction commits here. The combined-with above
+            # has already exited (resetting the scope contextvar). The
+            # local ``post_commit_scope`` dict is still bound in this
+            # frame; flush its queued ``on_committed`` callbacks now.
+            # Per spec S8: per-callback try/except converts
+            # ``InvalidationFailedError`` into a structured WARNING log
+            # (with merge_id / tenant_id / source / target / dependents
+            # for ops) and emits ``vcmerge_invalidation_failed`` in the
+            # same record's ``metric`` field. Merge success is unchanged
+            # because the merge is durable; cache eviction heals on
+            # next state-construct via the engine resolver.
+            for cb, event in list(post_commit_scope["hooks"]):
+                try:
+                    cb(event)
+                except _InvalidationFailedError as inv_exc:
+                    logger.warning(
+                        "vcmerge invalidation failed",
+                        extra={
+                            "metric": "vcmerge_invalidation_failed",
+                            "merge_id": merge_id,
+                            "tenant_id": tenant_id,
+                            "source": source_conversation_id[:12],
+                            "target": target_conversation_id[:12],
+                            "reverse_dependents": [
+                                d[:12] for d in inv_exc.event.get(
+                                    "reverse_dependents", [],
+                                )
+                            ],
+                            "callback_error": repr(inv_exc.__cause__),
+                        },
+                    )
+            post_commit_scope["hooks"].clear()
 
             elapsed = max((completed_at - started_at).total_seconds(), 0.0)
             return MergeStats(
@@ -5116,14 +5183,142 @@ class PostgresStore(ContextStore):
             return result
 
     # ------------------------------------------------------------------
-    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
-        with self.pool.connection() as conn:
+    @contextmanager
+    def _alias_post_commit_scope_cm(self, conn):
+        """Mark an active post-commit scope on this contextvar for alias writes.
+
+        Inside the scope, ``save_conversation_alias`` /
+        ``delete_conversation_alias`` execute their DML on *conn* (the
+        merge body's outer-transaction connection) without committing
+        and append ``(callback, event)`` tuples to ``scope["hooks"]``.
+        The merge body owns the transaction lifecycle and is responsible
+        for calling ``_flush_post_commit_hooks(scope)`` AFTER the outer
+        commit succeeds (or letting the queue go unfired on rollback).
+        Per spec S8.
+        """
+        scope: dict = {"conn": conn, "hooks": []}
+        token = self._alias_post_commit_scope.set(scope)
+        try:
+            yield scope
+        finally:
+            self._alias_post_commit_scope.reset(token)
+
+    def _flush_post_commit_hooks(self, scope: dict) -> None:
+        """Fire queued ``(callback, event)`` pairs from a post-commit scope.
+
+        Caller invokes this AFTER the outer transaction commits. Each
+        callback may raise ``InvalidationFailedError``; the merge body
+        catches that to log+meter without changing merge success.
+        Hooks fire in registration order. The queue is drained so a
+        second flush is a no-op.
+        """
+        queue = list(scope["hooks"])
+        scope["hooks"].clear()
+        for cb, event in queue:
+            cb(event)
+
+    def _build_alias_created_event(self, alias_id: str, target_id: str) -> dict:
+        """Construct the engine-side ``AliasCreatedEvent`` payload.
+
+        Walks ``target_id`` to its terminal so subscribers always evict
+        the resolved tip; computes ``reverse_dependents`` over the
+        incoming-edge graph of ``alias_id`` so transitively-stale
+        sources also evict. Excludes ``tenant_id`` (the cloud-side
+        adapter wraps this and adds ``tenant_id`` before publishing).
+        """
+        from ..core.alias_resolution import (
+            compute_reverse_dependents,
+            walk_conversation_alias_chain,
+        )
+        terminal = walk_conversation_alias_chain(self, target_id)
+        return {
+            "type": "alias_created",
+            "source": alias_id,
+            "target": terminal,
+            "reverse_dependents": compute_reverse_dependents(self, alias_id),
+            "timestamp": utcnow_iso(),
+        }
+
+    def _build_alias_deleted_event(self, alias_id: str) -> dict:
+        """Construct the engine-side ``AliasDeletedEvent`` payload before
+        the DELETE so the BFS captures pre-delete state."""
+        from ..core.alias_resolution import compute_reverse_dependents
+        return {
+            "type": "alias_deleted",
+            "alias_id": alias_id,
+            "reverse_dependents": compute_reverse_dependents(self, alias_id),
+            "timestamp": utcnow_iso(),
+        }
+
+    def _save_alias_on_conn(
+        self,
+        conn,
+        alias_id: str,
+        target_id: str,
+        *,
+        epoch: int | None,
+    ) -> None:
+        """Run the alias UPSERT on *conn* without committing.
+
+        ``epoch`` is ``None`` for VCATTACH (no lifecycle epoch supplied;
+        defaults to 1 via the table's column default) and
+        ``expected_target_lifecycle_epoch`` for VCMERGE.
+        """
+        if epoch is None:
             conn.execute(
                 """INSERT INTO conversation_aliases (alias_id, target_id)
-                VALUES (%s, %s)
-                ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id""",
+                   VALUES (%s, %s)
+                   ON CONFLICT (alias_id) DO UPDATE
+                     SET target_id = EXCLUDED.target_id""",
                 (alias_id, target_id),
             )
+        else:
+            conn.execute(
+                """INSERT INTO conversation_aliases (alias_id, target_id, epoch)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (alias_id) DO UPDATE
+                     SET target_id = EXCLUDED.target_id,
+                         epoch = EXCLUDED.epoch""",
+                (alias_id, target_id, epoch),
+            )
+
+    def save_conversation_alias(
+        self,
+        alias_id: str,
+        target_id: str,
+        *,
+        epoch: int | None = None,
+        on_committed=None,
+    ) -> None:
+        """Insert / update an alias row.
+
+        When called inside an ``_alias_post_commit_scope_cm`` (e.g.,
+        during VCMERGE body), executes DML on the scope's connection
+        and defers ``on_committed`` until the merge body flushes the
+        queue post-commit. Otherwise owns the connection: acquires from
+        the pool (autocommit), executes the DML, and fires
+        ``on_committed`` exactly once with the
+        ``AliasCreatedEvent``-shaped payload. Callbacks may raise
+        ``InvalidationFailedError`` (per spec S7); callers (VCATTACH
+        path re-raises retryable; VCMERGE path catches + logs).
+        """
+        scope = self._alias_post_commit_scope.get()
+        if scope is not None:
+            self._save_alias_on_conn(
+                scope["conn"], alias_id, target_id, epoch=epoch,
+            )
+            if on_committed is not None:
+                event = self._build_alias_created_event(alias_id, target_id)
+                scope["hooks"].append((on_committed, event))
+            return
+
+        with self.pool.connection() as conn:
+            self._save_alias_on_conn(conn, alias_id, target_id, epoch=epoch)
+        # Connection auto-commits at __exit__ (autocommit=True). Callback
+        # fires after the commit is durable.
+        if on_committed is not None:
+            event = self._build_alias_created_event(alias_id, target_id)
+            on_committed(event)
 
     def resolve_conversation_alias(self, alias_id: str) -> str | None:
         with self.pool.connection() as conn:
@@ -5133,12 +5328,58 @@ class PostgresStore(ContextStore):
             ).fetchone()
             return row["target_id"] if row else None
 
-    def delete_conversation_alias(self, alias_id: str) -> None:
+    def delete_conversation_alias(
+        self,
+        alias_id: str,
+        *,
+        on_committed=None,
+    ) -> None:
+        """Delete the alias row.
+
+        Same scope-vs-own-commit semantics as ``save_conversation_alias``.
+        Computes the ``AliasDeletedEvent`` payload BEFORE the DELETE so
+        the ``reverse_dependents`` BFS captures pre-delete state.
+        """
+        scope = self._alias_post_commit_scope.get()
+        event: dict | None = None
+        if on_committed is not None:
+            event = self._build_alias_deleted_event(alias_id)
+
+        if scope is not None:
+            scope["conn"].execute(
+                "DELETE FROM conversation_aliases WHERE alias_id = %s",
+                (alias_id,),
+            )
+            if on_committed is not None and event is not None:
+                scope["hooks"].append((on_committed, event))
+            return
+
         with self.pool.connection() as conn:
             conn.execute(
                 "DELETE FROM conversation_aliases WHERE alias_id = %s",
                 (alias_id,),
             )
+        if on_committed is not None and event is not None:
+            on_committed(event)
+
+    def list_conversation_aliases_by_target(self, target_id: str) -> list[str]:
+        """Return alias ids whose outgoing alias currently points at *target_id*.
+
+        Sorted ascending by ``alias_id`` for deterministic event payloads.
+        Backed by ``idx_conversation_aliases_target_id`` (created in
+        schema bootstrap) so lookups stay sub-linear at scale. Initial
+        deploy uses plain ``CREATE INDEX IF NOT EXISTS``; future
+        operational follow-up may switch to ``CREATE INDEX CONCURRENTLY``
+        if the alias table grows large enough that the bootstrap lock
+        becomes a deploy-window concern.
+        """
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT alias_id FROM conversation_aliases "
+                "WHERE target_id = %s ORDER BY alias_id",
+                (target_id,),
+            ).fetchall()
+        return [r["alias_id"] for r in rows]
 
     def save_canonical_turn(
         self,

@@ -370,14 +370,72 @@ class CompositeStore:
             ) or 0
         )
 
-    def save_conversation_alias(self, alias_id: str, target_id: str) -> None:
-        self._segments.save_conversation_alias(alias_id, target_id)
+    def save_conversation_alias(
+        self,
+        alias_id: str,
+        target_id: str,
+        *,
+        epoch: int | None = None,
+        on_committed=None,
+    ) -> None:
+        """Forward to the segments backend, preserving the cross-worker
+        invalidation parameters.
+
+        ``epoch`` is the lifecycle epoch stamped on the alias row at
+        insert time (VCMERGE supplies the target's epoch so a future
+        delete+resurrect can invalidate the alias; VCATTACH leaves it
+        ``None`` to use the table default of 1). ``on_committed`` is
+        the engine-side cross-worker invalidation callback receiving
+        an ``AliasCreatedEvent`` after the row commits. Cloud's
+        adapter wraps this and adds ``tenant_id`` before publishing
+        the Redis payload.
+        """
+        # Older SegmentStore implementations may not yet accept the
+        # extra kwargs; preserve backwards-compat by sniffing first.
+        save_method = self._segments.save_conversation_alias
+        kwargs = {}
+        if epoch is not None:
+            kwargs["epoch"] = epoch
+        if on_committed is not None:
+            kwargs["on_committed"] = on_committed
+        save_method(alias_id, target_id, **kwargs)
 
     def resolve_conversation_alias(self, alias_id: str) -> str | None:
         return self._segments.resolve_conversation_alias(alias_id)
 
-    def delete_conversation_alias(self, alias_id: str) -> None:
-        self._segments.delete_conversation_alias(alias_id)
+    def delete_conversation_alias(
+        self,
+        alias_id: str,
+        *,
+        on_committed=None,
+    ) -> None:
+        """Forward to the segments backend, preserving the cross-worker
+        invalidation callback.
+
+        ``on_committed`` receives an ``AliasDeletedEvent`` after the
+        row commits (or after the outer transaction commits when called
+        inside a merge-body post-commit scope).
+        """
+        delete_method = self._segments.delete_conversation_alias
+        if on_committed is not None:
+            delete_method(alias_id, on_committed=on_committed)
+        else:
+            delete_method(alias_id)
+
+    def list_conversation_aliases_by_target(self, target_id: str) -> list[str]:
+        """Return alias ids whose outgoing alias currently points at *target_id*.
+
+        Forwards to the segments backend. Used by
+        ``virtual_context.core.alias_resolution.compute_reverse_dependents``
+        to populate the ``reverse_dependents`` field on ``alias_created``
+        / ``alias_deleted`` cross-worker invalidation events.
+        """
+        list_by_target = getattr(
+            self._segments, "list_conversation_aliases_by_target", None,
+        )
+        if not callable(list_by_target):
+            return []
+        return list_by_target(target_id)
 
     # ------------------------------------------------------------------
     # FactStore
@@ -1078,6 +1136,7 @@ class CompositeStore:
         expected_target_lifecycle_epoch: int,
         source_label_at_merge: str,
         expected_source_lifecycle_epoch: int | None = None,
+        cross_worker_invalidate=None,
     ):
         """ / body method forwarder. Returns MergeStats per
         plan (frozen dataclass with merge_id + rows_moved dict +
@@ -1101,17 +1160,23 @@ class CompositeStore:
         """
         fn = getattr(self._segments, "merge_conversation_data", None)
         if callable(fn):
-            return fn(
-                merge_id=merge_id,
-                tenant_id=tenant_id,
-                source_conversation_id=source_conversation_id,
-                target_conversation_id=target_conversation_id,
-                sort_key_offset=sort_key_offset,
-                request_turn_offset=request_turn_offset,
-                expected_target_lifecycle_epoch=expected_target_lifecycle_epoch,
-                source_label_at_merge=source_label_at_merge,
-                expected_source_lifecycle_epoch=expected_source_lifecycle_epoch,
-            )
+            kwargs = {
+                "merge_id": merge_id,
+                "tenant_id": tenant_id,
+                "source_conversation_id": source_conversation_id,
+                "target_conversation_id": target_conversation_id,
+                "sort_key_offset": sort_key_offset,
+                "request_turn_offset": request_turn_offset,
+                "expected_target_lifecycle_epoch": expected_target_lifecycle_epoch,
+                "source_label_at_merge": source_label_at_merge,
+                "expected_source_lifecycle_epoch": expected_source_lifecycle_epoch,
+            }
+            # Forward the cross-worker invalidation callback only when
+            # provided so older segments backends without the parameter
+            # continue working (defensive backwards compat).
+            if cross_worker_invalidate is not None:
+                kwargs["cross_worker_invalidate"] = cross_worker_invalidate
+            return fn(**kwargs)
         raise NotImplementedError(
             "underlying segments store does not implement "
             "merge_conversation_data; ensure Phase 0 schema (M0.3 + M0.4) "

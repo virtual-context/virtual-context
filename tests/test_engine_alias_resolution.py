@@ -1135,3 +1135,657 @@ def test_lossless_restart_refuses_unattachable_terminal(engine_factory) -> None:
     # outer catcher logs WARNING and leaves the registry slot empty;
     # next request triggers fresh __init__ resolution.
     assert engine.config.conversation_id == pre_conv_id
+
+
+# ===========================================================================
+# Commit-2 — S6 / S7 / S8 / S9 / S10 cross-worker invalidation tests
+# ===========================================================================
+#
+# This block covers the engine-side of the cross-worker invalidation
+# feature: store-level reverse-dependent lookup (S6), AliasEvent payload
+# shape (S7), the post-commit registry that defers callback firing until
+# the outer transaction commits (S8), VCATTACH callback wiring with
+# at-least-once / retryable contract (S9), and VCMERGE callback wiring
+# with post-commit best-effort + WARNING-and-metric on failure (S10).
+# All tests live in this file per the plan v1.2 test mapping section.
+
+
+# ---------------------------------------------------------------------------
+# S6 — Store.list_conversation_aliases_by_target
+# ---------------------------------------------------------------------------
+
+
+def _build_sqlite_store(tmp_path):
+    """Build a fresh CompositeStore-backed SQLite store for direct tests.
+
+    Mirrors the engine_factory's storage shape but skips engine
+    construction so tests can exercise low-level Store APIs.
+    """
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+
+    db_path = str(tmp_path / "store.db")
+    config_dict = {
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+    }
+    config = load_config(config_dict=config_dict)
+    engine = VirtualContextEngine(config=config)
+    raw = _underlying_store(engine)
+    return raw, raw._segments  # composite, sqlite
+
+
+def test_list_conversation_aliases_by_target_empty(tmp_path) -> None:
+    composite, _ = _build_sqlite_store(tmp_path)
+    assert composite.list_conversation_aliases_by_target("nobody") == []
+
+
+def test_list_conversation_aliases_by_target_single(tmp_path) -> None:
+    composite, _ = _build_sqlite_store(tmp_path)
+    composite.save_conversation_alias("alias-1", "target-1")
+    assert composite.list_conversation_aliases_by_target("target-1") == ["alias-1"]
+
+
+def test_list_conversation_aliases_by_target_sorted(tmp_path) -> None:
+    """Results must be sorted by alias_id for deterministic event payloads."""
+    composite, _ = _build_sqlite_store(tmp_path)
+    for src in ["zeta", "alpha", "mu", "beta"]:
+        composite.save_conversation_alias(src, "target-1")
+    assert composite.list_conversation_aliases_by_target("target-1") == [
+        "alpha", "beta", "mu", "zeta",
+    ]
+
+
+def test_list_conversation_aliases_by_target_filters_correct_target(tmp_path) -> None:
+    composite, _ = _build_sqlite_store(tmp_path)
+    composite.save_conversation_alias("alias-A", "target-1")
+    composite.save_conversation_alias("alias-B", "target-2")
+    composite.save_conversation_alias("alias-C", "target-1")
+    assert composite.list_conversation_aliases_by_target("target-1") == [
+        "alias-A", "alias-C",
+    ]
+    assert composite.list_conversation_aliases_by_target("target-2") == ["alias-B"]
+
+
+def test_list_conversation_aliases_by_target_index_exists(tmp_path) -> None:
+    """The ``idx_conversation_aliases_target_id`` index must be created by
+    schema bootstrap so lookups stay sub-linear at scale."""
+    _, sqlite = _build_sqlite_store(tmp_path)
+    conn = sqlite._get_conn()
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='conversation_aliases'"
+    ).fetchall()
+    index_names = {r[0] for r in rows}
+    assert "idx_conversation_aliases_target_id" in index_names
+
+
+def test_list_conversation_aliases_by_target_filesystem_backend(tmp_path) -> None:
+    """Filesystem store implements the method by scanning ``_vcattach_aliases``."""
+    from virtual_context.storage.filesystem import FilesystemStore
+
+    fs = FilesystemStore(root=str(tmp_path / "fs-store"))
+    fs.save_conversation_alias("z", "tgt")
+    fs.save_conversation_alias("a", "tgt")
+    fs.save_conversation_alias("m", "other-tgt")
+    assert fs.list_conversation_aliases_by_target("tgt") == ["a", "z"]
+    assert fs.list_conversation_aliases_by_target("missing") == []
+
+
+def test_context_store_abc_default_returns_empty_for_custom_backends() -> None:
+    """ContextStore ABC ships a default implementation returning [] so
+    custom backends without the new method continue working."""
+    from virtual_context.core.store import ContextStore
+
+    # Pick a method off the ABC; defensive: the default sits on the class.
+    default = ContextStore.list_conversation_aliases_by_target
+    assert callable(default)
+    # The unbound function called on a bare object must return [] without
+    # touching any backend state.
+    class _Bare:
+        list_conversation_aliases_by_target = (
+            ContextStore.list_conversation_aliases_by_target
+        )
+    assert _Bare().list_conversation_aliases_by_target("anything") == []
+
+
+# ---------------------------------------------------------------------------
+# S7 — AliasEvent TypedDict shape
+# ---------------------------------------------------------------------------
+
+
+def test_alias_created_event_typeddict_shape() -> None:
+    from virtual_context.types import AliasCreatedEvent
+
+    event: AliasCreatedEvent = {
+        "type": "alias_created",
+        "source": "src-1",
+        "target": "tgt-1",
+        "reverse_dependents": [],
+        "timestamp": "2026-05-10T17:30:00Z",
+    }
+    assert event["type"] == "alias_created"
+    assert event["source"] == "src-1"
+    assert event["target"] == "tgt-1"
+    assert event["reverse_dependents"] == []
+    assert event["timestamp"].endswith("Z")
+
+
+def test_alias_deleted_event_typeddict_shape() -> None:
+    from virtual_context.types import AliasDeletedEvent
+
+    event: AliasDeletedEvent = {
+        "type": "alias_deleted",
+        "alias_id": "src-1",
+        "reverse_dependents": ["nephew-1"],
+        "timestamp": "2026-05-10T17:30:00Z",
+    }
+    assert event["type"] == "alias_deleted"
+    assert event["alias_id"] == "src-1"
+    assert event["reverse_dependents"] == ["nephew-1"]
+
+
+# ---------------------------------------------------------------------------
+# S8 — save_conversation_alias / delete_conversation_alias on_committed
+# (own-commit + scoped post-commit registry, SQLite path)
+# ---------------------------------------------------------------------------
+
+
+def test_save_conversation_alias_invokes_on_committed_callback(tmp_path) -> None:
+    """Own-commit path: callback fires once after the row commits, with
+    the engine-side AliasCreatedEvent shape (type=source/target/
+    reverse_dependents/timestamp; tenant_id added by the caller-side
+    adapter, not by the store)."""
+    composite, _ = _build_sqlite_store(tmp_path)
+    received: list[dict] = []
+
+    def _cb(event):
+        received.append(dict(event))
+
+    composite.save_conversation_alias("src-cb-1", "tgt-cb-1", on_committed=_cb)
+
+    assert len(received) == 1
+    event = received[0]
+    assert event["type"] == "alias_created"
+    assert event["source"] == "src-cb-1"
+    assert event["target"] == "tgt-cb-1"
+    assert event["reverse_dependents"] == []
+    assert isinstance(event["timestamp"], str) and event["timestamp"]
+    # No tenant_id at the engine layer; cloud's adapter adds it.
+    assert "tenant_id" not in event
+
+
+def test_save_conversation_alias_callback_fires_after_row_committed(tmp_path) -> None:
+    """The callback observes a committed row: a SELECT inside the
+    callback must already see the new alias."""
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    seen_in_cb: dict = {}
+
+    def _cb(event):
+        conn = sqlite._get_conn()
+        row = conn.execute(
+            "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+            ("src-after",),
+        ).fetchone()
+        seen_in_cb["target"] = row["target_id"] if row else None
+
+    composite.save_conversation_alias("src-after", "tgt-after", on_committed=_cb)
+    assert seen_in_cb["target"] == "tgt-after"
+
+
+def test_save_conversation_alias_propagates_callback_error(tmp_path) -> None:
+    """Callback exceptions surface to the caller (VCATTACH path translates
+    InvalidationFailedError to retryable 503; merge body catches and logs)."""
+    from virtual_context.core.exceptions import InvalidationFailedError
+
+    composite, _ = _build_sqlite_store(tmp_path)
+
+    def _cb(event):
+        raise InvalidationFailedError(
+            event=event,
+            cause=ConnectionError("redis down"),
+        )
+
+    with pytest.raises(InvalidationFailedError) as excinfo:
+        composite.save_conversation_alias(
+            "src-err", "tgt-err", on_committed=_cb,
+        )
+    assert excinfo.value.event["type"] == "alias_created"
+    # Row is already committed despite the callback raising — the
+    # alias write is durable and the error is a delivery-side concern.
+    assert composite.resolve_conversation_alias("src-err") == "tgt-err"
+
+
+def test_delete_conversation_alias_invokes_on_committed_callback(tmp_path) -> None:
+    composite, _ = _build_sqlite_store(tmp_path)
+    composite.save_conversation_alias("src-del", "tgt-del")
+    received: list[dict] = []
+
+    def _cb(event):
+        received.append(dict(event))
+
+    composite.delete_conversation_alias("src-del", on_committed=_cb)
+    assert composite.resolve_conversation_alias("src-del") is None
+    assert len(received) == 1
+    event = received[0]
+    assert event["type"] == "alias_deleted"
+    assert event["alias_id"] == "src-del"
+    assert event["reverse_dependents"] == []
+    assert isinstance(event["timestamp"], str) and event["timestamp"]
+
+
+def test_save_conversation_alias_event_includes_reverse_dependents(tmp_path) -> None:
+    """When other aliases already point at the new alias_id, the event's
+    ``reverse_dependents`` lists them so cloud subscribers can evict
+    transitively-stale source ids."""
+    composite, _ = _build_sqlite_store(tmp_path)
+    # Pre-existing aliases that point at "src-rev" — i.e., they alias to
+    # the conversation that's about to gain its own outgoing alias.
+    composite.save_conversation_alias("upstream-a", "src-rev")
+    composite.save_conversation_alias("upstream-b", "src-rev")
+
+    received: list[dict] = []
+    composite.save_conversation_alias(
+        "src-rev", "tgt-rev",
+        on_committed=lambda e: received.append(dict(e)),
+    )
+    assert len(received) == 1
+    event = received[0]
+    # alias_created event payload's reverse_dependents covers the
+    # incoming-edge graph of the alias source (NOT the new target's
+    # graph — see plan S7 alias_created event shape).
+    assert sorted(event["reverse_dependents"]) == ["upstream-a", "upstream-b"]
+
+
+# ---------------------------------------------------------------------------
+# S8 — Post-commit registry (scoped) defers callback until outer commit
+# ---------------------------------------------------------------------------
+
+
+def test_post_commit_scope_defers_callback_until_outer_commit(tmp_path) -> None:
+    """Inside an `_alias_post_commit_scope`, save_conversation_alias must
+    register the callback rather than fire it; the callback fires only
+    when the scope's flush helper runs after the outer commit."""
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    fired: list[str] = []
+
+    conn = sqlite._get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with sqlite._alias_post_commit_scope(conn) as scope:
+            composite.save_conversation_alias(
+                "src-scoped", "tgt-scoped",
+                on_committed=lambda e: fired.append(e["source"]),
+            )
+            # Callback has NOT fired yet — registered on the scope.
+            assert fired == []
+            assert len(scope["hooks"]) == 1
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    # After outer commit: flush manually (the merge body wires the flush
+    # itself; tests exercise the contract directly).
+    sqlite._flush_post_commit_hooks(scope)
+    assert fired == ["src-scoped"]
+
+
+def test_post_commit_scope_discards_hooks_on_rollback(tmp_path) -> None:
+    """If the outer transaction rolls back, the registered hooks must be
+    abandoned (callback never fires)."""
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    fired: list[str] = []
+
+    conn = sqlite._get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with sqlite._alias_post_commit_scope(conn) as scope:
+            composite.save_conversation_alias(
+                "src-rb", "tgt-rb",
+                on_committed=lambda e: fired.append(e["source"]),
+            )
+            # Force rollback.
+            raise RuntimeError("simulated merge body failure")
+    except RuntimeError:
+        conn.execute("ROLLBACK")
+        scope["hooks"].clear()  # merge body's finally clears the queue
+
+    # No flush after rollback. Even if a buggy caller flushed an empty
+    # queue, no callback fires.
+    sqlite._flush_post_commit_hooks(scope)
+    assert fired == []
+    # Row was never committed.
+    assert composite.resolve_conversation_alias("src-rb") is None
+
+
+# ---------------------------------------------------------------------------
+# S9 — VCATTACH execute_attach forwards cross_worker_invalidate
+# ---------------------------------------------------------------------------
+
+
+def test_execute_attach_forwards_cross_worker_invalidate(tmp_path) -> None:
+    """``execute_attach`` passes ``cross_worker_invalidate`` down to BOTH
+    delete_conversation_alias (clearing the reverse alias) and
+    save_conversation_alias (registering the new alias) as
+    ``on_committed=``. Each store-side call fires the callback once; the
+    callback observes the engine-side AliasEvent payload (no tenant_id)."""
+    from virtual_context.proxy.vcattach import execute_attach
+
+    composite, _ = _build_sqlite_store(tmp_path)
+    # Pre-existing alias on the new target so the delete leg has work
+    # to do.
+    composite.save_conversation_alias("tgt-vcattach", "old-target")
+    received: list[dict] = []
+
+    execute_attach(
+        old_id="src-vcattach",
+        target_id="tgt-vcattach",
+        store=composite,
+        cross_worker_invalidate=lambda e: received.append(dict(e)),
+    )
+
+    types = [e["type"] for e in received]
+    # Expect the delete leg's alias_deleted (clearing tgt-vcattach's
+    # reverse alias) followed by the save leg's alias_created.
+    assert types == ["alias_deleted", "alias_created"]
+
+    deleted_event = received[0]
+    assert deleted_event["alias_id"] == "tgt-vcattach"
+    created_event = received[1]
+    assert created_event["source"] == "src-vcattach"
+    assert created_event["target"] == "tgt-vcattach"
+    # Final state: src-vcattach -> tgt-vcattach; tgt-vcattach has no alias.
+    assert composite.resolve_conversation_alias("src-vcattach") == "tgt-vcattach"
+    assert composite.resolve_conversation_alias("tgt-vcattach") is None
+
+
+def test_execute_attach_propagates_invalidation_failed_error(tmp_path) -> None:
+    """When the cross_worker_invalidate callback raises
+    InvalidationFailedError, ``execute_attach`` re-raises so the REST
+    handler can surface a retryable 503. The alias row is already
+    committed at the moment the exception is raised."""
+    from virtual_context.core.exceptions import InvalidationFailedError
+    from virtual_context.proxy.vcattach import execute_attach
+
+    composite, _ = _build_sqlite_store(tmp_path)
+
+    def _cb(event):
+        if event["type"] == "alias_created":
+            raise InvalidationFailedError(
+                event=event, cause=ConnectionError("redis offline"),
+            )
+
+    with pytest.raises(InvalidationFailedError):
+        execute_attach(
+            old_id="src-vcattach-fail",
+            target_id="tgt-vcattach-fail",
+            store=composite,
+            cross_worker_invalidate=_cb,
+        )
+    # Row is durable: at-least-once contract — retry will fire callback again.
+    assert composite.resolve_conversation_alias(
+        "src-vcattach-fail",
+    ) == "tgt-vcattach-fail"
+
+
+# ---------------------------------------------------------------------------
+# S10 — VCMERGE post-commit invalidation wiring
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the merge body's alias UPSERT through the post-
+# commit scope: callback fires AFTER the outer transaction commits, and
+# callback failure logs WARNING + emits ``vcmerge_invalidation_failed``
+# without changing merge success. Full multi-row VCMERGE replay is
+# covered by tests/test_merge_body_*.py — these tests stay narrow on
+# the alias-write + callback contract.
+
+
+def _seed_vcmerge_preconditions(
+    sqlite_store, *, tenant_id: str, source_id: str, target_id: str,
+    merge_id: str, expected_target_epoch: int = 1,
+) -> None:
+    """Seed the minimum DB rows the merge body needs to run end-to-end:
+    `conversations` rows for source + target (active, current epoch) and
+    a `merge_audit` row in `in_progress`."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite_store._get_conn()
+    for cid in (source_id, target_id):
+        conn.execute(
+            """INSERT OR REPLACE INTO conversations
+               (conversation_id, tenant_id, lifecycle_epoch, phase, deleted_at,
+                created_at, updated_at)
+               VALUES (?, ?, ?, 'active', NULL, ?, ?)""",
+            (cid, tenant_id, expected_target_epoch, now, now),
+        )
+    conn.execute(
+        """INSERT INTO merge_audit
+           (merge_id, tenant_id, source_conversation_id,
+            target_conversation_id, status,
+            source_label_at_merge, started_at)
+           VALUES (?, ?, ?, ?, 'in_progress', '', ?)""",
+        (merge_id, tenant_id, source_id, target_id, now),
+    )
+    conn.commit()
+
+
+def test_merge_body_alias_write_fires_invalidation_callback(tmp_path) -> None:
+    """The merge body's alias UPSERT fires
+    ``cross_worker_invalidate`` AFTER the outer transaction commits.
+    Callback observes an alias_created event for source -> target with
+    the row already visible."""
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    _seed_vcmerge_preconditions(
+        sqlite,
+        tenant_id="t1",
+        source_id="merge-src",
+        target_id="merge-tgt",
+        merge_id="merge-id-1",
+    )
+
+    received: list[dict] = []
+
+    def _cb(event):
+        received.append(dict(event))
+        # Row visible at callback time -> outer commit completed first.
+        assert composite.resolve_conversation_alias("merge-src") == "merge-tgt"
+
+    sqlite.merge_conversation_data(
+        merge_id="merge-id-1",
+        tenant_id="t1",
+        source_conversation_id="merge-src",
+        target_conversation_id="merge-tgt",
+        sort_key_offset=0.0,
+        request_turn_offset=0,
+        expected_target_lifecycle_epoch=1,
+        source_label_at_merge="src-label",
+        cross_worker_invalidate=_cb,
+    )
+
+    assert len(received) == 1
+    assert received[0]["type"] == "alias_created"
+    assert received[0]["source"] == "merge-src"
+    assert received[0]["target"] == "merge-tgt"
+
+
+def test_merge_body_invalidation_callback_failure_does_not_break_merge(
+    tmp_path, caplog,
+) -> None:
+    """When ``cross_worker_invalidate`` raises ``InvalidationFailedError``
+    after the outer commit, the merge MUST return success (the merge is
+    durable) and the failure MUST be logged at WARNING with the
+    structured fields per spec.
+    """
+    import logging
+    from virtual_context.core.exceptions import InvalidationFailedError
+
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    _seed_vcmerge_preconditions(
+        sqlite,
+        tenant_id="t1",
+        source_id="merge-src-fail",
+        target_id="merge-tgt-fail",
+        merge_id="merge-id-fail",
+    )
+
+    def _cb(event):
+        raise InvalidationFailedError(
+            event=event, cause=ConnectionError("redis flapping"),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="virtual_context.storage.sqlite"):
+        stats = sqlite.merge_conversation_data(
+            merge_id="merge-id-fail",
+            tenant_id="t1",
+            source_conversation_id="merge-src-fail",
+            target_conversation_id="merge-tgt-fail",
+            sort_key_offset=0.0,
+            request_turn_offset=0,
+            expected_target_lifecycle_epoch=1,
+            source_label_at_merge="src-label",
+            cross_worker_invalidate=_cb,
+        )
+
+    # Merge committed despite callback failure.
+    assert stats.source_conversation_id == "merge-src-fail"
+    assert stats.target_conversation_id == "merge-tgt-fail"
+    assert composite.resolve_conversation_alias(
+        "merge-src-fail",
+    ) == "merge-tgt-fail"
+
+    # WARNING surfaced for ops with the structured fields.
+    matching = [
+        rec for rec in caplog.records
+        if "vcmerge invalidation failed" in rec.getMessage().lower()
+    ]
+    assert matching, f"Expected vcmerge invalidation WARNING; got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_alias_deleted_event_includes_reverse_dependents(tmp_path) -> None:
+    """``delete_conversation_alias`` event payload includes
+    ``reverse_dependents`` — the alias ids that pointed at the cleared
+    row's source. Captured BEFORE the DELETE so the BFS sees pre-delete
+    incoming-edge state.
+    """
+    composite, _ = _build_sqlite_store(tmp_path)
+    # Seed: nephew-a / nephew-b alias to src-del; src-del aliases to tgt.
+    composite.save_conversation_alias("nephew-a", "src-del-rev")
+    composite.save_conversation_alias("nephew-b", "src-del-rev")
+    composite.save_conversation_alias("src-del-rev", "tgt-x")
+
+    received: list[dict] = []
+    composite.delete_conversation_alias(
+        "src-del-rev",
+        on_committed=lambda e: received.append(dict(e)),
+    )
+    assert len(received) == 1
+    event = received[0]
+    assert event["type"] == "alias_deleted"
+    assert event["alias_id"] == "src-del-rev"
+    assert sorted(event["reverse_dependents"]) == ["nephew-a", "nephew-b"]
+
+
+def test_vcattach_refuses_cross_tenant_source(tmp_path) -> None:
+    """REST handler S10 source-tenant gate: when the calling source
+    ``conversation_id`` belongs to a different tenant than the
+    request's ``tenant_id``, refuse with the source-tenant envelope
+    BEFORE writing any alias.
+
+    Closes W6 invariant: prevents a misroute / replay / hostile path
+    from creating an alias whose source is owned by another tenant.
+    The same ``is_attachable_target`` predicate that gates the target
+    via ``_target_exists`` also gates the source here for symmetry.
+    """
+    import json
+    from types import SimpleNamespace
+
+    from virtual_context.proxy import handlers
+
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    # Seed: source belongs to tenant-A, target belongs to tenant-B.
+    _seed_attachable_target(composite, "src-st-cross", tenant_id="tenant-A")
+    _seed_attachable_target(composite, "tgt-st-cross", tenant_id="tenant-B")
+
+    # Build a minimal engine handle so the handler can reach
+    # `state.engine._store` without spinning up a real engine.
+    engine_stub = SimpleNamespace(_store=composite)
+    state = SimpleNamespace(engine=engine_stub, request=None)
+
+    # Registry stub — attach path needs labels + conv_ids from the
+    # tenant-scoped registry; the session state provider attributes are
+    # only consulted during ``_invalidate``, which the gate prevents.
+    class _StubRegistry:
+        def get_conversation_labels(self, tenant_id):
+            return {"tgt-st-cross": "TARGET-LABEL"}
+
+        def list_persisted_conversation_ids(self, tenant_id):
+            return ["tgt-st-cross"]
+
+        _lock = None
+        _states = None
+        _session_state_provider = None
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="TARGET-LABEL",
+        conversation_id="src-st-cross",
+    )
+
+    response = handlers._handle_vc_command_rest(
+        result, state, _StubRegistry(),
+        tenant_id="tenant-B",  # mismatched against source tenant-A
+        vcconv=None,
+    )
+    payload = json.loads(response.body)
+    assert payload["error"] == "source conversation does not belong to this tenant"
+    assert payload["message"] == payload["error"]
+    assert payload["vc_command"] == "attach"
+    assert payload["conversation_id"] == "src-st-cross"
+    # No alias was written.
+    assert composite.resolve_conversation_alias("src-st-cross") is None
+
+
+def test_merge_body_post_commit_callback_does_not_fire_on_rollback(
+    tmp_path,
+) -> None:
+    """If the merge body raises BEFORE the outer COMMIT (e.g.,
+    LifecycleEpochMismatch), the registered post-commit callback MUST
+    NOT fire (the alias row never persisted)."""
+    from virtual_context.core.exceptions import LifecycleEpochMismatch
+
+    composite, sqlite = _build_sqlite_store(tmp_path)
+    _seed_vcmerge_preconditions(
+        sqlite,
+        tenant_id="t1",
+        source_id="merge-rb-src",
+        target_id="merge-rb-tgt",
+        merge_id="merge-rb-id",
+        expected_target_epoch=1,
+    )
+
+    fired: list[dict] = []
+
+    def _cb(event):
+        fired.append(dict(event))
+
+    # Pass an INTENTIONALLY WRONG epoch so the merge body's pre-flight
+    # epoch check raises and the outer transaction rolls back.
+    with pytest.raises(LifecycleEpochMismatch):
+        sqlite.merge_conversation_data(
+            merge_id="merge-rb-id",
+            tenant_id="t1",
+            source_conversation_id="merge-rb-src",
+            target_conversation_id="merge-rb-tgt",
+            sort_key_offset=0.0,
+            request_turn_offset=0,
+            expected_target_lifecycle_epoch=999,  # mismatch
+            source_label_at_merge="src-label",
+            cross_worker_invalidate=_cb,
+        )
+
+    assert fired == []
+    # Alias never committed.
+    assert composite.resolve_conversation_alias("merge-rb-src") is None

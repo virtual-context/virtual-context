@@ -406,6 +406,7 @@ class VirtualContextEngine:
         source_lifecycle_epoch: int,
         target_lifecycle_epoch: int,
         source_label_at_merge: str,
+        cross_worker_invalidate=None,
     ):
         """Phase A merge entry. Called by cloud's handle_vc_merge_cloud
         AFTER reservation succeeds; this method validates cross-tenant +
@@ -522,6 +523,7 @@ class VirtualContextEngine:
             expected_source_lifecycle_epoch=source_lifecycle_epoch,
             expected_target_lifecycle_epoch=target_lifecycle_epoch,
             source_label_at_merge=source_label_at_merge,
+            cross_worker_invalidate=cross_worker_invalidate,
         )
 
     def close(self) -> None:
