@@ -642,6 +642,19 @@ class CompositeStore:
             return str(fn(conversation_id))
         raise KeyError(conversation_id)
 
+    def is_attachable_target(
+        self,
+        *,
+        conversation_id: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        fn = getattr(self._segments, "is_attachable_target", None)
+        if not callable(fn):
+            # Backend pre-dates the predicate; fall back to permissive so
+            # VCATTACH gating callers can decide their own fail-open policy.
+            return True
+        return bool(fn(conversation_id=conversation_id, tenant_id=tenant_id))
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         fn = getattr(self._segments, "mark_conversation_deleted", None)
         if callable(fn):

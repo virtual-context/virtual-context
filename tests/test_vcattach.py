@@ -841,7 +841,7 @@ def test_proxy_vcattach_rejects_label_pointing_to_deleted_target():
     from virtual_context.proxy.formats import detect_format
 
     inner = MagicMock()
-    inner.load_engine_state.return_value = None
+    inner.is_attachable_target.return_value = False
     state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
     registry = SimpleNamespace(remove_conversation=lambda cid: None)
     result = SimpleNamespace(
@@ -901,3 +901,313 @@ def test_proxy_vcattach_evicts_issuing_chat_state():
         "the next request from this chat keeps routing to the stale state."
     )
     assert "target-conv" in invalidated
+
+
+# ---------------------------------------------------------------------
+# Store.is_attachable_target predicate — VCATTACH liveness gate
+# ---------------------------------------------------------------------
+# Replaces the post-cutover-empty engine_state row check. The
+# predicate denies for missing / soft-deleted (deleted_at) /
+# phase IN ('deleted','merged') / cross-tenant; allows for
+# active/init/ingesting/compacting rows in the matching tenant.
+
+
+def _seed_conversation(
+    store, *, conversation_id: str, tenant_id: str,
+    phase: str = "active", deleted_at: str | None = None,
+) -> None:
+    """Insert a row into ``conversations`` with the requested liveness fields.
+
+    Uses the store's own pool/connection seam so the new row participates in
+    the same transactional view as ``is_attachable_target`` reads.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = store._get_conn()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO conversations (
+            conversation_id, tenant_id, lifecycle_epoch, phase,
+            pending_raw_payload_entries, last_raw_payload_entries,
+            last_ingestible_payload_entries,
+            created_at, updated_at, deleted_at
+        ) VALUES (?, ?, 1, ?, 0, 0, 0, ?, ?, ?)
+        """,
+        (conversation_id, tenant_id, phase, now, now, deleted_at),
+    )
+    conn.commit()
+
+
+def test_is_attachable_target_active_no_tenant(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-active",
+                       tenant_id="t1", phase="active")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-active") is True
+
+
+def test_is_attachable_target_active_tenant_match(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-active",
+                       tenant_id="t1", phase="active")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-active", tenant_id="t1") is True
+
+
+def test_is_attachable_target_cross_tenant_denied(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-active",
+                       tenant_id="t1", phase="active")
+    # Same conv id, different tenant → must deny so a stale label can't
+    # bridge across tenants.
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-active", tenant_id="t2") is False
+
+
+def test_is_attachable_target_phase_deleted(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-del",
+                       tenant_id="t1", phase="deleted")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-del", tenant_id="t1") is False
+
+
+def test_is_attachable_target_phase_merged(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-merged",
+                       tenant_id="t1", phase="merged")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-merged", tenant_id="t1") is False
+
+
+def test_is_attachable_target_soft_deleted_via_deleted_at(sqlite_store):
+    """phase='active' but deleted_at non-null = soft-deleted in transit
+    (e.g. the deletion flow stamped deleted_at before flipping phase)."""
+    now = datetime.now(timezone.utc).isoformat()
+    _seed_conversation(sqlite_store, conversation_id="c-soft",
+                       tenant_id="t1", phase="active", deleted_at=now)
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-soft", tenant_id="t1") is False
+
+
+def test_is_attachable_target_missing_row(sqlite_store):
+    assert sqlite_store.is_attachable_target(
+        conversation_id="never-existed", tenant_id="t1") is False
+
+
+def test_is_attachable_target_empty_conversation_id(sqlite_store):
+    """Defensive: empty string must not match anything."""
+    assert sqlite_store.is_attachable_target(
+        conversation_id="", tenant_id="t1") is False
+
+
+def test_is_attachable_target_phase_init_attachable(sqlite_store):
+    """phase='init' is a freshly-created conversation; still a valid attach
+    target (it owns its own identity even before first ingest)."""
+    _seed_conversation(sqlite_store, conversation_id="c-init",
+                       tenant_id="t1", phase="init")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-init", tenant_id="t1") is True
+
+
+def test_is_attachable_target_phase_ingesting_attachable(sqlite_store):
+    _seed_conversation(sqlite_store, conversation_id="c-ing",
+                       tenant_id="t1", phase="ingesting")
+    assert sqlite_store.is_attachable_target(
+        conversation_id="c-ing", tenant_id="t1") is True
+
+
+# ---------------------------------------------------------------------
+# Regression: prod symptom 2026-05-09 — active conv with no engine_state
+# ---------------------------------------------------------------------
+# Pre-fix: _target_exists consulted load_engine_state(tid) which is empty
+# across every REST-only tenant in the post-cutover schema, so VCATTACH
+# rejected every legitimate target ("the conversation has no persisted
+# state"). Post-fix: the conversations row is the liveness signal.
+
+
+def test_rest_vcattach_attaches_when_engine_state_empty(sqlite_store):
+    """REST VCATTACH against an active target must succeed even when no
+    engine_state row exists — covers REST-only ingest tenants whose
+    session-state save path was never invoked."""
+    import json as _json
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    # Active target with NO engine_state row. The new predicate reads
+    # ``conversations`` directly.
+    _seed_conversation(sqlite_store, conversation_id="target-conv",
+                       tenant_id="tenant-1", phase="active")
+    _seed_conversation(sqlite_store, conversation_id="old-conv",
+                       tenant_id="tenant-1", phase="active")
+
+    state = SimpleNamespace(engine=SimpleNamespace(
+        _store=SimpleNamespace(_store=sqlite_store)))
+
+    registry, provider = _build_rest_registry(
+        labels={"target-conv": "Telegram Group"},
+        conv_ids=["old-conv", "target-conv"],
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram Group",
+        conversation_id="old-conv",
+    )
+
+    response = _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+    body = _json.loads(response.body)
+
+    # No error: the active target with no engine_state is attachable.
+    assert not body.get("error"), (
+        f"VCATTACH unexpectedly rejected active target with no engine_state row; "
+        f"response was: {body}"
+    )
+    # Alias row written for the durable redirect.
+    assert sqlite_store.resolve_conversation_alias("old-conv") == "target-conv"
+
+
+def test_proxy_vcattach_attaches_when_engine_state_empty(sqlite_store):
+    """Proxy path mirror of the REST regression — no engine_state row,
+    active conversations row, attach must succeed."""
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    _seed_conversation(sqlite_store, conversation_id="target-conv",
+                       tenant_id="tenant-1", phase="active")
+
+    state = SimpleNamespace(engine=SimpleNamespace(
+        _store=SimpleNamespace(_store=sqlite_store)))
+    registry = SimpleNamespace(remove_conversation=lambda cid: None)
+
+    result = SimpleNamespace(
+        vcattach_label="target-conv",
+        conversation_id="old-conv",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH target-conv"}],
+    })
+
+    asyncio.run(
+        _handle_vcattach(
+            result, fmt, state, registry,
+            labels={},
+            conv_ids=["old-conv", "target-conv"],
+            tenant_id="tenant-1",
+        )
+    )
+
+    assert sqlite_store.resolve_conversation_alias("old-conv") == "target-conv"
+
+
+def test_rest_vcattach_rejects_merged_source(sqlite_store):
+    """A merged source is a tombstone whose content is at the merge target;
+    re-attaching to it would graft an alias onto a corpse. Must refuse."""
+    import json as _json
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    _seed_conversation(sqlite_store, conversation_id="merged-src",
+                       tenant_id="tenant-1", phase="merged")
+    _seed_conversation(sqlite_store, conversation_id="old-conv",
+                       tenant_id="tenant-1", phase="active")
+
+    state = SimpleNamespace(engine=SimpleNamespace(
+        _store=SimpleNamespace(_store=sqlite_store)))
+
+    registry, _provider = _build_rest_registry(
+        labels={"merged-src": "Old Topic"},
+        conv_ids=["old-conv", "merged-src"],
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Old Topic",
+        conversation_id="old-conv",
+    )
+
+    response = _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+    body = _json.loads(response.body)
+
+    assert body.get("error"), "expected error response for merged source"
+    # No alias row written.
+    assert sqlite_store.resolve_conversation_alias("old-conv") is None
+
+
+def test_rest_vcattach_rejects_cross_tenant_target(sqlite_store):
+    """A label resolved to a conversation owned by a different tenant must
+    be denied so a stale labels.json entry cannot bridge tenants."""
+    import json as _json
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    # Target lives in tenant-OTHER, attacker is tenant-1.
+    _seed_conversation(sqlite_store, conversation_id="other-tenant-conv",
+                       tenant_id="tenant-OTHER", phase="active")
+    _seed_conversation(sqlite_store, conversation_id="old-conv",
+                       tenant_id="tenant-1", phase="active")
+
+    state = SimpleNamespace(engine=SimpleNamespace(
+        _store=SimpleNamespace(_store=sqlite_store)))
+
+    # tenant-1's labels.json points (incorrectly / maliciously) to a conv
+    # that belongs to tenant-OTHER. The list_persisted_conversation_ids
+    # returns it because tenant-1's labels.json has it; the conversations
+    # table predicate is the cross-tenant safety net.
+    registry, _provider = _build_rest_registry(
+        labels={"other-tenant-conv": "Some Label"},
+        conv_ids=["old-conv", "other-tenant-conv"],
+    )
+
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Some Label",
+        conversation_id="old-conv",
+    )
+
+    response = _handle_vc_command_rest(
+        result, state, registry, tenant_id="tenant-1", vcconv="old-conv",
+    )
+    body = _json.loads(response.body)
+
+    assert body.get("error"), "expected cross-tenant attach to be rejected"
+    assert sqlite_store.resolve_conversation_alias("old-conv") is None
+
+
+# ---------------------------------------------------------------------
+# Multi-worker concurrency: two threads VCATTACH the same source
+# ---------------------------------------------------------------------
+# conversation_aliases.alias_id is PK; concurrent UPSERTs serialize cleanly
+# with last-write-wins. No constraint violation; final state is one of the
+# two target ids.
+
+
+def test_concurrent_save_conversation_alias_no_constraint_violation(sqlite_store):
+    """Last-write-wins under contention; no constraint violation. Models the
+    multi-worker safety claim of the rigor pass."""
+    import threading
+
+    _seed_conversation(sqlite_store, conversation_id="t-a",
+                       tenant_id="t1", phase="active")
+    _seed_conversation(sqlite_store, conversation_id="t-b",
+                       tenant_id="t1", phase="active")
+
+    errors: list[BaseException] = []
+
+    def _attach(target_id: str) -> None:
+        try:
+            sqlite_store.save_conversation_alias("src", target_id)
+        except BaseException as exc:  # noqa: BLE001 — capture any race
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_attach, args=("t-a",)),
+        threading.Thread(target=_attach, args=("t-b",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"unexpected errors under contention: {errors!r}"
+    final = sqlite_store.resolve_conversation_alias("src")
+    assert final in {"t-a", "t-b"}, (
+        f"final alias target must be one of the contenders, got {final!r}"
+    )
