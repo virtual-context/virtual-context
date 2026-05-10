@@ -1133,3 +1133,17 @@ class ContextStore(ABC):
         conversation_id: str | None = None,
     ) -> list[dict]:
         return []
+
+    def list_conversation_aliases_by_target(self, target_id: str) -> list[str]:
+        """Return alias ids whose outgoing alias currently points at *target_id*.
+
+        Default implementation returns ``[]`` so custom Store backends
+        without the new method continue to function.
+        ``virtual_context.core.alias_resolution.compute_reverse_dependents``
+        treats this empty result as "no incoming aliases known" and
+        produces an empty ``reverse_dependents`` field on the
+        cross-worker invalidation event payload. Built-in SQLite,
+        Postgres, filesystem, and composite stores override with real
+        implementations.
+        """
+        return []

@@ -954,6 +954,19 @@ class FilesystemStore(ContextStore):
             del self._vcattach_aliases[alias_id]
             self._save_vcattach_aliases()
 
+    def list_conversation_aliases_by_target(self, target_id: str) -> list[str]:
+        """Return alias ids whose outgoing alias currently points at *target_id*.
+
+        Sorted ascending by ``alias_id`` for deterministic event payloads.
+        Filesystem fixtures exercise the same reverse-dependent logic as
+        the SQL backends even though the implementation scans
+        ``_vcattach_aliases`` linearly (single-process; no index needed).
+        """
+        return sorted(
+            alias for alias, target in self._vcattach_aliases.items()
+            if target == target_id
+        )
+
     # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------

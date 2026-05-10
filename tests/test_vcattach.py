@@ -426,12 +426,18 @@ def test_execute_attach_no_longer_accepts_reset_engine_state():
 
     # Stronger guard: assert the entire parameter set is the expected
     # non-destructive shape. Any new kwarg added here triggers explicit
-    # review.
+    # review. ``cross_worker_invalidate`` was added by engine commit-2
+    # for cross-worker cache invalidation: it forwards an
+    # observer-only ``AliasEvent`` callback to
+    # ``save_conversation_alias`` / ``delete_conversation_alias`` and
+    # cannot mutate or destroy persisted state. The guard is preserved
+    # so any FUTURE kwarg still triggers review.
     assert set(sig.parameters.keys()) == {
         "old_id",
         "target_id",
         "store",
         "registry_invalidate",
+        "cross_worker_invalidate",
     }
 
 
