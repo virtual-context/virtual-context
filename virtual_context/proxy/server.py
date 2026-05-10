@@ -104,6 +104,15 @@ _PROTECTED_BREAKDOWN_LOG_THRESHOLD_TOKENS = 50_000
 # ---------------------------------------------------------------------------
 
 
+class _RebindSkipped(Exception):
+    """Internal sentinel raised by the lossless-restart path when an
+    `EngineConstructionError` (alias chain corrupt, target unattachable,
+    or transient store error) is caught. The outer try/except converts
+    this into a clean skip: registry slot stays empty for this source,
+    and the next request through that source triggers fresh `__init__`
+    resolution via `SessionRegistry.get_or_create`. Per spec E2."""
+
+
 def _compute_effective_budget(
     context_window: int,
     system_tokens: int,
@@ -2272,6 +2281,13 @@ def create_app(
             # Lossless restart: if engine has no persisted state for its
             # auto-generated conversation_id, try loading the most recent conversation.
             # This avoids re-ingestion on proxy restart.
+            #
+            # Per engine-alias-resolution spec S5: walk any alias chain on
+            # the loaded conversation_id BEFORE binding state. The
+            # `execute_attach` flow does not save a new engine_state for
+            # the post-VCATTACH source, so `load_latest_engine_state` can
+            # return an alias source on restart; defensive resolve binds
+            # to the terminal target.
             if (
                 hasattr(engine, '_store')
                 and hasattr(engine._store, 'load_latest_engine_state')
@@ -2284,40 +2300,112 @@ def create_app(
                         and isinstance(getattr(latest, 'turn_tag_entries', None), list)
                         and latest.turn_tag_entries
                     ):
+                        # Resolve alias chain on the latest.conversation_id
+                        # against the raw store (unwrap ConversationStoreView).
+                        # On EngineConstructionError per spec E2:
+                        # WARN + skip rebind, do NOT crash. Engine simply
+                        # ends startup without a pre-warmed entry; the
+                        # next request through that source triggers fresh
+                        # `__init__` resolution from `SessionRegistry.get_or_create`.
+                        from ..core.alias_resolution import (
+                            AliasResolutionError,
+                            walk_conversation_alias_chain,
+                        )
+                        from ..core.exceptions import EngineConstructionError
+
+                        _raw_store = getattr(engine._store, '_store', engine._store)
+                        _source_id = latest.conversation_id
+                        try:
+                            try:
+                                _resolved = walk_conversation_alias_chain(
+                                    _raw_store, _source_id,
+                                )
+                            except AliasResolutionError as _exc:
+                                raise EngineConstructionError(
+                                    reason=_exc.reason,
+                                    source_id=_source_id,
+                                    chain=_exc.chain,
+                                ) from _exc
+                            except Exception as _exc:
+                                raise EngineConstructionError(
+                                    reason="transient_store_error",
+                                    source_id=_source_id,
+                                ) from _exc
+
+                            _is_attachable = getattr(
+                                _raw_store, "is_attachable_target", None,
+                            )
+                            if callable(_is_attachable):
+                                try:
+                                    _ok = bool(_is_attachable(
+                                        conversation_id=_resolved,
+                                        tenant_id=getattr(
+                                            engine.config, "tenant_id", None,
+                                        ) or None,
+                                    ))
+                                except Exception as _exc:
+                                    raise EngineConstructionError(
+                                        reason="transient_store_error",
+                                        source_id=_source_id,
+                                        target_id=_resolved,
+                                    ) from _exc
+                                if not _ok:
+                                    raise EngineConstructionError(
+                                        reason="alias_target_unattachable",
+                                        source_id=_source_id,
+                                        target_id=_resolved,
+                                    )
+                        except EngineConstructionError as _ec:
+                            logger.warning(
+                                "Lossless restart rebind refused",
+                                extra={
+                                    "event": "lossless_restart_rebind_refused",
+                                    "reason": _ec.reason,
+                                    "source_id": _ec.source_id[:12],
+                                    "target_id": _ec.target_id[:12],
+                                    "chain_prefix": [c[:12] for c in _ec.chain],
+                                },
+                            )
+                            # Skip rebind for this engine; registry slot stays
+                            # empty for this source. Next request through that
+                            # source triggers fresh __init__ resolution.
+                            raise _RebindSkipped()
+
+                        if _resolved != _source_id:
+                            logger.info(
+                                "Lossless restart alias resolved: %s → %s",
+                                _source_id[:12], _resolved[:12],
+                            )
+
                         # Try Redis first for the restored conversation ID
                         _redis_hit = False
                         if session_cache and session_cache.is_available():
-                            _cached = session_cache.load_snapshot(latest.conversation_id)
-                            if _cached and _cached.get("conversation_id") == latest.conversation_id:
-                                engine.config.conversation_id = latest.conversation_id
+                            _cached = session_cache.load_snapshot(_resolved)
+                            if _cached and _cached.get("conversation_id") == _resolved:
+                                engine.config.conversation_id = _resolved
                                 engine._apply_cached_state(_cached)
+                                engine._refresh_conversation_binding_after_rebind(_raw_store)
                                 engine._apply_persisted_state_to_delegates()
                                 engine._bootstrap_vocabulary()
-                                engine._init_retriever()
-                                if hasattr(engine, '_retrieval'):
-                                    engine._retrieval._retriever = engine._retriever
-                                if hasattr(engine, '_paging'):
-                                    engine._paging._conversation_id = engine.config.conversation_id
                                 _redis_hit = True
                                 logger.info(
                                     "Lossless restart: restored from Redis (conv=%s, version=%s)",
-                                    latest.conversation_id[:12], _cached.get("version", "?"),
+                                    _resolved[:12], _cached.get("version", "?"),
                                 )
 
                         if not _redis_hit:
-                            engine.config.conversation_id = latest.conversation_id
+                            engine.config.conversation_id = _resolved
                             engine._load_persisted_state()
+                            engine._refresh_conversation_binding_after_rebind(_raw_store)
                             engine._apply_persisted_state_to_delegates()
                             engine._bootstrap_vocabulary()
-                            engine._init_retriever()
-                            if hasattr(engine, '_retrieval'):
-                                engine._retrieval._retriever = engine._retriever
-                            if hasattr(engine, '_paging'):
-                                engine._paging._conversation_id = engine.config.conversation_id
                             logger.info(
                                 "Lossless restart: restored from store (conv=%s, %d turns)",
-                                latest.conversation_id[:12], len(latest.turn_tag_entries),
+                                _resolved[:12], len(latest.turn_tag_entries),
                             )
+                except _RebindSkipped:
+                    # Already logged above; skip rebind cleanly.
+                    pass
                 except Exception as _e:
                     logger.info("Lossless restart failed: %s", _e)
 

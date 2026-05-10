@@ -154,7 +154,69 @@ class VirtualContextEngine:
         self.progress_event_bus = ProgressEventBus()
         # Initialize components
         self._turn_tag_index = TurnTagIndex()
-        self._init_store()
+
+        # Build the raw store first so we can resolve aliases against it.
+        # Per engine-alias-resolution spec (Layer 2 + Option A wrap-site):
+        # alias resolution lives in engine `__init__`, runs BEFORE
+        # `_init_store_view` so every captured `conversation_id` /
+        # `_conversation_generation` downstream binds to the resolved
+        # terminal target. Transport layers stay pass-through.
+        from .core.alias_resolution import (
+            AliasResolutionError,
+            walk_conversation_alias_chain,
+        )
+        from .core.exceptions import EngineConstructionError
+
+        _raw_store = self._build_raw_store()
+        _raw_conv_id = self.config.conversation_id
+        if _raw_conv_id:
+            try:
+                _resolved = walk_conversation_alias_chain(_raw_store, _raw_conv_id)
+            except AliasResolutionError as exc:
+                raise EngineConstructionError(
+                    reason=exc.reason,
+                    source_id=_raw_conv_id,
+                    chain=exc.chain,
+                ) from exc
+            except Exception as exc:
+                raise EngineConstructionError(
+                    reason="transient_store_error",
+                    source_id=_raw_conv_id,
+                ) from exc
+            if _resolved != _raw_conv_id:
+                # Verify the terminal is attachable (deleted/merged/cross-tenant).
+                # `is_attachable_target` was added in d2691c7 with signature:
+                #   is_attachable_target(*, conversation_id: str,
+                #                        tenant_id: str | None = None) -> bool
+                # Defensive `getattr` matches the d2691c7 fallback semantics
+                # for stores that pre-date the predicate.
+                _is_attachable = getattr(_raw_store, "is_attachable_target", None)
+                if callable(_is_attachable):
+                    try:
+                        _ok = bool(_is_attachable(
+                            conversation_id=_resolved,
+                            tenant_id=getattr(self.config, "tenant_id", None) or None,
+                        ))
+                    except Exception as exc:
+                        raise EngineConstructionError(
+                            reason="transient_store_error",
+                            source_id=_raw_conv_id,
+                            target_id=_resolved,
+                        ) from exc
+                    if not _ok:
+                        raise EngineConstructionError(
+                            reason="alias_target_unattachable",
+                            source_id=_raw_conv_id,
+                            target_id=_resolved,
+                        )
+                logger.info(
+                    "Engine alias resolution: %s → %s",
+                    _raw_conv_id[:12], _resolved[:12],
+                )
+                self.config.conversation_id = _resolved
+
+        # Wrap the raw store now that conversation_id is final.
+        self._init_store_view(_raw_store)
         self._init_telemetry()
         self._init_canonicalizer()
         self._init_tag_generator()
@@ -601,7 +663,15 @@ class VirtualContextEngine:
             code_mode=self.config.compactor.code_mode,
         )
 
-    def _init_store(self) -> None:
+    def _build_raw_store(self):
+        """Return the unwrapped CompositeStore (or backend equivalent).
+
+        Extracted from `_init_store` so `VirtualContextEngine.__init__`
+        can perform alias resolution against the raw store BEFORE wrapping
+        in `ConversationStoreView` (which captures `conversation_id` +
+        `generation` at construction time). Per the engine-alias-resolution
+        spec's Option-A wrap-site policy.
+        """
         from .core.composite_store import CompositeStore
         from .storage.noop_fact_link_store import NoopFactLinkStore
 
@@ -661,16 +731,138 @@ class VirtualContextEngine:
         else:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
+        return store
+
+    def _init_store_view(self, raw_store) -> None:
+        """Activate the conversation generation and install the store view.
+
+        Called AFTER alias resolution has finalized
+        `self.config.conversation_id`, so the activated generation and the
+        ConversationStoreView wrap both bind to the resolved terminal id.
+        """
         self._conversation_generation = int(
-            getattr(store, "activate_conversation", lambda _cid: 0)(self.config.conversation_id) or 0
+            getattr(raw_store, "activate_conversation", lambda _cid: 0)(
+                self.config.conversation_id
+            ) or 0
         )
         self._store = ConversationStoreView(
-            store,
+            raw_store,
             self.config.conversation_id,
             self._conversation_generation,
         )
         # Propagate search config to the store for excerpt/snippet lengths
         self._store.search_config = self.config.search
+
+    def _init_store(self) -> None:
+        """Backwards-compat thin wrapper for callers that do not perform
+        alias resolution between the two halves.
+
+        Calls the raw build then immediately wraps. Used by code paths
+        that don't construct via `__init__` (rare; primarily diagnostic
+        / replay). Kept additive so the engine-alias-resolution rollback
+        path is "revert the `__init__` wiring at S4 only" — the helpers
+        stay as harmless additive code.
+        """
+        raw = self._build_raw_store()
+        self._init_store_view(raw)
+
+    def _refresh_conversation_binding_after_rebind(self, raw_store) -> None:
+        """Rebuild conversation-bound wrappers/delegates after a post-init
+        change to `self.config.conversation_id`.
+
+        Called only by the proxy lossless-restart code at
+        `proxy/server.py:2292/2308` after the alias chain has been
+        walked and the resolved terminal id has replaced
+        `self.config.conversation_id`.
+
+        **Precondition**: this engine must NOT yet be published to any
+        request-serving registry (per spec C3 atomicity invariant).
+        Lossless-restart runs during proxy startup before the engine is
+        registered into `SessionRegistry._states`, so by construction no
+        concurrent requests can hold a reference at rebind time. If a
+        future call site violates this invariant, the caller MUST hold
+        an exclusive engine lock spanning the rebind.
+
+        Mirrors the structure of `__init__`'s post-`_init_store_view`
+        block: re-init the per-component wrappers + recreate store-bound
+        delegates + re-point pipeline objects at the rebuilt
+        dependencies. Intentionally broader than the pre-S5 manual patch
+        (`_init_retriever` + `_paging._conversation_id`) because the
+        engine has already completed construction; replacing only the
+        store view would leave existing
+        semantic/search/temporal/retrieval objects holding the old
+        `ConversationStoreView`.
+        """
+        # Wrap the raw store again with the new conversation_id +
+        # freshly-activated generation.
+        self._init_store_view(raw_store)
+
+        # Re-init the per-component wrappers so each captures the
+        # resolved conversation_id (Option-A wrap-site).
+        self._init_canonicalizer()
+        self._init_monitor()
+        self._init_assembler()
+        self._init_retriever()
+
+        # Recreate store-bound delegates that were built in __init__
+        # against the old ConversationStoreView. Local imports mirror
+        # the import sites in __init__ to keep the module-load surface
+        # identical.
+        self._semantic = SemanticSearchManager(
+            store=self._store, config=self.config,
+            embedding_provider=self._embedding_provider,
+        )
+        self._ingest_reconciler = IngestReconciler(self._store, self._semantic)
+        from .core.fact_query import FactQueryEngine
+        self._facts = FactQueryEngine(
+            store=self._store, semantic=self._semantic, config=self.config,
+        )
+        from .core.search_engine import SearchEngine
+        self._search = SearchEngine(
+            store=self._store, semantic=self._semantic,
+            turn_tag_index=self._turn_tag_index, config=self.config,
+        )
+        from .core.temporal_resolver import TemporalResolver
+        self._temporal = TemporalResolver(
+            store=self._store, search_engine=self._search,
+            config=self.config, semantic=self._semantic,
+        )
+        if self._reference_date is not None:
+            self._temporal.reference_date = self._reference_date
+        from .core.tool_query import ToolQueryRunner
+        self._tool_query = ToolQueryRunner(engine=self, config=self.config)
+        self._paging = PagingManager(
+            store=self._store,
+            token_counter=self._token_counter,
+            tag_context_max_tokens=self.config.assembler.tag_context_max_tokens,
+            auto_evict=self.config.paging.auto_evict,
+            paging_enabled=self.config.paging.enabled,
+            conversation_id=self.config.conversation_id,
+        )
+        self._supersession_checker = None
+        self._init_supersession_checker()
+        self._fact_curator = None
+        self._init_fact_curator()
+
+        # Re-point pipeline objects at rebuilt dependencies so they no
+        # longer hold the old ConversationStoreView / semantic / etc.
+        if hasattr(self, "_tagging"):
+            self._tagging.store = self._store
+            self._tagging.semantic = self._semantic
+            self._tagging.canonicalizer = self._canonicalizer
+            self._tagging.monitor = self._monitor
+        if hasattr(self, "_compaction"):
+            self._compaction.store = self._store
+            self._compaction.semantic = self._semantic
+            self._compaction.supersession_checker = self._supersession_checker
+            self._compaction.fact_curator = self._fact_curator
+        if hasattr(self, "_retrieval"):
+            self._retrieval._retriever = self._retriever
+            self._retrieval._assembler = self._assembler
+            self._retrieval._monitor = self._monitor
+            self._retrieval._paging = self._paging
+            self._retrieval._store = self._store
+            self._retrieval._set_semantic(self._semantic)
 
     def _init_monitor(self) -> None:
         self._monitor = ContextMonitor(

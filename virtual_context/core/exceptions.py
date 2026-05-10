@@ -1,15 +1,23 @@
-"""Exception types for the VCMERGE surface.
+"""Exception types for the VCMERGE surface and engine alias resolution.
 
-These exceptions are raised by storage methods and the engine entry point
-in `virtual_context/engine.py::Engine.merge_conversation`. The cloud-side
-REST handler (`vc_cloud/rest_api.py`'s `handle_vc_merge_cloud`) catches
-them and translates each into a dual-populated error envelope per spec
-section 12.9.
+VCMERGE exceptions are raised by storage methods and the engine entry
+point in `virtual_context/engine.py::Engine.merge_conversation`. The
+cloud-side REST handler (`vc_cloud/rest_api.py`'s `handle_vc_merge_cloud`)
+catches them and translates each into a dual-populated error envelope
+per the VCMERGE spec section 12.9. Sub-codes for `MergeBusy` follow that
+spec's section 6.2 classification: `merge_busy_compact`, `merge_busy_ingest`,
+`merge_busy_lock`, etc. The sub-code lets cloud render an actionable
+message rather than a generic "merge busy" string.
 
-Sub-codes for `MergeBusy` follow spec section 6.2's classification:
-`merge_busy_compact`, `merge_busy_ingest`, `merge_busy_lock`, etc. The
-sub-code lets cloud render an actionable message rather than a generic
-"merge busy" string.
+Engine-alias-resolution exceptions (`EngineConstructionError`,
+`InvalidationFailedError`) are raised by `VirtualContextEngine.__init__`,
+the lossless-restart rebind site, the multi-hop walker, and the
+post-commit cross-worker invalidation callback path. Callers (proxy
+SessionRegistry, cloud TenantRegistry, lossless-restart, VCATTACH /
+VCMERGE handlers) catch and surface per spec policy: VCATTACH path
+re-raises `InvalidationFailedError` as a retryable 503; VCMERGE path
+catches + logs WARNING + emits `vcmerge_invalidation_failed` metric and
+returns merge success unconditionally.
 """
 
 from __future__ import annotations
@@ -99,3 +107,74 @@ class SchemaMismatchError(Exception):
     cycle ever leaves the schema in an inconsistent state. Plan section
     9.6 calls out forward-fix as the preferred recovery.
     """
+
+
+class EngineConstructionError(RuntimeError):
+    """Raised when `VirtualContextEngine.__init__` (or the lossless-restart
+    rebind site) cannot bind to a conversation due to alias chain or
+    attachability failure.
+
+    Caller (proxy SessionRegistry, cloud TenantRegistry, lossless restart)
+    catches and surfaces as a user-visible error envelope. Cloud picks
+    the user-facing text per `reason`:
+
+    - `cycle` / `max_hops` → "alias chain corrupt, please re-VCATTACH"
+    - `alias_target_unattachable` → "the alias target was deleted; VCATTACH
+      again to a fresh target"
+    - `transient_store_error` → "alias resolution failed, please retry"
+
+    `chain` carries the visited conversation_ids (12-char-truncated when
+    surfaced via the exception's __str__) for ops debugging.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        source_id: str = "",
+        target_id: str = "",
+        chain: list[str] | None = None,
+    ) -> None:
+        super().__init__(
+            f"engine construction failed: {reason} "
+            f"(source={source_id[:12] or 'n/a'}, "
+            f"target={target_id[:12] or 'n/a'})"
+        )
+        self.reason = reason
+        self.source_id = source_id
+        self.target_id = target_id
+        self.chain = list(chain or [])
+
+
+class InvalidationFailedError(RuntimeError):
+    """Raised when a cross-worker invalidation callback fails (typically a
+    Redis publish error in cloud's adapter).
+
+    Caller policy varies by call site:
+
+    - VCATTACH path: re-raise as a retryable 503 to the user. The alias
+      row is already committed; the next request resolves correctly via
+      the engine `__init__` resolver, and on retry the callback fires
+      again.
+    - VCMERGE path: catch, log WARNING with structured fields, emit
+      `vcmerge_invalidation_failed` metric, return merge success
+      unconditionally. The merge is durable; cache heals on next
+      state-construct via the resolver.
+
+    `event` is a defensive copy of the AliasEvent payload that failed to
+    publish. `cause` becomes the exception's `__cause__` so callers can
+    surface the underlying transport error.
+    """
+
+    def __init__(
+        self,
+        *,
+        event: dict,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(
+            f"invalidation callback failed for {event.get('type', 'unknown')}"
+        )
+        self.event = dict(event)
+        if cause is not None:
+            self.__cause__ = cause
