@@ -1424,6 +1424,69 @@ def cmd_daemon(args):
         sys.exit(1)
 
 
+def cmd_admin_backfill_tag_summaries(args):
+    """Backfill ``tag_summaries`` rows for a conversation whose segments
+    are already durable.
+
+    Builds a ``VirtualContextEngine`` bound to *conversation_id* (with
+    the operator-supplied tenant scope) and invokes
+    ``engine.backfill_tag_summaries(force_rebuild=...)``. Prints a JSON
+    line to stdout so ops scripts can parse the result without
+    re-running a SQL query. Exit code is non-zero only on hard error
+    (config load failure, engine construction failure); a backfill that
+    returns 0 (idempotent re-run, no eligible cover tags) is a normal
+    PASS.
+    """
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = args.conversation_id
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    force_rebuild = bool(getattr(args, "force_rebuild", False))
+
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "status": "error",
+            "stage": "load_config",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }
+        print(json.dumps(payload))
+        sys.exit(1)
+    config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "status": "error",
+            "stage": "engine_construct",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }
+        print(json.dumps(payload))
+        sys.exit(1)
+
+    try:
+        count = engine.backfill_tag_summaries(force_rebuild=force_rebuild)
+        payload = {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "tenant_id": tenant_id,
+            "force_rebuild": force_rebuild,
+            "tag_summaries_written": count,
+        }
+        print(json.dumps(payload))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="virtual-context",
@@ -1600,6 +1663,40 @@ def main():
     config_sub = config_parser.add_subparsers(dest="config_command")
     config_sub.add_parser("validate", help="Validate config file")
 
+    # admin: namespaced subcommand for operational primitives that
+    # don't belong on the day-to-day surface. Subcommands print
+    # structured JSON to stdout so ops scripts and dashboards can
+    # parse the result without scraping prose.
+    admin_parser = subparsers.add_parser(
+        "admin",
+        help="Operational primitives (backfills, repairs)",
+    )
+    admin_sub = admin_parser.add_subparsers(dest="admin_command")
+
+    backfill_ts_parser = admin_sub.add_parser(
+        "backfill-tag-summaries",
+        help=(
+            "Generate tag_summaries for an existing conversation whose "
+            "segments are durable but tag-summary rows are missing"
+        ),
+    )
+    backfill_ts_parser.add_argument(
+        "conversation_id",
+        help="Conversation id to backfill",
+    )
+    backfill_ts_parser.add_argument(
+        "--tenant-id",
+        default="",
+        help="Tenant id to set on the engine config (default: empty)",
+    )
+    backfill_ts_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "Rebuild every cover tag's summary even if a row already exists"
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1642,6 +1739,12 @@ def main():
             cmd_config_validate(args)
         else:
             print("Usage: virtual-context config validate")
+            sys.exit(1)
+    elif args.command == "admin":
+        if args.admin_command == "backfill-tag-summaries":
+            cmd_admin_backfill_tag_summaries(args)
+        else:
+            print("Usage: virtual-context admin backfill-tag-summaries <conversation_id> [--tenant-id <id>] [--force-rebuild]")
             sys.exit(1)
 
 

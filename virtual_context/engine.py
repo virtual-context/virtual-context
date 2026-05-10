@@ -2209,6 +2209,166 @@ class VirtualContextEngine:
     ) -> CompactionReport | None:
         return self._compaction.compact_manual(conversation_history, turn_id=turn_id)
 
+    def backfill_tag_summaries(self, *, force_rebuild: bool = False) -> int:
+        """Generate ``tag_summaries`` rows from already-stored segments.
+
+        Recovery primitive for conversations whose segments are already
+        durable but whose ``tag_summaries`` table is empty (or stale).
+        Common cause: a cold-start / takeover compaction completed phase
+        ``store`` but skipped phase ``tag_summaries`` because the engine's
+        in-memory ``_turn_tag_index`` was empty at the time. The
+        ``_run_compaction`` gate that drove that skip is closed for
+        future compactions; this method covers conversations whose
+        segments are already on disk.
+
+        Mechanics:
+
+        * Reads all stored segments for the bound
+          ``self.config.conversation_id``.
+        * Derives cover tags from each segment's ``primary_tag`` and
+          ``tags`` (excluding ``_general``).
+        * Reads canonical turns for the conversation and builds
+          ``tag_to_turns`` / ``tag_to_canonical_turn_ids`` per cover
+          tag plus the overall ``max_turn``.
+        * Calls ``self._compactor.compact_tag_summaries`` for the
+          remaining cover tags.
+        * Persists each returned ``TagSummary`` via
+          ``self._store.save_tag_summary`` and the matching embedding
+          via ``self._store.store_tag_summary_embedding``.
+
+        Args:
+            force_rebuild: When ``False`` (default), tags that already
+                have a ``tag_summary`` row are skipped. When ``True``,
+                every cover tag is rebuilt regardless (the existing
+                row is overwritten by the UPSERT in
+                ``save_tag_summary``).
+
+        Returns:
+            The number of ``tag_summary`` rows written by this call.
+            Returns ``0`` when no compactor is configured, when the
+            conversation has no segments, when all cover tags are
+            ``_general``, or when ``force_rebuild=False`` and every
+            cover tag already has a summary.
+        """
+        conv_id = self.config.conversation_id
+        if not conv_id or self._compactor is None:
+            return 0
+
+        raw_store = getattr(self._store, "_store", self._store)
+        all_segments = raw_store.get_all_segments(conversation_id=conv_id)
+        if not all_segments:
+            return 0
+
+        # Derive cover tags from stored segments. Mirrors the
+        # "primary-tag guarantee" used in the compaction pipeline so
+        # every segment's primary topic gets a summary even when the
+        # greedy cover set would have dropped it.
+        cover_tags_set: set[str] = set()
+        for seg in all_segments:
+            primary = getattr(seg, "primary_tag", "") or ""
+            if primary and primary != "_general":
+                cover_tags_set.add(primary)
+            for tag in (getattr(seg, "tags", None) or []):
+                if tag and tag != "_general":
+                    cover_tags_set.add(tag)
+        cover_tags = sorted(cover_tags_set)
+        if not cover_tags:
+            return 0
+
+        # Idempotency gate: skip tags that already have a summary row
+        # unless the caller explicitly opted into a force rebuild. The
+        # backfill is safe to call repeatedly on the same conversation
+        # without re-burning the compactor's LLM budget.
+        if not force_rebuild:
+            cover_tags = [
+                t for t in cover_tags
+                if self._store.get_tag_summary(t, conversation_id=conv_id) is None
+            ]
+            if not cover_tags:
+                return 0
+
+        cover_set = set(cover_tags)
+
+        # Group stored segments by tag for the compactor's per-tag input.
+        tag_to_summaries: dict[str, list] = {}
+        for seg in all_segments:
+            seg_tags = set(getattr(seg, "tags", None) or [])
+            primary = getattr(seg, "primary_tag", "") or ""
+            if primary:
+                seg_tags.add(primary)
+            for tag in seg_tags & cover_set:
+                tag_to_summaries.setdefault(tag, []).append(seg)
+        # Drop tags with no segment-summary content; the compactor would
+        # skip them anyway, but pruning here keeps the call surface
+        # consistent with the in-pipeline path.
+        cover_tags = [t for t in cover_tags if tag_to_summaries.get(t)]
+        if not cover_tags:
+            return 0
+
+        # Build turn-number + canonical-turn-id maps from stored
+        # canonical rows. These feed the compactor's per-tag summary
+        # builder (it attaches the turn anchors to the rendered output).
+        canonical_rows = raw_store.get_all_canonical_turns(conv_id)
+        tag_to_turns: dict[str, list[int]] = {}
+        tag_to_canonical_turn_ids: dict[str, list[str]] = {}
+        max_turn = 0
+        for row in canonical_rows or []:
+            # ``turn_number`` is a real int (0 is valid, -1 means "unset");
+            # avoid ``or`` because ``0 or -1`` evaluates to -1 and corrupts
+            # the cover-tag → turn-number map.
+            _raw_turn = getattr(row, "turn_number", -1)
+            turn_no = int(_raw_turn if _raw_turn is not None else -1)
+            if turn_no > max_turn:
+                max_turn = turn_no
+            row_tags = set(getattr(row, "tags", None) or [])
+            primary = getattr(row, "primary_tag", "") or ""
+            if primary:
+                row_tags.add(primary)
+            cid = getattr(row, "canonical_turn_id", "") or ""
+            for tag in row_tags & cover_set:
+                tag_to_turns.setdefault(tag, []).append(turn_no)
+                if cid:
+                    tag_to_canonical_turn_ids.setdefault(tag, []).append(cid)
+
+        # When force_rebuild is requested, treat existing summaries as
+        # absent so the compactor's freshness check (which short-circuits
+        # when existing.covers_through_turn >= max_turn) doesn't suppress
+        # the rebuild. The downstream save_tag_summary UPSERT overwrites
+        # the row.
+        existing_tag_summaries: dict = {}
+        if not force_rebuild:
+            for tag in cover_tags:
+                ts = self._store.get_tag_summary(tag, conversation_id=conv_id)
+                if ts is not None:
+                    existing_tag_summaries[tag] = ts
+
+        new_summaries = self._compactor.compact_tag_summaries(
+            cover_tags=cover_tags,
+            tag_to_summaries=tag_to_summaries,
+            tag_to_turns=tag_to_turns,
+            tag_to_canonical_turn_ids=tag_to_canonical_turn_ids,
+            existing_tag_summaries=existing_tag_summaries,
+            max_turn=max_turn,
+        )
+
+        count = 0
+        for ts in new_summaries:
+            self._store.save_tag_summary(ts, conversation_id=conv_id)
+            try:
+                embed_fn = self._semantic.get_embed_fn() if self._semantic else None
+                if embed_fn and ts.summary:
+                    emb = embed_fn([ts.summary[:2000]])[0]
+                    self._store.store_tag_summary_embedding(
+                        ts.tag, conv_id, emb,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Failed to embed tag summary '%s' during backfill: %s",
+                    ts.tag, e,
+                )
+            count += 1
+        return count
+
     def ingest_history(
         self,
         history_messages: list[Message],

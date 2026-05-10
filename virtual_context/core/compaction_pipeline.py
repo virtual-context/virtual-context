@@ -437,109 +437,13 @@ class CompactionPipeline:
         tags = list({tag for r in results for tag in r.tags})
 
         # Build/update tag summaries — only for tags in newly compacted segments
-        tag_summaries_built = 0
-        cover_tags: list[str] = []
-        if results and self._compactor:
-            # Only rebuild tag summaries for tags that were just compacted
-            compacted_tags = {tag for r in results for tag in r.tags}
-            cover_tags = [
-                t for t in self._turn_tag_index.compute_cover_set()
-                if t in compacted_tags
-            ]
-            # Primary tag guarantee: ensure every segment's primary_tag gets
-            # a tag summary, even if the greedy set cover dropped it.
-            # Without this, ephemeral topics (2-3 turns) lose their most
-            # specific tag to broader tags that cover more segments.
-            cover_set = set(cover_tags)
-            for r in results:
-                if r.primary_tag and r.primary_tag not in cover_set:
-                    cover_tags.append(r.primary_tag)
-                    cover_set.add(r.primary_tag)
-            if cover_tags:
-                # Gather segment summaries per cover tag
-                tag_to_summaries: dict[str, list] = {}
-                for tag in cover_tags:
-                    summaries = self._store.get_summaries_by_tags(
-                        tags=[tag], min_overlap=1, limit=50,
-                        conversation_id=self._config.conversation_id,
-                    )
-                    if summaries:
-                        tag_to_summaries[tag] = summaries
-
-                # Gather turn numbers per tag from index
-                tag_to_turns: dict[str, list[int]] = {}
-                tag_to_canonical_turn_ids: dict[str, list[str]] = {}
-                for entry in self._turn_tag_index.entries:
-                    for tag in entry.tags:
-                        if tag in cover_tags:
-                            tag_to_turns.setdefault(tag, []).append(entry.turn_number)
-                            if entry.canonical_turn_id:
-                                tag_to_canonical_turn_ids.setdefault(tag, []).append(
-                                    entry.canonical_turn_id,
-                                )
-
-                # Load existing tag summaries for staleness check
-                existing_tag_summaries = {}
-                for tag in cover_tags:
-                    ts = self._store.get_tag_summary(tag, conversation_id=self._config.conversation_id)
-                    if ts:
-                        existing_tag_summaries[tag] = ts
-
-                if self._turn_tag_index.entries:
-                    max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
-
-                    new_tag_summaries = self._compactor.compact_tag_summaries(
-                        cover_tags=cover_tags,
-                        tag_to_summaries=tag_to_summaries,
-                        tag_to_turns=tag_to_turns,
-                        tag_to_canonical_turn_ids=tag_to_canonical_turn_ids,
-                        existing_tag_summaries=existing_tag_summaries,
-                        max_turn=max_turn,
-                        generated_by_turn_id=generated_by_turn_id,
-                    )
-
-                    for ts_i, ts in enumerate(new_tag_summaries):
-                        self._store.save_tag_summary(
-                            ts,
-                            conversation_id=self._config.conversation_id,
-                            operation_id=operation_id,
-                            owner_worker_id=self._worker_id,
-                            lifecycle_epoch=(
-                                int(self._engine_state.lifecycle_epoch)
-                                if operation_id is not None and self._worker_id is not None
-                                else None
-                            ),
-                        )
-                        # Compute and store tag summary embedding for RRF scoring
-                        try:
-                            embed_fn = self._semantic.get_embed_fn()
-                            if embed_fn and ts.summary:
-                                emb = embed_fn([ts.summary[:2000]])[0]
-                                self._store.store_tag_summary_embedding(
-                                    ts.tag, self._config.conversation_id, emb,
-                                    operation_id=operation_id,
-                                    owner_worker_id=self._worker_id,
-                                    lifecycle_epoch=(
-                                        int(self._engine_state.lifecycle_epoch)
-                                        if operation_id is not None and self._worker_id is not None
-                                        else None
-                                    ),
-                                )
-                        except Exception as e:
-                            logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
-                        if progress_callback:
-                            try:
-                                _pct = 95 + int(5 * (ts_i + 1) / max(len(new_tag_summaries), 1))
-                                progress_callback(
-                                    ts_i + 1, len(new_tag_summaries), None,
-                                    phase="tag_summary_built",
-                                    overall_percent=_pct,
-                                    phase_name="tag_summaries",
-                                    tag=ts.tag,
-                                )
-                            except Exception:
-                                pass
-                    tag_summaries_built = len(new_tag_summaries)
+        tag_summaries_built, cover_tags = self._build_tag_summaries(
+            results=results,
+            compact_rows=compact_rows,
+            operation_id=operation_id,
+            generated_by_turn_id=generated_by_turn_id,
+            progress_callback=progress_callback,
+        )
 
         report = CompactionReport(
             segments_compacted=len(results),
@@ -553,6 +457,185 @@ class CompactionPipeline:
         self._refresh_shared_retrieval_snapshots()
 
         return report
+
+    def _build_tag_summaries(
+        self,
+        *,
+        results: list,
+        compact_rows: list | None,
+        operation_id: str | None,
+        generated_by_turn_id: str = "",
+        progress_callback: Callable[..., None] | None = None,
+    ) -> tuple[int, list[str]]:
+        """Build and persist tag summaries for the just-compacted segments.
+
+        Returns ``(count_built, cover_tags)`` so callers (``_run_compaction``)
+        can populate the resulting ``CompactionReport``.
+
+        Cover-tag derivation:
+
+        * Intersect ``compute_cover_set`` (greedy on the in-memory tag index)
+          with the set of tags carried by ``results``. Then apply the
+          primary-tag guarantee so every result's ``primary_tag`` is included
+          in ``cover_tags`` even if the greedy set-cover dropped it.
+
+        Turn-data sourcing for ``compact_tag_summaries`` (``tag_to_turns`` +
+        ``tag_to_canonical_turn_ids`` + ``max_turn``):
+
+        * Prefer the in-memory ``_turn_tag_index.entries`` (normal
+          request-driven path). The index carries the same per-turn tags
+          the tagger produced.
+        * Fall back to deriving the maps from ``compact_rows`` when the
+          index is empty (cold-start / takeover compactions). Each
+          ``CanonicalTurnRow`` carries its own ``turn_number`` +
+          ``canonical_turn_id`` + ``tags`` + ``primary_tag``, so the data
+          is equivalent for the compactor's per-tag summary builder. The
+          fallback closes a gap where takeover compactions with an empty
+          in-memory index silently skipped tag-summary building even
+          though ``cover_tags`` was correctly populated.
+
+        Caller contract: invoke once per compaction pass with the
+        ``results`` and ``compact_rows`` produced upstream.
+        """
+        if not (results and self._compactor):
+            return 0, []
+
+        # Greedy cover from the in-memory tag index, intersected with the
+        # tags carried by newly compacted segments.
+        compacted_tags = {tag for r in results for tag in r.tags}
+        cover_tags: list[str] = [
+            t for t in self._turn_tag_index.compute_cover_set()
+            if t in compacted_tags
+        ]
+        # Primary tag guarantee: ensure every segment's primary_tag gets a
+        # tag summary, even if the greedy set cover dropped it. Without
+        # this, ephemeral topics (2-3 turns) lose their most specific tag
+        # to broader tags that cover more segments.
+        cover_set = set(cover_tags)
+        for r in results:
+            if r.primary_tag and r.primary_tag not in cover_set:
+                cover_tags.append(r.primary_tag)
+                cover_set.add(r.primary_tag)
+        if not cover_tags:
+            return 0, []
+
+        # Gather segment summaries per cover tag (input to the compactor's
+        # per-tag summary builder).
+        tag_to_summaries: dict[str, list] = {}
+        for tag in cover_tags:
+            summaries = self._store.get_summaries_by_tags(
+                tags=[tag], min_overlap=1, limit=50,
+                conversation_id=self._config.conversation_id,
+            )
+            if summaries:
+                tag_to_summaries[tag] = summaries
+
+        # Gather turn numbers + canonical_turn_ids per cover tag, plus
+        # ``max_turn``. Prefer the in-memory index; fall back to the
+        # compact_rows source when the index is empty.
+        tag_to_turns: dict[str, list[int]] = {}
+        tag_to_canonical_turn_ids: dict[str, list[str]] = {}
+        if self._turn_tag_index.entries:
+            for entry in self._turn_tag_index.entries:
+                for tag in entry.tags:
+                    if tag in cover_tags:
+                        tag_to_turns.setdefault(tag, []).append(entry.turn_number)
+                        if entry.canonical_turn_id:
+                            tag_to_canonical_turn_ids.setdefault(tag, []).append(
+                                entry.canonical_turn_id,
+                            )
+            max_turn = max(e.turn_number for e in self._turn_tag_index.entries)
+        else:
+            for row in compact_rows or []:
+                row_tags = set(getattr(row, "tags", None) or [])
+                row_primary = getattr(row, "primary_tag", "") or ""
+                if row_primary:
+                    row_tags.add(row_primary)
+                # ``turn_number`` is a real int (0 is valid, -1 means
+                # "unset"); avoid ``or`` because ``0 or -1`` evaluates
+                # to -1 and corrupts the cover-tag → turn-number map.
+                _raw_turn = getattr(row, "turn_number", -1)
+                row_turn = int(_raw_turn if _raw_turn is not None else -1)
+                row_cid = getattr(row, "canonical_turn_id", "") or ""
+                for tag in row_tags:
+                    if tag in cover_tags:
+                        tag_to_turns.setdefault(tag, []).append(row_turn)
+                        if row_cid:
+                            tag_to_canonical_turn_ids.setdefault(tag, []).append(row_cid)
+            max_turn = max(
+                (
+                    int(
+                        getattr(r, "turn_number", -1)
+                        if getattr(r, "turn_number", -1) is not None
+                        else -1
+                    )
+                    for r in (compact_rows or [])
+                ),
+                default=0,
+            )
+
+        # Load existing tag summaries for the compactor's staleness check.
+        existing_tag_summaries: dict = {}
+        for tag in cover_tags:
+            ts = self._store.get_tag_summary(
+                tag, conversation_id=self._config.conversation_id,
+            )
+            if ts:
+                existing_tag_summaries[tag] = ts
+
+        new_tag_summaries = self._compactor.compact_tag_summaries(
+            cover_tags=cover_tags,
+            tag_to_summaries=tag_to_summaries,
+            tag_to_turns=tag_to_turns,
+            tag_to_canonical_turn_ids=tag_to_canonical_turn_ids,
+            existing_tag_summaries=existing_tag_summaries,
+            max_turn=max_turn,
+            generated_by_turn_id=generated_by_turn_id,
+        )
+
+        for ts_i, ts in enumerate(new_tag_summaries):
+            self._store.save_tag_summary(
+                ts,
+                conversation_id=self._config.conversation_id,
+                operation_id=operation_id,
+                owner_worker_id=self._worker_id,
+                lifecycle_epoch=(
+                    int(self._engine_state.lifecycle_epoch)
+                    if operation_id is not None and self._worker_id is not None
+                    else None
+                ),
+            )
+            # Compute and store tag summary embedding for RRF scoring.
+            try:
+                embed_fn = self._semantic.get_embed_fn() if self._semantic else None
+                if embed_fn and ts.summary:
+                    emb = embed_fn([ts.summary[:2000]])[0]
+                    self._store.store_tag_summary_embedding(
+                        ts.tag, self._config.conversation_id, emb,
+                        operation_id=operation_id,
+                        owner_worker_id=self._worker_id,
+                        lifecycle_epoch=(
+                            int(self._engine_state.lifecycle_epoch)
+                            if operation_id is not None and self._worker_id is not None
+                            else None
+                        ),
+                    )
+            except Exception as e:
+                logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
+            if progress_callback:
+                try:
+                    _pct = 95 + int(5 * (ts_i + 1) / max(len(new_tag_summaries), 1))
+                    progress_callback(
+                        ts_i + 1, len(new_tag_summaries), None,
+                        phase="tag_summary_built",
+                        overall_percent=_pct,
+                        phase_name="tag_summaries",
+                        tag=ts.tag,
+                    )
+                except Exception:
+                    pass
+
+        return len(new_tag_summaries), cover_tags
 
     def _refresh_shared_retrieval_snapshots(self) -> None:
         if self._session_state_provider is None or not self._config.conversation_id:
