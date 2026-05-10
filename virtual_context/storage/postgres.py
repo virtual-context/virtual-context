@@ -2056,6 +2056,49 @@ class PostgresStore(ContextStore):
                 raise KeyError(conversation_id)
             return str(row["phase"] if isinstance(row, dict) else row[0])
 
+    def is_attachable_target(
+        self,
+        *,
+        conversation_id: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Return True iff *conversation_id* is a valid VCATTACH target.
+
+        See ``ContextStore.is_attachable_target`` for semantics. Single
+        ``SELECT 1`` against ``conversations``; the partial index
+        ``idx_conversations_tenant_phase`` already excludes ``phase='deleted'``
+        rows, so the lookup hits the index when tenant_id is supplied.
+        """
+        if not conversation_id:
+            return False
+        with self.pool.connection() as conn:
+            if tenant_id is None:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM conversations
+                     WHERE conversation_id = %s
+                       AND deleted_at IS NULL
+                       AND phase NOT IN ('deleted','merged')
+                     LIMIT 1
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM conversations
+                     WHERE conversation_id = %s
+                       AND tenant_id = %s
+                       AND deleted_at IS NULL
+                       AND phase NOT IN ('deleted','merged')
+                     LIMIT 1
+                    """,
+                    (conversation_id, tenant_id),
+                ).fetchone()
+        return row is not None
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
 

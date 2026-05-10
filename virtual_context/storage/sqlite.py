@@ -2664,6 +2664,51 @@ CREATE TABLE IF NOT EXISTS request_captures (
             raise KeyError(conversation_id)
         return str(row[0])
 
+    def is_attachable_target(
+        self,
+        *,
+        conversation_id: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Return True iff *conversation_id* is a valid VCATTACH target.
+
+        See ``ContextStore.is_attachable_target`` for semantics. Implemented
+        as a single ``SELECT 1`` against ``conversations`` so the predicate
+        is one round-trip even on cold caches. Returns False for missing,
+        soft-deleted (``deleted_at`` non-null), ``phase`` in
+        ``('deleted', 'merged')``, and (when *tenant_id* is supplied)
+        cross-tenant rows.
+        """
+        if not conversation_id:
+            return False
+        with self._get_conn() as conn:
+            if tenant_id is None:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM conversations
+                     WHERE conversation_id = ?
+                       AND deleted_at IS NULL
+                       AND phase NOT IN ('deleted','merged')
+                     LIMIT 1
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM conversations
+                     WHERE conversation_id = ?
+                       AND tenant_id = ?
+                       AND deleted_at IS NULL
+                       AND phase NOT IN ('deleted','merged')
+                     LIMIT 1
+                    """,
+                    (conversation_id, tenant_id),
+                ).fetchone()
+        return row is not None
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at.
 

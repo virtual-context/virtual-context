@@ -446,6 +446,29 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def is_attachable_target(
+        self,
+        *,
+        conversation_id: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Return True iff *conversation_id* is a valid VCATTACH target.
+
+        Predicate: row exists in ``conversations``, ``deleted_at IS NULL``,
+        ``phase NOT IN ('deleted', 'merged')``, and (when *tenant_id* is
+        not None) the row belongs to that tenant.
+
+        Read-only liveness gate for VCATTACH. Replaces the
+        ``engine_state``-row check that pre-dated the post-cutover
+        schema, in which ``engine_state`` is structurally empty for
+        REST-only ingest flows. Implementations must fail closed for the
+        false branches (missing / deleted / merged / cross-tenant). The
+        caller is responsible for handling exceptions (the VCATTACH gate
+        fails open on transient errors so a DB blip can't block every
+        legitimate attach).
+        """
+        raise NotImplementedError
+
     def mark_conversation_deleted(self, conversation_id: str) -> None:
         """Admin-flow delete: sets phase='deleted' and stamps deleted_at."""
         raise NotImplementedError

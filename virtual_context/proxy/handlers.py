@@ -1826,21 +1826,24 @@ async def _handle_vcattach(
                 except Exception:
                     pass
     # Defense-in-depth: reject labels pointing to deleted/nonexistent
-    # conversations. Mirrors the REST path's _target_exists guard so a
-    # stale labels.json entry can't graft an alias onto a corpse.
+    # conversations. Consult ``conversations`` (the post-cutover durable
+    # identity) — phase != 'deleted'/'merged' and deleted_at IS NULL.
+    # ``engine_state`` is structurally empty for REST-only ingest tenants
+    # so it cannot serve as the liveness signal here.
     _store_proxy = state.engine._store if state else None
     _inner_proxy = getattr(_store_proxy, '_store', _store_proxy) if _store_proxy else None
 
     def _target_exists(tid):
         if _inner_proxy is None:
             return True
-        loader = getattr(_inner_proxy, "load_engine_state", None)
-        if not callable(loader):
+        fn = getattr(_inner_proxy, "is_attachable_target", None)
+        if not callable(fn):
             return True
         try:
-            return loader(tid) is not None
+            return bool(fn(conversation_id=tid, tenant_id=tenant_id))
         except Exception:
-            # Transient store error — fail open.
+            # Transient store error — fail open so a DB blip can't block
+            # legitimate VCATTACH for everyone.
             return True
 
     target_id, target_label, error = resolve_target(
@@ -2360,10 +2363,18 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
         def _target_exists(tid):
             """Defense-in-depth: reject labels that point to deleted convs.
 
-            Checks the Redis session-state tombstone first (fast path for
-            recently deleted conversations) and the durable engine_state
-            row second (catches anything missed by the tombstone TTL or
-            written by a different deletion code path).
+            Two layers:
+
+            1. Redis tombstone short-circuit — fast deny for conversations
+               that were recently deleted via the dashboard / REST flow.
+            2. ``conversations`` table predicate — authoritative liveness
+               check via ``is_attachable_target``. Replaces the prior
+               ``engine_state`` lookup, which is structurally empty for
+               REST-only ingest tenants in the post-cutover schema and
+               therefore vetoed every legitimate VCATTACH.
+
+            Tenant-scoped: the predicate enforces ``tenant_id`` match so
+            a stale label cannot bridge across tenants.
             """
             provider = getattr(registry, "_session_state_provider", None)
             if provider is not None:
@@ -2375,12 +2386,13 @@ def _handle_vc_command_rest(result, state, registry, tenant_id, vcconv):
                     # Fall through to the store-level check.
                     pass
             if _inner is not None:
-                loader = getattr(_inner, "load_engine_state", None)
-                if callable(loader):
+                fn = getattr(_inner, "is_attachable_target", None)
+                if callable(fn):
                     try:
-                        return loader(tid) is not None
+                        return bool(fn(conversation_id=tid, tenant_id=tenant_id))
                     except Exception:
-                        # Transient store error — fail open below.
+                        # Transient store error — fail open so a DB blip
+                        # cannot block every VCATTACH for the tenant.
                         return True
             # No way to verify — don't block the user from a valid VCATTACH.
             return True
