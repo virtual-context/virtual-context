@@ -1424,6 +1424,40 @@ def cmd_daemon(args):
         sys.exit(1)
 
 
+def _apply_storage_overrides(config, args) -> None:
+    """Apply CLI storage-override flags on top of the loaded config.
+
+    Precedence: explicit flag > ``-c`` config > ``DATABASE_URL`` env
+    fallback (only consulted when no storage flag and no ``-c`` were
+    given). Lets ops invoke the admin subcommands inside a container
+    that has the right environment variables but no config file
+    mounted at a standard path.
+    """
+    import os
+
+    storage_backend = getattr(args, "storage_backend", None)
+    postgres_dsn = getattr(args, "postgres_dsn", None)
+    sqlite_path = getattr(args, "sqlite_path", None)
+
+    if (
+        storage_backend is None
+        and postgres_dsn is None
+        and sqlite_path is None
+        and not getattr(args, "config", None)
+    ):
+        env_db_url = os.environ.get("DATABASE_URL", "").strip()
+        if env_db_url:
+            storage_backend = "postgres"
+            postgres_dsn = env_db_url
+
+    if storage_backend:
+        config.storage.backend = storage_backend
+    if postgres_dsn:
+        config.storage.postgres_dsn = postgres_dsn
+    if sqlite_path:
+        config.storage.sqlite_path = sqlite_path
+
+
 def cmd_admin_backfill_tag_summaries(args):
     """Backfill ``tag_summaries`` rows for a conversation whose segments
     are already durable.
@@ -1436,6 +1470,15 @@ def cmd_admin_backfill_tag_summaries(args):
     (config load failure, engine construction failure); a backfill that
     returns 0 (idempotent re-run, no eligible cover tags) is a normal
     PASS.
+
+    Storage configuration follows the precedence documented on
+    ``_apply_storage_overrides``: explicit flag > ``-c`` config >
+    ``DATABASE_URL`` env fallback. Inside a container that has
+    ``DATABASE_URL`` set but no config file mounted at a standard
+    path, the bare invocation works:
+
+        virtual-context admin backfill-tag-summaries <conv-id>
+            --tenant-id <tid>
     """
     from virtual_context.engine import VirtualContextEngine
 
@@ -1458,6 +1501,9 @@ def cmd_admin_backfill_tag_summaries(args):
     if tenant_id:
         config.tenant_id = tenant_id
 
+    # Storage overrides (CLI flags > -c config > DATABASE_URL env fallback).
+    _apply_storage_overrides(config, args)
+
     try:
         engine = VirtualContextEngine(config=config)
     except Exception as exc:  # noqa: BLE001
@@ -1478,6 +1524,7 @@ def cmd_admin_backfill_tag_summaries(args):
             "tenant_id": tenant_id,
             "force_rebuild": force_rebuild,
             "tag_summaries_written": count,
+            "storage_backend": config.storage.backend,
         }
         print(json.dumps(payload))
     finally:
@@ -1695,6 +1742,32 @@ def main():
         help=(
             "Rebuild every cover tag's summary even if a row already exists"
         ),
+    )
+    # Storage override flags. Let ops point the engine at the same
+    # Postgres DSN / SQLite path the running workers use without
+    # staging a separate config file in the container. Precedence:
+    # explicit flag > ``-c`` config > ``DATABASE_URL`` env fallback
+    # (only consulted when no flag and no ``-c`` are given).
+    backfill_ts_parser.add_argument(
+        "--storage-backend",
+        choices=("sqlite", "postgres", "filesystem"),
+        help=(
+            "Override the engine's storage backend. Useful when running "
+            "the subcommand inside a container that does not have a "
+            "config file mounted but does have the right env vars."
+        ),
+    )
+    backfill_ts_parser.add_argument(
+        "--postgres-dsn",
+        help=(
+            "Postgres connection string. Overrides storage.postgres_dsn. "
+            "If neither this flag nor -c is provided, falls back to the "
+            "DATABASE_URL environment variable when set."
+        ),
+    )
+    backfill_ts_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite database path. Overrides storage.sqlite_path.",
     )
 
     args = parser.parse_args()
