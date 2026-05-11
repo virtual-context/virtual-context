@@ -2250,13 +2250,35 @@ class VirtualContextEngine:
             ``_general``, or when ``force_rebuild=False`` and every
             cover tag already has a summary.
         """
+        import time as _time
+
         conv_id = self.config.conversation_id
-        if not conv_id or self._compactor is None:
+        if not conv_id:
             return 0
+        if self._compactor is None:
+            logger.warning(
+                "backfill_tag_summaries: no compactor configured; returning 0 "
+                "(no LLM provider in engine.config.providers + "
+                "config.summarization.provider)",
+                extra={"conversation_id": conv_id[:12]},
+            )
+            return 0
+
+        _t_start = _time.monotonic()
 
         raw_store = getattr(self._store, "_store", self._store)
         all_segments = raw_store.get_all_segments(conversation_id=conv_id)
+        logger.info(
+            "backfill_tag_summaries: starting conv=%s segments=%d "
+            "force_rebuild=%s",
+            conv_id[:12], len(all_segments), force_rebuild,
+        )
         if not all_segments:
+            logger.info(
+                "backfill_tag_summaries: no stored segments for conv=%s; "
+                "returning 0",
+                conv_id[:12],
+            )
             return 0
 
         # Derive cover tags from stored segments. Mirrors the
@@ -2272,7 +2294,17 @@ class VirtualContextEngine:
                 if tag and tag != "_general":
                     cover_tags_set.add(tag)
         cover_tags = sorted(cover_tags_set)
+        logger.info(
+            "backfill_tag_summaries: derived %d cover tags from segments "
+            "for conv=%s",
+            len(cover_tags), conv_id[:12],
+        )
         if not cover_tags:
+            logger.info(
+                "backfill_tag_summaries: no non-_general cover tags; returning 0 "
+                "for conv=%s",
+                conv_id[:12],
+            )
             return 0
 
         # Idempotency gate: skip tags that already have a summary row
@@ -2280,11 +2312,24 @@ class VirtualContextEngine:
         # backfill is safe to call repeatedly on the same conversation
         # without re-burning the compactor's LLM budget.
         if not force_rebuild:
+            _pre_filter_count = len(cover_tags)
             cover_tags = [
                 t for t in cover_tags
                 if self._store.get_tag_summary(t, conversation_id=conv_id) is None
             ]
+            _skipped = _pre_filter_count - len(cover_tags)
+            if _skipped > 0:
+                logger.info(
+                    "backfill_tag_summaries: idempotency filter kept %d tags, "
+                    "skipped %d that already had summaries for conv=%s",
+                    len(cover_tags), _skipped, conv_id[:12],
+                )
             if not cover_tags:
+                logger.info(
+                    "backfill_tag_summaries: all cover tags already have "
+                    "summaries; returning 0 for conv=%s",
+                    conv_id[:12],
+                )
                 return 0
 
         cover_set = set(cover_tags)
@@ -2301,8 +2346,20 @@ class VirtualContextEngine:
         # Drop tags with no segment-summary content; the compactor would
         # skip them anyway, but pruning here keeps the call surface
         # consistent with the in-pipeline path.
+        _pruned_tags = [t for t in cover_tags if not tag_to_summaries.get(t)]
         cover_tags = [t for t in cover_tags if tag_to_summaries.get(t)]
+        if _pruned_tags:
+            logger.info(
+                "backfill_tag_summaries: pruned %d cover tag(s) with no "
+                "matching segments for conv=%s (pruned=%s)",
+                len(_pruned_tags), conv_id[:12], _pruned_tags[:10],
+            )
         if not cover_tags:
+            logger.info(
+                "backfill_tag_summaries: no cover tags survive segment-matching "
+                "filter; returning 0 for conv=%s",
+                conv_id[:12],
+            )
             return 0
 
         # Build turn-number + canonical-turn-id maps from stored
@@ -2342,6 +2399,12 @@ class VirtualContextEngine:
                 if ts is not None:
                     existing_tag_summaries[tag] = ts
 
+        logger.info(
+            "backfill_tag_summaries: invoking compactor for %d cover tags "
+            "(max_turn=%d, conv=%s)",
+            len(cover_tags), max_turn, conv_id[:12],
+        )
+        _t_compactor = _time.monotonic()
         new_summaries = self._compactor.compact_tag_summaries(
             cover_tags=cover_tags,
             tag_to_summaries=tag_to_summaries,
@@ -2350,10 +2413,36 @@ class VirtualContextEngine:
             existing_tag_summaries=existing_tag_summaries,
             max_turn=max_turn,
         )
+        _compactor_elapsed = round(_time.monotonic() - _t_compactor, 2)
+
+        # Diagnostic discrimination: the compactor may return fewer
+        # summaries than requested (per-tag LLM failures, freshness
+        # short-circuits inside the compactor, etc.). Surface the
+        # missing-tag list at WARNING so 0-write or partial-write
+        # backfills are self-diagnostic without re-running.
+        _returned_tags = {ts.tag for ts in new_summaries}
+        _missing_tags = sorted(set(cover_tags) - _returned_tags)
+        if _missing_tags:
+            logger.warning(
+                "backfill_tag_summaries: compactor returned no summary for "
+                "%d of %d requested tags for conv=%s (compactor_duration_s=%.2f); "
+                "missing=%s",
+                len(_missing_tags), len(cover_tags), conv_id[:12],
+                _compactor_elapsed, _missing_tags[:20],
+            )
 
         count = 0
         for ts in new_summaries:
             self._store.save_tag_summary(ts, conversation_id=conv_id)
+            segments_contrib = len(tag_to_summaries.get(ts.tag, []))
+            logger.info(
+                "backfill_tag_summaries: persisted tag=%s segments_contributed=%d "
+                "summary_tokens=%d covers_through_turn=%d conv=%s",
+                ts.tag, segments_contrib,
+                getattr(ts, "summary_tokens", 0),
+                getattr(ts, "covers_through_turn", -1),
+                conv_id[:12],
+            )
             try:
                 embed_fn = self._semantic.get_embed_fn() if self._semantic else None
                 if embed_fn and ts.summary:
@@ -2362,11 +2451,25 @@ class VirtualContextEngine:
                         ts.tag, conv_id, emb,
                     )
             except Exception as e:
-                logger.debug(
-                    "Failed to embed tag summary '%s' during backfill: %s",
-                    ts.tag, e,
+                # Promoted from debug to warning so ops sees per-tag
+                # embedding failures during a backfill run (the row is
+                # still durable; only the embedding for RRF scoring is
+                # missing).
+                logger.warning(
+                    "backfill_tag_summaries: failed to embed tag '%s' during "
+                    "backfill for conv=%s: %s",
+                    ts.tag, conv_id[:12], e,
                 )
             count += 1
+
+        _total_elapsed = round(_time.monotonic() - _t_start, 2)
+        logger.info(
+            "backfill_tag_summaries: done conv=%s tags_attempted=%d "
+            "tags_persisted=%d tags_missing=%d compactor_duration_s=%.2f "
+            "total_duration_s=%.2f force_rebuild=%s",
+            conv_id[:12], len(cover_tags), count, len(_missing_tags),
+            _compactor_elapsed, _total_elapsed, force_rebuild,
+        )
         return count
 
     def ingest_history(

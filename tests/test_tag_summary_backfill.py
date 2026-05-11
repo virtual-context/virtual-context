@@ -452,3 +452,186 @@ def test_backfill_tag_summaries_force_rebuild_overwrites(
     # The force-rebuild call passed an EMPTY existing_tag_summaries
     # so the compactor's freshness gate does not suppress the rebuild.
     assert stub.calls[1]["existing_tag_summaries"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic logging in backfill_tag_summaries
+# ---------------------------------------------------------------------------
+#
+# The "0-write but status=ok" outcome ops observed on small
+# experimental conversations could mean: (a) all per-tag LLM calls
+# failed silently, (b) freshness gate inside the compactor
+# short-circuited, or (c) something else. Logging makes the path the
+# invocation took visible so a re-run is diagnostic without engine
+# changes.
+
+
+def test_backfill_emits_start_and_done_lines_with_counts(
+    engine_with_stub_compactor, caplog,
+) -> None:
+    """The backfill emits a ``starting ... segments=N force_rebuild=...``
+    INFO line at entry and a ``done ... tags_attempted=N tags_persisted=N
+    tags_missing=N`` INFO line at exit."""
+    import logging as _logging
+
+    engine, stub = engine_with_stub_compactor
+    conv_id = engine.config.conversation_id
+
+    raw = _underlying(engine)
+    _seed_segment(
+        raw, conv_id, ref="seg-1", primary_tag="alpha",
+        tags=["alpha"], summary_text="alpha content",
+    )
+    _seed_canonical_turn(
+        raw, conv_id, turn_number=0, canonical_turn_id="ct-0",
+        primary_tag="alpha", tags=["alpha"],
+    )
+
+    with caplog.at_level(_logging.INFO, logger="virtual_context.engine"):
+        engine.backfill_tag_summaries()
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    starting = [m for m in messages if "backfill_tag_summaries: starting" in m]
+    done = [m for m in messages if "backfill_tag_summaries: done" in m]
+    persisted = [m for m in messages if "backfill_tag_summaries: persisted tag=" in m]
+    assert starting, f"missing 'starting' INFO line; got: {messages}"
+    assert done, f"missing 'done' INFO line; got: {messages}"
+    assert persisted, f"missing per-tag 'persisted' INFO line; got: {messages}"
+    # The 'starting' line carries segments + force_rebuild.
+    assert "segments=1" in starting[0]
+    assert "force_rebuild=False" in starting[0]
+    # The 'done' line carries the aggregate counts.
+    assert "tags_attempted=1" in done[0]
+    assert "tags_persisted=1" in done[0]
+    assert "tags_missing=0" in done[0]
+
+
+def test_backfill_warns_when_compactor_returns_fewer_than_requested(
+    engine_with_stub_compactor, caplog,
+) -> None:
+    """When the compactor returns fewer summaries than the requested
+    cover tags (per-tag LLM failures, internal freshness short-circuit,
+    etc.), a WARNING line surfaces the missing-tag list. This is the
+    discriminator for the 0-write / partial-write diagnostic case ops
+    flagged on a small experimental conversation: a re-run with this
+    logging tells ops which path the invocation took."""
+    import logging as _logging
+
+    engine, stub = engine_with_stub_compactor
+    conv_id = engine.config.conversation_id
+
+    raw = _underlying(engine)
+    _seed_segment(
+        raw, conv_id, ref="seg-1", primary_tag="alpha",
+        tags=["alpha", "beta"], summary_text="alpha+beta",
+    )
+    _seed_canonical_turn(
+        raw, conv_id, turn_number=0, canonical_turn_id="ct-0",
+        primary_tag="alpha", tags=["alpha", "beta"],
+    )
+
+    # Stub compactor to silently drop one tag — simulates the case where
+    # per-tag LLM calls produced no result for some cover tags.
+    def _selective(*, cover_tags, max_turn, **kwargs):
+        return [
+            TagSummary(
+                tag="alpha",
+                summary="summary-for-alpha",
+                summary_tokens=10,
+                covers_through_turn=max_turn,
+            ),
+            # 'beta' deliberately absent from the returned list.
+        ]
+    stub.compact_tag_summaries = _selective  # type: ignore[assignment]
+
+    with caplog.at_level(_logging.WARNING, logger="virtual_context.engine"):
+        engine.backfill_tag_summaries()
+
+    warnings = [
+        rec.getMessage() for rec in caplog.records
+        if rec.levelno >= _logging.WARNING
+    ]
+    matching = [
+        m for m in warnings
+        if "compactor returned no summary for" in m and "beta" in m
+    ]
+    assert matching, (
+        "expected WARNING surfacing missing tags from compactor; "
+        f"got warnings: {warnings}"
+    )
+    assert "1 of 2" in matching[0]  # 1 missing of 2 requested
+
+
+def test_backfill_logs_idempotency_skip_count(
+    engine_with_stub_compactor, caplog,
+) -> None:
+    """The idempotent re-run emits an INFO line documenting how many
+    tags were skipped because they already had summaries. Lets ops see
+    that the second run was indeed idempotent rather than a silent
+    no-op."""
+    import logging as _logging
+
+    engine, stub = engine_with_stub_compactor
+    conv_id = engine.config.conversation_id
+
+    raw = _underlying(engine)
+    _seed_segment(
+        raw, conv_id, ref="seg-1", primary_tag="alpha",
+        tags=["alpha"], summary_text="alpha content",
+    )
+    _seed_canonical_turn(
+        raw, conv_id, turn_number=0, canonical_turn_id="ct-0",
+        primary_tag="alpha", tags=["alpha"],
+    )
+
+    # First run writes the summary.
+    engine.backfill_tag_summaries()
+
+    # Second run should idempotently skip and log the skip count.
+    caplog.clear()
+    with caplog.at_level(_logging.INFO, logger="virtual_context.engine"):
+        engine.backfill_tag_summaries()
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    skip_lines = [
+        m for m in messages
+        if "all cover tags already have summaries" in m
+    ]
+    assert skip_lines, (
+        "expected idempotency-skip INFO line on the second run; "
+        f"got: {messages}"
+    )
+
+
+def test_backfill_warns_when_no_compactor_configured(tmp_path, caplog) -> None:
+    """When the engine has no compactor (no LLM provider), the backfill
+    emits a WARNING explaining the missing configuration rather than
+    silently returning 0. Makes deploy-misconfiguration scenarios
+    self-diagnostic."""
+    import logging as _logging
+
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+
+    db_path = str(tmp_path / "store.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+        "conversation_id": "conv-no-compactor",
+    })
+    engine = VirtualContextEngine(config=config)
+    # Default engine has no LLM provider configured → _compactor is None.
+    assert engine._compactor is None
+
+    with caplog.at_level(_logging.WARNING, logger="virtual_context.engine"):
+        count = engine.backfill_tag_summaries()
+
+    assert count == 0
+    warnings = [
+        rec.getMessage() for rec in caplog.records
+        if rec.levelno >= _logging.WARNING
+    ]
+    assert any("no compactor configured" in m for m in warnings), (
+        f"expected 'no compactor configured' WARNING; got: {warnings}"
+    )
