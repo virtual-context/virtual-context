@@ -305,6 +305,7 @@ def engine_factory(tmp_path):
             "context_window": 10000,
             "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
+            "retrieval": {"inbound_tagger_type": "keyword"},
         }
         if conversation_id is not None:
             config_dict["conversation_id"] = conversation_id
@@ -772,6 +773,7 @@ def engine_factory_tenant(tmp_path):
             "context_window": 10000,
             "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
             "tag_generator": {"type": "keyword"},
+            "retrieval": {"inbound_tagger_type": "keyword"},
             "conversation_id": conversation_id,
             "tenant_id": tenant_id,
         }
@@ -1169,6 +1171,7 @@ def _build_sqlite_store(tmp_path):
         "context_window": 10000,
         "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
         "tag_generator": {"type": "keyword"},
+        "retrieval": {"inbound_tagger_type": "keyword"},
     }
     config = load_config(config_dict=config_dict)
     engine = VirtualContextEngine(config=config)
@@ -1789,3 +1792,441 @@ def test_merge_body_post_commit_callback_does_not_fire_on_rollback(
     assert fired == []
     # Alias never committed.
     assert composite.resolve_conversation_alias("merge-rb-src") is None
+
+
+# ===========================================================================
+# Engine self-hydrate on alias-resolver rebind (provider mode).
+#
+# Spec: docs/specs/engine-self-hydrate-on-rebind.md
+# Fix target: task #29 (SessionState hydration keying mismatch).
+# ===========================================================================
+
+
+from virtual_context.proxy.session_state import SessionState
+
+
+class _StubSessionStateProvider:
+    """Minimal SessionStateProvider stub for engine.__init__ self-hydrate tests.
+
+    Only ``load(conversation_id)`` is exercised by the engine's
+    self-hydrate block at the end of ``VirtualContextEngine.__init__``.
+    Other provider surface (``save``, embedding caches, tag stats) are
+    not invoked during construction in provider mode (the engine's
+    ``_save_state`` short-circuit and the embedding cache hooks fire
+    later, on actual turn ingestion).
+
+    ``load_calls`` records every ``load`` invocation so tests can
+    assert which conversation_id the engine asked for. ``response_by_id``
+    drives the return value: an explicit ``SessionState`` instance
+    returns that state, an ``Exception`` subclass raises it, ``None``
+    returns ``None`` (Redis miss). Default fallback when an id is not
+    in the map is ``None``.
+    """
+
+    def __init__(self, response_by_id: dict[str, object] | None = None) -> None:
+        self.response_by_id: dict[str, object] = response_by_id or {}
+        self.load_calls: list[str] = []
+        self._store = None  # cloud's wiring point; engine never reads this
+
+    def load(self, conversation_id: str) -> SessionState | None:
+        self.load_calls.append(conversation_id)
+        response = self.response_by_id.get(conversation_id)
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, SessionState):
+            return response
+        return None
+
+    # Other provider methods called during engine __init__ delegate
+    # construction. None of these affect the self-hydrate logic; they
+    # exist so the engine's delegates accept the provider reference
+    # without throwing.
+    def load_tag_embeddings(self, model_name, tags):  # pragma: no cover
+        return {}
+
+    def save_tag_embeddings(self, *_a, **_kw):  # pragma: no cover
+        return None
+
+    def load_tag_stats_snapshot(self, conversation_id):  # pragma: no cover
+        return None
+
+    def load_tag_summary_embedding_snapshot(self, conversation_id):  # pragma: no cover
+        return None
+
+    def load_context_hint_cache(self, conversation_id, cache_key):  # pragma: no cover
+        return None
+
+    def save_payload_token_cache(self, *_a, **_kw):  # pragma: no cover
+        return None
+
+    def load_payload_token_cache(self, *_a, **_kw):  # pragma: no cover
+        return None
+
+    def next_tool_tag(self, conversation_id):  # pragma: no cover
+        return 0
+
+
+class _NoopEmbeddingProvider:
+    """EmbeddingProvider double that keeps provider-mode construction offline."""
+
+    def get_embed_fn(self):  # pragma: no cover
+        return None
+
+
+def _populated_target_session_state(
+    *,
+    last_completed_turn: int = 499,
+    working_set: list[dict] | None = None,
+) -> SessionState:
+    """Return a SessionState with the post-compaction invariants the
+    retriever's ``summary_floor`` gate depends on (flushed > 0,
+    last_completed_turn matching a non-empty index)."""
+    return SessionState(
+        compacted_prefix_messages=958,
+        flushed_prefix_messages=958,
+        flushed_prefix_messages_present=True,
+        last_request_time=0.0,
+        last_compacted_turn=478,
+        last_completed_turn=last_completed_turn,
+        last_indexed_turn=last_completed_turn,
+        checkpoint_version=1,
+        conversation_generation=0,
+        tool_tag_counter=0,
+        split_processed_tags=set(),
+        trailing_fingerprint="",
+        provider="stub",
+        turn_tag_entries=[],
+        working_set=list(working_set or []),
+        version=1,
+    )
+
+
+def _engine_with_provider(tmp_path, *, conversation_id, provider):
+    """Build a VirtualContextEngine in provider mode for self-hydrate tests.
+
+    Uses the same SQLite-backed config shape as ``engine_factory`` but
+    passes ``session_state_provider=provider`` so the engine __init__'s
+    provider-mode branch runs.
+    """
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.config import load_config
+
+    db_path = str(tmp_path / "store.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+        "retrieval": {"inbound_tagger_type": "keyword"},
+        "conversation_id": conversation_id,
+    })
+    return VirtualContextEngine(
+        config=config,
+        session_state_provider=provider,
+        embedding_provider=_NoopEmbeddingProvider(),
+    )
+
+
+def test_self_hydrate_fires_on_rebind_with_provider(engine_factory, tmp_path) -> None:
+    """Happy path: alias source -> target exists, provider returns target's
+    SessionState. Engine self-hydrates, sets the flag, and the
+    retriever-driving fields reflect target's values."""
+    # Seed an attachable target + alias row via a no-provider engine.
+    seeder = engine_factory("seeder-sh-001")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-target-001")
+    raw.save_conversation_alias("sh-source-001", "sh-target-001")
+
+    target_state = _populated_target_session_state(
+        working_set=[
+            {
+                "tag": "target-topic",
+                "depth": "summary",
+                "tokens": 321,
+                "last_accessed_turn": 478,
+            },
+        ],
+    )
+    provider = _StubSessionStateProvider(
+        response_by_id={"sh-target-001": target_state},
+    )
+
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-source-001", provider=provider,
+    )
+
+    # Resolver rebound to target.
+    assert engine.config.conversation_id == "sh-target-001"
+    # Self-hydrate fired.
+    assert engine._self_hydrated_from_provider is True
+    # Provider was asked for the resolver-rebound (target) id, NOT the source.
+    assert "sh-target-001" in provider.load_calls
+    assert "sh-source-001" not in provider.load_calls
+    # Retriever-driving fields reflect target's loaded values.
+    #
+    # NOTE on the assertion choice: ``hydrate_from_session_state`` at
+    # ``engine.py:1441`` clamps ``flushed_prefix_messages`` to
+    # ``min(loaded, _derive_compacted_prefix_messages_from_rows(...))``.
+    # For a target with zero canonical_turns rows (this test's
+    # freshly-seeded target lives only in the ``conversations`` table),
+    # the derivation returns ``(0, -1)`` and the clamp drives flushed
+    # down to 0 regardless of the loaded value. That's correct engine
+    # behaviour — the retriever's compaction watermark should reflect
+    # actual rows on disk, not stale SessionState. To assert that
+    # hydration ran with the right *target* state we use
+    # ``last_completed_turn`` / ``last_indexed_turn`` which are loaded
+    # directly from SessionState without a clamp.
+    assert engine._engine_state.last_completed_turn == 499
+    assert engine._engine_state.last_indexed_turn == 499
+    assert list(engine._paging.working_set) == ["target-topic"]
+    assert engine._paging.working_set["target-topic"].tokens == 321
+
+
+def test_self_hydrate_multi_hop_rebind_loads_terminal_provider_state(
+    engine_factory, tmp_path,
+) -> None:
+    """Self-hydrate must use the alias-chain terminal id, not an
+    intermediate hop."""
+    seeder = engine_factory("seeder-sh-chain-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-chain-target")
+    raw.save_conversation_alias("sh-chain-source", "sh-chain-mid")
+    raw.save_conversation_alias("sh-chain-mid", "sh-chain-target")
+
+    target_state = _populated_target_session_state(last_completed_turn=777)
+    provider = _StubSessionStateProvider(
+        response_by_id={"sh-chain-target": target_state},
+    )
+
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-chain-source", provider=provider,
+    )
+
+    assert engine.config.conversation_id == "sh-chain-target"
+    assert engine._self_hydrated_from_provider is True
+    assert provider.load_calls == ["sh-chain-target"]
+    assert engine._engine_state.last_completed_turn == 777
+
+
+def test_self_hydrate_concurrent_same_source_construction_is_idempotent(
+    engine_factory, tmp_path,
+) -> None:
+    """Concurrent constructions for the same source both rebind and hydrate from
+    the same terminal target state."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    seeder = engine_factory("seeder-sh-repeat-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-repeat-target")
+    raw.save_conversation_alias("sh-repeat-source", "sh-repeat-target")
+
+    provider = _StubSessionStateProvider(
+        response_by_id={
+            "sh-repeat-target": _populated_target_session_state(
+                last_completed_turn=888,
+            ),
+        },
+    )
+
+    def _build():
+        return _engine_with_provider(
+            tmp_path, conversation_id="sh-repeat-source", provider=provider,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = [future.result() for future in (
+            pool.submit(_build),
+            pool.submit(_build),
+        )]
+
+    assert first.config.conversation_id == "sh-repeat-target"
+    assert second.config.conversation_id == "sh-repeat-target"
+    assert first._self_hydrated_from_provider is True
+    assert second._self_hydrated_from_provider is True
+    assert provider.load_calls == ["sh-repeat-target", "sh-repeat-target"]
+    assert first._engine_state.last_completed_turn == 888
+    assert second._engine_state.last_completed_turn == 888
+
+
+def test_self_hydrate_provider_state_wins_over_persisted_engine_state(
+    engine_factory, tmp_path,
+) -> None:
+    """Provider mode skips _load_persisted_state; target-keyed provider
+    state remains authoritative even if a target engine_state row exists."""
+    from virtual_context.types import TurnTagEntry
+
+    seeder = engine_factory("seeder-sh-persist-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-persist-target")
+    raw.save_conversation_alias("sh-persist-source", "sh-persist-target")
+    _seed_engine_state_for_conversation(
+        raw,
+        "sh-persist-target",
+        turn_tag_entries=[
+            TurnTagEntry(
+                turn_number=0,
+                message_hash="persisted-hash",
+                tags=["persisted"],
+                primary_tag="persisted",
+            ),
+        ],
+        turn_count=1,
+    )
+
+    provider = _StubSessionStateProvider(
+        response_by_id={
+            "sh-persist-target": _populated_target_session_state(
+                last_completed_turn=999,
+            ),
+        },
+    )
+
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-persist-source", provider=provider,
+    )
+
+    assert engine.config.conversation_id == "sh-persist-target"
+    assert engine._self_hydrated_from_provider is True
+    assert engine._engine_state.last_completed_turn == 999
+    assert engine._turn_tag_index.entries == []
+
+
+def test_self_hydrate_skipped_when_no_rebind(engine_factory, tmp_path) -> None:
+    """When the resolver does NOT rebind (no alias row), the self-hydrate
+    block is skipped — cloud will hydrate on its own path."""
+    provider = _StubSessionStateProvider(
+        response_by_id={
+            "sh-noalias-source": _populated_target_session_state(),
+        },
+    )
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-noalias-source", provider=provider,
+    )
+
+    # No alias row exists, so config.conversation_id is unchanged.
+    assert engine.config.conversation_id == "sh-noalias-source"
+    # Self-hydrate did NOT fire (resolver didn't rebind).
+    assert engine._self_hydrated_from_provider is False
+    # Provider was NOT asked during construction.
+    assert provider.load_calls == []
+
+
+def test_self_hydrate_skipped_when_no_provider(engine_factory) -> None:
+    """Local-proxy mode (session_state_provider=None) skips the
+    self-hydrate block entirely — the existing _load_persisted_state
+    path is authoritative for non-provider deployments."""
+    seeder = engine_factory("seeder-sh-noprov-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-noprov-target")
+    raw.save_conversation_alias("sh-noprov-source", "sh-noprov-target")
+
+    # engine_factory builds with session_state_provider=None.
+    engine = engine_factory("sh-noprov-source")
+
+    # Resolver still rebound.
+    assert engine.config.conversation_id == "sh-noprov-target"
+    # Flag stays False — provider mode wasn't active.
+    assert engine._self_hydrated_from_provider is False
+
+
+def test_self_hydrate_handles_provider_exception(engine_factory, tmp_path, caplog) -> None:
+    """Provider.load raises a transient/persistent exception. The engine
+    swallows + logs at WARNING, leaves the flag at False, and
+    construction succeeds. Cloud's caller-driven hydration path then
+    fires on the next request (back to pre-fix behavior — not a
+    regression).
+    """
+    import logging
+
+    seeder = engine_factory("seeder-sh-exc-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-exc-target")
+    raw.save_conversation_alias("sh-exc-source", "sh-exc-target")
+
+    provider = _StubSessionStateProvider(
+        response_by_id={
+            "sh-exc-target": RuntimeError("simulated redis hiccup"),
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger="virtual_context.engine"):
+        engine = _engine_with_provider(
+            tmp_path, conversation_id="sh-exc-source", provider=provider,
+        )
+
+    # Resolver still rebound.
+    assert engine.config.conversation_id == "sh-exc-target"
+    # Self-hydrate attempted (load was called).
+    assert "sh-exc-target" in provider.load_calls
+    # Flag stays False because load raised.
+    assert engine._self_hydrated_from_provider is False
+    # WARNING-level log was emitted with the rebound id prefix.
+    assert any(
+        "self-hydration load failed" in record.getMessage().lower()
+        and "sh-exc-targ" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_self_hydrate_handles_tombstoned_target(engine_factory, tmp_path) -> None:
+    """Provider returns SessionState(deleted=True) for the target.
+    The engine MUST NOT call hydrate_from_session_state — clobbering
+    state with tombstone fields would corrupt the engine. Flag stays
+    False; cloud's existing tombstone path on the source id takes
+    over (and likely also returns False since source isn't tombstoned)."""
+    seeder = engine_factory("seeder-sh-tomb-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "sh-tomb-target")
+    raw.save_conversation_alias("sh-tomb-source", "sh-tomb-target")
+
+    tombstoned = SessionState(deleted=True, version=1)
+    provider = _StubSessionStateProvider(
+        response_by_id={"sh-tomb-target": tombstoned},
+    )
+
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-tomb-source", provider=provider,
+    )
+
+    # Resolver rebound to target.
+    assert engine.config.conversation_id == "sh-tomb-target"
+    # Provider was queried.
+    assert "sh-tomb-target" in provider.load_calls
+    # Flag stays False — we did NOT hydrate from a tombstone.
+    assert engine._self_hydrated_from_provider is False
+
+
+def test_double_hydrate_with_different_state_is_observable(engine_factory, tmp_path) -> None:
+    """Document the bug shape this spec is fixing.
+
+    ``hydrate_from_session_state`` is overwrite-shaped. Calling it once
+    with source-empty state then once with target-populated state
+    LEAVES THE ENGINE IN TARGET STATE (the second call wins). The
+    actual bug is the reverse: cloud hydrates with source state AFTER
+    the engine has self-hydrated with target state, which clobbers
+    target with source. This test pins the overwrite invariant so any
+    future change to make hydration accumulative breaks the test
+    loudly and forces a re-read of the spec.
+    """
+    # Build a non-provider engine on a fresh DB so canonical_turns
+    # derivation doesn't override our test values.
+    provider = _StubSessionStateProvider()  # no response
+    engine = _engine_with_provider(
+        tmp_path, conversation_id="sh-double-source", provider=provider,
+    )
+    assert engine._self_hydrated_from_provider is False
+
+    state_a = _populated_target_session_state(last_completed_turn=100)
+    state_b = _populated_target_session_state(last_completed_turn=499)
+
+    engine.hydrate_from_session_state(state_a)
+    # ``last_completed_turn`` is loaded directly from SessionState without
+    # a canonical-turns clamp, so we use it (rather than
+    # ``flushed_prefix_messages``, which the line 1441 clamp would drive
+    # to 0 against an empty canonical_turns table) to observe overwrite
+    # semantics across successive hydrate calls.
+    assert engine._engine_state.last_completed_turn == 100
+
+    engine.hydrate_from_session_state(state_b)
+    # Second call OVERWRITES — engine reflects state_b, not an
+    # accumulation of state_a + state_b.
+    assert engine._engine_state.last_completed_turn == 499
