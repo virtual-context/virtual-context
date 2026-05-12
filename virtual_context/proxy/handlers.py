@@ -1862,8 +1862,39 @@ async def _handle_vcattach(
     # VCATTACH is a durable redirect, not a merge. The old conversation is
     # preserved; only the alias row is written and caches are invalidated so
     # the next request sees the new routing.
-    _store = state.engine._store if state else None
+    _store = (
+        state.engine._store
+        if state and getattr(state, "engine", None) and state.engine._store
+        else None
+    )
     _inner = getattr(_store, '_store', _store) if _store else None
+
+    # Structural guard: when engine construction has partially completed
+    # without an attached ``_store`` (observed in multi-worker prod under
+    # a race that bypasses the ``_init_store_view`` wrap at
+    # ``engine.py:750``), ``execute_attach`` calls ``store.save_conversation_alias``
+    # on a ``None`` store and raises ``AttributeError`` deep in
+    # ``vcattach.py:187``. That surfaces to the user as an opaque HTTP 500
+    # and the VCATTACH appears to silently fail. Convert that condition
+    # into a retryable HTTP 503 so the client (Claude Code is the canonical
+    # caller) can retry past the transient window and reach a properly
+    # constructed engine. The root cause of ``_store=None`` post-construction
+    # is tracked separately as a follow-up investigation; this guard ships
+    # the user-visible mitigation.
+    if _inner is None:
+        if result.is_streaming:
+            return StreamingResponse(
+                iter([fmt.emit_fake_response_sse(
+                    "engine state not ready; please retry",
+                    result.conversation_id,
+                )]),
+                media_type="text/event-stream",
+                status_code=503,
+            )
+        return JSONResponse(
+            {"error": "engine state not ready; please retry"},
+            status_code=503,
+        )
 
     execute_attach(
         old_id=result.conversation_id,

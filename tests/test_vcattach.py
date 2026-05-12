@@ -1217,3 +1217,97 @@ def test_concurrent_save_conversation_alias_no_constraint_violation(sqlite_store
     assert final in {"t-a", "t-b"}, (
         f"final alias target must be one of the contenders, got {final!r}"
     )
+
+
+# ===========================================================================
+# Structural guard: engine._store=None on VCATTACH handler entry (task #28).
+#
+# The unwrap site at handlers.py walks ``state.engine._store ->
+# (._store)`` to extract the raw store passed to ``execute_attach``. In
+# multi-worker prod a window exists where engine construction has
+# completed enough for ``state.engine`` to be published into the cache
+# but ``_store`` is still ``None`` (root cause tracked separately as a
+# follow-up investigation; reproduction requires conditions a
+# single-worker harness can't trigger).
+#
+# Without the guard, ``execute_attach`` reaches ``vcattach.py:187``'s
+# ``store.save_conversation_alias(...)`` on ``None`` and raises
+# ``AttributeError``, surfacing as an opaque HTTP 500 the client
+# can't usefully retry on. The guard converts the condition into a
+# retryable HTTP 503 so Claude Code (and any other client) can retry
+# past the transient window.
+# ===========================================================================
+
+
+def test_vcattach_returns_503_when_engine_store_is_none() -> None:
+    """When ``state.engine._store`` is ``None`` at handler entry, the
+    VCATTACH path MUST return HTTP 503 with a retryable error payload,
+    NOT raise an AttributeError out of ``execute_attach``."""
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    # Engine published into state but ``_store`` is None — the failure
+    # shape the guard exists for.
+    state = SimpleNamespace(
+        engine=SimpleNamespace(_store=None),
+    )
+    registry = SimpleNamespace(remove_conversation=lambda cid: None)
+    result = SimpleNamespace(
+        vcattach_label="some-target",
+        conversation_id="src-conv-123",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH some-target"}],
+    })
+
+    response = asyncio.run(
+        _handle_vcattach(
+            result,
+            fmt,
+            state,
+            registry,
+            labels={"target-conv-id": "some-target"},
+            conv_ids=["src-conv-123", "target-conv-id"],
+        )
+    )
+
+    # 503 (retryable), not 500 (AttributeError surface).
+    assert response.status_code == 503
+
+
+def test_vcattach_returns_503_streaming_when_engine_store_is_none() -> None:
+    """Streaming variant: when the request is_streaming and engine._store
+    is None, response is a 503 StreamingResponse, not a JSONResponse."""
+    from starlette.responses import StreamingResponse
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    state = SimpleNamespace(
+        engine=SimpleNamespace(_store=None),
+    )
+    registry = SimpleNamespace(remove_conversation=lambda cid: None)
+    result = SimpleNamespace(
+        vcattach_label="some-target",
+        conversation_id="src-conv-789",
+        is_streaming=True,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH some-target"}],
+    })
+
+    response = asyncio.run(
+        _handle_vcattach(
+            result,
+            fmt,
+            state,
+            registry,
+            labels={"target-conv-id": "some-target"},
+            conv_ids=["src-conv-789", "target-conv-id"],
+        )
+    )
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 503
