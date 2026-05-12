@@ -184,6 +184,39 @@ def test_post_compaction_gate_true_when_both_positive():
     assert call_kwargs["post_compaction"] is True
 
 
+def test_active_tags_cleared_under_bug_shape_compacted_positive_flushed_zero():
+    """Companion to the primary post_compaction gate test: the
+    active-tag clearing at the head of ``on_message_inbound``
+    (``retrieval_assembler.py:157-160``) MUST also route through the
+    new compacted-driven gate, not the legacy flushed-driven gate.
+
+    Before the fix the assembler ran ``active_tags =
+    self._get_active_tags(...)`` for the bug-shape input (compacted
+    positive, flushed zero), which suppressed cross-tag retrieval on
+    the first request of a freshly-hydrated post-compaction engine
+    — exactly the comment's "don't suppress retrieval -- stored
+    summaries are needed since raw turns have been compacted away"
+    intent, inverted. The fix routes the same gate through
+    ``_post_compaction``, so the assembler now passes ``active_tags
+    = []`` to the retriever for the bug shape.
+    """
+    assembler, retriever = _make_assembler(
+        compacted_prefix_messages=958,
+        flushed_prefix_messages=0,
+    )
+
+    assembler.on_message_inbound(message="what topics?", conversation_history=[])
+
+    call_kwargs = retriever.retrieve.call_args.kwargs
+    assert call_kwargs["current_active_tags"] == [], (
+        "Bug shape (compacted > 0 with flushed == 0): active_tags "
+        "must clear to []. Routing this gate through the flushed "
+        "watermark suppressed retrieval on the first request of a "
+        "freshly-hydrated post-compaction engine — the same failure "
+        "shape as the primary summary_floor gate."
+    )
+
+
 def test_retrieval_does_not_mutate_flushed_prefix_messages():
     """Preserve the deferred-payload-mutation invariant that
     ``flushed_prefix_messages`` is session-scoped and lags
