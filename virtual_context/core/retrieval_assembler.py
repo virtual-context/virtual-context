@@ -143,10 +143,21 @@ class RetrievalAssembler:
 
         # Determine active tags from recent tag results
         # Post-compaction: don't suppress retrieval -- stored summaries are needed
-        # since raw turns have been compacted away
+        # since raw turns have been compacted away.
+        #
+        # The post-compaction gate consults ``compacted_prefix_messages``
+        # (durable, re-derived from canonical_turns on every hydration) NOT
+        # ``flushed_prefix_messages`` (session-scoped, lags compacted by
+        # design for deferred-payload-mutation deployments and stays at the
+        # loaded value until the next ``prepare_payload`` flush gate runs).
+        # The retriever's binary "has compaction happened" signal must reflect
+        # durable content progress, not per-session payload mutation progress.
         _active_stage = time.monotonic()
         _ft = self._engine_state.flushed_prefix_messages
-        if _ft > 0:
+        _post_compaction = int(
+            getattr(self._engine_state, "compacted_prefix_messages", 0) or 0
+        ) > 0
+        if _post_compaction:
             active_tags = []
         else:
             active_tags = self._get_active_tags(conversation_history)
@@ -182,7 +193,7 @@ class RetrievalAssembler:
             message=message,
             current_active_tags=active_tags,
             current_utilization=utilization,
-            post_compaction=(_ft > 0),
+            post_compaction=_post_compaction,
             context_turns=context,
         )
         _note("retrieve_primary", _retrieve_stage)
@@ -254,7 +265,7 @@ class RetrievalAssembler:
                     message=message,
                     current_active_tags=active_tags,
                     current_utilization=utilization,
-                    post_compaction=(_ft > 0),
+                    post_compaction=_post_compaction,
                     context_turns=expanded,
                 )
                 _note("retrieve_retry_general", _retry_retrieve_stage)
