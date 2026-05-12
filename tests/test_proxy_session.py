@@ -720,7 +720,14 @@ class TestContentFingerprintRouting:
 
         # Create an engine, ingest some data, and persist state
         config_path = tmp_path / "vc.yaml"
-        config_path.write_text("storage:\n  backend: sqlite\n  sqlite:\n    path: " + str(tmp_path / "store.db") + "\n")
+        config_path.write_text(
+            "storage:\n"
+            "  backend: sqlite\n"
+            "  sqlite:\n"
+            "    path: " + str(tmp_path / "store.db") + "\n"
+            "retrieval:\n"
+            "  inbound_tagger_type: keyword\n"
+        )
         engine1 = VirtualContextEngine(config_path=str(config_path))
         saved_id = engine1.config.conversation_id
         from virtual_context.types import Message, TurnTagEntry
@@ -759,7 +766,14 @@ class TestContentFingerprintRouting:
         from virtual_context.engine import VirtualContextEngine
 
         config_path = tmp_path / "vc.yaml"
-        config_path.write_text("storage:\n  backend: sqlite\n  sqlite:\n    path: " + str(tmp_path / "store.db") + "\n")
+        config_path.write_text(
+            "storage:\n"
+            "  backend: sqlite\n"
+            "  sqlite:\n"
+            "    path: " + str(tmp_path / "store.db") + "\n"
+            "retrieval:\n"
+            "  inbound_tagger_type: keyword\n"
+        )
         engine1 = VirtualContextEngine(config_path=str(config_path))
         saved_id = engine1.config.conversation_id
         engine1._save_state([

@@ -236,6 +236,13 @@ class VirtualContextEngine:
         self._restored_pending_turns: list[tuple[int, str, str, str | None, str | None]] = []
         self._restored_from_checkpoint = False
         self._restored_checkpoint_source = ""
+        # Set True at the end of __init__ when alias resolver rebound
+        # ``config.conversation_id`` AND we successfully self-hydrated from
+        # the SessionStateProvider for the resolver-rebound id. See
+        # ``docs/specs/engine-self-hydrate-on-rebind.md`` for the contract:
+        # cloud's ``_hydrate_session_state`` honors this flag and no-ops
+        # to avoid clobbering target-keyed state with source-keyed state.
+        self._self_hydrated_from_provider = False
 
         if self._session_state_provider is None:
             # Self-managed restore (local proxy mode)
@@ -389,7 +396,57 @@ class VirtualContextEngine:
             session_state_provider=self._session_state_provider,
         )
         self._retrieval._set_semantic(self._semantic)
+
         self._apply_persisted_state_to_delegates()
+
+        # ------------------------------------------------------------------
+        # Self-hydrate on alias-resolver rebind (provider mode only).
+        #
+        # When the alias resolver rebound ``config.conversation_id`` from
+        # ``_raw_conv_id`` (source) to the resolved target during the
+        # block at lines 170-216, cloud's later
+        # ``_hydrate_session_state(state, source_id)`` would key off the
+        # request's source id and load fresh-source's empty SessionState —
+        # clobbering the resolver-rebound target's state and leaving the
+        # retriever's ``post_compaction`` gate at False (the user-visible
+        # bug #29 symptom: no recall content after VCATTACH).
+        #
+        # Pre-empt that by loading + hydrating target's SessionState here,
+        # then signalling cloud via the ``_self_hydrated_from_provider``
+        # flag so cloud's call no-ops. See
+        # ``docs/specs/engine-self-hydrate-on-rebind.md`` for the full
+        # contract + deploy ordering (cloud-first / engine-second).
+        # ------------------------------------------------------------------
+        if (
+            self._session_state_provider is not None
+            and _raw_conv_id
+            and self.config.conversation_id != _raw_conv_id
+        ):
+            try:
+                _session = self._session_state_provider.load(
+                    self.config.conversation_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Engine self-hydration load failed for resolver-rebound "
+                    "id %s; falling back to caller-driven hydration which "
+                    "may load source-keyed state. Underlying error (transient "
+                    "or persistent) will retry on next engine construction.",
+                    self.config.conversation_id[:12], exc_info=True,
+                )
+                _session = None
+            if _session is not None and not getattr(_session, "deleted", False):
+                self.hydrate_from_session_state(_session)
+                self._self_hydrated_from_provider = True
+                logger.info(
+                    "Engine self-hydrated from provider for resolver-rebound "
+                    "id %s (compacted=%d, flushed=%d, last_completed_turn=%d)",
+                    self.config.conversation_id[:12],
+                    self._engine_state.compacted_prefix_messages,
+                    self._engine_state.flushed_prefix_messages,
+                    self._engine_state.last_completed_turn,
+                )
+
         self._bootstrap_vocabulary()
 
     # ------------------------------------------------------------------
