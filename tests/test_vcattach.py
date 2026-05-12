@@ -1234,23 +1234,24 @@ def test_concurrent_save_conversation_alias_no_constraint_violation(sqlite_store
 # ``store.save_conversation_alias(...)`` on ``None`` and raises
 # ``AttributeError``, surfacing as an opaque HTTP 500 the client
 # can't usefully retry on. The guard converts the condition into a
-# retryable HTTP 503 so Claude Code (and any other client) can retry
-# past the transient window.
+# retryable HTTP 503 so clients can retry past the transient window.
 # ===========================================================================
 
 
-def test_vcattach_returns_503_when_engine_store_is_none() -> None:
-    """When ``state.engine._store`` is ``None`` at handler entry, the
+@pytest.mark.parametrize(
+    "state",
+    [
+        SimpleNamespace(engine=SimpleNamespace(_store=None)),
+        SimpleNamespace(engine=None),
+    ],
+)
+def test_vcattach_returns_503_when_engine_store_is_unavailable(state) -> None:
+    """When ``state.engine._store`` is unavailable at handler entry, the
     VCATTACH path MUST return HTTP 503 with a retryable error payload,
     NOT raise an AttributeError out of ``execute_attach``."""
     from virtual_context.proxy.handlers import _handle_vcattach
     from virtual_context.proxy.formats import detect_format
 
-    # Engine published into state but ``_store`` is None — the failure
-    # shape the guard exists for.
-    state = SimpleNamespace(
-        engine=SimpleNamespace(_store=None),
-    )
     registry = SimpleNamespace(remove_conversation=lambda cid: None)
     result = SimpleNamespace(
         vcattach_label="some-target",
@@ -1275,12 +1276,16 @@ def test_vcattach_returns_503_when_engine_store_is_none() -> None:
 
     # 503 (retryable), not 500 (AttributeError surface).
     assert response.status_code == 503
+    assert response.media_type == "application/json"
+    assert response.body == (
+        b'{"error":"engine state not ready; please retry","retryable":true}'
+    )
 
 
-def test_vcattach_returns_503_streaming_when_engine_store_is_none() -> None:
+def test_vcattach_returns_json_503_streaming_when_engine_store_is_none() -> None:
     """Streaming variant: when the request is_streaming and engine._store
-    is None, response is a 503 StreamingResponse, not a JSONResponse."""
-    from starlette.responses import StreamingResponse
+    is None, response is a retryable JSON 503."""
+    from starlette.responses import JSONResponse
     from virtual_context.proxy.handlers import _handle_vcattach
     from virtual_context.proxy.formats import detect_format
 
@@ -1309,5 +1314,8 @@ def test_vcattach_returns_503_streaming_when_engine_store_is_none() -> None:
         )
     )
 
-    assert isinstance(response, StreamingResponse)
+    assert isinstance(response, JSONResponse)
     assert response.status_code == 503
+    assert response.body == (
+        b'{"error":"engine state not ready; please retry","retryable":true}'
+    )

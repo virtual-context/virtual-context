@@ -1596,6 +1596,7 @@ class TestCreateAppSharedEngine:
         config = load_config(config_dict={
             "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
             "storage_root": str(tmp_path),
+            "retrieval": {"inbound_tagger_type": "keyword"},
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=config)
@@ -1615,6 +1616,7 @@ class TestCreateAppSharedEngine:
         config = load_config(config_dict={
             "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
             "storage_root": str(tmp_path),
+            "retrieval": {"inbound_tagger_type": "keyword"},
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=config)
@@ -1633,6 +1635,7 @@ class TestCreateAppSharedEngine:
         config = load_config(config_dict={
             "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "test.db")}},
             "storage_root": str(tmp_path),
+            "retrieval": {"inbound_tagger_type": "keyword"},
         })
         from virtual_context.engine import VirtualContextEngine
         engine = VirtualContextEngine(config=config)

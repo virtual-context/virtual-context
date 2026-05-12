@@ -1811,12 +1811,17 @@ async def _handle_vcattach(
 
     target_raw = result.vcattach_label
 
+    def _current_store_proxy():
+        engine = getattr(state, "engine", None) if state else None
+        return getattr(engine, "_store", None) if engine else None
+
     # In cloud mode, labels and conv_ids are passed from the tenant registry.
     # In standalone mode, fall back to in-memory sessions + store stats.
     if conv_ids is None:
         conv_ids = list(registry._conversations.keys()) if registry else []
-        if state and state.engine._store:
-            _stats = getattr(state.engine._store, "get_conversation_stats", None)
+        _store_proxy = _current_store_proxy()
+        if _store_proxy:
+            _stats = getattr(_store_proxy, "get_conversation_stats", None)
             if callable(_stats):
                 try:
                     for s in _stats():
@@ -1830,7 +1835,7 @@ async def _handle_vcattach(
     # identity) — phase != 'deleted'/'merged' and deleted_at IS NULL.
     # ``engine_state`` is structurally empty for REST-only ingest tenants
     # so it cannot serve as the liveness signal here.
-    _store_proxy = state.engine._store if state else None
+    _store_proxy = _current_store_proxy()
     _inner_proxy = getattr(_store_proxy, '_store', _store_proxy) if _store_proxy else None
 
     def _target_exists(tid):
@@ -1862,11 +1867,7 @@ async def _handle_vcattach(
     # VCATTACH is a durable redirect, not a merge. The old conversation is
     # preserved; only the alias row is written and caches are invalidated so
     # the next request sees the new routing.
-    _store = (
-        state.engine._store
-        if state and getattr(state, "engine", None) and state.engine._store
-        else None
-    )
+    _store = _current_store_proxy()
     _inner = getattr(_store, '_store', _store) if _store else None
 
     # Structural guard: when engine construction has partially completed
@@ -1876,23 +1877,13 @@ async def _handle_vcattach(
     # on a ``None`` store and raises ``AttributeError`` deep in
     # ``vcattach.py:187``. That surfaces to the user as an opaque HTTP 500
     # and the VCATTACH appears to silently fail. Convert that condition
-    # into a retryable HTTP 503 so the client (Claude Code is the canonical
-    # caller) can retry past the transient window and reach a properly
-    # constructed engine. The root cause of ``_store=None`` post-construction
-    # is tracked separately as a follow-up investigation; this guard ships
-    # the user-visible mitigation.
+    # into a retryable HTTP 503 so the client can retry past the transient
+    # window and reach a properly constructed engine. The root cause of
+    # ``_store=None`` post-construction is tracked separately as a follow-up
+    # investigation; this guard ships the user-visible mitigation.
     if _inner is None:
-        if result.is_streaming:
-            return StreamingResponse(
-                iter([fmt.emit_fake_response_sse(
-                    "engine state not ready; please retry",
-                    result.conversation_id,
-                )]),
-                media_type="text/event-stream",
-                status_code=503,
-            )
         return JSONResponse(
-            {"error": "engine state not ready; please retry"},
+            {"error": "engine state not ready; please retry", "retryable": True},
             status_code=503,
         )
 
