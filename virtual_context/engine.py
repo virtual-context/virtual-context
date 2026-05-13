@@ -1679,9 +1679,15 @@ class VirtualContextEngine:
 
             _loaded_lct = int(self._engine_state.last_completed_turn)
             _loaded_lit = int(self._engine_state.last_indexed_turn)
-            if _loaded_lct < 0 and _derived_lct >= 0:
+            if (
+                (_loaded_lct < 0 and _derived_lct >= 0)
+                or (_loaded_lct == 0 and _derived_lct > 0)
+            ):
                 self._engine_state.last_completed_turn = _derived_lct
-            if _loaded_lit < 0 and _derived_lit >= 0:
+            if (
+                (_loaded_lit < 0 and _derived_lit >= 0)
+                or (_loaded_lit == 0 and _derived_lit > 0)
+            ):
                 self._engine_state.last_indexed_turn = _derived_lit
 
             # turn_tag_entries: when the loaded index is empty but
