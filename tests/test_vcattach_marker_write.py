@@ -23,7 +23,11 @@ import pytest
 
 from virtual_context.core.state_recovery import derive_session_state_markers
 from virtual_context.proxy.session_state import SessionState
-from virtual_context.proxy.vcattach import execute_attach
+from virtual_context.proxy.vcattach import (
+    _alias_created_event_for,
+    _alias_deleted_event_for,
+    execute_attach,
+)
 
 
 def _row(
@@ -364,3 +368,44 @@ def test_execute_attach_self_target_still_writes_markers():
     assert provider.save.call_count == 1
     saved_state = provider.save.call_args.args[1]
     assert saved_state.compacted_prefix_messages == 2
+
+
+def test_alias_event_helpers_reach_composite_segments_builders():
+    """CompositeStore keeps the alias event builders on its _segments
+    backend; execute_attach should use that richer event shape."""
+    inner = SimpleNamespace(
+        _build_alias_deleted_event=lambda alias_id: {
+            "type": "alias_deleted",
+            "alias_id": alias_id,
+            "reverse_dependents": ["child"],
+        },
+        _build_alias_created_event=lambda alias_id, target_id: {
+            "type": "alias_created",
+            "source": alias_id,
+            "target": target_id,
+            "reverse_dependents": ["child"],
+        },
+    )
+    store = SimpleNamespace(_segments=inner)
+
+    deleted = _alias_deleted_event_for(store, "target")
+    created = _alias_created_event_for(store, "source", "target")
+
+    assert deleted["reverse_dependents"] == ["child"]
+    assert created["reverse_dependents"] == ["child"]
+
+
+def test_alias_event_helpers_fallback_without_store_builders():
+    """Fallback path remains stable for custom stores that expose alias
+    persistence but no private event-builder helpers."""
+    store = SimpleNamespace()
+
+    assert _alias_deleted_event_for(store, "target") == {
+        "type": "alias_deleted",
+        "alias_id": "target",
+    }
+    assert _alias_created_event_for(store, "source", "target") == {
+        "type": "alias_created",
+        "source": "source",
+        "target": "target",
+    }
