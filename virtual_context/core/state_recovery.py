@@ -21,6 +21,7 @@ for the surrounding design.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -79,6 +80,8 @@ def _build_turn_tag_entries(
         sender = ""
         session_date = ""
         canonical_turn_id = ""
+        user_content = ""
+        assistant_content = ""
         tags: list[str] = []
         fact_signals: list[Any] = []
         code_refs: list[dict] = []
@@ -94,6 +97,10 @@ def _build_turn_tag_entries(
                 sender = getattr(row, "sender", "") or ""
             if not session_date:
                 session_date = getattr(row, "session_date", "") or ""
+            if not user_content and getattr(row, "user_content", ""):
+                user_content = str(getattr(row, "user_content", "") or "")
+            if not assistant_content and getattr(row, "assistant_content", ""):
+                assistant_content = str(getattr(row, "assistant_content", "") or "")
             tags.extend(list(getattr(row, "tags", []) or []))
             fact_signals.extend(list(getattr(row, "fact_signals", []) or []))
             code_refs.extend(list(getattr(row, "code_refs", []) or []))
@@ -101,14 +108,18 @@ def _build_turn_tag_entries(
                 getattr(row, "last_seen_at", None),
                 getattr(row, "first_seen_at", None),
                 getattr(row, "updated_at", None),
+                getattr(row, "created_at", None),
             ])
 
         ts_value = next((t for t in timestamps if t), None)
+        message_hash = hashlib.sha256(
+            f"{user_content} {assistant_content}".encode(),
+        ).hexdigest()[:16]
         entries.append(TurnTagEntry(
             turn_number=int(turn_number),
-            message_hash="",  # derivation source doesn't carry the hash
+            message_hash=message_hash,
             canonical_turn_id=canonical_turn_id,
-            tags=list(dict.fromkeys(tags)),  # dedupe, preserve order
+            tags=list(dict.fromkeys(tags)) or [primary_tag],
             primary_tag=primary_tag,
             timestamp=_parse_timestamp(ts_value),
             session_date=session_date,
