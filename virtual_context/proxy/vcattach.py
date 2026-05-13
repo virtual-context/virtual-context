@@ -322,9 +322,11 @@ def execute_attach(
                 # itself signals retryable failure. Caller (REST
                 # handler) translates to 503 so the client retries.
                 # Alias row is already committed; marker write at T2
-                # already ran; retry of the VCATTACH refires this
-                # publish step and the version-checked provider.save
-                # discards the redundant marker write.
+                # already ran. A retry of the VCATTACH refires this
+                # publish step. If the retried marker write derives
+                # from stale state, provider.save's Redis version check
+                # rejects it; if it derives from the current state, the
+                # write is a harmless checkpoint bump.
                 raise
             except Exception:
                 logger.warning(

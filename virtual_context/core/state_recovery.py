@@ -140,7 +140,12 @@ def derive_session_state_markers(
 
     Args:
         store: unwrapped storage backend. Must expose
-            ``get_all_canonical_turns(conversation_id)``.
+            ``get_all_canonical_turns(conversation_id)``. That storage
+            API is conversation-scoped by contract; this helper trusts
+            the store to filter by ``conversation_id`` rather than
+            re-filtering row objects, because lightweight test/store
+            adapters do not always carry a row-level ``conversation_id``
+            attribute.
         conversation_id: target conversation.
         existing_state: optional SessionState that may already exist in
             Redis. Non-derivable fields (``checkpoint_version``,
