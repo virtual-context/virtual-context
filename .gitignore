@@ -60,6 +60,7 @@ extraneous/paper/*.png
 *.json
 !pyproject.toml
 !package.json
+!tests/fixtures/*.json
 *.autopsy.md
 
 # OS
