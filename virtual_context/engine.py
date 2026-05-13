@@ -1697,9 +1697,26 @@ class VirtualContextEngine:
             # is idempotent and noop's when canonical_turns is empty.
             if not self._turn_tag_index.entries and _derived_lit >= 0:
                 try:
-                    self._restore_from_canonical_rows(
+                    if self._restore_from_canonical_rows(
                         self.config.conversation_id,
-                    )
+                    ):
+                        restored_tti = self._turn_tag_index
+                        for attr in ("_tagging", "_compaction", "_retrieval", "_search"):
+                            delegate = getattr(self, attr, None)
+                            if delegate is None:
+                                continue
+                            if hasattr(delegate, "_turn_tag_index"):
+                                delegate._turn_tag_index = restored_tti
+                        if hasattr(self, "_retriever"):
+                            self._retriever._turn_tag_index = restored_tti
+                        retrieval = getattr(self, "_retrieval", None)
+                        if retrieval and hasattr(retrieval, "_retriever"):
+                            retrieval._retriever._turn_tag_index = restored_tti
+                        if (
+                            hasattr(self, "_segmenter")
+                            and hasattr(self._segmenter, "_turn_tag_index")
+                        ):
+                            self._segmenter._turn_tag_index = restored_tti
                 except Exception:
                     logger.warning(
                         "Defensive recovery: turn_tag_entries reconstruction "
