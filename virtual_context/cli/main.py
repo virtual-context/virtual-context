@@ -1555,9 +1555,14 @@ def cmd_admin_backfill_session_state_markers(args):
     Batch shape:
 
         virtual-context admin backfill-session-state-markers \\
-            --tenant-id <tid> --all-convs-for-tenant \\
+            --all-convs-for-tenant \\
             --redis-url redis://... \\
             --limit 25
+
+    Add ``--tenant-id <tid>`` in multi-tenant deployments to scope
+    enumeration to one tenant. In single-tenant proxy mode, omit it
+    and the command repairs all live/attachable conversations in the
+    configured store.
 
     Add ``--dry-run`` to compute + log the derived SessionState
     shape without invoking ``provider.save``. Useful for inspecting
@@ -1582,13 +1587,6 @@ def cmd_admin_backfill_session_state_markers(args):
             "status": "error",
             "stage": "args",
             "error": "either <conversation_id> or --all-convs-for-tenant must be supplied",
-        }))
-        sys.exit(2)
-    if all_convs and not tenant_id:
-        print(json.dumps({
-            "status": "error",
-            "stage": "args",
-            "error": "--all-convs-for-tenant requires --tenant-id",
         }))
         sys.exit(2)
     if not dry_run and not redis_url:
@@ -1650,10 +1648,10 @@ def cmd_admin_backfill_session_state_markers(args):
                 cid = getattr(stat, "conversation_id", "")
                 if not cid:
                     continue
-                if tenant_id and callable(is_attachable):
+                if callable(is_attachable):
                     if not bool(is_attachable(
                         conversation_id=cid,
-                        tenant_id=tenant_id,
+                        tenant_id=tenant_id or None,
                     )):
                         continue
                 conv_ids.append(cid)
@@ -2001,8 +1999,8 @@ def main():
         "--tenant-id",
         default="",
         help=(
-            "Tenant id to set on the engine config. Required when "
-            "--all-convs-for-tenant is set."
+            "Tenant id to set on the engine config and use for batch "
+            "filtering. Optional for single-tenant stores."
         ),
     )
     backfill_ssm_parser.add_argument(
@@ -2010,8 +2008,8 @@ def main():
         action="store_true",
         help=(
             "Enumerate every conversation in the configured storage "
-            "and run the marker repair against each. Requires "
-            "--tenant-id."
+            "and run the marker repair against each. When --tenant-id "
+            "is supplied, limits enumeration to that tenant."
         ),
     )
     backfill_ssm_parser.add_argument(

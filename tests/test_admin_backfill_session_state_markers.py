@@ -230,3 +230,84 @@ def test_cmd_admin_backfill_session_state_markers_batch_filters_tenant(
     assert lines[2]["status"] == "complete"
     assert lines[2]["processed"] == 2
     assert lines[2]["saved"] == 2
+
+
+def test_cmd_admin_backfill_session_state_markers_batch_all_convs_single_tenant(
+    monkeypatch,
+    capsys,
+):
+    """Single-tenant proxy mode has no tenant id. Batch repair should
+    still enumerate all live attachable conversations and pass
+    tenant_id=None to the store predicate."""
+    import virtual_context.cli.main as cli_main
+    import virtual_context.core.state_recovery as state_recovery
+    import virtual_context.engine as engine_module
+
+    class RawStore:
+        def __init__(self):
+            self.attachable_calls: list[tuple[str, object]] = []
+
+        def get_conversation_stats(self):
+            return [
+                SimpleNamespace(conversation_id="conv-live"),
+                SimpleNamespace(conversation_id="conv-deleted"),
+            ]
+
+        def is_attachable_target(self, *, conversation_id, tenant_id=None):
+            self.attachable_calls.append((conversation_id, tenant_id))
+            return tenant_id is None and conversation_id == "conv-live"
+
+    raw_store = RawStore()
+
+    class StubEngine:
+        def __init__(self, config):
+            self._store = SimpleNamespace(_store=raw_store)
+
+        def close(self):
+            pass
+
+    derived_for: list[str] = []
+
+    def fake_derive(store, conversation_id, *, existing_state=None):
+        assert store is raw_store
+        assert existing_state is None
+        derived_for.append(conversation_id)
+        return SimpleNamespace(
+            compacted_prefix_messages=2,
+            flushed_prefix_messages=2,
+            last_completed_turn=1,
+            last_indexed_turn=1,
+            turn_tag_entries=[{"turn_number": 0}],
+        )
+
+    monkeypatch.setattr(cli_main, "load_config", lambda path: SimpleNamespace())
+    monkeypatch.setattr(cli_main, "_apply_storage_overrides", lambda config, args: None)
+    monkeypatch.setattr(engine_module, "VirtualContextEngine", StubEngine)
+    monkeypatch.setattr(state_recovery, "derive_session_state_markers", fake_derive)
+
+    args = SimpleNamespace(
+        config=None,
+        conversation_id=None,
+        tenant_id="",
+        all_convs_for_tenant=True,
+        dry_run=True,
+        limit=None,
+        redis_url="",
+    )
+
+    cli_main.cmd_admin_backfill_session_state_markers(args)
+
+    assert raw_store.attachable_calls == [
+        ("conv-live", None),
+        ("conv-deleted", None),
+    ]
+    assert derived_for == ["conv-live"]
+
+    lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.strip().splitlines()
+    ]
+    assert lines[0]["status"] == "dry_run"
+    assert lines[0]["conversation_id"] == "conv-live"
+    assert lines[1]["status"] == "complete"
+    assert lines[1]["processed"] == 1
