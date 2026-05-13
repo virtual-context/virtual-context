@@ -92,12 +92,79 @@ def resolve_target(
     return tid, tlabel, ""
 
 
+def _alias_deleted_event_for(store, target_id: str) -> dict:
+    """Construct the AliasDeletedEvent dict for the explicit-invoke shape.
+
+    Delegates to the store's ``_build_alias_deleted_event`` when
+    available so the event shape matches what the legacy
+    ``on_committed`` plumbing produced (including
+    ``reverse_dependents`` BFS over incoming edges). Falls back to a
+    minimal dict when the store doesn't expose the helper — preserves
+    forward-compat against older or non-canonical store implementations.
+    """
+    builder = _resolve_store_attr(store, "_build_alias_deleted_event")
+    if callable(builder):
+        try:
+            return builder(target_id)
+        except Exception:
+            logger.warning(
+                "VCATTACH: _build_alias_deleted_event raised for %s; "
+                "falling back to minimal event",
+                target_id[:12], exc_info=True,
+            )
+    # Fallback shape matches the canonical store helpers' output keys
+    # (``alias_id`` for the deleted-side, see
+    # ``storage/sqlite.py:_build_alias_deleted_event``). Keeps
+    # downstream subscribers' key access stable when the store layer
+    # doesn't expose the helper directly.
+    return {"type": "alias_deleted", "alias_id": target_id}
+
+
+def _alias_created_event_for(store, old_id: str, target_id: str) -> dict:
+    """Construct the AliasCreatedEvent dict.
+
+    Same store-helper-with-fallback shape as
+    ``_alias_deleted_event_for``. The store's helper resolves
+    ``target_id`` to its terminal (walks the alias chain) and computes
+    ``reverse_dependents`` for the source side.
+    """
+    builder = _resolve_store_attr(store, "_build_alias_created_event")
+    if callable(builder):
+        try:
+            return builder(old_id, target_id)
+        except Exception:
+            logger.warning(
+                "VCATTACH: _build_alias_created_event raised for %s->%s; "
+                "falling back to minimal event",
+                old_id[:12], target_id[:12], exc_info=True,
+            )
+    return {"type": "alias_created", "source": old_id, "target": target_id}
+
+
+def _resolve_store_attr(store, attr_name: str):
+    """Return ``attr_name`` from ``store`` or its inner state store.
+
+    ``CompositeStore`` delegates alias APIs explicitly but does NOT
+    forward private helpers like ``_build_alias_*_event``. Reach
+    through to the inner state store (which is a ``SQLiteStore`` or
+    ``PostgresStore``) when the composite is the visible interface.
+    """
+    direct = getattr(store, attr_name, None)
+    if direct is not None:
+        return direct
+    state = getattr(store, "_state", None) or getattr(store, "state", None)
+    if state is not None:
+        return getattr(state, attr_name, None)
+    return None
+
+
 def execute_attach(
     old_id: str,
     target_id: str,
     store,
     registry_invalidate=None,
     cross_worker_invalidate=None,
+    session_state_provider=None,
 ) -> None:
     """Execute the attach: clear any reverse alias, register new alias, invalidate.
 
@@ -150,44 +217,111 @@ def execute_attach(
         hook appears later, re-introduce with an explicit name and a
         docstring rule forbidding destructive primitives.
     """
-    # 1. Clear any alias FROM target_id so target_id resolves to itself again.
+    # T0a. Clear any alias FROM target_id so target_id resolves to itself.
     # This unlocks "return to A" flows where A was previously aliased to B.
+    # ``on_committed`` is INTENTIONALLY NOT passed — cross-worker
+    # invalidation moves to an explicit post-marker-write step (T1) so
+    # the strict T2-before-T1 ordering invariant holds for every
+    # observer. See ``docs/specs/vcattach-redis-marker-write-and-cross-worker-invalidation.md``
+    # CRITICAL invariant (3).
     delete_alias = getattr(store, "delete_conversation_alias", None)
     if callable(delete_alias):
-        # ``cross_worker_invalidate`` propagates as ``on_committed=`` so
-        # the AliasDeletedEvent fires once after the row commits. Failures
-        # raise ``InvalidationFailedError`` and propagate to the REST
-        # handler (per spec S9 at-least-once).
-        kwargs = (
-            {"on_committed": cross_worker_invalidate}
-            if cross_worker_invalidate is not None else {}
-        )
         try:
-            delete_alias(target_id, **kwargs)
-        except Exception as exc:
-            from ..core.exceptions import InvalidationFailedError
-            if isinstance(exc, InvalidationFailedError):
-                # At-least-once contract: surface to the caller as
-                # retryable. Row is already committed; retry will
-                # refire the callback.
-                raise
+            delete_alias(target_id)
+        except Exception:
             logger.warning(
                 "VCATTACH: failed to clear existing alias for %s",
                 target_id[:12],
             )
 
-    # 2. Register new alias old_id -> target_id. Same on_committed
-    # plumbing as above — fires AliasCreatedEvent once after the row
-    # commits; failures propagate as InvalidationFailedError so the
-    # REST handler can return a retryable 503.
-    save_kwargs = (
-        {"on_committed": cross_worker_invalidate}
-        if cross_worker_invalidate is not None else {}
-    )
-    store.save_conversation_alias(old_id, target_id, **save_kwargs)
+    # T0b. Register new alias old_id -> target_id. Same no-on_committed
+    # rule as T0a — explicit cross-worker invocation at T1 below.
+    store.save_conversation_alias(old_id, target_id)
     logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
 
-    # 3. Invalidate cached runtime state for BOTH ids. old_id eviction is
+    # T2. Derive correct SessionState markers from canonical_turns and
+    # write to Redis BEFORE publishing cross-worker invalidation. This
+    # corrects target's SessionState in one shot, replacing any
+    # corrupted state where compaction-time fields silently failed to
+    # persist (the system-wide class fixed in v0.4.5's clamp inversion
+    # at hydrate-time, here fixed at the write-time entry point so
+    # future hydrations have correct data on disk too).
+    #
+    # Failures here are best-effort — alias row is already committed
+    # at T0b, and T1 below still fires to invalidate sibling caches.
+    # The hydrate-time defensive recovery (Step C in spec) catches any
+    # workers that read stale Redis between T0b and a successful T2.
+    if session_state_provider is not None:
+        try:
+            from ..core.state_recovery import derive_session_state_markers
+            existing = None
+            try:
+                existing = session_state_provider.load(target_id)
+            except Exception:
+                logger.warning(
+                    "VCATTACH: failed to load existing SessionState for "
+                    "%s; deriving from canonical_turns without "
+                    "carrying forward non-derivable fields",
+                    target_id[:12], exc_info=True,
+                )
+            derived = derive_session_state_markers(
+                store, target_id, existing_state=existing,
+            )
+            if derived is not None:
+                session_state_provider.save(target_id, derived)
+                logger.info(
+                    "VCATTACH: persisted derived SessionState markers for "
+                    "target %s (compacted=%d, flushed=%d, "
+                    "last_completed_turn=%d, last_indexed_turn=%d, "
+                    "turn_tag_entries=%d)",
+                    target_id[:12],
+                    derived.compacted_prefix_messages,
+                    derived.flushed_prefix_messages,
+                    derived.last_completed_turn,
+                    derived.last_indexed_turn,
+                    len(derived.turn_tag_entries),
+                )
+        except Exception:
+            logger.warning(
+                "VCATTACH: SessionState marker write failed for target %s; "
+                "alias is committed and cross-worker invalidation will "
+                "still fire — sibling workers will apply hydrate-time "
+                "defensive recovery from canonical_turns",
+                target_id[:12], exc_info=True,
+            )
+
+    # T1. Cross-worker invalidation — fires whether T2 succeeded or
+    # not. The alias row IS committed at this point and sibling
+    # workers MUST learn about it regardless of marker-write outcome.
+    # When T2 succeeded: siblings re-hydrate from corrected Redis on
+    # next request. When T2 failed: siblings re-hydrate from stale
+    # Redis and apply hydrate-time defensive recovery.
+    if callable(cross_worker_invalidate):
+        from ..core.exceptions import InvalidationFailedError
+        for event in (
+            _alias_deleted_event_for(store, target_id),
+            _alias_created_event_for(store, old_id, target_id),
+        ):
+            try:
+                cross_worker_invalidate(event)
+            except InvalidationFailedError:
+                # Preserve at-least-once contract when the callback
+                # itself signals retryable failure. Caller (REST
+                # handler) translates to 503 so the client retries.
+                # Alias row is already committed; marker write at T2
+                # already ran; retry of the VCATTACH refires this
+                # publish step and the version-checked provider.save
+                # discards the redundant marker write.
+                raise
+            except Exception:
+                logger.warning(
+                    "VCATTACH: cross-worker invalidation failed for "
+                    "event %s",
+                    event.get("type", "?"),
+                    exc_info=True,
+                )
+
+    # T1.5. Local-worker registry eviction. old_id eviction is
     # the critical fix for the routing bug: without it, the issuing
     # chat's ProxyState (whose engine.config.conversation_id == old_id)
     # keeps matching chat_id/sys_hash routing on subsequent requests,

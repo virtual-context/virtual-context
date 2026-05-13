@@ -432,12 +432,20 @@ def test_execute_attach_no_longer_accepts_reset_engine_state():
     # ``save_conversation_alias`` / ``delete_conversation_alias`` and
     # cannot mutate or destroy persisted state. The guard is preserved
     # so any FUTURE kwarg still triggers review.
+    # ``session_state_provider`` was added by the
+    # vcattach-redis-marker-write spec for the post-alias-commit
+    # SessionState derivation + write step (T2). It accepts the
+    # cloud-side SessionStateProvider instance so target's Redis
+    # markers reflect canonical_turns truth after VCATTACH. The
+    # provider is observer-via-save-only at this entry point — the
+    # alias write itself is unaffected by provider availability.
     assert set(sig.parameters.keys()) == {
         "old_id",
         "target_id",
         "store",
         "registry_invalidate",
         "cross_worker_invalidate",
+        "session_state_provider",
     }
 
 

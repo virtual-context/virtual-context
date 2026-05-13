@@ -1618,12 +1618,22 @@ class VirtualContextEngine:
         if hasattr(self, "_segmenter") and hasattr(self._segmenter, "_turn_tag_index"):
             self._segmenter._turn_tag_index = new_tti
 
-        # Canonical rows are authoritative for compacted_prefix_messages across
-        # all workers. The session state we just loaded may be stale relative
-        # to another worker's committed compaction — re-derive from the DB so
-        # this request operates on current truth. flushed_prefix_messages stays
-        # as session state provided it (per-session flush progress is not
-        # DB-derivable), but we clamp it to the derived compacted watermark.
+        # Canonical rows are authoritative for compaction-related markers
+        # across all workers. The session state we just loaded may be stale
+        # relative to another worker's committed compaction — re-derive
+        # from the DB so this request operates on current truth.
+        #
+        # Extended defensive recovery (per
+        # ``docs/specs/vcattach-redis-marker-write-and-cross-worker-invalidation.md``
+        # Step C): when the loaded SessionState has fields at their
+        # "fresh" sentinel values (0 / -1 / [] for compaction-related
+        # fields) but canonical_turns shows the conv has actually been
+        # ingested and/or compacted, prefer the DB-derived values. This
+        # auto-heals stale-Redis cases without requiring a backfill or
+        # re-VCATTACH. The defensive recovery is NOT load-bearing for
+        # the primary VCATTACH marker-write path; it covers the
+        # unavoidable race window between alias commit and marker write,
+        # and pre-v0.4.6 sibling-worker transition states.
         derived = self._derive_compacted_prefix_messages_from_rows(
             self.config.conversation_id,
         )
@@ -1631,10 +1641,65 @@ class VirtualContextEngine:
             compacted_prefix_messages, last_compacted_turn = derived
             self._engine_state.compacted_prefix_messages = compacted_prefix_messages
             self._engine_state.last_compacted_turn = last_compacted_turn
-            self._engine_state.flushed_prefix_messages = min(
-                int(self._engine_state.flushed_prefix_messages or 0),
-                compacted_prefix_messages,
-            )
+            # flushed_prefix_messages: when loaded is 0 and derived
+            # compacted is positive, the SessionState is suspect.
+            # Prefer derived. Matches the v0.4.5 retriever-gate logic
+            # at retrieval_assembler.py:148-160 (gate on compacted not
+            # flushed) at the hydrate-time entry point too — so the
+            # in-memory engine_state field also reflects the durable
+            # truth for any other downstream consumer that reads it.
+            _loaded_flushed = int(self._engine_state.flushed_prefix_messages or 0)
+            if _loaded_flushed == 0 and compacted_prefix_messages > 0:
+                self._engine_state.flushed_prefix_messages = compacted_prefix_messages
+            else:
+                self._engine_state.flushed_prefix_messages = min(
+                    _loaded_flushed, compacted_prefix_messages,
+                )
+
+        # Extended derivation: last_completed_turn, last_indexed_turn,
+        # and turn_tag_entries can also be reconstructed from
+        # canonical_turns. Apply the same loaded-is-sentinel +
+        # derived-is-positive recovery shape.
+        try:
+            _rows = list(self._store.get_all_canonical_turns(
+                self.config.conversation_id,
+            ))
+        except Exception:
+            _rows = []
+        if _rows:
+            _paired = self._group_canonical_rows_into_pairs(_rows)
+            _derived_lct = -1
+            _derived_lit = -1
+            for _tn, _pair in _paired:
+                if not _pair:
+                    continue
+                _derived_lct = max(_derived_lct, int(_tn))
+                if all(getattr(_r, "tagged_at", None) for _r in _pair):
+                    _derived_lit = max(_derived_lit, int(_tn))
+
+            _loaded_lct = int(self._engine_state.last_completed_turn)
+            _loaded_lit = int(self._engine_state.last_indexed_turn)
+            if _loaded_lct < 0 and _derived_lct >= 0:
+                self._engine_state.last_completed_turn = _derived_lct
+            if _loaded_lit < 0 and _derived_lit >= 0:
+                self._engine_state.last_indexed_turn = _derived_lit
+
+            # turn_tag_entries: when the loaded index is empty but
+            # canonical_turns has tagged rows, reconstruct via the
+            # existing canonical-rows restore path so downstream
+            # delegates have a populated index. _restore_from_canonical_rows
+            # is idempotent and noop's when canonical_turns is empty.
+            if not self._turn_tag_index.entries and _derived_lit >= 0:
+                try:
+                    self._restore_from_canonical_rows(
+                        self.config.conversation_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Defensive recovery: turn_tag_entries reconstruction "
+                        "failed for %s",
+                        self.config.conversation_id[:12], exc_info=True,
+                    )
 
     def extract_session_state(self):
         """Extract current checkpoint state for SessionStateProvider save.
