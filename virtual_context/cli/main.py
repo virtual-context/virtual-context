@@ -1591,6 +1591,13 @@ def cmd_admin_backfill_session_state_markers(args):
             "error": "--all-convs-for-tenant requires --tenant-id",
         }))
         sys.exit(2)
+    if not dry_run and not redis_url:
+        print(json.dumps({
+            "status": "error",
+            "stage": "args",
+            "error": "--redis-url required unless --dry-run is set",
+        }))
+        sys.exit(2)
 
     try:
         config = load_config(args.config)
@@ -1601,6 +1608,10 @@ def cmd_admin_backfill_session_state_markers(args):
             "error": repr(exc),
         }))
         sys.exit(1)
+    if conversation_id:
+        config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
     _apply_storage_overrides(config, args)
 
     # Build the raw store directly — we don't need a full engine for
@@ -1620,13 +1631,6 @@ def cmd_admin_backfill_session_state_markers(args):
 
     provider = None
     if not dry_run:
-        if not redis_url:
-            print(json.dumps({
-                "status": "error",
-                "stage": "args",
-                "error": "--redis-url required unless --dry-run is set",
-            }))
-            sys.exit(2)
         try:
             provider = SessionStateProvider(redis_url=redis_url)
         except Exception as exc:  # noqa: BLE001
@@ -1641,10 +1645,18 @@ def cmd_admin_backfill_session_state_markers(args):
     if all_convs:
         conv_ids: list[str] = []
         try:
+            is_attachable = getattr(raw_store, "is_attachable_target", None)
             for stat in raw_store.get_conversation_stats():
                 cid = getattr(stat, "conversation_id", "")
-                if cid:
-                    conv_ids.append(cid)
+                if not cid:
+                    continue
+                if tenant_id and callable(is_attachable):
+                    if not bool(is_attachable(
+                        conversation_id=cid,
+                        tenant_id=tenant_id,
+                    )):
+                        continue
+                conv_ids.append(cid)
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({
                 "status": "error",
