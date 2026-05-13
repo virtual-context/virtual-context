@@ -2383,6 +2383,7 @@ def test_hydrate_repairs_stale_zero_last_completed_turn_from_canonical_rows(tmp_
         "context_window": 10000,
         "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
         "tag_generator": {"type": "keyword"},
+        "retrieval": {"inbound_tagger_type": "keyword"},
     })
     engine = VirtualContextEngine(config=config)
     conversation_id = engine.config.conversation_id
@@ -2402,6 +2403,10 @@ def test_hydrate_repairs_stale_zero_last_completed_turn_from_canonical_rows(tmp_
 
     assert engine._engine_state.last_completed_turn == 2
     assert engine._engine_state.last_indexed_turn == 2
+    assert len(engine._turn_tag_index.entries) == 3
+    assert engine._retriever._turn_tag_index is engine._turn_tag_index
+    if hasattr(engine, "_retrieval") and hasattr(engine._retrieval, "_retriever"):
+        assert engine._retrieval._retriever._turn_tag_index is engine._turn_tag_index
 
 
 def test_hydrate_preserves_partial_pair_asymmetry_under_stale_zero(tmp_path) -> None:
@@ -2420,6 +2425,7 @@ def test_hydrate_preserves_partial_pair_asymmetry_under_stale_zero(tmp_path) -> 
         "context_window": 10000,
         "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
         "tag_generator": {"type": "keyword"},
+        "retrieval": {"inbound_tagger_type": "keyword"},
     })
     engine = VirtualContextEngine(config=config)
     conversation_id = engine.config.conversation_id
@@ -2460,6 +2466,7 @@ def test_hydrate_stale_zero_recovery_does_not_regress_positive_loaded(tmp_path) 
         "context_window": 10000,
         "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
         "tag_generator": {"type": "keyword"},
+        "retrieval": {"inbound_tagger_type": "keyword"},
     })
     engine = VirtualContextEngine(config=config)
     conversation_id = engine.config.conversation_id
