@@ -1534,6 +1534,211 @@ def cmd_admin_backfill_tag_summaries(args):
             pass
 
 
+def cmd_admin_backfill_session_state_markers(args):
+    """Backfill SessionState markers for conversations whose Redis
+    state drifted from their canonical_turns truth.
+
+    The marker write activates the v0.4.6 + spec's hydrate-time
+    defensive recovery: when a conversation's Redis SessionState
+    reports zero-or-sentinel values for compaction-related markers
+    but canonical_turns has rows that disagree, the engine has a
+    code path to recover in-memory at read time. This subcommand
+    closes the loop at the write side, persisting the corrected
+    SessionState to Redis so future readers see the truth without
+    waiting for the next hydrate-time recovery cycle.
+
+    Per-conversation invocation is the primitive:
+
+        virtual-context admin backfill-session-state-markers <conv-id> \\
+            --redis-url redis://...
+
+    Batch shape:
+
+        virtual-context admin backfill-session-state-markers \\
+            --all-convs-for-tenant \\
+            --redis-url redis://... \\
+            --limit 25
+
+    Add ``--tenant-id <tid>`` in multi-tenant deployments to scope
+    enumeration to one tenant. In single-tenant proxy mode, omit it
+    and the command repairs all live/attachable conversations in the
+    configured store.
+
+    Add ``--dry-run`` to compute + log the derived SessionState
+    shape without invoking ``provider.save``. Useful for inspecting
+    a tenant's recovery surface without modifying Redis.
+
+    Storage configuration follows the same precedence as
+    ``backfill-tag-summaries``: explicit flag > ``-c`` config >
+    ``DATABASE_URL`` env fallback.
+    """
+    from virtual_context.core.state_recovery import derive_session_state_markers
+    from virtual_context.proxy.session_state import SessionStateProvider
+
+    conversation_id = getattr(args, "conversation_id", None) or ""
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    all_convs = bool(getattr(args, "all_convs_for_tenant", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    limit = getattr(args, "limit", None)
+    redis_url = getattr(args, "redis_url", "") or ""
+
+    if not conversation_id and not all_convs:
+        print(json.dumps({
+            "status": "error",
+            "stage": "args",
+            "error": "either <conversation_id> or --all-convs-for-tenant must be supplied",
+        }))
+        sys.exit(2)
+    if not dry_run and not redis_url:
+        print(json.dumps({
+            "status": "error",
+            "stage": "args",
+            "error": "--redis-url required unless --dry-run is set",
+        }))
+        sys.exit(2)
+
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "load_config",
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+    if conversation_id:
+        config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+    _apply_storage_overrides(config, args)
+
+    # Build the raw store directly — we don't need a full engine for
+    # the derivation pass; canonical_turns + the alias-resolution
+    # surface live on the raw store.
+    from virtual_context.engine import VirtualContextEngine
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "engine_construct",
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+    raw_store = engine._store._store if hasattr(engine._store, "_store") else engine._store
+
+    provider = None
+    if not dry_run:
+        try:
+            provider = SessionStateProvider(redis_url=redis_url)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({
+                "status": "error",
+                "stage": "provider_construct",
+                "error": repr(exc),
+            }))
+            sys.exit(1)
+
+    # Conversation enumeration.
+    if all_convs:
+        conv_ids: list[str] = []
+        try:
+            is_attachable = getattr(raw_store, "is_attachable_target", None)
+            for stat in raw_store.get_conversation_stats():
+                cid = getattr(stat, "conversation_id", "")
+                if not cid:
+                    continue
+                if callable(is_attachable):
+                    if not bool(is_attachable(
+                        conversation_id=cid,
+                        tenant_id=tenant_id or None,
+                    )):
+                        continue
+                conv_ids.append(cid)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({
+                "status": "error",
+                "stage": "enumerate_convs",
+                "tenant_id": tenant_id,
+                "error": repr(exc),
+            }))
+            sys.exit(1)
+        if isinstance(limit, int) and limit > 0:
+            conv_ids = conv_ids[:limit]
+    else:
+        conv_ids = [conversation_id]
+
+    saved_count = 0
+    skipped_count = 0
+    failed_count = 0
+    for cid in conv_ids:
+        result: dict = {
+            "conversation_id": cid,
+            "tenant_id": tenant_id,
+            "dry_run": dry_run,
+            "saved": False,
+        }
+        try:
+            existing = None
+            if provider is not None:
+                try:
+                    existing = provider.load(cid)
+                except Exception:
+                    existing = None
+            derived = derive_session_state_markers(
+                raw_store, cid, existing_state=existing,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed_count += 1
+            result["status"] = "error"
+            result["error"] = repr(exc)
+            print(json.dumps(result))
+            continue
+        if derived is None:
+            skipped_count += 1
+            result["status"] = "skip"
+            result["reason"] = "no_canonical_rows"
+            print(json.dumps(result))
+            continue
+        result.update({
+            "compacted_prefix_messages": derived.compacted_prefix_messages,
+            "flushed_prefix_messages": derived.flushed_prefix_messages,
+            "last_completed_turn": derived.last_completed_turn,
+            "last_indexed_turn": derived.last_indexed_turn,
+            "turn_tag_entries": len(derived.turn_tag_entries),
+        })
+        if dry_run:
+            result["status"] = "dry_run"
+            print(json.dumps(result))
+            continue
+        try:
+            provider.save(cid, derived)
+            saved_count += 1
+            result["status"] = "ok"
+            result["saved"] = True
+        except Exception as exc:  # noqa: BLE001
+            failed_count += 1
+            result["status"] = "error"
+            result["error"] = repr(exc)
+        print(json.dumps(result))
+
+    summary = {
+        "status": "complete",
+        "tenant_id": tenant_id,
+        "all_convs_for_tenant": all_convs,
+        "dry_run": dry_run,
+        "processed": len(conv_ids),
+        "saved": saved_count,
+        "skipped": skipped_count,
+        "failed": failed_count,
+    }
+    print(json.dumps(summary))
+    try:
+        engine.close()
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="virtual-context",
@@ -1770,6 +1975,82 @@ def main():
         help="SQLite database path. Overrides storage.sqlite_path.",
     )
 
+    # ------------------------------------------------------------------
+    # admin backfill-session-state-markers
+    # ------------------------------------------------------------------
+    backfill_ssm_parser = admin_sub.add_parser(
+        "backfill-session-state-markers",
+        help=(
+            "Recompute SessionState markers (compacted/flushed prefix, "
+            "last_completed_turn, last_indexed_turn, turn_tag_entries) "
+            "from canonical_turns and persist to the SessionStateProvider"
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "conversation_id",
+        nargs="?",
+        default=None,
+        help=(
+            "Conversation id to repair. Omit when using "
+            "--all-convs-for-tenant."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--tenant-id",
+        default="",
+        help=(
+            "Tenant id to set on the engine config and use for batch "
+            "filtering. Optional for single-tenant stores."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--all-convs-for-tenant",
+        action="store_true",
+        help=(
+            "Enumerate every conversation in the configured storage "
+            "and run the marker repair against each. When --tenant-id "
+            "is supplied, limits enumeration to that tenant."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Derive markers and log them without writing to the "
+            "SessionStateProvider. --redis-url is not required when "
+            "this flag is set."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap the number of conversations processed in batch mode.",
+    )
+    backfill_ssm_parser.add_argument(
+        "--redis-url",
+        default="",
+        help=(
+            "Redis URL for the SessionStateProvider. Required unless "
+            "--dry-run is set."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--storage-backend",
+        choices=("sqlite", "postgres", "filesystem"),
+        help="Override the engine's storage backend.",
+    )
+    backfill_ssm_parser.add_argument(
+        "--postgres-dsn",
+        help=(
+            "Postgres connection string. Overrides storage.postgres_dsn."
+        ),
+    )
+    backfill_ssm_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite database path. Overrides storage.sqlite_path.",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1816,8 +2097,14 @@ def main():
     elif args.command == "admin":
         if args.admin_command == "backfill-tag-summaries":
             cmd_admin_backfill_tag_summaries(args)
+        elif args.admin_command == "backfill-session-state-markers":
+            cmd_admin_backfill_session_state_markers(args)
         else:
-            print("Usage: virtual-context admin backfill-tag-summaries <conversation_id> [--tenant-id <id>] [--force-rebuild]")
+            print(
+                "Usage:\n"
+                "  virtual-context admin backfill-tag-summaries <conversation_id> [--tenant-id <id>] [--force-rebuild]\n"
+                "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
+            )
             sys.exit(1)
 
 
