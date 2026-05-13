@@ -231,6 +231,19 @@ def derive_session_state_markers(
         split_processed_tags = set(getattr(existing_state, "split_processed_tags", set()) or set())
         trailing_fingerprint = str(getattr(existing_state, "trailing_fingerprint", "") or "")
         provider = str(getattr(existing_state, "provider", "") or "")
+        session_state = str(getattr(existing_state, "session_state", "") or "")
+        live_turn_count = int(getattr(existing_state, "live_turn_count", 0) or 0)
+        history_message_count = int(getattr(existing_state, "history_message_count", 0) or 0)
+        ingestion_done = int(getattr(existing_state, "ingestion_done", 0) or 0)
+        ingestion_total = int(getattr(existing_state, "ingestion_total", 0) or 0)
+        last_payload_kb = float(getattr(existing_state, "last_payload_kb", 0.0) or 0.0)
+        last_payload_tokens = int(getattr(existing_state, "last_payload_tokens", 0) or 0)
+        raw_payload_entry_count = int(getattr(existing_state, "raw_payload_entry_count", 0) or 0)
+        ingestible_entry_count = int(getattr(existing_state, "ingestible_entry_count", 0) or 0)
+        skipped_payload_entry_count = int(getattr(existing_state, "skipped_payload_entry_count", 0) or 0)
+        telemetry_rollup = dict(getattr(existing_state, "telemetry_rollup", {}) or {})
+        request_captures = list(getattr(existing_state, "request_captures", []) or [])
+        deleted = bool(getattr(existing_state, "deleted", False))
         version = int(getattr(existing_state, "version", 0) or 0)
     else:
         last_request_time = 0.0
@@ -240,6 +253,19 @@ def derive_session_state_markers(
         split_processed_tags = set()
         trailing_fingerprint = ""
         provider = ""
+        session_state = ""
+        live_turn_count = 0
+        history_message_count = 0
+        ingestion_done = 0
+        ingestion_total = 0
+        last_payload_kb = 0.0
+        last_payload_tokens = 0
+        raw_payload_entry_count = 0
+        ingestible_entry_count = 0
+        skipped_payload_entry_count = 0
+        telemetry_rollup = {}
+        request_captures = []
+        deleted = False
         version = 0
 
     serialized_entries = [
@@ -282,7 +308,20 @@ def derive_session_state_markers(
         split_processed_tags=split_processed_tags,
         trailing_fingerprint=trailing_fingerprint,
         provider=provider,
+        session_state=session_state,
+        live_turn_count=live_turn_count,
+        history_message_count=history_message_count,
+        ingestion_done=ingestion_done,
+        ingestion_total=ingestion_total,
+        last_payload_kb=last_payload_kb,
+        last_payload_tokens=last_payload_tokens,
+        raw_payload_entry_count=raw_payload_entry_count,
+        ingestible_entry_count=ingestible_entry_count,
+        skipped_payload_entry_count=skipped_payload_entry_count,
         turn_tag_entries=serialized_entries,
         working_set=[],
+        telemetry_rollup=telemetry_rollup,
+        request_captures=request_captures,
         version=version,
+        deleted=deleted,
     )

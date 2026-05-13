@@ -151,12 +151,24 @@ def test_derive_session_state_markers_carries_existing_non_derivable_fields():
         flushed_prefix_messages=0,
         last_completed_turn=-1,
         last_indexed_turn=-1,
+        session_state="active",
+        live_turn_count=500,
+        history_message_count=1000,
+        ingestion_done=20,
+        ingestion_total=25,
+        last_payload_kb=23062.4,
+        last_payload_tokens=123456,
+        raw_payload_entry_count=4632,
+        ingestible_entry_count=989,
+        skipped_payload_entry_count=17,
         checkpoint_version=7,
         conversation_generation=3,
         tool_tag_counter=42,
         split_processed_tags={"old-tag"},
         trailing_fingerprint="abc",
         provider="anthropic",
+        telemetry_rollup={"requests": 5},
+        request_captures=[{"turn": 1, "model": "claude"}],
         version=99,
     )
 
@@ -169,6 +181,18 @@ def test_derive_session_state_markers_carries_existing_non_derivable_fields():
     assert state.split_processed_tags == {"old-tag"}
     assert state.trailing_fingerprint == "abc"
     assert state.provider == "anthropic"
+    assert state.session_state == "active"
+    assert state.live_turn_count == 500
+    assert state.history_message_count == 1000
+    assert state.ingestion_done == 20
+    assert state.ingestion_total == 25
+    assert state.last_payload_kb == 23062.4
+    assert state.last_payload_tokens == 123456
+    assert state.raw_payload_entry_count == 4632
+    assert state.ingestible_entry_count == 989
+    assert state.skipped_payload_entry_count == 17
+    assert state.telemetry_rollup == {"requests": 5}
+    assert state.request_captures == [{"turn": 1, "model": "claude"}]
     assert state.version == 99
 
 
