@@ -2245,22 +2245,38 @@ def test_double_hydrate_with_different_state_is_observable(engine_factory, tmp_p
 # ===========================================================================
 
 
-def _seed_tagged_canonical_turns(raw_store, conversation_id: str, count: int) -> None:
+def _seed_tagged_canonical_turns(
+    raw_store,
+    conversation_id: str,
+    count: int,
+    *,
+    last_untagged: bool = False,
+) -> None:
     """Insert ``count`` paired canonical_turn rows for ``conversation_id``,
     tagged but not compacted, so the engine's derivation passes treat
-    them as live (not flushed)."""
+    them as live (not flushed).
+
+    When ``last_untagged`` is True, the highest-numbered turn is inserted
+    without a ``tagged_at`` value. The derivation contract is that any
+    paired row advances ``last_completed_turn`` but only fully-tagged
+    pairs advance ``last_indexed_turn`` — this hook exercises that
+    asymmetry.
+    """
     from virtual_context.core.canonical_turns import generate_canonical_turn_id
 
     for n in range(count):
+        is_last = n == count - 1
+        tagged_at = None if (last_untagged and is_last) else "2026-05-13T12:00:00+00:00"
         raw_store.save_canonical_turn(
+            conversation_id,
+            n,
+            f"user-{n}",
+            f"assistant-{n}",
             canonical_turn_id=generate_canonical_turn_id(),
-            conversation_id=conversation_id,
             turn_group_number=n,
             sort_key=float(n),
             turn_hash=f"hash-{n}",
-            user_content=f"user-{n}",
-            assistant_content=f"assistant-{n}",
-            tagged_at="2026-05-13T12:00:00+00:00",
+            tagged_at=tagged_at,
             primary_tag=f"topic-{n:03d}",
             tags=[f"topic-{n:03d}"],
         )
@@ -2344,3 +2360,122 @@ def test_hydrate_does_not_clobber_positive_loaded_markers(engine_factory, tmp_pa
     # from; defensive recovery short-circuits on derived-is-empty).
     assert engine._engine_state.last_completed_turn == 4
     assert engine._engine_state.last_indexed_turn == 4
+
+
+def test_hydrate_repairs_stale_zero_last_completed_turn_from_canonical_rows(tmp_path) -> None:
+    """Stale-zero recovery: a SessionState whose loaded
+    ``last_completed_turn`` is the literal value 0 (not the -1 fresh
+    sentinel) is a legitimate stale-Redis case when canonical_turns
+    shows the conversation has actually advanced past turn 0. Defensive
+    recovery prefers the derived value over the suspect zero so
+    downstream paging / retrieval / passthrough gates operate on
+    durable truth.
+
+    Mirrors the v0.4.5 flushed_prefix_messages clamp-inversion shape:
+    loaded == 0 + derived > 0 ⇒ derived wins.
+    """
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.proxy.session_state import SessionState
+
+    db_path = str(tmp_path / "store.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+    })
+    engine = VirtualContextEngine(config=config)
+    conversation_id = engine.config.conversation_id
+
+    # Three paired, tagged rows. Highest turn_number = 2.
+    _seed_tagged_canonical_turns(engine._store, conversation_id, 3)
+
+    loaded = SessionState(
+        compacted_prefix_messages=0,
+        flushed_prefix_messages=0,
+        last_completed_turn=0,
+        last_indexed_turn=0,
+        turn_tag_entries=[],
+    )
+
+    engine.hydrate_from_session_state(loaded)
+
+    assert engine._engine_state.last_completed_turn == 2
+    assert engine._engine_state.last_indexed_turn == 2
+
+
+def test_hydrate_preserves_partial_pair_asymmetry_under_stale_zero(tmp_path) -> None:
+    """Codex finding 6 (partial-row asymmetry) carries into the
+    hydrate-time defensive recovery: when the highest-numbered pair
+    is untagged, ``last_completed_turn`` still advances to it, but
+    ``last_indexed_turn`` only advances to the last fully-tagged pair.
+    Stale-zero loaded values must heal to those derived bounds, not
+    overshoot or undershoot."""
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.proxy.session_state import SessionState
+
+    db_path = str(tmp_path / "store.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+    })
+    engine = VirtualContextEngine(config=config)
+    conversation_id = engine.config.conversation_id
+
+    # Turns 0 + 1 fully tagged; turn 2 paired but untagged.
+    _seed_tagged_canonical_turns(
+        engine._store, conversation_id, 3, last_untagged=True,
+    )
+
+    loaded = SessionState(
+        compacted_prefix_messages=0,
+        flushed_prefix_messages=0,
+        last_completed_turn=0,
+        last_indexed_turn=0,
+        turn_tag_entries=[],
+    )
+
+    engine.hydrate_from_session_state(loaded)
+
+    # Derivation: any paired row → last_completed_turn = 2.
+    # tagged-only pairs → last_indexed_turn = 1.
+    assert engine._engine_state.last_completed_turn == 2
+    assert engine._engine_state.last_indexed_turn == 1
+
+
+def test_hydrate_stale_zero_recovery_does_not_regress_positive_loaded(tmp_path) -> None:
+    """When the loaded SessionState already carries a positive marker
+    and canonical_turns has fewer turns than the loaded value, the
+    broadened guard MUST NOT collapse the loaded value to the lower
+    derived one. The clamp inversion only activates on the sentinel
+    (-1) or stale-zero (0) shapes, never on positive loaded markers."""
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.proxy.session_state import SessionState
+
+    db_path = str(tmp_path / "store.db")
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": db_path}},
+        "tag_generator": {"type": "keyword"},
+    })
+    engine = VirtualContextEngine(config=config)
+    conversation_id = engine.config.conversation_id
+
+    _seed_tagged_canonical_turns(engine._store, conversation_id, 2)
+
+    loaded = SessionState(
+        compacted_prefix_messages=0,
+        flushed_prefix_messages=0,
+        last_completed_turn=9,
+        last_indexed_turn=9,
+        turn_tag_entries=[],
+    )
+
+    engine.hydrate_from_session_state(loaded)
+
+    # derived_lct = 1 < loaded 9; broadened guard does not fire.
+    assert engine._engine_state.last_completed_turn == 9
+    assert engine._engine_state.last_indexed_turn == 9
