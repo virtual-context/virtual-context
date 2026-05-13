@@ -142,19 +142,24 @@ def _alias_created_event_for(store, old_id: str, target_id: str) -> dict:
 
 
 def _resolve_store_attr(store, attr_name: str):
-    """Return ``attr_name`` from ``store`` or its inner state store.
+    """Return ``attr_name`` from ``store`` or an inner concrete store.
 
     ``CompositeStore`` delegates alias APIs explicitly but does NOT
     forward private helpers like ``_build_alias_*_event``. Reach
-    through to the inner state store (which is a ``SQLiteStore`` or
-    ``PostgresStore``) when the composite is the visible interface.
+    through to the inner concrete stores (which are usually
+    ``SQLiteStore`` or ``PostgresStore``) when the composite is the
+    visible interface.
     """
     direct = getattr(store, attr_name, None)
     if direct is not None:
         return direct
-    state = getattr(store, "_state", None) or getattr(store, "state", None)
-    if state is not None:
-        return getattr(state, attr_name, None)
+    for inner_name in ("_segments", "segments", "_state", "state"):
+        inner = getattr(store, inner_name, None)
+        if inner is None:
+            continue
+        resolved = getattr(inner, attr_name, None)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -194,12 +199,12 @@ def execute_attach(
             persisted conversation data — VCATTACH preserves both rows.
             A failure on one id does not prevent invocation for the other.
         cross_worker_invalidate: callable(``AliasEvent``) — engine-side
-            cross-worker invalidation callback. Forwarded to BOTH the
-            ``delete_conversation_alias`` and ``save_conversation_alias``
-            calls as ``on_committed=``. Cloud's adapter wraps this to
-            capture ``tenant_id`` and publish a Redis event so cached
-            engine instances on sibling workers evict their stale
-            source-bound state on every alias write. Per spec S9
+            cross-worker invalidation callback. Invoked explicitly after
+            the alias write commits and the best-effort SessionState
+            marker write runs. Cloud's adapter wraps this to capture
+            ``tenant_id`` and publish a Redis event so cached engine
+            instances on sibling workers evict their stale source-bound
+            state on every alias write. Per spec S9
             at-least-once contract: callback failures raise
             ``InvalidationFailedError`` which propagates back through
             this function so the REST handler can return a retryable
@@ -207,7 +212,7 @@ def execute_attach(
             the callback fires; retrying the request fires the
             callback again.
 
-    Removed (F-2 audit, ):
+    Removed (F-2 audit):
         ``reset_engine_state`` callable(target_id) was a dormant callback
         slot. All call sites passed None and the slot was shape-identical
         to the VCATTACH seam (a non-destructively-named
@@ -268,19 +273,27 @@ def execute_attach(
                 store, target_id, existing_state=existing,
             )
             if derived is not None:
-                session_state_provider.save(target_id, derived)
-                logger.info(
-                    "VCATTACH: persisted derived SessionState markers for "
-                    "target %s (compacted=%d, flushed=%d, "
-                    "last_completed_turn=%d, last_indexed_turn=%d, "
-                    "turn_tag_entries=%d)",
-                    target_id[:12],
-                    derived.compacted_prefix_messages,
-                    derived.flushed_prefix_messages,
-                    derived.last_completed_turn,
-                    derived.last_indexed_turn,
-                    len(derived.turn_tag_entries),
-                )
+                saved_version = session_state_provider.save(target_id, derived)
+                if saved_version is None:
+                    logger.warning(
+                        "VCATTACH: SessionStateProvider.save did not persist "
+                        "derived markers for target %s; alias is committed and "
+                        "cross-worker invalidation will still fire",
+                        target_id[:12],
+                    )
+                else:
+                    logger.info(
+                        "VCATTACH: persisted derived SessionState markers for "
+                        "target %s (compacted=%d, flushed=%d, "
+                        "last_completed_turn=%d, last_indexed_turn=%d, "
+                        "turn_tag_entries=%d)",
+                        target_id[:12],
+                        derived.compacted_prefix_messages,
+                        derived.flushed_prefix_messages,
+                        derived.last_completed_turn,
+                        derived.last_indexed_turn,
+                        len(derived.turn_tag_entries),
+                    )
         except Exception:
             logger.warning(
                 "VCATTACH: SessionState marker write failed for target %s; "

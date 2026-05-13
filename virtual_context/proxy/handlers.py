@@ -2538,6 +2538,19 @@ def _handle_vc_command_rest(
         # TenantRegistry + Redis publisher; single-process / no-Redis
         # runs leave it None. Forwarded to ``execute_attach`` so the
         # alias write fires the callback after commit.
+        #
+        # ``session_state_provider`` is sourced from the registry when
+        # available — TenantRegistry exposes ``_session_state_provider``
+        # as the shared provider instance across all tenants. When the
+        # provider is non-None, ``execute_attach`` derives + writes
+        # corrected SessionState markers for the target before
+        # publishing cross-worker invalidation, closing the
+        # corrupted-target-SessionState class for the direct-REST
+        # VCATTACH path (parity with the HTTP-proxy-mode path that
+        # already threaded the provider through cloud's adapter).
+        _session_state_provider = getattr(
+            registry, "_session_state_provider", None,
+        )
         try:
             execute_attach(
                 old_id=conv_id,
@@ -2545,6 +2558,7 @@ def _handle_vc_command_rest(
                 store=_inner,
                 registry_invalidate=_invalidate,
                 cross_worker_invalidate=cross_worker_invalidate,
+                session_state_provider=_session_state_provider,
             )
         except Exception as exc:
             from ..core.exceptions import InvalidationFailedError
