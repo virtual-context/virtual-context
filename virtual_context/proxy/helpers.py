@@ -91,9 +91,13 @@ def _extract_history_pairs(body: dict) -> list[Message]:
     return fmt.extract_history_pairs(body)
 
 
-def _extract_ingestible_messages(body: dict) -> list[Message]:
+def _extract_ingestible_messages(
+    body: dict,
+    *,
+    mode: str = "ingest",
+) -> list[Message]:
     fmt = detect_format(body)
-    messages, _ = extract_ingestible_messages(body, fmt)
+    messages, _ = extract_ingestible_messages(body, fmt, mode=mode)
     return messages
 
 

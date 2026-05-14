@@ -134,7 +134,7 @@ class IngestReconciler:
     ) -> CanonicalIngestResult:
         from ..proxy.formats import extract_ingestible_messages
 
-        entries, _stats = extract_ingestible_messages(body, fmt)
+        entries, _stats = extract_ingestible_messages(body, fmt, mode="ingest")
         prepared = [
             self._prepare_message_row(
                 conversation_id,

@@ -125,10 +125,22 @@ class PhaseDecision:
     "this call successfully claimed the ingestion lease" — a downstream
     tagger thread will be launched by ``start_ingestion_if_needed``
     later in the request flow.
+
+    ``canonical_ingest_rows``: the canonical-turn rows that the
+    ingest-batch step persisted during this call (or an empty tuple
+    when no ingest fired). Carried out so the proxy/server can stamp
+    ``canonical_turn_id`` + ``turn_number`` onto the same
+    ``state.conversation_history`` list it will pass to
+    ``on_message_inbound``, fulfilling the cross-channel-mirror Tier 2
+    payload-anchor contract. The field defaults to an empty tuple so
+    pre-existing ``PhaseDecision(...)`` constructors and monkeypatches
+    keep working unchanged when ``protected_window_db_source`` is
+    ``off``.
     """
 
     phase: str
     started_tagger: bool
+    canonical_ingest_rows: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1088,23 @@ class ProxyState:
         new_raw = int(payload_accounting.get("raw_payload_entry_count", 0) or 0)
         new_ing = int(payload_accounting.get("ingestible_entry_count", 0) or 0)
 
+        # Cross-channel-mirror Tier 2 stamping payload-anchor: carry the
+        # canonical-turn rows the reconciler persists in THIS call out
+        # to the proxy/server so it can stamp ``canonical_turn_id`` +
+        # ``turn_number`` onto the same ``state.conversation_history``
+        # list it will pass to ``on_message_inbound``. Default empty;
+        # populated below only when the ingest path actually fires and
+        # returns rows.
+        canonical_ingest_rows: tuple = ()
+
+        def _decision(*, phase: str, started_tagger: bool) -> PhaseDecision:
+            _decision_result = PhaseDecision(
+                phase=phase,
+                started_tagger=started_tagger,
+                canonical_ingest_rows=canonical_ingest_rows,
+            )
+            return _decision_result
+
         # Step 2: entry-verify. Re-verified before each subsequent write as
         # defense in depth — a delete+resurrect between verify and write
         # would otherwise stomp the new lifecycle's row.
@@ -1089,7 +1118,7 @@ class ProxyState:
             from ..proxy.formats import detect_format
             fmt = detect_format(body)
             try:
-                self.engine._ingest_reconciler.ingest_batch(
+                _ingest_result = self.engine._ingest_reconciler.ingest_batch(
                     conversation_id,
                     body=body,
                     fmt=fmt,
@@ -1103,6 +1132,10 @@ class ProxyState:
                     "skipping canonical row persistence for conv=%s",
                     conversation_id[:12],
                 )
+            else:
+                _rows = getattr(_ingest_result, "rows", None)
+                if _rows:
+                    canonical_ingest_rows = tuple(_rows)
 
         # Defense-in-depth: fresh epoch check before the next write.
         self.engine.verify_epoch()
@@ -1195,8 +1228,8 @@ class ProxyState:
                     value=new_raw,
                 )
                 if not widened:
-                    return PhaseDecision(phase=phase, started_tagger=False)
-                return PhaseDecision(phase="compacting", started_tagger=False)
+                    return _decision(phase=phase, started_tagger=False)
+                return _decision(phase="compacting", started_tagger=False)
 
             # claim.claimed=True
             if self._active_compaction_op == claim.prev_operation_id:
@@ -1207,8 +1240,8 @@ class ProxyState:
                     value=new_raw,
                 )
                 if not widened:
-                    return PhaseDecision(phase=phase, started_tagger=False)
-                return PhaseDecision(phase="compacting", started_tagger=False)
+                    return _decision(phase=phase, started_tagger=False)
+                return _decision(phase="compacting", started_tagger=False)
 
             # Takeover path.
             dead_op = claim.prev_operation_id
@@ -1251,8 +1284,8 @@ class ProxyState:
                     value=new_raw,
                 )
                 if not widened:
-                    return PhaseDecision(phase=phase, started_tagger=False)
-                return PhaseDecision(phase="compacting", started_tagger=False)
+                    return _decision(phase=phase, started_tagger=False)
+                return _decision(phase="compacting", started_tagger=False)
 
             logger.info(
                 "COMPACTION_TAKEOVER conv=%s dead_op=%s new_op=%s worker=%s",
@@ -1310,8 +1343,8 @@ class ProxyState:
                 value=new_raw,
             )
             if not widened:
-                return PhaseDecision(phase=phase, started_tagger=False)
-            return PhaseDecision(phase="compacting", started_tagger=False)
+                return _decision(phase=phase, started_tagger=False)
+            return _decision(phase="compacting", started_tagger=False)
 
         # Step 5.5: derive progress from canonical_turns SUM and transition
         # phase when the derived totals cross a boundary (total==done with
@@ -1355,7 +1388,7 @@ class ProxyState:
                 # complete the episode, flip phase → active.
                 if self._finalize_ingestion_if_complete(conversation_id):
                     phase = "active"
-            return PhaseDecision(phase=phase, started_tagger=False)
+            return _decision(phase=phase, started_tagger=False)
 
         # total_ingestible > done_ingestible: there IS untagged work.
         if phase in ("init", "active"):
@@ -1409,8 +1442,8 @@ class ProxyState:
             # ``TurnTagIndex``. ``started_tagger=True`` signals that this
             # call claimed the lease; the legacy path spawns the actual
             # worker thread downstream in the same request flow.
-            return PhaseDecision(phase="ingesting", started_tagger=True)
-        return PhaseDecision(phase="ingesting", started_tagger=False)
+            return _decision(phase="ingesting", started_tagger=True)
+        return _decision(phase="ingesting", started_tagger=False)
 
     def _another_worker_owns_lease(self, conversation_id: str) -> bool:
         """Defense-in-depth check: return True iff an active ingestion

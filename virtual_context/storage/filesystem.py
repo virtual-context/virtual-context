@@ -967,6 +967,38 @@ class FilesystemStore(ContextStore):
             if target == target_id
         )
 
+    def has_any_alias(self, conversation_id: str) -> bool:
+        """Tier 1 cross-channel-mirror lookup.
+
+        Returns ``True`` iff ``conversation_id`` appears as either the
+        source (dict key) or the target (dict value) of any VCATTACH
+        alias. Uses the same ``_vcattach_aliases`` dict the SQL
+        backends mirror via ``conversation_aliases``.
+        """
+        if not conversation_id:
+            return False
+        if conversation_id in self._vcattach_aliases:
+            return True
+        return any(
+            target == conversation_id
+            for target in self._vcattach_aliases.values()
+        )
+
+    def get_recent_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+    ) -> list[CanonicalTurnRow]:
+        """Filesystem stores do not host canonical_turns; return empty.
+
+        Test fixtures or development setups that pair a filesystem
+        VCATTACH alias map with a SQL canonical_turns table would route
+        the canonical-turn read through the SQL segment store via
+        ``CompositeStore``, not through this method.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------

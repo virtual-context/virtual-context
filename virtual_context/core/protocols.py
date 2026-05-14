@@ -182,6 +182,13 @@ class SegmentStore(Protocol):
         on_committed=None,
     ) -> None: ...
     def list_conversation_aliases_by_target(self, target_id: str) -> list[str]: ...
+    def has_any_alias(self, conversation_id: str) -> bool: ...
+    def get_recent_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+    ) -> list[CanonicalTurnRow]: ...
 
 
 @runtime_checkable
