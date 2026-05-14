@@ -253,6 +253,10 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", _asm_defaults.context_hint_max_tokens),
         pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", _asm_defaults.pre_compaction_filtering),
         context_injection_max_tokens=assembly_raw.get("context_injection_max_tokens", -1),
+        protected_window_db_source=assembly_raw.get(
+            "protected_window_db_source",
+            _asm_defaults.protected_window_db_source,
+        ),
     )
 
     # Retrieval
@@ -480,6 +484,14 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append(
             f"assembly.pre_compaction_filtering must be one of {_valid_pcf}, "
             f"got '{config.assembler.pre_compaction_filtering}'"
+        )
+
+    # Cross-channel-mirror protected-window source mode
+    _valid_pwds = {"off", "merge"}
+    if config.assembler.protected_window_db_source not in _valid_pwds:
+        errors.append(
+            f"assembly.protected_window_db_source must be one of {_valid_pwds}, "
+            f"got '{config.assembler.protected_window_db_source}'"
         )
 
     # Segmenter config
