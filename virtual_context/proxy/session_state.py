@@ -255,6 +255,50 @@ class SessionStateProvider:
             return [float(value) for value in embedding]
         return [float(value) / norm for value in embedding]
 
+    def get_marker(self, conversation_id: str, marker_name: str):
+        """Fast Redis read of a single SessionState field.
+
+        Used by the cross-channel-mirror Tier 2 staleness check, which
+        needs a single marker (typically ``last_completed_turn``) on
+        every participant-conv inbound request. Performing the full
+        ``load`` deserialization round-trip there is wasteful because
+        the full SessionState dataclass carries `turn_tag_entries`,
+        `telemetry_rollup`, `request_captures`, and timestamp parsing
+        that the gate does not consult. ``get_marker`` does one Redis
+        ``GET`` and a lightweight JSON key extract.
+
+        Returns:
+            The raw decoded marker value (typically ``int`` for the
+            turn-number markers), or ``None`` when the SessionState is
+            absent / Redis is degraded / the blob is malformed / the
+            named field is missing. Callers MUST tolerate ``None`` and
+            fall through to a safe default (the Tier 2 caller falls
+            through to Tier 3 unconditionally on ``None``).
+        """
+        if not conversation_id or not marker_name:
+            return None
+        try:
+            raw = self._redis.get(self._key(conversation_id))
+        except Exception:
+            logger.warning(
+                "Redis get_marker failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            self._degraded = True
+            return None
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            data = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data.get(marker_name)
+
     def load(self, conversation_id: str) -> SessionState | None:
         """Load session state from Redis. Returns None if not found.
         Returns SessionState(deleted=True) if tombstoned.
