@@ -389,6 +389,8 @@ def _filtered_chat_messages(messages: list[dict], fmt: "PayloadFormat") -> list[
 def extract_ingestible_messages(
     body: dict,
     fmt: "PayloadFormat",
+    *,
+    mode: str = "ingest",
 ) -> tuple[list["Message"], dict[str, int]]:
     """Return the normalized chat entries that should become canonical rows.
 
@@ -399,6 +401,14 @@ def extract_ingestible_messages(
     - tool_result carrier user entries
     - assistant/model entries with no textual payload
     - empty user entries
+
+    ``mode`` is a kw-only discriminator added by the cross-channel-mirror
+    spec. The only supported value today is ``"ingest"``, which produces
+    the historical extraction shape; the parameter exists so the
+    cross-channel-mirror stamping contract can require both the ingest
+    path and the assembler-input path to extract under the same mode.
+    Adding a new filter shape in the future requires picking a new mode
+    name rather than changing ``"ingest"`` semantics.
     """
     from ..types import Message
 
@@ -511,7 +521,7 @@ def summarize_payload_accounting(
 ) -> dict[str, object]:
     """Summarize how raw payload entries become normalized ingestible entries."""
     messages = fmt.get_messages(body)
-    _, ingest_stats = extract_ingestible_messages(body, fmt)
+    _, ingest_stats = extract_ingestible_messages(body, fmt, mode="ingest")
 
     summary = {
         "normalized_payload_entry_count": len(messages),
