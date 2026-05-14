@@ -310,6 +310,23 @@ class CompositeStore:
             protected_recent_turns=protected_recent_turns,
         )
 
+    def get_recent_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+    ) -> list[CanonicalTurnRow]:
+        getter = getattr(self._segments, "get_recent_canonical_turns", None)
+        if not callable(getter):
+            return []
+        return getter(conversation_id, limit=limit)
+
+    def has_any_alias(self, conversation_id: str) -> bool:
+        getter = getattr(self._segments, "has_any_alias", None)
+        if not callable(getter):
+            return False
+        return bool(getter(conversation_id))
+
     def mark_canonical_turns_tagged(
         self,
         conversation_id: str,

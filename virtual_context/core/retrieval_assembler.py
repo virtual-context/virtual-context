@@ -141,6 +141,99 @@ class RetrievalAssembler:
             _breakdown[stage] = round(_breakdown.get(stage, 0.0) + elapsed, 1)
             return elapsed
 
+        # ------------------------------------------------------------------
+        # Cross-channel-mirror three-tier gate (engine spec §1.1).
+        #
+        # Tier 0 off -> true no-op: no Redis read, no DB read, no new log
+        # fields. Tier 1 unattached -> short-circuit on the cached
+        # ``_is_merge_participant`` bool. Tier 2 compares the Redis
+        # ``last_completed_turn`` marker (INT) against the payload's
+        # stamped turn-number anchor (INT); equality skips Tier 3.
+        # Tier 3 reads the most-recent-N canonical_turn rows and merges
+        # them into the protected window before downstream assembly.
+        # ------------------------------------------------------------------
+        _gate_outcome: str | None = None
+        _gate_read_ms: float = 0.0
+        _gate_merged_rows: int = 0
+        _gate_budget_evictions: int = 0
+        _gate_mode = getattr(
+            self.config.assembler, "protected_window_db_source", "off",
+        )
+        if _gate_mode == "merge":
+            if not getattr(self, "_is_merge_participant", False):
+                _gate_outcome = "tier1_unattached"
+            else:
+                from .protected_window import (
+                    _last_already_canonical_turn_number,
+                    _merge_protected_window,
+                )
+
+                _anchor_turn = _last_already_canonical_turn_number(
+                    conversation_history,
+                )
+                _provider = self._session_state_provider
+                _redis_last_turn = None
+                if _provider is not None and _anchor_turn is not None:
+                    try:
+                        _redis_last_turn = _provider.get_marker(
+                            self.config.conversation_id,
+                            "last_completed_turn",
+                        )
+                    except Exception:
+                        _redis_last_turn = None
+
+                if _anchor_turn is None:
+                    _gate_outcome = "tier2_legacy_fallthrough"
+                elif _redis_last_turn is None:
+                    # Marker absent / Redis degraded — fall through to
+                    # Tier 3 unconditionally rather than skipping
+                    # incorrectly. Cost-only on participant convs that
+                    # are new to Redis.
+                    _gate_outcome = "tier2_legacy_fallthrough"
+                else:
+                    try:
+                        _redis_int = int(_redis_last_turn)
+                        _anchor_int = int(_anchor_turn)
+                    except (TypeError, ValueError):
+                        # JSON-decoded marker is not an int-coercible
+                        # value. Treat as non-comparable; fall through
+                        # to Tier 3 rather than skipping unsafely.
+                        _gate_outcome = "tier2_legacy_fallthrough"
+                    else:
+                        if _redis_int == _anchor_int:
+                            _gate_outcome = "tier2_equal"
+                        else:
+                            _gate_outcome = "tier3_db_read"
+
+                if _gate_outcome in ("tier2_legacy_fallthrough", "tier3_db_read"):
+                    _gate_stage = time.monotonic()
+                    try:
+                        _db_recent_rows = self._store.get_recent_canonical_turns(
+                            self.config.conversation_id,
+                            limit=self.config.monitor.protected_recent_turns,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Tier 3 get_recent_canonical_turns failed for conv=%s",
+                            self.config.conversation_id[:12],
+                            exc_info=True,
+                        )
+                        _db_recent_rows = []
+                    _gate_read_ms = round(
+                        (time.monotonic() - _gate_stage) * 1000.0, 2,
+                    )
+                    if _db_recent_rows:
+                        _pre_len = len(conversation_history)
+                        conversation_history = _merge_protected_window(
+                            payload_history=conversation_history,
+                            db_recent_rows=_db_recent_rows,
+                            mode="merge",
+                        )
+                        _gate_merged_rows = max(
+                            0, len(conversation_history) - _pre_len,
+                        )
+        # End cross-channel-mirror gate.
+
         # Determine active tags from recent tag results
         # Post-compaction: don't suppress retrieval -- stored summaries are needed
         # since raw turns have been compacted away.
@@ -331,6 +424,36 @@ class RetrievalAssembler:
                 len(conversation_history),
                 inbound_total_ms,
                 " ".join(stage_bits) if stage_bits else "no-stages",
+            )
+
+        # Cross-channel-mirror per-request observability (engine spec §8).
+        # Emit only when the gate actually ran (Tier 0 == merge). Tier 0
+        # off is a true no-op and emits no new log fields, preserving
+        # the "ship-as-no-observable-change-under-default-config"
+        # rollout contract. Cloud consumes via stdlib log aggregation
+        # (no metric pipeline), so the key/value pairs are rendered
+        # INLINE in the message text — ``logging.extra`` fields are
+        # dropped by cloud's formatter.
+        if _gate_outcome is not None:
+            logger.info(
+                "PROTECTED_WINDOW_GATE conv=%s "
+                "protected_window_db_source_mode=merge "
+                "protected_window_db_source_gate_outcome=%s "
+                "protected_window_db_read_ms=%.2f "
+                "protected_window_db_source_merged_rows=%d "
+                "protected_window_db_source_budget_evictions=%d",
+                self.config.conversation_id[:12] if self.config.conversation_id else "none",
+                _gate_outcome,
+                _gate_read_ms,
+                _gate_merged_rows,
+                _gate_budget_evictions,
+                extra={
+                    "protected_window_db_source_mode": "merge",
+                    "protected_window_db_source_gate_outcome": _gate_outcome,
+                    "protected_window_db_read_ms": _gate_read_ms,
+                    "protected_window_db_source_merged_rows": _gate_merged_rows,
+                    "protected_window_db_source_budget_evictions": _gate_budget_evictions,
+                },
             )
 
         # Cache for reassemble_context() -- used after paging tool execution

@@ -5646,6 +5646,60 @@ CREATE TABLE IF NOT EXISTS request_captures (
             uncompacted = []
         return uncompacted
 
+    def get_recent_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+    ) -> list[CanonicalTurnRow]:
+        """Tier 3 cross-channel-mirror lookup.
+
+        Single indexed query against ``canonical_turns_ordinal``
+        ordered by ``sort_key DESC`` with ``LIMIT``. No ``tagged_at``
+        filter — fresh peer-channel rows must surface even before the
+        tagger catches up. ``conversation_id`` is already indexed via
+        ``idx_canonical_turns_conv_order``.
+        """
+        if limit <= 0:
+            return []
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
+                      sort_key, turn_hash, hash_version,
+                      normalized_user_text, normalized_assistant_text,
+                      user_content, assistant_content,
+                      user_raw_content, assistant_raw_content,
+                      primary_tag, tags_json, session_date, sender,
+                      fact_signals_json, code_refs_json,
+                      tagged_at, compacted_at,
+                      first_seen_at, last_seen_at,
+                      source_batch_id, created_at, updated_at
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = ?
+               ORDER BY sort_key DESC
+               LIMIT ?""",
+            (conversation_id, int(limit)),
+        ).fetchall()
+        return [_row_to_canonical_turn(row) for row in rows]
+
+    def has_any_alias(self, conversation_id: str) -> bool:
+        """Tier 1 cross-channel-mirror lookup.
+
+        Single indexed `SELECT 1` against ``conversation_aliases``. The
+        ``alias_id`` leg is covered by the PRIMARY KEY's implicit index;
+        the ``target_id`` leg is covered by
+        ``idx_conversation_aliases_target_id``.
+        """
+        if not conversation_id:
+            return False
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM conversation_aliases "
+            "WHERE alias_id = ? OR target_id = ? LIMIT 1",
+            (conversation_id, conversation_id),
+        ).fetchone()
+        return row is not None
+
     def mark_canonical_turns_tagged(
         self,
         conversation_id: str,

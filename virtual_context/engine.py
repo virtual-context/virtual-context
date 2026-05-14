@@ -217,6 +217,24 @@ class VirtualContextEngine:
 
         # Wrap the raw store now that conversation_id is final.
         self._init_store_view(_raw_store)
+
+        # Cross-channel-mirror Tier 1 gate (see spec §1.1). Set the
+        # cached participation bool BEFORE any delegate construction
+        # that might inspect it. Tier 0 == "off" means the gate is
+        # disabled and we MUST NOT call ``has_any_alias`` at all so
+        # cloud's allowlist surface and any DB-roundtrip cost stay
+        # out of the construction path on the dominant unattached
+        # path. We do not catch broad ``Exception`` around the call
+        # in merge mode — a broken store / missing allowlist / DB
+        # outage that hides mirror loss as a stale ``False`` would be
+        # worse than failing fast at engine construction.
+        if getattr(self.config.assembler, "protected_window_db_source", "off") == "merge":
+            self._is_merge_participant = bool(
+                self._store.has_any_alias(self.config.conversation_id)
+            )
+        else:
+            self._is_merge_participant = False
+
         self._init_telemetry()
         self._init_canonicalizer()
         self._init_tag_generator()
@@ -396,6 +414,10 @@ class VirtualContextEngine:
             session_state_provider=self._session_state_provider,
         )
         self._retrieval._set_semantic(self._semantic)
+        # Cross-channel-mirror Tier 1 cache propagation. The assembler
+        # gate reads ``self._is_merge_participant`` via ``getattr`` with
+        # a False default; this assignment is the engine-owned source.
+        self._retrieval._is_merge_participant = self._is_merge_participant
 
         self._apply_persisted_state_to_delegates()
 

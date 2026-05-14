@@ -951,6 +951,11 @@ class AssemblerConfig:
     context_hint_enabled: bool = True
     context_hint_max_tokens: int = 2000
     pre_compaction_filtering: str = "aggressive"  # "off" | "conservative" | "aggressive"
+    # Cross-channel-mirror protected-window read mode.
+    # "off"   -> no Redis/DB read, today's payload-only protected window (default).
+    # "merge" -> three-tier gate fires per the cross-channel-mirror spec.
+    # YAML key: assembly.protected_window_db_source.
+    protected_window_db_source: str = "off"
 
     def __post_init__(self):
         if self.context_injection_max_tokens < 0:
