@@ -160,6 +160,37 @@ class ContextStore(ABC):
         """Search canonical turn text across stored conversation turns."""
         return []
 
+    def has_any_alias(self, conversation_id: str) -> bool:
+        """Tier 1 cross-channel-mirror lookup.
+
+        Returns ``True`` iff ``conversation_id`` appears as either
+        ``alias_id`` (outgoing source) or ``target_id`` (incoming
+        target) in the ``conversation_aliases`` table. Backends without
+        an alias surface (filesystem-only test fixtures, secondary
+        graph stores) return ``False`` defensively so the engine's
+        Tier 1 short-circuits cleanly.
+        """
+        return False
+
+    def get_recent_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+    ) -> list[CanonicalTurnRow]:
+        """Tier 3 cross-channel-mirror lookup.
+
+        Returns at most ``limit`` rows from ``canonical_turns`` for
+        ``conversation_id``, ordered by ``sort_key DESC`` so the
+        caller sees the most recent rows first. Filtering by
+        ``tagged_at`` is intentionally NOT applied — see the
+        cross-channel-mirror spec §1.2 ``tagged_at`` decision.
+
+        Backends that do not host canonical_turns (filesystem,
+        secondary graph stores) return ``[]`` defensively.
+        """
+        return []
+
     def conversation_reconcile(self, conversation_id: str):
         """Optional per-conversation write lock for merge-style ingest paths."""
         return nullcontext()
