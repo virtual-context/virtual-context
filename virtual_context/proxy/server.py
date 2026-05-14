@@ -1123,6 +1123,41 @@ async def prepare_payload(
                 wait_ms += _note_prep("wait_for_prior_compact", t_compact)
 
             if not state.is_conversation_deleted():
+                # Cross-channel-mirror Tier 2 stamping (engine spec §2.5).
+                # Stamp canonical_turn_id + turn_number metadata onto the
+                # completed-history prefix of state.conversation_history
+                # so the next on_message_inbound call has a payload-side
+                # anchor for the Tier 2 staleness check. Stamping is
+                # deliberately done BEFORE the active-tail user append
+                # below — the active turn must remain unstamped so it
+                # is excluded from anchor selection.
+                if (
+                    getattr(state.engine.config.assembler, "protected_window_db_source", "off") == "merge"
+                    and _phase_decision is not None
+                    and getattr(_phase_decision, "canonical_ingest_rows", ())
+                ):
+                    try:
+                        from ..core.protected_window import _stamp_canonical_turn_ids
+                        _ingest_rows = list(_phase_decision.canonical_ingest_rows)
+                        # Drop suffix rows that correspond to the active-tail
+                        # user message ingested in this request but excluded
+                        # from completed history. state.conversation_history
+                        # at this point is the completed-prefix history.
+                        _extracted = _extract_ingestible_messages(body)
+                        _completed = state._completed_history_messages(_extracted)
+                        _drop = max(0, len(_extracted) - len(_completed))
+                        if _drop and len(_ingest_rows) > _drop:
+                            _ingest_rows = _ingest_rows[:-_drop]
+                        _stamp_canonical_turn_ids(
+                            state.conversation_history, _ingest_rows,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Tier 2 stamping failed for conv=%s",
+                            state.engine.config.conversation_id[:12],
+                            exc_info=True,
+                        )
+
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
                             timestamp=datetime.now(timezone.utc),
