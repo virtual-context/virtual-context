@@ -203,10 +203,15 @@ class ProxyMetrics:
     :pyattr:`MAX_EVENTS`.  Older entries are evicted lazily --
     every 100 ``record()`` calls and at the start of
     ``events_since()`` / ``snapshot()``.
+
+    ``MAX_EVENTS`` is enforced on every ``record()`` call by the
+    hard-cap branch in that method, so the in-memory list size is
+    bounded at the append boundary, not only on reads.  Worst-case
+    memory per instance is approximately ``MAX_EVENTS * ~3KB / event``.
     """
 
     BASELINE_RATIO = 0.30  # typical summarization compression (3.3x)
-    MAX_EVENTS = 50_000
+    MAX_EVENTS = 5_000
     MAX_AGE_S = 86_400  # 24 hours
 
     def __init__(self, context_window: int = 120_000, telemetry_ledger=None,

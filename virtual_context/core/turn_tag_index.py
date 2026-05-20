@@ -12,7 +12,36 @@ class TurnTagIndex:
 
     Updated every round trip by the engine. Read by segmenter and retriever.
     Purely in-memory — not persisted. Rebuilt each session.
+
+    Bounded at :pyattr:`MAX_ENTRIES` to cap per-instance memory.  When
+    the bound is reached, the oldest entry is evicted from
+    :pyattr:`entries` and from the three reference dicts
+    (:pyattr:`_by_logical_turn`, :pyattr:`_by_canonical_turn`,
+    :pyattr:`_by_hash`); :pyattr:`_all_tags` is recomputed from the
+    remaining entries so tags whose sole carrier was the evicted entry
+    drop out.
+
+    Aggregation methods (:py:meth:`compute_cover_set`,
+    :py:meth:`get_tag_counts`, :py:meth:`get_tag_velocity`,
+    :py:meth:`replace_tag`) now operate on the bounded window rather
+    than the full conversation history.  For typical conversations
+    under :pyattr:`MAX_ENTRIES` turns this is identical to the
+    pre-bound behavior; for longer conversations the aggregations
+    approximate "recent activity" rather than "full history."  The
+    durable source of truth in the ``canonical_turns`` SQL table is
+    unchanged; callers that need full-history aggregation can route
+    through :py:meth:`VirtualContextEngine._restore_from_canonical_rows`
+    to rebuild a fresh full-history index for that one operation.
+
+    Eviction uses identity-guarded ``is``-comparison before removing
+    each dict entry because the duplicate-detection guards in
+    :py:meth:`append` reject incoming duplicates and KEEP the original
+    entry; without the identity check, evicting an older slot that
+    happened to share a key with a later-rejected duplicate would
+    silently drop the kept entry from the dicts.
     """
+
+    MAX_ENTRIES = 5_000
 
     def __init__(self) -> None:
         self.entries: list[TurnTagEntry] = []
@@ -20,6 +49,7 @@ class TurnTagIndex:
         self._by_canonical_turn: dict[str, TurnTagEntry] = {}
         self._by_hash: dict[str, TurnTagEntry] = {}
         self._all_tags: set[str] = set()
+        self._evicted_count: int = 0
 
     def append(self, entry: TurnTagEntry) -> None:
         if entry.turn_number in self._by_logical_turn:
@@ -40,6 +70,13 @@ class TurnTagIndex:
                 entry.tags,
             )
             return
+
+        # LRU eviction BEFORE the new append so the post-condition is
+        # always ``len(self.entries) <= MAX_ENTRIES`` and one eviction
+        # at most per append keeps the amortized cost bounded.
+        if len(self.entries) >= self.MAX_ENTRIES:
+            self._evict_oldest()
+
         self.entries.append(entry)
         self._by_logical_turn[entry.turn_number] = entry
         if entry.canonical_turn_id:
@@ -47,6 +84,33 @@ class TurnTagIndex:
         if entry.message_hash:
             self._by_hash[entry.message_hash] = entry
         self._all_tags.update(entry.tags)
+
+    def _evict_oldest(self) -> None:
+        """Evict the oldest entry and drop it from all reference dicts.
+
+        Identity-guarded ``is``-comparison protects against the case
+        where ``append``'s duplicate-detection rejected a later entry
+        with the same ``turn_number`` / ``canonical_turn_id`` /
+        ``message_hash`` as the oldest entry; without the guard, the
+        dict slot pointing at the kept entry would be silently
+        deleted along with the eviction.
+        """
+        if not self.entries:
+            return
+        oldest = self.entries.pop(0)
+        if self._by_logical_turn.get(oldest.turn_number) is oldest:
+            del self._by_logical_turn[oldest.turn_number]
+        if oldest.canonical_turn_id and self._by_canonical_turn.get(oldest.canonical_turn_id) is oldest:
+            del self._by_canonical_turn[oldest.canonical_turn_id]
+        if oldest.message_hash and self._by_hash.get(oldest.message_hash) is oldest:
+            del self._by_hash[oldest.message_hash]
+        self._evicted_count += 1
+        # Rebuild ``_all_tags`` from the remaining entries so tags
+        # whose only carrier was ``oldest`` drop out of the set.
+        # Per design doc §2.4 benchmark: ~0.43 ms at MAX_ENTRIES=5_000
+        # with average ~3 tags per entry; acceptable on the append
+        # hot path.
+        self._all_tags = {tag for entry in self.entries for tag in entry.tags}
 
     def get_active_tags(self, lookback: int = 4) -> set[str]:
         recent = self.entries[-lookback:] if len(self.entries) >= lookback else self.entries
