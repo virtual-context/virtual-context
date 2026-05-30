@@ -214,13 +214,32 @@ class FalkorDBFactStore:
         )
         return [self._node_to_fact(row[0]) for row in rows]
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         self._query(
             "MATCH (f:Fact {id: $id}) SET f.superseded_by = $new_id",
             {"id": old_fact_id, "new_id": new_fact_id},
         )
 
-    def update_fact_fields(self, fact_id: str, verb: str, object: str, status: str, what: str) -> None:
+    def update_fact_fields(
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         self._query(
             "MATCH (f:Fact {id: $id}) SET f.verb = $verb, f.object = $object, "
             "f.status = $status, f.what = $what",
@@ -248,7 +267,15 @@ class FalkorDBFactStore:
     # FactLinkStore — native graph edges
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
         if not links:
             return 0
         count = 0

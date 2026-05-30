@@ -11,10 +11,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from virtual_context.core.canonical_turns import utcnow_iso
+from virtual_context.core.compaction_fence import CompactionFenceMode
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import Fact, SegmentMetadata, StoredSegment, TagSummary
 
 _TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _make_store(path: Path) -> SQLiteStore:
+    """Pin ACTIVE so pre-P7 ownership-guard regression tests keep
+    asserting the enforced raise contract under the default-OFF rollout.
+    """
+    return SQLiteStore(path, compaction_fence_mode=CompactionFenceMode.ACTIVE)
 
 
 def _seed_running(store, conv, op_id, worker="w"):
@@ -41,7 +49,7 @@ def _segment(conv, ref):
 
 
 def test_store_segment_write_succeeds_while_operation_running(tmp_path: Path):
-    store = SQLiteStore(tmp_path / "ok.db")
+    store = _make_store(tmp_path / "ok.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-1", worker="w")
 
@@ -68,7 +76,7 @@ def test_store_segment_raises_lease_lost_when_operation_abandoned(tmp_path: Path
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "abandon.db")
+    store = _make_store(tmp_path / "abandon.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-1", worker="w")
 
@@ -102,7 +110,7 @@ def test_store_segment_raises_lease_lost_when_wrong_owner(tmp_path: Path):
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "wrongowner.db")
+    store = _make_store(tmp_path / "wrongowner.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-1", worker="w-real")
 
@@ -126,7 +134,7 @@ def test_store_segment_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path)
     Otherwise we'd break all existing test harnesses that construct
     rows directly.
     """
-    store = SQLiteStore(tmp_path / "legacy.db")
+    store = _make_store(tmp_path / "legacy.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     ref = store.store_segment(_segment("c", "ref-legacy"))
     assert ref == "ref-legacy"
@@ -155,7 +163,7 @@ def _fact(fact_id: str, conv: str = "c") -> Fact:
 
 def test_store_facts_write_succeeds_while_operation_running(tmp_path: Path):
     """Batch insert with guard kwargs succeeds when op is still running."""
-    store = SQLiteStore(tmp_path / "facts_ok.db")
+    store = _make_store(tmp_path / "facts_ok.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-facts-1", worker="w")
 
@@ -188,7 +196,7 @@ def test_store_facts_raises_lease_lost_when_operation_abandoned(tmp_path: Path):
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "facts_abandon.db")
+    store = _make_store(tmp_path / "facts_abandon.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-facts-2", worker="w")
 
@@ -221,7 +229,7 @@ def test_store_facts_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Path):
     """Callers that omit guard kwargs use the unconditional INSERT path.
     Existing test harnesses and non-compaction call sites must not break.
     """
-    store = SQLiteStore(tmp_path / "facts_legacy.db")
+    store = _make_store(tmp_path / "facts_legacy.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     inserted = store.store_facts([_fact("f-legacy-1"), _fact("f-legacy-2")])
@@ -251,7 +259,7 @@ def _tag_summary(tag: str) -> TagSummary:
 
 def test_save_tag_summary_write_succeeds_while_operation_running(tmp_path: Path):
     """UPSERT with guard kwargs succeeds when the operation is still running."""
-    store = SQLiteStore(tmp_path / "tag_summary_ok.db")
+    store = _make_store(tmp_path / "tag_summary_ok.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-ts-1", worker="w")
 
@@ -277,7 +285,7 @@ def test_save_tag_summary_raises_lease_lost_when_operation_abandoned(tmp_path: P
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "tag_summary_abandon.db")
+    store = _make_store(tmp_path / "tag_summary_abandon.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-ts-2", worker="w")
 
@@ -311,7 +319,7 @@ def test_save_tag_summary_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Pa
     """Callers that omit guard kwargs use the unconditional UPSERT path.
     Existing test harnesses and non-compaction call sites must not break.
     """
-    store = SQLiteStore(tmp_path / "tag_summary_legacy.db")
+    store = _make_store(tmp_path / "tag_summary_legacy.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     store.save_tag_summary(_tag_summary("legacy-tag"), conversation_id="c")
@@ -330,7 +338,7 @@ def test_save_tag_summary_legacy_path_no_guard_kwargs_still_inserts(tmp_path: Pa
 
 def test_store_tag_summary_embedding_write_succeeds_while_running(tmp_path: Path):
     """Embedding UPSERT with guard kwargs succeeds when the operation is still running."""
-    store = SQLiteStore(tmp_path / "emb_ok.db")
+    store = _make_store(tmp_path / "emb_ok.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-emb-1", worker="w")
 
@@ -356,7 +364,7 @@ def test_store_tag_summary_embedding_raises_lease_lost_when_operation_abandoned(
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "emb_abandon.db")
+    store = _make_store(tmp_path / "emb_abandon.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-emb-2", worker="w")
 
@@ -390,7 +398,7 @@ def test_store_tag_summary_embedding_legacy_path_no_guard_kwargs_still_inserts(t
     """Callers that omit guard kwargs use the unconditional UPSERT path.
     Existing test harnesses and non-compaction call sites must not break.
     """
-    store = SQLiteStore(tmp_path / "emb_legacy.db")
+    store = _make_store(tmp_path / "emb_legacy.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     store.store_tag_summary_embedding("legacy-tag", "c", [1.0, 2.0, 3.0])
@@ -451,7 +459,7 @@ def test_mark_canonical_turns_compacted_guarded_path_preserves_turn_group_merge_
     compaction_operation_id on each row, preserving the merge-expansion
     behaviour from 6e2d5bd.
     """
-    store = SQLiteStore(tmp_path / "mark_guard_ok.db")
+    store = _make_store(tmp_path / "mark_guard_ok.db")
     conv = "conv-mark-guard"
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     _seed_running(store, conv, "op-mark-1", worker="w")
@@ -492,7 +500,7 @@ def test_mark_canonical_turns_compacted_raises_lease_lost_when_operation_abandon
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "mark_guard_abandon.db")
+    store = _make_store(tmp_path / "mark_guard_abandon.db")
     conv = "conv-mark-abandon"
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     _seed_running(store, conv, "op-mark-2", worker="w")
@@ -534,7 +542,7 @@ def test_mark_canonical_turns_compacted_legacy_path_no_guard_kwargs_still_marks(
     which still expands through turn_group_number (behaviour from 6e2d5bd).
     Existing call sites and test harnesses must not break.
     """
-    store = SQLiteStore(tmp_path / "mark_legacy.db")
+    store = _make_store(tmp_path / "mark_legacy.db")
     conv = "conv-mark-legacy"
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
 
@@ -565,7 +573,7 @@ def test_start_compaction_operation_uses_caller_supplied_operation_id(tmp_path: 
     causing the per-write guard kwargs threaded by _run_compact to match zero
     rows and raising CompactionLeaseLost on every normal compaction.
     """
-    store = SQLiteStore(tmp_path / "caller_id.db")
+    store = _make_store(tmp_path / "caller_id.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     caller_id = "my-fixed-op-id-123"
@@ -595,7 +603,7 @@ def test_start_compaction_operation_uses_caller_supplied_operation_id(tmp_path: 
 
 def test_start_compaction_operation_auto_generates_id_when_none_supplied(tmp_path: Path):
     """Legacy path: when operation_id is not supplied, a UUID is auto-generated."""
-    store = SQLiteStore(tmp_path / "auto_id.db")
+    store = _make_store(tmp_path / "auto_id.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     returned_id = store.start_compaction_operation(
@@ -630,7 +638,7 @@ def test_replace_facts_for_segment_does_not_lose_preexisting_facts_on_lease_lost
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "replace_race.db")
+    store = _make_store(tmp_path / "replace_race.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
 
     # Seed pre-existing facts attributed to segment_ref=seg-1 via the
@@ -685,7 +693,7 @@ def test_replace_facts_for_segment_does_not_lose_preexisting_facts_on_lease_lost
 
 def test_update_segment_succeeds_while_operation_running(tmp_path: Path) -> None:
     """update_segment with guard kwargs succeeds when the operation is running."""
-    store = SQLiteStore(tmp_path / "update_seg_ok.db")
+    store = _make_store(tmp_path / "update_seg_ok.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-us-1", worker="w")
 
@@ -717,7 +725,7 @@ def test_update_segment_raises_lease_lost_when_operation_abandoned(tmp_path: Pat
     import pytest
     from virtual_context.types import CompactionLeaseLost
 
-    store = SQLiteStore(tmp_path / "update_seg_abandon.db")
+    store = _make_store(tmp_path / "update_seg_abandon.db")
     store.upsert_conversation(tenant_id="t", conversation_id="c")
     _seed_running(store, "c", "op-us-2", worker="w")
 

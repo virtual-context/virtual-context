@@ -38,7 +38,13 @@ class TestFactLinkCheckerSupersessionMode:
         links_created, superseded = checker.check_and_link([new])
         assert superseded == 1
         assert links_created == 0
-        store.set_fact_superseded.assert_called_once_with("old", "new")
+        # Per fencing plan §5.6 caller-side propagation, FactLinkChecker
+        # now forwards guard kwargs (here all None for legacy callers)
+        # through to set_fact_superseded.
+        store.set_fact_superseded.assert_called_once_with(
+            "old", "new",
+            operation_id=None, owner_worker_id=None, lifecycle_epoch=None,
+        )
 
     def test_disabled_config(self):
         cfg = SupersessionConfig(enabled=False)

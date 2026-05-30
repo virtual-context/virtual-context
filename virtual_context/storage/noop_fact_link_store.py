@@ -8,7 +8,15 @@ from ..types import FactLink, LinkedFact
 class NoopFactLinkStore:
     """All methods return empty results. Used when graph_links config is false."""
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
         return 0
 
     def get_fact_links(self, fact_id: str, direction: str = "both") -> list[FactLink]:

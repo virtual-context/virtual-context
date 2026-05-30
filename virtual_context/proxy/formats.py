@@ -280,7 +280,12 @@ def normalize_messages(messages: list) -> list:
                     msg["content"] = remaining if remaining else None
 
             # Clean up non-standard keys on assistant messages
-            for k in ("api", "provider", "stopReason", "usage",
+            # (Keep `api`/`provider`/`model` so downstream OpenAI-Codex-style
+            # transports can correctly identify same-model assistant turns
+            # and preserve thinking blocks + textSignature. Other fields
+            # stripped here are unused by engine/cloud after the early-
+            # return checks above; historically removed for size hygiene.)
+            for k in ("stopReason", "usage",
                        "responseId", "timestamp", "errorMessage",
                        "thinkingSignature"):
                 msg.pop(k, None)

@@ -281,7 +281,13 @@ class TestCheckAndSupersede:
 
         result = checker.check_and_supersede([new_fact])
         assert result == 1
-        store.set_fact_superseded.assert_called_once_with("old-001", "new-001")
+        # Per fencing plan §5.6, check_and_supersede now forwards the
+        # guard triple to set_fact_superseded. Legacy callers (this
+        # test omits the guard kwargs) get all-None forwarded.
+        store.set_fact_superseded.assert_called_once_with(
+            "old-001", "new-001",
+            operation_id=None, owner_worker_id=None, lifecycle_epoch=None,
+        )
 
     def test_no_contradiction(self):
         """LLM returns empty array => nothing superseded."""

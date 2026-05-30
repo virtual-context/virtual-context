@@ -59,6 +59,19 @@ _COMPACT_PHASE_INDEX: dict[str, int] = {
     name: idx for idx, name in enumerate(_COMPACT_PHASE_PLAN)
 }
 
+
+def compaction_phase_count() -> int:
+    """Number of phases in the canonical compaction plan.
+
+    Used by the compaction-backlog sweeper's claim adapter to
+    populate ``compaction_operation.phase_count`` consistently with
+    the proxy LLM compaction path. Cloud's sweeper tick handler
+    calls this helper rather than passing a maintained literal so a
+    future change to the phase plan stays sourced from one location.
+    Per compaction-backlog sweeper spec v1.4 §4.1.
+    """
+    return len(_COMPACT_PHASE_PLAN)
+
 # ---------------------------------------------------------------------------
 # Provider derivation from upstream URL
 # ---------------------------------------------------------------------------
@@ -899,46 +912,52 @@ class ProxyState:
     def enter_compaction(
         self, *, phase_count: int, initial_phase_name: str = "init",
         operation_id: str | None = None,
-    ) -> None:
-        """Transition phase from ``'active'`` to ``'compacting'`` and start
-        a fresh ``compaction_operation`` row.
+    ) -> bool:
+        """Atomic phase CAS + active-op insert via the lifecycle-locked
+        begin primitive. Returns ``True`` iff this worker inserted the
+        active ``compaction_operation`` row (i.e. won the race against a
+        concurrent enter from another worker or sweeper).
 
-        Epoch-guarded via ``verify_epoch`` at entry. The phase write is
-        additionally epoch-filtered at the SQL layer — a stale caller whose
-        epoch does not match the authoritative conversations row sees
-        ``set_phase`` return False and this method exits without writing
-        the operation row.
+        Returns ``False`` on any precondition failure: lifecycle lock
+        held by another transaction (SKIP LOCKED), conversation deleted,
+        phase not in ``('active', 'ingesting')``, lifecycle_epoch
+        mismatch, or an active successor row already exists. Loser
+        workers must skip ``_run_compaction`` and must NOT call
+        ``exit_compaction`` from their finally block per the fencing
+        plan §3.3 caller-side discipline.
 
-        *operation_id*: when provided, the DB row is inserted with this PK
-        rather than a store-generated UUID. This ensures the row PK matches
-        the id the caller already threaded into downstream per-write
-        ownership-guard kwargs.
+        Epoch-guarded via ``verify_epoch`` at entry; the SQL layer
+        additionally re-verifies the epoch inside the locked
+        transaction so a stale caller fails closed.
+
+        *operation_id*: when provided, the DB row is inserted with this
+        PK rather than a store-generated UUID. The id is also returned
+        through the active op so heartbeat / per-write ownership guards
+        match. When omitted a UUID is generated.
         """
+        import uuid as _uuid
         conv = self.engine.config.conversation_id
         self.engine.verify_epoch()
         epoch = int(self.engine._engine_state.lifecycle_epoch)
-        ok = self.engine._store.set_phase(
-            conversation_id=conv,
-            lifecycle_epoch=epoch,
-            phase="compacting",
-        )
-        if not ok:
-            logger.info(
-                "enter_compaction aborted: phase write rejected"
-                " (epoch mismatch) for conv=%s",
-                conv[:12],
-            )
-            return
-        self.engine._store.start_compaction_operation(
+        new_op = operation_id if operation_id is not None else _uuid.uuid4().hex
+        inserted = self.engine._store.begin_compaction_with_lock(
             conversation_id=conv,
             lifecycle_epoch=epoch,
             worker_id=self._worker_id,
+            new_operation_id=new_op,
             phase_count=phase_count,
             phase_name=initial_phase_name,
-            operation_id=operation_id,
         )
+        if not inserted:
+            logger.info(
+                "enter_compaction aborted: begin_compaction_with_lock "
+                "rejected for conv=%s worker=%s",
+                conv[:12], self._worker_id,
+            )
+            return False
         self._publish_compaction_progress()
         self._publish_phase_transition("active", "compacting")
+        return True
 
     def advance_compaction_phase(
         self, *, phase_index: int, phase_name: str,
@@ -1039,10 +1058,21 @@ class ProxyState:
         # transaction as the phase UPDATE via a direct EXISTS check on
         # canonical_turns.tagged_at, so a concurrent tagger cannot flip
         # the answer between read and write.
+        #
+        # Per the fencing plan §3.3 caller-side discipline: when
+        # ``active`` from the pre-snapshot is None, this worker does
+        # not own a running op (e.g. a loser observed someone else's
+        # row earlier). Skip the drain entirely so we cannot
+        # terminalize a phase that belongs to another worker. When the
+        # snapshot did surface an op, pass its operation_id to the
+        # drain as the ownership guard.
+        if active is None:
+            return
         new_phase = self.engine._store.drain_compaction_exit(
             conversation_id=conv,
             lifecycle_epoch=epoch,
             worker_id=self._worker_id,
+            expected_operation_id=active.operation_id,
         )
         if new_phase in ("ingesting", "active"):
             self._publish_phase_transition("compacting", new_phase)
@@ -2256,6 +2286,34 @@ class ProxyState:
         except Exception as e:
             logger.error("tag_split error: %s", e, exc_info=True)
 
+    @staticmethod
+    def _resolve_c2r_gate(
+        signal: object, explicit: bool | None,
+    ) -> bool:
+        """Resolve the C2R (``disable_replacement_passes``) gate.
+
+        Per fencing plan §7.3, the gate is True when:
+
+        * the caller passes ``True`` explicitly, OR
+        * no explicit value is supplied AND the dispatching signal
+          has ``priority == "backlog"`` (i.e. the backlog sweeper
+          fired this compaction and any replacement write would
+          collide with content owned by another operation).
+
+        Otherwise the gate is False so proxy LLM compaction
+        (priorities ``"soft"`` / ``"hard"`` / ``"takeover"``) keeps
+        its full replacement semantics. The two-direction override
+        in T5.8 reflects this: a caller can force the gate ON for a
+        non-backlog dispatch and OFF for a backlog dispatch.
+        """
+        if explicit is not None:
+            return bool(explicit)
+        try:
+            priority = str(getattr(signal, "priority", "") or "")
+        except Exception:
+            priority = ""
+        return priority == "backlog"
+
     def _run_compact(
         self,
         history: list[Message],
@@ -2264,6 +2322,7 @@ class ProxyState:
         turn_id: str = "",
         *,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool | None = None,
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request.
 
@@ -2276,8 +2335,18 @@ class ProxyState:
         enter / each phase advance / exit. See ``enter_compaction``,
         ``advance_compaction_phase``, and ``exit_compaction`` on
         ``ProxyState`` for the underlying primitives.
+
+        *disable_replacement_passes*: when explicitly supplied, threaded
+        through to ``compact_if_needed``. When left ``None``, a default
+        is derived from ``signal.priority == "backlog"`` so a direct
+        caller that hands in a backlog signal still gets the C2R gate
+        without needing to set the flag separately. Per fencing plan
+        §7.2 dispatch-flow description.
         """
         conversation_id = self.engine.config.conversation_id
+        disable_replacement_passes = self._resolve_c2r_gate(
+            signal, disable_replacement_passes,
+        )
         if preexisting_operation_id is not None:
             # Takeover path: the caller pre-inserted the compaction_operation
             # row (e.g. via cleanup_abandoned_compaction). Use the supplied
@@ -2430,27 +2499,45 @@ class ProxyState:
                 last_advanced_phase_index = 0
                 entered_lifecycle = True
             else:
+                entered_lifecycle = False
                 try:
-                    self.enter_compaction(
+                    entered_lifecycle = bool(self.enter_compaction(
                         phase_count=len(_COMPACT_PHASE_PLAN),
                         initial_phase_name=_COMPACT_PHASE_PLAN[0],
                         operation_id=operation_id,
-                    )
+                    ))
                     last_advanced_phase_index = 0
                 except Exception:
                     logger.warning(
-                        "enter_compaction failed for %s — continuing legacy path only",
+                        "enter_compaction failed for %s; skipping compaction",
                         conversation_id[:12],
                         exc_info=True,
                     )
-                entered_lifecycle = False
-                try:
-                    snap_after_enter = self.engine._store.read_progress_snapshot(
-                        conversation_id,
-                    )
-                    entered_lifecycle = snap_after_enter.active_compaction is not None
-                except Exception:
                     entered_lifecycle = False
+                if not entered_lifecycle:
+                    # Loser path: we did not insert the active
+                    # compaction_operation row, so we must NOT run the
+                    # compaction body or call exit_compaction. Per the
+                    # fencing plan §3.3 the snapshot probe is replaced
+                    # by the explicit return value: a False here means
+                    # another worker owns the active op and we yield
+                    # cleanly to that worker.
+                    logger.info(
+                        "Compaction lifecycle not entered for %s; "
+                        "yielding to active owner",
+                        conversation_id[:12],
+                    )
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="skipped",
+                        phase="skipped",
+                        phase_name="skipped",
+                        done=0,
+                        total=0,
+                        overall_percent=100,
+                        phase_detail="compaction lifecycle not entered",
+                    )
+                    return
 
             # Spawn the heartbeat sidecar. It refreshes the compaction_operation
             # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor
@@ -2490,27 +2577,39 @@ class ProxyState:
                     if not callable(compact_target):
                         compact_target = compact_if_needed
                     supports_turn_id = True
+                    supports_operation_id = True
+                    supports_disable_replacement_passes = True
                     try:
                         signature = inspect.signature(compact_target)
+                        accepts_kwargs = any(
+                            param.kind == inspect.Parameter.VAR_KEYWORD
+                            for param in signature.parameters.values()
+                        )
                         supports_turn_id = (
                             "turn_id" in signature.parameters
-                            or any(
-                                param.kind == inspect.Parameter.VAR_KEYWORD
-                                for param in signature.parameters.values()
-                            )
+                            or accepts_kwargs
+                        )
+                        supports_operation_id = (
+                            "operation_id" in signature.parameters
+                            or accepts_kwargs
+                        )
+                        supports_disable_replacement_passes = (
+                            "disable_replacement_passes" in signature.parameters
+                            or accepts_kwargs
                         )
                     except (TypeError, ValueError):
                         supports_turn_id = True
+                        supports_operation_id = True
+                        supports_disable_replacement_passes = True
 
+                    compact_kwargs = {"progress_callback": _compact_progress}
                     if supports_turn_id:
-                        report = compact_if_needed(
-                            history, signal, progress_callback=_compact_progress,
-                            turn_id=turn_id, operation_id=operation_id,
-                        )
-                    else:
-                        report = self.engine.compact_if_needed(
-                            history, signal, progress_callback=_compact_progress,
-                        )
+                        compact_kwargs["turn_id"] = turn_id
+                    if supports_operation_id:
+                        compact_kwargs["operation_id"] = operation_id
+                    if supports_disable_replacement_passes:
+                        compact_kwargs["disable_replacement_passes"] = disable_replacement_passes
+                    report = compact_if_needed(history, signal, **compact_kwargs)
                     compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
                     if report is not None:
@@ -2676,10 +2775,12 @@ class ProxyState:
         turn_id: str = "",
         *,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool | None = None,
     ) -> None:
         try:
             self._run_compact(history, signal, turn, turn_id=turn_id,
-                              preexisting_operation_id=preexisting_operation_id)
+                              preexisting_operation_id=preexisting_operation_id,
+                              disable_replacement_passes=disable_replacement_passes)
         finally:
             # Always clear the active op so the takeover predicate is unblocked.
             self._active_compaction_op = None

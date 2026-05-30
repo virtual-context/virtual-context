@@ -2,7 +2,7 @@
 <!-- [![Python](https://img.shields.io/pypi/pyversions/virtual-context.svg)](https://pypi.org/project/virtual-context/) -->
 <!-- [![Downloads](https://img.shields.io/pypi/dm/virtual-context.svg)](https://pypistats.org/packages/virtual-context) -->
 <!-- [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://github.com/yursilkidwai/virtual-context/blob/main/LICENSE) -->
-[![Discord](https://img.shields.io/badge/Discord-Chat%20with%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/YxDHKEZz)
+[![Discord](https://img.shields.io/badge/Discord-Chat%20with%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/kGJva2D8Ej)
 [![Twitter](https://img.shields.io/badge/Twitter-Follow-1DA1F2?logo=x&logoColor=white)](https://x.com/virtualctx)
 
 <p align="center">

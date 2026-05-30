@@ -2329,6 +2329,8 @@ class VirtualContextEngine:
         progress_callback: Callable[..., None] | None = None,
         turn_id: str = "",
         operation_id: str | None = None,
+        *,
+        disable_replacement_passes: bool = False,
     ) -> CompactionReport | None:
         return self._compaction.compact_if_needed(
             conversation_history,
@@ -2336,6 +2338,7 @@ class VirtualContextEngine:
             progress_callback,
             turn_id=turn_id,
             operation_id=operation_id,
+            disable_replacement_passes=disable_replacement_passes,
         )
 
     def on_turn_complete(
@@ -2373,8 +2376,14 @@ class VirtualContextEngine:
         self,
         conversation_history: list[Message],
         turn_id: str = "",
+        *,
+        disable_replacement_passes: bool = False,
     ) -> CompactionReport | None:
-        return self._compaction.compact_manual(conversation_history, turn_id=turn_id)
+        return self._compaction.compact_manual(
+            conversation_history,
+            turn_id=turn_id,
+            disable_replacement_passes=disable_replacement_passes,
+        )
 
     def backfill_tag_summaries(self, *, force_rebuild: bool = False) -> int:
         """Generate ``tag_summaries`` rows from already-stored segments.

@@ -38,6 +38,20 @@ logger = logging.getLogger(__name__)
 _INBOUND_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 _INBOUND_BREAKDOWN_MAX_STAGES = 8
 
+# Captured at module import for the worker_process_uptime_s diagnostic in
+# the INBOUND_BREAKDOWN log. Reused for every context-hint instrumentation
+# emission so a fresh worker shows uptime near zero on its first slow
+# hint build, which is the structural cache-miss signature.
+_PROCESS_START_MONOTONIC = time.monotonic()
+
+# Slow-context-hint diagnostic gate. When the hint stage exceeds this
+# threshold AND the overall request crosses
+# _INBOUND_BREAKDOWN_LOG_THRESHOLD_MS, the breakdown log appends the
+# instrumentation block populated by _build_context_hint (cache layer,
+# cache-key components, sub-stage timings, tag_summary_count,
+# worker uptime). Cheap path stays untouched.
+_CONTEXT_HINT_DIAG_THRESHOLD_MS = 500.0
+
 
 class RetrievalAssembler:
     """Retrieval, assembly, hint building, and history filtering.
@@ -303,7 +317,11 @@ class RetrievalAssembler:
         # Build context awareness hint (post-compaction only)
         _hint_stage = time.monotonic()
         _paging_mode = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
-        context_hint = self._build_context_hint(paging_mode=_paging_mode)
+        _hint_instrumentation: dict[str, object] = {}
+        context_hint = self._build_context_hint(
+            paging_mode=_paging_mode,
+            instrumentation=_hint_instrumentation,
+        )
         _note("context_hint", _hint_stage)
 
         # Load core context
@@ -418,6 +436,25 @@ class RetrievalAssembler:
                 f"{stage}={ms:.1f}ms"
                 for stage, ms in list(inbound_breakdown.items())[:_INBOUND_BREAKDOWN_MAX_STAGES]
             ]
+            # Append context-hint diagnostic block only when the hint stage
+            # itself was slow. Cheap in-process hits leave the instrumentation
+            # dict empty so the log volume does not grow on warm cache
+            # lookups.
+            _hint_ms = float(_breakdown.get("context_hint", 0.0) or 0.0)
+            _include_hint_diagnostics = bool(
+                _hint_ms >= _CONTEXT_HINT_DIAG_THRESHOLD_MS
+                and _hint_instrumentation
+            )
+            if _include_hint_diagnostics:
+                _uptime_s = round(time.monotonic() - _PROCESS_START_MONOTONIC, 1)
+                _hint_instrumentation["worker_process_uptime_s"] = _uptime_s
+                # Render as flat key=value pairs so cloud's stdlib log
+                # aggregation can parse without nested structure.
+                hint_bits = [
+                    f"hint_{key}={value}"
+                    for key, value in _hint_instrumentation.items()
+                ]
+                stage_bits.extend(hint_bits)
             logger.info(
                 "INBOUND_BREAKDOWN conv=%s history_msgs=%d total=%sms %s",
                 self.config.conversation_id[:12] if self.config.conversation_id else "none",
@@ -425,6 +462,17 @@ class RetrievalAssembler:
                 inbound_total_ms,
                 " ".join(stage_bits) if stage_bits else "no-stages",
             )
+            # Also surface the instrumentation on the request's
+            # retrieval_metadata so dashboard / SSE consumers can render
+            # the breakdown alongside other inbound timing fields without
+            # re-parsing the log line. Kept separate from
+            # inbound_breakdown (which is dict[str, float]) to preserve
+            # the existing type contract that downstream renderers rely
+            # on.
+            if _include_hint_diagnostics:
+                assembled.retrieval_metadata.setdefault(
+                    "context_hint_diagnostics", dict(_hint_instrumentation)
+                )
 
         # Cross-channel-mirror per-request observability (engine spec §8).
         # Emit only when the gate actually ran (Tier 0 == merge). Tier 0
@@ -648,7 +696,12 @@ class RetrievalAssembler:
             json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
 
-    def _build_context_hint(self, paging_mode: str | None = None) -> str:
+    def _build_context_hint(
+        self,
+        paging_mode: str | None = None,
+        *,
+        instrumentation: dict[str, object] | None = None,
+    ) -> str:
         """Build a topic list for post-compaction prompts.
 
         *paging_mode* overrides the resolved mode (``"autonomous"`` or
@@ -659,6 +712,16 @@ class RetrievalAssembler:
         Mode determines detail level:
         - supervised: topic list with depth, "call expand_topic for detail"
         - autonomous: full budget dashboard with token costs
+
+        *instrumentation* is an optional dict that, when supplied by the
+        caller, is populated with diagnostic fields describing the path the
+        hint build took: which cache layer answered, the salient
+        cache-key components, sub-stage timings on the cache-miss path,
+        and the tag_summary_count. In-process cache hits leave the dict
+        empty so the hot path stays cheap. The caller renders this into
+        the INBOUND_BREAKDOWN log when the request is slow. None disables
+        the instrumentation entirely with no per-call overhead beyond
+        the parameter check.
 
         Returns empty string if compaction hasn't occurred or the feature is disabled.
         """
@@ -675,49 +738,116 @@ class RetrievalAssembler:
         cache_key = self._build_context_hint_cache_key(paging_mode)
         if cache_key and cache_key == self._context_hint_cache_key:
             return self._context_hint_cache_value
+        _cache_load_ms: float | None = None
         if (
             cache_key
             and self._session_state_provider is not None
             and self.config.conversation_id
         ):
+            _t_cache_load = time.monotonic()
             cached = self._session_state_provider.load_context_hint_cache(
                 self.config.conversation_id,
                 cache_key,
             )
+            _cache_load_ms = round((time.monotonic() - _t_cache_load) * 1000, 1)
             if cached is not None:
                 self._context_hint_cache_key = cache_key
                 self._context_hint_cache_value = cached
+                if (
+                    instrumentation is not None
+                    and _cache_load_ms >= _CONTEXT_HINT_DIAG_THRESHOLD_MS
+                ):
+                    instrumentation["paging_mode"] = paging_mode or "default"
+                    instrumentation["compacted_prefix"] = int(
+                        getattr(self._engine_state, "compacted_prefix_messages", 0) or 0
+                    )
+                    instrumentation["last_compacted_turn"] = int(
+                        getattr(self._engine_state, "last_compacted_turn", -1) or -1
+                    )
+                    instrumentation["generation"] = int(
+                        getattr(self._engine_state, "conversation_generation", 0) or 0
+                    )
+                    instrumentation["working_set_size"] = len(self._paging.working_set)
+                    instrumentation["cache_layer"] = "cross_worker_hit"
+                    instrumentation["load_context_hint_cache_ms"] = _cache_load_ms
                 return cached
 
+        if instrumentation is not None:
+            instrumentation["paging_mode"] = paging_mode or "default"
+            instrumentation["compacted_prefix"] = int(
+                getattr(self._engine_state, "compacted_prefix_messages", 0) or 0
+            )
+            instrumentation["last_compacted_turn"] = int(
+                getattr(self._engine_state, "last_compacted_turn", -1) or -1
+            )
+            instrumentation["generation"] = int(
+                getattr(self._engine_state, "conversation_generation", 0) or 0
+            )
+            instrumentation["working_set_size"] = len(self._paging.working_set)
+            instrumentation["cache_layer"] = "both_miss"
+            if _cache_load_ms is not None:
+                instrumentation["load_context_hint_cache_ms"] = _cache_load_ms
+
+        _t_fetch = time.monotonic()
         tag_summaries = self._store.get_all_tag_summaries(
             conversation_id=self.config.conversation_id,
         )
+        if instrumentation is not None:
+            instrumentation["get_all_tag_summaries_ms"] = round(
+                (time.monotonic() - _t_fetch) * 1000, 1
+            )
+            instrumentation["tag_summary_count"] = len(tag_summaries)
         if not tag_summaries:
             return ""
 
         if paging_enabled and paging_mode == "autonomous":
+            _t_stats = time.monotonic()
             tag_full_tokens = {
                 ts.tag: ts.total_full_tokens
                 for ts in self._load_tag_stats_snapshot()
             }
+            if instrumentation is not None:
+                instrumentation["load_tag_stats_snapshot_ms"] = round(
+                    (time.monotonic() - _t_stats) * 1000, 1
+                )
+            _t_render = time.monotonic()
             hint = self._build_autonomous_hint(
                 tag_summaries,
                 full_depth_tokens_by_tag=tag_full_tokens,
             )
+            if instrumentation is not None:
+                instrumentation["build_hint_ms"] = round(
+                    (time.monotonic() - _t_render) * 1000, 1
+                )
         elif paging_enabled and paging_mode == "supervised":
+            _t_render = time.monotonic()
             hint = self._build_supervised_hint(tag_summaries)
+            if instrumentation is not None:
+                instrumentation["build_hint_ms"] = round(
+                    (time.monotonic() - _t_render) * 1000, 1
+                )
         else:
+            _t_render = time.monotonic()
             hint = self._build_default_hint(tag_summaries)
+            if instrumentation is not None:
+                instrumentation["build_hint_ms"] = round(
+                    (time.monotonic() - _t_render) * 1000, 1
+                )
 
         if cache_key:
             self._context_hint_cache_key = cache_key
             self._context_hint_cache_value = hint
             if self._session_state_provider is not None and self.config.conversation_id:
+                _t_cache_save = time.monotonic()
                 self._session_state_provider.save_context_hint_cache(
                     self.config.conversation_id,
                     cache_key,
                     hint,
                 )
+                if instrumentation is not None:
+                    instrumentation["save_context_hint_cache_ms"] = round(
+                        (time.monotonic() - _t_cache_save) * 1000, 1
+                    )
 
         return hint
 

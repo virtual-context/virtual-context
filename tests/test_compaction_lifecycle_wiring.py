@@ -154,7 +154,10 @@ def test_compact_after_ingestion_wires_db_backed_lifecycle(
     assert len(compaction_events) >= 3
     # Entry event carries the seed phase.
     assert any(
-        e.status == "queued" and e.phase_name == "starting"
+        # Per fencing plan v1.1 P1-2: begin_compaction_with_lock inserts
+        # the active row at status='running' directly so a crash after
+        # begin is visible to the heartbeat-stale takeover sweeper.
+        e.status == "running" and e.phase_name == "starting"
         for e in compaction_events
     )
     # A pipeline-driven advance for segment_tagging fired.

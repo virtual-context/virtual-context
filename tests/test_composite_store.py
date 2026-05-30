@@ -41,10 +41,37 @@ class TestCompositeStoreDelegation:
         )
 
     def test_store_fact_links_delegates(self):
+        # Legacy callers omit the compaction-fence kwargs; CompositeStore
+        # forwards the four default-None kwargs through to the underlying
+        # FactLinkStore. The all-None call path preserves the legacy
+        # contract per the fencing plan M0.3.
         comp, _, _, fact_links, *_ = self._make_composite()
         links = [FactLink(source_fact_id="a", target_fact_id="b", relation_type="related_to")]
         comp.store_fact_links(links)
-        fact_links.store_fact_links.assert_called_once_with(links)
+        fact_links.store_fact_links.assert_called_once_with(
+            links,
+            operation_id=None,
+            owner_worker_id=None,
+            lifecycle_epoch=None,
+            conversation_id=None,
+        )
+
+    def test_store_fact_links_delegates_forwards_compaction_kwargs(self):
+        # When a guarded compaction caller supplies the fence kwargs,
+        # CompositeStore forwards them verbatim. The fencing plan M0.3
+        # requires all four kwargs to thread through unchanged.
+        comp, _, _, fact_links, *_ = self._make_composite()
+        links = [FactLink(source_fact_id="a", target_fact_id="b", relation_type="related_to")]
+        comp.store_fact_links(
+            links,
+            operation_id="op-1", owner_worker_id="w-1",
+            lifecycle_epoch=2, conversation_id="conv-1",
+        )
+        fact_links.store_fact_links.assert_called_once_with(
+            links,
+            operation_id="op-1", owner_worker_id="w-1",
+            lifecycle_epoch=2, conversation_id="conv-1",
+        )
 
     def test_save_engine_state_delegates(self):
         comp, _, _, _, state, _ = self._make_composite()

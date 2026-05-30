@@ -17,7 +17,11 @@ def test_enter_compaction_publishes_compaction_event(tmp_path):
     assert compaction_events[0].phase_name == "init"
     assert compaction_events[0].phase_count == 3
     assert compaction_events[0].phase_index == 0
-    assert compaction_events[0].status == "queued"
+    # Per fencing plan v1.1 P1-2: begin_compaction_with_lock inserts the
+    # active row at status='running' so a crash after begin but before
+    # the legacy 'queued -> running' transition is visible to the
+    # heartbeat-stale takeover sweeper.
+    assert compaction_events[0].status == "running"
 
 
 def test_advance_compaction_phase_publishes_event(tmp_path):

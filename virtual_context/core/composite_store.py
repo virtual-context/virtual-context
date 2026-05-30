@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
 from ..types import (
+    BacklogCandidate,
     ChunkEmbedding,
     ConversationStats,
     EngineStateSnapshot,
@@ -15,6 +16,7 @@ from ..types import (
     CanonicalTurnChunkEmbedding,
     CanonicalTurnRow,
     LinkedFact,
+    Message,
     QuoteResult,
     StoredSegment,
     StoredSummary,
@@ -43,7 +45,34 @@ class CompositeStore:
         fact_links: FactLinkStore,
         state: StateStore,
         search: SearchStore,
+        compaction_fence_mode: "CompactionFenceMode | None" = None,
     ) -> None:
+        from .compaction_fence import CompactionFenceMode as _CFM
+        # Resolve the runtime mode per fencing plan §9.0. If any
+        # delegate exposes its own ``_compaction_fence_mode`` we
+        # require it to match the composite's holder so cleanup and
+        # write paths cannot run on different mode sources.
+        self._compaction_fence_mode = _CFM.resolve(compaction_fence_mode)
+        for label, delegate in (
+            ("segments", segments), ("facts", facts),
+            ("fact_links", fact_links), ("state", state),
+            ("search", search),
+        ):
+            delegate_mode = getattr(delegate, "_compaction_fence_mode", None)
+            # The mismatch guard fires ONLY when the delegate exposes
+            # a real ``CompactionFenceMode`` value. ``getattr`` against
+            # a ``MagicMock`` returns an auto-generated child mock that
+            # is not a CompactionFenceMode; treat it as "delegate does
+            # not have a holder" so the test-double pattern of building
+            # a CompositeStore from MagicMocks keeps working.
+            if (isinstance(delegate_mode, _CFM)
+                    and delegate_mode != self._compaction_fence_mode):
+                raise ValueError(
+                    "CompositeStore compaction_fence_mode mismatch: "
+                    f"holder={self._compaction_fence_mode.value!r} but "
+                    f"{label} delegate={delegate_mode.value!r}. All "
+                    "delegates must share a single mode source."
+                )
         self._segments = segments
         self._facts = facts
         self._fact_links = fact_links
@@ -310,6 +339,39 @@ class CompositeStore:
             protected_recent_turns=protected_recent_turns,
         )
 
+    def reconstruct_history_for_conv(
+        self, conversation_id: str,
+    ) -> list[Message]:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §5.2.
+        Prefers a backend-native implementation when the delegate
+        exposes one; otherwise falls back to the default base
+        reconstruction via ``get_all_canonical_turns``.
+        """
+        fn = getattr(self._segments, "reconstruct_history_for_conv", None)
+        if callable(fn):
+            return list(fn(conversation_id))
+        # Fallback: reuse the ContextStore base body shape so cloud
+        # gets a consistent result no matter which delegate is wired
+        # under the composite.
+        history: list[Message] = []
+        for row in self.get_all_canonical_turns(conversation_id):
+            user_text = row.user_content or ""
+            asst_text = row.assistant_content or ""
+            if not asst_text.strip():
+                continue
+            history.append(Message(role="user", content=user_text))
+            history.append(Message(role="assistant", content=asst_text))
+        return history
+
+    def get_compaction_fence_mode(self):
+        """Forwarder for the runtime fence holder. Cloud's sweeper
+        tick reads this accessor rather than ``os.environ`` so a
+        dynamic env flip cannot bypass the active-tier precondition
+        (per spec v1.4 §4.2). Returns the composite's own holder
+        when the delegates lack the attribute.
+        """
+        return getattr(self, "_compaction_fence_mode", None)
+
     def get_recent_canonical_turns(
         self,
         conversation_id: str,
@@ -504,13 +566,40 @@ class CompositeStore:
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        return self._facts.set_fact_superseded(old_fact_id, new_fact_id)
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        return self._facts.set_fact_superseded(
+            old_fact_id, new_fact_id,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def update_fact_fields(
-        self, fact_id: str, verb: str, object: str, status: str, what: str,
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
-        return self._facts.update_fact_fields(fact_id, verb, object, status, what)
+        return self._facts.update_fact_fields(
+            fact_id, verb, object, status, what,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return self._facts.get_fact_count_by_tags(conversation_id=conversation_id)
@@ -536,8 +625,22 @@ class CompositeStore:
     # FactLinkStore
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
-        return self._fact_links.store_fact_links(links)
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
+        return self._fact_links.store_fact_links(
+            links,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
 
     def get_fact_links(self, fact_id: str, direction: str = "both") -> list[FactLink]:
         return self._fact_links.get_fact_links(fact_id, direction=direction)
@@ -616,12 +719,28 @@ class CompositeStore:
         return self._search.search_canonical_turn_text(*args, **kwargs)
 
     def store_chunk_embeddings(
-        self, segment_ref: str, chunks: list[ChunkEmbedding],
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
     ) -> None:
-        return self._search.store_chunk_embeddings(segment_ref, chunks)
+        return self._search.store_chunk_embeddings(
+            segment_ref, chunks,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return self._search.get_all_chunk_embeddings()
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        return self._search.has_chunks_for_segment(segment_ref)
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -827,6 +946,7 @@ class CompositeStore:
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
         fn = getattr(self._segments, "drain_compaction_exit", None)
         if callable(fn):
@@ -834,8 +954,35 @@ class CompositeStore:
                 conversation_id=conversation_id,
                 lifecycle_epoch=lifecycle_epoch,
                 worker_id=worker_id,
+                expected_operation_id=expected_operation_id,
             )
         raise NotImplementedError
+
+    def begin_compaction_with_lock(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        new_operation_id: str,
+        phase_count: int,
+        phase_name: str = "starting",
+        required_phase: str | None = None,
+        pre_begin_check=None,
+    ) -> bool:
+        fn = getattr(self._segments, "begin_compaction_with_lock", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                new_operation_id=new_operation_id,
+                phase_count=phase_count,
+                phase_name=phase_name,
+                required_phase=required_phase,
+                pre_begin_check=pre_begin_check,
+            ))
+        return False
 
     def start_compaction_operation(
         self,
@@ -1055,6 +1202,52 @@ class CompositeStore:
             return list(fn(grace_s=grace_s))
         return []
 
+    def find_compaction_backlog_conversations(
+        self, *, min_backlog_turns: int, grace_s: float, limit: int,
+    ) -> list["BacklogCandidate"]:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §3.1.
+        Returns empty list (NOT None) when the underlying store lacks
+        the method, matching the existing sweeper forwarder shape so
+        cloud's tick loop can iterate the result without a None check.
+        """
+        fn = getattr(
+            self._segments, "find_compaction_backlog_conversations", None,
+        )
+        if callable(fn):
+            return list(fn(
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+                limit=limit,
+            ))
+        return []
+
+    def claim_compaction_backlog(
+        self,
+        *,
+        candidate: "BacklogCandidate",
+        new_operation_id: str,
+        owner_worker_id: str,
+        phase_count: int,
+        min_backlog_turns: int,
+        grace_s: float,
+    ) -> bool:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §3.2.
+        Returns False when the underlying store lacks the method so
+        cloud's tick loop can treat the claim as lost without
+        special-casing the legacy store path.
+        """
+        fn = getattr(self._segments, "claim_compaction_backlog", None)
+        if callable(fn):
+            return bool(fn(
+                candidate=candidate,
+                new_operation_id=new_operation_id,
+                owner_worker_id=owner_worker_id,
+                phase_count=phase_count,
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+            ))
+        return False
+
     def find_idle_deletable_conversations(
         self, *, max_msgs: int, min_age_s: float, limit: int = 1000,
     ) -> list[dict]:
@@ -1264,8 +1457,22 @@ class CompositeStore:
     def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
         return self._search.get_tool_outputs_for_turn(conversation_id, turn_number)
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
-        return self._search.link_segment_tool_output(conversation_id, segment_ref, tool_output_ref)
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        return self._search.link_segment_tool_output(
+            conversation_id, segment_ref, tool_output_ref,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         return self._search.get_tool_outputs_for_segment(conversation_id, segment_ref)

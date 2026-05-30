@@ -115,6 +115,11 @@ def promote_planned_facts(
     reference_date: str = "",
     llm_provider: LLMProvider | None = None,
     model: str = "",
+    *,
+    operation_id: str | None = None,
+    owner_worker_id: str | None = None,
+    lifecycle_epoch: int | None = None,
+    conversation_id: str | None = None,
 ) -> int:
     """Promote 'planned' facts whose when_date has passed to 'completed'.
 
@@ -123,6 +128,17 @@ def promote_planned_facts(
     'completed' and verb/what are rewritten via LLM to reflect past tense.
 
     Falls back to a simple status flip if no LLM provider is available.
+
+    When called from a compaction phase, the caller forwards the guard
+    kwargs so ``update_fact_fields`` writes through the active
+    operation-id fence (fencing plan §5.6 caller-side propagation).
+    The caller also forwards ``conversation_id`` so the planned-facts
+    query is scoped to the active op's conversation. Without that
+    scope a due planned fact from another conversation would trigger
+    ``CompactionLeaseLost`` on its guarded rewrite and abort an
+    unrelated compaction. Legacy non-compaction callers (CLI, tests,
+    ingest pipelines) omit the kwargs and continue through the
+    documented all-None branch with a global planned-facts scan.
 
     Returns the number of facts promoted.
     """
@@ -134,7 +150,16 @@ def promote_planned_facts(
     if ref is None:
         ref = date.today()
 
-    planned = store.query_facts(status="planned", limit=10000)
+    # When the caller supplies operation context, also constrain the
+    # planned-facts scan to the active op's conversation so we never
+    # touch facts in other conversations under a fenced write.
+    _query_kwargs: dict[str, object] = {
+        "status": "planned",
+        "limit": 10000,
+    }
+    if conversation_id is not None:
+        _query_kwargs["conversation_id"] = conversation_id
+    planned = store.query_facts(**_query_kwargs)
     promoted = 0
     for fact in planned:
         fact_date = _parse_date_for_comparison(fact.when_date or "")
@@ -171,7 +196,12 @@ def promote_planned_facts(
                 except Exception as e:
                     logger.warning("Planned fact rewrite failed, using status-only: %s", e)
 
-            store.update_fact_fields(fact.id, verb=verb, object=obj, status="completed", what=what)
+            store.update_fact_fields(
+                fact.id, verb=verb, object=obj, status="completed", what=what,
+                operation_id=operation_id,
+                owner_worker_id=owner_worker_id,
+                lifecycle_epoch=lifecycle_epoch,
+            )
             promoted += 1
             logger.info(
                 "Promoted planned→completed: %s %s → %s %s [when: %s]",
@@ -236,13 +266,37 @@ class FactSupersessionChecker:
         self._embed_fn = embed_fn
         self._all_facts_cache: list[Fact] | None = None
 
-    def check_and_supersede(self, new_facts: list[Fact]) -> int:
+    def check_and_supersede(
+        self,
+        new_facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> int:
         """For each new fact, find candidates by subject, ask LLM, mark superseded.
+
+        When called from a compaction phase, the caller forwards the
+        guard kwargs so ``set_fact_superseded`` writes through the
+        active operation-id fence (fencing plan §5.6 caller-side
+        propagation). Candidate queries are then scoped to each
+        fact's ``conversation_id`` (which the compaction pipeline
+        sets to the active op's conversation) so a candidate from a
+        different conversation never reaches the fenced supersession
+        write, avoiding a spurious ``CompactionLeaseLost`` from the
+        both-endpoint validation. Legacy callers omit the kwargs and
+        continue with the global candidate scan.
 
         Returns count of superseded facts.
         """
         if not self.config.enabled or not new_facts:
             return 0
+
+        # When the caller is fenced (operation_id supplied), constrain
+        # candidate queries to each fact's conversation_id. The pipeline
+        # writes the active op's conversation_id onto every fact before
+        # calling this method, so per-fact scoping is the right granularity.
+        _is_fenced = operation_id is not None
 
         import sys as _sys
         import time as _time
@@ -264,22 +318,28 @@ class FactSupersessionChecker:
             # When tags are available, filter by them to avoid sending
             # unrelated facts to the LLM (reduces false supersessions).
             # Tag-based candidates (existing behaviour)
-            candidates = self.store.query_facts(
-                subject=fact.subject,
-                tags=fact.tags if fact.tags else None,
-                limit=self.config.batch_size,
-            )
-            # Object-similarity candidates — catches cross-session duplicates
+            _query_kwargs: dict[str, object] = {
+                "subject": fact.subject,
+                "tags": fact.tags if fact.tags else None,
+                "limit": self.config.batch_size,
+            }
+            if _is_fenced and fact.conversation_id:
+                _query_kwargs["conversation_id"] = fact.conversation_id
+            candidates = self.store.query_facts(**_query_kwargs)
+            # Object-similarity candidates -- catches cross-session duplicates
             # whose tags don't overlap with the new fact's tags.
             # Use case-sensitive keyword to avoid false matches
             # (e.g. "Apple" the brand vs "apple" the fruit).
             keyword = _extract_object_keyword(fact.object)
             if keyword and fact.tags:  # only when tag-scoped: unfiltered query already covers all subjects
-                obj_candidates = self.store.query_facts(
-                    subject=fact.subject,
-                    object_contains=keyword,
-                    limit=self.config.batch_size,
-                )
+                _obj_query_kwargs: dict[str, object] = {
+                    "subject": fact.subject,
+                    "object_contains": keyword,
+                    "limit": self.config.batch_size,
+                }
+                if _is_fenced and fact.conversation_id:
+                    _obj_query_kwargs["conversation_id"] = fact.conversation_id
+                obj_candidates = self.store.query_facts(**_obj_query_kwargs)
                 # Filter to case-sensitive whole-word matches to avoid
                 # false positives from substring/case-insensitive SQL LIKE
                 kw_pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
@@ -291,7 +351,12 @@ class FactSupersessionChecker:
             # Embedding-based candidates — finds semantically similar facts
             # regardless of tag overlap or ingestion order.
             seen_ids = {c.id for c in candidates}
-            embed_candidates = self._embedding_candidates(fact, seen_ids)
+            embed_candidates = self._embedding_candidates(
+                fact, seen_ids,
+                restrict_conversation_id=(
+                    fact.conversation_id if _is_fenced and fact.conversation_id else None
+                ),
+            )
             candidates.extend(embed_candidates)
             candidates = [c for c in candidates if c.id != fact.id and c.id not in superseded_this_run]
             if not candidates:
@@ -327,7 +392,12 @@ class FactSupersessionChecker:
                             continue
                     safe_ids.append(old_id)
                 for old_id in safe_ids:
-                    self.store.set_fact_superseded(old_id, fact.id)
+                    self.store.set_fact_superseded(
+                        old_id, fact.id,
+                        operation_id=operation_id,
+                        owner_worker_id=owner_worker_id,
+                        lifecycle_epoch=lifecycle_epoch,
+                    )
                     superseded_this_run.add(old_id)
                     superseded_count += 1
                 logger.info("  Supersession %d/%d: %d superseded (total %d) — %s",
@@ -357,9 +427,18 @@ class FactSupersessionChecker:
         return self._all_facts_cache
 
     def _embedding_candidates(
-        self, fact: Fact, already_seen: set[str], top_k: int = 10, threshold: float = 0.5
+        self, fact: Fact, already_seen: set[str], top_k: int = 10, threshold: float = 0.5,
+        *,
+        restrict_conversation_id: str | None = None,
     ) -> list[Fact]:
-        """Find semantically similar facts via embedding on the 'what' field."""
+        """Find semantically similar facts via embedding on the 'what' field.
+
+        When ``restrict_conversation_id`` is supplied, the candidate
+        pool is filtered to facts in that conversation. The compaction
+        pipeline passes the active op's conversation_id to avoid
+        cross-conversation candidates triggering a guarded supersession
+        write rejection.
+        """
         if self._embed_fn is None:
             return []
         query_text = fact.what or f"{fact.subject} {fact.verb} {fact.object}"
@@ -373,6 +452,10 @@ class FactSupersessionChecker:
             if f.id not in already_seen
             and f.id != fact.id
             and f.subject and f.subject.lower() == (fact.subject or "").lower()
+            and (
+                restrict_conversation_id is None
+                or f.conversation_id == restrict_conversation_id
+            )
         ]
         if not pool:
             return []
@@ -607,55 +690,107 @@ class FactLinkChecker:
         self.graph_links = graph_links
         self._telemetry = telemetry_ledger
 
-    def check_and_link(self, new_facts: list[Fact]) -> tuple[int, int]:
+    def check_and_link(
+        self,
+        new_facts: list[Fact],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[int, int]:
         """Detect supersession and (optionally) inter-fact links.
 
-        Runs a deterministic planned→completed promotion pass first,
+        Runs a deterministic planned->completed promotion pass first,
         then LLM-based supersession/linking.
+
+        When called from a compaction phase, the caller forwards the
+        guard kwargs so ``promote_planned_facts``,
+        ``check_and_supersede``, ``set_fact_superseded``, and
+        ``store_fact_links`` all write through the active
+        operation-id fence (fencing plan §5.6 caller-side propagation).
+        ``conversation_id`` is required alongside the guard triple for
+        ``store_fact_links`` so the active op's conversation can be
+        matched against both endpoint facts.
 
         Returns ``(links_created, facts_superseded)``.
         """
         if not self.config.enabled or not new_facts:
             return 0, 0
+        from ..types import CompactionLeaseLost
 
-        # Pre-pass: promote planned facts whose date has passed (LLM rewrite)
-        promote_planned_facts(self.store, llm_provider=self.llm, model=self.model)
+        # Pre-pass: promote planned facts whose date has passed (LLM rewrite).
+        # conversation_id scopes the planned-facts scan so a due fact
+        # from another conversation cannot trigger a guarded rewrite
+        # rejection during this conversation's compaction.
+        promote_planned_facts(
+            self.store, llm_provider=self.llm, model=self.model,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
 
         if not self.graph_links:
-            superseded = self._supersession.check_and_supersede(new_facts)
+            superseded = self._supersession.check_and_supersede(
+                new_facts,
+                operation_id=operation_id,
+                owner_worker_id=owner_worker_id,
+                lifecycle_epoch=lifecycle_epoch,
+            )
             return 0, superseded
 
         # Graph mode: expanded prompt for all relationship types
         total_links = 0
         total_superseded = 0
 
+        _is_fenced = operation_id is not None
         for fact in new_facts:
             if not fact.subject:
                 continue
 
-            candidates = self.store.query_facts(
-                subject=fact.subject,
-                tags=fact.tags if fact.tags else None,
-                limit=self.config.batch_size,
-            )
+            # When fenced, scope candidates to the active op's
+            # conversation so a candidate from another conversation
+            # cannot trigger a guarded supersession/link write rejection.
+            _query_kwargs: dict[str, object] = {
+                "subject": fact.subject,
+                "tags": fact.tags if fact.tags else None,
+                "limit": self.config.batch_size,
+            }
+            if _is_fenced and conversation_id is not None:
+                _query_kwargs["conversation_id"] = conversation_id
+            candidates = self.store.query_facts(**_query_kwargs)
             candidates = [c for c in candidates if c.id != fact.id]
             if not candidates:
                 continue
 
             try:
                 links, superseded_ids = self._check_links(fact, candidates)
+            except CompactionLeaseLost:
+                raise
             except Exception as e:
                 logger.warning("FactLinkChecker LLM call failed: %s", e)
                 continue
 
             # Handle supersession
             for old_id in superseded_ids:
-                self.store.set_fact_superseded(old_id, fact.id)
+                self.store.set_fact_superseded(
+                    old_id, fact.id,
+                    operation_id=operation_id,
+                    owner_worker_id=owner_worker_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                )
                 total_superseded += 1
 
             # Store links
             if links:
-                self.store.store_fact_links(links)
+                self.store.store_fact_links(
+                    links,
+                    operation_id=operation_id,
+                    owner_worker_id=owner_worker_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    conversation_id=conversation_id,
+                )
                 total_links += len(links)
 
         return total_links, total_superseded

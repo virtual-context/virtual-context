@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
+    operation_id TEXT NULL,
     PRIMARY KEY (segment_ref, chunk_index)
 );
 
@@ -281,6 +282,114 @@ END;
 def _escape_like(text: str) -> str:
     """Escape ``%`` and ``_`` wildcards for use in LIKE clauses with ``ESCAPE '\\'``."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# SQLite analog of the Postgres ``_BACKLOG_DETECTION_SQL`` per
+# compaction-backlog sweeper spec v1.4 §3.1. SQLite has no
+# ``make_interval`` so the grace cutoff uses ``julianday('now', '-' ||
+# ? || ' seconds')`` and the terminal timestamp is compared through
+# ``julianday(...)``. Parameter style is positional ``?`` (matching the
+# existing ``conn.execute(sql, tuple)`` calls in this file) rather than
+# psycopg's named ``%(name)s``.
+_BACKLOG_DETECTION_SQL_SQLITE = """
+WITH backlog AS (
+  SELECT ct.conversation_id, COUNT(*) AS backlog_turns
+    FROM canonical_turns ct
+   WHERE ct.tagged_at IS NOT NULL
+     AND ct.compacted_at IS NULL
+   GROUP BY ct.conversation_id
+  HAVING COUNT(*) >= ?
+),
+last_terminal AS (
+  -- ``MAX(...)`` on a TEXT timestamp compares lexicographically and
+  -- so can pick the wrong row when a conversation has terminal ops
+  -- stored in mixed formats (some ISO ``T``-separated with ``+00:00``
+  -- suffix, some SQLite's space-separated UTC). ``datetime(...)``
+  -- normalizes both forms to the SQLite canonical
+  -- ``YYYY-MM-DD HH:MM:SS`` shape so the text MAX is comparable +
+  -- correct. The grace-window WHERE clause below then operates on
+  -- the right row even under mixed-format histories. Per codex
+  -- sweeper Phase 0 P2 finding.
+  SELECT co.conversation_id, co.lifecycle_epoch,
+         MAX(datetime(COALESCE(co.completed_at, co.started_at)))
+           AS last_terminal_at
+    FROM compaction_operation co
+   WHERE co.status IN ('completed', 'failed', 'abandoned', 'cancelled')
+   GROUP BY co.conversation_id, co.lifecycle_epoch
+)
+SELECT c.conversation_id, c.tenant_id, c.lifecycle_epoch,
+       b.backlog_turns,
+       lt.last_terminal_at AS last_terminal_compaction_at
+  FROM backlog b
+  JOIN conversations c
+    ON c.conversation_id = b.conversation_id
+  LEFT JOIN last_terminal lt
+    ON lt.conversation_id = b.conversation_id
+   AND lt.lifecycle_epoch = c.lifecycle_epoch
+ WHERE c.phase = 'active'
+   AND c.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1
+       FROM canonical_turns ct_untagged
+      WHERE ct_untagged.conversation_id = c.conversation_id
+        AND ct_untagged.tagged_at IS NULL
+   )
+   AND NOT EXISTS (
+     SELECT 1
+       FROM compaction_operation co_live
+      WHERE co_live.conversation_id = c.conversation_id
+        AND co_live.lifecycle_epoch = c.lifecycle_epoch
+        AND co_live.status IN ('queued', 'running')
+   )
+   AND (
+     lt.last_terminal_at IS NULL
+     OR julianday(lt.last_terminal_at)
+        < julianday('now', '-' || ? || ' seconds')
+   )
+ ORDER BY b.backlog_turns DESC
+ LIMIT ?
+"""
+
+
+def _validate_compaction_guard_kwargs(
+    operation_id: str | None,
+    owner_worker_id: str | None,
+    lifecycle_epoch: int | None,
+    conversation_id: str | None = ...,  # type: ignore[assignment]
+) -> None:
+    """Reject mixed-partial compaction guard kwargs as programming errors.
+
+    Per fencing plan §5.7 T3.19, the guard contract for fenced writes is
+    binary: either all operation guard kwargs are ``None`` (legacy
+    unguarded path) or all are non-``None`` (fenced path with active
+    op). Mixed partial kwargs are a programming error and silently
+    bypassing the fence would hide a caller bug.
+
+    The triple ``(operation_id, owner_worker_id, lifecycle_epoch)`` is
+    always required as a group. ``conversation_id`` is required only when
+    that full triple is supplied for methods whose fence contract needs
+    conversation scope (``store_chunk_embeddings``, ``store_fact_links``);
+    for other methods the caller passes ``...`` as the sentinel to skip
+    its check.
+    """
+    triple = (operation_id, owner_worker_id, lifecycle_epoch)
+    none_count = sum(1 for v in triple if v is None)
+    if none_count not in (0, len(triple)):
+        raise ValueError(
+            "compaction guard kwargs must be all-None or all-non-None; "
+            f"got operation_id={operation_id!r}, "
+            f"owner_worker_id={owner_worker_id!r}, "
+            f"lifecycle_epoch={lifecycle_epoch!r}"
+        )
+    if conversation_id is not ... and none_count == 0 and conversation_id is None:
+        raise ValueError(
+            "compaction guard kwargs for this method require conversation_id "
+            "when operation_id, owner_worker_id, and lifecycle_epoch are supplied; "
+            f"got operation_id={operation_id!r}, "
+            f"owner_worker_id={owner_worker_id!r}, "
+            f"lifecycle_epoch={lifecycle_epoch!r}, "
+            f"conversation_id={conversation_id!r}"
+        )
 
 
 def _sanitize_fts_query(query: str) -> str:
@@ -635,7 +744,18 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
 class SQLiteStore(ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        compaction_fence_mode: "CompactionFenceMode | None" = None,
+    ) -> None:
+        from ..core.compaction_fence import CompactionFenceMode as _CFM
+        # Resolve the runtime mode BEFORE the schema/conn setup so a
+        # bad ``VC_COMPACTION_FENCE_MODE`` value fails startup loudly,
+        # not after the store has already started serving writes in a
+        # weaker mode. Per fencing plan §9.0.
+        self._compaction_fence_mode = _CFM.resolve(compaction_fence_mode)
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
@@ -649,6 +769,30 @@ class SQLiteStore(ContextStore):
         self._post_commit_scope = threading.local()
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
+
+    def _enforce_or_observe_mismatch(
+        self, *, operation_id: str | None, write_site: str,
+    ) -> None:
+        """Mode-aware fence rejection. See PostgresStore equivalent
+        for the full contract (fencing plan §9.1-9.3). At ACTIVE
+        raises ``CompactionLeaseLost``; at OBSERVE logs
+        ``COMPACTION_FENCE_OBSERVED_MISMATCH`` without raising; at
+        OFF silently no-ops so the env-var-driven rollback is a
+        single-line configuration change.
+        """
+        mode = self._compaction_fence_mode
+        if mode.enforces:
+            from ..types import CompactionLeaseLost
+            raise CompactionLeaseLost(
+                operation_id=operation_id or "", write_site=write_site,
+            )
+        if mode.is_observe:
+            logger.warning(
+                "COMPACTION_FENCE_OBSERVED_MISMATCH operation_id=%s "
+                "write_site=%s mode=%s",
+                operation_id, write_site, mode.value,
+            )
+        # OFF: silent.
 
     def _get_conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
@@ -1201,6 +1345,7 @@ class SQLiteStore(ContextStore):
                 context TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '',
                 created_by TEXT NOT NULL DEFAULT 'compaction',
+                operation_id TEXT NULL,
                 FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
             );
@@ -1208,6 +1353,10 @@ class SQLiteStore(ContextStore):
             CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
         """)
+        # M0 operation_id indexes are declared inside
+        # _ensure_compaction_scoping_columns, after the ALTER TABLE that adds
+        # operation_id to upgraded databases. Declaring them here would fail
+        # on existing stores whose tables predate the column.
         # D1: migrate — add fact_type column to existing facts tables
         try:
             conn.execute("SELECT fact_type FROM facts LIMIT 1")
@@ -1318,6 +1467,10 @@ class SQLiteStore(ContextStore):
             conn.execute(
                 "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tag_summaries_conv_updated "
+            "ON tag_summaries(conversation_id, updated_at DESC)"
+        )
         # Request capture persistence for proxy dashboard
         conn.executescript("""
 CREATE TABLE IF NOT EXISTS request_captures (
@@ -1433,6 +1586,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 conversation_id TEXT NOT NULL,
                 segment_ref TEXT NOT NULL,
                 tool_output_ref TEXT NOT NULL,
+                operation_id TEXT NULL,
                 PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
             );
         """)
@@ -1710,6 +1864,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ("tag_summaries", "operation_id", "TEXT"),
             ("tag_summary_embeddings", "operation_id", "TEXT"),
             ("canonical_turns", "compaction_operation_id", "TEXT"),
+            # Compaction-fence M0 tables. Operation-id linkage lets
+            # cleanup_abandoned_compaction scope-delete pure-insert
+            # writes on these tables; without it the rows would persist
+            # after the owning operation is abandoned.
+            ("segment_chunks", "operation_id", "TEXT"),
+            ("segment_tool_outputs", "operation_id", "TEXT"),
+            ("fact_links", "operation_id", "TEXT"),
         ):
             self._add_column_if_missing(conn, table, column, definition)
             # Backfill pre-migration rows to the zero-UUID sentinel.
@@ -1719,6 +1880,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL",
                 (zero_uuid,),
             )
+        # M0.2 fence indexes for cleanup DELETE efficiency. CREATE INDEX
+        # IF NOT EXISTS is idempotent.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_segment_chunks_operation_id "
+            "ON segment_chunks(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_segment_tool_outputs_operation_id "
+            "ON segment_tool_outputs(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_links_operation_id "
+            "ON fact_links(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_facts_operation_id "
+            "ON facts(operation_id)",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
         conn = self._get_conn()
@@ -1885,10 +2062,60 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 context_updates.append((seq, int(row["id"])))
 
         if context_updates:
-            conn.executemany(
-                "UPDATE request_context SET request_turn = ? WHERE id = ?",
-                context_updates,
-            )
+            # Two-pass UPDATE to avoid intermediate-state collisions
+            # against ``idx_request_context_conv_turn_unique``. SQLite
+            # (and Postgres) evaluate the unique constraint at
+            # statement end, so a sequential UPDATE that assigns row A
+            # to a ``request_turn`` value some other row B currently
+            # holds raises IntegrityError even when the final
+            # post-normalization state would have no duplicates. The
+            # collision happens whenever the kept rows for a
+            # conversation are NOT monotonic in (id, request_turn);
+            # a typical trigger is a post-VCMERGE state where source
+            # rows arrive at offset request_turn values and a later
+            # trim leaves a non-monotonic kept set.
+            #
+            # Pass 1 stages every row needing update to a unique
+            # negative sentinel (-id is guaranteed unique within and
+            # across conversations because id is the INTEGER PRIMARY KEY).
+            # Pass 2 sets each row to its final positive target sequence.
+            # Already-normalized rows (not in ``context_updates``)
+            # keep their positive values, which by definition equal
+            # their target seq so they cannot collide with any other
+            # row's target seq.
+            #
+            # Both passes execute inside a single BEGIN IMMEDIATE /
+            # COMMIT block so a crash between pass 1 and pass 2 rolls
+            # back the negative sentinels rather than leaving them
+            # committed in the table. The SQLite connection runs at
+            # ``isolation_level=None`` (autocommit) so without this
+            # explicit transaction each executemany would auto-commit
+            # individually. When a caller has already opened a
+            # transaction on this connection (``conn.in_transaction``
+            # is True) the two passes ride that outer transaction and
+            # we skip the local BEGIN/COMMIT to avoid nesting.
+            pass_one = [(-row_id, row_id) for _seq, row_id in context_updates]
+            own_txn = not conn.in_transaction
+            if own_txn:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany(
+                    "UPDATE request_context SET request_turn = ? WHERE id = ?",
+                    pass_one,
+                )
+                conn.executemany(
+                    "UPDATE request_context SET request_turn = ? WHERE id = ?",
+                    context_updates,
+                )
+                if own_txn:
+                    conn.commit()
+            except Exception:
+                if own_txn:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise
 
         tool_rows = conn.execute(
             "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
@@ -2010,11 +2237,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # ROLLBACK fires at every tier so the open
+                    # BEGIN IMMEDIATE transaction is closed even when
+                    # the helper does not raise (OBSERVE / OFF).
+                    # Without this the connection would carry an
+                    # open txn into the next caller.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="store_segment",
                     )
+                    return segment.ref
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
@@ -3133,6 +3366,96 @@ CREATE TABLE IF NOT EXISTS request_captures (
             })
         return out
 
+    def claim_compaction_backlog(
+        self,
+        *,
+        candidate: "BacklogCandidate",
+        new_operation_id: str,
+        owner_worker_id: str,
+        phase_count: int,
+        min_backlog_turns: int,
+        grace_s: float,
+    ) -> bool:
+        """SQLite mirror of the Postgres adapter. See the PG docstring
+        for the full contract. Both adapters share the predicate
+        verifier exposed by ``virtual_context.core.sweeper_backlog``
+        so the predicate set lives in one backend-agnostic helper
+        and the SQLite path does not pull in psycopg.
+        """
+        from ..core.sweeper_backlog import (
+            verify_backlog_candidate_under_lock as _verify,
+        )
+
+        def pre_begin_check(conn) -> bool:
+            return _verify(
+                conn=conn,
+                candidate=candidate,
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+                placeholder="?",
+            )
+
+        return self.begin_compaction_with_lock(
+            conversation_id=candidate.conversation_id,
+            lifecycle_epoch=candidate.lifecycle_epoch,
+            worker_id=owner_worker_id,
+            new_operation_id=new_operation_id,
+            phase_count=phase_count,
+            phase_name="starting",
+            required_phase="active",
+            pre_begin_check=pre_begin_check,
+        )
+
+    def find_compaction_backlog_conversations(
+        self,
+        *,
+        min_backlog_turns: int,
+        grace_s: float,
+        limit: int,
+    ) -> list["BacklogCandidate"]:
+        """SQLite mirror of the Postgres detection query per
+        compaction-backlog sweeper spec v1.4 §3.1. Substitutions from
+        the PG path:
+
+        * ``make_interval(secs => %(grace_s)s)`` becomes a
+          ``julianday('now', '-' || ? || ' seconds')`` cutoff compared
+          against ``julianday(last_terminal_at)``.
+        * Named ``%(name)s`` parameters become positional ``?``.
+        * ``MAX(COALESCE(co.completed_at, co.started_at))`` keeps the
+          same shape; SQLite supports both functions.
+        * ``NOT EXISTS`` subqueries are identical.
+
+        Production runs Postgres; SQLite parity catches regressions
+        in tests. Returns the same ``BacklogCandidate`` shape so
+        upstream consumers stay backend-agnostic.
+        """
+        from datetime import datetime
+        from ..types import BacklogCandidate
+        conn = self._get_conn()
+        rows = conn.execute(
+            _BACKLOG_DETECTION_SQL_SQLITE,
+            (int(min_backlog_turns), float(grace_s), int(limit)),
+        ).fetchall()
+        out: list[BacklogCandidate] = []
+        for r in rows:
+            ts_raw = r["last_terminal_compaction_at"]
+            ts: datetime | None
+            if ts_raw is None or ts_raw == "":
+                ts = None
+            else:
+                try:
+                    ts = datetime.fromisoformat(str(ts_raw))
+                except ValueError:
+                    ts = None
+            out.append(BacklogCandidate(
+                conversation_id=str(r["conversation_id"]),
+                tenant_id=str(r["tenant_id"] or ""),
+                lifecycle_epoch=int(r["lifecycle_epoch"]),
+                backlog_turns=int(r["backlog_turns"]),
+                last_terminal_compaction_at=ts,
+            ))
+        return out
+
     def find_idle_deletable_conversations(
         self,
         *,
@@ -4034,6 +4357,125 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # conversation was resurrected to a newer epoch is rejected at SQL
     # level.
 
+    def begin_compaction_with_lock(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        new_operation_id: str,
+        phase_count: int,
+        phase_name: str = "starting",
+        required_phase: str | None = None,
+        pre_begin_check=None,
+    ) -> bool:
+        """SQLite analog of the Postgres lifecycle-locked begin primitive.
+
+        SQLite has no ``FOR UPDATE SKIP LOCKED``; the
+        ``BEGIN IMMEDIATE`` transaction acquires the database-level
+        write lock and serializes concurrent begin attempts. The
+        contract is identical to the Postgres version: returns True iff
+        this call inserted the active compaction_operation row.
+
+        Other writers (the existing tests + the runtime proxy state)
+        also use IMMEDIATE-flavor transactions so the serialization is
+        coherent.
+        """
+        class _ClaimLost(Exception):
+            pass
+
+        now = utcnow_iso()
+        conn = self._get_conn()
+        inserted = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise _ClaimLost()
+
+            c_row = conn.execute(
+                "SELECT phase, deleted_at, lifecycle_epoch "
+                "  FROM conversations "
+                " WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if c_row is None:
+                raise _ClaimLost()
+            phase, deleted_at, c_epoch = c_row[0], c_row[1], c_row[2]
+            if deleted_at is not None and deleted_at != "":
+                raise _ClaimLost()
+            if int(c_epoch) != lifecycle_epoch:
+                raise _ClaimLost()
+            current_phase = str(phase)
+            if required_phase is not None:
+                if current_phase != required_phase:
+                    raise _ClaimLost()
+            elif current_phase not in ("active", "ingesting"):
+                raise _ClaimLost()
+
+            if pre_begin_check is not None:
+                try:
+                    ok = pre_begin_check(conn)
+                except Exception:
+                    raise _ClaimLost()
+                if not ok:
+                    raise _ClaimLost()
+
+            cur = conn.execute(
+                "UPDATE conversations "
+                "   SET phase = 'compacting', updated_at = ? "
+                " WHERE conversation_id = ? "
+                "   AND lifecycle_epoch = ? "
+                "   AND phase = ?",
+                (now, conversation_id, lifecycle_epoch, current_phase),
+            )
+            if cur.rowcount == 0:
+                raise _ClaimLost()
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO compaction_operation (
+                        operation_id, conversation_id, lifecycle_epoch,
+                        phase_index, phase_count, phase_name, status,
+                        started_at, owner_worker_id, heartbeat_ts
+                    ) VALUES (?, ?, ?, 0, ?, ?, 'running',
+                              ?, ?, ?)
+                    """,
+                    (
+                        new_operation_id, conversation_id, lifecycle_epoch,
+                        phase_count, phase_name, now, worker_id, now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # idx_compaction_operation_active partial unique index
+                # already covers (conversation_id, lifecycle_epoch) for
+                # status IN ('queued','running'). A concurrent winner
+                # races us; the transaction rolls back below.
+                raise _ClaimLost()
+            inserted = True
+        except _ClaimLost:
+            inserted = False
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+        if inserted:
+            conn.commit()
+        else:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return inserted
+
     def start_compaction_operation(
         self,
         *,
@@ -4164,9 +4606,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
         1. UPDATE dead_op to 'abandoned'. Use rowcount to decide whether
            this is a fresh takeover (> 0) or an idempotent re-run (== 0).
         2. DELETE scoped partial writes from segments/facts/tag_summaries/
-           tag_summary_embeddings. (Idempotent: no-ops on already-absent
-           rows. Safe to run even on the idempotent re-run path because
-           there's nothing left to delete.)
+           tag_summary_embeddings/segment_tool_outputs, then
+           operation-owned rows from segment_chunks/fact_links.
+           (Idempotent: no-ops on already-absent rows. Safe to run even on
+           the idempotent re-run path because there's nothing left to
+           delete.)
         3. UPDATE canonical_turns to NULL compacted_at / compaction_operation_id
            where compaction_operation_id = dead_op. (Also idempotent.)
         4. ONLY IF the dead_op UPDATE in step 1 matched a row, INSERT a
@@ -4177,7 +4621,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
            (conversation_id, lifecycle_epoch).
         """
         now = utcnow_iso()
-        with self._get_conn() as conn:
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Lifecycle-first lock so takeover serializes against any
+            # active-op inserter (begin_compaction_with_lock or another
+            # takeover). SQLite's BEGIN IMMEDIATE acquires the
+            # database-level write lock; the explicit SELECT confirms
+            # the lifecycle row exists.
+            lock = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if lock is None:
+                conn.rollback()
+                return False
             cur = conn.execute(
                 """UPDATE compaction_operation
                       SET status = 'abandoned', completed_at = ?
@@ -4188,13 +4647,68 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (now, dead_operation_id, conversation_id, lifecycle_epoch),
             )
             fresh_takeover = (cur.rowcount or 0) > 0
+            # The four original cleanup tables (segments / facts /
+            # tag_summaries / tag_summary_embeddings) were active from
+            # M0 onward; their cleanup is NOT tier-gated because the
+            # ownership invariant they protect predates the fence
+            # rollout. The three new tables added in P4 are gated on
+            # the runtime mode per fencing plan §9.1-9.3:
+            #
+            #   - ACTIVE: DELETE rows owned by the dead operation.
+            #   - OBSERVE: log a would-delete count without executing
+            #     the DELETE, so cloud can verify the cleanup would
+            #     fire correctly before enabling enforcement.
+            #   - OFF: skip silently. The new-table rows leak until
+            #     the mode is flipped, which is acceptable during a
+            #     kill-switch window because the new tables are also
+            #     not being written under OFF.
+            _mode = self._compaction_fence_mode
             for table in (
-                "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+                "segments", "facts",
+                "tag_summaries", "tag_summary_embeddings",
+                "segment_tool_outputs",
             ):
+                if table == "segment_tool_outputs" and not _mode.enforces:
+                    if _mode.is_observe:
+                        _row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE operation_id = ? AND conversation_id = ?",
+                            (dead_operation_id, conversation_id),
+                        ).fetchone()
+                        logger.warning(
+                            "COMPACTION_FENCE_CLEANUP_OBSERVED "
+                            "table=%s operation_id=%s would_delete=%s",
+                            table, dead_operation_id, int(_row[0]) if _row else 0,
+                        )
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} "
                     f"WHERE operation_id = ? AND conversation_id = ?",
                     (dead_operation_id, conversation_id),
+                )
+            # Tables WITHOUT ``conversation_id`` are scoped by
+            # operation_id alone. ``segment_chunks`` keys to
+            # ``segment_ref`` and ``fact_links`` keys to endpoint fact
+            # ids, so the operation_id stamp is the only cleanup join
+            # key. Per fencing plan §6.1 P1-4 fold. Both are new in
+            # P4 so the tier gate applies (see comment block above).
+            for table in ("segment_chunks", "fact_links"):
+                if not _mode.enforces:
+                    if _mode.is_observe:
+                        _row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE operation_id = ?",
+                            (dead_operation_id,),
+                        ).fetchone()
+                        logger.warning(
+                            "COMPACTION_FENCE_CLEANUP_OBSERVED "
+                            "table=%s operation_id=%s would_delete=%s",
+                            table, dead_operation_id, int(_row[0]) if _row else 0,
+                        )
+                    continue
+                conn.execute(
+                    f"DELETE FROM {table} WHERE operation_id = ?",
+                    (dead_operation_id,),
                 )
             conn.execute(
                 """UPDATE canonical_turns
@@ -4218,7 +4732,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         phase_count, now, now, worker_id, now,
                     ),
                 )
-            self._commit_if_unlocked(conn)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         return fresh_takeover
 
     def refresh_compaction_heartbeat(
@@ -4505,21 +5025,34 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
-        """Atomic compaction-exit decision + pending drain.
+        """Atomic compaction-exit decision + pending drain, operation-id fenced.
 
-        Single ``BEGIN IMMEDIATE`` transaction containing: epoch check,
+        Single ``BEGIN IMMEDIATE`` transaction containing: lifecycle
+        lock probe, optional terminal-op + no-active-successor guards,
         ``EXISTS (SELECT 1 FROM canonical_turns WHERE tagged_at IS NULL)``,
         phase UPDATE with pending drain, and (on untagged-exists) a fresh
-        ``ingestion_episode`` INSERT seeded with the drained ``pending_raw``
-        value. Serialising the read and write in one transaction closes
-        the race where a concurrent tagger marks the last row tagged
-        between a separate snapshot read and the phase UPDATE.
+        ``ingestion_episode`` INSERT seeded with the drained
+        ``pending_raw`` value. Serialising the read and write in one
+        transaction closes the race where a concurrent tagger marks
+        the last row tagged between a separate snapshot read and the
+        phase UPDATE, AND the no-active-successor race against a
+        concurrent ``begin_compaction_with_lock``.
 
-        Returns ``'ingesting'`` (work remains — episode row inserted) or
-        ``'active'`` (all canonical rows tagged) on success, or ``None``
-        when the caller's ``lifecycle_epoch`` does not match the
-        authoritative conversations row. Epoch-guarded.
+        The no-active-successor guard rejects any row at ``status IN
+        ('queued','running')`` for the same
+        ``(conversation_id, lifecycle_epoch)``. When
+        ``expected_operation_id`` is supplied, the drain also requires a
+        terminal ``compaction_operation`` row for the caller's
+        ``(operation_id, owner_worker_id, lifecycle_epoch)``. A loser
+        worker whose ``expected_operation_id`` is the caller's own
+        (non-owned) op observes the mismatch and skips the phase advance.
+
+        Returns ``'ingesting'`` / ``'active'`` on success, or ``None``
+        on any guard failure (epoch mismatch, missing lifecycle row,
+        missing terminal op, active successor present, or fenced phase
+        no longer ``'compacting'``).
         """
         import uuid
 
@@ -4527,9 +5060,57 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            lock_row = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if lock_row is None:
+                conn.rollback()
+                return None
+
+            if expected_operation_id is not None:
+                terminal_row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM compaction_operation
+                     WHERE conversation_id = ?
+                       AND operation_id = ?
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?
+                       AND status IN (
+                           'completed', 'failed',
+                           'abandoned', 'cancelled'
+                       )
+                    """,
+                    (
+                        conversation_id, expected_operation_id,
+                        worker_id, lifecycle_epoch,
+                    ),
+                ).fetchone()
+                if terminal_row is None:
+                    conn.rollback()
+                    return None
+
+            successor_row = conn.execute(
+                """
+                SELECT 1
+                  FROM compaction_operation
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                   AND status IN ('queued', 'running')
+                 LIMIT 1
+                """,
+                (conversation_id, lifecycle_epoch),
+            ).fetchone()
+            if successor_row is not None:
+                conn.rollback()
+                return None
+
             row = conn.execute(
                 """
                 SELECT pending_raw_payload_entries, lifecycle_epoch,
+                       phase,
                        EXISTS (
                          SELECT 1 FROM canonical_turns
                           WHERE conversation_id = ? AND tagged_at IS NULL
@@ -4543,19 +5124,43 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 conn.rollback()
                 return None
             pending_raw = int(row[0])
-            has_untagged = bool(row[2])
+            current_phase = str(row[2])
+            has_untagged = bool(row[3])
+            if (
+                expected_operation_id is not None
+                and current_phase != "compacting"
+            ):
+                conn.rollback()
+                return None
             if has_untagged:
-                conn.execute(
-                    """
-                    UPDATE conversations
-                       SET phase = 'ingesting',
-                           pending_raw_payload_entries = 0,
-                           updated_at = ?
-                     WHERE conversation_id = ?
-                       AND lifecycle_epoch = ?
-                    """,
-                    (now, conversation_id, lifecycle_epoch),
-                )
+                if expected_operation_id is not None:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                           AND phase = 'compacting'
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return None
+                else:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
                 conn.execute(
                     """
                     INSERT INTO ingestion_episode (
@@ -4571,17 +5176,34 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 new_phase = "ingesting"
             else:
-                conn.execute(
-                    """
-                    UPDATE conversations
-                       SET phase = 'active',
-                           pending_raw_payload_entries = 0,
-                           updated_at = ?
-                     WHERE conversation_id = ?
-                       AND lifecycle_epoch = ?
-                    """,
-                    (now, conversation_id, lifecycle_epoch),
-                )
+                if expected_operation_id is not None:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                           AND phase = 'compacting'
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return None
+                else:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
                 new_phase = "active"
             conn.commit()
             return new_phase
@@ -4724,11 +5346,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # Unconditional ROLLBACK -- see store_segment
+                    # comment for the open-transaction rationale.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="save_tag_summary",
                     )
+                    return
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
@@ -4883,16 +5508,92 @@ CREATE TABLE IF NOT EXISTS request_captures (
             results.append(_row_to_segment(row, tags_map[row["ref"]]))
         return results
 
-    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+    def store_chunk_embeddings(
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Store chunk embeddings for a segment.
+
+        When all guard kwargs are supplied, the DELETE and INSERTs are
+        gated on a probe that verifies (1) the segment_ref belongs to
+        the supplied conversation_id (via segments JOIN, not trusting
+        the caller-supplied conversation_id) AND (2) the active op
+        matches the guard triple at status='running'. Per fencing
+        plan §5.4 P1-3 fold. Inserted rows carry operation_id so
+        cleanup_abandoned_compaction can DELETE them on takeover.
+        """
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+            and conversation_id is not None
+        )
+        # OFF/OBSERVE tier downgrades the guard so the method takes
+        # the legacy unguarded SQL path with no operation_id stamp,
+        # matching pre-fence behavior. The ACTIVE tier keeps the
+        # guarded path with its raise-on-mismatch contract. Per
+        # fencing plan §9.1 + the spec's rollout discipline: OFF is
+        # a kill switch that must produce legacy behavior, not a
+        # soft-drop of the mismatched write.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if guard_all:
+                probe = conn.execute(
+                    """SELECT 1
+                         FROM segments s, compaction_operation co
+                        WHERE s.ref = ?
+                          AND s.conversation_id = ?
+                          AND co.conversation_id = s.conversation_id
+                          AND co.operation_id = ?
+                          AND co.owner_worker_id = ?
+                          AND co.lifecycle_epoch = ?
+                          AND co.status = 'running'""",
+                    (
+                        segment_ref, conversation_id,
+                        operation_id, owner_worker_id, lifecycle_epoch,
+                    ),
+                ).fetchone()
+                if probe is None:
+                    # Close the BEGIN IMMEDIATE before returning so
+                    # the connection does not leak an open
+                    # transaction at OBSERVE / OFF. At ACTIVE the
+                    # helper raises after the rollback.
+                    conn.rollback()
+                    self._enforce_or_observe_mismatch(
+                        operation_id=operation_id,
+                        write_site="store_chunk_embeddings",
+                    )
+                    return
             conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
             for chunk in chunks:
-                conn.execute(
-                    "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
-                    (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
-                )
+                if guard_all:
+                    conn.execute(
+                        """INSERT INTO segment_chunks
+                        (segment_ref, chunk_index, text, embedding_json, operation_id)
+                        VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            segment_ref, chunk.chunk_index, chunk.text,
+                            json.dumps(chunk.embedding), operation_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
+                        (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -4912,6 +5613,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             for row in rows
         ]
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        """Single-row probe replacing the O(N)
+        ``get_all_chunk_embeddings`` scan that the C2R gate
+        previously used. ``LIMIT 1`` short circuits on the
+        ``segment_chunks(segment_ref, chunk_index)`` primary key.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM segment_chunks WHERE segment_ref = ? LIMIT 1",
+            (segment_ref,),
+        ).fetchone()
+        return row is not None
+
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -5853,7 +6568,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         """
         if not canonical_turn_ids:
             return 0
-        from ..types import CompactionLeaseLost
 
         guard_all = (
             operation_id is not None
@@ -5897,10 +6611,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             self._commit_if_unlocked(conn)
             if (cur.rowcount or 0) == 0:
-                raise CompactionLeaseLost(
+                self._enforce_or_observe_mismatch(
                     operation_id=operation_id,
                     write_site="mark_canonical_turns_compacted",
                 )
+                return 0
             return int(cur.rowcount)
         else:
             cur = conn.execute(
@@ -6053,15 +6768,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> int:
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+        )
         if not facts:
             return 0
-        from ..types import CompactionLeaseLost
 
         guard_all = (
             operation_id is not None
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so ``store_facts``
+        # takes the legacy unguarded INSERT OR REPLACE path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -6076,12 +6799,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     # batch, so a concurrent takeover cannot interleave between
                     # rows. However, a takeover that completes *before* the
                     # first INSERT fires (at-rest stale) is caught here.
+                    # Stamps facts.operation_id so cleanup_abandoned_compaction
+                    # can DELETE the op-owned rows on takeover. Per fencing
+                    # plan iter-2 P1-2.
                     cur = conn.execute(
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -6107,6 +6833,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             _dt_to_str(fact.mentioned_at),
                             fact.session_date or "",
                             fact.superseded_by,
+                            operation_id,
                             # WHERE clause params:
                             operation_id,
                             fact.conversation_id,
@@ -6115,11 +6842,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
-                        conn.execute("ROLLBACK")
-                        raise CompactionLeaseLost(
+                        if self._compaction_fence_mode.enforces:
+                            conn.execute("ROLLBACK")
+                            self._enforce_or_observe_mismatch(
+                                operation_id=operation_id,
+                                write_site="store_facts",
+                            )
+                            return count
+                        # OBSERVE / OFF: log (OBSERVE) or silent (OFF)
+                        # then skip this fact and continue.
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="store_facts",
                         )
+                        continue
                 else:
                     # Legacy unconditional path — existing callers and
                     # non-compaction write sites.
@@ -6294,12 +7030,27 @@ CREATE TABLE IF NOT EXISTS request_captures (
         behaviour is unchanged: unconditional DELETE + INSERT.
         """
         from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+        )
 
         guard_all = (
             operation_id is not None
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # ``replace_facts_for_segment`` has a pre-INSERT DELETE that
+        # opens a data-loss window: at OBSERVE/OFF a per-fact INSERT
+        # mismatch would commit the DELETE without a matching INSERT
+        # and leave the segment factless. Downgrade to the legacy
+        # unguarded path at every tier below ACTIVE so the DELETE and
+        # INSERTs run atomically without the per-fact guard. The
+        # operation_id stamp is dropped at OBSERVE for this method
+        # specifically; documented spec deviation per fencing plan
+        # §9.2 in exchange for data-integrity safety. Per Codex
+        # P7-behavioral pt.2 finding.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -6317,11 +7068,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
                 ).fetchone()
                 if row is None:
+                    # Unconditional ROLLBACK so the BEGIN IMMEDIATE
+                    # transaction is closed at every tier before the
+                    # function returns. At ACTIVE the helper raises
+                    # after the rollback (matches pre-P7 behavior);
+                    # at OBSERVE/OFF the helper logs/silent and the
+                    # early return propagates the no-op result.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="replace_facts_for_segment",
                     )
+                    return (0, 0)
 
             # DELETE existing facts (and their tag links) for this segment.
             conn.execute(
@@ -6340,12 +7098,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
             count = 0
             for fact in facts:
                 if guard_all:
+                    # Stamps facts.operation_id so cleanup_abandoned_compaction
+                    # can DELETE the op-owned rows on takeover. Per fencing
+                    # plan iter-2 P1-2.
                     cur = conn.execute(
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -6358,18 +7119,25 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                             fact.conversation_id, json.dumps(fact.turn_numbers),
                             _dt_to_str(fact.mentioned_at), fact.session_date or "",
-                            fact.superseded_by,
+                            fact.superseded_by, operation_id,
                             # WHERE clause params:
                             operation_id, fact.conversation_id,
                             owner_worker_id, lifecycle_epoch,
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
+                        # Only reached when ``guard_all`` is True,
+                        # which now only happens at ACTIVE tier (the
+                        # gate at the top of this method downgrades
+                        # OBSERVE/OFF callers to the legacy path to
+                        # close the DELETE-then-mismatch data-loss
+                        # window). Roll back the DELETE then raise.
                         conn.execute("ROLLBACK")
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="replace_facts_for_segment",
                         )
+                        return (0, 0)
                 else:
                     conn.execute(
                         """INSERT OR REPLACE INTO facts
@@ -6454,22 +7222,140 @@ CREATE TABLE IF NOT EXISTS request_captures (
             rows = conn.execute(sql, params).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE facts SET superseded_by = ? WHERE id = ?",
-            (new_fact_id, old_fact_id),
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        """Mark ``old_fact_id`` superseded by ``new_fact_id``.
+
+        When all guard kwargs are supplied, the UPDATE is gated on a
+        running ``compaction_operation`` row matching the guard triple
+        AND both endpoint facts belonging to the same conversation as
+        the active op. Blocks cross-conversation supersession pointers
+        per fencing plan §4.3 P1-8 fold.
+        """
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``set_fact_superseded`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """UPDATE facts
+                      SET superseded_by = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1
+                            FROM facts f_old, facts f_new,
+                                 compaction_operation co
+                           WHERE f_old.id = ?
+                             AND f_new.id = ?
+                             AND f_old.conversation_id = f_new.conversation_id
+                             AND co.conversation_id = f_old.conversation_id
+                             AND co.operation_id = ?
+                             AND co.owner_worker_id = ?
+                             AND co.lifecycle_epoch = ?
+                             AND co.status = 'running'
+                      )""",
+                (
+                    new_fact_id, old_fact_id,
+                    old_fact_id, new_fact_id,
+                    operation_id, owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            if (cur.rowcount or 0) == 0:
+                if self._compaction_fence_mode.enforces:
+                    conn.rollback()
+                self._enforce_or_observe_mismatch(
+                    operation_id=operation_id,
+                    write_site="set_fact_superseded",
+                )
+                return
+        else:
+            conn.execute(
+                "UPDATE facts SET superseded_by = ? WHERE id = ?",
+                (new_fact_id, old_fact_id),
+            )
         conn.commit()
 
     def update_fact_fields(
-        self, fact_id: str, verb: str, object: str, status: str, what: str
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
-            (verb, object, status, what, fact_id),
+        """Update mutable fact fields. When all guard kwargs are
+        supplied, the UPDATE only fires if the target fact belongs to
+        the same conversation as the active op (matched on the guard
+        triple at status='running').
+        """
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``update_fact_fields`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """UPDATE facts
+                      SET verb = ?, object = ?, status = ?, what = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1
+                            FROM facts f, compaction_operation co
+                           WHERE f.id = ?
+                             AND co.conversation_id = f.conversation_id
+                             AND co.operation_id = ?
+                             AND co.owner_worker_id = ?
+                             AND co.lifecycle_epoch = ?
+                             AND co.status = 'running'
+                      )""",
+                (
+                    verb, object, status, what, fact_id,
+                    fact_id, operation_id, owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            if (cur.rowcount or 0) == 0:
+                if self._compaction_fence_mode.enforces:
+                    conn.rollback()
+                self._enforce_or_observe_mismatch(
+                    operation_id=operation_id,
+                    write_site="update_fact_fields",
+                )
+                return
+        else:
+            conn.execute(
+                "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
+                (verb, object, status, what, fact_id),
+            )
         # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
         conn.commit()
 
@@ -6512,30 +7398,112 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # Fact links
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """Insert fact_links rows.
+
+        When all guard kwargs are supplied (including conversation_id),
+        each INSERT only fires for a link whose BOTH endpoint facts
+        belong to the supplied conversation AND the active op matches
+        the guard triple at status='running'. Inserted rows carry
+        operation_id so cleanup_abandoned_compaction can DELETE the
+        op-owned rows on takeover. Per fencing plan §4.3 P1-7 fold.
+        """
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
         if not links:
             return 0
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+            and conversation_id is not None
+        )
+        # OFF/OBSERVE tier downgrades the guard so ``store_fact_links``
+        # takes the legacy unguarded INSERT OR REPLACE path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             count = 0
             for link in links:
-                conn.execute(
-                    """INSERT OR REPLACE INTO fact_links
-                    (id, source_fact_id, target_fact_id, relation_type,
-                     confidence, context, created_at, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        link.id,
-                        link.source_fact_id,
-                        link.target_fact_id,
-                        link.relation_type,
-                        link.confidence,
-                        link.context,
-                        _dt_to_str(link.created_at),
-                        link.created_by,
-                    ),
-                )
+                if guard_all:
+                    cur = conn.execute(
+                        """INSERT INTO fact_links (
+                            id, source_fact_id, target_fact_id, relation_type,
+                            confidence, context, created_at, created_by,
+                            operation_id
+                        )
+                        SELECT ?,?,?,?,?,?,?,?,?
+                          FROM facts f_src, facts f_tgt, compaction_operation co
+                         WHERE f_src.id = ?
+                           AND f_tgt.id = ?
+                           AND f_src.conversation_id = ?
+                           AND f_tgt.conversation_id = ?
+                           AND co.conversation_id = ?
+                           AND co.operation_id = ?
+                           AND co.owner_worker_id = ?
+                           AND co.lifecycle_epoch = ?
+                           AND co.status = 'running'
+                        ON CONFLICT (id) DO NOTHING""",
+                        (
+                            link.id, link.source_fact_id, link.target_fact_id,
+                            link.relation_type, link.confidence, link.context,
+                            _dt_to_str(link.created_at), link.created_by,
+                            operation_id,
+                            link.source_fact_id, link.target_fact_id,
+                            conversation_id, conversation_id,
+                            conversation_id, operation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    # rowcount=0 can mean ON CONFLICT skip (idempotent
+                    # re-insert) OR guard mismatch. Distinguish via a
+                    # pre-existence check: if a row with this id already
+                    # exists, treat as idempotent; otherwise the guard
+                    # rejected.
+                    if (cur.rowcount or 0) == 0:
+                        pre_existing = conn.execute(
+                            "SELECT 1 FROM fact_links WHERE id = ?",
+                            (link.id,),
+                        ).fetchone()
+                        if pre_existing is None:
+                            # Real guard rejection (not an idempotent
+                            # ON CONFLICT skip). Mode-aware: raise at
+                            # ACTIVE, log at OBSERVE, silent at OFF.
+                            self._enforce_or_observe_mismatch(
+                                operation_id=operation_id,
+                                write_site="store_fact_links",
+                            )
+                            continue
+                else:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO fact_links
+                        (id, source_fact_id, target_fact_id, relation_type,
+                         confidence, context, created_at, created_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            link.id,
+                            link.source_fact_id,
+                            link.target_fact_id,
+                            link.relation_type,
+                            link.confidence,
+                            link.context,
+                            _dt_to_str(link.created_at),
+                            link.created_by,
+                        ),
+                    )
                 count += 1
             conn.execute("COMMIT")
             return count
@@ -6829,13 +7797,79 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [row["tool_output_ref"] for row in rows]
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
-            VALUES (?, ?, ?)""",
-            (conversation_id, segment_ref, tool_output_ref),
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        """Insert a segment_tool_outputs link. When all guard kwargs are
+        supplied, the INSERT only fires if the active op matches the
+        guard triple at status='running' for the supplied
+        conversation_id. Inserted row carries operation_id for
+        cleanup-on-takeover.
+        """
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``link_segment_tool_output`` takes the legacy unguarded
+        # INSERT OR IGNORE path with no operation_id stamp. Per
+        # fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """INSERT INTO segment_tool_outputs
+                (conversation_id, segment_ref, tool_output_ref, operation_id)
+                SELECT ?, ?, ?, ?
+                  FROM compaction_operation co
+                 WHERE co.conversation_id = ?
+                   AND co.operation_id = ?
+                   AND co.owner_worker_id = ?
+                   AND co.lifecycle_epoch = ?
+                   AND co.status = 'running'
+                ON CONFLICT (conversation_id, segment_ref, tool_output_ref) DO NOTHING""",
+                (
+                    conversation_id, segment_ref, tool_output_ref, operation_id,
+                    conversation_id, operation_id,
+                    owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            # rowcount=0 can mean ON CONFLICT skip (idempotent re-link)
+            # OR guard mismatch. Distinguish via a pre-existence check:
+            # if a matching row already exists, the link is idempotent;
+            # otherwise the guard rejected.
+            if (cur.rowcount or 0) == 0:
+                pre_existing = conn.execute(
+                    """SELECT 1 FROM segment_tool_outputs
+                        WHERE conversation_id = ?
+                          AND segment_ref = ?
+                          AND tool_output_ref = ?""",
+                    (conversation_id, segment_ref, tool_output_ref),
+                ).fetchone()
+                if pre_existing is None:
+                    self._enforce_or_observe_mismatch(
+                        operation_id=operation_id,
+                        write_site="link_segment_tool_output",
+                    )
+                    return
+        else:
+            conn.execute(
+                """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
+                VALUES (?, ?, ?)""",
+                (conversation_id, segment_ref, tool_output_ref),
+            )
         conn.commit()
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
@@ -7127,11 +8161,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # Unconditional ROLLBACK so the open BEGIN
+                    # IMMEDIATE transaction is closed at every tier.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="store_tag_summary_embedding",
                     )
+                    return
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(

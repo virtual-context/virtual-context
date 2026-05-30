@@ -434,7 +434,25 @@ class ContextSnapshot:
 
 @dataclass
 class CompactionSignal:
-    priority: Literal["soft", "hard"]
+    """Trigger envelope for a compaction dispatch.
+
+    ``priority`` is the dispatch source label:
+
+    * ``"soft"`` / ``"hard"`` -- normal proxy LLM compaction; soft
+      runs when token usage crosses the soft threshold, hard fires
+      when the conversation is about to overflow.
+    * ``"takeover"`` -- a stale-compaction takeover from the existing
+      heartbeat sweeper has reassigned ownership.
+    * ``"backlog"`` -- the backlog sweeper detected an overdue
+      tagged-uncompacted backlog and is dispatching a recovery
+      compaction. Per compaction-backlog sweeper spec v1.4 §5.1, the
+      ``"backlog"`` label drives ``_run_compact_wrapper``'s default
+      derivation of ``disable_replacement_passes=True`` (the C2R
+      gate shipped in fencing P5) when the explicit kwarg is
+      omitted; the backlog dispatcher still passes the kwarg
+      explicitly so the fallback is purely defensive.
+    """
+    priority: Literal["soft", "hard", "takeover", "backlog"]
     current_tokens: int
     budget_tokens: int
     overflow_tokens: int
@@ -1172,6 +1190,45 @@ class VirtualContextConfig:
     def cost_tracking(self) -> TelemetryConfig:
         """Deprecated — use ``telemetry`` directly."""
         return self.telemetry
+
+
+@dataclass(frozen=True)
+class BacklogCandidate:
+    """One conversation surfaced by
+    ``find_compaction_backlog_conversations`` as a backlog-sweeper
+    candidate.
+
+    Returned by the detection query defined in
+    ``specs/compaction-backlog-sweeper.md`` §3.1 and consumed by the
+    Phase 1 claim adapter ``claim_compaction_backlog``. The dataclass
+    is intentionally narrow: cloud passes the whole instance back to
+    the claim method, and any later schema or predicate change to
+    detection / claim must keep the contract symmetric.
+
+    Fields:
+
+    * ``conversation_id``: target conversation.
+    * ``tenant_id``: joined from ``conversations.tenant_id`` for
+      per-tenant metrics + logging.
+    * ``lifecycle_epoch``: snapshotted at detection time so the claim
+      can reject candidates whose lifecycle bumped between tick and
+      claim.
+    * ``backlog_turns``: ``COUNT(*)`` of tagged-uncompacted
+      ``canonical_turns`` rows at detection time. Used for ordering
+      and observability; claim re-verification re-counts current rows
+      against the configured threshold.
+    * ``last_terminal_compaction_at``: most-recent terminal
+      ``compaction_operation`` row's ``COALESCE(completed_at,
+      started_at)`` in the current epoch, or ``None`` when no
+      terminal op exists (the historical-burst-backfill case).
+      Surfaced for observability + the grace-window
+      cross-check.
+    """
+    conversation_id: str
+    tenant_id: str
+    lifecycle_epoch: int
+    backlog_turns: int
+    last_terminal_compaction_at: datetime | None
 
 
 @dataclass(frozen=True)

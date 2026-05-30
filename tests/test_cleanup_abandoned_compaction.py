@@ -36,6 +36,17 @@ def _seed(store: SQLiteStore, conv: str, dead_op: str, live_op: str):
     """
     now = utcnow_iso()
     with store._get_conn() as conn:
+        # cleanup_abandoned_compaction now acquires conversation_lifecycle
+        # FOR UPDATE before any other work per the fencing plan §3.4
+        # serialization contract; seed the row so the lock probe finds
+        # it. Without the row the cleanup fails closed per the fencing
+        # plan v1.3 P1-1 fold.
+        conn.execute(
+            "INSERT INTO conversation_lifecycle "
+            "(conversation_id, generation, deleted, updated_at) "
+            "VALUES (?, 0, 0, ?)",
+            (conv, now),
+        )
         # live_op: status='completed' — a PRIOR finished compaction at
         # this same epoch. started_at is earlier than dead_op so the
         # ``ORDER BY started_at DESC LIMIT 1`` in claim_compaction_lease

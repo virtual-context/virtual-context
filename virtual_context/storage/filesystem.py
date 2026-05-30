@@ -681,7 +681,16 @@ class FilesystemStore(ContextStore):
                 results.append(seg)
         return results
 
-    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+    def store_chunk_embeddings(
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         embed_dir = self.root / "_embeddings"
         embed_dir.mkdir(parents=True, exist_ok=True)
         safe_ref = segment_ref.replace("/", "_").replace("\\", "_").replace("..", "_")
@@ -1117,7 +1126,16 @@ class FilesystemStore(ContextStore):
     def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
         return []
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         pass
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
