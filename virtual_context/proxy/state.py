@@ -451,7 +451,47 @@ class ProxyState:
         return max(history_turns, marker + 1)
 
     def has_pending_indexing(self) -> bool:
+        """Return True iff the watermark shows untagged completed turns.
+
+        WARNING: this predicate is the legacy "pending tag work" signal
+        used by ingestion bootstrap and the legacy tagger spawn paths
+        (start_ingestion_if_needed, resume_pending_ingestion_if_needed,
+        ingest_if_needed, _history_ingested, reconcile_history_bootstrap).
+        It MUST NOT be used as a passthrough-routing predicate. The
+        routing gate uses _has_retrievable_content(); using the
+        watermark inequality to drive routing breaks multi-client
+        retrieval and produces permanent passthrough on small
+        live-vs-indexed gaps.
+        """
         return self._completed_turn_count() > self._indexed_turn_count()
+
+    def _has_retrievable_content(self) -> bool:
+        """Return True iff the engine has any content the assembler can retrieve.
+
+        Two satisfying conditions:
+        1. At least one compaction has produced segments + tag_summaries
+           (``compacted_prefix_messages > 0``).
+        2. ``turn_tag_index`` has at least one entry (tagging happened
+           even if no compaction has fired).
+
+        A conversation that fails both is genuinely cold-start: no
+        tags, no segments, no summaries. The assembler would return
+        minimal output and the proxy correctly routes to passthrough.
+        Defensive on negative / missing values.
+        """
+        try:
+            compacted = int(getattr(
+                self.engine._engine_state, "compacted_prefix_messages", 0,
+            ) or 0)
+        except (TypeError, AttributeError):
+            compacted = 0
+        if compacted > 0:
+            return True
+        try:
+            indexed = len(self.engine._turn_tag_index.entries)
+        except (TypeError, AttributeError):
+            indexed = 0
+        return indexed > 0
 
     def _restore_signature(self) -> tuple[int, int, int, int]:
         try:
@@ -469,15 +509,18 @@ class ProxyState:
         self,
         history_messages: list[Message] | None = None,
     ) -> bool:
-        existing_turns = self._indexed_turn_count()
-        if existing_turns <= 0:
-            return False
-        if self.has_pending_indexing():
-            return False
-        needed_turns = self._history_turn_count(history_messages)
-        if needed_turns > 0 and existing_turns < needed_turns:
-            return False
-        return True
+        """Return True iff persisted state has retrievable content.
+
+        Routing now depends on whether the engine has any compacted
+        content or indexed turns, not on whether the watermark is
+        exactly caught up to the client's payload. The assembler is
+        robust to lagging behind the client; concurrent multi-client
+        prepares on the same conversation each see their own payload's
+        protected window and retrieve from the shared store
+        independently.
+        """
+        del history_messages  # no longer needed; retained for API stability
+        return self._has_retrievable_content()
 
     def note_engine_restore(self, *, force: bool = False) -> bool:
         """Mark that routing readiness must be revalidated after an engine hydrate.
@@ -502,16 +545,18 @@ class ProxyState:
     ) -> tuple[SessionState, str | None]:
         """Return the routing state for the current request.
 
-        This keeps legitimate passthrough intact while preventing restored,
-        durably-ready conversations from falling back into passthrough solely
-        because a worker-local ingested marker was lost.
+        Routing is content-based: a conversation routes ACTIVE whenever
+        the engine has any compacted content or any indexed turns. The
+        legacy ``pending_indexing`` watermark check is no longer a
+        passthrough trigger; the watermark inequality is unrelated to
+        whether the assembler can add value. Cold-start (no compaction
+        and no tag-index entries) is the only legitimate passthrough
+        criterion from this gate; ``manual_override`` and
+        ``history_widening`` continue to short-circuit independently.
         """
         conversation_id = self.engine.config.conversation_id
         if self._manual_passthrough:
             return SessionState.PASSTHROUGH, "manual_override"
-
-        if self.has_pending_indexing():
-            return SessionState.INGESTING, "pending_indexing"
 
         if not history_messages:
             self._ingested_conversations.add(conversation_id)
@@ -538,7 +583,7 @@ class ProxyState:
             if widened:
                 return SessionState.PASSTHROUGH, "history_widening"
 
-        reason = "initial_ingest" if self._indexed_turn_count() <= 0 else "restore_not_ready"
+        reason = "initial_ingest" if not self._has_retrievable_content() else "restore_not_ready"
         self._ingested_conversations.discard(conversation_id)
         return SessionState.PASSTHROUGH, reason
 

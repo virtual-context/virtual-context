@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from virtual_context.core.retriever import ContextRetriever
+from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     Message,
@@ -17,6 +18,7 @@ from virtual_context.types import (
     TagGeneratorConfig,
     TagResult,
     TagSummary,
+    TurnTagEntry,
 )
 
 from conftest import MockTagGenerator
@@ -116,6 +118,81 @@ def test_general_returns_empty(retriever_and_store):
     retriever, _ = retriever_and_store
     result = retriever.retrieve("The weather is nice today")
     assert result.total_tokens == 0
+
+
+def test_fallback_working_set_honors_entries_snapshot(tmp_sqlite_db):
+    tag_gen = MockTagGenerator(default_tag="_general", default_tags=["_general"])
+    tag_gen.set_override(
+        "fallback",
+        TagResult(tags=["_general"], primary="_general", source="fallback"),
+    )
+    store = SQLiteStore(db_path=tmp_sqlite_db)
+    turn_tag_index = TurnTagIndex()
+    turn_tag_index.append(TurnTagEntry(
+        turn_number=0,
+        message_hash="h0",
+        tags=["stable"],
+        primary_tag="stable",
+    ))
+    entries_snapshot = list(turn_tag_index.entries)
+    turn_tag_index.append(TurnTagEntry(
+        turn_number=1,
+        message_hash="h1",
+        tags=["late"],
+        primary_tag="late",
+    ))
+
+    retriever = ContextRetriever(
+        tag_generator=tag_gen,
+        store=store,
+        config=RetrieverConfig(
+            skip_active_tags=False,
+            strategy_configs={"default": StrategyConfig()},
+        ),
+        turn_tag_index=turn_tag_index,
+    )
+
+    result = retriever.retrieve("fallback question", entries_snapshot=entries_snapshot)
+
+    assert result.retrieval_metadata["tags_queried"] == ["stable"]
+    assert "late" not in result.retrieval_metadata["tags_queried"]
+    store.close()
+
+
+def test_general_fallback_inheritance_honors_entries_snapshot(tmp_sqlite_db):
+    tag_gen = MockTagGenerator(default_tag="_general", default_tags=["_general"])
+    store = SQLiteStore(db_path=tmp_sqlite_db)
+    turn_tag_index = TurnTagIndex()
+    turn_tag_index.append(TurnTagEntry(
+        turn_number=0,
+        message_hash="h0",
+        tags=["stable"],
+        primary_tag="stable",
+    ))
+    entries_snapshot = list(turn_tag_index.entries)
+    turn_tag_index.append(TurnTagEntry(
+        turn_number=1,
+        message_hash="h1",
+        tags=["late"],
+        primary_tag="late",
+    ))
+
+    retriever = ContextRetriever(
+        tag_generator=tag_gen,
+        store=store,
+        config=RetrieverConfig(
+            skip_active_tags=False,
+            strategy_configs={"default": StrategyConfig()},
+        ),
+        turn_tag_index=turn_tag_index,
+    )
+
+    result = retriever.retrieve("general question", entries_snapshot=entries_snapshot)
+
+    assert result.retrieval_metadata["general_fallback"] == "previous_turn"
+    assert result.retrieval_metadata["tags_queried"] == ["stable"]
+    assert "late" not in result.retrieval_metadata["tags_queried"]
+    store.close()
 
 
 def test_cost_report_populated(retriever_and_store):

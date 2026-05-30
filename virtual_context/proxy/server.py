@@ -845,12 +845,13 @@ async def prepare_payload(
         )
         if _dispatch_manual_passthrough:
             _passthrough_reason = "manual_override"
-        elif current_state == SessionState.INGESTING:
-            _passthrough_reason = "pending_indexing"
 
-        # Fresh session starts ACTIVE but may need ingestion — check and
-        # redirect to passthrough path if there's history to ingest.
-        if current_state == SessionState.ACTIVE:
+        # Route every prepare through resolve_prepare_state, including
+        # sessions whose in-memory state was INGESTING (snapshot restore
+        # or post-spawn transition). The new content-based gate is the
+        # single source of truth for routing; the legacy "INGESTING
+        # in-memory state forces passthrough" branch is removed.
+        if current_state in (SessionState.ACTIVE, SessionState.INGESTING):
             _dispatch_history_messages = state._completed_history_messages(_extract_ingestible_messages(body))
             _dispatch_needed_turns = state._history_turn_count(_dispatch_history_messages)
             current_state, _passthrough_reason = state.resolve_prepare_state(_dispatch_history_messages)
@@ -861,9 +862,42 @@ async def prepare_payload(
             _dispatch_compacted_prefix_messages = int(
                 getattr(getattr(getattr(state, "engine", None), "_engine_state", None), "compacted_prefix_messages", 0) or 0
             )
-            if _passthrough_reason == "pending_indexing" and _owns_ingestion_lease:
+            # Spawn legacy-tag work whenever this worker owns the lease
+            # AND there is pending tag work. Decoupled from the routing
+            # reason so content-bearing pending convs (now routed
+            # ACTIVE) still get their tagger spawned. The helper
+            # internally no-ops on no pending work / failed lease.
+            #
+            # CRITICAL: do NOT re-read state.session_state after the
+            # spawn. resume_pending_ingestion_if_needed transitions
+            # the local state to INGESTING before spawning workers
+            # (state.py: _transition_to(SessionState.INGESTING)),
+            # which would overwrite the ACTIVE result from
+            # resolve_prepare_state above and route THIS request back
+            # to passthrough. The request keeps the routing decision
+            # already made; the persistent INGESTING flag reflects
+            # background tagger state for observability, not this
+            # request's routing.
+            if _owns_ingestion_lease and state.has_pending_indexing():
                 state.resume_pending_ingestion_if_needed()
-                current_state = state.session_state
+            # ACTIVE-path dispatch log so operators can observe
+            # "this prepare routed ACTIVE while pending tag work exists
+            # in the background." The PASSTHROUGH_DECISION log fires
+            # only for passthrough; an ACTIVE-routed prepare emits its
+            # own status line carrying _dispatch_pending_indexing so
+            # dashboards / alerts that previously inferred "session is
+            # ingesting" from the passthrough log can still observe
+            # the pending-tag-work signal.
+            if current_state == SessionState.ACTIVE and _dispatch_pending_indexing:
+                logger.info(
+                    "ACTIVE_PENDING_TAG conversation=%s "
+                    "last_completed_turn=%d last_indexed_turn=%d "
+                    "compacted_prefix_messages=%d pending_indexing=True",
+                    state.engine.config.conversation_id[:12],
+                    _dispatch_completed_turns - 1,
+                    _dispatch_indexed_turns - 1,
+                    _dispatch_compacted_prefix_messages,
+                )
         _note_prep("session_state_dispatch", _dispatch_stage)
 
         if current_state in (SessionState.PASSTHROUGH, SessionState.INGESTING):

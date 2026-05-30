@@ -111,17 +111,26 @@ class VirtualContextEngine:
         report = engine.on_turn_complete(history)
 
     Threading contract:
-        - ``tag_turn`` and ``on_message_inbound`` must NOT run concurrently
-          with each other. They mutate shared state (TurnTagIndex, watermark)
-          without internal locking.
+        - Direct engine callers remain responsible for serializing mutating
+          lifecycle calls unless a narrower call path documents otherwise.
+        - In proxy mode, the routing gate may allow legacy ingestion
+          ``tag_turn`` work to overlap with ``on_message_inbound`` on the
+          same conversation. That overlap relies on DB-backed retrieval
+          plus GIL-atomic reads of ``TurnTagIndex.entries`` length and
+          ``EngineState`` integer watermarks; readers observe either the
+          old or new value but not a torn value. ``on_message_inbound``
+          MUST take a bounded snapshot of ``len(TurnTagIndex.entries)``
+          at entry and use it for downstream reads to avoid observing
+          multiple inconsistent snapshots within one call.
+        - This is NOT a general inbound mutex. Proxy request code that
+          mutates shared ``ProxyState`` fields still needs its own
+          sequencing contract.
         - ``compact_if_needed`` MAY run concurrently with inbound methods.
-          Stale watermark reads are benign by design: worst case the assembler
-          includes slightly extra context, never less.
-        - Direct usage of the engine without the proxy's sequencing guarantees
-          is NOT thread-safe. Callers are responsible for serializing calls.
-        - The proxy layer (``ProxyState``) enforces safe sequencing via
-          ``wait_for_tag()`` -- each inbound request waits for the previous
-          tag_turn to complete before proceeding.
+          The operation-id fence guards content writes from compaction.
+        - The proxy layer's ``wait_for_tag()`` is preserved for code paths
+          that explicitly chain "wait for prior tag, then run inbound"
+          (e.g. paging tool callbacks). It is not invoked on the assembly
+          path; assembly relies on the benign-contention property above.
     """
 
     def __init__(

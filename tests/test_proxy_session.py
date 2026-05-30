@@ -1193,7 +1193,13 @@ class TestSessionStateMachine:
         assert reason == "initial_ingest"
         assert state._history_ingested() is False
 
-    def test_pending_indexing_keeps_ingesting_state(self):
+    def test_pending_indexing_routes_active_when_content_present(self):
+        """Content-based routing: a watermark gap no longer triggers
+        passthrough. With at least one ``turn_tag_index`` entry the
+        gate routes ACTIVE even when ``has_pending_indexing()`` is
+        True. ``_history_ingested()`` continues to read the legacy
+        watermark predicate for bootstrap-side consumers.
+        """
         state = self._make_state()
         for i in range(2):
             state.engine._turn_tag_index.append(TurnTagEntry(
@@ -1215,8 +1221,10 @@ class TestSessionStateMachine:
         ]
         session_state, reason = state.resolve_prepare_state(pairs)
 
-        assert session_state == SessionState.INGESTING
-        assert reason == "pending_indexing"
+        assert session_state == SessionState.ACTIVE
+        assert reason is None
+        # has_pending_indexing remains True; only routing changed.
+        assert state.has_pending_indexing() is True
         assert state._history_ingested() is False
 
     def test_widened_history_reenters_passthrough(self):

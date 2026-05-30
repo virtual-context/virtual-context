@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from virtual_context.core.retrieval_assembler import RetrievalAssembler
+from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import (
     AssembledContext,
     AssemblerConfig,
@@ -41,6 +42,7 @@ from virtual_context.types import (
     RetrievalResult,
     RetrieverConfig,
     TagGeneratorConfig,
+    TurnTagEntry,
     VirtualContextConfig,
 )
 
@@ -115,6 +117,149 @@ def _make_assembler(
     # on the bleed-threshold path.
     assembler._set_semantic(MagicMock())
     return assembler, retriever
+
+
+class _AppendOnFlushEngineState:
+    """Append one index entry after assembler snapshot capture."""
+
+    compacted_prefix_messages = 0
+    last_compacted_turn = -1
+    conversation_generation = 0
+
+    def __init__(
+        self,
+        turn_tag_index: TurnTagIndex,
+        appended_entry: TurnTagEntry,
+    ) -> None:
+        self._turn_tag_index = turn_tag_index
+        self._appended_entry = appended_entry
+        self._flushed_read = False
+        self.history_offset_total_turns: int | None = None
+
+    @property
+    def flushed_prefix_messages(self) -> int:
+        if not self._flushed_read:
+            self._flushed_read = True
+            self._turn_tag_index.append(self._appended_entry)
+        return 0
+
+    def history_offset(
+        self,
+        history_len: int,
+        *,
+        total_turns_indexed: int | None = None,
+        watermark: int | None = None,
+    ) -> int:
+        self.history_offset_total_turns = total_turns_indexed
+        return 0
+
+
+def _make_snapshot_assembler(
+    *,
+    turn_tag_index,
+    engine_state,
+    retrieval_result: RetrievalResult,
+) -> tuple[RetrievalAssembler, MagicMock]:
+    retriever = MagicMock()
+    retriever.retrieve.return_value = retrieval_result
+
+    assembler_delegate = MagicMock()
+    assembler_delegate.load_core_context.return_value = ""
+    assembler_delegate.assemble.side_effect = lambda **kwargs: AssembledContext(
+        core_context=kwargs.get("core_context", ""),
+        conversation_history=kwargs.get("conversation_history", []),
+    )
+
+    monitor = MagicMock()
+    monitor.build_snapshot.return_value = SimpleNamespace(
+        total_tokens=0,
+        budget_tokens=10_000,
+    )
+
+    paging = MagicMock()
+    paging.working_set = {}
+
+    config = VirtualContextConfig(
+        context_window=10_000,
+        tag_generator=TagGeneratorConfig(type="keyword"),
+        retriever=RetrieverConfig(),
+        assembler=AssemblerConfig(context_hint_enabled=False),
+    )
+
+    assembler = RetrievalAssembler(
+        retriever=retriever,
+        assembler=assembler_delegate,
+        monitor=monitor,
+        paging=paging,
+        store=MagicMock(),
+        turn_tag_index=turn_tag_index,
+        engine_state=engine_state,
+        fact_curator=None,
+        config=config,
+        token_counter=lambda text: len(text) // 4,
+        session_state_provider=None,
+    )
+    assembler._set_semantic(MagicMock())
+    return assembler, retriever
+
+
+def test_on_message_inbound_uses_method_entry_turn_tag_snapshot():
+    turn_tag_index = TurnTagIndex()
+    stable_entry = TurnTagEntry(
+        turn_number=0,
+        message_hash="h0",
+        tags=["stable"],
+        primary_tag="stable",
+    )
+    late_entry = TurnTagEntry(
+        turn_number=1,
+        message_hash="h1",
+        tags=["late"],
+        primary_tag="late",
+    )
+    turn_tag_index.append(stable_entry)
+    engine_state = _AppendOnFlushEngineState(turn_tag_index, late_entry)
+    assembler, retriever = _make_snapshot_assembler(
+        turn_tag_index=turn_tag_index,
+        engine_state=engine_state,
+        retrieval_result=RetrievalResult(
+            tags_matched=["_general"],
+            retrieval_metadata={"tags_from_message": ["_general"]},
+        ),
+    )
+
+    result = assembler.on_message_inbound(
+        message="what were we discussing?",
+        conversation_history=[],
+    )
+
+    call_kwargs = retriever.retrieve.call_args.kwargs
+    assert call_kwargs["entries_snapshot"] == [stable_entry]
+    assert set(call_kwargs["current_active_tags"]) == {"stable"}
+    assert engine_state.history_offset_total_turns == 1
+    assert late_entry in turn_tag_index.entries
+    assert result.matched_tags == ["stable"]
+
+
+def test_on_message_inbound_handles_missing_turn_tag_index():
+    assembler, retriever = _make_snapshot_assembler(
+        turn_tag_index=None,
+        engine_state=EngineState(),
+        retrieval_result=RetrievalResult(
+            tags_matched=["_general"],
+            retrieval_metadata={"tags_from_message": ["_general"]},
+        ),
+    )
+
+    result = assembler.on_message_inbound(
+        message="what were we discussing?",
+        conversation_history=[],
+    )
+
+    call_kwargs = retriever.retrieve.call_args.kwargs
+    assert call_kwargs["entries_snapshot"] is None
+    assert call_kwargs["current_active_tags"] == []
+    assert result.matched_tags == ["_general"]
 
 
 def test_post_compaction_gate_true_when_compacted_positive_and_flushed_zero():

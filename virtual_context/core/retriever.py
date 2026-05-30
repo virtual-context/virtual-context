@@ -150,6 +150,8 @@ class ContextRetriever:
         current_utilization: float = 0.0,
         post_compaction: bool = False,
         context_turns: list[str] | None = None,
+        *,
+        entries_snapshot: list | None = None,
     ) -> RetrievalResult:
         """Tag inbound message, fetch relevant summaries by tag overlap.
 
@@ -158,6 +160,14 @@ class ContextRetriever:
             current_active_tags: Tags from recent conversation turns to skip.
             current_utilization: Current context window usage ratio (0.0-1.0).
             context_turns: Recent user/assistant text for context-aware tagging.
+            entries_snapshot: optional bounded view of
+                ``TurnTagIndex.entries`` captured by the caller at the
+                inbound method entry. When provided, the retriever's
+                fallback paths (working-set tags on tagger failure,
+                inherit-from-previous on _general) read tags from the
+                snapshot so a concurrent legacy-tagger append does not
+                give one inbound call mixed views of the index. Default
+                None preserves backward compat for non-proxy callers.
         """
         start_time = time.monotonic()
         _breakdown: dict[str, float] = {}
@@ -208,10 +218,14 @@ class ContextRetriever:
             retrieval_metadata["temporal_hint"] = True
 
         if tag_result.source == "fallback":
-            # Tagging failed — fall back to working set tags from live index
+            # Tagging failed — fall back to working set tags. When the
+            # caller supplied a bounded entries_snapshot (proxy mode),
+            # the working-set computation uses it to stay consistent
+            # with the rest of the inbound call's view of the index.
             if self._turn_tag_index:
                 working_set = list(self._turn_tag_index.get_active_tags(
-                    lookback=self.config.anchorless_lookback
+                    lookback=self.config.anchorless_lookback,
+                    entries_snapshot=entries_snapshot,
                 ))
                 query_tags = [t for t in working_set if t != "_general"]
                 retrieval_metadata["fallback"] = "working_set"
@@ -228,9 +242,14 @@ class ContextRetriever:
         skipped_tags = [t for t in tag_result.tags if t in active_tags]
 
         if not query_tags:
-            # _general fallback: use previous turn's tags for focused retrieval
+            # _general fallback: use previous turn's tags for focused
+            # retrieval. Honor the entries_snapshot when supplied so
+            # the inherited tags match the same bounded view as the
+            # rest of this inbound call.
             if self._turn_tag_index:
-                prev = self._turn_tag_index.latest_meaningful_tags()
+                prev = self._turn_tag_index.latest_meaningful_tags(
+                    entries_snapshot=entries_snapshot,
+                )
                 if prev:
                     query_tags = [t for t in prev.tags if t not in self._turn_tag_index._NON_INHERITABLE_TAGS]
                     if query_tags:

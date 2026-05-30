@@ -155,6 +155,29 @@ class RetrievalAssembler:
             _breakdown[stage] = round(_breakdown.get(stage, 0.0) + elapsed, 1)
             return elapsed
 
+        # Bounded snapshot: copy turn_tag_index.entries at method
+        # entry and derive the count from the copy. Downstream
+        # stages (history_offset, paging access bookkeeping,
+        # active-tag lookback, latest-meaningful fallback, retriever
+        # fallback paths) all observe the same entries view even
+        # when a concurrent legacy tagger appends new entries
+        # mid-call. The list copy is GIL-atomic; deriving the
+        # count from the COPY (not from a separate live len() read)
+        # avoids a TOCTOU at the LRU cap where TurnTagIndex.append
+        # evicts before appending. See the engine threading
+        # contract for the broader rationale.
+        _tti_entries_snapshot: list | None = None
+        _tti_count_at_entry: int = 0
+        _tti = None
+        try:
+            _tti = self._turn_tag_index
+            if _tti is not None:
+                _tti_entries_snapshot = list(_tti.entries)
+                _tti_count_at_entry = len(_tti_entries_snapshot)
+        except (TypeError, AttributeError):
+            _tti_entries_snapshot = [] if _tti is not None else None
+            _tti_count_at_entry = 0
+
         # ------------------------------------------------------------------
         # Cross-channel-mirror three-tier gate (engine spec §1.1).
         #
@@ -266,13 +289,21 @@ class RetrievalAssembler:
         ) > 0
         if _post_compaction:
             active_tags = []
+        elif self._turn_tag_index is None:
+            active_tags = []
         else:
-            active_tags = self._get_active_tags(conversation_history)
+            active_tags = self._get_active_tags(
+                conversation_history,
+                entries_snapshot=_tti_entries_snapshot,
+            )
         _note("active_tags", _active_stage)
 
-        # Compute current utilization (only count un-flushed history)
+        # Compute current utilization (only count un-flushed history).
+        # Use the method-entry bounded snapshot so a concurrent legacy
+        # tagger appending entries mid-call does not desync the offset
+        # calculation from earlier-in-method reads.
         _snapshot_stage = time.monotonic()
-        _total_turns = len(self._turn_tag_index.entries) if self._turn_tag_index else None
+        _total_turns = _tti_count_at_entry
         _offset = self._engine_state.history_offset(
             len(conversation_history), total_turns_indexed=_total_turns,
             watermark=_ft,
@@ -294,7 +325,10 @@ class RetrievalAssembler:
         )
         _note("recent_context", _context_stage)
 
-        # Retrieve relevant tag summaries
+        # Retrieve relevant tag summaries. Pass the method-entry
+        # bounded snapshot so retriever fallback paths (working-set
+        # tags on tagger failure, inherit-from-previous on _general)
+        # see the same index view as the rest of this inbound call.
         _retrieve_stage = time.monotonic()
         retrieval_result = self._retriever.retrieve(
             message=message,
@@ -302,6 +336,7 @@ class RetrievalAssembler:
             current_utilization=utilization,
             post_compaction=_post_compaction,
             context_turns=context,
+            entries_snapshot=_tti_entries_snapshot,
         )
         _note("retrieve_primary", _retrieve_stage)
 
@@ -334,11 +369,12 @@ class RetrievalAssembler:
         ws_param, full_segments_param = self._load_working_set_segments()
         _note("load_working_set", _working_set_stage)
         if ws_param:
-            # Update last_accessed_turn for tags matched by current query
+            # Update last_accessed_turn for tags matched by current query.
+            # Use the bounded snapshot from method entry.
             query_tags = retrieval_result.retrieval_metadata.get("tags_from_message", [])
             for tag, entry in self._paging.working_set.items():
                 if tag in query_tags:
-                    entry.last_accessed_turn = len(self._turn_tag_index.entries)
+                    entry.last_accessed_turn = _tti_count_at_entry
 
         # Assemble enriched context -- only pass uncompacted messages
         uncompacted = conversation_history[_offset:]
@@ -378,6 +414,7 @@ class RetrievalAssembler:
                     current_utilization=utilization,
                     post_compaction=_post_compaction,
                     context_turns=expanded,
+                    entries_snapshot=_tti_entries_snapshot,
                 )
                 _note("retrieve_retry_general", _retry_retrieve_stage)
                 retry_tags = retry_result.retrieval_metadata.get(
@@ -407,10 +444,16 @@ class RetrievalAssembler:
                     )
                     _note("assemble_retry", _retry_assemble_stage)
 
-        # Final fallback: inherit from most recent meaningful turn in the index
-        if message_tags == ["_general"]:
+        # Final fallback: inherit from most recent meaningful turn in
+        # the index. Uses the method-entry bounded snapshot so a
+        # concurrent legacy tagger appending entries mid-call does
+        # not yield a "newer" inherited tag set than the same call
+        # saw for active_tags lookback above.
+        if message_tags == ["_general"] and self._turn_tag_index is not None:
             _inherit_stage = time.monotonic()
-            prev = self._turn_tag_index.latest_meaningful_tags()
+            prev = self._turn_tag_index.latest_meaningful_tags(
+                entries_snapshot=_tti_entries_snapshot,
+            )
             if prev:
                 message_tags = list(prev.tags)
             _note("inherit_previous_tags", _inherit_stage)
@@ -664,9 +707,18 @@ class RetrievalAssembler:
     # _get_active_tags
     # ------------------------------------------------------------------
 
-    def _get_active_tags(self, history: list[Message]) -> list[str]:
+    def _get_active_tags(
+        self,
+        history: list[Message],
+        *,
+        entries_snapshot: list | None = None,
+    ) -> list[str]:
+        if self._turn_tag_index is None:
+            return []
         lookback = self.config.retriever.active_tag_lookback
-        return list(self._turn_tag_index.get_active_tags(lookback=lookback))
+        return list(self._turn_tag_index.get_active_tags(
+            lookback=lookback, entries_snapshot=entries_snapshot,
+        ))
 
     # ------------------------------------------------------------------
     # Context hint building

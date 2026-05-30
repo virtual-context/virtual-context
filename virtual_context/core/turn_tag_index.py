@@ -112,8 +112,23 @@ class TurnTagIndex:
         # hot path.
         self._all_tags = {tag for entry in self.entries for tag in entry.tags}
 
-    def get_active_tags(self, lookback: int = 4) -> set[str]:
-        recent = self.entries[-lookback:] if len(self.entries) >= lookback else self.entries
+    def get_active_tags(
+        self,
+        lookback: int = 4,
+        *,
+        entries_snapshot: list["TurnTagEntry"] | None = None,
+    ) -> set[str]:
+        """Compute the active-tag set over the last ``lookback`` entries.
+
+        ``entries_snapshot``: optional bounded view of ``self.entries``
+        captured by the caller at method entry. Callers that hold a
+        method-entry snapshot (e.g. retrieval_assembler.on_message_inbound)
+        pass it so a concurrent ``append`` during the call cannot
+        desync downstream stages from earlier reads. When omitted, the
+        method reads ``self.entries`` live.
+        """
+        source = self.entries if entries_snapshot is None else entries_snapshot
+        recent = source[-lookback:] if len(source) >= lookback else source
         tags: set[str] = set()
         for entry in recent:
             tags.update(entry.tags)
@@ -160,14 +175,23 @@ class TurnTagIndex:
 
     _NON_INHERITABLE_TAGS = {"_general", "_stub"}
 
-    def latest_meaningful_tags(self) -> TurnTagEntry | None:
+    def latest_meaningful_tags(
+        self,
+        *,
+        entries_snapshot: list["TurnTagEntry"] | None = None,
+    ) -> TurnTagEntry | None:
         """Return the most recent entry with real tags (not ``_general``/``_stub`` only).
 
         Walks backwards through entries to find the last turn whose tags
-        contain at least one substantive tag.  Used to propagate topic
+        contain at least one substantive tag. Used to propagate topic
         continuity to ultra-short messages during history ingestion.
+
+        ``entries_snapshot``: optional bounded view of ``self.entries``
+        captured by the caller at method entry. See ``get_active_tags``
+        for the rationale.
         """
-        for entry in reversed(self.entries):
+        source = self.entries if entries_snapshot is None else entries_snapshot
+        for entry in reversed(source):
             if any(t not in self._NON_INHERITABLE_TAGS for t in entry.tags):
                 return entry
         return None
