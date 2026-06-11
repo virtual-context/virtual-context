@@ -1878,3 +1878,54 @@ def test_body_target_is_literal_even_when_target_has_outgoing_alias(tmp_path):
     ).fetchone()[0]
     assert literal_count == 1
     assert terminal_count == 0
+
+
+# ---------------------------------------------------------------------------
+# count_canonical_turns: literal-id-scoped row count
+# ---------------------------------------------------------------------------
+
+def test_count_canonical_turns_zero_for_unknown_conv(tmp_path):
+    store = _store(tmp_path)
+    assert store.count_canonical_turns("no-such-conv") == 0
+
+
+def test_count_canonical_turns_counts_rows(tmp_path):
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "conv-a")
+    _seed_canonical_turn(conn, "conv-a", "t1", sort_key=1.0)
+    _seed_canonical_turn(conn, "conv-a", "t2", sort_key=2.0)
+    _seed_canonical_turn(conn, "conv-a", "t3", sort_key=3.0)
+    conn.commit()
+    assert store.count_canonical_turns("conv-a") == 3
+
+
+def test_count_canonical_turns_is_literal_id_scoped(tmp_path):
+    """An alias source with its own rows counts ONLY its own rows — the
+    alias terminal's rows are never included. Mirrors the merge body's
+    literal-endpoint contract so threshold reads agree with what a merge
+    of that source would actually move."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "dual-src")
+    _seed_conversation(conn, "tA", "terminal-conv")
+    _seed_canonical_turn(conn, "dual-src", "own-1", sort_key=1.0)
+    for i in range(5):
+        _seed_canonical_turn(conn, "terminal-conv", f"term-{i}", sort_key=float(i))
+    conn.commit()
+    store.save_conversation_alias("dual-src", "terminal-conv")
+    assert store.count_canonical_turns("dual-src") == 1
+    assert store.count_canonical_turns("terminal-conv") == 5
+
+
+def test_count_canonical_turns_composite_delegates(tmp_path):
+    from virtual_context.core.composite_store import CompositeStore
+    inner = _store(tmp_path)
+    conn = inner._get_conn()
+    _seed_conversation(conn, "tA", "conv-c")
+    _seed_canonical_turn(conn, "conv-c", "t1", sort_key=1.0)
+    conn.commit()
+    composite = CompositeStore(
+        segments=inner, facts=inner, fact_links=inner, state=inner, search=inner,
+    )
+    assert composite.count_canonical_turns("conv-c") == 1

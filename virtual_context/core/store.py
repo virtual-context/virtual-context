@@ -352,6 +352,16 @@ class ContextStore(ABC):
     ) -> list[CanonicalTurnRow]:
         return []
 
+    def count_canonical_turns(self, conversation_id: str) -> int:
+        """Number of canonical_turn rows under the LITERAL conversation id.
+
+        No alias resolution: the count agrees with what conversation-scoped
+        row operations (merge moves, deletes) on this id would touch.
+        Backends override with an indexed COUNT; this default derives from
+        ``get_all_canonical_turns`` for minimal implementations.
+        """
+        return len(self.get_all_canonical_turns(conversation_id))
+
     def get_uncompacted_canonical_turns(
         self,
         conversation_id: str,

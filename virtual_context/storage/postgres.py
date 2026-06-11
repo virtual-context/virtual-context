@@ -6411,6 +6411,17 @@ class PostgresStore(ContextStore):
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
+    def count_canonical_turns(self, conversation_id: str) -> int:
+        """Indexed COUNT of canonical_turn rows under the literal id."""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        return int(row[0] if not hasattr(row, "keys") else list(row.values())[0])
+
     def get_uncompacted_canonical_turns(
         self,
         conversation_id: str,

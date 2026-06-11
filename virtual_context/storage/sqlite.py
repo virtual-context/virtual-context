@@ -6347,6 +6347,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
+    def count_canonical_turns(self, conversation_id: str) -> int:
+        """Indexed COUNT of canonical_turn rows under the literal id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def get_uncompacted_canonical_turns(
         self,
         conversation_id: str,
