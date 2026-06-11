@@ -39,6 +39,9 @@ class _FakeRowsResult:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
 
 class _ConnCheckout:
     def __init__(self, conn: _FakeConn) -> None:
