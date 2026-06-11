@@ -138,7 +138,11 @@ def _fact_operation_id(store, fact_id: str) -> str | None:
         row = conn.execute(
             "SELECT operation_id FROM facts WHERE id = %s", (fact_id,),
         ).fetchone()
-        return row["operation_id"] if row else None
+        if row is None or row["operation_id"] is None:
+            return None
+        # uuid columns come back as uuid.UUID; normalize to the hex form
+        # the engine passes in so equality asserts compare like-for-like.
+        return getattr(row["operation_id"], "hex", row["operation_id"])
 
 
 @_pg_required

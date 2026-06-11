@@ -26,18 +26,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 from virtual_context.storage.postgres import PostgresStore  # noqa: E402
+from tests.pg_helpers import pg_test_conn
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _ct_id(kind: str, conv: str) -> str:
+    """Deterministic valid-uuid canonical_turn_id for seed/assert pairing."""
+    return uuid.uuid5(uuid.NAMESPACE_OID, f"ct-{kind}-{conv}").hex
+
 def _fresh_ids():
     """Return a unique (conv_id, dead_op_id, live_op_id) triple."""
     return (
         f"pg-conv-{uuid.uuid4().hex[:8]}",
-        f"pg-dead-{uuid.uuid4().hex[:8]}",
-        f"pg-live-{uuid.uuid4().hex[:8]}",
+        uuid.uuid4().hex,
+        uuid.uuid4().hex,
     )
 
 
@@ -55,8 +61,19 @@ def _seed(store: PostgresStore, conv: str, dead_op: str, live_op: str) -> None:
     now = datetime.now(timezone.utc)
     earlier_str = "2026-01-01T00:00:00+00:00"
     earlier = datetime.fromisoformat(earlier_str)
+    conn = pg_test_conn()
+    # cleanup_abandoned_compaction acquires conversation_lifecycle
+    # FOR UPDATE before any other work; seed the row so the lock
+    # probe finds it (mirrors the sqlite twin's seed — without the
+    # row the cleanup fails closed).
+    conn.execute(
+        "INSERT INTO conversation_lifecycle "
+        "(conversation_id, generation, deleted, updated_at) "
+        "VALUES (%s, 0, FALSE, %s) ON CONFLICT DO NOTHING",
+        (conv, now.isoformat()),
+    )
 
-    conn = store._get_conn()
+    conn = pg_test_conn()
     with conn.transaction():
         # live_op: completed prior compaction — control group
         conn.execute(
@@ -107,8 +124,8 @@ def _seed(store: PostgresStore, conv: str, dead_op: str, live_op: str) -> None:
             )
         # canonical_turns: one marked by dead_op, one by live_op
         for op_id, canonical_id, sort_key in (
-            (dead_op, f"ct-dead-{conv}", 1000.0),
-            (live_op, f"ct-live-{conv}", 2000.0),
+            (dead_op, _ct_id("dead", conv), 1000.0),
+            (live_op, _ct_id("live", conv), 2000.0),
         ):
             conn.execute(
                 """INSERT INTO canonical_turns
@@ -129,7 +146,7 @@ def _seed(store: PostgresStore, conv: str, dead_op: str, live_op: str) -> None:
 
 def _counts(store: PostgresStore, conv: str, op_id: str) -> dict[str, int]:
     out: dict[str, int] = {}
-    conn = store._get_conn()
+    conn = pg_test_conn()
     for table in (
         "segments", "facts", "tag_summaries", "tag_summary_embeddings",
     ):
@@ -150,7 +167,7 @@ def _counts(store: PostgresStore, conv: str, op_id: str) -> dict[str, int]:
 
 def _teardown(store: PostgresStore, conv: str) -> None:
     """Delete all rows seeded for conv so tests don't bleed state."""
-    conn = store._get_conn()
+    conn = pg_test_conn()
     with conn.transaction():
         for table in (
             "tag_summary_embeddings", "tag_summaries", "facts", "segments",
@@ -187,7 +204,7 @@ def test_pg_cleanup_scopes_by_operation_id(store: PostgresStore):
         store.cleanup_abandoned_compaction(
             conversation_id=conv,
             dead_operation_id=dead_op,
-            new_operation_id=f"new-op-{uuid.uuid4().hex[:8]}",
+            new_operation_id=uuid.uuid4().hex,
             lifecycle_epoch=1,
             worker_id="new-worker",
             phase_count=7,
@@ -216,34 +233,34 @@ def test_pg_cleanup_unsets_canonical_compacted_at(store: PostgresStore):
         store.cleanup_abandoned_compaction(
             conversation_id=conv,
             dead_operation_id=dead_op,
-            new_operation_id=f"new-op-{uuid.uuid4().hex[:8]}",
+            new_operation_id=uuid.uuid4().hex,
             lifecycle_epoch=1,
             worker_id="new-worker",
             phase_count=7,
         )
 
-        conn = store._get_conn()
+        conn = pg_test_conn()
         dead_ct = conn.execute(
             "SELECT compacted_at, compaction_operation_id FROM canonical_turns "
             "WHERE canonical_turn_id = %s",
-            (f"ct-dead-{conv}",),
+            (_ct_id("dead", conv),),
         ).fetchone()
         live_ct = conn.execute(
             "SELECT compacted_at, compaction_operation_id FROM canonical_turns "
             "WHERE canonical_turn_id = %s",
-            (f"ct-live-{conv}",),
+            (_ct_id("live", conv),),
         ).fetchone()
         assert dead_ct["compacted_at"] is None
         assert dead_ct["compaction_operation_id"] is None
         assert live_ct["compacted_at"] is not None, "live-op's ct must be untouched"
-        assert str(live_ct["compaction_operation_id"]) == live_op
+        assert live_ct["compaction_operation_id"].hex == live_op
     finally:
         _teardown(store, conv)
 
 
 def test_pg_cleanup_inserts_new_running_row(store: PostgresStore):
     conv, dead_op, live_op = _fresh_ids()
-    new_op = f"new-op-{uuid.uuid4().hex[:8]}"
+    new_op = uuid.uuid4().hex
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     try:
         _seed(store, conv, dead_op=dead_op, live_op=live_op)
@@ -257,7 +274,7 @@ def test_pg_cleanup_inserts_new_running_row(store: PostgresStore):
             phase_count=7,
         )
 
-        conn = store._get_conn()
+        conn = pg_test_conn()
         new_row = conn.execute(
             "SELECT status, owner_worker_id, phase_count FROM compaction_operation "
             "WHERE operation_id = %s",
@@ -281,8 +298,8 @@ def test_pg_cleanup_is_idempotent_and_preserves_one_active_invariant(store: Post
     UPDATE, skips the INSERT, and does NOT create a second running row.
     """
     conv, dead_op, live_op = _fresh_ids()
-    new_op_1 = f"new-op-1-{uuid.uuid4().hex[:6]}"
-    new_op_2 = f"new-op-2-{uuid.uuid4().hex[:6]}"
+    new_op_1 = uuid.uuid4().hex
+    new_op_2 = uuid.uuid4().hex
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     try:
         _seed(store, conv, dead_op=dead_op, live_op=live_op)
@@ -307,7 +324,7 @@ def test_pg_cleanup_is_idempotent_and_preserves_one_active_invariant(store: Post
         assert ret1 is True, "first call must be a fresh takeover"
         assert ret2 is False, "second call must be idempotent (False)"
 
-        conn = store._get_conn()
+        conn = pg_test_conn()
         rows = conn.execute(
             "SELECT operation_id, status FROM compaction_operation "
             "WHERE conversation_id = %s AND lifecycle_epoch = 1 "
@@ -321,9 +338,9 @@ def test_pg_cleanup_is_idempotent_and_preserves_one_active_invariant(store: Post
             f"One-active invariant violated: expected exactly 1 running "
             f"row at ({conv}, epoch=1); got {[dict(r) for r in running]}"
         )
-        assert str(running[0]["operation_id"]) == new_op_1
-        assert {str(r["operation_id"]) for r in abandoned} == {dead_op}
-        assert all(str(r["operation_id"]) != new_op_2 for r in rows), (
+        assert running[0]["operation_id"].hex == new_op_1
+        assert {r["operation_id"].hex for r in abandoned} == {dead_op}
+        assert all(r["operation_id"].hex != new_op_2 for r in rows), (
             "new-op-2 was inserted on a redundant cleanup call — invariant violated"
         )
     finally:
@@ -337,17 +354,17 @@ def test_pg_cleanup_respects_one_active_invariant_on_concurrent_peer(store: Post
     import psycopg
 
     conv, dead_op, live_op = _fresh_ids()
-    new_op = f"new-op-{uuid.uuid4().hex[:8]}"
+    new_op = uuid.uuid4().hex
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     try:
         _seed(store, conv, dead_op=dead_op, live_op=live_op)
 
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        peer_op = f"peer-op-{uuid.uuid4().hex[:8]}"
+        peer_op = uuid.uuid4().hex
 
         # Attempting to seed a second 'running' row at the same epoch must fail
-        conn = store._get_conn()
+        conn = pg_test_conn()
         with pytest.raises(psycopg.errors.UniqueViolation):
             with conn.transaction():
                 conn.execute(
@@ -376,6 +393,6 @@ def test_pg_cleanup_respects_one_active_invariant_on_concurrent_peer(store: Post
             (conv,),
         ).fetchall()
         assert len(running) == 1
-        assert str(running[0]["operation_id"]) == new_op
+        assert running[0]["operation_id"].hex == new_op
     finally:
         _teardown(store, conv)

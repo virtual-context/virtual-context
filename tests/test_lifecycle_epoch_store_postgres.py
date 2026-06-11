@@ -18,9 +18,10 @@ import threading
 import uuid
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -45,7 +46,7 @@ def test_upsert_conversation_is_idempotent_pg():
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     assert s.get_lifecycle_epoch(cid) == 1
-    conn = s._get_conn()
+    conn = pg_test_conn()
     count_row = conn.execute(
         "SELECT COUNT(*) AS c FROM conversations WHERE conversation_id = %s",
         (cid,),
@@ -64,7 +65,7 @@ def test_mark_conversation_deleted_sets_phase_and_deleted_at_pg():
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     s.mark_conversation_deleted(cid)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT phase, deleted_at FROM conversations WHERE conversation_id = %s",
         (cid,),
@@ -77,7 +78,7 @@ def test_mark_conversation_deleted_terminalizes_active_episode_and_compaction_pg
     s = _store()
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     ep_id = str(uuid.uuid4())
     op_id = str(uuid.uuid4())
     conn.execute(
@@ -128,7 +129,7 @@ def test_increment_lifecycle_epoch_bumps_on_resurrect_pg():
     new_epoch = s.increment_lifecycle_epoch_on_resurrect(cid)
     assert new_epoch == 2
     assert s.get_lifecycle_epoch(cid) == 2
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT phase, deleted_at FROM conversations WHERE conversation_id = %s",
         (cid,),
@@ -141,7 +142,7 @@ def test_increment_lifecycle_epoch_resurrect_cleans_stale_active_rows_pg():
     s = _store()
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     ep_id = str(uuid.uuid4())
     op_id = str(uuid.uuid4())
     conn.execute(
@@ -242,7 +243,7 @@ def test_delete_conversation_removes_lifecycle_and_progress_rows_pg():
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     s.save_canonical_turn(cid, 0, "u0", "a0")
-    conn = s._get_conn()
+    conn = pg_test_conn()
     ep_id = str(uuid.uuid4())
     op_id = str(uuid.uuid4())
     conn.execute(

@@ -19,9 +19,10 @@ import os
 import uuid
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -86,7 +87,7 @@ def test_widen_pending_raw_is_monotonic_pg():
     s, cid = _fresh()
     s.widen_pending_raw_payload_entries(conversation_id=cid, lifecycle_epoch=1, value=100)
     s.widen_pending_raw_payload_entries(conversation_id=cid, lifecycle_epoch=1, value=50)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT pending_raw_payload_entries FROM conversations WHERE conversation_id = %s",
         (cid,),
@@ -103,7 +104,7 @@ def test_widen_pending_raw_rejects_stale_epoch_pg():
         conversation_id=cid, lifecycle_epoch=1, value=500,
     )
     assert ok is False
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT pending_raw_payload_entries FROM conversations WHERE conversation_id = %s",
         (cid,),
@@ -165,7 +166,7 @@ def test_set_phase_and_drain_pending_raw_success_pg():
     assert drained == 42
     snap = s.read_progress_snapshot(cid)
     assert snap.phase == "active"
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT pending_raw_payload_entries FROM conversations WHERE conversation_id = %s",
         (cid,),

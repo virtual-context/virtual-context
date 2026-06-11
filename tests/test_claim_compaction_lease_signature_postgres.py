@@ -12,9 +12,10 @@ import os
 import uuid
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -35,7 +36,7 @@ def test_claim_compaction_lease_returns_claim_object_on_success_pg():
     from datetime import datetime, timedelta, timezone
 
     s, cid = _fresh()
-    conn = s._get_conn()
+    conn = pg_test_conn()
 
     stale = datetime.now(timezone.utc) - timedelta(seconds=600)
     now = datetime.now(timezone.utc)
@@ -86,7 +87,7 @@ def test_claim_compaction_lease_rejects_fresh_heartbeat_pg():
     from datetime import datetime, timezone
 
     s, cid = _fresh()
-    conn = s._get_conn()
+    conn = pg_test_conn()
 
     now = datetime.now(timezone.utc)
     op_id = str(uuid.uuid4())

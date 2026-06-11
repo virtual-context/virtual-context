@@ -8,16 +8,17 @@ lockstep on the lifecycle/phase/counters columns.
 import os
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
 
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def test_conversations_table_has_phase_and_epoch_columns_pg():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute(
             """
             SELECT column_name FROM information_schema.columns

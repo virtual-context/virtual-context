@@ -9,16 +9,17 @@ indexes used by the DB-derived progress tracker.
 import os
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
 
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def test_canonical_turns_has_covered_and_tagged_columns_pg():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute("""
             SELECT column_name FROM information_schema.columns
              WHERE table_name = 'canonical_turns'
@@ -31,7 +32,7 @@ def test_canonical_turns_has_covered_and_tagged_columns_pg():
 def test_canonical_turns_partial_indexes_exist_pg():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute("""
             SELECT indexname, indexdef FROM pg_indexes
              WHERE tablename = 'canonical_turns'

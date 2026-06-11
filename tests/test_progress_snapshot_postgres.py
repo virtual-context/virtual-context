@@ -21,9 +21,10 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -67,7 +68,7 @@ def test_read_progress_snapshot_derives_total_and_done_from_canonical_pg():
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     # Insert 3 canonical rows: 2 tagged, 1 untagged. All have covered_ingestible_entries=1.
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     for i, tagged in enumerate([True, True, False]):
         conn.execute(
             """
@@ -103,7 +104,7 @@ def test_recompute_canonical_turn_groups_assigns_explicit_groups_pg():
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     rows = [
         (str(uuid.uuid4()), "hello", "", 1000.0),
         (str(uuid.uuid4()), "", "hi", 2000.0),
@@ -150,7 +151,7 @@ def test_read_progress_snapshot_includes_active_episode_pg():
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     now = _now()
     ep_id = str(uuid.uuid4())
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO ingestion_episode (
@@ -174,7 +175,7 @@ def test_read_progress_snapshot_ignores_stale_running_episode_from_prior_epoch_p
     s.mark_conversation_deleted(cid)
     assert s.increment_lifecycle_epoch_on_resurrect(cid) == 2
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO ingestion_episode (
@@ -206,7 +207,7 @@ def test_read_progress_snapshot_skips_completed_episode_pg():
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO ingestion_episode (
@@ -227,7 +228,7 @@ def test_read_progress_snapshot_includes_active_compaction_pg():
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     now = _now()
     op_id = str(uuid.uuid4())
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO compaction_operation (
@@ -254,7 +255,7 @@ def test_read_progress_snapshot_ignores_stale_active_compaction_from_prior_epoch
     s.mark_conversation_deleted(cid)
     assert s.increment_lifecycle_epoch_on_resurrect(cid) == 2
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO compaction_operation (
@@ -289,7 +290,7 @@ def test_read_progress_snapshot_queued_compaction_is_also_active_pg():
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
     now = _now()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO compaction_operation (
@@ -309,7 +310,7 @@ def test_read_progress_snapshot_reads_request_metadata_pg():
     s = _store()
     cid = _cid()
     s.upsert_conversation(tenant_id="t", conversation_id=cid)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         UPDATE conversations

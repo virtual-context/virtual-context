@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -50,7 +51,7 @@ def _stale_ts(age_s: float = 600) -> datetime:
 
 def _teardown(store, conv: str) -> None:
     """Delete all rows for *conv* so reruns against a shared DB stay clean."""
-    conn = store._get_conn()
+    conn = pg_test_conn()
     with conn.transaction():
         for table in (
             "tag_summary_embeddings", "tag_summaries", "facts", "segments",
@@ -99,11 +100,11 @@ def _seed_canonical_turns(pg_store, conv: str, n: int = 6) -> None:
     compacted_at=NULL (not yet compacted).
     """
     now = _utcnow()
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     with conn.transaction():
         for i in range(n):
             sort_key = float(i + 1) * 1000.0
-            canonical_id = f"ct-e2e-{uuid.uuid4().hex[:8]}"
+            canonical_id = uuid.uuid4().hex
             turn_hash = uuid.uuid4().hex[:16]
             conn.execute(
                 """
@@ -132,7 +133,7 @@ def _insert_running_compaction(pg_store, conv: str, op_id: str) -> None:
     heartbeat — representing the dead worker's in-flight operation.
     """
     now = _utcnow()
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     with conn.transaction():
         conn.execute(
             """
@@ -153,7 +154,7 @@ def _age_heartbeat(pg_store, op_id: str, age_s: float = 600) -> None:
     as stale and triggers takeover on the next handle_prepare_payload call.
     """
     stale = _stale_ts(age_s)
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         "UPDATE compaction_operation SET heartbeat_ts = %s WHERE operation_id = %s",
         (stale, op_id),
@@ -256,7 +257,7 @@ def test_compaction_resume_e2e_postgres():
                 pass
 
         # --- Step 7: assert DB invariants -----------------------------------
-        conn = pg_store._get_conn()
+        conn = pg_test_conn()
 
         # 7a. conversations.phase = 'active' (exit_compaction flipped it)
         phase_row = conn.execute(
@@ -282,9 +283,13 @@ def test_compaction_resume_e2e_postgres():
         statuses = {}
         for row in op_rows:
             if isinstance(row, dict):
-                statuses[row["operation_id"]] = row["status"]
+                op_val = row["operation_id"]
+                st_val = row["status"]
             else:
-                statuses[str(row[0])] = row[1]
+                op_val, st_val = row[0], row[1]
+            # uuid columns surface as uuid.UUID (or dashed str); normalize
+            # to the undashed hex the engine passes around.
+            statuses[uuid.UUID(str(op_val)).hex] = st_val
 
         running_ops = [op for op, st in statuses.items() if st == "running"]
         abandoned_ops = [op for op, st in statuses.items() if st == "abandoned"]

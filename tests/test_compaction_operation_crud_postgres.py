@@ -24,9 +24,10 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -155,7 +156,7 @@ def test_claim_succeeds_when_other_worker_lease_is_stale_pg():
     )
     # Force stale heartbeat so w2 can take over.
     stale = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         "UPDATE compaction_operation SET heartbeat_ts = %s WHERE conversation_id = %s",
         (stale, cid),
@@ -308,7 +309,7 @@ def test_fail_records_error_message_pg():
         conversation_id=cid, lifecycle_epoch=1, worker_id="w1",
         error_message="explode",
     ) is True
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT status, error_message FROM compaction_operation WHERE conversation_id = %s",
         (cid,),
@@ -391,7 +392,7 @@ def test_stale_epoch_thread_cannot_affect_resurrected_epoch_pg():
     assert snap.active_compaction.operation_id == op2
     assert snap.active_compaction.status == "queued"
     assert snap.active_compaction.phase_index == 0
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT error_message FROM compaction_operation WHERE operation_id = %s",
         (op2,),

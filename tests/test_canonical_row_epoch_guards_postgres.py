@@ -23,9 +23,10 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -50,7 +51,7 @@ def _seed_canonical_row(
     tagged: bool = False,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         """
         INSERT INTO canonical_turns (
@@ -146,7 +147,7 @@ def test_mark_canonical_row_tagged_sets_timestamp_pg():
         expected_lifecycle_epoch=1,
     )
     assert ok is True
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT tagged_at FROM canonical_turns WHERE canonical_turn_id = %s",
         (t_pending,),
@@ -167,7 +168,7 @@ def test_mark_canonical_row_tagged_rejects_on_epoch_mismatch_pg():
         expected_lifecycle_epoch=1,
     )
     assert ok is False
-    conn = s._get_conn()
+    conn = pg_test_conn()
     row = conn.execute(
         "SELECT tagged_at FROM canonical_turns WHERE canonical_turn_id = %s",
         (t0,),
