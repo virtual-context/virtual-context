@@ -149,3 +149,59 @@ class TestNeedsMerge:
         assert res.outcome == "needs_merge"
         assert store.resolve_conversation_alias(PRED) is None
         assert store.resolve_conversation_alias(STABLE) is None
+
+
+class TestEngineMethod:
+    """engine.link_predecessor — the surface remote callers invoke.
+
+    Returns a plain dict (metadata-safe) and wires the engine's own
+    store + session-state provider; only the cross-worker invalidation
+    callback is caller-supplied.
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_path):
+        from virtual_context.engine import VirtualContextEngine
+        from virtual_context.config import load_config
+
+        config = load_config(config_dict={
+            "context_window": 10000,
+            "conversation_id": STABLE,
+            "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "store.db")}},
+            "tag_generator": {"type": "keyword"},
+            "retrieval": {"inbound_tagger_type": "keyword"},
+        })
+        eng = VirtualContextEngine(config=config)
+        yield eng
+        eng.close()
+
+    def test_returns_dict_linked(self, engine):
+        raw = getattr(engine._store, "_store", engine._store)
+        for i in range(2):
+            raw.save_canonical_turn(PRED, i, f"u{i}", f"a{i}")
+        result = engine.link_predecessor(PRED, STABLE)
+        assert isinstance(result, dict)
+        assert result["outcome"] == "linked"
+        assert result["alias_source"] == STABLE
+        assert result["alias_target"] == PRED
+        assert raw.resolve_conversation_alias(STABLE) == PRED
+
+    def test_returns_dict_noop_same_id(self, engine):
+        result = engine.link_predecessor(PRED, PRED)
+        assert result == {
+            "outcome": "noop",
+            "reason": "same_id",
+            "alias_source": "",
+            "alias_target": "",
+            "detail": "",
+        }
+
+    def test_cross_worker_invalidate_kwarg_fires(self, engine):
+        raw = getattr(engine._store, "_store", engine._store)
+        raw.save_canonical_turn(PRED, 0, "u", "a")
+        events: list[dict] = []
+        result = engine.link_predecessor(
+            PRED, STABLE, cross_worker_invalidate=events.append,
+        )
+        assert result["outcome"] == "linked"
+        assert any(e.get("type") == "alias_created" for e in events)
