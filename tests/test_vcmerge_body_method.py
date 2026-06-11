@@ -1929,3 +1929,81 @@ def test_count_canonical_turns_composite_delegates(tmp_path):
         segments=inner, facts=inner, fact_links=inner, state=inner, search=inner,
     )
     assert composite.count_canonical_turns("conv-c") == 1
+
+
+# ---------------------------------------------------------------------------
+# Engine merge entry: pre-check connection acquisition across backends
+# ---------------------------------------------------------------------------
+
+def _engine_with_store(store_obj):
+    """Bare engine carrying only _store — merge_conversation touches
+    nothing else on self."""
+    from virtual_context.engine import VirtualContextEngine
+    eng = object.__new__(VirtualContextEngine)
+    eng._store = store_obj
+    return eng
+
+
+def test_merge_entry_precheck_works_without_get_conn(tmp_path):
+    """The tenant pre-check must work against a backend exposing a
+    connection pool but NO _get_conn — the connection-pool backend shape.
+    Pre-checks acquire from pool.connection() when present."""
+    from contextlib import contextmanager
+
+    sqlite = _store(tmp_path)
+    conn = sqlite._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_canonical_turn(conn, "src", "t1", sort_key=1.0)
+    conn.commit()
+    merge_id = _reserve(sqlite, source="src", target="tgt")
+
+    class _Pool:
+        @contextmanager
+        def connection(self):
+            yield sqlite._get_conn()
+
+    class _PoolOnlyInner:
+        """Pool-backed inner store: no _get_conn attribute at all."""
+        pool = _Pool()
+
+    class _FakeStore:
+        _segments = _PoolOnlyInner()
+
+        def merge_conversation_data(self, **kwargs):
+            return sqlite.merge_conversation_data(**kwargs)
+
+    engine = _engine_with_store(_FakeStore())
+    stats = engine.merge_conversation(
+        merge_id=merge_id,
+        tenant_id="tA",
+        source_conversation_id="src",
+        target_conversation_id="tgt",
+        source_lifecycle_epoch=1,
+        target_lifecycle_epoch=1,
+        source_label_at_merge="lbl",
+    )
+    assert stats.rows_moved.get("canonical_turns") == 1
+
+
+def test_merge_entry_precheck_still_works_with_get_conn_only(tmp_path):
+    """Backends exposing only _get_conn (no pool) keep working."""
+    sqlite = _store(tmp_path)
+    conn = sqlite._get_conn()
+    _seed_conversation(conn, "tA", "src2")
+    _seed_conversation(conn, "tA", "tgt2")
+    _seed_canonical_turn(conn, "src2", "t1", sort_key=1.0)
+    conn.commit()
+    merge_id = _reserve(sqlite, source="src2", target="tgt2")
+
+    engine = _engine_with_store(sqlite)
+    stats = engine.merge_conversation(
+        merge_id=merge_id,
+        tenant_id="tA",
+        source_conversation_id="src2",
+        target_conversation_id="tgt2",
+        source_lifecycle_epoch=1,
+        target_lifecycle_epoch=1,
+        source_label_at_merge="lbl",
+    )
+    assert stats.rows_moved.get("canonical_turns") == 1
