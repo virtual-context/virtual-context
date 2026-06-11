@@ -21,7 +21,6 @@ def _make_quote(ref: str, tag: str, session_date: str, text: str) -> QuoteResult
         tags=[tag],
         match_type="fts",
         session_date=session_date,
-        created_at="2024-08-01T00:00:00Z",
     )
 
 
