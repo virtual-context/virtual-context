@@ -11,10 +11,11 @@ import os
 import uuid
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
 
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 @pytest.fixture
@@ -90,7 +91,7 @@ def test_get_recent_limit_honored(store) -> None:
         rows = store.get_recent_canonical_turns(conv, limit=2)
         assert len(rows) == 2
     finally:
-        with store._get_conn() as conn:
+        with pg_test_conn() as conn:
             conn.execute("DELETE FROM canonical_turns WHERE conversation_id = %s", (conv,))
 
 
@@ -103,7 +104,7 @@ def test_get_recent_ordered_desc_by_sort_key(store) -> None:
         sort_keys = [r.sort_key for r in rows]
         assert sort_keys == sorted(sort_keys, reverse=True)
     finally:
-        with store._get_conn() as conn:
+        with pg_test_conn() as conn:
             conn.execute("DELETE FROM canonical_turns WHERE conversation_id = %s", (conv,))
 
 
@@ -117,7 +118,7 @@ def test_get_recent_includes_untagged_rows(store) -> None:
         untagged = [r for r in rows if not r.tagged_at]
         assert len(untagged) == 1
     finally:
-        with store._get_conn() as conn:
+        with pg_test_conn() as conn:
             conn.execute("DELETE FROM canonical_turns WHERE conversation_id = %s", (conv,))
 
 
@@ -132,7 +133,7 @@ def test_conversation_aliases_indexes_present(store) -> None:
     PK on ``alias_id`` -> ``conversation_aliases_pkey`` (Postgres
     convention). ``idx_conversation_aliases_target_id`` on ``target_id``.
     """
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute(
             "SELECT indexname FROM pg_indexes WHERE tablename = %s",
             ("conversation_aliases",),

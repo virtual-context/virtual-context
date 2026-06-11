@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
 pytestmark = [
     pytest.mark.skipif(
@@ -44,7 +45,7 @@ def pg_store():
     # Teardown: clear test rows from the merge tables. Don't drop the
     # tables themselves; that would race with parallel test workers.
     try:
-        conn = store._get_conn()
+        conn = pg_test_conn()
         conn.execute("DELETE FROM merge_post_commit_pending WHERE tenant_id LIKE 'pgtest-%'")
         conn.execute("DELETE FROM merge_audit WHERE tenant_id LIKE 'pgtest-%'")
         conn.execute("DELETE FROM conversations WHERE tenant_id LIKE 'pgtest-%'")
@@ -61,7 +62,7 @@ def _now() -> datetime:
 # ---------------------------------------------------------------------------
 
 def test_pg_conversations_phase_check_admits_merged(pg_store):
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     tid = f"pgtest-{uuid.uuid4()}"
     cid = f"conv-{uuid.uuid4()}"
     now = _now()
@@ -82,7 +83,7 @@ def test_pg_conversations_phase_check_admits_merged(pg_store):
 # ---------------------------------------------------------------------------
 
 def test_pg_merge_audit_unique_partial_index_rejects_duplicate_in_progress(pg_store):
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     tid = f"pgtest-{uuid.uuid4()}"
     src = f"src-{uuid.uuid4()}"
     tgt = f"tgt-{uuid.uuid4()}"
@@ -108,7 +109,7 @@ def test_pg_merge_audit_unique_partial_index_rejects_duplicate_in_progress(pg_st
 
 def test_pg_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(pg_store):
     """ INSERT trigger: tenant_id must match parent merge_audit row."""
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     tid = f"pgtest-{uuid.uuid4()}"
     merge_id = str(uuid.uuid4())
     conn.execute(
@@ -135,7 +136,7 @@ def test_pg_merge_post_commit_pending_insert_trigger_rejects_tenant_mismatch(pg_
 # ---------------------------------------------------------------------------
 
 def test_pg_conversation_aliases_has_epoch_column(pg_store):
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     cols = conn.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'conversation_aliases'",
@@ -149,7 +150,7 @@ def test_pg_conversation_aliases_has_epoch_column(pg_store):
 # ---------------------------------------------------------------------------
 
 def test_pg_per_conv_tables_have_origin_conversation_id(pg_store):
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     for tbl in ("segments", "canonical_turns", "facts", "tool_outputs",
                 "tag_summaries"):
         cols = conn.execute(

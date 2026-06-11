@@ -25,9 +25,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def _store():
@@ -46,7 +47,7 @@ def _fresh(conv_id: str | None = None):
 def _seed_canonical(s, *, conv_id: str, count: int, tagged: int) -> None:
     """Insert ``count`` canonical rows; first ``tagged`` of them have tagged_at set."""
     now = datetime.now(timezone.utc)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     for i in range(count):
         conn.execute(
             """
@@ -156,7 +157,7 @@ def test_claim_succeeds_when_other_worker_lease_is_stale_pg():
     )
     # Force stale heartbeat.
     stale = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    conn = s._get_conn()
+    conn = pg_test_conn()
     conn.execute(
         "UPDATE ingestion_episode SET heartbeat_ts = %s WHERE conversation_id = %s",
         (stale, cid),

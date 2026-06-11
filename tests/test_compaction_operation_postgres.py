@@ -10,15 +10,16 @@ that enforces at-most-one active (queued/running) operation per
 import os
 
 import pytest
+from tests.pg_helpers import pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL not set")
+PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
 
 def test_compaction_operation_table_exists_pg():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute("""
             SELECT column_name FROM information_schema.columns
              WHERE table_name = 'compaction_operation'
@@ -37,7 +38,7 @@ def test_compaction_operation_table_exists_pg():
 def test_compaction_operation_partial_unique_index_predicate_pg():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
-    with store._get_conn() as conn:
+    with pg_test_conn() as conn:
         rows = conn.execute("""
             SELECT indexname, indexdef FROM pg_indexes
              WHERE tablename = 'compaction_operation'

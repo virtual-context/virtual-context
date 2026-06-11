@@ -33,6 +33,7 @@ from virtual_context.core.exceptions import (
     MergeAuditMissing,
     MergeBusy,
 )
+from tests.pg_helpers import pg_test_conn
 
 
 pytestmark = [
@@ -56,7 +57,7 @@ def pg_store():
     store = PostgresStore(dsn)
     yield store
     try:
-        conn = store._get_conn()
+        conn = pg_test_conn()
         for tbl in (
             "merge_post_commit_pending", "merge_audit",
             "tag_aliases", "tag_summaries", "tag_summary_embeddings",
@@ -118,7 +119,7 @@ def test_pg_body_raises_merge_audit_missing_without_reservation(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     with pytest.raises(MergeAuditMissing):
@@ -139,7 +140,7 @@ def test_pg_body_refuses_cross_tenant_source(pg_store):
     tid_b = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid_a, tgt)  # target under tenant A
     _seed_conversation(conn, tid_b, src)  # source under tenant B
     merge_id = _reserve(pg_store, tenant=tid_a, src=src, tgt=tgt)
@@ -157,7 +158,7 @@ def test_pg_body_refuses_lifecycle_epoch_mismatch(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src, lifecycle_epoch=1)
     _seed_conversation(conn, tid, tgt, lifecycle_epoch=5)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -184,7 +185,7 @@ def test_pg_body_moves_segments_and_canonical_turns(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     seg_ref = f"pgsmoke-seg-{uuid.uuid4().hex[:8]}"
@@ -220,7 +221,7 @@ def test_pg_body_bumps_target_request_turn_counter(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     # target counter at 3
@@ -271,7 +272,7 @@ def test_pg_body_captures_prior_alias_target_in_audit(pg_store):
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
     earlier = f"pgsmoke-earlier-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     _seed_conversation(conn, tid, earlier)
@@ -309,7 +310,7 @@ def test_pg_body_post_commit_pendings_written(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -334,7 +335,7 @@ def test_pg_body_returns_merge_stats_with_v14_fields(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -369,7 +370,7 @@ def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, 
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -450,7 +451,7 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
     # Setup with main conn
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     # source has tool_calls 1..3
