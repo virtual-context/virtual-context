@@ -17,9 +17,11 @@ import importlib.util
 import os
 import pytest
 
+from tests.pg_helpers import pg_dsn
+
 
 _pg_required = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set; skipping PG catalog smoke tests",
 )
 _psycopg_required = pytest.mark.skipif(
@@ -32,7 +34,7 @@ _psycopg_required = pytest.mark.skipif(
 def store():
     from virtual_context.storage.postgres import PostgresStore
 
-    s = PostgresStore(os.environ["DATABASE_URL"])
+    s = PostgresStore(pg_dsn())
     yield s
     # No teardown: schema additions are idempotent ALTERs and the test
     # database is reused across runs.

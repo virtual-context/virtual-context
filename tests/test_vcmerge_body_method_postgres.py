@@ -33,12 +33,12 @@ from virtual_context.core.exceptions import (
     MergeAuditMissing,
     MergeBusy,
 )
-from tests.pg_helpers import pg_test_conn
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 
 pytestmark = [
     pytest.mark.skipif(
-        not os.environ.get("DATABASE_URL"),
+        not pg_dsn(),
         reason="DATABASE_URL not set: Postgres smoke skipped",
     ),
     pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26"),
@@ -53,7 +53,7 @@ def pg_store():
     prefix.
     """
     from virtual_context.storage.postgres import PostgresStore
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn)
     yield store
     try:
@@ -446,7 +446,7 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
     and observes the post-bump counter.
     """
     import psycopg
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"

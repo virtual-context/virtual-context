@@ -19,6 +19,19 @@ import os
 _CONN = None
 
 
+def pg_dsn() -> str | None:
+    """The single sanctioned DSN resolver for the Postgres test fleet.
+
+    Every fleet file must gate and connect through this function —
+    never through a direct ``os.environ`` lookup — so that setting
+    EITHER sanctioned variable enables the entire fleet. A file that
+    reads the environment directly can silently honor only one
+    spelling; the fleet sentinel's gate-uniformity lint enforces use
+    of this resolver.
+    """
+    return os.environ.get("DATABASE_URL") or os.environ.get("VC_TEST_POSTGRES_URL")
+
+
 def pg_test_conn():
     """Return the shared direct connection to ``DATABASE_URL``.
 
@@ -30,7 +43,8 @@ def pg_test_conn():
     from psycopg.rows import dict_row
 
     if _CONN is None or _CONN.closed:
-        dsn = os.environ.get("DATABASE_URL") or os.environ["VC_TEST_POSTGRES_URL"]
+        dsn = pg_dsn()
+        assert dsn, "no Postgres DSN configured"
         _CONN = psycopg.connect(
             dsn,
             row_factory=dict_row,

@@ -28,12 +28,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
-from tests.pg_helpers import pg_test_conn
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set — Postgres E2E compaction-resume test skipped",
 )
 
@@ -176,7 +176,7 @@ def test_compaction_resume_e2e_postgres():
     the DB-lifecycle path (claim → cleanup → new_op row → completed), NOT the
     actual segmentation output.
     """
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     conv = f"e2e-test-{uuid.uuid4().hex[:8]}"
     dead_op = uuid.uuid4().hex
 

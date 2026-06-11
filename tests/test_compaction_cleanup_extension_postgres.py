@@ -24,9 +24,11 @@ import uuid
 
 import pytest
 
+from tests.pg_helpers import pg_dsn
+
 
 _pg_required = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set; skipping PG cleanup smoke tests",
 )
 
@@ -39,7 +41,7 @@ def store():
     from virtual_context.core.compaction_fence import CompactionFenceMode
     from virtual_context.storage.postgres import PostgresStore
     s = PostgresStore(
-        os.environ["DATABASE_URL"],
+        pg_dsn(),
         compaction_fence_mode=CompactionFenceMode.ACTIVE,
     )
     yield s

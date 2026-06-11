@@ -8,14 +8,14 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import pytest
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set; skipping Postgres integration test.",
 )
 
 from virtual_context.storage.postgres import PostgresStore
-from tests.pg_helpers import pg_test_conn
 
 
 TARGETS = [
@@ -38,7 +38,7 @@ def _columns_of(store: PostgresStore, table: str) -> set[str]:
 
 
 def test_migration_adds_all_five_operation_id_columns_postgres():
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn=dsn)  # construction triggers schema
     for table, col in TARGETS:
         cols = _columns_of(store, table)
@@ -55,7 +55,7 @@ def test_ensure_canonical_turn_views_survives_underlying_column_add_postgres():
     deploy: ``InvalidTableDefinition: cannot change name of view column
     "turn_number" to "compaction_operation_id"``.
     """
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn=dsn)
     conn = pg_test_conn()
 
@@ -112,7 +112,7 @@ def test_concurrent_workers_racing_canonical_turn_view_migration_postgres():
     """
     import threading
 
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     # Two independent stores → two connections → true concurrency.
     store_a = PostgresStore(dsn=dsn)
     store_b = PostgresStore(dsn=dsn)
@@ -152,7 +152,7 @@ def test_migration_backfills_null_operation_id_to_zero_uuid_postgres():
     """Same spec contract as SQLite test. Legacy rows get the
     zero-UUID sentinel, never NULL, after migration.
     """
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     ZERO_UUID = "00000000-0000-0000-0000-000000000000"
     store = PostgresStore(dsn=dsn)
     conn = pg_test_conn()

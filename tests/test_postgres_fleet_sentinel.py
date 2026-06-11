@@ -58,12 +58,20 @@ def test_pg_substrate_preflight():
 
 
 def test_pg_fleet_gates_are_uniform():
-    """Every Postgres test file must gate on a sanctioned env variable.
+    """Every Postgres test file must gate through the shared DSN resolver.
 
-    A file gated on any other variable never runs anywhere and looks
-    permanently 'skipped' — the exact shape under which the fleet's
-    breakage hid. Scans each ``tests/*postgres*.py`` for the variables
-    its skip gate reads and asserts they are the sanctioned pair.
+    Two silent-skip shapes are banned:
+
+    * gating on an unsanctioned env-variable spelling — the file never
+      runs anywhere;
+    * reading a sanctioned variable DIRECTLY via ``os.environ`` — the
+      file honors only one of the two sanctioned spellings, so the
+      fleet silently loses tests under the other (observed: 61 tests
+      skipped under VC_TEST_POSTGRES_URL while green under
+      DATABASE_URL).
+
+    Files must import and use ``tests.pg_helpers.pg_dsn`` for both the
+    skip gate and store construction.
     """
     tests_dir = pathlib.Path(__file__).parent
     env_read = re.compile(r"os\.environ(?:\.get)?[\(\[]\s*[\"']([A-Z0-9_]+)[\"']")
@@ -76,11 +84,20 @@ def test_pg_fleet_gates_are_uniform():
         unknown = vars_read - _SANCTIONED_VARS
         if unknown:
             offenders[path.name] = unknown
-        # A Postgres-named test file with no env gate at all would run
-        # (and fail) everywhere — also flag it unless it self-skips.
-        if not vars_read and "skipif" not in text and "pg_test_conn" in text:
+        # Direct reads of the sanctioned vars honor only one spelling;
+        # require the shared resolver instead.
+        direct_sanctioned = vars_read & _SANCTIONED_VARS
+        if direct_sanctioned:
+            offenders[path.name] = (
+                offenders.get(path.name, set())
+                | {f"direct read of {v} (use pg_dsn())" for v in direct_sanctioned}
+            )
+        # A Postgres-named test file with no gate at all would run
+        # (and fail) everywhere — flag it unless it self-skips.
+        uses_db = "pg_test_conn" in text or "pg_dsn" in text
+        if not vars_read and "pg_dsn" not in text and "skipif" not in text and uses_db:
             offenders[path.name] = {"<no env gate>"}
     assert not offenders, (
-        "Postgres test files gating on unsanctioned env variables "
-        f"(use DATABASE_URL / VC_TEST_POSTGRES_URL): {offenders}"
+        "Postgres test files must gate via tests.pg_helpers.pg_dsn(): "
+        f"{offenders}"
     )

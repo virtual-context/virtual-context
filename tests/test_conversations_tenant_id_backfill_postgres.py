@@ -23,12 +23,12 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-from tests.pg_helpers import pg_test_conn
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 
 pytestmark = [
     pytest.mark.skipif(
-        not os.environ.get("DATABASE_URL"),
+        not pg_dsn(),
         reason="DATABASE_URL not set: Postgres smoke skipped",
     ),
     pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26"),
@@ -40,7 +40,7 @@ def pg_store():
     """Build a PostgresStore against DATABASE_URL. Cleanup teardown drops
     test rows under the test tenant prefix."""
     from virtual_context.storage.postgres import PostgresStore
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn)
     yield store
     try:

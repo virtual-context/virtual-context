@@ -17,16 +17,16 @@ import os
 import uuid
 
 import pytest
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set — Postgres tests skipped",
 )
 
 from virtual_context.storage.postgres import PostgresStore  # noqa: E402
-from tests.pg_helpers import pg_test_conn
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ def _teardown(store: PostgresStore, conv: str) -> None:
 
 @pytest.fixture
 def store():
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     return PostgresStore(dsn=dsn)
 
 

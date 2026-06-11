@@ -9,9 +9,9 @@ indexes used by the DB-derived progress tracker.
 import os
 
 import pytest
-from tests.pg_helpers import pg_test_conn
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
+PG_URL = pg_dsn()
 
 pytestmark = pytest.mark.skipif(not PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
 
