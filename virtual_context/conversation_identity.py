@@ -311,9 +311,18 @@ def resolve_conversation_id(
     Special case: if explicit_id is already a valid UUID AND no format_name,
     returned as-is.  With format_name, it is re-hashed to include the format.
     Returns a random UUID if no signals are found.
+
+    Reserved namespace: explicit ids with the ``sk:`` prefix are
+    caller-asserted stable identities (e.g. derived from a chat scope's
+    session key).  They are returned verbatim on every path — no UUID
+    parse, no format_name salt.  A stable id names the same conversation
+    regardless of payload format; canonical-turn hash dedup absorbs any
+    cross-format replay overlap.
     """
     if explicit_id and explicit_id.strip():
         explicit_id = explicit_id.strip()
+        if explicit_id.startswith("sk:"):
+            return explicit_id
         # If explicit_id is already a valid UUID (e.g. from a vc:conversation
         # marker in a previous response), use it as-is.  The marker IS the
         # canonical conversation ID — re-hashing it with format_name would

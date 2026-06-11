@@ -265,3 +265,44 @@ class TestSystemPromptChatId:
         result = resolve_conversation_id(body)
         expected = _candidate_to_uuid("chat_id", "telegram:123")
         assert result == expected
+
+
+class TestSkNamespaceVerbatim:
+    """`sk:`-prefixed explicit ids are caller-asserted stable identities.
+
+    They pass through verbatim on every path: no UUID parse, no
+    format_name salt. Non-sk non-UUID explicit ids keep the existing
+    hash (+ format salt) behavior — pinned here so the namespace
+    change is provably additive.
+    """
+
+    def test_sk_explicit_id_verbatim(self):
+        sk = "sk:agent:bastkid-dedicated:telegram:group:-5156869263"
+        assert resolve_conversation_id({}, explicit_id=sk) == sk
+
+    def test_sk_explicit_id_verbatim_with_format_name(self):
+        sk = "sk:agent:bastkid-dedicated:telegram:direct:8049932331"
+        assert resolve_conversation_id({}, explicit_id=sk, format_name="anthropic") == sk
+
+    def test_sk_explicit_id_stripped_then_verbatim(self):
+        sk = "sk:agent:a:main"
+        assert resolve_conversation_id({}, explicit_id=f"  {sk}  ") == sk
+
+    def test_sk_requires_exact_prefix(self):
+        # "sk" without the colon is NOT the namespace — still hashed.
+        result = resolve_conversation_id({}, explicit_id="skagent:foo")
+        assert result == _candidate_to_uuid("explicit_id", "skagent:foo")
+
+    def test_non_sk_non_uuid_still_hashed_with_format_salt(self):
+        # Pin existing behavior: format_name salts non-sk explicit ids.
+        plain = resolve_conversation_id({}, explicit_id="my-custom-id")
+        salted = resolve_conversation_id(
+            {}, explicit_id="my-custom-id", format_name="anthropic",
+        )
+        assert plain == _candidate_to_uuid("explicit_id", "my-custom-id")
+        assert salted == _candidate_to_uuid("explicit_id", "anthropic:my-custom-id")
+        assert plain != salted
+
+    def test_uuid_explicit_id_still_verbatim(self):
+        explicit = str(uuid.uuid4())
+        assert resolve_conversation_id({}, explicit_id=explicit) == explicit

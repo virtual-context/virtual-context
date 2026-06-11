@@ -18,8 +18,12 @@ _VC_PROMPT_MARKER = "[vc:prompt]\n"
 _MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
 
 # Conversation marker: injected into assistant responses, extracted from inbound history
-# Accepts both legacy "vc:session" and current "vc:conversation"
-_VC_CONVERSATION_RE = re.compile(r"<!-- vc:(?:session|conversation)=([a-f0-9-]+) -->")
+# Accepts both legacy "vc:session" and current "vc:conversation".
+# Ids are either bare UUIDs or `sk:`-namespace stable identities
+# (caller-asserted, passed verbatim by resolve_conversation_id).
+_VC_CONVERSATION_RE = re.compile(
+    r"<!-- vc:(?:session|conversation)=(sk:[^\s<>]+|[a-f0-9-]+) -->"
+)
 
 # OpenClaw envelope patterns — consistent across all channels
 _VC_USER_RE = re.compile(r"^\[vc:user\](.*?)\[/vc:user\]", re.DOTALL)

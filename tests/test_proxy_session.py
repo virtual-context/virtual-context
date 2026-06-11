@@ -101,6 +101,25 @@ class TestExtractSessionId:
         ]}
         assert _extract_conversation_id(body) == "dead-beef-1234"
 
+    def test_extracts_sk_namespace_marker(self):
+        # sk:-namespace conversation ids round-trip through the marker.
+        sk = "sk:agent:bastkid-dedicated:telegram:group:-5156869263"
+        body = {"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": f"Hi\n<!-- vc:conversation={sk} -->"},
+            {"role": "user", "content": "Next"},
+        ]}
+        assert _extract_conversation_id(body) == sk
+
+    def test_sk_marker_strip_roundtrip(self):
+        from virtual_context.proxy.helpers import _strip_conversation_markers
+        sk = "sk:agent:a:main"
+        body = {"messages": [
+            {"role": "assistant", "content": f"Hi\n<!-- vc:conversation={sk} -->"},
+        ]}
+        stripped = _strip_conversation_markers(body)
+        assert "vc:conversation" not in stripped["messages"][0]["content"]
+
     def test_returns_none_when_no_marker(self):
         body = {"messages": [
             {"role": "user", "content": "Hello"},
