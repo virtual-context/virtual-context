@@ -2007,3 +2007,89 @@ def test_merge_entry_precheck_still_works_with_get_conn_only(tmp_path):
         source_label_at_merge="lbl",
     )
     assert stats.rows_moved.get("canonical_turns") == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-silo natural-key conflicts: dedup-not-fail on join/content tables
+# ---------------------------------------------------------------------------
+
+def _seed_turn_tool_output(conn, conv: str, turn_number: int, ref: str):
+    conn.execute(
+        "INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref) "
+        "VALUES (?, ?, ?)",
+        (conv, turn_number, ref),
+    )
+
+
+def _seed_media_output(conn, conv: str, ref: str):
+    conn.execute(
+        "INSERT INTO media_outputs (ref, conversation_id, media_type, width, "
+        "height, original_bytes, compressed_bytes, file_path, created_at) "
+        "VALUES (?, ?, 'image/png', 1, 1, 10, 5, '/x', '')",
+        (ref, conv),
+    )
+
+
+def test_body_dedups_conflicting_turn_tool_outputs(tmp_path):
+    """Source and target carrying an IDENTICAL (turn_number,
+    tool_output_ref) row must merge cleanly: target's row wins, the
+    source's duplicate is dropped and counted, non-conflicting rows move.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    # Identical join row in BOTH conversations (overlapping re-ingest).
+    _seed_turn_tool_output(conn, "src", 0, "tool_dup")
+    _seed_turn_tool_output(conn, "tgt", 0, "tool_dup")
+    # Non-conflicting source row must still move.
+    _seed_turn_tool_output(conn, "src", 5, "tool_only_src")
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    rows = conn.execute(
+        "SELECT turn_number, tool_output_ref FROM turn_tool_outputs "
+        "WHERE conversation_id = 'tgt' ORDER BY turn_number",
+    ).fetchall()
+    assert [(r[0], r[1]) for r in rows] == [(0, "tool_dup"), (5, "tool_only_src")]
+    src_left = conn.execute(
+        "SELECT COUNT(*) FROM turn_tool_outputs WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_left == 0
+    assert stats.rows_moved.get("turn_tool_outputs") == 1
+    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 1
+
+
+def test_body_dedups_conflicting_media_outputs(tmp_path):
+    """media_outputs keys on (conversation_id, ref); identical
+    content-hash refs across sibling conversations must dedup, not fail."""
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    _seed_media_output(conn, "src", "img_samehash")
+    _seed_media_output(conn, "tgt", "img_samehash")
+    _seed_media_output(conn, "src", "img_only_src")
+    conn.commit()
+    merge_id = _reserve(store)
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    refs = {
+        r[0] for r in conn.execute(
+            "SELECT ref FROM media_outputs WHERE conversation_id = 'tgt'",
+        ).fetchall()
+    }
+    assert refs == {"img_samehash", "img_only_src"}
+    src_left = conn.execute(
+        "SELECT COUNT(*) FROM media_outputs WHERE conversation_id = 'src'",
+    ).fetchone()[0]
+    assert src_left == 0
+    assert stats.rows_moved.get("media_outputs") == 1
+    assert stats.rows_moved.get("media_outputs__conflicts_deleted") == 1

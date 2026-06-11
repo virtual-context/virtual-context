@@ -3357,6 +3357,9 @@ class PostgresStore(ContextStore):
           (b) tag_summaries + tag_summary_embeddings on conflict resolution
               (target wins);
           (c) tag_aliases on conflict resolution (target wins);
+          (d) turn_tool_outputs + media_outputs source rows whose natural
+              key already exists at target (target wins — sibling
+              conversations can carry identical join/content-hash rows);
         i.e. NEVER against segments/canonical_turns/facts/etc. Move
         semantics is UPDATE conversation_id, not DELETE FROM <table>.
         """
@@ -3379,8 +3382,17 @@ class PostgresStore(ContextStore):
             # action 'tag_conflict': special tag-summary conflict resolution
             TABLES_SIMPLE = (
                 "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-                "ingest_batches", "facts", "turn_tool_outputs",
-                "segment_tool_outputs", "chain_snapshots", "media_outputs",
+                "ingest_batches", "facts",
+                "segment_tool_outputs", "chain_snapshots",
+            )
+            # Tables whose natural key can legitimately collide across
+            # sibling conversations (overlapping re-ingest produces
+            # identical join / content-hash rows). Conflict resolution
+            # mirrors the tag tables: target wins, the source's
+            # conflicting rows are DELETEd and counted, the rest moves.
+            TABLES_NATURAL_KEY_CONFLICT = (
+                ("turn_tool_outputs", ("turn_number", "tool_output_ref")),
+                ("media_outputs", ("ref",)),
             )
             TABLES_OFFSET_SORT_KEY = (
                 ("canonical_turns", "sort_key"),
@@ -3644,6 +3656,29 @@ class PostgresStore(ContextStore):
                         (target_conversation_id, source_conversation_id, source_conversation_id),
                     )
                     rows_moved[tbl] = cur.rowcount
+
+                # Natural-key conflict tables: drop source rows whose key
+                # already exists at target (bounded DELETE surface, target
+                # wins), then move the remainder.
+                for tbl, key_cols in TABLES_NATURAL_KEY_CONFLICT:
+                    key_list = ", ".join(key_cols)
+                    cur = conn.execute(
+                        f"DELETE FROM {tbl} "
+                        f" WHERE conversation_id = %s "
+                        f"   AND ({key_list}) IN "
+                        f"       (SELECT {key_list} FROM {tbl} WHERE conversation_id = %s)",
+                        (source_conversation_id, target_conversation_id),
+                    )
+                    deleted_conflicts = cur.rowcount
+                    cur2 = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = %s, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                        f" WHERE conversation_id = %s",
+                        (target_conversation_id, source_conversation_id, source_conversation_id),
+                    )
+                    rows_moved[tbl] = cur2.rowcount
+                    rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
 
                 # canonical_turns rows arrive with
                 # source's compacted_at populated. Target's compaction prefix
