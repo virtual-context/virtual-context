@@ -1793,3 +1793,88 @@ def test_pg_share_lock_helper_present_on_postgres_store(tmp_path):
         "share-lock contract: PostgresStore.save_request_context no longer invokes "
         "_acquire_lifecycle_share_lock; lock contract regressed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Alias interplay pins: merge endpoints are LITERAL ids, never alias-resolved
+# ---------------------------------------------------------------------------
+
+def test_body_source_scoping_is_literal_when_source_also_has_alias(tmp_path):
+    """A source holding BOTH its own rows AND an outgoing alias moves only
+    its OWN rows; the alias terminal's rows are untouched.
+
+    Dual-existence shape: a conversation acquired an alias to a terminal
+    while still holding stranded rows under its own id. The merge body's
+    per-table UPDATEs are conversation_id-scoped to the literal source.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "dual-src")
+    _seed_conversation(conn, "tA", "terminal-conv")
+    _seed_conversation(conn, "tA", "tgt")
+    # Source's own stranded rows.
+    _seed_canonical_turn(conn, "dual-src", "stranded-1", sort_key=1.0)
+    _seed_canonical_turn(conn, "dual-src", "stranded-2", sort_key=2.0)
+    # Terminal's rows — must never move.
+    _seed_canonical_turn(conn, "terminal-conv", "terminal-1", sort_key=1.0)
+    conn.commit()
+    # Source is ALSO an alias to the terminal (dual existence).
+    store.save_conversation_alias("dual-src", "terminal-conv")
+
+    merge_id = _reserve(store, source="dual-src", target="tgt")
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="dual-src", target_conversation_id="tgt",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    assert stats.rows_moved.get("canonical_turns") == 2
+    # Terminal untouched.
+    terminal_count = conn.execute(
+        "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = 'terminal-conv'",
+    ).fetchone()[0]
+    assert terminal_count == 1
+    # Target received exactly the source's own rows.
+    tgt_ids = {
+        r["canonical_turn_id"] for r in conn.execute(
+            "SELECT canonical_turn_id FROM canonical_turns "
+            "WHERE conversation_id = 'tgt'",
+        ).fetchall()
+    }
+    assert tgt_ids == {"stranded-1", "stranded-2"}
+
+
+def test_body_target_is_literal_even_when_target_has_outgoing_alias(tmp_path):
+    """Merge does NOT resolve the target's alias chain: rows land under the
+    literal target id even when that id aliases to another conversation.
+
+    Pins the literal-endpoint contract: callers that want merged content
+    reachable through alias-bound readers must pass the chain TERMINAL as
+    the target themselves. If this test ever fails because the body starts
+    resolving aliases, that contract change must be made consciously.
+    """
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "alias-target")
+    _seed_conversation(conn, "tA", "real-terminal")
+    _seed_canonical_turn(conn, "src", "row-1", sort_key=1.0)
+    conn.commit()
+    # Target id has an outgoing alias to the real terminal.
+    store.save_conversation_alias("alias-target", "real-terminal")
+
+    merge_id = _reserve(store, source="src", target="alias-target")
+    stats = store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="alias-target",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    assert stats.rows_moved.get("canonical_turns") == 1
+    # Rows land under the LITERAL target id, not the alias terminal.
+    literal_count = conn.execute(
+        "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = 'alias-target'",
+    ).fetchone()[0]
+    terminal_count = conn.execute(
+        "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = 'real-terminal'",
+    ).fetchone()[0]
+    assert literal_count == 1
+    assert terminal_count == 0
