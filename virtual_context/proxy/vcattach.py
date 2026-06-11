@@ -3,8 +3,184 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PredecessorLinkResult:
+    """Outcome of a ``link_predecessor`` call.
+
+    ``outcome`` is one of:
+
+    * ``"noop"`` — nothing to do (same id, already linked, or invalid
+      input; ``reason`` differentiates).
+    * ``"linked"`` — an alias row was written; ``alias_source`` /
+      ``alias_target`` carry the direction.
+    * ``"conflict"`` — one side is already bound to a different
+      terminal (or the alias chain is corrupt).  Nothing was written;
+      existing aliases are never repointed.
+    * ``"needs_merge"`` — both conversations hold canonical turns.  An
+      alias in either direction would strand one side's stored content,
+      so nothing was written; resolution belongs to the merge machinery.
+
+    Intended to surface in response metadata — a conflict or
+    needs_merge must never fail the request that carried the hint.
+    """
+
+    outcome: str
+    reason: str = ""
+    alias_source: str = ""
+    alias_target: str = ""
+    detail: str = ""
+
+
+def _has_canonical_turns(store, conversation_id: str) -> bool:
+    """Return True iff *conversation_id* has at least one canonical turn.
+
+    Uses the indexed most-recent-row lookup when available; falls back
+    to the full-scan accessor for minimal store implementations.
+    """
+    recent = getattr(store, "get_recent_canonical_turns", None)
+    if callable(recent):
+        try:
+            return bool(recent(conversation_id, limit=1))
+        except Exception:
+            logger.warning(
+                "link_predecessor: get_recent_canonical_turns failed for %s",
+                conversation_id[:12], exc_info=True,
+            )
+    get_all = getattr(store, "get_all_canonical_turns", None)
+    if callable(get_all):
+        try:
+            return bool(get_all(conversation_id))
+        except Exception:
+            logger.warning(
+                "link_predecessor: get_all_canonical_turns failed for %s",
+                conversation_id[:12], exc_info=True,
+            )
+    return False
+
+
+def link_predecessor(
+    predecessor_id: str,
+    stable_id: str,
+    store,
+    *,
+    registry_invalidate=None,
+    cross_worker_invalidate=None,
+    session_state_provider=None,
+) -> PredecessorLinkResult:
+    """Idempotently link a predecessor conversation to a stable identity.
+
+    Designed for an every-request hint: a caller that adopted a stable
+    conversation id (``sk:`` namespace) names the conversation it
+    superseded, and this surface decides whether and how to link them.
+
+    Decision tree:
+
+    1. Blank ids or ``predecessor_id == stable_id`` → ``noop``.
+    2. Both ids are resolved through the alias chain.  Equal terminals →
+       ``noop`` (idempotent replay).  Either side bound to a *different*
+       terminal → ``conflict``; existing aliases are NEVER repointed
+       (the underlying alias upsert is last-write-wins, so first-write-
+       wins is enforced here).
+    3. Stable side has no canonical turns and the predecessor has data →
+       alias **stable → predecessor**: the stable id binds onto the
+       data-bearing conversation.  An alias only achieves retrieval
+       reach in this direction; aliasing the predecessor at a still-empty
+       stable conversation would strand the predecessor's stored turns.
+    4. Predecessor has no canonical turns → alias **predecessor →
+       stable** (nothing to strand; stray requests for the old id route
+       forward).  Also the both-empty default.
+    5. Both sides hold canonical turns → ``needs_merge``: no alias is
+       written; moving data is the merge machinery's job.
+
+    Linked branches delegate to :func:`execute_attach`, so target
+    SessionState marker derivation, cross-worker invalidation, and
+    local registry eviction behave exactly like VCATTACH.  Callers that
+    hold a cached state for either id must re-resolve after a
+    ``"linked"`` outcome (the invalidate callbacks evict both ids).
+
+    Never raises for semantic outcomes; the result is metadata.
+    """
+    pred = (predecessor_id or "").strip()
+    stable = (stable_id or "").strip()
+    if not pred or not stable:
+        return PredecessorLinkResult(outcome="noop", reason="invalid_input")
+    if pred == stable:
+        return PredecessorLinkResult(outcome="noop", reason="same_id")
+
+    from ..core.alias_resolution import (
+        AliasResolutionError,
+        walk_conversation_alias_chain,
+    )
+
+    try:
+        pred_terminal = walk_conversation_alias_chain(store, pred)
+        stable_terminal = walk_conversation_alias_chain(store, stable)
+    except AliasResolutionError as exc:
+        logger.warning(
+            "link_predecessor: alias chain error for %s / %s: %s",
+            pred[:12], stable[:12], exc,
+        )
+        return PredecessorLinkResult(
+            outcome="conflict", reason="alias_chain_error", detail=str(exc),
+        )
+
+    if pred_terminal == stable_terminal:
+        return PredecessorLinkResult(outcome="noop", reason="already_linked")
+
+    # Never repoint: a side whose terminal differs from itself already
+    # has an outgoing alias bound elsewhere.
+    if pred_terminal != pred:
+        return PredecessorLinkResult(
+            outcome="conflict",
+            reason="predecessor_bound_elsewhere",
+            detail=f"{pred[:12]} resolves to {pred_terminal[:12]}",
+        )
+    if stable_terminal != stable:
+        return PredecessorLinkResult(
+            outcome="conflict",
+            reason="stable_bound_elsewhere",
+            detail=f"{stable[:12]} resolves to {stable_terminal[:12]}",
+        )
+
+    pred_has_data = _has_canonical_turns(store, pred)
+    stable_has_data = _has_canonical_turns(store, stable)
+
+    if pred_has_data and stable_has_data:
+        return PredecessorLinkResult(outcome="needs_merge", reason="both_have_data")
+
+    if pred_has_data:
+        # Stable side is empty: bind the stable id onto the data-bearing
+        # predecessor so retrieval through the stable id reaches it.
+        alias_source, alias_target = stable, pred
+        reason = "stable_empty"
+    else:
+        # Predecessor empty (or both empty): route the old id forward.
+        alias_source, alias_target = pred, stable
+        reason = "predecessor_empty"
+
+    execute_attach(
+        alias_source,
+        alias_target,
+        store,
+        registry_invalidate=registry_invalidate,
+        cross_worker_invalidate=cross_worker_invalidate,
+        session_state_provider=session_state_provider,
+    )
+    logger.info(
+        "PREDECESSOR_LINK: %s -> %s (%s)",
+        alias_source[:12], alias_target[:12], reason,
+    )
+    return PredecessorLinkResult(
+        outcome="linked",
+        reason=reason,
+        alias_source=alias_source,
+        alias_target=alias_target,
+    )
 
 
 def resolve_target(
