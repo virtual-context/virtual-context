@@ -305,10 +305,26 @@ def test_phase_gate_compacting_widens_pending_and_returns(tmp_path):
     try:
         conv_id = state.engine.config.conversation_id
         inner = _inner_store(state.engine)
-        # Force phase='compacting'.
+        # Force phase='compacting' WITH a live operation row owned by a
+        # peer worker. phase='compacting' without an active op row is an
+        # illegal state that the orphan repair in handle_prepare_payload
+        # flips back to 'active'; the widen-and-return branch under test
+        # only runs against a legal compacting state.
         inner.set_phase(
             conversation_id=conv_id, lifecycle_epoch=1, phase="compacting",
         )
+        import uuid as _uuid
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc).isoformat()
+        with inner._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO compaction_operation (
+                       operation_id, conversation_id, lifecycle_epoch,
+                       phase_index, phase_count, phase_name, status,
+                       started_at, owner_worker_id, heartbeat_ts
+                   ) VALUES (?, ?, 1, 0, 7, 'starting', 'running', ?, ?, ?)""",
+                (_uuid.uuid4().hex, conv_id, _now, "peer-worker", _now),
+            )
         decision = state.handle_prepare_payload(
             body={"messages": [{"role": "user", "content": "hi"}]},
             payload_accounting={
