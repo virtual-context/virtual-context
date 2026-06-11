@@ -614,6 +614,42 @@ class VirtualContextEngine:
             cross_worker_invalidate=cross_worker_invalidate,
         )
 
+    def link_predecessor(
+        self,
+        predecessor_id: str,
+        stable_id: str,
+        *,
+        cross_worker_invalidate=None,
+    ) -> dict:
+        """Idempotently link a predecessor conversation to a stable id.
+
+        Thin engine entry over :func:`proxy.vcattach.link_predecessor` —
+        wires this engine's store and session-state provider; only the
+        cross-worker invalidation callback is caller-supplied. Returns
+        the result as a plain dict (metadata-safe): keys ``outcome``,
+        ``reason``, ``alias_source``, ``alias_target``, ``detail``.
+
+        Callers holding cached runtime state for either id must
+        re-resolve after a ``"linked"`` outcome — a linked alias changes
+        which terminal the ids bind to on the next construction.
+        """
+        from dataclasses import asdict
+
+        from .proxy.vcattach import link_predecessor as _link
+
+        store = self._store
+        inner = getattr(store, "_store", store) if store is not None else None
+        result = _link(
+            predecessor_id,
+            stable_id,
+            inner,
+            cross_worker_invalidate=cross_worker_invalidate,
+            session_state_provider=getattr(
+                self, "_session_state_provider", None,
+            ),
+        )
+        return asdict(result)
+
     def close(self) -> None:
         store = getattr(self, "_store", None)
         if store is not None and hasattr(store, "close"):
