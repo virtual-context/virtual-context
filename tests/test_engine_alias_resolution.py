@@ -381,6 +381,27 @@ def test_engine_init_with_alias_rebinds_to_target(engine_factory) -> None:
     assert engine.config.conversation_id == "target-conv-aaa"
 
 
+def test_engine_init_alias_wins_over_source_shell_row(engine_factory) -> None:
+    """A source id holding BOTH an alias row and its own zero-turn
+    `conversations` shell row still rebinds to the alias target.
+
+    This shape arises when a stable-identity conversation issues an
+    attach as its first act: the command prepare creates a shell
+    conversations row under the stable id before the alias commits.
+    The alias-chain walk consults only conversation_aliases — the
+    shell row must not shadow the redirect."""
+    sk_id = "sk:agent:test-agent:telegram:group:-555"
+    seeder = engine_factory("seeder-shell-000")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "target-conv-shell")
+    # Shell row for the SOURCE id (0 canonical turns) + the alias.
+    _seed_attachable_target(raw, sk_id)
+    raw.save_conversation_alias(sk_id, "target-conv-shell")
+
+    engine = engine_factory(sk_id)
+    assert engine.config.conversation_id == "target-conv-shell"
+
+
 def test_engine_init_with_multi_hop_alias_walks_to_terminal(engine_factory) -> None:
     seeder = engine_factory("seeder-multi-000")
     raw = _underlying_store(seeder)
