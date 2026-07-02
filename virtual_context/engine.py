@@ -408,6 +408,11 @@ class VirtualContextEngine:
             telemetry=self._telemetry,
             save_state_callback=self._save_state,
             session_state_provider=self._session_state_provider,
+            # Late-binding: self._retrieval is constructed a few lines
+            # below, long before any compaction can run.
+            prewarm_context_hint_callback=(
+                lambda: self._retrieval.prewarm_context_hint_cache()
+            ),
         )
         self._retrieval = RetrievalAssembler(
             retriever=self._retriever,

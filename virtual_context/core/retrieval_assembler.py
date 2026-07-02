@@ -903,6 +903,45 @@ class RetrievalAssembler:
 
         return hint
 
+    def prewarm_context_hint_cache(self) -> str:
+        """Rebuild and cache the context hint under the current cache key.
+
+        Called at compaction commit. Compaction changes the engine-state
+        fields the hint cache key hashes (``compacted_prefix_messages``,
+        ``last_compacted_turn``, ...), so the first request after every
+        compaction would miss BOTH cache layers and rebuild the hint from
+        every tag summary inside the request hot path — tens of seconds
+        on large conversations. Warming at commit moves that rebuild off
+        the hot path: ``_build_context_hint`` computes the new key,
+        misses, rebuilds, and saves through the same in-process and
+        cross-worker layers a live request uses, so the next request on
+        any worker gets a hit.
+
+        Mode resolution mirrors a live request, anchored to the
+        conversation's last-seen model name. Returns the hint ("" when
+        the feature is disabled or nothing is compacted yet).
+        """
+        paging_mode = (
+            self._resolve_paging_mode(self._last_model_name)
+            if self.config.paging.enabled
+            else None
+        )
+        instrumentation: dict[str, object] = {}
+        _t_warm = time.monotonic()
+        hint = self._build_context_hint(
+            paging_mode=paging_mode,
+            instrumentation=instrumentation,
+        )
+        logger.info(
+            "CONTEXT_HINT_PREWARM conv=%s mode=%s bytes=%d total_ms=%s %s",
+            (self.config.conversation_id or "")[:12],
+            paging_mode or "default",
+            len(hint),
+            round((time.monotonic() - _t_warm) * 1000, 1),
+            " ".join(f"{k}={v}" for k, v in sorted(instrumentation.items())),
+        )
+        return hint
+
     def _build_autonomous_hint(
         self,
         tag_summaries: list,
