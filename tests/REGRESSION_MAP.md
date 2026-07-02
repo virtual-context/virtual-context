@@ -385,6 +385,14 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_sort_key_rebalance.py::TestShiftHelperSQLite`
   - `test_sort_key_shift_postgres.py::TestShiftHelperPostgres` / `TestMidInsertRebalancePostgres`
 
+### BUG-037 — Schema bootstrap DDL races across workers
+
+- **Symptom**: Multi-worker startup logs `tuple concurrently updated` from `CREATE OR REPLACE FUNCTION` (and historically DuplicateObject from trigger DROP+CREATE pairs); the losing worker logs "merge_post_commit_pending bootstrap failed" and skips the rest of its guarded block.
+- **Root cause**: `PostgresStore._ensure_schema` ran all bootstrap DDL with no cross-worker serialization.
+- **Fix**: Session-scoped `pg_advisory_lock` held on a dedicated connection for the whole bootstrap (`_SCHEMA_BOOTSTRAP_LOCK_KEY`); session-scoped rather than xact-scoped because the bootstrap relies on per-statement autocommit for its try/except-guarded statements.
+- **Tests**:
+  - `test_schema_bootstrap_postgres.py::TestSchemaBootstrapSerialization::test_concurrent_bootstrap_no_ddl_race_warnings`
+
 ---
 
 ## By Test File
@@ -410,3 +418,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_conversation_scoping.py` | BUG-035 |
 | `test_ingest_sort_key_rebalance.py` | BUG-036 |
 | `test_sort_key_shift_postgres.py` | BUG-036 |
+| `test_schema_bootstrap_postgres.py` | BUG-037 |

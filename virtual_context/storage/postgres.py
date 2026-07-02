@@ -950,7 +950,44 @@ class PostgresStore(ContextStore):
                 ).fetchone()
                 yield
 
+    # Advisory-lock key serializing the whole schema bootstrap across
+    # concurrent workers. Stable bigint (not a hash) so it's reproducible
+    # across processes without a shared registry.
+    _SCHEMA_BOOTSTRAP_LOCK_KEY = 0x7663536368656d31  # "vcSchem1"
+
     def _ensure_schema(self) -> None:
+        """Bootstrap the schema under a cross-worker advisory lock.
+
+        Without serialization, workers booting together race the DDL:
+        concurrent ``CREATE OR REPLACE FUNCTION`` on the same function
+        fails with "tuple concurrently updated" and concurrent
+        ``DROP TRIGGER IF EXISTS`` + ``CREATE TRIGGER`` pairs fail with
+        DuplicateObject — each losing worker logs a bootstrap warning
+        and skips the rest of its guarded block.
+
+        The lock is session-scoped on a dedicated connection (NOT
+        ``pg_advisory_xact_lock``): the bootstrap relies on per-statement
+        autocommit so its try/except-guarded statements can fail benignly
+        without aborting a wrapping transaction.
+        """
+        with self.pool.connection() as lock_conn:
+            lock_conn.execute(
+                "SELECT pg_advisory_lock(%s)",
+                (self._SCHEMA_BOOTSTRAP_LOCK_KEY,),
+            )
+            try:
+                self._ensure_schema_locked()
+            finally:
+                try:
+                    lock_conn.execute(
+                        "SELECT pg_advisory_unlock(%s)",
+                        (self._SCHEMA_BOOTSTRAP_LOCK_KEY,),
+                    )
+                except Exception:
+                    # Connection loss releases the session lock server-side.
+                    pass
+
+    def _ensure_schema_locked(self) -> None:
         with self.pool.connection() as conn:
             # Split SCHEMA_SQL by statements and execute individually
             for stmt in SCHEMA_SQL.split(";"):
