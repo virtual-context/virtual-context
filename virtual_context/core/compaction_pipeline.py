@@ -70,6 +70,7 @@ class CompactionPipeline:
         save_state_callback: Callable,
         session_state_provider=None,
         worker_id: str | None = None,
+        prewarm_context_hint_callback: Callable[[], str] | None = None,
     ) -> None:
         self._compactor = compactor
         self._segmenter = segmenter
@@ -83,6 +84,7 @@ class CompactionPipeline:
         self._telemetry = telemetry
         self._save_state_callback = save_state_callback
         self._session_state_provider = session_state_provider
+        self._prewarm_context_hint_callback = prewarm_context_hint_callback
         # Per-write ownership guard: the worker identity seeded at construction
         # (or set post-construction by the caller). ProxyState writes its own
         # self._worker_id here after construction so store_segment guards can
@@ -517,6 +519,7 @@ class CompactionPipeline:
         )
 
         self._refresh_shared_retrieval_snapshots()
+        self._prewarm_context_hint(operation_id)
 
         return report
 
@@ -714,6 +717,59 @@ class CompactionPipeline:
                     pass
 
         return len(new_tag_summaries), cover_tags
+
+    #: Ownership-probe TTL for the pre-warm fence check. Deliberately huge
+    #: so ``claim_compaction_lease``'s stale-heartbeat takeover branch can
+    #: never trigger — the call degenerates to a pure "do I still own the
+    #: active operation row" probe (claimed=True iff the caller already
+    #: owns it).
+    _PREWARM_OWNERSHIP_PROBE_TTL_S = 1e9
+
+    def _prewarm_context_hint(self, operation_id: str | None) -> None:
+        """Warm the context-hint cache at compaction commit.
+
+        Compaction changes the engine-state fields the hint cache key
+        hashes, so the first post-compaction request would rebuild the
+        hint from every tag summary inside the request hot path. The
+        callback rebuilds and caches it now instead (both cache layers).
+
+        Fencing: on the guarded path (operation_id + worker_id set) the
+        warm only runs while this worker still owns the active
+        compaction operation — a worker that lost its lease mid-commit
+        must not publish a hint built from its stale view. When
+        ownership cannot be verified, the warm is skipped (degrading to
+        the old first-request rebuild), never the other way around.
+
+        Failure is isolated: a pre-warm error is logged and swallowed —
+        it must never fail the compaction commit.
+        """
+        if self._prewarm_context_hint_callback is None:
+            return
+        try:
+            if operation_id is not None and self._worker_id is not None:
+                claim = self._store.claim_compaction_lease(
+                    conversation_id=self._config.conversation_id,
+                    lifecycle_epoch=int(self._engine_state.lifecycle_epoch),
+                    worker_id=self._worker_id,
+                    lease_ttl_s=self._PREWARM_OWNERSHIP_PROBE_TTL_S,
+                )
+                if not getattr(claim, "claimed", False):
+                    logger.warning(
+                        "CONTEXT_HINT_PREWARM_SKIPPED conv=%s op=%s: "
+                        "compaction lease no longer held",
+                        (self._config.conversation_id or "")[:12],
+                        operation_id,
+                    )
+                    return
+            self._prewarm_context_hint_callback()
+        except Exception:
+            logger.warning(
+                "CONTEXT_HINT_PREWARM_FAILED conv=%s op=%s: first "
+                "post-compaction request will rebuild the hint instead",
+                (self._config.conversation_id or "")[:12],
+                operation_id,
+                exc_info=True,
+            )
 
     def _refresh_shared_retrieval_snapshots(self) -> None:
         if self._session_state_provider is None or not self._config.conversation_id:
