@@ -155,12 +155,17 @@ def test_engine_creates_conversations_row_with_config_tenant_id(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_pg_backfill_sql_present_in_ensure_schema():
-    """ structural pin: ``PostgresStore._ensure_schema`` must contain
+    """ structural pin: the ``PostgresStore`` schema bootstrap must contain
     the cloud_conversations backfill UPDATE. A future regression that drops
-    the migration would fail this test before reaching staging."""
+    the migration would fail this test before reaching staging.
+
+    The bootstrap is split across ``_ensure_schema`` (advisory-lock
+    wrapper) and ``_ensure_schema_locked`` (DDL body); the pin covers
+    their combined source so either hosting the SQL satisfies it."""
     import inspect
     from virtual_context.storage import postgres as postgres_mod
     src = inspect.getsource(postgres_mod.PostgresStore._ensure_schema)
+    src += inspect.getsource(postgres_mod.PostgresStore._ensure_schema_locked)
     # The backfill SQL fingerprint: "FROM cloud_conversations" + tenant_id update target.
     assert "FROM cloud_conversations" in src, (
         "tenant_id-propagation: PostgresStore._ensure_schema missing cloud_conversations "
