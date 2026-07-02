@@ -116,6 +116,71 @@ class IngestReconciler:
                             turns_inserted=0,
                             rows=recent,
                         )
+            # Prepare-then-ingest flow: the pair's user half is normally
+            # already persisted as the conversation's LAST row by the
+            # preceding payload reconcile — only the assistant half is
+            # new. The general aligner cannot see this: a 2-row incoming
+            # fragment has no ≥3-row anchor window and short-overlap
+            # matching is disallowed here, so alignment failed and
+            # ``no_overlap_append`` duplicated the user row. The duplicate
+            # then scrambled every later payload alignment (mid-insertions
+            # of already-present content), broke strict pair tagging, and
+            # progressively exhausted sort-key gaps at the insertion
+            # point. Anchor on the tail row's hash instead: mirror its
+            # identity (no rewrite — the fast-skip contract) and append
+            # only the assistant row.
+            if existing:
+                user_row, assistant_row = prepared
+                tail = existing[-1]
+                if tail.turn_hash == user_row.turn_hash:
+                    user_row.canonical_turn_id = tail.canonical_turn_id
+                    user_row.sort_key = tail.sort_key
+                    user_row.source_batch_id = tail.source_batch_id
+                    user_row.first_seen_at = tail.first_seen_at or user_row.first_seen_at
+                    user_row.last_seen_at = tail.last_seen_at or user_row.last_seen_at
+                    self._preserve_existing_enrichment(user_row, tail)
+                    now = utcnow_iso()
+                    batch_id = generate_canonical_turn_id()
+                    assistant_row.canonical_turn_id = generate_canonical_turn_id()
+                    assistant_row.sort_key = float(tail.sort_key) + 1000.0
+                    assistant_row.source_batch_id = batch_id
+                    assistant_row.last_seen_at = now
+                    self._write_turn(assistant_row, turn_number=len(existing))
+                    recompute_groups = getattr(
+                        self._store, "recompute_canonical_turn_groups", None,
+                    )
+                    if callable(recompute_groups):
+                        try:
+                            recompute_groups(conversation_id)
+                        except Exception:
+                            logger.warning(
+                                "CANONICAL_TURN_GROUP_RECOMPUTE_FAILED: conv=%s",
+                                conversation_id[:12],
+                                exc_info=True,
+                            )
+                    batch = self._save_batch(
+                        conversation_id,
+                        raw_turn_count=len(prepared),
+                        merge_mode="tail_append",
+                        first_turn_hash=prepared[0].turn_hash,
+                        last_turn_hash=prepared[-1].turn_hash,
+                        turns_matched=1,
+                        turns_appended=1,
+                        turns_prepended=0,
+                        turns_inserted=0,
+                        batch_id=batch_id,
+                    )
+                    self._refresh_persisted_anchors(conversation_id)
+                    return CanonicalIngestResult(
+                        merge_mode="tail_append",
+                        turns_written=1,
+                        turns_matched=1,
+                        turns_appended=1,
+                        turns_prepended=0,
+                        turns_inserted=0,
+                        batch=batch,
+                        rows=[user_row, assistant_row],
+                    )
             return self._ingest_prepared_turns_locked(
                 conversation_id,
                 prepared_turns=prepared,
