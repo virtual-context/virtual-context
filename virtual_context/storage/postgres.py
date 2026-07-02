@@ -1003,8 +1003,36 @@ class PostgresStore(ContextStore):
             # from tables created by earlier bundled schemas. Without them
             # every engine-state save fails with UndefinedColumn (swallowed
             # upstream as a warning), so session-restore state silently
-            # never persists. Idempotent forward migration.
+            # never persists. Two vintages converge here: the oldest shape
+            # used ``compacted_through`` / ``flushed_through`` (renamed —
+            # RENAME has no IF EXISTS, so each rename is guarded by a
+            # catalog probe), and the bundled 5-column shape lacked the
+            # columns entirely (added). Idempotent forward migration.
             try:
+                legacy_renames = (
+                    ("compacted_through", "compacted_prefix_messages"),
+                    ("flushed_through", "flushed_prefix_messages"),
+                )
+                for old_name, new_name in legacy_renames:
+                    # Rename only when the legacy column exists AND the
+                    # target does not — a half-migrated table keeps both
+                    # and the ADD COLUMN below still guarantees the name
+                    # the save path writes.
+                    eligible = conn.execute(
+                        """SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'engine_state'
+                             AND column_name = %s
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM information_schema.columns
+                                 WHERE table_name = 'engine_state'
+                                   AND column_name = %s
+                             )""",
+                        (old_name, new_name),
+                    ).fetchone()
+                    if eligible:
+                        conn.execute(
+                            f"ALTER TABLE engine_state RENAME COLUMN {old_name} TO {new_name}"
+                        )
                 conn.execute("""
                     ALTER TABLE engine_state
                         ADD COLUMN IF NOT EXISTS flushed_prefix_messages INTEGER NOT NULL DEFAULT 0
