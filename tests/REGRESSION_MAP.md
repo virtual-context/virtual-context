@@ -385,6 +385,13 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_sort_key_rebalance.py::TestShiftHelperSQLite`
   - `test_sort_key_shift_postgres.py::TestShiftHelperPostgres` / `TestMidInsertRebalancePostgres`
 
+### BUG-038 — Strict tagging aborts on concurrently-tagged rows
+
+- **Symptom**: `RuntimeError: strict canonical tagging expected at least N covered ingestible entries, found M across K rows` on catch-up ingestion of a multi-worker conversation; the whole batch falls through to the row-based DB sweep, losing payload-context tagging for the still-untagged rows.
+- **Root cause**: The strict precondition in `ingest_history` required every payload entry to map to an UNTAGGED canonical row. Rows legitimately tagged between the prepare and the follow-up pass — by another worker's row sweep or a prior pass over an overlapping payload — broke the count.
+- **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
+- **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
+
 ### BUG-037 — Schema bootstrap DDL races across workers
 
 - **Symptom**: Multi-worker startup logs `tuple concurrently updated` from `CREATE OR REPLACE FUNCTION` (and historically DuplicateObject from trigger DROP+CREATE pairs); the losing worker logs "merge_post_commit_pending bootstrap failed" and skips the rest of its guarded block.
@@ -419,3 +426,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_ingest_sort_key_rebalance.py` | BUG-036 |
 | `test_sort_key_shift_postgres.py` | BUG-036 |
 | `test_schema_bootstrap_postgres.py` | BUG-037 |
+| `test_strict_tagging_tagged_rows.py` | BUG-038 |
