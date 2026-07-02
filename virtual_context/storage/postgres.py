@@ -1798,7 +1798,8 @@ class PostgresStore(ContextStore):
                           normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                           user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
                           sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
-                          last_seen_at, source_batch_id, created_at, updated_at
+                          last_seen_at, source_batch_id, created_at, updated_at,
+                          covered_ingestible_entries
                    FROM canonical_turns_ordinal
                    WHERE conversation_id = %s
                    ORDER BY sort_key, canonical_turn_id""",

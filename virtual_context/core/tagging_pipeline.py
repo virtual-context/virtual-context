@@ -554,6 +554,100 @@ class TaggingPipeline:
         # up where this one left off.
         return match_offset + needed
 
+    def _hydrate_entry_from_tagged_rows(
+        self,
+        pair_messages: list["Message"],
+        existing_rows: list["CanonicalTurnRow"],
+        turn_number: int,
+    ) -> tuple["TurnTagEntry", int] | None:
+        """Build an index entry from already-tagged rows for one pair.
+
+        When every row backing a payload pair is already tagged — by
+        another worker's row sweep or a prior pass over an overlapping
+        payload — re-running the tag generator is pure waste and
+        rewriting the rows would clobber the winner's tags. Instead the
+        pair's ``TurnTagIndex`` entry hydrates straight from the stored
+        row tags.
+
+        Matching is by per-message ``turn_hash`` (not role shape): the
+        entry copies the rows' tags, so content identity is required —
+        a shape-only match could hydrate from a different turn's rows.
+        Returns ``(entry, rows_consumed)`` on a full match of tagged
+        rows, or ``None`` when any backing row is untagged, missing, or
+        hash-mismatched (callers fall through to the normal tagger,
+        which is idempotent for half-tagged pairs).
+        """
+        from ..types import TurnTagEntry
+
+        source_messages = [
+            msg for msg in pair_messages if msg.role in {"user", "assistant"}
+        ]
+        if not source_messages or not existing_rows:
+            return None
+        sorted_rows = sorted(
+            existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id)
+        )
+        needed = len(source_messages)
+        if len(sorted_rows) < needed:
+            return None
+        match_offset = -1
+        for start_idx in range(0, len(sorted_rows) - needed + 1):
+            window = sorted_rows[start_idx : start_idx + needed]
+            if not all(row.tagged_at for row in window):
+                continue
+            matched = True
+            for row, message in zip(window, source_messages):
+                user_content = message.content if message.role == "user" else ""
+                assistant_content = (
+                    message.content if message.role == "assistant" else ""
+                )
+                message_hash, _, _ = compute_turn_hash_from_raw(
+                    user_content,
+                    assistant_content,
+                    version=row.hash_version or HASH_VERSION,
+                )
+                if row.turn_hash != message_hash:
+                    matched = False
+                    break
+            if matched:
+                match_offset = start_idx
+                break
+        if match_offset < 0:
+            return None
+        window = sorted_rows[match_offset : match_offset + needed]
+        tags: list[str] = []
+        primary_tag = ""
+        sender = ""
+        session_date = ""
+        fact_signals: list = []
+        code_refs: list[dict] = []
+        for row in window:
+            if not tags and row.tags:
+                tags = list(row.tags)
+            if not primary_tag and (row.primary_tag or "").strip():
+                primary_tag = row.primary_tag
+            if not sender and (row.sender or "").strip():
+                sender = row.sender
+            if not session_date and (row.session_date or "").strip():
+                session_date = row.session_date
+            if not fact_signals and row.fact_signals:
+                fact_signals = list(row.fact_signals)
+            if not code_refs and row.code_refs:
+                code_refs = list(row.code_refs)
+        combined_text = " ".join(msg.content for msg in source_messages)
+        entry = TurnTagEntry(
+            turn_number=turn_number,
+            message_hash=hashlib.sha256(combined_text.encode()).hexdigest()[:16],
+            canonical_turn_id=window[0].canonical_turn_id or "",
+            tags=tags or ["_general"],
+            primary_tag=primary_tag or (tags[0] if tags else "_general"),
+            sender=sender,
+            session_date=session_date,
+            fact_signals=fact_signals,
+            code_refs=code_refs,
+        )
+        return entry, match_offset + needed
+
     @staticmethod
     def _row_shape_matches_role(row: "CanonicalTurnRow", role: str) -> bool:
         """True when ``row``'s user/assistant shape is compatible with ``role``.
@@ -1168,29 +1262,48 @@ class TaggingPipeline:
             expected_entries = sum(
                 1 for msg in history_messages if msg.role in {"user", "assistant"}
             )
+            # Epoch guard (preserved from the untagged-only fetch this
+            # replaces): a stale caller sees zero rows and fails the
+            # coverage check below rather than tagging a resurrected
+            # lifecycle's rows.
+            epoch_ok = True
             if expected_lifecycle_epoch is not None:
-                strict_rows = list(
-                    self._store.iter_untagged_canonical_rows(
-                        conversation_id=self.config.conversation_id,
-                        expected_lifecycle_epoch=expected_lifecycle_epoch,
-                        batch_size=max(expected_entries, 32),
+                try:
+                    observed_epoch = int(
+                        self._store.get_lifecycle_epoch(self.config.conversation_id)
                     )
+                except (KeyError, NotImplementedError, AttributeError):
+                    observed_epoch = None
+                if observed_epoch is not None:
+                    epoch_ok = observed_epoch == int(expected_lifecycle_epoch)
+            all_rows: list["CanonicalTurnRow"] = []
+            if epoch_ok:
+                all_rows = sorted(
+                    self._store.get_all_canonical_turns(self.config.conversation_id),
+                    key=lambda row: (row.sort_key, row.canonical_turn_id),
                 )
-            else:
-                strict_rows = [
-                    row
-                    for row in self._store.get_all_canonical_turns(self.config.conversation_id)
-                    if not row.tagged_at
-                ]
-            strict_covered_entries = sum(
-                max(1, int(getattr(row, "covered_ingestible_entries", 1) or 1))
-                for row in strict_rows
-            )
-            if strict_covered_entries < expected_entries:
+            # Tail slice covering the payload's entries. This INCLUDES
+            # already-tagged rows: a row tagged between the prepare and
+            # this pass — by another worker's row sweep or a prior pass
+            # over an overlapping payload — still covers its payload
+            # entry. Requiring untagged-only coverage here spuriously
+            # aborted whole batches on multi-worker conversations. Pairs
+            # whose rows are already tagged hydrate their index entries
+            # from the stored tags in the pair loop below.
+            coverage = 0
+            start = len(all_rows)
+            while start > 0 and coverage < expected_entries:
+                start -= 1
+                coverage += max(
+                    1,
+                    int(getattr(all_rows[start], "covered_ingestible_entries", 1) or 1),
+                )
+            strict_rows = all_rows[start:]
+            if coverage < expected_entries:
                 raise RuntimeError(
                     "strict canonical tagging expected at least "
                     f"{expected_entries} covered ingestible entries, found "
-                    f"{strict_covered_entries} across {len(strict_rows)} rows"
+                    f"{coverage} across {len(strict_rows)} rows"
                 )
         # Seed from DB when resuming bulk ingest mid-conversation: the caller
         # passes turn_offset > 0 when there are already-persisted turns that
@@ -1246,6 +1359,33 @@ class TaggingPipeline:
                 sender = get_sender_name(pair_msg.metadata) if pair_msg.metadata else ""
                 if sender:
                     break
+
+            # Hydrate fast-path: a pair whose backing rows are ALL already
+            # tagged (concurrent worker sweep, prior overlapping pass) gets
+            # its index entry from the stored row tags — no tag-generator
+            # call, no row rewrite. Consumes the strict cursor like the
+            # normal persist path so subsequent pairs stay aligned.
+            if require_existing_canonical and strict_pair_rows:
+                hydrated = self._hydrate_entry_from_tagged_rows(
+                    pair.messages,
+                    strict_pair_rows,
+                    turn_offset + batch_turn,
+                )
+                if hydrated is not None:
+                    entry, consumed = hydrated
+                    if not entry.sender:
+                        entry.sender = sender or ""
+                    if entry.session_date:
+                        running_session_date = entry.session_date
+                    elif running_session_date:
+                        entry.session_date = running_session_date
+                    self._turn_tag_index.append(entry)
+                    strict_row_cursor += consumed
+                    self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
+                    ingested += 1
+                    if progress_callback:
+                        progress_callback(ingested, _total_turns, entry)
+                    continue
 
             # Tool-only turns: skip LLM tagger, assign sequential tool_N tag
             if self._is_tool_turn(pair.messages):
