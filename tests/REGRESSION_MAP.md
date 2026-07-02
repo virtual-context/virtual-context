@@ -392,6 +392,13 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-040 — Assistant-half ingest duplicates the prepared user row
+
+- **Symptom**: Three linked production symptoms on prepare-then-ingest REST conversations: (1) strict tagging fails with "could not map payload messages to existing rows for logical turn N" and turns fall through to the context-free row sweep (observed as a jump in `_general` primary tags on live traffic), (2) canonical rows contain duplicated user halves and mid-inserted copies of already-present content, (3) sort-key gaps at the insertion point halve with every prepare, priming the BUG-036 gap-exhaustion collisions.
+- **Root cause**: `ingest_single` (the completed-pair persist path) prepares a `[user, assistant]` row pair, but the user half is normally already the conversation's LAST row, persisted by the preceding payload prepare. A 2-row incoming fragment has no ≥3-row anchor window and short-overlap matching is disallowed on this path, so alignment failed and `no_overlap_append` duplicated the user row; the duplicate scrambled every subsequent payload alignment.
+- **Fix**: Before falling through to full alignment, `ingest_single` matches the pair's user hash against the tail row; on a match it mirrors the existing row's identity (no rewrite) and appends only the assistant row (`tail_append`). Resend dedup and genuinely-new-pair append behavior are unchanged.
+- **Tests**: `test_ingest_single_tail_pair.py` — no duplication, multi-turn row cleanliness, strict tagging green across a full REST conversation, resend dedup preserved, unprepared-pair append preserved.
+
 ### BUG-039 — engine_state saves fail on schema-bootstrapped Postgres
 
 - **Symptom**: `Failed to save engine state: column "flushed_prefix_messages" of relation "engine_state" does not exist` on every engine-state save; swallowed as a warning, so session-restore state silently never persists.
@@ -437,3 +444,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_schema_bootstrap_postgres.py` | BUG-037 |
 | `test_strict_tagging_tagged_rows.py` | BUG-038 |
 | `test_engine_state_schema_postgres.py` | BUG-039 |
+| `test_ingest_single_tail_pair.py` | BUG-040 |
