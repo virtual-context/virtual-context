@@ -253,3 +253,44 @@ def test_cli_command_wired(tmp_path):
     # count plus the never-downgrade accounting.
     assert payload["selected_pairs"] == 3
     assert payload["retagged_pairs"] + payload["skipped_low_quality"] == 3
+    # No alias on 'c': resolved id echoes the requested id.
+    assert payload["resolved_conversation_id"] == "c"
+
+
+def test_cli_surfaces_alias_rebind(tmp_path):
+    """An alias-carrying conversation id rebinds to its terminal at
+    engine construction — the command operates on (and, under
+    force-rebuild, bills for) the TERMINAL. The JSON output must
+    surface the rebind so operators see it before interpreting counts."""
+    import json
+    import subprocess
+    import sys
+    engine = _make_engine(tmp_path)
+    try:
+        _seed_general_rows(engine, tmp_path)
+        conn = sqlite3.connect(tmp_path / "c.db")
+        conn.execute(
+            "INSERT INTO conversation_aliases (alias_id, target_id, epoch) "
+            "VALUES ('old-conv-name', 'c', 1)"
+        )
+        conn.commit()
+        conn.close()
+    finally:
+        engine.close()
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "virtual_context.cli.main",
+            "admin", "retag-canonical-turns", "old-conv-name",
+            "--sqlite-path", str(tmp_path / "c.db"),
+            "--dry-run",
+        ],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr[-500:]
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["conversation_id"] == "old-conv-name"
+    assert payload["resolved_conversation_id"] == "c", (
+        "alias rebind must be visible in the output"
+    )
+    # And the retag actually saw the terminal's rows through the alias.
+    assert payload["selected_pairs"] == 3
