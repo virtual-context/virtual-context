@@ -1534,6 +1534,88 @@ def cmd_admin_backfill_tag_summaries(args):
             pass
 
 
+def cmd_admin_retag_canonical_turns(args):
+    """Re-tag canonical rows that carry degraded fallback tags.
+
+    Builds a ``VirtualContextEngine`` bound to *conversation_id* and
+    invokes ``engine.retag_canonical_turns``. Selected rows (default:
+    ``primary_tag = '_general'``, optionally restricted to a half-open
+    ``[--since, --until)`` window over ``created_at``) are re-tagged
+    with preceding-pair conversational context through the configured
+    tag generator — the lookback the context-free row sweep lacked. A
+    fallback/empty generator result never downgrades a row, so re-runs
+    converge. Prints a JSON line to stdout.
+
+    Window inputs accept space- or T-separated ISO-8601 and are
+    normalized internally to the T-separated TEXT format the
+    ``created_at`` column stores.
+
+        virtual-context admin retag-canonical-turns <conv-id> \\
+            --tenant-id <tid> \\
+            --since 2026-06-17T17:00:00 --until 2026-07-03T00:00:00 \\
+            --dry-run
+
+    Canonical rows are the only write target — compose the
+    ``backfill-session-state-markers`` subcommand afterwards to refresh
+    cross-worker session state from the re-tagged rows.
+
+    Storage configuration follows the precedence documented on
+    ``_apply_storage_overrides``: explicit flag > ``-c`` config >
+    ``DATABASE_URL`` env fallback.
+    """
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = args.conversation_id
+    tenant_id = getattr(args, "tenant_id", "") or ""
+
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "load_config",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+    config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+    _apply_storage_overrides(config, args)
+
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "engine_construct",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    try:
+        report = engine.retag_canonical_turns(
+            since=getattr(args, "since", None),
+            until=getattr(args, "until", None),
+            only_general=not bool(getattr(args, "all_tags", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        payload = {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "tenant_id": tenant_id,
+            "storage_backend": config.storage.backend,
+            **report,
+        }
+        print(json.dumps(payload))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
 def cmd_admin_backfill_session_state_markers(args):
     """Backfill SessionState markers for conversations whose Redis
     state drifted from their canonical_turns truth.
@@ -1976,6 +2058,70 @@ def main():
     )
 
     # ------------------------------------------------------------------
+    # admin retag-canonical-turns
+    # ------------------------------------------------------------------
+    retag_parser = admin_sub.add_parser(
+        "retag-canonical-turns",
+        help=(
+            "Re-tag canonical rows that carry degraded fallback tags "
+            "(default: primary_tag = '_general') with preceding-pair "
+            "conversational context through the configured tag generator"
+        ),
+    )
+    retag_parser.add_argument(
+        "conversation_id",
+        help="Conversation id to re-tag",
+    )
+    retag_parser.add_argument(
+        "--tenant-id",
+        default="",
+        help="Tenant id to set on the engine config (default: empty)",
+    )
+    retag_parser.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Inclusive lower bound on created_at (ISO-8601; space- or "
+            "T-separated, normalized internally)"
+        ),
+    )
+    retag_parser.add_argument(
+        "--until",
+        default=None,
+        help="Exclusive upper bound on created_at (ISO-8601)",
+    )
+    retag_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        help=(
+            "Select every row in the window instead of only "
+            "primary_tag='_general' rows (re-runs no longer converge "
+            "naturally when this is set)"
+        ),
+    )
+    retag_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be re-tagged without writing",
+    )
+    retag_parser.add_argument(
+        "--storage-backend",
+        choices=("sqlite", "postgres", "filesystem"),
+        help="Override the engine's storage backend.",
+    )
+    retag_parser.add_argument(
+        "--postgres-dsn",
+        help=(
+            "Postgres connection string. Overrides storage.postgres_dsn; "
+            "falls back to DATABASE_URL when neither this nor -c is given."
+        ),
+    )
+    retag_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite database path. Overrides storage.sqlite_path.",
+    )
+
+    # ------------------------------------------------------------------
     # admin backfill-session-state-markers
     # ------------------------------------------------------------------
     backfill_ssm_parser = admin_sub.add_parser(
@@ -2095,7 +2241,9 @@ def main():
             print("Usage: virtual-context config validate")
             sys.exit(1)
     elif args.command == "admin":
-        if args.admin_command == "backfill-tag-summaries":
+        if args.admin_command == "retag-canonical-turns":
+            cmd_admin_retag_canonical_turns(args)
+        elif args.admin_command == "backfill-tag-summaries":
             cmd_admin_backfill_tag_summaries(args)
         elif args.admin_command == "backfill-session-state-markers":
             cmd_admin_backfill_session_state_markers(args)

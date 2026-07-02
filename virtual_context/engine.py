@@ -2446,6 +2446,30 @@ class VirtualContextEngine:
             disable_replacement_passes=disable_replacement_passes,
         )
 
+    def retag_canonical_turns(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        only_general: bool = True,
+        dry_run: bool = False,
+    ) -> dict:
+        """Re-tag canonical rows carrying degraded fallback tags.
+
+        Recovery primitive for rows tagged by the context-free row sweep
+        during a degraded window. Delegates to the tagging pipeline,
+        which re-tags selected logical turns with preceding-pair context
+        through the configured tag generator, never downgrading a row
+        when the generator returns a fallback result. See
+        ``TaggingPipeline.retag_canonical_turns`` for full semantics.
+        """
+        return self._tagging.retag_canonical_turns(
+            since=since,
+            until=until,
+            only_general=only_general,
+            dry_run=dry_run,
+        )
+
     def backfill_tag_summaries(self, *, force_rebuild: bool = False) -> int:
         """Generate ``tag_summaries`` rows from already-stored segments.
 
