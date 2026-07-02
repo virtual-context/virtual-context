@@ -392,7 +392,15 @@ class IngestReconciler:
             if prefix:
                 left_key = existing[alignment.existing_start - 1].sort_key if alignment.existing_start > 0 else None
                 right_key = existing[alignment.existing_start].sort_key
-                for row, key in zip(prefix, self._allocate_sort_keys(left_key, right_key, len(prefix))):
+                prefix_keys = self._allocate_bounded_sort_keys(
+                    conversation_id,
+                    existing=existing,
+                    rows_touched=rows_touched,
+                    left_key=left_key,
+                    right_key=right_key,
+                    count=len(prefix),
+                )
+                for row, key in zip(prefix, prefix_keys):
                     row.canonical_turn_id = generate_canonical_turn_id()
                     row.sort_key = key
                     row.source_batch_id = batch_id
@@ -411,7 +419,15 @@ class IngestReconciler:
                 left_key = existing[left_idx].sort_key if left_idx >= 0 else None
                 next_existing_idx = alignment.existing_start + alignment.overlap_len
                 right_key = existing[next_existing_idx].sort_key if next_existing_idx < len(existing) else None
-                for row, key in zip(suffix, self._allocate_sort_keys(left_key, right_key, len(suffix))):
+                suffix_keys = self._allocate_bounded_sort_keys(
+                    conversation_id,
+                    existing=existing,
+                    rows_touched=rows_touched,
+                    left_key=left_key,
+                    right_key=right_key,
+                    count=len(suffix),
+                )
+                for row, key in zip(suffix, suffix_keys):
                     row.canonical_turn_id = generate_canonical_turn_id()
                     row.sort_key = key
                     row.source_batch_id = batch_id
@@ -770,12 +786,28 @@ class IngestReconciler:
             last_turn_hash=last_turn_hash,
         )
 
+    #: Minimum spacing between allocated sort keys in a bounded gap. A
+    #: bounded allocation that cannot fit ``count`` keys strictly inside
+    #: ``(left_key, right_key)`` at this spacing signals exhaustion so the
+    #: caller can rebalance instead of colliding with the boundary rows.
+    _MIN_SORT_KEY_STEP = 0.001
+
     def _allocate_sort_keys(
         self,
         left_key: float | None,
         right_key: float | None,
         count: int,
-    ) -> list[float]:
+    ) -> list[float] | None:
+        """Allocate ``count`` sort keys between the given boundaries.
+
+        Returns ``None`` when both boundaries are set and the gap cannot
+        host ``count`` keys strictly inside the open interval. The old
+        behavior clamped the step to 0.001, which let allocated keys land
+        ON or PAST ``right_key`` — a guaranteed violation of the
+        ``UNIQUE (conversation_id, sort_key)`` constraint (when a key hit
+        an existing row) or a silent ordering corruption (when a key
+        overshot the boundary without colliding).
+        """
         if count <= 0:
             return []
         if left_key is None and right_key is None:
@@ -786,9 +818,145 @@ class IngestReconciler:
         if right_key is None:
             return [float(left_key + (1000.0 * (idx + 1))) for idx in range(count)]
         step = (right_key - left_key) / float(count + 1)
-        if step <= 0.001:
-            step = 0.001
-        return [float(left_key + (step * (idx + 1))) for idx in range(count)]
+        if step < self._MIN_SORT_KEY_STEP:
+            return None
+        keys = [float(left_key + (step * (idx + 1))) for idx in range(count)]
+        # Float-precision guard: at extreme magnitudes ``left + step`` can
+        # round onto a boundary or collapse adjacent keys. Any violation of
+        # strict interior ordering is exhaustion, same as a too-small gap.
+        prev = float(left_key)
+        for key in keys:
+            if not (prev < key < right_key):
+                return None
+            prev = key
+        return keys
+
+    def _allocate_bounded_sort_keys(
+        self,
+        conversation_id: str,
+        *,
+        existing: list[CanonicalTurnRow],
+        rows_touched: list[CanonicalTurnRow],
+        left_key: float | None,
+        right_key: float | None,
+        count: int,
+    ) -> list[float]:
+        """Allocate keys, rebalancing the conversation when the gap is full.
+
+        On exhaustion (only possible when both boundaries are set), every
+        row at or beyond ``right_key`` is shifted upward to open room, the
+        in-memory mirrors in ``existing`` / ``rows_touched`` are kept in
+        lockstep with the DB, and allocation is retried in the widened gap.
+        """
+        keys = self._allocate_sort_keys(left_key, right_key, count)
+        if keys is not None:
+            return keys
+        delta = self._open_sort_key_gap(
+            conversation_id,
+            existing=existing,
+            rows_touched=rows_touched,
+            right_key=float(right_key),
+            count=count,
+        )
+        keys = self._allocate_sort_keys(left_key, float(right_key) + delta, count)
+        if keys is None:
+            raise RuntimeError(
+                "sort-key allocation failed after rebalance: "
+                f"conv={conversation_id[:12]} left={left_key} "
+                f"right={right_key} delta={delta} count={count}"
+            )
+        return keys
+
+    def _open_sort_key_gap(
+        self,
+        conversation_id: str,
+        *,
+        existing: list[CanonicalTurnRow],
+        rows_touched: list[CanonicalTurnRow],
+        right_key: float,
+        count: int,
+    ) -> float:
+        """Shift every row at or beyond ``right_key`` upward by a delta.
+
+        The delta exceeds the sort-key spread being shifted, so a
+        single-statement UPDATE can never transiently collide on the
+        ``UNIQUE (conversation_id, sort_key)`` constraint regardless of
+        row visit order. In-memory row objects whose keys mirror the
+        shifted DB rows are updated in lockstep so later allocation in
+        this reconcile pass sees current boundaries.
+        """
+        max_key = max(row.sort_key for row in existing)
+        delta = (max_key - right_key) + 1000.0 * (count + 1)
+        shifter = getattr(self._store, "shift_canonical_turn_sort_keys", None)
+        shifted = -1
+        if callable(shifter):
+            try:
+                shifted = int(
+                    shifter(conversation_id, min_sort_key=right_key, delta=delta)
+                )
+            except NotImplementedError:
+                shifted = -1
+        if shifted < 0:
+            # Store lacks the bulk shift: per-row upserts in descending key
+            # order. The delta puts every shifted key above the current
+            # maximum, so each single-row write lands in free space.
+            for row in sorted(
+                (r for r in existing if r.sort_key >= right_key),
+                key=lambda r: r.sort_key,
+                reverse=True,
+            ):
+                row.sort_key = float(row.sort_key) + delta
+                # Direct save (not _write_turn): content is unchanged, so
+                # re-embedding the shifted rows would be pure waste.
+                self._store.save_canonical_turn(
+                    row.conversation_id or conversation_id,
+                    row.turn_number,
+                    row.user_content,
+                    row.assistant_content,
+                    user_raw_content=row.user_raw_content,
+                    assistant_raw_content=row.assistant_raw_content,
+                    primary_tag=row.primary_tag,
+                    tags=list(row.tags or []),
+                    session_date=row.session_date,
+                    sender=row.sender,
+                    fact_signals=list(row.fact_signals or []),
+                    code_refs=list(row.code_refs or []),
+                    created_at=row.created_at,
+                    updated_at=utcnow_iso(),
+                    canonical_turn_id=row.canonical_turn_id or None,
+                    sort_key=row.sort_key,
+                    turn_hash=row.turn_hash,
+                    hash_version=row.hash_version or HASH_VERSION,
+                    normalized_user_text=row.normalized_user_text,
+                    normalized_assistant_text=row.normalized_assistant_text,
+                    tagged_at=row.tagged_at,
+                    compacted_at=row.compacted_at,
+                    first_seen_at=row.first_seen_at,
+                    last_seen_at=row.last_seen_at,
+                    source_batch_id=row.source_batch_id or None,
+                    turn_group_number=row.turn_group_number,
+                )
+            # Per-row path already updated ``existing`` in place; only the
+            # ``rows_touched`` mirrors remain.
+            for row in rows_touched:
+                if row.sort_key >= right_key:
+                    row.sort_key = float(row.sort_key) + delta
+            logger.info(
+                "SORT_KEY_GAP_REBALANCE conv=%s right_key=%s delta=%s path=per-row",
+                conversation_id[:12], right_key, delta,
+            )
+            return delta
+        for row in existing:
+            if row.sort_key >= right_key:
+                row.sort_key = float(row.sort_key) + delta
+        for row in rows_touched:
+            if row.sort_key >= right_key:
+                row.sort_key = float(row.sort_key) + delta
+        logger.info(
+            "SORT_KEY_GAP_REBALANCE conv=%s right_key=%s delta=%s rows=%d",
+            conversation_id[:12], right_key, delta, shifted,
+        )
+        return delta
 
     def _seen_recently(self, last_seen_at: str) -> bool:
         try:

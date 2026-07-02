@@ -816,6 +816,20 @@ class CompositeStore:
         from contextlib import nullcontext
         return nullcontext()
 
+    def shift_canonical_turn_sort_keys(
+        self,
+        conversation_id: str,
+        *,
+        min_sort_key: float,
+        delta: float,
+    ) -> int:
+        fn = getattr(self._segments, "shift_canonical_turn_sort_keys", None)
+        if callable(fn):
+            return int(fn(conversation_id, min_sort_key=min_sort_key, delta=delta))
+        # Signal "no bulk shift" so the caller can use its per-row fallback;
+        # returning 0 here would be read as "nothing needed shifting".
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Conversation row lifecycle (progress-bar redesign)
     # ------------------------------------------------------------------
