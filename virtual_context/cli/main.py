@@ -1521,6 +1521,11 @@ def cmd_admin_backfill_tag_summaries(args):
         payload = {
             "status": "ok",
             "conversation_id": conversation_id,
+            # The engine's alias resolver rebinds an alias-carrying id to
+            # its terminal during construction, so the backfill operates
+            # on (and bills for) the TERMINAL conversation. Surface the
+            # rebind so operators see it before interpreting the counts.
+            "resolved_conversation_id": engine.config.conversation_id,
             "tenant_id": tenant_id,
             "force_rebuild": force_rebuild,
             "tag_summaries_written": count,
@@ -1604,6 +1609,10 @@ def cmd_admin_retag_canonical_turns(args):
         payload = {
             "status": "ok",
             "conversation_id": conversation_id,
+            # Alias-carrying ids rebind to their terminal at engine
+            # construction; the retag then reads and writes the terminal
+            # conversation's rows. Surfaced so operators see the rebind.
+            "resolved_conversation_id": engine.config.conversation_id,
             "tenant_id": tenant_id,
             "storage_backend": config.storage.backend,
             **report,
