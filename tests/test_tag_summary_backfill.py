@@ -248,21 +248,20 @@ def test_compaction_tag_summaries_populated_when_in_memory_index_empty(
         operation_id=None,
     )
 
-    # The greedy cover-set (computed against the empty in-memory index)
-    # returns []; the primary-tag guarantee then adds each result's
-    # primary_tag. Two distinct primary_tags here (alpha + gamma) means
-    # two cover tags. `beta` is a non-primary tag and is NOT eligible
-    # for the cover-set when the in-memory index is empty (matches the
-    # existing primary-tag-guarantee contract, just exercised on the
-    # fallback path now). The fix's purpose is closing the silent-skip
-    # gap, not expanding cover-tag eligibility.
-    assert count == 2
-    assert sorted(cover_tags) == ["alpha", "gamma"]
+    # Materialization contract (BUG-041): every non-_general tag carried
+    # by the just-compacted segments gets a summary — including the
+    # non-primary `beta`. The historical cover-set intersection omitted
+    # secondary tags on every compaction, leaving segment_tags rows with
+    # no tag_summaries counterpart for the read paths that consume the
+    # table directly.
+    assert count == 3
+    assert sorted(cover_tags) == ["alpha", "beta", "gamma"]
 
     # Stub recorded one call with the fallback-derived turn data.
     assert len(stub.calls) == 1
     call = stub.calls[0]
     assert call["tag_to_turns"]["alpha"] == [0]
+    assert call["tag_to_turns"]["beta"] == [0]
     assert call["tag_to_turns"]["gamma"] == [1]
     assert call["tag_to_canonical_turn_ids"]["alpha"] == ["ct-0"]
     assert call["tag_to_canonical_turn_ids"]["gamma"] == ["ct-1"]
@@ -273,7 +272,7 @@ def test_compaction_tag_summaries_populated_when_in_memory_index_empty(
         ts.tag
         for ts in engine._store.get_all_tag_summaries(conversation_id=conv_id)
     }
-    assert persisted_tags == {"alpha", "gamma"}
+    assert persisted_tags == {"alpha", "beta", "gamma"}
 
 
 def test_compaction_tag_summaries_unchanged_when_in_memory_index_populated(

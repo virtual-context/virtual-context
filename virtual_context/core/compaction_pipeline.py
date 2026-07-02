@@ -540,10 +540,14 @@ class CompactionPipeline:
 
         Cover-tag derivation:
 
-        * Intersect ``compute_cover_set`` (greedy on the in-memory tag index)
-          with the set of tags carried by ``results``. Then apply the
-          primary-tag guarantee so every result's ``primary_tag`` is included
-          in ``cover_tags`` even if the greedy set-cover dropped it.
+        * Every non-``_general`` tag carried by ``results`` (the
+          just-compacted segments), plus the primary-tag guarantee so
+          every result's ``primary_tag`` is included even when absent
+          from the tag lists. The tag-summary table must stay complete
+          for the read paths that consume it directly (context hint,
+          broad/recall-all floor, tag-summary-embedding scoring); the
+          staleness check inside ``compact_tag_summaries`` bounds the
+          LLM cost of the wide set.
 
         Turn-data sourcing for ``compact_tag_summaries`` (``tag_to_turns`` +
         ``tag_to_canonical_turn_ids`` + ``max_turn``):
@@ -566,17 +570,29 @@ class CompactionPipeline:
         if not (results and self._compactor):
             return 0, []
 
-        # Greedy cover from the in-memory tag index, intersected with the
-        # tags carried by newly compacted segments.
-        compacted_tags = {tag for r in results for tag in r.tags}
-        cover_tags: list[str] = [
-            t for t in self._turn_tag_index.compute_cover_set()
-            if t in compacted_tags
-        ]
-        # Primary tag guarantee: ensure every segment's primary_tag gets a
-        # tag summary, even if the greedy set cover dropped it. Without
-        # this, ephemeral topics (2-3 turns) lose their most specific tag
-        # to broader tags that cover more segments.
+        # Every non-``_general`` tag carried by the just-compacted
+        # segments gets a tag summary. Historically this intersected the
+        # greedy set-cover with the compacted tags (plus a primary-tag
+        # guarantee), which structurally omitted every non-primary
+        # secondary tag outside the cover — those tags landed in
+        # ``segment_tags`` with no ``tag_summaries`` row on every
+        # compaction. The read side assumes completeness: the
+        # context-hint topic list, the broad/recall-all summary floor,
+        # and tag-summary-embedding scoring all read the
+        # ``tag_summaries`` table directly, so an omitted tag was
+        # invisible there, and a row materialized by an external repair
+        # sweep went permanently stale because later compactions kept
+        # skipping the tag. The existing staleness check inside
+        # ``compact_tag_summaries`` keeps the widened set cheap: fresh
+        # summaries are skipped, only new/stale ones burn LLM budget.
+        cover_tags: list[str] = sorted({
+            tag
+            for r in results
+            for tag in r.tags
+            if tag and tag != "_general"
+        })
+        # Primary tag guarantee (unchanged): every segment's primary_tag
+        # gets a summary even when it is absent from the tag lists.
         cover_set = set(cover_tags)
         for r in results:
             if r.primary_tag and r.primary_tag not in cover_set:

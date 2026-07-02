@@ -392,6 +392,15 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-041 — Compaction materializes tag summaries for only the greedy cover
+
+- **Symptom**: Every compaction leaves segment tags with no `tag_summaries` row (~69/day on a live multi-tag conversation); those tags are invisible to the context-hint topic list, absent from the broad/recall-all summary floor, and missing from tag-summary-embedding scoring. Rows materialized by an external repair sweep go permanently stale because later compactions keep skipping the tags. First observed May 30 (tags present in `segment_tags`, absent from `tag_summaries`).
+- **Root cause**: By-design minimality that contradicted the system's own read and repair contracts: `_build_tag_summaries` intersected the greedy set-cover with the compacted segments' tags (plus a primary-tag guarantee), structurally omitting every non-primary secondary tag outside the cover. The backfill repair and the read paths both assume every non-`_general` segment tag has a summary.
+- **Fix**: Compaction materializes a summary for every non-`_general` tag carried by the just-compacted segments; the primary-tag guarantee is unchanged. The pre-existing staleness check inside `compact_tag_summaries` bounds the LLM cost (fresh summaries skip), and secondary tags now also REFRESH on later compactions instead of going stale.
+- **Tests**:
+  - `test_tag_summary_materialization.py` — no gap after an organic compaction, `_general` exclusion, report coverage, secondary-tag refresh eligibility on later compactions
+  - `test_tag_summary_backfill.py::test_compaction_tag_summaries_populated_when_in_memory_index_empty` (pin updated to the wide contract)
+
 ### BUG-040 — Assistant-half ingest duplicates the prepared user row
 
 - **Symptom**: Three linked production symptoms on prepare-then-ingest REST conversations: (1) strict tagging fails with "could not map payload messages to existing rows for logical turn N" and turns fall through to the context-free row sweep (observed as a jump in `_general` primary tags on live traffic), (2) canonical rows contain duplicated user halves and mid-inserted copies of already-present content, (3) sort-key gaps at the insertion point halve with every prepare, priming the BUG-036 gap-exhaustion collisions.
@@ -445,3 +454,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_strict_tagging_tagged_rows.py` | BUG-038 |
 | `test_engine_state_schema_postgres.py` | BUG-039 |
 | `test_ingest_single_tail_pair.py` | BUG-040 |
+| `test_tag_summary_materialization.py` | BUG-041 |
