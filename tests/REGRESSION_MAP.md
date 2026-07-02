@@ -374,6 +374,17 @@ Use `pytest -m regression` to run all regression tests.
   - `test_conversation_scoping.py::TestEndToEndScoping::test_find_quote_scoped_no_cross_conversation_leaks`
   - `test_conversation_scoping.py::TestEndToEndScoping::test_alias_ride_along_scoped`
 
+### BUG-036 — Sort-key gap exhaustion collides with boundary rows
+
+- **Symptom**: Prepare-payload ingest aborts with `UNIQUE (conversation_id, sort_key)` violation (Postgres UniqueViolation / SQLite IntegrityError) on mid-insertion into a conversation whose insertion-point rows sit ≤0.002 apart; large mid-inserts also silently mis-order rows past the right boundary.
+- **Root cause**: `IngestReconciler._allocate_sort_keys` clamped its step to 0.001 when the bounded gap was too tight, letting allocated keys land ON or PAST `right_key`. Self-priming: the first clamped allocation writes 0.001-spaced rows, after which every insertion between them collides deterministically.
+- **Fix**: Bounded allocation signals exhaustion (returns `None`) instead of clamping, with a float-precision strict-interior guard. The reconciler then opens the gap via `shift_canonical_turn_sort_keys` (single UPDATE whose delta exceeds the shifted range's spread — transient-collision-safe in any row visit order) and re-allocates; per-row descending fallback for stores without the bulk helper.
+- **Tests**:
+  - `test_ingest_sort_key_rebalance.py::TestAllocatorBoundedGap` (exhaustion signaling)
+  - `test_ingest_sort_key_rebalance.py::TestMidInsertRebalance` (end-to-end rebalance, self-priming loop, rows_touched consistency, per-row fallback)
+  - `test_ingest_sort_key_rebalance.py::TestShiftHelperSQLite`
+  - `test_sort_key_shift_postgres.py::TestShiftHelperPostgres` / `TestMidInsertRebalancePostgres`
+
 ---
 
 ## By Test File
@@ -397,3 +408,5 @@ Use `pytest -m regression` to run all regression tests.
 | `test_verb_expansion.py` | BUG-032 |
 | `test_engine_integration.py` | BUG-034 |
 | `test_conversation_scoping.py` | BUG-035 |
+| `test_ingest_sort_key_rebalance.py` | BUG-036 |
+| `test_sort_key_shift_postgres.py` | BUG-036 |

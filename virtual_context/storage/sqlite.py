@@ -6306,6 +6306,46 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ),
         )
 
+    def shift_canonical_turn_sort_keys(
+        self,
+        conversation_id: str,
+        *,
+        min_sort_key: float,
+        delta: float,
+    ) -> int:
+        """Shift ``sort_key`` by ``delta`` for rows at or above ``min_sort_key``.
+
+        ``delta`` must exceed the sort-key spread of the shifted range so
+        the single UPDATE can never transiently collide on the
+        ``UNIQUE (conversation_id, sort_key)`` constraint regardless of
+        row visit order: every shifted key lands above the range's current
+        maximum. Raises ``ValueError`` when the contract is violated.
+        Returns the number of rows shifted.
+        """
+        if delta <= 0:
+            raise ValueError(f"delta must be positive, got {delta}")
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT MAX(sort_key) AS max_key FROM canonical_turns
+               WHERE conversation_id = ? AND sort_key >= ?""",
+            (conversation_id, min_sort_key),
+        ).fetchone()
+        max_key = row["max_key"] if row else None
+        if max_key is None:
+            return 0
+        if delta <= float(max_key) - float(min_sort_key):
+            raise ValueError(
+                "delta must exceed the sort-key spread being shifted: "
+                f"delta={delta} spread={float(max_key) - float(min_sort_key)}"
+            )
+        cursor = conn.execute(
+            """UPDATE canonical_turns SET sort_key = sort_key + ?
+               WHERE conversation_id = ? AND sort_key >= ?""",
+            (delta, conversation_id, min_sort_key),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
+
     def recompute_canonical_turn_groups(
         self,
         conversation_id: str,
