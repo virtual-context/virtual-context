@@ -1214,6 +1214,210 @@ class TaggingPipeline:
             turn_group_number=row.turn_group_number,
         )
 
+    def retag_canonical_turns(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        only_general: bool = True,
+        dry_run: bool = False,
+    ) -> dict:
+        """Re-tag canonical rows that carry degraded fallback tags.
+
+        Rows tagged by the row-based DB sweep during a degraded window
+        were tagged in isolation — no conversational lookback — so
+        substantive content landed on ``_general``. This pass re-tags
+        them the way the healthy pair path does: rows are grouped into
+        logical turns, each selected turn is tagged with
+        preceding-pair context (gated by the context-bleed check), and
+        the result is persisted onto every backing row.
+
+        Selection: ``only_general`` restricts to rows whose
+        ``primary_tag`` is ``_general``; ``since``/``until`` form a
+        half-open ``[since, until)`` window over ``created_at``.
+        Window inputs are normalized to the T-separated ISO format the
+        TEXT column stores, so space-separated timestamps cannot
+        silently mis-compare.
+
+        Never downgrades: when the generator returns a fallback or
+        empty result (dead provider, unusable content) the row is left
+        exactly as it was. Idempotent: re-runs converge because
+        successfully re-tagged rows stop matching ``only_general``.
+
+        Writes canonical rows only — no turn-tag-index or session-state
+        writes. Cross-worker index coherence is composed by running the
+        session-state marker backfill afterwards.
+        """
+        _ensure_engine_imports()
+        conversation_id = self.config.conversation_id
+
+        def _normalize(stamp: str | None) -> str | None:
+            if not stamp:
+                return None
+            return str(stamp).strip().replace(" ", "T", 1)
+
+        since_n = _normalize(since)
+        until_n = _normalize(until)
+
+        rows = sorted(
+            self._store.get_all_canonical_turns(conversation_id),
+            key=lambda row: (row.sort_key, row.canonical_turn_id),
+        )
+        messages: list[Message] = []
+        message_rows: dict[int, "CanonicalTurnRow"] = {}
+        for row in rows:
+            if (row.user_content or "").strip():
+                msg = Message(role="user", content=row.user_content)
+                messages.append(msg)
+                message_rows[id(msg)] = row
+            if (row.assistant_content or "").strip():
+                msg = Message(role="assistant", content=row.assistant_content)
+                messages.append(msg)
+                message_rows[id(msg)] = row
+
+        history_turns = pair_messages_into_turns(messages)
+        store_tags = [
+            ts.tag
+            for ts in self._store.get_all_tags(conversation_id=conversation_id)
+        ]
+        n_context = self.config.tag_generator.context_lookback_pairs
+
+        def _in_window(row: "CanonicalTurnRow") -> bool:
+            stamp = _normalize(row.created_at or "") or ""
+            if since_n and stamp < since_n:
+                return False
+            if until_n and stamp >= until_n:
+                return False
+            return True
+
+        def _eligible(row: "CanonicalTurnRow") -> bool:
+            if only_general and (row.primary_tag or "") != "_general":
+                return False
+            return _in_window(row)
+
+        def _quality(result) -> bool:
+            real_tags = [
+                tag for tag in (result.tags or [])
+                if tag and not tag.startswith("_")
+            ]
+            primary = (result.primary or "").strip()
+            return bool(real_tags) and bool(primary) and not primary.startswith("_")
+
+        report = {
+            "selected_pairs": 0,
+            "retagged_pairs": 0,
+            "rows_updated": 0,
+            "skipped_stub": 0,
+            "skipped_low_quality": 0,
+            "dry_run": bool(dry_run),
+            "since": since_n,
+            "until": until_n,
+            "only_general": bool(only_general),
+        }
+
+        for batch_turn, pair in enumerate(history_turns):
+            pair_rows: list["CanonicalTurnRow"] = []
+            seen_ids: set[str] = set()
+            for msg in pair.messages:
+                row = message_rows.get(id(msg))
+                if row is not None and row.canonical_turn_id not in seen_ids:
+                    seen_ids.add(row.canonical_turn_id)
+                    pair_rows.append(row)
+            if not pair_rows or not any(_eligible(row) for row in pair_rows):
+                continue
+            report["selected_pairs"] += 1
+
+            user_msg, asst_msg = self._split_pair_messages(pair.messages)
+            combined_text = f"{user_msg.content} {asst_msg.content}"
+            if _is_stub_content_fn(combined_text):
+                report["skipped_stub"] += 1
+                continue
+
+            # Context + bleed gate — same shape as the healthy pair path.
+            context: list[str] | None = None
+            if batch_turn > 0:
+                start = max(0, batch_turn - n_context)
+                context = self._flatten_context_pairs(history_turns[start:batch_turn])
+            if context and self.config.tag_generator.context_bleed_threshold > 0:
+                relevant, _sim = self._semantic.context_is_relevant_with_score(
+                    combined_text, context,
+                )
+                if not relevant:
+                    context = None
+
+            tag_result = self._tag_generator.generate_tags(
+                combined_text, store_tags, context_turns=context,
+            )
+            if not _quality(tag_result) and batch_turn > 0:
+                expanded_start = max(0, batch_turn - (n_context * 2))
+                expanded_ctx = self._flatten_context_pairs(
+                    history_turns[expanded_start:batch_turn],
+                ) or []
+                if expanded_ctx and self.config.tag_generator.context_bleed_threshold > 0:
+                    relevant, _sim = self._semantic.context_is_relevant_with_score(
+                        combined_text, expanded_ctx,
+                    )
+                    if not relevant:
+                        expanded_ctx = []
+                if expanded_ctx:
+                    tag_result = self._tag_generator.generate_tags(
+                        combined_text, store_tags, context_turns=expanded_ctx,
+                    )
+            if not _quality(tag_result):
+                report["skipped_low_quality"] += 1
+                logger.info(
+                    "RETAG_SKIPPED_LOW_QUALITY conv=%s turn=%d primary=%r",
+                    conversation_id[:12], batch_turn, tag_result.primary,
+                )
+                continue
+
+            report["retagged_pairs"] += 1
+            report["rows_updated"] += len(pair_rows)
+            if dry_run:
+                continue
+
+            tagged_at = utcnow_iso()
+            for row in pair_rows:
+                self._store.save_canonical_turn(
+                    conversation_id,
+                    row.turn_number,
+                    row.user_content,
+                    row.assistant_content,
+                    user_raw_content=row.user_raw_content,
+                    assistant_raw_content=row.assistant_raw_content,
+                    primary_tag=tag_result.primary,
+                    tags=list(tag_result.tags),
+                    session_date=row.session_date,
+                    sender=row.sender,
+                    fact_signals=list(row.fact_signals or []),
+                    code_refs=list(row.code_refs or []),
+                    canonical_turn_id=row.canonical_turn_id,
+                    sort_key=row.sort_key,
+                    turn_hash=row.turn_hash,
+                    hash_version=row.hash_version or HASH_VERSION,
+                    normalized_user_text=row.normalized_user_text,
+                    normalized_assistant_text=row.normalized_assistant_text,
+                    tagged_at=tagged_at,
+                    compacted_at=row.compacted_at,
+                    first_seen_at=row.first_seen_at,
+                    last_seen_at=row.last_seen_at,
+                    source_batch_id=row.source_batch_id,
+                    created_at=row.created_at,
+                    updated_at=tagged_at,
+                    turn_group_number=row.turn_group_number,
+                )
+            for tag in tag_result.tags:
+                if tag not in store_tags:
+                    store_tags.append(tag)
+            logger.info(
+                "RETAG conv=%s turn=%d rows=%d primary=%s tags=%s ctx_pairs=%d",
+                conversation_id[:12], batch_turn, len(pair_rows),
+                tag_result.primary, sorted(tag_result.tags),
+                len(context) // 2 if context else 0,
+            )
+
+        return report
+
     def ingest_history(
         self,
         history_messages: list[Message],
