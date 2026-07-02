@@ -115,7 +115,9 @@ CREATE TABLE IF NOT EXISTS engine_state (
     compacted_prefix_messages INTEGER NOT NULL,
     turn_count INTEGER NOT NULL,
     turn_tag_entries TEXT NOT NULL,
-    saved_at TEXT NOT NULL
+    saved_at TEXT NOT NULL,
+    flushed_prefix_messages INTEGER NOT NULL DEFAULT 0,
+    last_request_time DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS conversation_lifecycle (
@@ -997,6 +999,22 @@ class PostgresStore(ContextStore):
                         conn.execute(stmt)
                     except Exception:
                         pass  # Table/index already exists
+            # engine_state columns written by save_engine_state but absent
+            # from tables created by earlier bundled schemas. Without them
+            # every engine-state save fails with UndefinedColumn (swallowed
+            # upstream as a warning), so session-restore state silently
+            # never persists. Idempotent forward migration.
+            try:
+                conn.execute("""
+                    ALTER TABLE engine_state
+                        ADD COLUMN IF NOT EXISTS flushed_prefix_messages INTEGER NOT NULL DEFAULT 0
+                """)
+                conn.execute("""
+                    ALTER TABLE engine_state
+                        ADD COLUMN IF NOT EXISTS last_request_time DOUBLE PRECISION NOT NULL DEFAULT 0
+                """)
+            except Exception:
+                logger.warning("engine_state column migration failed", exc_info=True)
             # Lifecycle/phase-tracked conversations table. Mirrors the SQLite
             # schema (see sqlite.py) — carries lifecycle_epoch (for
             # delete+resurrect invariants), a phase state machine

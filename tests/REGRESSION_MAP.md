@@ -392,6 +392,15 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-039 — engine_state saves fail on schema-bootstrapped Postgres
+
+- **Symptom**: `Failed to save engine state: column "flushed_prefix_messages" of relation "engine_state" does not exist` on every engine-state save; swallowed as a warning, so session-restore state silently never persists.
+- **Root cause**: The bundled schema created `engine_state` with five columns while `save_engine_state` on Postgres INSERTs seven (`flushed_prefix_messages`, `last_request_time`).
+- **Fix**: Both columns added to the bundled CREATE TABLE, plus idempotent `ADD COLUMN IF NOT EXISTS` migration in the schema bootstrap for tables created by earlier schemas.
+- **Tests**:
+  - `test_engine_state_schema_postgres.py::test_engine_state_table_has_save_path_columns`
+  - `test_engine_state_schema_postgres.py::test_save_engine_state_round_trips_on_fresh_schema`
+
 ### BUG-037 — Schema bootstrap DDL races across workers
 
 - **Symptom**: Multi-worker startup logs `tuple concurrently updated` from `CREATE OR REPLACE FUNCTION` (and historically DuplicateObject from trigger DROP+CREATE pairs); the losing worker logs "merge_post_commit_pending bootstrap failed" and skips the rest of its guarded block.
@@ -427,3 +436,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_sort_key_shift_postgres.py` | BUG-036 |
 | `test_schema_bootstrap_postgres.py` | BUG-037 |
 | `test_strict_tagging_tagged_rows.py` | BUG-038 |
+| `test_engine_state_schema_postgres.py` | BUG-039 |
