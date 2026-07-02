@@ -1014,22 +1014,34 @@ class PostgresStore(ContextStore):
                     ("flushed_through", "flushed_prefix_messages"),
                 )
                 for old_name, new_name in legacy_renames:
-                    # Rename only when the legacy column exists AND the
-                    # target does not — a half-migrated table keeps both
-                    # and the ADD COLUMN below still guarantees the name
-                    # the save path writes.
-                    eligible = conn.execute(
+                    legacy_present = conn.execute(
                         """SELECT 1 FROM information_schema.columns
                            WHERE table_name = 'engine_state'
-                             AND column_name = %s
-                             AND NOT EXISTS (
-                                 SELECT 1 FROM information_schema.columns
-                                 WHERE table_name = 'engine_state'
-                                   AND column_name = %s
-                             )""",
-                        (old_name, new_name),
+                             AND column_name = %s""",
+                        (old_name,),
                     ).fetchone()
-                    if eligible:
+                    if not legacy_present:
+                        continue
+                    target_present = conn.execute(
+                        """SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'engine_state'
+                             AND column_name = %s""",
+                        (new_name,),
+                    ).fetchone()
+                    if target_present:
+                        # Half-migrated table (the canonical column was
+                        # added while the legacy one survived as an
+                        # orphan). Coalesce any data the orphan still
+                        # carries, then drop it.
+                        conn.execute(
+                            f"""UPDATE engine_state
+                                SET {new_name} = {old_name}
+                                WHERE {new_name} = 0 AND {old_name} <> 0"""
+                        )
+                        conn.execute(
+                            f"ALTER TABLE engine_state DROP COLUMN {old_name}"
+                        )
+                    else:
                         conn.execute(
                             f"ALTER TABLE engine_state RENAME COLUMN {old_name} TO {new_name}"
                         )

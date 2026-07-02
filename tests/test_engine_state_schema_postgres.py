@@ -102,6 +102,56 @@ def test_legacy_column_names_converge_on_bootstrap():
 
 
 @pytest.mark.regression("BUG-039")
+def test_half_migrated_orphan_legacy_columns_are_coalesced_and_dropped():
+    """A table that gained the canonical column while the legacy one
+    still existed (rename skipped because the target was present) keeps
+    an orphan legacy column. The bootstrap must coalesce any data the
+    orphan still carries into the canonical column and drop the orphan."""
+    from virtual_context.storage.postgres import PostgresStore  # deferred
+    conn = pg_test_conn()
+    conn.execute("DROP TABLE IF EXISTS engine_state")
+    conn.execute(
+        """CREATE TABLE engine_state (
+            conversation_id TEXT PRIMARY KEY,
+            compacted_prefix_messages INTEGER NOT NULL,
+            turn_count INTEGER NOT NULL,
+            turn_tag_entries TEXT NOT NULL,
+            saved_at TEXT NOT NULL,
+            flushed_through INTEGER NOT NULL DEFAULT 0,
+            flushed_prefix_messages INTEGER NOT NULL DEFAULT 0,
+            last_request_time DOUBLE PRECISION NOT NULL DEFAULT 0
+        )"""
+    )
+    # A row whose data lives only in the orphan column.
+    conn.execute(
+        """INSERT INTO engine_state
+           (conversation_id, compacted_prefix_messages, turn_count,
+            turn_tag_entries, saved_at, flushed_through)
+           VALUES ('half-migrated', 4, 1, '{"entries": []}', '2026-01-01', 7)"""
+    )
+    store = PostgresStore(PG_URL)
+    try:
+        cols = {
+            row["column_name"]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'engine_state'"
+            ).fetchall()
+        }
+        assert "flushed_through" not in cols, cols
+        assert "compacted_through" not in cols, cols
+        row = conn.execute(
+            "SELECT flushed_prefix_messages FROM engine_state "
+            "WHERE conversation_id = 'half-migrated'"
+        ).fetchone()
+        assert row["flushed_prefix_messages"] == 7, (
+            "orphan column data must be coalesced before the drop"
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.regression("BUG-039")
 def test_save_engine_state_round_trips_on_fresh_schema():
     from virtual_context.storage.postgres import PostgresStore  # deferred
     store = PostgresStore(PG_URL)
