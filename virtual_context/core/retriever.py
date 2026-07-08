@@ -371,6 +371,13 @@ class ContextRetriever:
                     embed_mode, self.config.scoring.embedding_context_turns,
                     ctx_embed_ms,
                 )
+        # Resolve the strategy up front — its max_results is K for the
+        # embedding reserved-seats pass inside score_candidates.
+        strategy = self.config.strategy_configs.get("default")
+        if strategy is None:
+            from ..types import StrategyConfig
+            strategy = StrategyConfig()
+
         scores, breakdowns = score_candidates(
             query_tags=query_tags,
             related_tags=related_query_tags,
@@ -383,15 +390,12 @@ class ContextRetriever:
             tag_stats=tag_stats,
             stored_embeddings=stored_embeddings,
             query_embedding_context=query_embedding_context,
+            top_k=strategy.max_results,
         )
         _note("score_candidates", _score_stage)
         retrieval_scores = scores
 
-        # Fetch summaries for top-scored tags and apply token budget
-        strategy = self.config.strategy_configs.get("default")
-        if strategy is None:
-            from ..types import StrategyConfig
-            strategy = StrategyConfig()
+        # Apply token budget
 
         budget_fraction = strategy.max_budget_fraction
         if current_utilization > 0.5:

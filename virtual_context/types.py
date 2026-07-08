@@ -952,6 +952,14 @@ class ScoringConfig:
     # the context-augmented embedding alone (plain-concat, experimentation only).
     # YAML key: retrieval.scoring.embedding_context_guard.
     embedding_context_guard: bool = True
+    # Reserve fused-ranking slots for the strongest embedding-signal candidates.
+    # RRF's missing-signal penalty buries tags that only the embedding signal
+    # surfaces (e.g. analog queries with no keyword overlap). With N > 0, after
+    # fusion + dampening + boost, the top-N embedding candidates not already in
+    # the fused top-K (K = strategy max_results) are forced into it by displacing
+    # its lowest-ranked entries. 0 (default) = byte-identical legacy behavior.
+    # YAML key: retrieval.scoring.embedding_reserved_seats.
+    embedding_reserved_seats: int = 0
     dampening: DampeningConfig = field(default_factory=DampeningConfig)
 
 

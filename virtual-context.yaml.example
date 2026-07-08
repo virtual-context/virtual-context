@@ -356,6 +356,12 @@ retrieval:
                                                     # so irrelevant context can
                                                     # never demote a tag below
                                                     # its bare rank.
+    embedding_reserved_seats: 0                     # 0 = legacy. N>0 forces the
+                                                    # top-N embedding candidates
+                                                    # into the fused top-K
+                                                    # (K = strategy max_results),
+                                                    # rescuing embedding-only tags
+                                                    # RRF's penalty would bury.
   strategy_config:
     default:
       min_overlap: 1

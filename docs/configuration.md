@@ -134,11 +134,14 @@ retrieval:
   scoring:
     embedding_context_turns: 0      # 0 = bare query only (legacy default)
     embedding_context_guard: true   # per-tag max(bare, context) similarity
+    embedding_reserved_seats: 0     # 0 = legacy; N reserves fused slots
 ```
 
 **`embedding_context_turns`**: The embedding retrieval signal compares a query vector against stored tag-summary vectors. With `0` (default) the query vector is the bare inbound message. With `N > 0` the last `N` conversational turns are concatenated with the current message and embedded on the same encoder, so an under-specified query ("what should I get her") inherits the elided topic from recent context. Only takes effect with the embedding inbound tagger.
 
 **`embedding_context_guard`**: When context turns are blended, `true` scores each tag by the maximum of its bare-query and context-augmented cosine similarity. This guarantees a tag can only rank at least as well as it would from the bare query alone, so irrelevant recent context cannot demote a relevant tag. `false` scores the context-augmented vector alone (plain concatenation, for experimentation).
+
+**`embedding_reserved_seats`**: RRF fuses three ranked signals and penalizes candidates missing from a signal, which buries tags that only the embedding signal surfaces — common on analog queries with no keyword overlap. With `N > 0`, after fusion, dampening, and boosting, the top `N` embedding candidates that are not already in the fused top-K (K is the strategy's `max_results`) are forced into it by displacing its lowest-ranked entries. `0` (default) leaves fusion untouched. Composes with `embedding_context_turns`: the context blend surfaces the right embedding candidate, and reserved seats guarantee it survives the fused top-K cut.
 
 ### Assembly
 

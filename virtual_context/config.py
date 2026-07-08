@@ -288,6 +288,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         embedding_min_threshold=scoring_raw.get("embedding_min_threshold", _sc_defaults.embedding_min_threshold),
         embedding_context_turns=scoring_raw.get("embedding_context_turns", _sc_defaults.embedding_context_turns),
         embedding_context_guard=scoring_raw.get("embedding_context_guard", _sc_defaults.embedding_context_guard),
+        embedding_reserved_seats=scoring_raw.get("embedding_reserved_seats", _sc_defaults.embedding_reserved_seats),
         dampening=dampening_config,
     )
     retriever_config = RetrieverConfig(
