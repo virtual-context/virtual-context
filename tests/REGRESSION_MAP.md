@@ -392,6 +392,17 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
+
+- **Symptom**: On analog queries with no keyword overlap, the tag the embedding signal surfaces most strongly lands far outside the fused top-K (embedding candidates observed at fused rank 15-33 while the selection cut is 10), because RRF penalizes every candidate absent from the idf/bm25 signals. The context-augmented embedding signal (BUG-042) surfaces the right tag but fusion then discards it.
+- **Root cause**: `score_candidates` fuses three ranked signals with a missing-signal penalty rank; a strong embedding-only candidate carries penalty ranks for idf and bm25 and cannot reach the top-K on the embedding weight alone.
+- **Fix**: New `retrieval.scoring.embedding_reserved_seats` (default 0 = byte-identical legacy). After fusion/dampening/boost and before the top-K cut, `apply_embedding_reserved_seats` seats the top-N embedding-signal candidates (raw pre-gravity embedding order) that are outside the fused top-K (K = strategy `max_results`) by raising their fused scores into the gap between the last surviving entry and the first displaced one, so the retriever's score-descending cut yields surviving + reserved. Only the seated tags' scores change; a degenerate boundary tie nudges the displaced entries down. Composes with BUG-042.
+- **Tests**:
+  - `test_embedding_reserved_seats.py::TestReservedSeatMath` (seating parity vs the rule on a synthetic fixture and an anonymized real prod fused/embedding dump; lowest-of-top-K displaced)
+  - `test_embedding_reserved_seats.py::TestLegacyByteIdentical` (N=0 no mutation, everything-already-fits, embedding-already-in-top-K, defaults)
+  - `test_embedding_reserved_seats.py::TestNoGoldDisplacement` (buried gold seated without evicting gold already in top-K; seated score lands between survivor and displaced)
+  - `test_embedding_reserved_seats.py::TestConfigPlumbing`
+
 ### BUG-042 — Under-specified analog queries miss the relevant tag on the bare embedding signal
 
 - **Symptom**: The embedding retrieval signal scores only the bare inbound message against tag-summary vectors, so an under-specified query whose surface words name neither the gold tag nor the summary's distinctive nouns ("what should I get her for her birthday") fails to surface the relevant tag even when the elided topic sits in the immediately preceding turns.
@@ -467,3 +478,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_ingest_single_tail_pair.py` | BUG-040 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
+| `test_embedding_reserved_seats.py` | BUG-043 |

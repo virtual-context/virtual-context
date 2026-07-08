@@ -274,6 +274,74 @@ def apply_hub_dampening(
                     tag, old, fused_scores[tag], seg_count, p90, penalty)
 
 
+def apply_embedding_reserved_seats(
+    fused_scores: dict[str, float],
+    embedding_ranked: list[str],
+    reserved_seats: int,
+    top_k: int,
+    breakdowns: dict[str, dict] | None = None,
+) -> list[str]:
+    """Force the top embedding-signal candidates into the fused top-K (in-place).
+
+    RRF's missing-signal penalty buries tags that only the embedding signal
+    surfaces. After fusion/dampening/boost, this takes the top ``reserved_seats``
+    embedding candidates (``embedding_ranked``, the pre-gravity embedding order)
+    that are NOT already in the fused top-``top_k`` and seats them by displacing
+    the lowest-ranked entries of the top-K. Seating raises only the seated tags'
+    fused scores into the open gap between the last surviving entry and the first
+    displaced one, so every other tag keeps its score and the retriever's
+    score-descending top-K cut yields ``surviving + reserved``. Returns the list
+    of seated tags (empty when nothing is seated). Documented tie-break: if that
+    gap is degenerate (equal boundary scores) the displaced entries are nudged
+    just below the seated band to guarantee the membership swap.
+    """
+    if reserved_seats <= 0 or top_k <= 0 or not embedding_ranked or not fused_scores:
+        return []
+    ranked = sorted(fused_scores.keys(), key=lambda t: fused_scores[t], reverse=True)
+    if len(ranked) <= top_k:
+        return []  # everything already fits inside the top-K; nothing to seat
+
+    top = ranked[:top_k]
+    top_set = set(top)
+    reserved = [t for t in embedding_ranked if t in fused_scores and t not in top_set]
+    reserved = reserved[:reserved_seats]
+    m = min(len(reserved), top_k)
+    if m == 0:
+        return []
+    reserved = reserved[:m]
+
+    surviving = top[: top_k - m]          # top-K entries that keep their seats
+    displaced = top[top_k - m:]           # lowest-ranked top-K entries, evicted
+
+    # Score band the seated tags must land in: strictly below the last surviving
+    # entry and strictly above the highest displaced entry.
+    upper = fused_scores[surviving[-1]] if surviving else fused_scores[ranked[0]] + 1.0
+    lower = fused_scores[displaced[0]]    # highest-scored displaced entry
+    if upper <= lower:
+        # Degenerate gap (boundary tie): open one by nudging displaced entries
+        # below where the seated band will sit.
+        span = abs(upper) if upper != 0 else 1.0
+        nudge = span * 1e-6
+        new_lower = upper - nudge * (m + 1)
+        for j, tag in enumerate(displaced):
+            fused_scores[tag] = new_lower - nudge * (j + 1)
+            if breakdowns is not None and tag in breakdowns:
+                breakdowns[tag]["fused"] = fused_scores[tag]
+        lower = new_lower
+
+    step = (upper - lower) / (m + 1)
+    for i, tag in enumerate(reserved):
+        fused_scores[tag] = upper - step * (i + 1)
+        if breakdowns is not None and tag in breakdowns:
+            breakdowns[tag]["reserved_seat"] = True
+            breakdowns[tag]["fused"] = fused_scores[tag]
+        logger.info(
+            "Retriever: RESERVED '%s': emb_signal_rank=%d forced into top-%d (fused=%.4f)",
+            tag, embedding_ranked.index(tag), top_k, fused_scores[tag],
+        )
+    return reserved
+
+
 def apply_resolution_boost(
     fused_scores: dict[str, float],
     actionable_tags: set[str],
@@ -304,6 +372,7 @@ def score_candidates(
     tag_stats: dict[str, int] | None = None,
     stored_embeddings: dict[str, list[float]] | None = None,
     query_embedding_context: list[float] | None = None,
+    top_k: int | None = None,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """3-signal RRF fusion. Returns ({tag: fused_score}, {tag: signal_breakdown})."""
     _started = time.monotonic()
@@ -336,6 +405,11 @@ def score_candidates(
     _embed_mode = (
         "bare" if query_embedding_context is None
         else ("guard" if config.embedding_context_guard else "concat")
+    )
+    # Capture the embedding-signal order BEFORE gravity dampening mutates the
+    # scores, so reserved-seat selection reflects raw embedding confidence.
+    embedding_ranked = sorted(
+        embed_scores.keys(), key=lambda t: embed_scores[t], reverse=True,
     )
 
     # --- Phase 2: Dampening (pre-RRF) ---
@@ -426,6 +500,15 @@ def score_candidates(
             tag, bd["idf_rank"], bd["bm25_rank"], bd["embed_rank"], bd["fused"],
         )
 
+    # --- Phase 3: reserved seats (post-fusion/dampening/boost, pre-top-K-cut) ---
+    seated: list[str] = []
+    if config.embedding_reserved_seats > 0 and top_k:
+        _seat_stage = time.monotonic()
+        seated = apply_embedding_reserved_seats(
+            fused, embedding_ranked, config.embedding_reserved_seats, top_k, breakdowns,
+        )
+        _note("reserved_seats", _seat_stage)
+
     # Log top results
     top = sorted(fused.keys(), key=lambda t: fused[t], reverse=True)[:10]
     logger.info("Retriever: Top %d by RRF: %s", len(top),
@@ -439,13 +522,14 @@ def score_candidates(
             if ms > 0
         )
         logger.info(
-            "RETRIEVAL_SCORE_BREAKDOWN total=%sms candidates=%d idf=%d bm25=%d embed=%d embed_mode=%s %s",
+            "RETRIEVAL_SCORE_BREAKDOWN total=%sms candidates=%d idf=%d bm25=%d embed=%d embed_mode=%s reserved=%d %s",
             total_ms,
             len(all_tags),
             len(idf_scores),
             len(bm25_scores),
             len(embed_scores),
             _embed_mode,
+            len(seated),
             stages or "no-stages",
         )
 
