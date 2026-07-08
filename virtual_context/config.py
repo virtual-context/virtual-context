@@ -286,6 +286,8 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         bm25_limit=scoring_raw.get("bm25_limit", _sc_defaults.bm25_limit),
         embedding_limit=scoring_raw.get("embedding_limit", _sc_defaults.embedding_limit),
         embedding_min_threshold=scoring_raw.get("embedding_min_threshold", _sc_defaults.embedding_min_threshold),
+        embedding_context_turns=scoring_raw.get("embedding_context_turns", _sc_defaults.embedding_context_turns),
+        embedding_context_guard=scoring_raw.get("embedding_context_guard", _sc_defaults.embedding_context_guard),
         dampening=dampening_config,
     )
     retriever_config = RetrieverConfig(

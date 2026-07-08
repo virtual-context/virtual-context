@@ -121,6 +121,14 @@ def compute_bm25_candidates(
     return tag_scores
 
 
+def _normalize_vec(vec: list[float]):
+    arr = np.asarray(vec, dtype=np.float32)
+    norm = float(np.linalg.norm(arr))
+    if norm > 0.0:
+        return arr / norm, norm
+    return arr, 0.0
+
+
 def compute_embedding_candidates(
     query_embedding: list[float] | None,
     store: ContextStore,
@@ -128,8 +136,21 @@ def compute_embedding_candidates(
     limit: int = 20,
     min_threshold: float = 0.25,
     stored_embeddings: dict[str, list[float]] | None = None,
+    query_embedding_context: list[float] | None = None,
+    guard: bool = True,
 ) -> dict[str, float]:
-    """Signal 3: Embedding cosine similarity. Returns {primary_tag: cosine_score}."""
+    """Signal 3: Embedding cosine similarity. Returns {primary_tag: cosine_score}.
+
+    When ``query_embedding_context`` is provided it is a second query vector —
+    the current message concatenated with recent conversational turns, embedded
+    on the same encoder. ``guard=True`` takes the per-tag MAX of the bare and
+    context similarities before threshold/ranking, so a tag can only ever rank
+    at least as well as it would from the bare query (irrelevant context cannot
+    demote a tag below its bare rank). ``guard=False`` scores the context vector
+    alone (plain-concat). Both similarities are on the same [-1, 1] cosine scale,
+    so an elementwise max is a valid rank key. With ``query_embedding_context``
+    None the function is byte-identical to the bare-only legacy path.
+    """
     if query_embedding is None:
         return {}
 
@@ -141,10 +162,15 @@ def compute_embedding_candidates(
 
     scored: list[tuple[str, float]] = []
     if np is not None:
-        query_vec = np.asarray(query_embedding, dtype=np.float32)
-        query_norm = float(np.linalg.norm(query_vec))
+        query_vec, query_norm = _normalize_vec(query_embedding)
+        # Context vector: only usable when the bare vector is usable too, so the
+        # guard max is always over two live similarity rows.
+        ctx_vec = None
+        if query_embedding_context is not None and query_norm > 0.0:
+            _ctx, ctx_norm = _normalize_vec(query_embedding_context)
+            if ctx_norm > 0.0:
+                ctx_vec = _ctx
         if query_norm > 0.0:
-            query_vec = query_vec / query_norm
             candidate_tags: list[str] = []
             embedding_rows: list[list[float]] = []
             for tag, emb in stored.items():
@@ -161,7 +187,14 @@ def compute_embedding_candidates(
                     filtered_tags = [
                         candidate_tags[idx] for idx, ok in enumerate(valid.tolist()) if ok
                     ]
-                    similarities = embedding_matrix @ query_vec
+                    bare_sims = embedding_matrix @ query_vec
+                    if ctx_vec is not None:
+                        ctx_sims = embedding_matrix @ ctx_vec
+                        similarities = (
+                            np.maximum(bare_sims, ctx_sims) if guard else ctx_sims
+                        )
+                    else:
+                        similarities = bare_sims
                     matching = np.flatnonzero(similarities >= min_threshold)
                     if matching.size:
                         ordered = matching[np.argsort(similarities[matching])[::-1]]
@@ -170,16 +203,21 @@ def compute_embedding_candidates(
                             for idx in ordered
                         ]
     else:
+        use_ctx = query_embedding_context is not None
         for tag, emb in stored.items():
             sim = cosine_similarity(query_embedding, emb)
+            if use_ctx:
+                ctx_sim = cosine_similarity(query_embedding_context, emb)
+                sim = max(sim, ctx_sim) if guard else ctx_sim
             if sim >= min_threshold:
                 scored.append((tag, sim))
 
     scored.sort(key=lambda x: x[1], reverse=True)
     result = {tag: sim for tag, sim in scored[:limit]}
 
-    logger.info("Retriever: Embedding path: %d candidates above threshold=%.2f",
-                len(result), min_threshold)
+    mode = "bare" if query_embedding_context is None else ("guard" if guard else "concat")
+    logger.info("Retriever: Embedding path: %d candidates above threshold=%.2f (mode=%s)",
+                len(result), min_threshold, mode)
     return result
 
 
@@ -265,6 +303,7 @@ def score_candidates(
     config: "ScoringConfig",
     tag_stats: dict[str, int] | None = None,
     stored_embeddings: dict[str, list[float]] | None = None,
+    query_embedding_context: list[float] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """3-signal RRF fusion. Returns ({tag: fused_score}, {tag: signal_breakdown})."""
     _started = time.monotonic()
@@ -290,8 +329,14 @@ def score_candidates(
         limit=config.embedding_limit,
         min_threshold=config.embedding_min_threshold,
         stored_embeddings=stored_embeddings,
+        query_embedding_context=query_embedding_context,
+        guard=config.embedding_context_guard,
     )
     _note("embedding_candidates", _embed_stage)
+    _embed_mode = (
+        "bare" if query_embedding_context is None
+        else ("guard" if config.embedding_context_guard else "concat")
+    )
 
     # --- Phase 2: Dampening (pre-RRF) ---
     dampening = config.dampening
@@ -394,12 +439,13 @@ def score_candidates(
             if ms > 0
         )
         logger.info(
-            "RETRIEVAL_SCORE_BREAKDOWN total=%sms candidates=%d idf=%d bm25=%d embed=%d %s",
+            "RETRIEVAL_SCORE_BREAKDOWN total=%sms candidates=%d idf=%d bm25=%d embed=%d embed_mode=%s %s",
             total_ms,
             len(all_tags),
             len(idf_scores),
             len(bm25_scores),
             len(embed_scores),
+            _embed_mode,
             stages or "no-stages",
         )
 

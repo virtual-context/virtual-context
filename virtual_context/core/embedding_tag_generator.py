@@ -247,6 +247,22 @@ class EmbeddingTagGenerator:
             query_embedding=text_embedding,
         )
 
+    def embed_text(self, text: str) -> list[float] | None:
+        """Embed a single text with this generator's encoder (raw, un-normalized).
+
+        Additive read-only helper used by context-augmented retrieval to embed a
+        recent-turns + query concatenation on the SAME encoder that produced the
+        bare query embedding. Does not touch tag-name matching. Returns None on
+        empty input or encoder failure so callers can fall back to the bare query.
+        """
+        if not text:
+            return None
+        try:
+            return list(self._embed([text[:2000]])[0])
+        except Exception:
+            logger.debug("embed_text failed; falling back to bare query", exc_info=True)
+            return None
+
     def load_vocabulary(self, tag_counts: dict[str, int]) -> None:
         self._tag_vocabulary.update(tag_counts)
         self._ensure_tag_embeddings(list(tag_counts))

@@ -346,6 +346,16 @@ retrieval:
   inbound_tagger_type: "embedding"                  # "embedding" or "llm"
   embedding_model: "all-MiniLM-L6-v2"
   embedding_threshold: 0.3
+  scoring:
+    # 3-signal RRF fusion weights/limits use built-in defaults; override here.
+    embedding_context_turns: 0                      # 0 = bare query only (legacy).
+                                                    # N>0: also embed the last N
+                                                    # conversation turns + the
+                                                    # current message for signal 3.
+    embedding_context_guard: true                   # per-tag max(bare, context)
+                                                    # so irrelevant context can
+                                                    # never demote a tag below
+                                                    # its bare rank.
   strategy_config:
     default:
       min_overlap: 1

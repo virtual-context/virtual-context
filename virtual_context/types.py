@@ -939,6 +939,19 @@ class ScoringConfig:
     bm25_limit: int = 20
     embedding_limit: int = 20
     embedding_min_threshold: float = 0.25
+    # Blend recent-turn context into the embedding retrieval signal.
+    # 0 (default) = byte-identical legacy behavior: the bare query embedding
+    # is the only vector scored against tag summaries. N > 0 = also embed the
+    # last N conversational turns concatenated with the current message and
+    # combine per the guard below. YAML key: retrieval.scoring.embedding_context_turns.
+    embedding_context_turns: int = 0
+    # When context turns are blended, guard the signal by taking the per-tag
+    # MAX of the bare-query and context-augmented cosine similarities, so a
+    # tag can only ever rank better than it would from the bare query alone
+    # (irrelevant context cannot demote a tag below its bare rank). False uses
+    # the context-augmented embedding alone (plain-concat, experimentation only).
+    # YAML key: retrieval.scoring.embedding_context_guard.
+    embedding_context_guard: bool = True
     dampening: DampeningConfig = field(default_factory=DampeningConfig)
 
 
