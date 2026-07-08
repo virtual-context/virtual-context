@@ -127,6 +127,19 @@ retrieval:
 
 **`max_budget_fraction`**: The ceiling for injected context as a fraction of the total context window. At 0.25 with a 120K window, up to 30K tokens of retrieved summaries can be injected.
 
+#### Scoring — context-augmented embedding signal
+
+```yaml
+retrieval:
+  scoring:
+    embedding_context_turns: 0      # 0 = bare query only (legacy default)
+    embedding_context_guard: true   # per-tag max(bare, context) similarity
+```
+
+**`embedding_context_turns`**: The embedding retrieval signal compares a query vector against stored tag-summary vectors. With `0` (default) the query vector is the bare inbound message. With `N > 0` the last `N` conversational turns are concatenated with the current message and embedded on the same encoder, so an under-specified query ("what should I get her") inherits the elided topic from recent context. Only takes effect with the embedding inbound tagger.
+
+**`embedding_context_guard`**: When context turns are blended, `true` scores each tag by the maximum of its bare-query and context-augmented cosine similarity. This guarantees a tag can only rank at least as well as it would from the bare query alone, so irrelevant recent context cannot demote a relevant tag. `false` scores the context-augmented vector alone (plain concatenation, for experimentation).
+
 ### Assembly
 
 ```yaml

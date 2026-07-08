@@ -392,6 +392,17 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-042 — Under-specified analog queries miss the relevant tag on the bare embedding signal
+
+- **Symptom**: The embedding retrieval signal scores only the bare inbound message against tag-summary vectors, so an under-specified query whose surface words name neither the gold tag nor the summary's distinctive nouns ("what should I get her for her birthday") fails to surface the relevant tag even when the elided topic sits in the immediately preceding turns.
+- **Root cause**: `compute_embedding_candidates` had one query vector — the bare message embedding produced by the inbound embedding tagger, which discards the conversational context it receives. Recent-turn context that would disambiguate the query was never folded into signal 3.
+- **Fix**: New `retrieval.scoring.embedding_context_turns` (default 0 = byte-identical legacy) blends the last N conversational turns + the current message into a second query embedding on the same encoder. `embedding_context_guard` (default true) takes the per-tag MAX of the bare and context similarities before threshold/ranking, so a tag can only ever rank at least as well as it would from the bare query alone — irrelevant recent context cannot demote a relevant tag below its bare rank. Guard false scores the context vector alone (plain concat, experimentation).
+- **Tests**:
+  - `test_embedding_context_guard.py::TestGuardMathParity` (per-tag max ranking matches the reference guard math; guard sim >= bare sim per tag)
+  - `test_embedding_context_guard.py::TestLegacyByteIdentical` (N=0 / no-context path identical to legacy; defaults are 0/true)
+  - `test_embedding_context_guard.py::TestCraterRegression` (irrelevant-context crater repaired: plain concat demotes the gold tag, guard recovers it near the bare rank)
+  - `test_embedding_context_guard.py::TestConfigPlumbing` / `TestRetrieverContextEmbedding` (YAML parse + retriever concat construction)
+
 ### BUG-041 — Compaction materializes tag summaries for only the greedy cover
 
 - **Symptom**: Every compaction leaves segment tags with no `tag_summaries` row (~69/day on a live multi-tag conversation); those tags are invisible to the context-hint topic list, absent from the broad/recall-all summary floor, and missing from tag-summary-embedding scoring. Rows materialized by an external repair sweep go permanently stale because later compactions keep skipping the tags. First observed May 30 (tags present in `segment_tags`, absent from `tag_summaries`).
@@ -455,3 +466,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_engine_state_schema_postgres.py` | BUG-039 |
 | `test_ingest_single_tail_pair.py` | BUG-040 |
 | `test_tag_summary_materialization.py` | BUG-041 |
+| `test_embedding_context_guard.py` | BUG-042 |

@@ -82,6 +82,37 @@ class ContextRetriever:
             )
         return stored
 
+    def _build_context_query_embedding(
+        self, message: str, context_turns: list[str] | None,
+    ) -> tuple[list[float] | None, str, float | None]:
+        """Embed recent-turn context + the current message for the guard signal.
+
+        Returns ``(embedding, mode, embed_ms)``. ``embedding`` is None (and mode
+        ``"bare"``) whenever context blending is disabled, no context is
+        available, or the inbound tagger cannot embed — in which case retrieval
+        scores the bare query embedding exactly as before. ``mode`` is
+        ``"guard"`` or ``"concat"`` per ``scoring.embedding_context_guard`` when
+        a context vector is produced.
+        """
+        scoring = self.config.scoring
+        n_ctx = getattr(scoring, "embedding_context_turns", 0)
+        if n_ctx <= 0 or not context_turns:
+            return None, "bare", None
+        embed_text = getattr(self._inbound_tagger, "embed_text", None)
+        if embed_text is None:
+            return None, "bare", None
+        recent = [t for t in context_turns[-n_ctx:] if t]
+        if not recent:
+            return None, "bare", None
+        concat_text = (" ".join(recent) + " " + message).strip()
+        _stage = time.monotonic()
+        ctx_embedding = embed_text(concat_text)
+        embed_ms = round((time.monotonic() - _stage) * 1000, 1)
+        if not ctx_embedding:
+            return None, "bare", embed_ms
+        mode = "guard" if getattr(scoring, "embedding_context_guard", True) else "concat"
+        return ctx_embedding, mode, embed_ms
+
     def _compute_idf_weights(self, all_tags: list | None = None) -> dict[str, float]:
         """Compute IDF weights from tag usage counts in the store.
 
@@ -327,6 +358,19 @@ class ContextRetriever:
             self._load_tag_summary_embedding_snapshot()
             if query_embedding is not None else None
         )
+        query_embedding_context = None
+        if query_embedding is not None:
+            query_embedding_context, embed_mode, ctx_embed_ms = (
+                self._build_context_query_embedding(message, context_turns)
+            )
+            if query_embedding_context is not None:
+                if ctx_embed_ms is not None:
+                    _breakdown["context_embed"] = ctx_embed_ms
+                logger.info(
+                    "Retriever: embedding-context mode=%s turns=%d embed_ctx=%sms",
+                    embed_mode, self.config.scoring.embedding_context_turns,
+                    ctx_embed_ms,
+                )
         scores, breakdowns = score_candidates(
             query_tags=query_tags,
             related_tags=related_query_tags,
@@ -338,6 +382,7 @@ class ContextRetriever:
             config=self.config.scoring,
             tag_stats=tag_stats,
             stored_embeddings=stored_embeddings,
+            query_embedding_context=query_embedding_context,
         )
         _note("score_candidates", _score_stage)
         retrieval_scores = scores
