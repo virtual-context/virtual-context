@@ -7263,6 +7263,22 @@ class PostgresStore(ContextStore):
                 break
             offset += batch_size
 
+    def get_fact_embedding_index(
+        self,
+        conversation_id: str,
+    ) -> dict[str, tuple[str, str]]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT fact_id, model, embedding_json
+                     FROM fact_embeddings
+                    WHERE conversation_id = %s""",
+                (conversation_id,),
+            ).fetchall()
+        return {
+            row["fact_id"]: (row["model"], row["embedding_json"])
+            for row in rows
+        }
+
     def get_actionable_fact_tags(
         self, tags: list[str], conversation_id: str | None = None,
     ) -> set[str]:

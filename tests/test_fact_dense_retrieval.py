@@ -646,3 +646,191 @@ def test_postgres_update_fact_fields_invalidates_then_refreshes_all_callers(pg_s
     assert loaded["pgplanned"][1] == _embed([promoted.embed_text()])[0]
     assert loaded["pgplanned"][1] != [9.0, 9.0, 9.0]
     pg_store.delete_conversation(conv)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — admin backfill (engine.backfill_fact_embeddings)
+# ---------------------------------------------------------------------------
+
+
+class _StubSemantic:
+    """Deterministic in-process embedder standing in for the semantic
+    manager so backfill tests never load a real embedding model."""
+
+    def __init__(self, dim: int = 4) -> None:
+        self._dim = dim
+        self.calls: list[list[str]] = []
+
+    def get_embed_fn(self):
+        def _embed(texts):
+            self.calls.append(list(texts))
+            out = []
+            for t in texts:
+                h = abs(hash(t))
+                out.append([float((h >> (8 * i)) & 0xFF) for i in range(self._dim)])
+            return out
+
+        return _embed
+
+
+def _backfill_engine(tmp_path, conv_id: str = "conv-fdr-backfill"):
+    from virtual_context.config import load_config
+    from virtual_context.engine import VirtualContextEngine
+
+    config = load_config(config_dict={
+        "context_window": 10000,
+        "storage": {"backend": "sqlite", "sqlite": {"path": str(tmp_path / "b.db")}},
+        "tag_generator": {"type": "keyword"},
+        "conversation_id": conv_id,
+    })
+    engine = VirtualContextEngine(config=config)
+    engine._semantic = _StubSemantic()
+    return engine
+
+
+def _raw(engine):
+    store = engine._store
+    store = getattr(store, "_store", store)
+    # Single-backend sqlite still composes a CompositeStore whose fact
+    # store is the concrete SQLiteStore (the one owning _get_conn and the
+    # fact_embeddings table).
+    return getattr(store, "_facts", store)
+
+
+def test_backfill_fact_embeddings_idempotent_second_run_all_skipped_current(tmp_path):
+    conv = "conv-fdr-idem"
+    engine = _backfill_engine(tmp_path, conv)
+    raw = _raw(engine)
+    raw.store_facts([
+        _fact("a", conv, verb="likes", obj="tea"),
+        _fact("b", conv, verb="visited", obj="paris"),
+    ])
+
+    first = engine.backfill_fact_embeddings(conv)
+    assert first["embedded"] == 2
+    assert first["skipped_current"] == 0
+
+    loaded = raw.load_fact_embeddings(conv, MODEL_A)
+    assert set(loaded) == {"a", "b"}
+
+    second = engine.backfill_fact_embeddings(conv)
+    assert second == {
+        "embedded": 0, "skipped_current": 2,
+        "model_mismatch": 0, "malformed": 0, "windowed_out": 0,
+    }
+
+
+def test_backfill_fact_embeddings_window_uses_half_open_text_timestamp_normalization(tmp_path):
+    conv = "conv-fdr-win"
+    engine = _backfill_engine(tmp_path, conv)
+    raw = _raw(engine)
+    raw.store_facts([
+        _fact("early", conv, mentioned_at=datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+        _fact("mid", conv, mentioned_at=datetime(2026, 1, 2, 12, tzinfo=timezone.utc)),
+        _fact("late", conv, mentioned_at=datetime(2026, 1, 3, 12, tzinfo=timezone.utc)),
+    ])
+
+    t_rep = engine.backfill_fact_embeddings(
+        conv, since="2026-01-02T00:00:00", until="2026-01-03T00:00:00")
+    # only "mid" is in-window; early+late windowed out
+    assert t_rep["embedded"] == 1
+    assert t_rep["windowed_out"] == 2
+    assert set(raw.load_fact_embeddings(conv, MODEL_A)) == {"mid"}
+
+    # space-separated bounds select the identical row set (half-open)
+    conv2 = "conv-fdr-win2"
+    engine2 = _backfill_engine(tmp_path, conv2)
+    raw2 = _raw(engine2)
+    raw2.store_facts([
+        _fact("early", conv2, mentioned_at=datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+        _fact("mid", conv2, mentioned_at=datetime(2026, 1, 2, 12, tzinfo=timezone.utc)),
+        _fact("late", conv2, mentioned_at=datetime(2026, 1, 3, 12, tzinfo=timezone.utc)),
+    ])
+    space_rep = engine2.backfill_fact_embeddings(
+        conv2, since="2026-01-02 00:00:00", until="2026-01-03 00:00:00")
+    assert space_rep["embedded"] == t_rep["embedded"]
+    assert space_rep["windowed_out"] == t_rep["windowed_out"]
+    assert set(raw2.load_fact_embeddings(conv2, MODEL_A)) == {"mid"}
+
+
+def test_backfill_fact_embeddings_force_rebuild_reembeds_current_rows(tmp_path):
+    conv = "conv-fdr-force"
+    engine = _backfill_engine(tmp_path, conv)
+    raw = _raw(engine)
+    raw.store_facts([_fact("a", conv), _fact("b", conv)])
+
+    engine.backfill_fact_embeddings(conv)
+    engine._semantic.calls.clear()
+
+    forced = engine.backfill_fact_embeddings(conv, force_rebuild=True)
+    assert forced["embedded"] == 2
+    assert forced["skipped_current"] == 0
+    # every current row was re-embedded (embed_fn invoked per fact)
+    embedded_texts = [c[0] for c in engine._semantic.calls]
+    assert len(embedded_texts) == 2
+
+
+def test_backfill_fact_embeddings_reports_model_mismatch_malformed_and_windowed_out(tmp_path):
+    conv = "conv-fdr-report"
+    engine = _backfill_engine(tmp_path, conv)
+    raw = _raw(engine)
+    raw.store_facts([
+        _fact("cur", conv, mentioned_at=datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        _fact("mism", conv, mentioned_at=datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        _fact("mal", conv, mentioned_at=datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        _fact("fresh", conv, mentioned_at=datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        _fact("out", conv, mentioned_at=datetime(2020, 1, 1, tzinfo=timezone.utc)),
+    ])
+    # cur: valid current-model row -> skipped_current
+    raw.store_fact_embeddings("cur", conv, MODEL_A, [1.0, 2.0, 3.0, 4.0])
+    # mism: row under a different model -> model_mismatch (rebuilt)
+    raw.store_fact_embeddings("mism", conv, MODEL_B, [1.0, 2.0, 3.0, 4.0])
+    # mal: current-model row with unparsable JSON -> malformed (rebuilt)
+    conn = raw._get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO fact_embeddings "
+        "(fact_id, conversation_id, model, embedding_json) VALUES (?, ?, ?, ?)",
+        ("mal", conv, MODEL_A, "not-json"),
+    )
+
+    rep = engine.backfill_fact_embeddings(
+        conv, since="2026-01-01", until="2027-01-01")
+    assert rep == {
+        "embedded": 1,          # "fresh"
+        "skipped_current": 1,   # "cur"
+        "model_mismatch": 1,    # "mism"
+        "malformed": 1,         # "mal"
+        "windowed_out": 1,      # "out"
+    }
+    # mismatch + malformed were rebuilt to a valid current-model row
+    loaded = raw.load_fact_embeddings(conv, MODEL_A)
+    assert {"cur", "mism", "mal", "fresh"} <= set(loaded)
+
+
+def test_backfill_fact_embeddings_overlapping_runs_converge_to_one_row_per_key(tmp_path):
+    conv = "conv-fdr-overlap"
+    engine = _backfill_engine(tmp_path, conv)
+    raw = _raw(engine)
+    raw.store_facts([
+        _fact("a", conv, mentioned_at=datetime(2026, 3, 1, tzinfo=timezone.utc)),
+        _fact("b", conv, mentioned_at=datetime(2026, 3, 5, tzinfo=timezone.utc)),
+    ])
+
+    engine.backfill_fact_embeddings(conv, since="2026-03-01", until="2026-03-10")
+    engine.backfill_fact_embeddings(conv, since="2026-03-03", until="2026-03-31")
+    engine.backfill_fact_embeddings(conv)
+
+    conn = raw._get_conn()
+    rows = conn.execute(
+        "SELECT fact_id, COUNT(*) c FROM fact_embeddings "
+        "WHERE conversation_id = ? GROUP BY fact_id",
+        (conv,),
+    ).fetchall()
+    counts = {r["fact_id"]: r["c"] for r in rows}
+    assert counts == {"a": 1, "b": 1}
+
+
+def test_backfill_fact_embeddings_raises_on_empty_conversation_id(tmp_path):
+    engine = _backfill_engine(tmp_path)
+    with pytest.raises(ValueError):
+        engine.backfill_fact_embeddings("")

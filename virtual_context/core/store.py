@@ -1052,6 +1052,19 @@ class ContextStore(ABC):
         """
         return iter(())
 
+    def get_fact_embedding_index(
+        self,
+        conversation_id: str,
+    ) -> dict[str, tuple[str, str]]:
+        """Return existing fact-embedding rows for a conversation.
+
+        Maps ``fact_id -> (model, embedding_json)`` across ALL models,
+        with the raw stored JSON (unparsed) so the admin backfill can
+        classify a row as current, model-mismatched, or malformed
+        without loading vectors. Default: empty.
+        """
+        return {}
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,
