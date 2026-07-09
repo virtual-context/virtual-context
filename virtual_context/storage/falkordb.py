@@ -208,6 +208,12 @@ class FalkorDBFactStore:
     ):
         return iter(())
 
+    def get_fact_embedding_index(
+        self,
+        conversation_id: str,
+    ) -> dict[str, tuple[str, str]]:
+        return {}
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,

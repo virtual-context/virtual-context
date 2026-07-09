@@ -1539,6 +1539,97 @@ def cmd_admin_backfill_tag_summaries(args):
             pass
 
 
+def cmd_admin_backfill_fact_embeddings(args):
+    """Backfill dense ``fact_embeddings`` rows for a conversation whose
+    facts are already durable.
+
+    Builds a ``VirtualContextEngine`` bound to *conversation_id* (with
+    the operator-supplied tenant scope) and invokes
+    ``engine.backfill_fact_embeddings(since=, until=, force_rebuild=)``.
+    Prints a JSON line to stdout with the per-run counts so ops scripts
+    can parse the result without re-running a SQL query. Exit code is
+    non-zero only on hard error (config load failure, engine
+    construction failure); a run that embeds nothing (idempotent re-run)
+    is a normal PASS.
+
+    Window bounds accept space- or T-separated ISO-8601 and are
+    normalized to the half-open ``[--since, --until)`` TEXT-timestamp
+    form inside the engine.
+
+    Storage configuration follows the precedence documented on
+    ``_apply_storage_overrides``: explicit flag > ``-c`` config >
+    ``DATABASE_URL`` env fallback.
+
+        virtual-context admin backfill-fact-embeddings <conv-id> \\
+            --tenant-id <tid> [--since ...] [--until ...] [--force-rebuild]
+    """
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = args.conversation_id
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    force_rebuild = bool(getattr(args, "force_rebuild", False))
+
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "status": "error",
+            "stage": "load_config",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }
+        print(json.dumps(payload))
+        sys.exit(1)
+    config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+
+    # Storage overrides (CLI flags > -c config > DATABASE_URL env fallback).
+    _apply_storage_overrides(config, args)
+
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "status": "error",
+            "stage": "engine_construct",
+            "conversation_id": conversation_id,
+            "error": repr(exc),
+        }
+        print(json.dumps(payload))
+        sys.exit(1)
+
+    try:
+        # The alias resolver may rebind an alias-carrying id to its
+        # terminal during construction; backfill the TERMINAL id.
+        resolved = engine.config.conversation_id
+        counts = engine.backfill_fact_embeddings(
+            resolved,
+            since=since,
+            until=until,
+            force_rebuild=force_rebuild,
+        )
+        payload = {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "resolved_conversation_id": resolved,
+            "tenant_id": tenant_id,
+            "since": since,
+            "until": until,
+            "force_rebuild": force_rebuild,
+            "storage_backend": config.storage.backend,
+            **counts,
+        }
+        print(json.dumps(payload))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
 def cmd_admin_retag_canonical_turns(args):
     """Re-tag canonical rows that carry degraded fallback tags.
 
@@ -2067,6 +2158,66 @@ def main():
     )
 
     # ------------------------------------------------------------------
+    # admin backfill-fact-embeddings
+    # ------------------------------------------------------------------
+    backfill_fe_parser = admin_sub.add_parser(
+        "backfill-fact-embeddings",
+        help=(
+            "Populate dense fact_embeddings for an existing conversation "
+            "whose facts are durable but vector rows are missing/stale"
+        ),
+    )
+    backfill_fe_parser.add_argument(
+        "conversation_id",
+        help="Conversation id to backfill",
+    )
+    backfill_fe_parser.add_argument(
+        "--tenant-id",
+        default="",
+        help="Tenant id to set on the engine config (default: empty)",
+    )
+    backfill_fe_parser.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Inclusive lower bound on mentioned_at (ISO-8601; space- or "
+            "T-separated, normalized internally)"
+        ),
+    )
+    backfill_fe_parser.add_argument(
+        "--until",
+        default=None,
+        help="Exclusive upper bound on mentioned_at (ISO-8601)",
+    )
+    backfill_fe_parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "Re-embed facts that already carry a valid current-model "
+            "vector row"
+        ),
+    )
+    # Storage override flags mirror backfill-tag-summaries. Precedence:
+    # explicit flag > ``-c`` config > ``DATABASE_URL`` env fallback.
+    backfill_fe_parser.add_argument(
+        "--storage-backend",
+        choices=("sqlite", "postgres", "filesystem"),
+        help="Override the engine's storage backend.",
+    )
+    backfill_fe_parser.add_argument(
+        "--postgres-dsn",
+        help=(
+            "Postgres connection string. Overrides storage.postgres_dsn. "
+            "If neither this flag nor -c is provided, falls back to the "
+            "DATABASE_URL environment variable when set."
+        ),
+    )
+    backfill_fe_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite database path. Overrides storage.sqlite_path.",
+    )
+
+    # ------------------------------------------------------------------
     # admin retag-canonical-turns
     # ------------------------------------------------------------------
     retag_parser = admin_sub.add_parser(
@@ -2254,12 +2405,15 @@ def main():
             cmd_admin_retag_canonical_turns(args)
         elif args.admin_command == "backfill-tag-summaries":
             cmd_admin_backfill_tag_summaries(args)
+        elif args.admin_command == "backfill-fact-embeddings":
+            cmd_admin_backfill_fact_embeddings(args)
         elif args.admin_command == "backfill-session-state-markers":
             cmd_admin_backfill_session_state_markers(args)
         else:
             print(
                 "Usage:\n"
                 "  virtual-context admin backfill-tag-summaries <conversation_id> [--tenant-id <id>] [--force-rebuild]\n"
+                "  virtual-context admin backfill-fact-embeddings <conversation_id> [--tenant-id <id>] [--since <ts>] [--until <ts>] [--force-rebuild]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )
             sys.exit(1)

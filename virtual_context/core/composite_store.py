@@ -591,6 +591,12 @@ class CompositeStore:
             conversation_id, since=since, until=until, batch_size=batch_size,
         )
 
+    def get_fact_embedding_index(
+        self,
+        conversation_id: str,
+    ) -> dict[str, tuple[str, str]]:
+        return self._facts.get_fact_embedding_index(conversation_id)
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,

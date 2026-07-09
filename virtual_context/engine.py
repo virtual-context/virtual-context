@@ -2735,6 +2735,132 @@ class VirtualContextEngine:
         )
         return count
 
+    def backfill_fact_embeddings(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        force_rebuild: bool = False,
+    ) -> dict[str, int]:
+        """Populate dense fact vectors for facts that predate embed-on-write.
+
+        Recovery/migration primitive for conversations whose facts are
+        already durable but whose ``fact_embeddings`` rows are missing or
+        stale. Iterates the conversation's live facts, computes
+        ``Fact.embed_text()`` on the same local embedding provider the
+        engine uses, and upserts a model-versioned vector via
+        ``store_fact_embeddings`` (no compaction-fence kwargs — this is
+        the admin path, like ``backfill_tag_summaries``).
+
+        A fact that already carries a valid current-model row is skipped
+        unless ``force_rebuild`` is set. A row stored under a different
+        model counts as ``model_mismatch`` and is rebuilt; a current-model
+        row whose stored JSON will not parse counts as ``malformed`` and
+        is rebuilt. Facts outside the half-open ``[since, until)`` window
+        are counted as ``windowed_out`` and left untouched. Window bounds
+        and each fact's ``mentioned_at`` are normalized with the same
+        TEXT-timestamp rule the tag re-tagger uses (``" " -> "T"`` once),
+        so space- and T-separated bounds select identical rows.
+
+        Args:
+            conversation_id: Conversation to backfill (must be non-empty).
+            since: Inclusive lower bound (ISO-8601; space/T-separated).
+            until: Exclusive upper bound (ISO-8601; space/T-separated).
+            force_rebuild: Re-embed facts that already have a valid
+                current-model row.
+
+        Returns:
+            ``{embedded, skipped_current, model_mismatch, malformed,
+            windowed_out}`` counts.
+        """
+        if not conversation_id:
+            raise ValueError(
+                "backfill_fact_embeddings requires a non-empty conversation_id"
+            )
+
+        report = {
+            "embedded": 0,
+            "skipped_current": 0,
+            "model_mismatch": 0,
+            "malformed": 0,
+            "windowed_out": 0,
+        }
+
+        model = self.config.retriever.embedding_model
+        embed_fn = self._semantic.get_embed_fn() if self._semantic else None
+        if embed_fn is None:
+            logger.warning(
+                "backfill_fact_embeddings: no embedding provider configured; "
+                "returning zero counts (conv=%s)",
+                conversation_id[:12],
+            )
+            return report
+
+        def _normalize(stamp) -> str | None:
+            if not stamp:
+                return None
+            return str(stamp).strip().replace(" ", "T", 1)
+
+        since_n = _normalize(since)
+        until_n = _normalize(until)
+
+        def _malformed(raw_json: str) -> bool:
+            try:
+                parsed = json.loads(raw_json)
+            except (json.JSONDecodeError, TypeError):
+                return True
+            return not isinstance(parsed, list)
+
+        existing_index = self._store.get_fact_embedding_index(conversation_id)
+
+        for fact in self._store.iter_facts_for_embedding_backfill(conversation_id):
+            stamp = _normalize(getattr(fact, "mentioned_at", None)) or ""
+            if since_n is not None and stamp < since_n:
+                report["windowed_out"] += 1
+                continue
+            if until_n is not None and stamp >= until_n:
+                report["windowed_out"] += 1
+                continue
+
+            bucket = "embedded"
+            existing = existing_index.get(fact.id)
+            if existing is not None:
+                ex_model, ex_json = existing
+                if ex_model != model:
+                    bucket = "model_mismatch"
+                elif _malformed(ex_json):
+                    bucket = "malformed"
+                elif force_rebuild:
+                    bucket = "embedded"
+                else:
+                    report["skipped_current"] += 1
+                    continue
+
+            try:
+                emb = embed_fn([fact.embed_text()])[0]
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "backfill_fact_embeddings: failed to embed fact %s for "
+                    "conv=%s: %s",
+                    fact.id, conversation_id[:12], e,
+                )
+                continue
+            self._store.store_fact_embeddings(
+                fact.id, conversation_id, model, emb,
+            )
+            report[bucket] += 1
+
+        logger.info(
+            "backfill_fact_embeddings: done conv=%s embedded=%d "
+            "skipped_current=%d model_mismatch=%d malformed=%d "
+            "windowed_out=%d force_rebuild=%s",
+            conversation_id[:12], report["embedded"],
+            report["skipped_current"], report["model_mismatch"],
+            report["malformed"], report["windowed_out"], force_rebuild,
+        )
+        return report
+
     def ingest_history(
         self,
         history_messages: list[Message],

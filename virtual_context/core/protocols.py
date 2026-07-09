@@ -238,6 +238,10 @@ class FactStore(Protocol):
         until: str | None = None,
         batch_size: int = 1000,
     ): ...
+    def get_fact_embedding_index(
+        self,
+        conversation_id: str,
+    ) -> dict[str, tuple[str, str]]: ...
     def replace_facts_for_segment(
         self,
         conversation_id: str,
