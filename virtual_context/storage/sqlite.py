@@ -1352,6 +1352,17 @@ class SQLiteStore(ContextStore):
             CREATE INDEX IF NOT EXISTS idx_fact_links_source ON fact_links(source_fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
+
+            CREATE TABLE IF NOT EXISTS fact_embeddings (
+                fact_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                PRIMARY KEY (fact_id, conversation_id),
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fact_embeddings_conv_model
+                ON fact_embeddings (conversation_id, model);
         """)
         # M0 operation_id indexes are declared inside
         # _ensure_compaction_scoping_columns, after the ALTER TABLE that adds
@@ -1642,6 +1653,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "segments", "segment_tags", "canonical_turns",
             "canonical_turn_anchors", "canonical_turn_chunks",
             "ingest_batches", "facts", "fact_tags", "fact_links",
+            "fact_embeddings",
             "tool_outputs", "tool_calls", "request_captures",
             "request_turn_counters", "request_context",
             "tag_summary_embeddings", "turn_tool_outputs",
@@ -3761,7 +3773,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
         TABLES_SIMPLE = (
             "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-            "ingest_batches", "facts",
+            "ingest_batches", "facts", "fact_embeddings",
             "segment_tool_outputs", "chain_snapshots",
         )
         # Tables whose natural key can legitimately collide across sibling
@@ -5251,6 +5263,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # resurrect a partially deleted conversation.
         for table in (
             "engine_state",
+            "fact_embeddings",
             "facts",
             "canonical_turns",
             "canonical_turn_chunks",
@@ -8284,6 +8297,171 @@ CREATE TABLE IF NOT EXISTS request_captures (
             except (json.JSONDecodeError, TypeError):
                 pass
         return result
+
+    def store_fact_embeddings(
+        self,
+        fact_id: str,
+        conversation_id: str,
+        model: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        from ..types import CompactionLeaseLost
+
+        if not fact_id or not conversation_id or not model:
+            raise ValueError(
+                "store_fact_embeddings requires non-empty fact_id, "
+                "conversation_id, and model",
+            )
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if guard_all:
+                # INSERT-SELECT form: writes zero rows if the
+                # compaction_operation row no longer matches (status !=
+                # 'running', owner mismatch, epoch advance). The ON CONFLICT
+                # DO UPDATE clause only fires when the SELECT produces a row
+                # candidate — i.e., when the guard passes. fact_embeddings
+                # carries no operation_id column: abandoned-op cleanup deletes
+                # op-owned facts rows and the FK cascade removes their vectors.
+                cur = conn.execute(
+                    """INSERT INTO fact_embeddings
+                    (fact_id, conversation_id, model, embedding_json)
+                    SELECT ?, ?, ?, ?
+                      FROM compaction_operation
+                     WHERE operation_id = ?
+                       AND conversation_id = ?
+                       AND status = 'running'
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?
+                    ON CONFLICT (fact_id, conversation_id) DO UPDATE SET
+                        model = excluded.model,
+                        embedding_json = excluded.embedding_json""",
+                    (
+                        fact_id,
+                        conversation_id,
+                        model,
+                        json.dumps(embedding),
+                        # WHERE clause params:
+                        operation_id,
+                        conversation_id,
+                        owner_worker_id,
+                        lifecycle_epoch,
+                    ),
+                )
+                if (cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    self._enforce_or_observe_mismatch(
+                        operation_id=operation_id,
+                        write_site="store_fact_embeddings",
+                    )
+                    return
+            else:
+                # Legacy unconditional path — backfill/admin + test harnesses.
+                conn.execute(
+                    """INSERT OR REPLACE INTO fact_embeddings
+                    (fact_id, conversation_id, model, embedding_json)
+                    VALUES (?, ?, ?, ?)""",
+                    (fact_id, conversation_id, model, json.dumps(embedding)),
+                )
+            conn.execute("COMMIT")
+        except CompactionLeaseLost:
+            # Already rolled back above; re-raise without swallowing.
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def load_fact_embeddings(
+        self,
+        conversation_id: str,
+        model: str,
+        *,
+        expected_dim: int | None = None,
+    ) -> dict[str, tuple[Fact, list[float]]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT f.*, fe.embedding_json AS embedding_json
+                 FROM fact_embeddings fe
+                 JOIN facts f ON f.id = fe.fact_id
+                WHERE fe.conversation_id = ?
+                  AND fe.model = ?
+                  AND f.conversation_id = ?
+                  AND f.superseded_by IS NULL""",
+            (conversation_id, model, conversation_id),
+        ).fetchall()
+        result: dict[str, tuple[Fact, list[float]]] = {}
+        skipped = 0
+        for row in rows:
+            try:
+                vec = json.loads(row["embedding_json"])
+            except (json.JSONDecodeError, TypeError):
+                skipped += 1
+                continue
+            if not isinstance(vec, list):
+                skipped += 1
+                continue
+            if expected_dim is not None and len(vec) != expected_dim:
+                skipped += 1
+                continue
+            fact = self._row_to_fact(row)
+            result[fact.id] = (fact, vec)
+        if skipped:
+            logger.warning(
+                "load_fact_embeddings skipped %d malformed/wrong-dim rows "
+                "(conversation_id=%s model=%s)",
+                skipped, conversation_id, model,
+            )
+        return result
+
+    def iter_facts_for_embedding_backfill(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        batch_size: int = 1000,
+    ):
+        def _normalize(stamp: str | None) -> str | None:
+            if not stamp:
+                return None
+            return str(stamp).strip().replace(" ", "T", 1)
+
+        since_n = _normalize(since)
+        until_n = _normalize(until)
+        conn = self._get_conn()
+        offset = 0
+        while True:
+            rows = conn.execute(
+                """SELECT * FROM facts
+                    WHERE conversation_id = ?
+                      AND superseded_by IS NULL
+                    ORDER BY mentioned_at, id
+                    LIMIT ? OFFSET ?""",
+                (conversation_id, batch_size, offset),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                stamp = _normalize(row["mentioned_at"]) or ""
+                if since_n is not None and stamp < since_n:
+                    continue
+                if until_n is not None and stamp >= until_n:
+                    continue
+                yield self._row_to_fact(row)
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
 
     def get_actionable_fact_tags(
         self, tags: list[str], conversation_id: str | None = None,

@@ -1010,6 +1010,48 @@ class ContextStore(ABC):
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return []
 
+    def store_fact_embeddings(
+        self,
+        fact_id: str,
+        conversation_id: str,
+        model: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        """Store a model-versioned dense vector for a fact. Default no-op."""
+        pass
+
+    def load_fact_embeddings(
+        self,
+        conversation_id: str,
+        model: str,
+        *,
+        expected_dim: int | None = None,
+    ) -> dict[str, tuple[Fact, list[float]]]:
+        """Load live-fact vectors for a conversation under the given model.
+
+        Returns ``{fact_id: (Fact, vector)}``. Default empty.
+        """
+        return {}
+
+    def iter_facts_for_embedding_backfill(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        batch_size: int = 1000,
+    ):
+        """Yield live facts in ``(mentioned_at, id)`` order for backfill.
+
+        Applies a half-open ``[since, until)`` TEXT-timestamp window.
+        Default: empty iterator.
+        """
+        return iter(())
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,

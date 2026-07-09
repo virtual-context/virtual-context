@@ -263,6 +263,18 @@ CREATE TABLE IF NOT EXISTS fact_links (
     FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    PRIMARY KEY (fact_id, conversation_id),
+    FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_embeddings_conv_model
+    ON fact_embeddings (conversation_id, model);
+
 CREATE TABLE IF NOT EXISTS tool_outputs (
     ref TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
@@ -1287,6 +1299,7 @@ class PostgresStore(ContextStore):
                 "segments", "segment_tags", "canonical_turns",
                 "canonical_turn_anchors", "canonical_turn_chunks",
                 "ingest_batches", "facts", "fact_tags", "fact_links",
+                "fact_embeddings",
                 "tool_outputs", "tool_calls", "request_captures",
                 "request_turn_counters", "request_context",
                 "tag_summary_embeddings", "turn_tool_outputs",
@@ -1567,6 +1580,37 @@ class PostgresStore(ContextStore):
         # these columns and indexes existing; a silent skip would
         # leave the fence build in an unsafe state.
         self._ensure_compaction_fence_schema()
+        # Required dense-fact-retrieval DDL. SCHEMA_SQL creates
+        # fact_embeddings + its FK + idx_fact_embeddings_conv_model, but
+        # the SCHEMA_SQL loop above swallows individual statement
+        # failures. Assert their presence here and fail startup on a miss
+        # rather than silently run without model-versioned fact vectors.
+        self._assert_fact_embeddings_schema()
+
+    def _assert_fact_embeddings_schema(self) -> None:
+        with self.pool.connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'fact_embeddings'"
+            ).fetchone() is None:
+                raise RuntimeError(
+                    "fact_embeddings table missing after schema bootstrap"
+                )
+            if conn.execute(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE indexname = 'idx_fact_embeddings_conv_model'"
+            ).fetchone() is None:
+                raise RuntimeError(
+                    "idx_fact_embeddings_conv_model missing after schema bootstrap"
+                )
+            if conn.execute(
+                "SELECT 1 FROM information_schema.table_constraints "
+                "WHERE table_name = 'fact_embeddings' "
+                "AND constraint_type = 'FOREIGN KEY'"
+            ).fetchone() is None:
+                raise RuntimeError(
+                    "fact_embeddings FK to facts missing after schema bootstrap"
+                )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -3478,7 +3522,7 @@ class PostgresStore(ContextStore):
             # action 'tag_conflict': special tag-summary conflict resolution
             TABLES_SIMPLE = (
                 "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-                "ingest_batches", "facts",
+                "ingest_batches", "facts", "fact_embeddings",
                 "segment_tool_outputs", "chain_snapshots",
             )
             # Tables whose natural key can legitimately collide across
@@ -5023,6 +5067,7 @@ class PostgresStore(ContextStore):
                 deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
                 for table in (
                     "engine_state",
+                    "fact_embeddings",
                     "facts",
                     "canonical_turns",
                     "canonical_turn_chunks",
@@ -7066,6 +7111,157 @@ class PostgresStore(ContextStore):
                 except (json.JSONDecodeError, TypeError):
                     pass
             return result
+
+    def store_fact_embeddings(
+        self,
+        fact_id: str,
+        conversation_id: str,
+        model: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        if not fact_id or not conversation_id or not model:
+            raise ValueError(
+                "store_fact_embeddings requires non-empty fact_id, "
+                "conversation_id, and model",
+            )
+
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                if guard_all:
+                    # INSERT-SELECT form: writes zero rows if the
+                    # compaction_operation row no longer matches. The ON
+                    # CONFLICT DO UPDATE clause only fires when the SELECT
+                    # produces a row candidate — i.e., when the guard passes.
+                    # fact_embeddings carries no operation_id column: the FK
+                    # cascade removes vectors when abandoned-op facts are cleaned.
+                    cur = conn.execute(
+                        """INSERT INTO fact_embeddings
+                        (fact_id, conversation_id, model, embedding_json)
+                        SELECT %s,%s,%s,%s
+                          FROM compaction_operation
+                         WHERE operation_id = %s
+                           AND conversation_id = %s
+                           AND status = 'running'
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                        ON CONFLICT (fact_id, conversation_id) DO UPDATE SET
+                            model = EXCLUDED.model,
+                            embedding_json = EXCLUDED.embedding_json""",
+                        (
+                            fact_id, conversation_id, model, json.dumps(embedding),
+                            # WHERE clause params:
+                            operation_id, conversation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        self._enforce_or_observe_mismatch(
+                            operation_id=operation_id,
+                            write_site="store_fact_embeddings",
+                        )
+                        return
+                else:
+                    # Legacy unconditional path — backfill/admin + test harnesses.
+                    conn.execute(
+                        """INSERT INTO fact_embeddings
+                        (fact_id, conversation_id, model, embedding_json)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (fact_id, conversation_id) DO UPDATE SET
+                            model = EXCLUDED.model,
+                            embedding_json = EXCLUDED.embedding_json""",
+                        (fact_id, conversation_id, model, json.dumps(embedding)),
+                    )
+
+    def load_fact_embeddings(
+        self,
+        conversation_id: str,
+        model: str,
+        *,
+        expected_dim: int | None = None,
+    ) -> dict[str, tuple[Fact, list[float]]]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT f.*, fe.embedding_json AS embedding_json
+                     FROM fact_embeddings fe
+                     JOIN facts f ON f.id = fe.fact_id
+                    WHERE fe.conversation_id = %s
+                      AND fe.model = %s
+                      AND f.conversation_id = %s
+                      AND f.superseded_by IS NULL""",
+                (conversation_id, model, conversation_id),
+            ).fetchall()
+        result: dict[str, tuple[Fact, list[float]]] = {}
+        skipped = 0
+        for row in rows:
+            try:
+                vec = json.loads(row["embedding_json"])
+            except (json.JSONDecodeError, TypeError):
+                skipped += 1
+                continue
+            if not isinstance(vec, list):
+                skipped += 1
+                continue
+            if expected_dim is not None and len(vec) != expected_dim:
+                skipped += 1
+                continue
+            fact = self._row_to_fact(row)
+            result[fact.id] = (fact, vec)
+        if skipped:
+            logger.warning(
+                "load_fact_embeddings skipped %d malformed/wrong-dim rows "
+                "(conversation_id=%s model=%s)",
+                skipped, conversation_id, model,
+            )
+        return result
+
+    def iter_facts_for_embedding_backfill(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        batch_size: int = 1000,
+    ):
+        def _normalize(stamp: str | None) -> str | None:
+            if not stamp:
+                return None
+            return str(stamp).strip().replace(" ", "T", 1)
+
+        since_n = _normalize(since)
+        until_n = _normalize(until)
+        offset = 0
+        while True:
+            with self.pool.connection() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM facts
+                        WHERE conversation_id = %s
+                          AND superseded_by IS NULL
+                        ORDER BY mentioned_at, id
+                        LIMIT %s OFFSET %s""",
+                    (conversation_id, batch_size, offset),
+                ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                stamp = _normalize(row["mentioned_at"]) or ""
+                if since_n is not None and stamp < since_n:
+                    continue
+                if until_n is not None and stamp >= until_n:
+                    continue
+                yield self._row_to_fact(row)
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
 
     def get_actionable_fact_tags(
         self, tags: list[str], conversation_id: str | None = None,

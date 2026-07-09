@@ -185,6 +185,39 @@ class Neo4jFactStore:
             )
             return [self._record_to_fact(record["f"]) for record in result]
 
+    def store_fact_embeddings(
+        self,
+        fact_id: str,
+        conversation_id: str,
+        model: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        # Graph backend does not store dense fact vectors.
+        return None
+
+    def load_fact_embeddings(
+        self,
+        conversation_id: str,
+        model: str,
+        *,
+        expected_dim: int | None = None,
+    ) -> dict[str, tuple[Fact, list[float]]]:
+        return {}
+
+    def iter_facts_for_embedding_backfill(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        batch_size: int = 1000,
+    ):
+        return iter(())
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,
