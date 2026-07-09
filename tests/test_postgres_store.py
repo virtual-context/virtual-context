@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+def _fact_embeddings_catalog_result(sql: str):
+    """Truthy catalog rows for the constructor's required-DDL assertion.
+
+    ``PostgresStore.__init__`` now asserts ``fact_embeddings`` + its index
+    + FK exist after schema bootstrap, so the fake DB doubles must model a
+    present catalog for those probes or every store construction raises.
+    Returns a truthy result for those queries, else ``None``.
+    """
+    if (
+        "fact_embeddings" in sql
+        or "idx_fact_embeddings_conv_model" in sql
+    ):
+        return _FakeRowsResult([{"present": 1}])
+    return None
+
+
 class _FakeConn:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -10,6 +26,9 @@ class _FakeConn:
 
     def execute(self, sql: str, params=None):
         self.executed.append((sql, params))
+        catalog = _fact_embeddings_catalog_result(sql)
+        if catalog is not None:
+            return catalog
         return self
 
     def fetchall(self):
@@ -105,6 +124,9 @@ def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
     class _RowsConn(_FakeConn):
         def execute(self, sql: str, params=None):
             self.executed.append((sql, params))
+            catalog = _fact_embeddings_catalog_result(sql)
+            if catalog is not None:
+                return catalog
             if "FROM segments" in sql:
                 return _FakeRowsResult([
                     {
@@ -151,6 +173,9 @@ def test_normalize_request_turn_sequences_works_without_executemany(monkeypatch)
     class _NormalizeConn(_FakeConn):
         def execute(self, sql: str, params=None):
             self.executed.append((sql, params))
+            catalog = _fact_embeddings_catalog_result(sql)
+            if catalog is not None:
+                return catalog
             if "SELECT id, conversation_id, request_turn, timestamp FROM request_context" in sql:
                 return _FakeRowsResult([
                     {
