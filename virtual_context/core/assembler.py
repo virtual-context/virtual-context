@@ -227,7 +227,21 @@ class ContextAssembler:
             retrieval_result.retrieval_metadata.get("tags_queried", [])
             + retrieval_result.retrieval_metadata.get("related_tags_used", [])
         )
+        # Dense-priority mode is active when the retriever attached dense
+        # metadata (gate on). In that mode only legacy tag-gated floor facts
+        # participate in the scalar greedy fill; dense-only facts are added
+        # afterward by dense rank so the legacy floor stays non-evictable.
+        _dense_rank_by_id: dict = retrieval_result.retrieval_metadata.get(
+            "fact_dense_rank_by_id"
+        )
+        _dense_mode = _dense_rank_by_id is not None
+        _floor_id_list: list = list(
+            retrieval_result.retrieval_metadata.get("fact_tag_floor_ids", [])
+        )
+        _floor_ids = set(_floor_id_list)
         _fact_lines: dict[int, str] = {}
+        _fact_tokens: dict[int, int] = {}
+        _fact_scores: dict[int, float] = {}
         for i, fact in enumerate(retrieval_result.facts):
             line = fact.format_for_prompt()
             line_tokens = self.token_counter(line)
@@ -237,9 +251,20 @@ class ContextAssembler:
             except (TypeError, AttributeError):
                 age_days = 365
             recency = 0.1 * max(0.0, 1.0 - age_days / 365)
-            fact_score = tag_overlap + recency
-            scored_items.append((fact_score, "fact", str(i), line_tokens))
             _fact_lines[i] = line
+            _fact_tokens[i] = line_tokens
+            _fact_scores[i] = tag_overlap + recency
+        if _dense_mode:
+            # Append only floor facts, in the exact legacy fetch order, so the
+            # scalar greedy fill reproduces gate-off floor selection (INV-6).
+            _id_to_index = {f.id: i for i, f in enumerate(retrieval_result.facts)}
+            for _fid in _floor_id_list:
+                _i = _id_to_index.get(_fid)
+                if _i is not None:
+                    scored_items.append((_fact_scores[_i], "fact", str(_i), _fact_tokens[_i]))
+        else:
+            for i in range(len(retrieval_result.facts)):
+                scored_items.append((_fact_scores[i], "fact", str(i), _fact_tokens[i]))
         _note("score_candidates", _stage)
 
         # Sort by score descending
@@ -281,13 +306,76 @@ class ContextAssembler:
                 pool_used += tokens
         _note("pool_fill", _stage)
 
+        # Dense-priority fill: after the legacy floor is selected, add
+        # dense-only facts by dense rank while budget allows. Never evicts a
+        # selected tag section or floor fact.
+        if _dense_mode:
+            _id_to_index = {f.id: i for i, f in enumerate(retrieval_result.facts)}
+            _selected_set = set(selected_fact_indices)
+            for _fid, _rank in sorted(_dense_rank_by_id.items(), key=lambda kv: kv[1]):
+                _i = _id_to_index.get(_fid)
+                if _i is None or _i in _selected_set:
+                    continue
+                _tokens = _fact_tokens[_i]
+                if facts_tokens + _tokens > facts_cap:
+                    continue
+                if pool_used + _tokens > pool:
+                    continue
+                selected_fact_indices.append(_i)
+                _selected_set.add(_i)
+                facts_tokens += _tokens
+                pool_used += _tokens
+
         logger.info("Pool allocation: tags=%dt (%d sections), facts=%dt (%d facts), total=%d/%dt",
                     tag_tokens, len(tag_sections), facts_tokens, len(selected_fact_indices),
                     pool_used, pool)
 
-        # Format selected facts (budget already enforced by pool allocation)
+        # Format selected facts (budget already enforced by pool allocation).
+        # Dense mode: emit dense-ranked facts first by dense rank, then
+        # tag-only floor facts in legacy order. Gate off: legacy index order.
         _stage = time.monotonic()
-        selected_facts = [retrieval_result.facts[i] for i in sorted(selected_fact_indices)]
+        if _dense_mode:
+            _dense_selected = [
+                i for i in selected_fact_indices
+                if retrieval_result.facts[i].id in _dense_rank_by_id
+            ]
+            _dense_selected.sort(
+                key=lambda i: _dense_rank_by_id[retrieval_result.facts[i].id]
+            )
+            _floor_only_selected = sorted(
+                i for i in selected_fact_indices
+                if retrieval_result.facts[i].id not in _dense_rank_by_id
+            )
+            _ordered_indices = _dense_selected + _floor_only_selected
+            selected_dense_only = sum(
+                1 for i in selected_fact_indices
+                if retrieval_result.facts[i].id in _dense_rank_by_id
+                and retrieval_result.facts[i].id not in _floor_ids
+            )
+            selected_floor = sum(
+                1 for i in selected_fact_indices
+                if retrieval_result.facts[i].id in _floor_ids
+            )
+            skipped_dense_budget = sum(
+                1 for _fid in _dense_rank_by_id
+                if _id_to_index.get(_fid) not in set(selected_fact_indices)
+            )
+            retrieval_result.retrieval_metadata["fact_dense_assembler"] = {
+                "selected_legacy_floor": selected_floor,
+                "selected_dense_only": selected_dense_only,
+                "skipped_dense_budget": skipped_dense_budget,
+                "facts_tokens": facts_tokens,
+                "pool_remaining": pool - pool_used,
+            }
+            logger.info(
+                "FACT_DENSE_BREAKDOWN assembler selected_floor=%d selected_dense_only=%d "
+                "skipped_dense_budget=%d facts_tokens=%d pool_remaining=%d",
+                selected_floor, selected_dense_only, skipped_dense_budget,
+                facts_tokens, pool - pool_used,
+            )
+        else:
+            _ordered_indices = sorted(selected_fact_indices)
+        selected_facts = [retrieval_result.facts[i] for i in _ordered_indices]
         facts_text = self._format_facts(selected_facts, facts_tokens + 100) if selected_facts else ""
         facts_tokens_actual = self.token_counter(facts_text) if facts_text else 0
         _note("format_facts", _stage)

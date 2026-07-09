@@ -9,6 +9,19 @@ import yaml
 from virtual_context.config import load_config, validate_config
 
 
+def test_retrieval_fact_dense_config_defaults_false_20_and_parses_yaml():
+    # Omitted keys default to off / 20.
+    default = load_config(config_dict={})
+    assert default.retriever.fact_dense_retrieval is False
+    assert default.retriever.fact_dense_top_n == 20
+    # Explicit YAML keys reach RetrieverConfig.
+    parsed = load_config(config_dict={
+        "retrieval": {"fact_dense_retrieval": True, "fact_dense_top_n": 7},
+    })
+    assert parsed.retriever.fact_dense_retrieval is True
+    assert parsed.retriever.fact_dense_top_n == 7
+
+
 class TestLoadConfig:
     def test_load_defaults(self):
         config = load_config(config_dict={})

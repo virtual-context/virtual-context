@@ -1037,6 +1037,15 @@ class VirtualContextEngine:
         if self.config.retriever.inbound_tagger_type == "embedding":
             inbound_tagger = self._build_inbound_embedding_tagger()
 
+        # Dense fact retrieval must embed the query on the shared local
+        # provider regardless of inbound_tagger_type, so pass the provider's
+        # embed function directly rather than relying on an embedding-mode
+        # inbound tagger side effect.
+        query_embed_fn = (
+            self._embedding_provider.get_embed_fn()
+            if self._embedding_provider else None
+        )
+
         self._retriever = ContextRetriever(
             tag_generator=self._tag_generator,
             store=self._store,
@@ -1045,6 +1054,7 @@ class VirtualContextEngine:
             inbound_tagger=inbound_tagger,
             conversation_id=self.config.conversation_id,
             session_state_provider=self._session_state_provider,
+            query_embed_fn=query_embed_fn,
         )
 
     def _build_inbound_embedding_tagger(self) -> TagGenerator:

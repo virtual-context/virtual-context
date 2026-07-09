@@ -300,6 +300,8 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", _ret_defaults.inbound_tagger_type),
         embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
+        fact_dense_retrieval=retrieval_raw.get("fact_dense_retrieval", _ret_defaults.fact_dense_retrieval),
+        fact_dense_top_n=retrieval_raw.get("fact_dense_top_n", _ret_defaults.fact_dense_top_n),
         scoring=scoring_config,
     )
 
