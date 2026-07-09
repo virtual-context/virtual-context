@@ -547,6 +547,50 @@ class CompositeStore:
     def get_facts_by_segment(self, segment_ref: str) -> list[Fact]:
         return self._facts.get_facts_by_segment(segment_ref)
 
+    def store_fact_embeddings(
+        self,
+        fact_id: str,
+        conversation_id: str,
+        model: str,
+        embedding: list[float],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        # FK co-location: fact_embeddings references facts(id), which lives
+        # in the fact store, NOT the segment store. Delegating to
+        # self._segments would break the FK in split-store configs.
+        return self._facts.store_fact_embeddings(
+            fact_id, conversation_id, model, embedding,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
+
+    def load_fact_embeddings(
+        self,
+        conversation_id: str,
+        model: str,
+        *,
+        expected_dim: int | None = None,
+    ) -> dict[str, tuple[Fact, list[float]]]:
+        return self._facts.load_fact_embeddings(
+            conversation_id, model, expected_dim=expected_dim,
+        )
+
+    def iter_facts_for_embedding_backfill(
+        self,
+        conversation_id: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        batch_size: int = 1000,
+    ):
+        return self._facts.iter_facts_for_embedding_backfill(
+            conversation_id, since=since, until=until, batch_size=batch_size,
+        )
+
     def replace_facts_for_segment(
         self,
         conversation_id: str,

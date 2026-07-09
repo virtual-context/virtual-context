@@ -208,3 +208,56 @@ def test_normalize_request_turn_sequences_works_without_executemany(monkeypatch)
         and params == ("conv-1", 2)
         for sql, params in conn.executed
     )
+
+
+# ---------------------------------------------------------------------------
+# fact_embeddings schema bootstrap (real Postgres; DSN-gated, run -n0)
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+import pytest as _pytest
+
+from tests.pg_helpers import pg_dsn as _pg_dsn, pg_test_conn as _pg_test_conn
+
+_PG_URL = _pg_dsn()
+
+
+@_pytest.mark.skipif(
+    not _PG_URL, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set"
+)
+def test_fact_embeddings_schema_bootstrap_is_idempotent_under_parallel_startup():
+    """Concurrent bootstrap converges: fact_embeddings + FK + index exist,
+    and no worker raises on the required post-DDL catalog assertion."""
+    from virtual_context.storage.postgres import PostgresStore
+
+    errors: list[BaseException] = []
+
+    def _boot():
+        try:
+            store = PostgresStore(_PG_URL)
+            store.close()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [_threading.Thread(target=_boot) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+
+    conn = _pg_test_conn()
+    assert conn.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+        ("fact_embeddings",),
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+        ("idx_fact_embeddings_conv_model",),
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM information_schema.table_constraints "
+        "WHERE table_name = %s AND constraint_type = %s",
+        ("fact_embeddings", "FOREIGN KEY"),
+    ).fetchone() is not None

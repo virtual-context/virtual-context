@@ -141,6 +141,20 @@ class Fact:
             line += f" [status: {self.status}]"
         return line
 
+    def embed_text(self) -> str:
+        """Composite text embedded for dense fact retrieval.
+
+        Single source of truth for both the embed-on-write path and the
+        admin backfill. Renders ``"{subject} {verb} {object}. {what}"``
+        with empty dimensions elided, falling back to
+        ``"{subject} {verb} {object}"`` when ``what`` is empty.
+        """
+        svo = " ".join(p for p in (self.subject, self.verb, self.object) if p)
+        what = (self.what or "").strip()
+        if what:
+            return f"{svo}. {what}" if svo else what
+        return svo
+
 
 class RelationType(str, Enum):
     """Supported relationship types between facts."""
