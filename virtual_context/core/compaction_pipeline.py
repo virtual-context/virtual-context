@@ -125,6 +125,40 @@ class CompactionPipeline:
             )
         return kwargs
 
+    def _embed_and_store_fact_embeddings(
+        self, facts, *, operation_id: str | None, guard_kwargs: dict,
+    ) -> None:
+        """Compute and persist dense embeddings for freshly-written facts.
+
+        Mirrors the tag-summary embedding posture: ``CompactionLeaseLost``
+        propagates (fail-closed) so the outer wrapper can emit
+        ``COMPACTION_WRITE_REJECTED``; any other embedding/store failure
+        is logged and swallowed so a degraded embedder never blocks a
+        compaction. Model versioning rides ``retriever.embedding_model``.
+        """
+        from ..types import CompactionLeaseLost as _CLL
+        embed_fn = self._semantic.get_embed_fn() if self._semantic else None
+        if not embed_fn or not facts:
+            return
+        conv_id = self._config.conversation_id
+        # A vector row is per-conversation; an empty conversation_id would
+        # write an unscoped row the read path can never target.
+        assert conv_id, "conversation_id must be non-empty before embedding facts"
+        model = self._config.retriever.embedding_model
+        for fact in facts:
+            try:
+                text = fact.embed_text()
+                if not text:
+                    continue
+                emb = embed_fn([text])[0]
+                self._store.store_fact_embeddings(
+                    fact.id, conv_id, model, emb, **guard_kwargs,
+                )
+            except _CLL:
+                raise
+            except Exception as e:
+                logger.warning("Failed to embed fact %s: %s", fact.id, e)
+
     def _load_compactable_rows(self) -> tuple[list["CanonicalTurnRow"], list["Message"]]:
         from ..types import Message
 
@@ -1275,6 +1309,17 @@ class CompactionPipeline:
                                     _deleted, _inserted, result.primary_tag)
                     else:
                         logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
+                    # Embed-on-write: only for facts actually inserted. The
+                    # DELETE half of replace_facts_for_segment cascades old
+                    # vectors via the FK. A (0, 0) return (guard mismatch at
+                    # OBSERVE) or a raised CompactionLeaseLost never reaches
+                    # here with rows to embed.
+                    if _inserted:
+                        self._embed_and_store_fact_embeddings(
+                            result.facts,
+                            operation_id=operation_id,
+                            guard_kwargs=self._compaction_guard_kwargs(operation_id),
+                        )
                 _superseded_count = 0
                 _links_count = 0
                 # C2R gate (fencing plan §7.2 #7/#8): backlog-sweeper

@@ -22,6 +22,48 @@ _STOPWORDS = frozenset({
 })
 
 
+def refresh_fact_embedding(
+    store: ContextStore,
+    embed_fn,
+    model: str,
+    fact: Fact,
+    *,
+    operation_id: str | None = None,
+    owner_worker_id: str | None = None,
+    lifecycle_epoch: int | None = None,
+) -> None:
+    """Recompute and persist a fact's dense embedding after a successful
+    ``update_fact_fields`` mutation.
+
+    The backend has already invalidated the stale vector inside the update
+    transaction, so this only re-embeds the current text. Best-effort:
+    ``CompactionLeaseLost`` propagates (fail-closed) so a fenced caller
+    aborts cleanly; any other failure is logged and swallowed, leaving the
+    fact vector-less (never stale) until the next backfill/compaction.
+    """
+    from ..types import CompactionLeaseLost
+    if embed_fn is None:
+        return
+    conv_id = fact.conversation_id
+    if not conv_id:
+        return
+    try:
+        text = fact.embed_text()
+        if not text:
+            return
+        emb = embed_fn([text])[0]
+        store.store_fact_embeddings(
+            fact.id, conv_id, model, emb,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
+    except CompactionLeaseLost:
+        raise
+    except Exception as e:
+        logger.warning("Failed to refresh fact embedding for %s: %s", fact.id, e)
+
+
 def _parse_date_for_comparison(date_str: str):
     """Parse a date string into a comparable date object. Returns None on failure."""
     from datetime import date, datetime
@@ -116,6 +158,8 @@ def promote_planned_facts(
     llm_provider: LLMProvider | None = None,
     model: str = "",
     *,
+    embed_fn=None,
+    embedding_model: str = "all-MiniLM-L6-v2",
     operation_id: str | None = None,
     owner_worker_id: str | None = None,
     lifecycle_epoch: int | None = None,
@@ -196,12 +240,26 @@ def promote_planned_facts(
                 except Exception as e:
                     logger.warning("Planned fact rewrite failed, using status-only: %s", e)
 
-            store.update_fact_fields(
+            _updated = store.update_fact_fields(
                 fact.id, verb=verb, object=obj, status="completed", what=what,
                 operation_id=operation_id,
                 owner_worker_id=owner_worker_id,
                 lifecycle_epoch=lifecycle_epoch,
             )
+            # Reflect the rewrite on the in-memory fact so the re-embed uses
+            # the promoted text, then refresh the dense vector under the same
+            # guard. The backend already invalidated the stale vector.
+            fact.verb = verb
+            fact.object = obj
+            fact.status = "completed"
+            fact.what = what
+            if _updated:
+                refresh_fact_embedding(
+                    store, embed_fn, embedding_model, fact,
+                    operation_id=operation_id,
+                    owner_worker_id=owner_worker_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                )
             promoted += 1
             logger.info(
                 "Promoted planned→completed: %s %s → %s %s [when: %s]",
@@ -257,6 +315,7 @@ class FactSupersessionChecker:
         config: SupersessionConfig,
         telemetry_ledger: TelemetryLedger | None = None,
         embed_fn=None,
+        embedding_model: str = "all-MiniLM-L6-v2",
     ):
         self.llm = llm_provider
         self.model = model
@@ -264,6 +323,7 @@ class FactSupersessionChecker:
         self.config = config
         self._telemetry = telemetry_ledger
         self._embed_fn = embed_fn
+        self._embedding_model = embedding_model
         self._all_facts_cache: list[Fact] | None = None
 
     def check_and_supersede(
@@ -569,12 +629,19 @@ class FactSupersessionChecker:
         status = merged.get("status", winning_fact.status)
         what = merged.get("what", winning_fact.what)
 
-        self.store.update_fact_fields(winning_fact.id, verb, obj, status, what)
+        _updated = self.store.update_fact_fields(winning_fact.id, verb, obj, status, what)
         # Update the in-memory object so subsequent merges see current state
         winning_fact.verb = verb
         winning_fact.object = obj
         winning_fact.status = status
         winning_fact.what = what
+        # Legacy non-compaction caller: refresh the dense vector best-effort
+        # with no guard kwargs (the backend already invalidated the stale
+        # row inside the update transaction).
+        if _updated:
+            refresh_fact_embedding(
+                self.store, self._embed_fn, self._embedding_model, winning_fact,
+            )
         logger.info(
             "Merged superseded fact into %s: verb=%r, object=%r",
             winning_fact.id[:8], verb, obj,
@@ -674,6 +741,7 @@ class FactLinkChecker:
         graph_links: bool = False,
         telemetry_ledger: TelemetryLedger | None = None,
         embed_fn=None,
+        embedding_model: str = "all-MiniLM-L6-v2",
     ):
         self._supersession = FactSupersessionChecker(
             llm_provider=llm_provider,
@@ -682,6 +750,7 @@ class FactLinkChecker:
             config=config,
             telemetry_ledger=telemetry_ledger,
             embed_fn=embed_fn,
+            embedding_model=embedding_model,
         )
         self.store = store
         self.llm = llm_provider
@@ -689,6 +758,8 @@ class FactLinkChecker:
         self.config = config
         self.graph_links = graph_links
         self._telemetry = telemetry_ledger
+        self._embed_fn = embed_fn
+        self._embedding_model = embedding_model
 
     def check_and_link(
         self,
@@ -725,6 +796,7 @@ class FactLinkChecker:
         # rejection during this conversation's compaction.
         promote_planned_facts(
             self.store, llm_provider=self.llm, model=self.model,
+            embed_fn=self._embed_fn, embedding_model=self._embedding_model,
             operation_id=operation_id,
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
