@@ -2260,6 +2260,7 @@ class VirtualContextEngine:
                 graph_links=True,
                 telemetry_ledger=self._telemetry,
                 embed_fn=self._semantic.get_embed_fn(),
+                embedding_model=self.config.retriever.embedding_model,
             )
             logger.info("Fact link checker initialized (provider=%s, model=%s, graph_links=True)", provider_name, model)
         else:
@@ -2271,6 +2272,7 @@ class VirtualContextEngine:
                 config=sc,
                 telemetry_ledger=self._telemetry,
                 embed_fn=self._semantic.get_embed_fn(),
+                embedding_model=self.config.retriever.embedding_model,
             )
             logger.info("Supersession checker initialized (provider=%s, model=%s)", provider_name, model)
 

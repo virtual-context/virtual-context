@@ -640,7 +640,7 @@ class CompositeStore:
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
+    ) -> bool:
         return self._facts.update_fact_fields(
             fact_id, verb, object, status, what,
             operation_id=operation_id,

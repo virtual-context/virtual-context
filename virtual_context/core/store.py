@@ -1096,8 +1096,8 @@ class ContextStore(ABC):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
-        pass
+    ) -> bool:
+        return False
 
     def get_actionable_fact_tags(
         self, tags: list[str], conversation_id: str | None = None,

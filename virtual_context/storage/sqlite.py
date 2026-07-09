@@ -7398,12 +7398,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Update mutable fact fields. When all guard kwargs are
         supplied, the UPDATE only fires if the target fact belongs to
         the same conversation as the active op (matched on the guard
         triple at status='running').
+
+        When the mutation changes an embed-text field (``verb``,
+        ``object``, or ``what``; a ``status``-only change is not embed
+        text) the fact's ``fact_embeddings`` row is deleted in the same
+        transaction so a stale vector can never survive the rewrite. A
+        guard-fail rolls the whole transaction back, keeping the old
+        fact and old vector together. Returns ``True`` iff a row was
+        actually updated so callers refresh only after a real update.
         """
+        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7418,41 +7427,62 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if guard_all and not self._compaction_fence_mode.enforces:
             guard_all = False
         conn = self._get_conn()
-        if guard_all:
-            cur = conn.execute(
-                """UPDATE facts
-                      SET verb = ?, object = ?, status = ?, what = ?
-                    WHERE id = ?
-                      AND EXISTS (
-                          SELECT 1
-                            FROM facts f, compaction_operation co
-                           WHERE f.id = ?
-                             AND co.conversation_id = f.conversation_id
-                             AND co.operation_id = ?
-                             AND co.owner_worker_id = ?
-                             AND co.lifecycle_epoch = ?
-                             AND co.status = 'running'
-                      )""",
-                (
-                    verb, object, status, what, fact_id,
-                    fact_id, operation_id, owner_worker_id, lifecycle_epoch,
-                ),
-            )
-            if (cur.rowcount or 0) == 0:
-                if self._compaction_fence_mode.enforces:
-                    conn.rollback()
-                self._enforce_or_observe_mismatch(
-                    operation_id=operation_id,
-                    write_site="update_fact_fields",
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _old = conn.execute(
+                "SELECT verb, object, what FROM facts WHERE id = ?", (fact_id,),
+            ).fetchone()
+            _embed_changed = _old is not None and (
+                _old["verb"], _old["object"], _old["what"]
+            ) != (verb, object, what)
+            if guard_all:
+                cur = conn.execute(
+                    """UPDATE facts
+                          SET verb = ?, object = ?, status = ?, what = ?
+                        WHERE id = ?
+                          AND EXISTS (
+                              SELECT 1
+                                FROM facts f, compaction_operation co
+                               WHERE f.id = ?
+                                 AND co.conversation_id = f.conversation_id
+                                 AND co.operation_id = ?
+                                 AND co.owner_worker_id = ?
+                                 AND co.lifecycle_epoch = ?
+                                 AND co.status = 'running'
+                          )""",
+                    (
+                        verb, object, status, what, fact_id,
+                        fact_id, operation_id, owner_worker_id, lifecycle_epoch,
+                    ),
                 )
-                return
-        else:
-            conn.execute(
-                "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
-                (verb, object, status, what, fact_id),
-            )
-        # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
-        conn.commit()
+                if (cur.rowcount or 0) == 0:
+                    # guard_all is only True at ACTIVE tier, so this
+                    # raises CompactionLeaseLost; the rollback keeps the
+                    # old fact and old vector together.
+                    conn.execute("ROLLBACK")
+                    self._enforce_or_observe_mismatch(
+                        operation_id=operation_id,
+                        write_site="update_fact_fields",
+                    )
+                    return False
+            else:
+                cur = conn.execute(
+                    "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
+                    (verb, object, status, what, fact_id),
+                )
+            _updated = (cur.rowcount or 0) > 0
+            if _updated and _embed_changed:
+                conn.execute(
+                    "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,),
+                )
+            # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
+            conn.execute("COMMIT")
+            return _updated
+        except CompactionLeaseLost:
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         conn = self._get_conn()

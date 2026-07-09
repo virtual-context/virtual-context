@@ -7724,10 +7724,18 @@ class PostgresStore(ContextStore):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Update mutable fact fields. Fenced when guard kwargs are
         supplied: the UPDATE only fires if the target fact belongs to
         the same conversation as the active op.
+
+        When the mutation changes an embed-text field (``verb``,
+        ``object``, or ``what``; a ``status``-only change is not embed
+        text) the fact's ``fact_embeddings`` row is deleted in the same
+        transaction so a stale vector can never survive the rewrite. A
+        guard-fail raises and the surrounding transaction rolls back,
+        keeping the old fact and old vector together. Returns ``True``
+        iff a row was actually updated.
         """
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
@@ -7743,6 +7751,12 @@ class PostgresStore(ContextStore):
         if guard_all and not self._compaction_fence_mode.enforces:
             guard_all = False
         with self.pool.connection() as conn:
+            _old = conn.execute(
+                "SELECT verb, object, what FROM facts WHERE id = %s", (fact_id,),
+            ).fetchone()
+            _embed_changed = _old is not None and (
+                _old["verb"], _old["object"], _old["what"]
+            ) != (verb, object, what)
             if guard_all:
                 cur = conn.execute(
                     """UPDATE facts
@@ -7764,16 +7778,25 @@ class PostgresStore(ContextStore):
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # guard_all is only True at ACTIVE tier, so this
+                    # raises CompactionLeaseLost and the transaction rolls
+                    # back, keeping the old fact and old vector together.
                     self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="update_fact_fields",
                     )
-                    return
+                    return False
             else:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
                     (verb, object, status, what, fact_id),
                 )
+            _updated = (cur.rowcount or 0) > 0
+            if _updated and _embed_changed:
+                conn.execute(
+                    "DELETE FROM fact_embeddings WHERE fact_id = %s", (fact_id,),
+                )
+            return _updated
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         with self.pool.connection() as conn:
