@@ -37,6 +37,7 @@ class ContextRetriever:
         inbound_tagger: TagGenerator | None = None,
         conversation_id: str | None = None,
         session_state_provider=None,
+        query_embed_fn=None,
     ) -> None:
         self.tag_generator = tag_generator
         self.store = store
@@ -45,6 +46,10 @@ class ContextRetriever:
         self._inbound_tagger = inbound_tagger
         self._conversation_id = conversation_id
         self._session_state_provider = session_state_provider
+        # Shared local embed function for dense fact retrieval. Independent of
+        # ``inbound_tagger`` so ``fact_dense_retrieval`` works under any
+        # ``inbound_tagger_type``. Signature: ``list[str] -> list[list[float]]``.
+        self._query_embed_fn = query_embed_fn
         # Pre-compile heuristic patterns for embedding-based inbound tagger
         self._temporal_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_TEMPORAL_PATTERNS]
 
@@ -144,6 +149,121 @@ class ContextRetriever:
             return self.store.query_facts(tags=tags, limit=limit, conversation_id=self._conversation_id)
         except Exception:
             return []
+
+    def _fetch_facts_dense(
+        self,
+        message: str,
+        context_turns: list[str] | None,
+        expanded_tags: list[str],
+        retrieval_metadata: dict,
+    ) -> list:
+        """Augment the legacy tag-gated fact fetch with a dense kNN ranking.
+
+        Runs the exact gate-off legacy fetch first to preserve the
+        non-evictable tag-gated floor (INV-6), then ranks the conversation's
+        current-model fact vectors by cosine similarity to the (optionally
+        recent-turn-blended) query embedding and unions the top
+        ``fact_dense_top_n`` in front of the floor. A fact present in both
+        sets appears once at its dense position. Attaches dense rank/score,
+        the legacy floor ids, and per-fact source to *retrieval_metadata* so
+        the assembler can preserve dense ordering without re-scoring.
+        """
+        from .math_utils import cosine_similarity
+
+        _t0 = time.monotonic()
+        # 1. Legacy floor — the exact gate-off fetch, order preserved.
+        if self.config.prefetch_facts and expanded_tags:
+            legacy_facts = self._fetch_facts_by_tags(expanded_tags)
+        else:
+            legacy_facts = self._fetch_all_facts()
+        floor_ids = [f.id for f in legacy_facts]
+        floor_set = set(floor_ids)
+
+        embed_fn = self._query_embed_fn
+        if embed_fn is None:
+            logger.warning(
+                "FACT_DENSE_BREAKDOWN dense retrieval enabled but no query "
+                "embedder configured; falling back to legacy floor only",
+            )
+            return legacy_facts
+
+        # 2. Query embeddings on the shared local provider.
+        try:
+            bare_vec = embed_fn([message])[0]
+        except Exception:
+            logger.warning("FACT_DENSE_BREAKDOWN query embed failed; legacy floor only")
+            return legacy_facts
+
+        scoring = self.config.scoring
+        n_ctx = getattr(scoring, "embedding_context_turns", 0)
+        ctx_vec = None
+        if n_ctx > 0 and context_turns:
+            recent = [t for t in context_turns[-n_ctx:] if t]
+            if recent:
+                concat_text = (" ".join(recent) + " " + message).strip()
+                try:
+                    ctx_vec = embed_fn([concat_text])[0]
+                except Exception:
+                    ctx_vec = None
+        guard = getattr(scoring, "embedding_context_guard", True)
+
+        # 3. Load current-model fact vectors and cosine-rank.
+        model = getattr(self.config, "embedding_model", "")
+        try:
+            loaded = self.store.load_fact_embeddings(
+                self._conversation_id, model, expected_dim=len(bare_vec),
+            )
+        except Exception:
+            loaded = {}
+        scored: list[tuple[float, str, object]] = []
+        for fid, (fact, vec) in loaded.items():
+            bare_cos = cosine_similarity(bare_vec, vec)
+            if ctx_vec is not None:
+                ctx_cos = cosine_similarity(ctx_vec, vec)
+                score = max(bare_cos, ctx_cos) if guard else ctx_cos
+            else:
+                score = bare_cos
+            scored.append((score, fid, fact))
+        # Cosine DESC, tie-break fact.id ASC (deterministic union order).
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        top_n = getattr(self.config, "fact_dense_top_n", 20)
+        top = scored[:top_n]
+
+        # 4. Deterministic union by fact.id: dense first, floor-only after.
+        dense_rank_by_id: dict[str, int] = {}
+        dense_score_by_id: dict[str, float] = {}
+        source_by_id: dict[str, str] = {}
+        union: list = []
+        seen: set[str] = set()
+        for rank, (score, fid, fact) in enumerate(top):
+            dense_rank_by_id[fid] = rank
+            dense_score_by_id[fid] = score
+            source_by_id[fid] = "both" if fid in floor_set else "dense"
+            union.append(fact)
+            seen.add(fid)
+        for fact in legacy_facts:
+            if fact.id in seen:
+                continue
+            union.append(fact)
+            seen.add(fact.id)
+            source_by_id[fact.id] = "tag"
+
+        # 5. Metadata for the assembler dense-priority branch.
+        retrieval_metadata["fact_dense_rank_by_id"] = dense_rank_by_id
+        retrieval_metadata["fact_dense_score_by_id"] = dense_score_by_id
+        retrieval_metadata["fact_tag_floor_ids"] = floor_ids
+        retrieval_metadata["fact_source_by_id"] = source_by_id
+
+        overlap = len(set(dense_rank_by_id) & floor_set)
+        top1 = top[0][0] if top else 0.0
+        logger.info(
+            "FACT_DENSE_BREAKDOWN conv=%s dense=%d floor=%d overlap=%d union=%d "
+            "top1_cos=%.4f load_score_ms=%.1f",
+            (self._conversation_id or "none")[:12],
+            len(dense_rank_by_id), len(floor_ids), overlap, len(union),
+            top1, round((time.monotonic() - _t0) * 1000, 1),
+        )
+        return union
 
     def _load_all_tag_summaries(self, token_budget: int) -> tuple[list[StoredSummary], int]:
         """Load all tag summaries within *token_budget*.
@@ -521,9 +641,13 @@ class ContextRetriever:
             "query_expanded": len(related_query_tags) > 0,
         })
 
-        # Fetch facts: prefetch by tag relevance or fetch all
+        # Fetch facts: dense-augmented (gated), tag prefetch, or fetch all
         _facts_stage = time.monotonic()
-        if self.config.prefetch_facts and expanded_tags:
+        if getattr(self.config, "fact_dense_retrieval", False):
+            facts = self._fetch_facts_dense(
+                message, context_turns, expanded_tags, retrieval_metadata,
+            )
+        elif self.config.prefetch_facts and expanded_tags:
             facts = self._fetch_facts_by_tags(expanded_tags)
             logger.info("Retriever: facts=%d (prefetch tags=%s)", len(facts), expanded_tags)
         else:

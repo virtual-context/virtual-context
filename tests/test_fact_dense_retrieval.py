@@ -834,3 +834,303 @@ def test_backfill_fact_embeddings_raises_on_empty_conversation_id(tmp_path):
     engine = _backfill_engine(tmp_path)
     with pytest.raises(ValueError):
         engine.backfill_fact_embeddings("")
+
+
+# ===========================================================================
+# Phase 4 — Retrieval integration (dense-priority + non-evictable floor + gate)
+# ===========================================================================
+
+from virtual_context.core.assembler import ContextAssembler  # noqa: E402
+from virtual_context.core.retriever import ContextRetriever  # noqa: E402
+from virtual_context.types import (  # noqa: E402
+    AssemblerConfig,
+    RetrievalResult,
+    RetrieverConfig,
+    ScoringConfig,
+)
+
+DENSE_CONV = "conv-dense"
+
+
+def _dfact(fid, *, subject="user", verb="likes", obj="tea", what="",
+           tags=None, mentioned_at=None, conv=DENSE_CONV):
+    f = Fact(
+        id=fid, subject=subject, verb=verb, object=obj, what=what,
+        conversation_id=conv,
+        mentioned_at=mentioned_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    if tags:
+        f.tags = list(tags)
+    return f
+
+
+class _DenseFakeStore:
+    """Minimal fact store exposing only the surfaces the dense fetch uses."""
+
+    def __init__(self, *, tag_facts, all_facts, vectors):
+        self._tag_facts = tag_facts
+        self._all_facts = all_facts
+        self._by_id = {f.id: f for f in all_facts}
+        self._vectors = vectors  # {fact_id: [floats]}
+
+    def query_facts(self, tags=None, limit=None, conversation_id=None):
+        return list(self._tag_facts) if tags else list(self._all_facts)
+
+    def load_fact_embeddings(self, conversation_id, model, *, expected_dim=None):
+        out = {}
+        for fid, vec in self._vectors.items():
+            if expected_dim is not None and len(vec) != expected_dim:
+                continue
+            if fid in self._by_id:
+                out[fid] = (self._by_id[fid], vec)
+        return out
+
+
+def _const_embed(vec):
+    def _fn(texts):
+        return [list(vec) for _ in texts]
+    return _fn
+
+
+def _dense_retriever(store, *, embed_fn, top_n=20, prefetch=True, ctx_turns=0):
+    cfg = RetrieverConfig(
+        fact_dense_retrieval=True,
+        fact_dense_top_n=top_n,
+        prefetch_facts=prefetch,
+        scoring=ScoringConfig(embedding_context_turns=ctx_turns),
+    )
+    return ContextRetriever(
+        tag_generator=MagicMock(),
+        store=store,
+        config=cfg,
+        conversation_id=DENSE_CONV,
+        query_embed_fn=embed_fn,
+    )
+
+
+def test_dense_oracle_parity_pins_fact_embed_text_and_tie_break():
+    # Pin the embed-text composition the dense ranking is scoped to.
+    fa = _dfact("fa", verb="wants", obj="perfume", what="for her birthday")
+    assert fa.embed_text() == "user wants perfume. for her birthday"
+
+    hi = _dfact("hi")
+    zz = _dfact("zz")
+    lo = _dfact("lo")
+    vectors = {"hi": [1.0, 0.0, 0.0], "zz": [1.0, 0.0, 0.0], "lo": [0.0, 1.0, 0.0]}
+    store = _DenseFakeStore(tag_facts=[], all_facts=[hi, zz, lo], vectors=vectors)
+    r = _dense_retriever(store, embed_fn=_const_embed([1.0, 0.0, 0.0]), prefetch=False)
+
+    meta = {}
+    union = r._fetch_facts_dense("q", None, [], meta)
+    # cosine DESC; hi/zz tie at 1.0 -> fact.id ASC (hi < zz); lo last at 0.0
+    assert meta["fact_dense_rank_by_id"] == {"hi": 0, "zz": 1, "lo": 2}
+    assert [f.id for f in union[:3]] == ["hi", "zz", "lo"]
+    assert meta["fact_dense_score_by_id"]["hi"] == pytest.approx(1.0)
+    assert meta["fact_dense_score_by_id"]["lo"] == pytest.approx(0.0)
+
+
+def test_gate_on_candidate_union_superset_of_legacy_floor_for_tagged_all_and_no_tags_paths():
+    buried = _dfact("buried", tags=["birthday"])
+    dense_hit = _dfact("dense_hit")
+    other = _dfact("other")
+    vectors = {
+        "dense_hit": [1.0, 0.0, 0.0],
+        "buried": [0.0, 1.0, 0.0],
+        "other": [0.5, 0.5, 0.0],
+    }
+    all_facts = [buried, dense_hit, other]
+    store = _DenseFakeStore(tag_facts=[buried], all_facts=all_facts, vectors=vectors)
+    embed = _const_embed([1.0, 0.0, 0.0])
+
+    # tagged path: floor = tag-gated fetch [buried]; dense adds the cosine hit
+    r = _dense_retriever(store, embed_fn=embed, prefetch=True)
+    meta = {}
+    union = r._fetch_facts_dense("q", None, ["birthday"], meta)
+    ids = {f.id for f in union}
+    assert {"buried"} <= ids                       # tag-exact-but-buried preserved
+    assert "dense_hit" in ids                       # dense-only added
+    assert meta["fact_tag_floor_ids"] == ["buried"]
+
+    # prefetch=False path: floor = fetch-all
+    r2 = _dense_retriever(store, embed_fn=embed, prefetch=False)
+    meta2 = {}
+    union2 = r2._fetch_facts_dense("q", None, [], meta2)
+    assert set(meta2["fact_tag_floor_ids"]) == {"buried", "dense_hit", "other"}
+    assert {f.id for f in union2} >= {"buried", "dense_hit", "other"}
+
+    # no-tags path: prefetch=True but no expanded tags -> fetch-all floor
+    r3 = _dense_retriever(store, embed_fn=embed, prefetch=True)
+    meta3 = {}
+    r3._fetch_facts_dense("q", None, [], meta3)
+    assert set(meta3["fact_tag_floor_ids"]) == {"buried", "dense_hit", "other"}
+
+
+def test_gate_off_fact_selection_order_and_budget_byte_identical():
+    facts = [_dfact("a"), _dfact("b"), _dfact("c")]
+    rr = RetrievalResult(facts=facts, retrieval_metadata={})
+    asm = ContextAssembler(config=AssemblerConfig(), token_counter=lambda t: 5)
+    out = asm.assemble("", rr, [], token_budget=100_000)
+    # Gate off: legacy index order, no dense metadata attached (INV-3).
+    assert [f.id for f in out.selected_facts] == ["a", "b", "c"]
+    assert "fact_dense_rank_by_id" not in rr.retrieval_metadata
+    assert "fact_dense_assembler" not in rr.retrieval_metadata
+
+
+def test_assembler_legacy_floor_non_evictable_when_dense_budget_saturated():
+    keep = _dfact("keep", what="small")
+    big = _dfact("big", what="BIG payload")
+    facts = [big, keep]  # union order: dense first, floor-only after
+    rr = RetrievalResult(facts=facts, retrieval_metadata={
+        "fact_dense_rank_by_id": {"big": 0},
+        "fact_dense_score_by_id": {"big": 0.9},
+        "fact_tag_floor_ids": ["keep"],
+        "fact_source_by_id": {"big": "dense", "keep": "tag"},
+    })
+    asm = ContextAssembler(
+        config=AssemblerConfig(facts_max_tokens=50),
+        token_counter=lambda t: 100 if "BIG" in t else 5,
+    )
+    out = asm.assemble("", rr, [], token_budget=100_000)
+    ids = {f.id for f in out.selected_facts}
+    assert "keep" in ids            # legacy floor is non-evictable
+    assert "big" not in ids         # dense-only skipped under saturation
+    br = rr.retrieval_metadata["fact_dense_assembler"]
+    assert br["skipped_dense_budget"] == 1
+    assert br["selected_legacy_floor"] == 1
+
+
+def test_assembler_dense_rank_survives_legacy_scorer_and_output_order():
+    old = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    dense1 = _dfact("dense1", mentioned_at=old)      # top dense, no tags, ancient
+    dense2 = _dfact("dense2", mentioned_at=old)
+    floorx = _dfact("floorx", tags=["t"], mentioned_at=now)  # strong scalar
+    # Union index order deliberately != dense rank order to prove dense rank
+    # (not sorted-by-index) controls dense output.
+    facts = [floorx, dense2, dense1]
+    rr = RetrievalResult(facts=facts, retrieval_metadata={
+        "fact_dense_rank_by_id": {"dense1": 0, "dense2": 1},
+        "fact_dense_score_by_id": {"dense1": 0.9, "dense2": 0.8},
+        "fact_tag_floor_ids": ["floorx"],
+        "fact_source_by_id": {"dense1": "dense", "dense2": "dense", "floorx": "tag"},
+        "tags_queried": ["t"],
+    })
+    asm = ContextAssembler(config=AssemblerConfig(), token_counter=lambda t: 5)
+    out = asm.assemble("", rr, [], token_budget=100_000)
+    assert [f.id for f in out.selected_facts] == ["dense1", "dense2", "floorx"]
+
+
+def test_dense_fact_in_both_sets_charged_once_and_marked_both():
+    shared = _dfact("shared", tags=["t"])
+    flooronly = _dfact("flooronly", tags=["t"])
+    vectors = {"shared": [1.0, 0.0, 0.0], "flooronly": [0.0, 1.0, 0.0]}
+    store = _DenseFakeStore(
+        tag_facts=[shared, flooronly], all_facts=[shared, flooronly], vectors=vectors,
+    )
+    r = _dense_retriever(store, embed_fn=_const_embed([1.0, 0.0, 0.0]),
+                         prefetch=True, top_n=1)
+    meta = {}
+    union = r._fetch_facts_dense("q", None, ["t"], meta)
+    assert [f.id for f in union].count("shared") == 1
+    assert meta["fact_source_by_id"]["shared"] == "both"
+    assert meta["fact_source_by_id"]["flooronly"] == "tag"
+
+    rr = RetrievalResult(facts=union, retrieval_metadata=dict(meta, tags_queried=["t"]))
+    asm = ContextAssembler(config=AssemblerConfig(), token_counter=lambda t: 5)
+    out = asm.assemble("", rr, [], token_budget=100_000)
+    assert [f.id for f in out.selected_facts].count("shared") == 1
+
+
+def test_dense_query_embedder_works_when_inbound_tagger_type_is_llm():
+    # LLM inbound mode: engine builds NO embedding tagger, so the retriever
+    # must embed the query through its own provider. Model that wiring.
+    a = _dfact("a")
+    b = _dfact("b")
+    vectors = {"a": [1.0, 0.0, 0.0], "b": [0.0, 1.0, 0.0]}
+    store = _DenseFakeStore(tag_facts=[], all_facts=[a, b], vectors=vectors)
+    cfg = RetrieverConfig(fact_dense_retrieval=True, inbound_tagger_type="llm")
+    r = ContextRetriever(
+        tag_generator=MagicMock(), store=store, config=cfg,
+        conversation_id=DENSE_CONV, inbound_tagger=None,
+        query_embed_fn=_const_embed([1.0, 0.0, 0.0]),
+    )
+    meta = {}
+    union = r._fetch_facts_dense("q", None, [], meta)
+    assert meta["fact_dense_rank_by_id"]["a"] == 0
+    assert [f.id for f in union][0] == "a"
+
+
+def test_fact_dense_breakdown_and_request_context_fact_metadata_are_emitted():
+    from virtual_context.proxy.server import _serialize_recall_fact
+
+    a = _dfact("a", tags=["t"])
+    b = _dfact("b")
+    vectors = {"a": [1.0, 0.0, 0.0], "b": [0.0, 1.0, 0.0]}
+    store = _DenseFakeStore(tag_facts=[a], all_facts=[a, b], vectors=vectors)
+    r = _dense_retriever(store, embed_fn=_const_embed([1.0, 0.0, 0.0]), prefetch=True)
+    meta = {}
+    union = r._fetch_facts_dense("q", None, ["t"], meta)
+    for k in ("fact_dense_rank_by_id", "fact_dense_score_by_id",
+              "fact_tag_floor_ids", "fact_source_by_id"):
+        assert k in meta
+
+    rr = RetrievalResult(facts=union, retrieval_metadata=dict(meta, tags_queried=["t"]))
+    asm = ContextAssembler(config=AssemblerConfig(), token_counter=lambda t: 5)
+    asm.assemble("", rr, [], token_budget=100_000)
+    br = rr.retrieval_metadata["fact_dense_assembler"]
+    assert set(br) >= {"selected_legacy_floor", "selected_dense_only",
+                       "skipped_dense_budget", "facts_tokens", "pool_remaining"}
+
+    ser_a = _serialize_recall_fact(a, retrieval_meta=meta)
+    assert ser_a["dense_rank"] == meta["fact_dense_rank_by_id"]["a"]
+    assert ser_a["fact_source"] == meta["fact_source_by_id"]["a"]
+    assert ser_a["legacy_floor"] is True
+    ser_b = _serialize_recall_fact(b, retrieval_meta=meta)
+    assert ser_b["legacy_floor"] is False
+
+
+def test_dense_on_does_not_demote_easy_tag_exact_fact_out_of_budget():
+    easy = _dfact("easy", tags=["t"])   # tag-exact floor fact, weak cosine
+    d1 = _dfact("d1")
+    d2 = _dfact("d2")
+    vectors = {"easy": [0.0, 1.0, 0.0], "d1": [1.0, 0.0, 0.0], "d2": [1.0, 0.0, 0.0]}
+    store = _DenseFakeStore(tag_facts=[easy], all_facts=[easy, d1, d2], vectors=vectors)
+    r = _dense_retriever(store, embed_fn=_const_embed([1.0, 0.0, 0.0]), prefetch=True)
+    meta = {}
+    union = r._fetch_facts_dense("q", None, ["t"], meta)
+    rr = RetrievalResult(facts=union, retrieval_metadata=dict(meta, tags_queried=["t"]))
+    asm = ContextAssembler(config=AssemblerConfig(), token_counter=lambda t: 5)
+    out = asm.assemble("", rr, [], token_budget=100_000)
+    assert "easy" in {f.id for f in out.selected_facts}
+
+
+def test_dense_vectors_present_before_engine_construct_rank_same_as_after_construct_compaction(tmp_path):
+    conv = DENSE_CONV
+    fa = _fact("fa", conv, verb="wants", obj="perfume", what="birthday gift")
+    fb = _fact("fb", conv, verb="likes", obj="tea")
+    cfg = RetrieverConfig(fact_dense_retrieval=True, prefetch_facts=False,
+                          embedding_model=MODEL_A)
+
+    # ordering (a): facts + vectors present BEFORE the retriever is built
+    store_a = SQLiteStore(db_path=str(tmp_path / "temporal_a.db"))
+    store_a.store_facts([fa, fb])
+    store_a.store_fact_embeddings("fa", conv, MODEL_A, _embed([fa.embed_text()])[0])
+    store_a.store_fact_embeddings("fb", conv, MODEL_A, _embed([fb.embed_text()])[0])
+    r_a = ContextRetriever(tag_generator=MagicMock(), store=store_a, config=cfg,
+                           conversation_id=conv, query_embed_fn=_embed)
+    meta_a = {}
+    r_a._fetch_facts_dense(fa.embed_text(), None, [], meta_a)
+
+    # ordering (b): retriever built against an EMPTY store, THEN writes land
+    store_b = SQLiteStore(db_path=str(tmp_path / "temporal_b.db"))
+    r_b = ContextRetriever(tag_generator=MagicMock(), store=store_b, config=cfg,
+                           conversation_id=conv, query_embed_fn=_embed)
+    store_b.store_facts([fa, fb])
+    store_b.store_fact_embeddings("fa", conv, MODEL_A, _embed([fa.embed_text()])[0])
+    store_b.store_fact_embeddings("fb", conv, MODEL_A, _embed([fb.embed_text()])[0])
+    meta_b = {}
+    r_b._fetch_facts_dense(fa.embed_text(), None, [], meta_b)
+
+    assert meta_a["fact_dense_rank_by_id"] == meta_b["fact_dense_rank_by_id"]
+    assert meta_a["fact_dense_score_by_id"] == meta_b["fact_dense_score_by_id"]
+    assert meta_a["fact_dense_rank_by_id"]["fa"] == 0

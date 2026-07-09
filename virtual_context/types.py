@@ -990,6 +990,17 @@ class RetrieverConfig:
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_threshold: float = 0.3
     prefetch_facts: bool = True            # filter facts by query tags instead of fetching all
+    # Dense fact retrieval: rank the eligible fact pool by cosine similarity
+    # between the (optionally recent-turn-blended) message embedding and the
+    # persisted per-fact vectors, augmenting — never replacing — the tag-gated
+    # prefetch. False (default) = byte-identical legacy behavior: facts are
+    # selected only by tag membership and ordered by mentioned_at.
+    # YAML key: retrieval.fact_dense_retrieval.
+    fact_dense_retrieval: bool = False
+    # Cap on the number of dense kNN fact candidates unioned into the pool.
+    # Mirrors scoring.embedding_limit; the assembler's facts_max_tokens budget
+    # remains the final cap. YAML key: retrieval.fact_dense_top_n.
+    fact_dense_top_n: int = 20
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
 
 

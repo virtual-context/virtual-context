@@ -291,6 +291,10 @@ def _serialize_recall_fact(
         reasons.append("Included by summary floor because the conversation was already compacted.")
     if retrieval_meta.get("fallback") == "working_set":
         reasons.append("Selected from working-set fallback.")
+    dense_rank_by_id = retrieval_meta.get("fact_dense_rank_by_id") or {}
+    dense_score_by_id = retrieval_meta.get("fact_dense_score_by_id") or {}
+    source_by_id = retrieval_meta.get("fact_source_by_id") or {}
+    floor_ids = set(retrieval_meta.get("fact_tag_floor_ids", []) or [])
     return {
         "id": fact.id,
         "subject": fact.subject,
@@ -312,6 +316,10 @@ def _serialize_recall_fact(
         "selected_because": reasons,
         "matched_query_tags": matched_query_tags,
         "related_match_tags": related_match_tags,
+        "dense_rank": dense_rank_by_id.get(fact.id),
+        "dense_score": dense_score_by_id.get(fact.id),
+        "fact_source": source_by_id.get(fact.id),
+        "legacy_floor": fact.id in floor_ids,
     }
 
 
