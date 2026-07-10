@@ -2871,6 +2871,148 @@ class VirtualContextEngine:
         )
         return report
 
+    @staticmethod
+    def _sender_from_raw_content(raw_content: str | None) -> str:
+        """Recover a sender name from a canonical row's stored raw content.
+
+        ``_extract_envelope_metadata`` parses only leading labeled JSON blocks
+        of a *text* payload, so a JSON-serialized list must be decoded first
+        and its text blocks fed in individually — running the parser on the
+        serialized list itself would never match. Blocks are inspected last
+        first, mirroring the ``_last_text_block`` rule the ingest path uses to
+        pick the message's real text. Returns ``""`` when nothing is
+        derivable, including for unparsable payloads.
+        """
+        from .proxy._envelope import _extract_envelope_metadata
+        from .types import get_sender_name
+
+        if not raw_content or not isinstance(raw_content, str):
+            return ""
+
+        candidates: list[str] = []
+        stripped = raw_content.strip()
+        decoded = None
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+        if isinstance(decoded, list):
+            for block in decoded:
+                if isinstance(block, str):
+                    candidates.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        candidates.append(text)
+        elif isinstance(decoded, dict):
+            text = decoded.get("text")
+            if isinstance(text, str):
+                candidates.append(text)
+        else:
+            # Plain string raw payload (or malformed JSON that is really just
+            # text): the envelope parser handles it directly.
+            candidates.append(raw_content)
+
+        for text in reversed(candidates):
+            try:
+                _clean, metadata = _extract_envelope_metadata(text)
+            except Exception:
+                continue
+            name = get_sender_name(metadata)
+            if name:
+                return str(name).strip()
+        return ""
+
+    def backfill_senders(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Recover ``canonical_turns.sender`` from stored user-side raw content.
+
+        Only rows whose stored ``sender`` is empty AND that carry both user
+        content and user-side raw content are eligible: for string-content
+        historical rows ``user_raw_content`` is NULL and ``user_content`` is
+        already envelope-stripped, so the name is unrecoverable. An
+        assistant-only row is never labeled with a human speaker.
+
+        Writes go through ``update_canonical_turn_senders_if_empty``, a
+        compare-and-set keyed by ``canonical_turn_id`` — never a full-row
+        rewrite from a possibly-stale payload — so a re-run is a no-op.
+
+        Returns ``{eligible, updated, skipped_existing, skipped_no_raw,
+        skipped_no_sender, failed, dry_run}``.
+        """
+        if not conversation_id:
+            raise ValueError("backfill_senders requires a non-empty conversation_id")
+
+        report = {
+            "eligible": 0,
+            "updated": 0,
+            "skipped_existing": 0,
+            "skipped_no_raw": 0,
+            "skipped_no_sender": 0,
+            "failed": 0,
+            "dry_run": bool(dry_run),
+        }
+
+        rows = self._store.get_all_canonical_turns(conversation_id)
+        upgrades: dict[str, str] = {}
+        for row in rows:
+            if limit is not None and len(upgrades) >= limit:
+                break
+            if (row.sender or "").strip():
+                report["skipped_existing"] += 1
+                continue
+            if not (row.user_content or "").strip():
+                # Assistant-only row: no human speaker to recover.
+                continue
+            if not (row.user_raw_content or "").strip():
+                report["skipped_no_raw"] += 1
+                continue
+            report["eligible"] += 1
+            try:
+                sender = self._sender_from_raw_content(row.user_raw_content)
+            except Exception:
+                report["failed"] += 1
+                continue
+            if not sender:
+                report["skipped_no_sender"] += 1
+                continue
+            if row.canonical_turn_id:
+                upgrades[row.canonical_turn_id] = sender
+
+        if dry_run:
+            report["updated"] = len(upgrades)
+            return report
+
+        if upgrades:
+            epoch = None
+            try:
+                epoch = self._store.get_lifecycle_epoch(conversation_id)
+            except Exception:
+                epoch = None
+            report["updated"] = int(
+                self._store.update_canonical_turn_senders_if_empty(
+                    conversation_id,
+                    upgrades,
+                    expected_lifecycle_epoch=epoch,
+                )
+            )
+
+        logger.info(
+            "backfill_senders: done conv=%s eligible=%d updated=%d "
+            "skipped_existing=%d skipped_no_raw=%d skipped_no_sender=%d "
+            "failed=%d dry_run=%s",
+            conversation_id[:12], report["eligible"], report["updated"],
+            report["skipped_existing"], report["skipped_no_raw"],
+            report["skipped_no_sender"], report["failed"], dry_run,
+        )
+        return report
+
     def ingest_history(
         self,
         history_messages: list[Message],
