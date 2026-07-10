@@ -2621,14 +2621,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
             # A filter, not another text match: it never yields a new
             # ``matched_side``. Applied before ORDER BY / LIMIT so an
             # out-of-channel top hit cannot starve an in-channel one.
-            sql += """ AND (origin_channel_id = ?
-                            OR LOWER(CASE
+            sql += " AND (origin_channel_id = ?"
+            params.append(wanted_channel)
+            wanted_label = strip_channel_hash(wanted_channel).lower()
+            if wanted_label:
+                sql += """ OR LOWER(CASE
                                    WHEN origin_channel_label LIKE '#%'
                                    THEN SUBSTR(origin_channel_label, 2)
                                    ELSE origin_channel_label
-                               END) = ?)"""
-            params.append(wanted_channel)
-            params.append(strip_channel_hash(wanted_channel).lower())
+                               END) = ?"""
+                params.append(wanted_label)
+            sql += ")"
         sql += " ORDER BY turn_number DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()

@@ -344,6 +344,12 @@ class TestSearchCanonicalTurnTextChannelPg:
             "peptide", conversation_id=conv, channel="#nope",
         ) == []
 
+    def test_hash_only_scope_does_not_match_an_empty_label(self, store):
+        conv = self._seed(store)
+        assert store.search_canonical_turn_text(
+            "peptide", conversation_id=conv, channel="#",
+        ) == []
+
     def test_scoped_excerpt_composes_channel_then_sender(self, store):
         conv = self._seed(store)
         results = store.search_canonical_turn_text(
