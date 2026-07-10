@@ -252,11 +252,18 @@ def _merge_protected_window(
             "source": "db_recent",
         }
         if user_text:
+            user_metadata = dict(base_metadata)
+            # Sender attributes the human half only. A legacy row may carry
+            # the logical-turn sender on both halves; the assistant message
+            # below must not inherit it.
+            sender = (getattr(row, "sender", "") or "").strip()
+            if sender:
+                user_metadata["sender"] = {"name": sender}
             user_msg = Message(
                 role="user",
                 content=user_text,
                 timestamp=timestamp,
-                metadata=dict(base_metadata),
+                metadata=user_metadata,
             )
             augmented.append(user_msg)
         if assistant_text:

@@ -53,15 +53,21 @@ def split_session_boundary_messages(messages: list[Message]) -> list[Message]:
     for msg in messages:
         parts = _SESSION_RE.split(msg.content, maxsplit=1)
         if len(parts) == 3 and parts[0].strip():
+            # Metadata rides along on both halves: it carries the sender the
+            # compactor uses as the speaker label, and dropping it here would
+            # lose the attribution before segmentation ever reaches the
+            # summarizer.
             out.append(Message(
                 role=msg.role,
                 content=parts[0].strip(),
                 timestamp=msg.timestamp,
+                metadata=msg.metadata,
             ))
             out.append(Message(
                 role=msg.role,
                 content=f"[Session from {parts[1]}]{parts[2]}",
                 timestamp=msg.timestamp,
+                metadata=msg.metadata,
             ))
         else:
             out.append(msg)

@@ -27,6 +27,90 @@ from ..types import (
 from .progress_snapshot import ProgressSnapshot
 
 
+def _group_canonical_rows(rows: list) -> list[list]:
+    """Group physical canonical rows into logical turns.
+
+    Both SQL backends store a logical turn as two physical half-rows (a
+    user-only row and an assistant-only row) sharing a
+    ``turn_group_number``. Legacy conversations may instead hold the whole
+    logical turn in one combined row. Grouping by ``turn_group_number``
+    handles the first; a row with no assigned group (``-1``) falls back to
+    attaching a bare assistant half to the user half that precedes it.
+    """
+    groups: list[list] = []
+    for row in rows:
+        group_number = getattr(row, "turn_group_number", -1)
+        if group_number is None:
+            group_number = -1
+        if group_number >= 0:
+            if groups and getattr(groups[-1][0], "turn_group_number", -1) == group_number:
+                groups[-1].append(row)
+            else:
+                groups.append([row])
+            continue
+        # Ungrouped row: an assistant-only half joins the immediately
+        # preceding user-only half, otherwise it opens its own group.
+        has_user = bool((getattr(row, "user_content", "") or "").strip())
+        has_assistant = bool((getattr(row, "assistant_content", "") or "").strip())
+        if (
+            groups
+            and not has_user
+            and has_assistant
+            and getattr(groups[-1][-1], "turn_group_number", -1) < 0
+            and not any(
+                (getattr(r, "assistant_content", "") or "").strip()
+                for r in groups[-1]
+            )
+            and any(
+                (getattr(r, "user_content", "") or "").strip()
+                for r in groups[-1]
+            )
+        ):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
+
+
+def canonical_rows_to_history(rows: list) -> list[Message]:
+    """Convert canonical rows into a chat history of ``Message`` objects.
+
+    Rows are folded into logical turns first, so a user/assistant pair split
+    across two physical rows emits one complete turn rather than a
+    content-less user message plus a stray assistant message. A logical group
+    without an assistant response is dropped, which keeps an incomplete
+    trailing turn out of the history.
+
+    Sender rides in ``Message.metadata`` (never in ``content``, which feeds
+    hashes and summaries) and only on the user half: a legacy row can carry
+    the logical-turn sender on both halves, and the assistant is not that
+    speaker.
+    """
+    history: list[Message] = []
+    for group in _group_canonical_rows(rows):
+        user_text = ""
+        sender = ""
+        asst_text = ""
+        for row in group:
+            candidate_user = getattr(row, "user_content", "") or ""
+            if not user_text and candidate_user:
+                user_text = candidate_user
+                sender = (getattr(row, "sender", "") or "").strip()
+            candidate_asst = getattr(row, "assistant_content", "") or ""
+            if not asst_text and candidate_asst:
+                asst_text = candidate_asst
+        if not asst_text.strip():
+            continue
+        if user_text:
+            history.append(Message(
+                role="user",
+                content=user_text,
+                metadata={"sender": {"name": sender}} if sender else None,
+            ))
+        history.append(Message(role="assistant", content=asst_text))
+    return history
+
+
 class ContextStore(ABC):
     """Pluggable storage backend for compacted conversation segments."""
 
@@ -396,19 +480,7 @@ class ContextStore(ABC):
         sort-key order; backends may override for an indexed read
         but the contract is identical.
         """
-        rows = self.get_all_canonical_turns(conversation_id)
-        history: list[Message] = []
-        for row in rows:
-            user_text = row.user_content or ""
-            asst_text = row.assistant_content or ""
-            if not asst_text.strip():
-                # Incomplete trailing turn group; per the spec, only
-                # canonical rows with an assistant message land in
-                # the reconstructed history.
-                continue
-            history.append(Message(role="user", content=user_text))
-            history.append(Message(role="assistant", content=asst_text))
-        return history
+        return canonical_rows_to_history(self.get_all_canonical_turns(conversation_id))
 
     def get_compaction_fence_mode(self):
         """Return the runtime compaction-fence holder pinned at
