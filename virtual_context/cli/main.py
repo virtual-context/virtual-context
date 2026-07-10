@@ -1796,8 +1796,22 @@ def cmd_admin_backfill_channels(args):
         config.tenant_id = tenant_id
     _apply_storage_overrides(config, args)
 
+    # This command only reads canonical rows and issues narrow storage CASes.
+    # Building the ordinary retrieval stack would otherwise make an offline
+    # admin operation try to load (and potentially download) the configured
+    # embedding model before it can touch the database.
+    class _NoopEmbeddingProvider:
+        @staticmethod
+        def get_embed_fn():
+            return None
+
+    config.retriever.inbound_tagger_type = "disabled"
+
     try:
-        engine = VirtualContextEngine(config=config)
+        engine = VirtualContextEngine(
+            config=config,
+            embedding_provider=_NoopEmbeddingProvider(),
+        )
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({
             "status": "error",
