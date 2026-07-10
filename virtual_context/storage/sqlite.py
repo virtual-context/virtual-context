@@ -432,7 +432,12 @@ def _text_term_hits(text: str, terms: list[str]) -> int:
     return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", lowered))
 
 
-def _matched_turn_side(query: str, user_text: str, assistant_text: str) -> str:
+def _matched_turn_side(
+    query: str,
+    user_text: str,
+    assistant_text: str,
+    sender: str = "",
+) -> str:
     query_lower = (query or "").strip().lower()
     user_lower = (user_text or "").lower()
     assistant_lower = (assistant_text or "").lower()
@@ -446,6 +451,17 @@ def _matched_turn_side(query: str, user_text: str, assistant_text: str) -> str:
     terms = _turn_query_terms(query)
     user_hits += _text_term_hits(user_text, terms)
     assistant_hits += _text_term_hits(assistant_text, terms)
+    # A sender-only hit is a user-side hit: the name attributes the human
+    # half of the turn. We do not mint a new ``matched_side`` value for it,
+    # and it only counts when the row actually has user content to excerpt.
+    if (
+        not user_hits
+        and (sender or "").strip()
+        and (user_text or "").strip()
+        and query_lower
+        and query_lower in (sender or "").lower()
+    ):
+        user_hits += 1
     if user_hits and assistant_hits:
         return "both"
     if user_hits:
@@ -455,6 +471,14 @@ def _matched_turn_side(query: str, user_text: str, assistant_text: str) -> str:
     return "unknown"
 
 
+def _user_label(sender: str = "") -> str:
+    """Speaker label for a user-side excerpt. Assistant excerpts never take
+    a human sender label, even when a legacy row carries one on both halves.
+    """
+    name = (sender or "").strip()
+    return name if name else "User"
+
+
 def _build_turn_excerpt(
     query: str,
     user_text: str,
@@ -462,17 +486,19 @@ def _build_turn_excerpt(
     matched_side: str,
     *,
     context_chars: int = 200,
+    sender: str = "",
 ) -> str:
+    label = _user_label(sender)
     if matched_side == "user":
-        return f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}"
+        return f"{label}: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}"
     if matched_side == "assistant":
         return f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
     if matched_side == "both":
         return (
-            f"User: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}\n\n"
+            f"{label}: {_extract_excerpt(user_text or '', query, context_chars=context_chars)}\n\n"
             f"Assistant: {_extract_excerpt(assistant_text or '', query, context_chars=context_chars)}"
         )
-    combined = f"User: {user_text or ''}\n\nAssistant: {assistant_text or ''}".strip()
+    combined = f"{label}: {user_text or ''}\n\nAssistant: {assistant_text or ''}".strip()
     return _extract_excerpt(combined, query, context_chars=context_chars)
 
 
@@ -2546,11 +2572,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[QuoteResult]:
         conn = self._get_conn()
         pattern = f"%{query}%"
+        # A member name can exist only in ``sender``: the envelope that
+        # carried it is stripped before the row's text is normalized. Match
+        # it too, but only on rows that have a user half to excerpt — an
+        # assistant-only row must never surface as a human-sender match.
         sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
-                        primary_tag, tags_json, session_date
+                        primary_tag, tags_json, session_date, sender
                  FROM canonical_turns_ordinal
-                 WHERE (user_content LIKE ? OR assistant_content LIKE ?)"""
-        params: list[object] = [pattern, pattern]
+                 WHERE (user_content LIKE ?
+                        OR assistant_content LIKE ?
+                        OR (sender LIKE ? AND TRIM(COALESCE(user_content, '')) <> ''))"""
+        params: list[object] = [pattern, pattern, pattern]
         if conversation_id is not None:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
@@ -2568,17 +2600,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
             primary_tag = (row["primary_tag"] if isinstance(row, sqlite3.Row) else row[4]) or "_general"
             tags_json = (row["tags_json"] if isinstance(row, sqlite3.Row) else row[5]) or "[]"
             session_date = (row["session_date"] if isinstance(row, sqlite3.Row) else row[6]) or ""
+            sender = (row["sender"] if isinstance(row, sqlite3.Row) else row[8]) or ""
             try:
                 tags = json.loads(tags_json or "[]")
             except Exception:
                 tags = []
-            matched_side = _matched_turn_side(query, u, a)
+            matched_side = _matched_turn_side(query, u, a, sender)
             excerpt = _build_turn_excerpt(
                 query,
                 u,
                 a,
                 matched_side,
                 context_chars=_ctx,
+                sender=sender,
             )
             results.append(QuoteResult(
                 text=excerpt,
