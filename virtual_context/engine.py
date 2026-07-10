@@ -3184,6 +3184,38 @@ class VirtualContextEngine:
                     candidate_label if fills_label else "",
                 )
 
+        # Label propagation: rows derived from stable keys carry an id but no
+        # label. When the conversation's own rows (stored or derived above)
+        # associate an id with exactly ONE label, that label fills the id-only
+        # rows too. An ambiguous id — two distinct labels, e.g. a renamed
+        # channel — never propagates.
+        report["label_propagated"] = 0
+        labels_by_id: dict[str, set[str]] = {}
+        pending_by_ct: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            if not row.canonical_turn_id:
+                continue
+            up_id, up_label = upgrades.get(row.canonical_turn_id, ("", ""))
+            eff_id = (row.origin_channel_id or "").strip() or up_id
+            eff_label = (row.origin_channel_label or "").strip() or up_label
+            pending_by_ct[row.canonical_turn_id] = (eff_id, eff_label)
+            if eff_id and eff_label:
+                labels_by_id.setdefault(eff_id, set()).add(eff_label)
+        unambiguous = {
+            cid: next(iter(labels))
+            for cid, labels in labels_by_id.items()
+            if len(labels) == 1
+        }
+        for ct_id, (eff_id, eff_label) in pending_by_ct.items():
+            if not eff_id or eff_label:
+                continue
+            label = unambiguous.get(eff_id)
+            if not label:
+                continue
+            prev_id, _prev_label = upgrades.get(ct_id, ("", ""))
+            upgrades[ct_id] = (prev_id, label)
+            report["label_propagated"] += 1
+
         if dry_run:
             report["updated"] = len(upgrades)
             return report

@@ -672,3 +672,53 @@ class TestCliWiring:
                 "--storage-backend", "sqlite", "--sqlite-path", db,
             ])
         assert exc.value.code == 2
+
+
+class TestLabelPropagation:
+    """An id->label mapping learned inside the conversation fills id-only rows.
+
+    Origin-derived rows carry an id but no label. When sibling rows in the
+    same conversation associate that id with exactly one label, the label
+    propagates; an ambiguous id (two labels) never does.
+    """
+
+    def test_unambiguous_label_fills_id_only_rows(self, tmp_path: Path):
+        engine = _engine(tmp_path)
+        store = engine._store
+        _seed(store, "c")
+        _row(store, "c", ct_id="ct-1", sort_key=1000.0, user_content="a",
+             origin_channel_id="7", origin_channel_label="#gen")
+        _row(store, "c", ct_id="ct-2", sort_key=2000.0, user_content="b",
+             origin_channel_id="7")
+        _row(store, "c", ct_id="ct-3", sort_key=3000.0, user_content="c",
+             origin_conversation_id="sk:agent:x:discord:channel:7")
+        report = engine.backfill_channels("c")
+        assert report["label_propagated"] == 2
+        assert _channels(store, "c") == [("7", "#gen"), ("7", "#gen"), ("7", "#gen")]
+
+    def test_ambiguous_id_never_propagates(self, tmp_path: Path):
+        engine = _engine(tmp_path)
+        store = engine._store
+        _seed(store, "c")
+        _row(store, "c", ct_id="ct-1", sort_key=1000.0, user_content="a",
+             origin_channel_id="7", origin_channel_label="#old")
+        _row(store, "c", ct_id="ct-2", sort_key=2000.0, user_content="b",
+             origin_channel_id="7", origin_channel_label="#new")
+        _row(store, "c", ct_id="ct-3", sort_key=3000.0, user_content="c",
+             origin_channel_id="7")
+        report = engine.backfill_channels("c")
+        assert report["label_propagated"] == 0
+        assert _channels(store, "c")[2] == ("7", "")
+
+    def test_propagation_is_idempotent(self, tmp_path: Path):
+        engine = _engine(tmp_path)
+        store = engine._store
+        _seed(store, "c")
+        _row(store, "c", ct_id="ct-1", sort_key=1000.0, user_content="a",
+             origin_channel_id="7", origin_channel_label="#gen")
+        _row(store, "c", ct_id="ct-2", sort_key=2000.0, user_content="b",
+             origin_channel_id="7")
+        engine.backfill_channels("c")
+        report = engine.backfill_channels("c")
+        assert report["label_propagated"] == 0
+        assert report["updated"] == 0
