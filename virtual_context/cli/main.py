@@ -1741,6 +1741,118 @@ def cmd_admin_backfill_senders(args):
             pass
 
 
+def cmd_admin_backfill_channels(args):
+    """Recover the canonical_turns channel columns for pre-existing rows.
+
+    Two sources combine per physical row, neither replacing a non-empty
+    stored field: the side-specific stored raw content, and a stable-key
+    fallback for a still-empty id parsed from the row's origin conversation
+    id (a moved row) or from its own conversation id (a target-native row).
+    A UUID/hash origin carries no recoverable channel and is left alone.
+
+    Per-conversation invocation is the primitive:
+
+        virtual-context admin backfill-channels <conv-id> [--tenant-id <tid>]
+
+    Batch shape enumerates conversations that own canonical rows (not
+    segments), optionally scoped to one tenant:
+
+        virtual-context admin backfill-channels \\
+            --tenant-id <tid> --all-convs-for-tenant --limit 25
+
+    ``--dry-run`` reports what would be updated without writing. Storage
+    configuration follows the precedence documented on
+    ``_apply_storage_overrides``: explicit flag > ``-c`` config >
+    ``DATABASE_URL`` env fallback.
+    """
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = getattr(args, "conversation_id", None) or ""
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    all_convs = bool(getattr(args, "all_convs_for_tenant", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    limit = getattr(args, "limit", None)
+
+    if not conversation_id and not all_convs:
+        print(json.dumps({
+            "status": "error",
+            "stage": "args",
+            "error": "either <conversation_id> or --all-convs-for-tenant must be supplied",
+        }))
+        sys.exit(2)
+
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "load_config",
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+    if conversation_id:
+        config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+    _apply_storage_overrides(config, args)
+
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error",
+            "stage": "engine_construct",
+            "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    try:
+        if all_convs:
+            targets = engine._store.list_canonical_conversation_ids(
+                tenant_id=tenant_id or None,
+                limit=limit,
+            )
+        else:
+            # An alias-carrying id is rebound to its terminal during engine
+            # construction; backfill the TERMINAL id.
+            targets = [engine.config.conversation_id]
+
+        results = []
+        totals = {
+            "eligible": 0,
+            "updated": 0,
+            "skipped_existing": 0,
+            "skipped_no_derivation": 0,
+            "derived_from_raw": 0,
+            "derived_from_origin": 0,
+            "failed": 0,
+        }
+        for target in targets:
+            counts = engine.backfill_channels(
+                target,
+                dry_run=dry_run,
+                limit=None if all_convs else limit,
+            )
+            for key in totals:
+                totals[key] += int(counts.get(key, 0))
+            results.append({"conversation_id": target, **counts})
+
+        print(json.dumps({
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "dry_run": dry_run,
+            "storage_backend": config.storage.backend,
+            "conversations": len(targets),
+            **totals,
+            "results": results,
+        }))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
 def cmd_admin_retag_canonical_turns(args):
     """Re-tag canonical rows that carry degraded fallback tags.
 
@@ -2392,6 +2504,69 @@ def main():
     )
 
     # ------------------------------------------------------------------
+    # admin backfill-channels
+    # ------------------------------------------------------------------
+    backfill_channel_parser = admin_sub.add_parser(
+        "backfill-channels",
+        help=(
+            "Recover canonical_turns channel provenance from stored raw "
+            "content and parseable stable conversation keys"
+        ),
+    )
+    backfill_channel_parser.add_argument(
+        "conversation_id",
+        nargs="?",
+        default=None,
+        help="Conversation id to backfill (omit with --all-convs-for-tenant)",
+    )
+    backfill_channel_parser.add_argument(
+        "--tenant-id",
+        default="",
+        help="Tenant id to set on the engine config (default: empty)",
+    )
+    backfill_channel_parser.add_argument(
+        "--all-convs-for-tenant",
+        action="store_true",
+        help=(
+            "Enumerate every conversation owning canonical rows, scoped to "
+            "--tenant-id when supplied"
+        ),
+    )
+    backfill_channel_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be updated without writing",
+    )
+    backfill_channel_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of rows upgraded per conversation, or the number "
+            "of conversations enumerated in batch mode"
+        ),
+    )
+    # Storage override flags mirror backfill-senders. Precedence:
+    # explicit flag > ``-c`` config > ``DATABASE_URL`` env fallback.
+    backfill_channel_parser.add_argument(
+        "--storage-backend",
+        choices=("sqlite", "postgres", "filesystem"),
+        help="Override the engine's storage backend.",
+    )
+    backfill_channel_parser.add_argument(
+        "--postgres-dsn",
+        help=(
+            "Postgres connection string. Overrides storage.postgres_dsn. "
+            "If neither this flag nor -c is provided, falls back to the "
+            "DATABASE_URL environment variable when set."
+        ),
+    )
+    backfill_channel_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite database path. Overrides storage.sqlite_path.",
+    )
+
+    # ------------------------------------------------------------------
     # admin retag-canonical-turns
     # ------------------------------------------------------------------
     retag_parser = admin_sub.add_parser(
@@ -2583,6 +2758,8 @@ def main():
             cmd_admin_backfill_fact_embeddings(args)
         elif args.admin_command == "backfill-senders":
             cmd_admin_backfill_senders(args)
+        elif args.admin_command == "backfill-channels":
+            cmd_admin_backfill_channels(args)
         elif args.admin_command == "backfill-session-state-markers":
             cmd_admin_backfill_session_state_markers(args)
         else:
@@ -2591,6 +2768,7 @@ def main():
                 "  virtual-context admin backfill-tag-summaries <conversation_id> [--tenant-id <id>] [--force-rebuild]\n"
                 "  virtual-context admin backfill-fact-embeddings <conversation_id> [--tenant-id <id>] [--since <ts>] [--until <ts>] [--force-rebuild]\n"
                 "  virtual-context admin backfill-senders [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
+                "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )
             sys.exit(1)
