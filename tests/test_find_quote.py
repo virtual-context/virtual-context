@@ -399,6 +399,7 @@ class TestProxyFindQuoteTool:
             max_results=20,
             intent_context="",
             mode="lookup",
+            channel="",
         )
         result = json.loads(result_str)
         assert result["found"] is True
@@ -418,6 +419,7 @@ class TestProxyFindQuoteTool:
             max_results=20,
             intent_context="",
             mode="lookup",
+            channel="",
         )
 
     def test_execute_vc_tool_dispatches_find_quote_with_explicit_mode(self):
@@ -431,6 +433,7 @@ class TestProxyFindQuoteTool:
             max_results=20,
             intent_context="",
             mode="exact_value",
+            channel="",
         )
 
 

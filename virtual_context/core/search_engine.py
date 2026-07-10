@@ -50,6 +50,7 @@ class SearchEngine:
         intent_context: str = "",
         session_filter: str = "",
         mode: str = "lookup",
+        channel: str = "",
     ) -> dict:
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
@@ -62,6 +63,7 @@ class SearchEngine:
             session_filter=session_filter,
             mode=mode,
             conversation_id=self._config.conversation_id,
+            channel=channel,
         )
 
     def get_turns_by_tag(

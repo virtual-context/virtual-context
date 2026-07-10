@@ -34,7 +34,7 @@ from ..core.progress_snapshot import (
     ProgressSnapshot,
 )
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 SCHEMA_SQL = """\
@@ -2595,6 +2595,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
+        channel: str = "",
     ) -> list[QuoteResult]:
         conn = self._get_conn()
         pattern = f"%{query}%"
@@ -2604,7 +2605,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # it too, but only on rows that have a user half to excerpt — an
         # assistant-only row must never surface as a human-sender match.
         sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
-                        primary_tag, tags_json, session_date, sender
+                        primary_tag, tags_json, session_date, sender,
+                        origin_channel_id, origin_channel_label
                  FROM canonical_turns_ordinal
                  WHERE (user_content LIKE ?
                         OR assistant_content LIKE ?
@@ -2614,6 +2616,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if conversation_id is not None:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
+        wanted_channel = (channel or "").strip()
+        if wanted_channel:
+            # A filter, not another text match: it never yields a new
+            # ``matched_side``. Applied before ORDER BY / LIMIT so an
+            # out-of-channel top hit cannot starve an in-channel one.
+            sql += """ AND (origin_channel_id = ?
+                            OR LOWER(CASE
+                                   WHEN origin_channel_label LIKE '#%'
+                                   THEN SUBSTR(origin_channel_label, 2)
+                                   ELSE origin_channel_label
+                               END) = ?)"""
+            params.append(wanted_channel)
+            params.append(strip_channel_hash(wanted_channel).lower())
         sql += " ORDER BY turn_number DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
@@ -2642,6 +2657,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 context_chars=_ctx,
                 sender=sender,
             )
+            if wanted_channel:
+                # One outer provenance prefix, composed before the reranker
+                # reads ``QuoteResult.text``. An unscoped call adds nothing,
+                # so its output stays byte-identical.
+                excerpt = channel_excerpt_prefix(
+                    (row["origin_channel_id"] if isinstance(row, sqlite3.Row) else "") or "",
+                    (row["origin_channel_label"] if isinstance(row, sqlite3.Row) else "") or "",
+                ) + excerpt
             results.append(QuoteResult(
                 text=excerpt,
                 tag=primary_tag,

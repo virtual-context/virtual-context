@@ -45,6 +45,8 @@ from ..types import (
     TemporalStatus,
     TurnTagEntry,
     WorkingSetEntry,
+    channel_excerpt_prefix,
+    strip_channel_hash,
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
@@ -5386,6 +5388,7 @@ class PostgresStore(ContextStore):
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
+        channel: str = "",
     ) -> list[QuoteResult]:
         with self.pool.connection() as conn:
             pattern = f"%{query}%"
@@ -5396,7 +5399,8 @@ class PostgresStore(ContextStore):
             # excerpt — an assistant-only row must never surface as a
             # human-sender match.
             sql = """SELECT canonical_turn_id, turn_number, user_content, assistant_content, created_at,
-                            primary_tag, tags_json, session_date, sender
+                            primary_tag, tags_json, session_date, sender,
+                            origin_channel_id, origin_channel_label
                      FROM canonical_turns_ordinal
                      WHERE (user_content ILIKE %s
                             OR assistant_content ILIKE %s
@@ -5406,6 +5410,19 @@ class PostgresStore(ContextStore):
             if conversation_id is not None:
                 sql += " AND conversation_id = %s"
                 params.append(conversation_id)
+            wanted_channel = (channel or "").strip()
+            if wanted_channel:
+                # A filter, not another text match: it never yields a new
+                # ``matched_side``. Applied before ORDER BY / LIMIT so an
+                # out-of-channel top hit cannot starve an in-channel one.
+                sql += """ AND (origin_channel_id = %s
+                                OR LOWER(CASE
+                                       WHEN origin_channel_label LIKE '#%%'
+                                       THEN SUBSTRING(origin_channel_label FROM 2)
+                                       ELSE origin_channel_label
+                                   END) = %s)"""
+                params.append(wanted_channel)
+                params.append(strip_channel_hash(wanted_channel).lower())
             sql += " ORDER BY sort_key DESC LIMIT %s"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
@@ -5433,6 +5450,14 @@ class PostgresStore(ContextStore):
                     context_chars=_ctx,
                     sender=sender,
                 )
+                if wanted_channel:
+                    # One outer provenance prefix, composed before the
+                    # reranker reads ``QuoteResult.text``. An unscoped call
+                    # adds nothing, so its output stays byte-identical.
+                    excerpt = channel_excerpt_prefix(
+                        row.get("origin_channel_id", "") or "",
+                        row.get("origin_channel_label", "") or "",
+                    ) + excerpt
                 results.append(QuoteResult(
                     text=excerpt,
                     tag=primary_tag,

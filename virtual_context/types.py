@@ -269,6 +269,44 @@ def get_origin_channel(metadata: dict | None) -> tuple[str, str]:
     return channel_id, channel_label
 
 
+def strip_channel_hash(value: str) -> str:
+    """Remove at most one leading ``#`` from a channel label or request."""
+    text = (value or "").strip()
+    return text[1:] if text.startswith("#") else text
+
+
+def channel_matches(
+    request: str,
+    origin_channel_id: str,
+    origin_channel_label: str,
+) -> bool:
+    """Does a row's stored channel provenance satisfy a scoped request?
+
+    The request is trimmed, then matched exactly against ``origin_channel_id``
+    or, failing that, case-insensitively against ``origin_channel_label`` with
+    at most one leading ``#`` removed from both sides. An empty request
+    disables filtering and matches everything.
+
+    This is a filter, not a text match: it never becomes a ``matched_side``.
+    """
+    wanted = (request or "").strip()
+    if not wanted:
+        return True
+    if wanted == (origin_channel_id or "").strip():
+        return True
+    label = strip_channel_hash(origin_channel_label or "")
+    return bool(label) and label.lower() == strip_channel_hash(wanted).lower()
+
+
+def channel_excerpt_prefix(origin_channel_id: str, origin_channel_label: str) -> str:
+    """Outer provenance prefix for a scoped excerpt, label preferred over id."""
+    label = (origin_channel_label or "").strip()
+    if label:
+        return f"[{label}] "
+    channel_id = (origin_channel_id or "").strip()
+    return f"[{channel_id}] " if channel_id else ""
+
+
 @dataclass
 class TurnPair:
     """Atomic unit: a user message and its assistant response (plus any system/tool)."""

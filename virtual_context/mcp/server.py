@@ -156,7 +156,7 @@ def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str
 
 
 @mcp.tool()
-def find_quote(query: str, mode: str = "lookup") -> str:
+def find_quote(query: str, mode: str = "lookup", channel: str = "") -> str:
     """Find direct quote-like evidence from raw conversation turns.
 
     Use this when you need the literal place something was said: names,
@@ -170,12 +170,15 @@ def find_quote(query: str, mode: str = "lookup") -> str:
         mode: Retrieval mode. Use 'lookup' for normal quote search. Use
             'exact_value' only when one excerpt should contain the answer
             verbatim as an explicit number/version/date/count.
+        channel: Optional source channel to restrict the search to: a channel
+            name with or without a leading '#', or a stored channel id. Pass
+            it only when the question is explicitly scoped to one channel.
     Returns:
         JSON with matching excerpts and quote provenance.
     """
     engine = _get_engine()
     # Keep MCP behavior aligned with proxy tool loop: always return top 20.
-    result = engine.find_quote(query, max_results=20, mode=mode)
+    result = engine.find_quote(query, max_results=20, mode=mode, channel=channel)
     return json.dumps(result)
 
 
