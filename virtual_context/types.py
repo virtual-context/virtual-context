@@ -228,6 +228,47 @@ def get_sender_name(metadata: dict | None) -> str | None:
     return None
 
 
+# Only explicit group kinds name a source channel. A ``direct:``/``dm:``
+# chat_id identifies a one-to-one conversation, not a channel, and must not
+# contribute an id.
+_GROUP_CHAT_ID_PREFIXES = ("channel:", "group:")
+
+
+def get_origin_channel(metadata: dict | None) -> tuple[str, str]:
+    """Derive ``(channel_id, channel_label)`` from one message's metadata.
+
+    Reads only a dict-valued ``metadata["conversation info"]`` block and only
+    string values inside it. ``chat_id`` yields the id with its ``channel:``/
+    ``group:`` kind prefix removed; any other kind (notably ``direct:``/
+    ``dm:``) yields no id. ``group_channel`` yields the trimmed label with its
+    leading ``#`` retained.
+
+    The two fields are independent: a label may exist without an id and vice
+    versa. Neither is ever inferred from the other. Side-effect free.
+    """
+    if not isinstance(metadata, dict):
+        return "", ""
+    conv_info = metadata.get("conversation info")
+    if not isinstance(conv_info, dict):
+        return "", ""
+
+    channel_id = ""
+    chat_id = conv_info.get("chat_id")
+    if isinstance(chat_id, str):
+        candidate = chat_id.strip()
+        for prefix in _GROUP_CHAT_ID_PREFIXES:
+            if candidate.startswith(prefix):
+                channel_id = candidate[len(prefix):].strip()
+                break
+
+    channel_label = ""
+    label = conv_info.get("group_channel")
+    if isinstance(label, str):
+        channel_label = label.strip()
+
+    return channel_id, channel_label
+
+
 @dataclass
 class TurnPair:
     """Atomic unit: a user message and its assistant response (plus any system/tool)."""
@@ -638,6 +679,16 @@ class CanonicalTurnRow:
     covered_ingestible_entries: int = 1
     created_at: str = ""
     updated_at: str = ""
+    # Source-channel provenance. Two independently fillable fields: a row may
+    # carry an id with no label (recovered from a stable conversation key) or
+    # a label with no id. Unlike ``sender`` an assistant row may legitimately
+    # carry both, because the derivation is per physical message.
+    origin_channel_id: str = ""
+    origin_channel_label: str = ""
+    # Read-only provenance projected by the raw loaders. VCMERGE owns the
+    # column; ``save_canonical_turn`` never writes it, so a default-empty
+    # full-row rewrite cannot erase it.
+    origin_conversation_id: str = ""
 
 
 @dataclass

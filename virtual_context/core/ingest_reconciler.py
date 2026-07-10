@@ -25,6 +25,7 @@ from ..types import (
     CanonicalTurnRow,
     IngestBatchRecord,
     TurnTagEntry,
+    get_origin_channel,
     get_sender_name,
 )
 
@@ -60,8 +61,13 @@ class IngestReconciler:
         tags: list[str] | None = None,
         session_date: str = "",
         sender: str = "",
+        user_origin_channel_id: str = "",
+        user_origin_channel_label: str = "",
+        assistant_origin_channel_id: str = "",
+        assistant_origin_channel_label: str = "",
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
+        expected_lifecycle_epoch: int | None = None,
         ) -> CanonicalIngestResult:
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
@@ -75,6 +81,8 @@ class IngestReconciler:
                     tags=tags,
                     session_date=session_date,
                     sender=sender,
+                    origin_channel_id=user_origin_channel_id,
+                    origin_channel_label=user_origin_channel_label,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
                 ),
@@ -87,6 +95,8 @@ class IngestReconciler:
                     tags=tags,
                     session_date=session_date,
                     sender=sender,
+                    origin_channel_id=assistant_origin_channel_id,
+                    origin_channel_label=assistant_origin_channel_label,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
                 ),
@@ -144,6 +154,32 @@ class IngestReconciler:
                     user_row.source_batch_id = tail.source_batch_id
                     user_row.first_seen_at = tail.first_seen_at or user_row.first_seen_at
                     user_row.last_seen_at = tail.last_seen_at or user_row.last_seen_at
+                    # The tail row is mirrored, never rewritten, so a channel
+                    # value that only became derivable on this call would live
+                    # in memory alone. Fence the CAS on the epoch the CALLER
+                    # entered with: reading the epoch here would observe a
+                    # conversation resurrected mid-flight and happily write
+                    # this stale provenance into its new lifecycle.
+                    tail_candidate_id = (user_row.origin_channel_id or "").strip()
+                    tail_candidate_label = (user_row.origin_channel_label or "").strip()
+                    tail_fills_id = (
+                        tail_candidate_id and not (tail.origin_channel_id or "").strip()
+                    )
+                    tail_fills_label = (
+                        tail_candidate_label
+                        and not (tail.origin_channel_label or "").strip()
+                    )
+                    if tail.canonical_turn_id and (tail_fills_id or tail_fills_label):
+                        self._upgrade_empty_channels(
+                            conversation_id,
+                            {
+                                tail.canonical_turn_id: (
+                                    tail_candidate_id if tail_fills_id else "",
+                                    tail_candidate_label if tail_fills_label else "",
+                                ),
+                            },
+                            expected_lifecycle_epoch=expected_lifecycle_epoch,
+                        )
                     self._preserve_existing_enrichment(user_row, tail)
                     now = utcnow_iso()
                     batch_id = generate_canonical_turn_id()
@@ -206,24 +242,34 @@ class IngestReconciler:
         from ..proxy.formats import extract_ingestible_messages
 
         entries, _stats = extract_ingestible_messages(body, fmt, mode="ingest")
-        prepared = [
-            self._prepare_message_row(
-                conversation_id,
-                role=message.role,
-                content=message.content,
-                raw_content=message.raw_content,
-                # Sender is speaker attribution, so only a user entry may
-                # carry it. ``extract_ingestible_messages`` has already parsed
-                # the leading labeled-JSON envelope into ``Message.metadata``;
-                # the name exists nowhere else once the envelope is stripped.
-                sender=(
-                    (get_sender_name(message.metadata) or "")
-                    if message.role == "user"
-                    else ""
-                ),
+        prepared: list[CanonicalTurnRow] = []
+        for message in entries:
+            # Channel is source provenance, not speaker attribution, so it is
+            # derived independently per physical entry and BOTH roles may
+            # carry it. An assistant entry gets values only when its own
+            # selected text exposed the envelope; the paired user's values are
+            # never copied onto it.
+            channel_id, channel_label = get_origin_channel(message.metadata)
+            prepared.append(
+                self._prepare_message_row(
+                    conversation_id,
+                    role=message.role,
+                    content=message.content,
+                    raw_content=message.raw_content,
+                    # Sender is speaker attribution, so only a user entry may
+                    # carry it. ``extract_ingestible_messages`` has already
+                    # parsed the leading labeled-JSON envelope into
+                    # ``Message.metadata``; the name exists nowhere else once
+                    # the envelope is stripped.
+                    sender=(
+                        (get_sender_name(message.metadata) or "")
+                        if message.role == "user"
+                        else ""
+                    ),
+                    origin_channel_id=channel_id,
+                    origin_channel_label=channel_label,
+                )
             )
-            for message in entries
-        ]
         return self.ingest_prepared_turns(
             conversation_id,
             prepared_turns=prepared,
@@ -468,6 +514,7 @@ class IngestReconciler:
             # epoch-guarded compare-and-set batch instead of dropping back to
             # ``_write_turn`` for every overlap row.
             sender_upgrades: dict[str, str] = {}
+            channel_upgrades: dict[str, tuple[str, str]] = {}
             for offset, row in enumerate(overlap_incoming):
                 existing_row = overlap_existing[offset]
                 row.canonical_turn_id = existing_row.canonical_turn_id
@@ -485,6 +532,21 @@ class IngestReconciler:
                     # I5: never attribute a human speaker to an assistant-only
                     # row, even when a legacy sibling row carries one.
                     sender_upgrades[existing_row.canonical_turn_id] = incoming_sender
+                # Channel has no user-half restriction: an assistant row that
+                # carried its own envelope legitimately owns the provenance.
+                # Each field is offered only when it is newly derivable.
+                candidate_id = (row.origin_channel_id or "").strip()
+                candidate_label = (row.origin_channel_label or "").strip()
+                fills_id = candidate_id and not (existing_row.origin_channel_id or "").strip()
+                fills_label = (
+                    candidate_label
+                    and not (existing_row.origin_channel_label or "").strip()
+                )
+                if existing_row.canonical_turn_id and (fills_id or fills_label):
+                    channel_upgrades[existing_row.canonical_turn_id] = (
+                        candidate_id if fills_id else "",
+                        candidate_label if fills_label else "",
+                    )
                 self._preserve_existing_enrichment(row, existing_row)
                 rows_touched.append(row)
                 turns_matched += 1
@@ -493,6 +555,13 @@ class IngestReconciler:
                 self._upgrade_empty_senders(
                     conversation_id,
                     sender_upgrades,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                )
+
+            if channel_upgrades:
+                self._upgrade_empty_channels(
+                    conversation_id,
+                    channel_upgrades,
                     expected_lifecycle_epoch=expected_lifecycle_epoch,
                 )
 
@@ -621,6 +690,41 @@ class IngestReconciler:
             )
             return 0
 
+    def _upgrade_empty_channels(
+        self,
+        conversation_id: str,
+        upgrades: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Make newly-derived channel provenance durable on fast-skipped rows.
+
+        An already-tagged overlap row takes the tagger's hydration fast path,
+        which never rewrites the canonical row, so provenance that only became
+        derivable on this payload would never become durable. The store-level
+        write is a per-column compare-and-set keyed by ``canonical_turn_id``,
+        so it can never overwrite either stored value and a re-run is a no-op.
+        A store without the surface (or a failure) degrades to "channel not
+        yet durable" rather than failing the ingest.
+        """
+        updater = getattr(self._store, "update_canonical_turn_channels_if_empty", None)
+        if not callable(updater):
+            return 0
+        try:
+            return int(updater(
+                conversation_id,
+                upgrades,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        except Exception:
+            logger.warning(
+                "CANONICAL_TURN_CHANNEL_UPGRADE_FAILED: conv=%s rows=%d",
+                conversation_id[:12],
+                len(upgrades),
+                exc_info=True,
+            )
+            return 0
+
     @staticmethod
     def _preserve_existing_enrichment(
         row: CanonicalTurnRow, existing_row: CanonicalTurnRow,
@@ -650,6 +754,21 @@ class IngestReconciler:
         # that a previous ingest (or the tagger) already derived.
         if not (row.sender or "").strip() and (existing_row.sender or "").strip():
             row.sender = existing_row.sender
+        # The two channel columns merge one-way and INDEPENDENTLY: a row can
+        # hold a stored id with no label (recovered from a stable conversation
+        # key) and later gain the label from a payload that carries the
+        # envelope, or vice versa. Merging them as a pair would let an
+        # incoming label-only derivation blank a stored id.
+        if (
+            not (row.origin_channel_id or "").strip()
+            and (existing_row.origin_channel_id or "").strip()
+        ):
+            row.origin_channel_id = existing_row.origin_channel_id
+        if (
+            not (row.origin_channel_label or "").strip()
+            and (existing_row.origin_channel_label or "").strip()
+        ):
+            row.origin_channel_label = existing_row.origin_channel_label
 
     def _prepare_message_row(
         self,
@@ -662,6 +781,8 @@ class IngestReconciler:
         tags: list[str] | None = None,
         session_date: str = "",
         sender: str = "",
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         entry: TurnTagEntry | None = None,
@@ -710,6 +831,11 @@ class IngestReconciler:
             tags=list(tags or []),
             session_date=session_date or "",
             sender=sender or "",
+            # Deliberately NOT sourced from ``entry``: a TurnTagEntry
+            # represents a logical turn, so taking channel from it would smear
+            # the user-derived value onto the assistant physical row.
+            origin_channel_id=origin_channel_id or "",
+            origin_channel_label=origin_channel_label or "",
             fact_signals=list(fact_signals or []),
             code_refs=list(code_refs or []),
             tagged_at=None,
@@ -858,6 +984,10 @@ class IngestReconciler:
             last_seen_at=last_seen_at or row.last_seen_at,
             source_batch_id=row.source_batch_id or None,
             turn_group_number=row.turn_group_number,
+            # The upsert overwrites omitted fields with defaults, so every
+            # full-row rewrite must re-supply both channel columns.
+            origin_channel_id=row.origin_channel_id,
+            origin_channel_label=row.origin_channel_label,
         )
         resolved_turn_number = turn_number
         if turn_number < 0 and row.canonical_turn_id:
@@ -1080,6 +1210,8 @@ class IngestReconciler:
                     last_seen_at=row.last_seen_at,
                     source_batch_id=row.source_batch_id or None,
                     turn_group_number=row.turn_group_number,
+                    origin_channel_id=row.origin_channel_id,
+                    origin_channel_label=row.origin_channel_label,
                 )
             # Per-row path already updated ``existing`` in place; only the
             # ``rows_touched`` mirrors remain.

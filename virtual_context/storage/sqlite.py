@@ -135,6 +135,8 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
     tags_json TEXT NOT NULL DEFAULT '[]',
     session_date TEXT NOT NULL DEFAULT '',
     sender TEXT NOT NULL DEFAULT '',
+    origin_channel_id TEXT NOT NULL DEFAULT '',
+    origin_channel_label TEXT NOT NULL DEFAULT '',
     fact_signals_json TEXT NOT NULL DEFAULT '[]',
     code_refs_json TEXT NOT NULL DEFAULT '[]',
     tagged_at TEXT,
@@ -629,6 +631,11 @@ def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
         else 1,
         created_at=row["created_at"] or "",
         updated_at=row["updated_at"] or "",
+        origin_channel_id=(row["origin_channel_id"] if "origin_channel_id" in row.keys() else "") or "",
+        origin_channel_label=(row["origin_channel_label"] if "origin_channel_label" in row.keys() else "") or "",
+        origin_conversation_id=(
+            row["origin_conversation_id"] if "origin_conversation_id" in row.keys() else ""
+        ) or "",
     )
 
 
@@ -1769,6 +1776,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
             by_name = {row["name"]: row for row in pragma_rows}
+        # Channel provenance columns must exist BEFORE the lifecycle rebuild
+        # below: that rebuild copies an explicit column list out of the old
+        # table, so a legacy DB missing these columns would fail the SELECT,
+        # and a rebuild that omitted them would silently discard them.
+        for channel_column in ("origin_channel_id", "origin_channel_label"):
+            if channel_column not in by_name:
+                self._add_column_if_missing(
+                    conn,
+                    "canonical_turns",
+                    channel_column,
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
+                by_name = {row["name"]: row for row in pragma_rows}
         lifecycle_columns = ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at")
         needs_rebuild = any(
             name in by_name and int(by_name[name]["notnull"] or 0) == 1
@@ -1796,6 +1817,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     session_date TEXT NOT NULL DEFAULT '',
                     sender TEXT NOT NULL DEFAULT '',
+                    origin_channel_id TEXT NOT NULL DEFAULT '',
+                    origin_channel_label TEXT NOT NULL DEFAULT '',
                     fact_signals_json TEXT NOT NULL DEFAULT '[]',
                     code_refs_json TEXT NOT NULL DEFAULT '[]',
                     tagged_at TEXT,
@@ -1825,6 +1848,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     tags_json,
                     session_date,
                     sender,
+                    COALESCE(origin_channel_id, ''),
+                    COALESCE(origin_channel_label, ''),
                     fact_signals_json,
                     code_refs_json,
                     NULLIF(tagged_at, ''),
@@ -1961,7 +1986,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
                       normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                       user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
-                      sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
+                      sender, origin_channel_id, origin_channel_label, origin_conversation_id,
+                      fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
                       last_seen_at, source_batch_id, created_at, updated_at,
                       covered_ingestible_entries
                FROM canonical_turns_ordinal
@@ -6244,6 +6270,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
         turn_group_number: int = -1,
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
@@ -6302,9 +6330,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
              normalized_user_text, normalized_assistant_text, user_content, assistant_content,
              user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
+             origin_channel_id, origin_channel_label,
              fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
              source_batch_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_turn_id) DO UPDATE SET
                 turn_group_number=excluded.turn_group_number,
                 sort_key=excluded.sort_key,
@@ -6320,6 +6349,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 tags_json=excluded.tags_json,
                 session_date=excluded.session_date,
                 sender=excluded.sender,
+                origin_channel_id=excluded.origin_channel_id,
+                origin_channel_label=excluded.origin_channel_label,
                 fact_signals_json=excluded.fact_signals_json,
                 code_refs_json=excluded.code_refs_json,
                 tagged_at=excluded.tagged_at,
@@ -6344,6 +6375,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 json.dumps(list(tags or [])),
                 session_date or "",
                 sender or "",
+                origin_channel_id or "",
+                origin_channel_label or "",
                 json.dumps(fact_signal_payload),
                 json.dumps(list(code_refs or [])),
                 tagged_at,
@@ -6451,6 +6484,77 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         expected_lifecycle_epoch,
                     ),
                 )
+            updated += int(cursor.rowcount or 0)
+        conn.commit()
+        return updated
+
+    def update_canonical_turn_channels_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set the two channel columns independently.
+
+        Each column is written only when its candidate is non-empty and the
+        stored column is empty, so an origin-derived id can later gain a
+        raw-derived label without either overwriting the other. The row is
+        touched only when at least one column actually fills, which keeps a
+        re-run a no-op. The epoch predicate lives inside the same UPDATE so
+        the guard and the write cannot race a concurrent epoch bump.
+        """
+        normalized: dict[str, tuple[str, str]] = {}
+        for ct_id, pair in (updates or {}).items():
+            if not ct_id or not pair:
+                continue
+            candidate_id = (pair[0] or "").strip()
+            candidate_label = (pair[1] or "").strip()
+            if candidate_id or candidate_label:
+                normalized[ct_id] = (candidate_id, candidate_label)
+        if not normalized:
+            return 0
+        conn = self._get_conn()
+        updated = 0
+        now = utcnow_iso()
+        epoch_clause = ""
+        if expected_lifecycle_epoch is not None:
+            epoch_clause = """
+                          AND EXISTS (
+                              SELECT 1
+                                FROM conversations c
+                               WHERE c.conversation_id = canonical_turns.conversation_id
+                                 AND c.lifecycle_epoch = ?
+                          )"""
+        for canonical_turn_id, (candidate_id, candidate_label) in normalized.items():
+            params: list[object] = [
+                candidate_id, candidate_id,
+                candidate_label, candidate_label,
+                now,
+                conversation_id,
+                canonical_turn_id,
+                candidate_id,
+                candidate_label,
+            ]
+            if expected_lifecycle_epoch is not None:
+                params.append(expected_lifecycle_epoch)
+            cursor = conn.execute(
+                f"""UPDATE canonical_turns
+                       SET origin_channel_id = CASE
+                               WHEN ? <> '' AND COALESCE(TRIM(origin_channel_id), '') = ''
+                               THEN ? ELSE origin_channel_id END,
+                           origin_channel_label = CASE
+                               WHEN ? <> '' AND COALESCE(TRIM(origin_channel_label), '') = ''
+                               THEN ? ELSE origin_channel_label END,
+                           updated_at = ?
+                     WHERE conversation_id = ?
+                       AND canonical_turn_id = ?
+                       AND (
+                             (? <> '' AND COALESCE(TRIM(origin_channel_id), '') = '')
+                          OR (? <> '' AND COALESCE(TRIM(origin_channel_label), '') = '')
+                       ){epoch_clause}""",
+                params,
+            )
             updated += int(cursor.rowcount or 0)
         conn.commit()
         return updated
@@ -6600,6 +6704,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                       user_content, assistant_content,
                       user_raw_content, assistant_raw_content,
                       primary_tag, tags_json, session_date, sender,
+                      origin_channel_id, origin_channel_label,
                       fact_signals_json, code_refs_json,
                       tagged_at, compacted_at,
                       first_seen_at, last_seen_at,
@@ -6684,6 +6789,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ct.user_content, ct.assistant_content,
                    ct.user_raw_content, ct.assistant_raw_content,
                    ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                   ct.origin_channel_id, ct.origin_channel_label,
                    ct.fact_signals_json, ct.code_refs_json,
                    ct.covered_ingestible_entries,
                    ct.tagged_at, ct.compacted_at,

@@ -276,6 +276,8 @@ class CompositeStore:
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
         turn_group_number: int = -1,
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
     ) -> None:
         return self._segments.save_canonical_turn(
             conversation_id,
@@ -304,6 +306,8 @@ class CompositeStore:
             last_seen_at=last_seen_at,
             source_batch_id=source_batch_id,
             turn_group_number=turn_group_number,
+            origin_channel_id=origin_channel_id,
+            origin_channel_label=origin_channel_label,
         )
 
     def recompute_canonical_turn_groups(
@@ -885,6 +889,22 @@ class CompositeStore:
         expected_lifecycle_epoch: int | None = None,
     ) -> int:
         fn = getattr(self._segments, "update_canonical_turn_senders_if_empty", None)
+        if callable(fn):
+            return int(fn(
+                conversation_id,
+                updates,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return 0
+
+    def update_canonical_turn_channels_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        fn = getattr(self._segments, "update_canonical_turn_channels_if_empty", None)
         if callable(fn):
             return int(fn(
                 conversation_id,
