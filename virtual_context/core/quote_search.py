@@ -598,7 +598,12 @@ def _question_is_first_person(*texts: str) -> bool:
     return False
 
 
-def _excerpt_starts_with_user_statement(text: str) -> bool:
+def _excerpt_starts_with_user_statement(
+    text: str,
+    matched_side: str = "",
+) -> bool:
+    if matched_side in {"user", "both"}:
+        return True
     stripped = (text or "").lstrip()
     return stripped.startswith("User:")
 
@@ -806,7 +811,10 @@ def _rerank_quote_results(
                 "matched_bigrams": matched_bigrams,
                 "matched_trigrams": matched_trigrams,
                 "term_span": _matched_term_span(qr.text or "", matched_terms),
-                "starts_with_user": 1 if _excerpt_starts_with_user_statement(qr.text or "") else 0,
+                "starts_with_user": 1 if _excerpt_starts_with_user_statement(
+                    qr.text or "",
+                    qr.matched_side,
+                ) else 0,
             })
 
         if not term_doc_counts and not bigram_doc_counts and not trigram_doc_counts:
@@ -1850,7 +1858,10 @@ def _build_exact_value_candidates(
         excerpt = row.get("excerpt", "") or ""
         versions = _extract_versions(excerpt)
         distinct_version_count = len(set(versions))
-        user_statement = _excerpt_starts_with_user_statement(excerpt)
+        user_statement = _excerpt_starts_with_user_statement(
+            excerpt,
+            str(row.get("matched_side", "") or ""),
+        )
         percentages = _extract_percentages(excerpt)
         quantities = _extract_quantity_mentions(excerpt, limit=6)
         if requested_units:
