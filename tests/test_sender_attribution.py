@@ -448,6 +448,55 @@ class TestFastSkipSenderUpgrade:
         assert updated == 1
         assert _rows(store)[0].sender == "BigTex"
 
+    def test_epoch_change_between_check_and_update_blocks_the_write(self, tmp_path: Path):
+        """The epoch predicate must be part of the sender UPDATE itself.
+
+        Simulate a delete/resurrect immediately before the canonical-row write.
+        A separate preflight SELECT would already have accepted epoch 1 and
+        would leak the sender into epoch 2; a correlated UPDATE predicate sees
+        the change and matches no row.
+        """
+        store = _store(tmp_path)
+        rec = _reconciler(store)
+        rec.ingest_batch(
+            conversation_id="c",
+            body={"messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]},
+            fmt=_anthropic_fmt(), expected_lifecycle_epoch=1,
+        )
+        ct_id = _rows(store)[0].canonical_turn_id
+        inner = store._get_conn()
+
+        class _EpochRaceConnection:
+            def __init__(self):
+                self.raced = False
+
+            def execute(self, sql, params=()):
+                if not self.raced and "UPDATE canonical_turns" in sql:
+                    self.raced = True
+                    inner.execute(
+                        "UPDATE conversations SET lifecycle_epoch = 2 "
+                        "WHERE conversation_id = ?",
+                        ("c",),
+                    )
+                return inner.execute(sql, params)
+
+            def commit(self):
+                return inner.commit()
+
+        racing_conn = _EpochRaceConnection()
+        store._get_conn = lambda: racing_conn
+
+        updated = store.update_canonical_turn_senders_if_empty(
+            "c", {ct_id: "BigTex"}, expected_lifecycle_epoch=1,
+        )
+
+        assert racing_conn.raced is True
+        assert updated == 0
+        assert _rows(store)[0].sender == ""
+
     def test_cas_is_idempotent_and_never_overwrites(self, tmp_path: Path):
         store = _store(tmp_path)
         rec = _reconciler(store)

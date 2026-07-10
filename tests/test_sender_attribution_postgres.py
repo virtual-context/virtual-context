@@ -151,6 +151,14 @@ class TestSearchCanonicalTurnTextSenderPg:
              assistant_content="neurological", sender="BigTex")
         assert store.search_canonical_turn_text("bigtex", conversation_id=conv) == []
 
+    @pytest.mark.parametrize("query", ["Big_ex", "Big%ex"])
+    def test_sender_match_treats_like_wildcards_literally(self, store, query):
+        conv = _conv()
+        store.upsert_conversation(tenant_id="t", conversation_id=conv)
+        _row(store, conv, ct_id=str(uuid.uuid4()), sort_key=1000.0,
+             user_content="hello", sender="BigTex")
+        assert store.search_canonical_turn_text(query, conversation_id=conv) == []
+
     def test_assistant_excerpt_is_never_sender_labeled(self, store):
         conv = _conv()
         store.upsert_conversation(tenant_id="t", conversation_id=conv)

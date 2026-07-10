@@ -2572,6 +2572,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[QuoteResult]:
         conn = self._get_conn()
         pattern = f"%{query}%"
+        sender_pattern = f"%{_escape_like(query)}%"
         # A member name can exist only in ``sender``: the envelope that
         # carried it is stripped before the row's text is normalized. Match
         # it too, but only on rows that have a user half to excerpt — an
@@ -2581,8 +2582,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                  FROM canonical_turns_ordinal
                  WHERE (user_content LIKE ?
                         OR assistant_content LIKE ?
-                        OR (sender LIKE ? AND TRIM(COALESCE(user_content, '')) <> ''))"""
-        params: list[object] = [pattern, pattern, pattern]
+                        OR (sender LIKE ? ESCAPE '\\'
+                            AND TRIM(COALESCE(user_content, '')) <> ''))"""
+        params: list[object] = [pattern, pattern, sender_pattern]
         if conversation_id is not None:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
@@ -6416,24 +6418,39 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if not updates:
             return 0
         conn = self._get_conn()
-        if expected_lifecycle_epoch is not None:
-            row = conn.execute(
-                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if row is None or int(row[0]) != int(expected_lifecycle_epoch):
-                return 0
         updated = 0
         now = utcnow_iso()
         for canonical_turn_id, sender in updates.items():
-            cursor = conn.execute(
-                """UPDATE canonical_turns
-                      SET sender = ?, updated_at = ?
-                    WHERE conversation_id = ?
-                      AND canonical_turn_id = ?
-                      AND COALESCE(TRIM(sender), '') = ''""",
-                (sender, now, conversation_id, canonical_turn_id),
-            )
+            if expected_lifecycle_epoch is None:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender), '') = ''""",
+                    (sender, now, conversation_id, canonical_turn_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender), '') = ''
+                          AND EXISTS (
+                              SELECT 1
+                                FROM conversations c
+                               WHERE c.conversation_id = canonical_turns.conversation_id
+                                 AND c.lifecycle_epoch = ?
+                          )""",
+                    (
+                        sender,
+                        now,
+                        conversation_id,
+                        canonical_turn_id,
+                        expected_lifecycle_epoch,
+                    ),
+                )
             updated += int(cursor.rowcount or 0)
         conn.commit()
         return updated

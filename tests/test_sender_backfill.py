@@ -42,13 +42,14 @@ def _sender_envelope(name: str, body: str) -> str:
 def _engine(tmp_path: Path, conv: str = "c", tenant: str = "t"):
     from virtual_context.config import VirtualContextConfig
     from virtual_context.engine import VirtualContextEngine
-    from virtual_context.types import StorageConfig, TagGeneratorConfig
+    from virtual_context.types import RetrieverConfig, StorageConfig, TagGeneratorConfig
 
     config = VirtualContextConfig(
         conversation_id=conv,
         tenant_id=tenant,
         storage=StorageConfig(backend="sqlite", sqlite_path=str(tmp_path / "vc.db")),
         tag_generator=TagGeneratorConfig(type="keyword"),
+        retriever=RetrieverConfig(inbound_tagger_type="llm"),
     )
     return VirtualContextEngine(config=config)
 

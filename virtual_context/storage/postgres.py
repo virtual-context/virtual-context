@@ -5372,6 +5372,7 @@ class PostgresStore(ContextStore):
     ) -> list[QuoteResult]:
         with self.pool.connection() as conn:
             pattern = f"%{query}%"
+            sender_pattern = f"%{_escape_like(query)}%"
             # A member name can exist only in ``sender``: the envelope that
             # carried it is stripped before the row's text is normalized.
             # Match it too, but only on rows that have a user half to
@@ -5382,8 +5383,9 @@ class PostgresStore(ContextStore):
                      FROM canonical_turns_ordinal
                      WHERE (user_content ILIKE %s
                             OR assistant_content ILIKE %s
-                            OR (sender ILIKE %s AND BTRIM(COALESCE(user_content, '')) <> ''))"""
-            params: list[object] = [pattern, pattern, pattern]
+                            OR (sender ILIKE %s ESCAPE '\\'
+                                AND BTRIM(COALESCE(user_content, '')) <> ''))"""
+            params: list[object] = [pattern, pattern, sender_pattern]
             if conversation_id is not None:
                 sql += " AND conversation_id = %s"
                 params.append(conversation_id)
@@ -6612,26 +6614,38 @@ class PostgresStore(ContextStore):
             return 0
         now = utcnow_iso()
         with self.pool.connection() as conn:
-            if expected_lifecycle_epoch is not None:
-                row = conn.execute(
-                    "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = %s",
-                    (conversation_id,),
-                ).fetchone()
-                if row is None:
-                    return 0
-                current = row["lifecycle_epoch"] if isinstance(row, dict) else row[0]
-                if int(current) != int(expected_lifecycle_epoch):
-                    return 0
             updated = 0
             for canonical_turn_id, sender in updates.items():
-                cursor = conn.execute(
-                    """UPDATE canonical_turns
-                          SET sender = %s, updated_at = %s
-                        WHERE conversation_id = %s
-                          AND canonical_turn_id = %s
-                          AND COALESCE(BTRIM(sender), '') = ''""",
-                    (sender, now, conversation_id, canonical_turn_id),
-                )
+                if expected_lifecycle_epoch is None:
+                    cursor = conn.execute(
+                        """UPDATE canonical_turns
+                              SET sender = %s, updated_at = %s
+                            WHERE conversation_id = %s
+                              AND canonical_turn_id = %s
+                              AND COALESCE(BTRIM(sender), '') = ''""",
+                        (sender, now, conversation_id, canonical_turn_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """UPDATE canonical_turns
+                              SET sender = %s, updated_at = %s
+                            WHERE conversation_id = %s
+                              AND canonical_turn_id = %s
+                              AND COALESCE(BTRIM(sender), '') = ''
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM conversations c
+                                   WHERE c.conversation_id = canonical_turns.conversation_id
+                                     AND c.lifecycle_epoch = %s
+                              )""",
+                        (
+                            sender,
+                            now,
+                            conversation_id,
+                            canonical_turn_id,
+                            expected_lifecycle_epoch,
+                        ),
+                    )
                 updated += int(cursor.rowcount or 0)
             return updated
 
