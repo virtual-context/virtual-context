@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 _SESSION_HEADER_RE = re.compile(r'\[Session from ([^\]]+)\]')
 
+# A caller-asserted stable conversation key whose trailing segment names the
+# source channel, e.g. ``sk:agent:bast:discord:channel:1524974537458974851``.
+# Anchored end-to-end: a partial match inside a longer id is not provenance.
+_STABLE_CHANNEL_KEY_RE = re.compile(
+    r'^(?:sk:)?agent:[^:]+:[^:]+:(?:channel|group):([^:]+)$'
+)
+
 
 # Patterns for stub content detection (media attachments, image placeholders, etc.)
 _STUB_PATTERNS = [
@@ -2884,22 +2891,20 @@ class VirtualContextEngine:
         return report
 
     @staticmethod
-    def _sender_from_raw_content(raw_content: str | None) -> str:
-        """Recover a sender name from a canonical row's stored raw content.
+    def _raw_content_text_candidates(raw_content: str | None) -> list[str]:
+        """Text blocks to feed the envelope parser, in payload order.
 
         ``_extract_envelope_metadata`` parses only leading labeled JSON blocks
         of a *text* payload, so a JSON-serialized list must be decoded first
         and its text blocks fed in individually — running the parser on the
-        serialized list itself would never match. Blocks are inspected last
-        first, mirroring the ``_last_text_block`` rule the ingest path uses to
-        pick the message's real text. Returns ``""`` when nothing is
-        derivable, including for unparsable payloads.
+        serialized list itself would never match. A valid list contributes its
+        string elements and its dict ``text`` strings; a valid object may
+        contribute its own ``text`` string; a plain string (or malformed JSON
+        that is really just text) is parsed directly. A valid list/object with
+        no supported candidate contributes nothing.
         """
-        from .proxy._envelope import _extract_envelope_metadata
-        from .types import get_sender_name
-
         if not raw_content or not isinstance(raw_content, str):
-            return ""
+            return []
 
         candidates: list[str] = []
         stripped = raw_content.strip()
@@ -2922,11 +2927,21 @@ class VirtualContextEngine:
             if isinstance(text, str):
                 candidates.append(text)
         else:
-            # Plain string raw payload (or malformed JSON that is really just
-            # text): the envelope parser handles it directly.
             candidates.append(raw_content)
+        return candidates
 
-        for text in reversed(candidates):
+    @classmethod
+    def _sender_from_raw_content(cls, raw_content: str | None) -> str:
+        """Recover a sender name from a canonical row's stored raw content.
+
+        Blocks are inspected last first, mirroring the ``_last_text_block``
+        rule the ingest path uses to pick the message's real text. Returns
+        ``""`` when nothing is derivable, including for unparsable payloads.
+        """
+        from .proxy._envelope import _extract_envelope_metadata
+        from .types import get_sender_name
+
+        for text in reversed(cls._raw_content_text_candidates(raw_content)):
             try:
                 _clean, metadata = _extract_envelope_metadata(text)
             except Exception:
@@ -2935,6 +2950,47 @@ class VirtualContextEngine:
             if name:
                 return str(name).strip()
         return ""
+
+    @classmethod
+    def _channel_from_raw_content(cls, raw_content: str | None) -> tuple[str, str]:
+        """Recover ``(channel_id, channel_label)`` from stored raw content.
+
+        Same decoding and last-candidate-first scan as the sender recovery,
+        but the two fields fill independently: a later block may supply the id
+        while an earlier one supplies the label. Scanning stops once both are
+        found. Returns empty strings for anything not derivable.
+        """
+        from .proxy._envelope import _extract_envelope_metadata
+        from .types import get_origin_channel
+
+        channel_id = ""
+        channel_label = ""
+        for text in reversed(cls._raw_content_text_candidates(raw_content)):
+            try:
+                _clean, metadata = _extract_envelope_metadata(text)
+            except Exception:
+                continue
+            candidate_id, candidate_label = get_origin_channel(metadata)
+            channel_id = channel_id or candidate_id
+            channel_label = channel_label or candidate_label
+            if channel_id and channel_label:
+                break
+        return channel_id, channel_label
+
+    @staticmethod
+    def _channel_id_from_provenance_key(key: str) -> str:
+        """Recover a channel id from a caller-asserted stable conversation key.
+
+        Only an entire key of the shape
+        ``[sk:]agent:<agent>:<platform>:(channel|group):<id>`` is parseable.
+        A UUID/hash conversation id carries no recoverable channel, and a
+        ``direct``/``dm`` key names a one-to-one conversation, not a channel;
+        both yield ``""`` rather than a guess.
+        """
+        if not key or not isinstance(key, str):
+            return ""
+        match = _STABLE_CHANNEL_KEY_RE.match(key.strip())
+        return match.group(1) if match else ""
 
     def backfill_senders(
         self,
@@ -3022,6 +3078,138 @@ class VirtualContextEngine:
             conversation_id[:12], report["eligible"], report["updated"],
             report["skipped_existing"], report["skipped_no_raw"],
             report["skipped_no_sender"], report["failed"], dry_run,
+        )
+        return report
+
+    def backfill_channels(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Recover the canonical_turns channel columns for pre-existing rows.
+
+        Iterates PHYSICAL canonical rows (never the merged logical view, which
+        would smear one half's provenance onto its sibling). A row is eligible
+        when at least one of its two channel columns is empty. Two sources
+        combine without ever replacing a non-empty stored or already-derived
+        field:
+
+        1. Side-specific raw content — ``user_raw_content`` when the row has
+           user content, ``assistant_raw_content`` when it has assistant
+           content, user first on a legacy combined row. Raw content is
+           retained only when the provider content was a list, so
+           string-content historical rows contribute nothing.
+        2. A stable-key fallback for any still-empty id, parsed from
+           ``origin_conversation_id`` when set (a moved row) or otherwise from
+           the row's own ``conversation_id`` (a target-native row). A non-empty
+           but unparseable origin never falls through to the current id: that
+           would misattribute a moved row to its merge target.
+
+        Writes go through ``update_canonical_turn_channels_if_empty``, a
+        per-column compare-and-set — never a full-row rewrite from a
+        possibly-stale payload — so a re-run is a no-op.
+
+        Returns ``{eligible, updated, skipped_existing, skipped_no_derivation,
+        derived_from_raw, derived_from_origin, failed, dry_run}``.
+        """
+        if not conversation_id:
+            raise ValueError("backfill_channels requires a non-empty conversation_id")
+
+        report = {
+            "eligible": 0,
+            "updated": 0,
+            "skipped_existing": 0,
+            "skipped_no_derivation": 0,
+            "derived_from_raw": 0,
+            "derived_from_origin": 0,
+            "failed": 0,
+            "dry_run": bool(dry_run),
+        }
+
+        rows = self._store.get_all_canonical_turns(conversation_id)
+        upgrades: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            if limit is not None and len(upgrades) >= limit:
+                break
+            stored_id = (row.origin_channel_id or "").strip()
+            stored_label = (row.origin_channel_label or "").strip()
+            if stored_id and stored_label:
+                report["skipped_existing"] += 1
+                continue
+            report["eligible"] += 1
+
+            candidate_id = ""
+            candidate_label = ""
+
+            # (1) Side-specific raw content, user first on a combined row.
+            raw_sources: list[str | None] = []
+            if (row.user_content or "").strip():
+                raw_sources.append(row.user_raw_content)
+            if (row.assistant_content or "").strip():
+                raw_sources.append(row.assistant_raw_content)
+            try:
+                for raw in raw_sources:
+                    if candidate_id and candidate_label:
+                        break
+                    raw_id, raw_label = self._channel_from_raw_content(raw)
+                    candidate_id = candidate_id or raw_id
+                    candidate_label = candidate_label or raw_label
+            except Exception:
+                report["failed"] += 1
+                continue
+            if candidate_id or candidate_label:
+                report["derived_from_raw"] += 1
+
+            # (2) Stable-key fallback, id only, only when still empty.
+            if not stored_id and not candidate_id:
+                origin = (row.origin_conversation_id or "").strip()
+                # A moved row's provenance is its stored origin. Only a
+                # target-native row (empty origin) may use its current id.
+                provenance_key = origin or conversation_id
+                origin_id = self._channel_id_from_provenance_key(provenance_key)
+                if origin_id:
+                    candidate_id = origin_id
+                    report["derived_from_origin"] += 1
+
+            fills_id = bool(candidate_id) and not stored_id
+            fills_label = bool(candidate_label) and not stored_label
+            if not (fills_id or fills_label):
+                report["skipped_no_derivation"] += 1
+                continue
+            if row.canonical_turn_id:
+                upgrades[row.canonical_turn_id] = (
+                    candidate_id if fills_id else "",
+                    candidate_label if fills_label else "",
+                )
+
+        if dry_run:
+            report["updated"] = len(upgrades)
+            return report
+
+        if upgrades:
+            epoch = None
+            try:
+                epoch = self._store.get_lifecycle_epoch(conversation_id)
+            except Exception:
+                epoch = None
+            report["updated"] = int(
+                self._store.update_canonical_turn_channels_if_empty(
+                    conversation_id,
+                    upgrades,
+                    expected_lifecycle_epoch=epoch,
+                )
+            )
+
+        logger.info(
+            "backfill_channels: done conv=%s eligible=%d updated=%d "
+            "skipped_existing=%d skipped_no_derivation=%d derived_from_raw=%d "
+            "derived_from_origin=%d failed=%d dry_run=%s",
+            conversation_id[:12], report["eligible"], report["updated"],
+            report["skipped_existing"], report["skipped_no_derivation"],
+            report["derived_from_raw"], report["derived_from_origin"],
+            report["failed"], dry_run,
         )
         return report
 
