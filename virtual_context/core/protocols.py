@@ -242,6 +242,19 @@ class FactStore(Protocol):
         self,
         conversation_id: str,
     ) -> dict[str, tuple[str, str]]: ...
+    def update_canonical_turn_senders_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
+    def list_canonical_conversation_ids(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]: ...
     def replace_facts_for_segment(
         self,
         conversation_id: str,

@@ -880,6 +880,33 @@ class CompositeStore:
         # returning 0 here would be read as "nothing needed shifting".
         raise NotImplementedError
 
+    def update_canonical_turn_senders_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        fn = getattr(self._segments, "update_canonical_turn_senders_if_empty", None)
+        if callable(fn):
+            return int(fn(
+                conversation_id,
+                updates,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return 0
+
+    def list_canonical_conversation_ids(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        fn = getattr(self._segments, "list_canonical_conversation_ids", None)
+        if callable(fn):
+            return list(fn(tenant_id=tenant_id, limit=limit))
+        return []
+
     # ------------------------------------------------------------------
     # Conversation row lifecycle (progress-bar redesign)
     # ------------------------------------------------------------------

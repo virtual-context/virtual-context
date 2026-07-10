@@ -337,7 +337,10 @@ class TaggingPipeline:
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                sender=entry.sender,
+                # Storage upserts overwrite ``sender`` unconditionally, so a
+                # direct rewrite must merge one-way: prefer the freshly derived
+                # value, else keep whatever the row already carries.
+                sender=entry.sender or user_row.sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
                 canonical_turn_id=user_row.canonical_turn_id,
@@ -365,7 +368,9 @@ class TaggingPipeline:
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                sender=entry.sender,
+                # An assistant-only row is never newly labeled with the human
+                # speaker; an existing legacy value is preserved as-is.
+                sender=assistant_row.sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
                 canonical_turn_id=assistant_row.canonical_turn_id,
@@ -458,7 +463,10 @@ class TaggingPipeline:
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                sender=entry.sender,
+                # Legacy combined row carries the whole logical turn, so the
+                # logical-turn sender applies; merge one-way against the stored
+                # value because the upsert would otherwise blank it.
+                sender=entry.sender or row.sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
                 canonical_turn_id=row.canonical_turn_id,
@@ -519,6 +527,10 @@ class TaggingPipeline:
             else:
                 user_raw_content = None
                 assistant_raw_content = json.dumps(message.raw_content) if message.raw_content else None
+            # Role-aware sender merge: only a user row may take the freshly
+            # derived speaker name. An assistant row keeps whatever it stored
+            # (possibly a legacy logical-turn value) and gains nothing new.
+            row_sender = (entry.sender or row.sender) if role == "user" else row.sender
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -529,7 +541,7 @@ class TaggingPipeline:
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                sender=entry.sender,
+                sender=row_sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
                 canonical_turn_id=row.canonical_turn_id,

@@ -20,7 +20,13 @@ from ..core.canonical_turns import (
 )
 from ..core.semantic_search import SemanticSearchManager
 from ..core.store import ContextStore
-from ..types import FactSignal, CanonicalTurnRow, IngestBatchRecord, TurnTagEntry
+from ..types import (
+    FactSignal,
+    CanonicalTurnRow,
+    IngestBatchRecord,
+    TurnTagEntry,
+    get_sender_name,
+)
 
 
 @dataclass
@@ -206,6 +212,15 @@ class IngestReconciler:
                 role=message.role,
                 content=message.content,
                 raw_content=message.raw_content,
+                # Sender is speaker attribution, so only a user entry may
+                # carry it. ``extract_ingestible_messages`` has already parsed
+                # the leading labeled-JSON envelope into ``Message.metadata``;
+                # the name exists nowhere else once the envelope is stripped.
+                sender=(
+                    (get_sender_name(message.metadata) or "")
+                    if message.role == "user"
+                    else ""
+                ),
             )
             for message in entries
         ]
@@ -247,6 +262,7 @@ class IngestReconciler:
                 raw_turn_count=raw_turn_count,
                 existing=existing,
                 allow_short_overlap=allow_short_overlap,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
             )
             # Commit-time check: a resurrect could have raced DURING our writes
             # (the Python-level merge lock doesn't serialize against external
@@ -279,6 +295,7 @@ class IngestReconciler:
         raw_turn_count: int,
         existing: list[CanonicalTurnRow],
         allow_short_overlap: bool = True,
+        expected_lifecycle_epoch: int | None = None,
     ) -> CanonicalIngestResult:
         if not prepared_turns:
             logger.info(
@@ -442,6 +459,15 @@ class IngestReconciler:
             #
             # Prefix / suffix writes below are genuinely new rows and must
             # still happen.
+            #
+            # One enrichment field cannot wait for the tagger: ``sender``.
+            # An already-tagged overlap row takes the tagger's hydration fast
+            # path, which never rewrites the canonical row, so a sender that
+            # only became derivable on this payload would never become
+            # durable. Collect those rows and issue one narrow,
+            # epoch-guarded compare-and-set batch instead of dropping back to
+            # ``_write_turn`` for every overlap row.
+            sender_upgrades: dict[str, str] = {}
             for offset, row in enumerate(overlap_incoming):
                 existing_row = overlap_existing[offset]
                 row.canonical_turn_id = existing_row.canonical_turn_id
@@ -449,9 +475,26 @@ class IngestReconciler:
                 row.source_batch_id = existing_row.source_batch_id
                 row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
                 row.last_seen_at = existing_row.last_seen_at or row.last_seen_at
+                incoming_sender = (row.sender or "").strip()
+                if (
+                    incoming_sender
+                    and not (existing_row.sender or "").strip()
+                    and (row.user_content or "").strip()
+                    and existing_row.canonical_turn_id
+                ):
+                    # I5: never attribute a human speaker to an assistant-only
+                    # row, even when a legacy sibling row carries one.
+                    sender_upgrades[existing_row.canonical_turn_id] = incoming_sender
                 self._preserve_existing_enrichment(row, existing_row)
                 rows_touched.append(row)
                 turns_matched += 1
+
+            if sender_upgrades:
+                self._upgrade_empty_senders(
+                    conversation_id,
+                    sender_upgrades,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                )
 
             prefix = prepared_turns[:alignment.incoming_start]
             if prefix:
@@ -546,6 +589,38 @@ class IngestReconciler:
             rows=rows_touched,
         )
 
+    def _upgrade_empty_senders(
+        self,
+        conversation_id: str,
+        upgrades: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Make a newly-derived sender durable on fast-skipped overlap rows.
+
+        The store-level write is a compare-and-set on ``sender = ''`` keyed by
+        ``canonical_turn_id``, so it can never overwrite a stored attribution
+        and a re-run is a no-op. A store without the surface (or a failure)
+        degrades to "sender not yet durable" rather than failing the ingest.
+        """
+        updater = getattr(self._store, "update_canonical_turn_senders_if_empty", None)
+        if not callable(updater):
+            return 0
+        try:
+            return int(updater(
+                conversation_id,
+                upgrades,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        except Exception:
+            logger.warning(
+                "CANONICAL_TURN_SENDER_UPGRADE_FAILED: conv=%s rows=%d",
+                conversation_id[:12],
+                len(upgrades),
+                exc_info=True,
+            )
+            return 0
+
     @staticmethod
     def _preserve_existing_enrichment(
         row: CanonicalTurnRow, existing_row: CanonicalTurnRow,
@@ -570,6 +645,11 @@ class IngestReconciler:
         # Inheriting the existing group closes that race.
         if row.turn_group_number < 0 and existing_row.turn_group_number >= 0:
             row.turn_group_number = existing_row.turn_group_number
+        # Sender follows the same one-way rule: a resend whose payload no
+        # longer carries the sender envelope must never blank an attribution
+        # that a previous ingest (or the tagger) already derived.
+        if not (row.sender or "").strip() and (existing_row.sender or "").strip():
+            row.sender = existing_row.sender
 
     def _prepare_message_row(
         self,
