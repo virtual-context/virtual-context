@@ -144,6 +144,8 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
     tags_json TEXT NOT NULL DEFAULT '[]',
     session_date TEXT NOT NULL DEFAULT '',
     sender TEXT NOT NULL DEFAULT '',
+    origin_channel_id TEXT NOT NULL DEFAULT '',
+    origin_channel_label TEXT NOT NULL DEFAULT '',
     fact_signals_json TEXT NOT NULL DEFAULT '[]',
     code_refs_json TEXT NOT NULL DEFAULT '[]',
     tagged_at TEXT,
@@ -768,6 +770,9 @@ def _row_to_canonical_turn(row: dict) -> CanonicalTurnRow:
         covered_ingestible_entries=int(row.get("covered_ingestible_entries", 1) or 1),
         created_at=row.get("created_at", "") or "",
         updated_at=row.get("updated_at", "") or "",
+        origin_channel_id=row.get("origin_channel_id", "") or "",
+        origin_channel_label=row.get("origin_channel_label", "") or "",
+        origin_conversation_id=row.get("origin_conversation_id", "") or "",
     )
 
 
@@ -1680,6 +1685,17 @@ class PostgresStore(ContextStore):
 
     def _ensure_canonical_turn_schema(self) -> None:
         with self.pool.connection() as conn:
+            # Additive channel-provenance columns. Runs before
+            # ``_ensure_canonical_turn_views``, which drops and recreates the
+            # ``ct.*`` view so the new columns are picked up.
+            for channel_column in ("origin_channel_id", "origin_channel_label"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE canonical_turns "
+                        f"ADD COLUMN IF NOT EXISTS {channel_column} TEXT NOT NULL DEFAULT ''"
+                    )
+                except Exception:
+                    pass
             for column in ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at"):
                 try:
                     conn.execute(
@@ -1925,7 +1941,8 @@ class PostgresStore(ContextStore):
                 """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
                           normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                           user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
-                          sender, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
+                          sender, origin_channel_id, origin_channel_label, origin_conversation_id,
+                          fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
                           last_seen_at, source_batch_id, created_at, updated_at,
                           covered_ingestible_entries
                    FROM canonical_turns_ordinal
@@ -6440,6 +6457,8 @@ class PostgresStore(ContextStore):
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
         turn_group_number: int = -1,
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
@@ -6498,9 +6517,10 @@ class PostgresStore(ContextStore):
                 (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
                  normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                  user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
+                 origin_channel_id, origin_channel_label,
                  fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
                  source_batch_id, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (canonical_turn_id) DO UPDATE SET
                     turn_group_number=EXCLUDED.turn_group_number,
                     sort_key=EXCLUDED.sort_key,
@@ -6516,6 +6536,8 @@ class PostgresStore(ContextStore):
                     tags_json=EXCLUDED.tags_json,
                     session_date=EXCLUDED.session_date,
                     sender=EXCLUDED.sender,
+                    origin_channel_id=EXCLUDED.origin_channel_id,
+                    origin_channel_label=EXCLUDED.origin_channel_label,
                     fact_signals_json=EXCLUDED.fact_signals_json,
                     code_refs_json=EXCLUDED.code_refs_json,
                     tagged_at=EXCLUDED.tagged_at,
@@ -6540,6 +6562,8 @@ class PostgresStore(ContextStore):
                     json.dumps(list(tags or [])),
                     session_date or "",
                     sender or "",
+                    origin_channel_id or "",
+                    origin_channel_label or "",
                     json.dumps(fact_signal_payload),
                     json.dumps(list(code_refs or [])),
                     tagged_at,
@@ -6646,6 +6670,76 @@ class PostgresStore(ContextStore):
                             expected_lifecycle_epoch,
                         ),
                     )
+                updated += int(cursor.rowcount or 0)
+            return updated
+
+    def update_canonical_turn_channels_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set the two channel columns independently.
+
+        Each column is written only when its candidate is non-empty and the
+        stored column is empty, so an origin-derived id can later gain a
+        raw-derived label without either overwriting the other. The row is
+        touched only when at least one column actually fills, which keeps a
+        re-run a no-op. The epoch predicate lives inside the same UPDATE so
+        the guard and the write cannot race a concurrent epoch bump.
+        """
+        normalized: dict[str, tuple[str, str]] = {}
+        for ct_id, pair in (updates or {}).items():
+            if not ct_id or not pair:
+                continue
+            candidate_id = (pair[0] or "").strip()
+            candidate_label = (pair[1] or "").strip()
+            if candidate_id or candidate_label:
+                normalized[ct_id] = (candidate_id, candidate_label)
+        if not normalized:
+            return 0
+        now = utcnow_iso()
+        epoch_clause = ""
+        if expected_lifecycle_epoch is not None:
+            epoch_clause = """
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM conversations c
+                                   WHERE c.conversation_id = canonical_turns.conversation_id
+                                     AND c.lifecycle_epoch = %s
+                              )"""
+        with self.pool.connection() as conn:
+            updated = 0
+            for canonical_turn_id, (candidate_id, candidate_label) in normalized.items():
+                params: list[object] = [
+                    candidate_id, candidate_id,
+                    candidate_label, candidate_label,
+                    now,
+                    conversation_id,
+                    canonical_turn_id,
+                    candidate_id,
+                    candidate_label,
+                ]
+                if expected_lifecycle_epoch is not None:
+                    params.append(expected_lifecycle_epoch)
+                cursor = conn.execute(
+                    f"""UPDATE canonical_turns
+                           SET origin_channel_id = CASE
+                                   WHEN %s <> '' AND COALESCE(BTRIM(origin_channel_id), '') = ''
+                                   THEN %s ELSE origin_channel_id END,
+                               origin_channel_label = CASE
+                                   WHEN %s <> '' AND COALESCE(BTRIM(origin_channel_label), '') = ''
+                                   THEN %s ELSE origin_channel_label END,
+                               updated_at = %s
+                         WHERE conversation_id = %s
+                           AND canonical_turn_id = %s
+                           AND (
+                                 (%s <> '' AND COALESCE(BTRIM(origin_channel_id), '') = '')
+                              OR (%s <> '' AND COALESCE(BTRIM(origin_channel_label), '') = '')
+                           ){epoch_clause}""",
+                    params,
+                )
                 updated += int(cursor.rowcount or 0)
             return updated
 
@@ -6795,6 +6889,7 @@ class PostgresStore(ContextStore):
                           user_content, assistant_content,
                           user_raw_content, assistant_raw_content,
                           primary_tag, tags_json, session_date, sender,
+                          origin_channel_id, origin_channel_label,
                           fact_signals_json, code_refs_json,
                           tagged_at, compacted_at,
                           first_seen_at, last_seen_at,
@@ -6879,6 +6974,7 @@ class PostgresStore(ContextStore):
                        ct.user_content, ct.assistant_content,
                        ct.user_raw_content, ct.assistant_raw_content,
                        ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                       ct.origin_channel_id, ct.origin_channel_label,
                        ct.fact_signals_json, ct.code_refs_json,
                        ct.covered_ingestible_entries,
                        ct.tagged_at, ct.compacted_at,

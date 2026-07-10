@@ -2088,6 +2088,13 @@ class VirtualContextEngine:
         # instead of trusting the upstream invariant. ``list(None)`` raises
         # ``TypeError`` and would crash the persist path silently under the
         # broad exception handler below.
+        # Per-entry derivation: each half's channel comes from its own
+        # metadata. An assistant message with no envelope of its own stays
+        # empty rather than inheriting the user's channel.
+        from .types import get_origin_channel
+
+        user_channel_id, user_channel_label = get_origin_channel(user_msg.metadata)
+        asst_channel_id, asst_channel_label = get_origin_channel(assistant_msg.metadata)
         try:
             result = IngestReconciler(
                 self._store,
@@ -2102,8 +2109,13 @@ class VirtualContextEngine:
                 tags=list(entry.tags or []) if entry else [],
                 session_date=entry.session_date if entry else "",
                 sender=entry.sender if entry else "",
+                user_origin_channel_id=user_channel_id,
+                user_origin_channel_label=user_channel_label,
+                assistant_origin_channel_id=asst_channel_id,
+                assistant_origin_channel_label=asst_channel_label,
                 fact_signals=list(entry.fact_signals or []) if entry else [],
                 code_refs=list(entry.code_refs or []) if entry else [],
+                expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
             )
             if entry is not None and result.rows:
                 entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id

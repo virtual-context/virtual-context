@@ -110,7 +110,29 @@ class SegmentStore(Protocol):
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
         turn_group_number: int = -1,
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
     ) -> None: ...
+    def update_canonical_turn_senders_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
+    def update_canonical_turn_channels_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
+    def list_canonical_conversation_ids(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]: ...
     def recompute_canonical_turn_groups(
         self,
         conversation_id: str,
@@ -242,19 +264,6 @@ class FactStore(Protocol):
         self,
         conversation_id: str,
     ) -> dict[str, tuple[str, str]]: ...
-    def update_canonical_turn_senders_if_empty(
-        self,
-        conversation_id: str,
-        updates: dict[str, str],
-        *,
-        expected_lifecycle_epoch: int | None = None,
-    ) -> int: ...
-    def list_canonical_conversation_ids(
-        self,
-        *,
-        tenant_id: str | None = None,
-        limit: int | None = None,
-    ) -> list[str]: ...
     def replace_facts_for_segment(
         self,
         conversation_id: str,
@@ -340,6 +349,7 @@ class SearchStore(Protocol):
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
+        channel: str = "",
     ) -> list[QuoteResult]: ...
     def store_chunk_embeddings(
         self,

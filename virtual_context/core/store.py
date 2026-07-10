@@ -264,8 +264,13 @@ class ContextStore(ABC):
         query: str,
         limit: int = 5,
         conversation_id: str | None = None,
+        channel: str = "",
     ) -> list[QuoteResult]:
-        """Search canonical turn text across stored conversation turns."""
+        """Search canonical turn text across stored conversation turns.
+
+        A non-empty ``channel`` filters candidates to rows whose stored
+        channel provenance matches, before the query's ``LIMIT``.
+        """
         return []
 
     def has_any_alias(self, conversation_id: str) -> bool:
@@ -414,6 +419,8 @@ class ContextStore(ABC):
         last_seen_at: str | None = None,
         source_batch_id: str | None = None,
         turn_group_number: int = -1,
+        origin_channel_id: str = "",
+        origin_channel_label: str = "",
     ) -> None:
         """Upsert a canonical turn, using ``turn_number`` only as an ordinal hint."""
 
@@ -593,6 +600,32 @@ class ContextStore(ABC):
         guarded on the conversation's current epoch so a CAS issued against a
         conversation that was deleted and resurrected mid-flight cannot leak
         into the new lifecycle.
+
+        Returns the number of rows updated. Backends without canonical-row
+        storage keep the no-op default.
+        """
+        return 0
+
+    def update_canonical_turn_channels_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set the two channel columns, each independently.
+
+        ``updates`` maps ``canonical_turn_id`` to a ``(candidate_id,
+        candidate_label)`` pair. A column is written only when its candidate
+        is non-empty AND the stored column is empty, so neither non-empty
+        stored value is ever overwritten and a re-run is a no-op. The pair is
+        not atomic: an origin-derived id may land now and a raw-derived label
+        later. A row is touched only when at least one column actually fills.
+
+        When ``expected_lifecycle_epoch`` is given the write is additionally
+        guarded on the conversation's current epoch, in the same statement, so
+        a CAS issued against a conversation that was deleted and resurrected
+        mid-flight cannot leak into the new lifecycle.
 
         Returns the number of rows updated. Backends without canonical-row
         storage keep the no-op default.

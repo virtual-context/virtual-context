@@ -266,6 +266,28 @@ class TaggingPipeline:
             return None
         return latest
 
+    @staticmethod
+    def _merge_row_channel(
+        message: "Message | None",
+        row: "CanonicalTurnRow | None",
+    ) -> tuple[str, str]:
+        """Channel pair to re-supply on a direct canonical-row rewrite.
+
+        The two columns merge independently: a freshly derived value wins on
+        an empty stored column, an empty derivation keeps the stored one. When
+        no message metadata is available the stored values pass through
+        unchanged. Never copies a paired message's channel onto the other
+        role's row — the caller passes each physical message with its own row.
+        """
+        from ..types import get_origin_channel
+
+        stored_id = (getattr(row, "origin_channel_id", "") or "") if row else ""
+        stored_label = (getattr(row, "origin_channel_label", "") or "") if row else ""
+        derived_id, derived_label = ("", "")
+        if message is not None and getattr(message, "metadata", None):
+            derived_id, derived_label = get_origin_channel(message.metadata)
+        return (derived_id or stored_id, derived_label or stored_label)
+
     def _persist_canonical_turn(
         self,
         entry: "TurnTagEntry",
@@ -327,6 +349,16 @@ class TaggingPipeline:
         if matched_pair is not None:
             user_row, assistant_row = matched_pair
             tagged_at = utcnow_iso()
+            # Channel metadata IS available here, so derive per physical
+            # message and fall back to the stored value field-by-field. The
+            # upsert overwrites omitted fields with defaults, so a rewrite
+            # that passed nothing would erase stored provenance.
+            user_channel_id, user_channel_label = self._merge_row_channel(
+                user_msg, user_row,
+            )
+            asst_channel_id, asst_channel_label = self._merge_row_channel(
+                asst_msg, assistant_row,
+            )
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -357,6 +389,8 @@ class TaggingPipeline:
                 created_at=user_row.created_at,
                 updated_at=tagged_at,
                 turn_group_number=entry.turn_number,
+                origin_channel_id=user_channel_id,
+                origin_channel_label=user_channel_label,
             )
             self._store.save_canonical_turn(
                 self.config.conversation_id,
@@ -387,11 +421,17 @@ class TaggingPipeline:
                 created_at=assistant_row.created_at,
                 updated_at=tagged_at,
                 turn_group_number=entry.turn_number,
+                origin_channel_id=asst_channel_id,
+                origin_channel_label=asst_channel_label,
             )
             entry.canonical_turn_id = user_row.canonical_turn_id or entry.canonical_turn_id
             # Fallback hash-search path: 0 rows consumed from
             # ``existing_rows`` (we bypassed it).
             return 0
+        from ..types import get_origin_channel
+
+        user_channel_id, user_channel_label = get_origin_channel(user_msg.metadata)
+        asst_channel_id, asst_channel_label = get_origin_channel(asst_msg.metadata)
         result = IngestReconciler(self._store, self._semantic).ingest_single(
             conversation_id=self.config.conversation_id,
             user_content=user_msg.content,
@@ -402,8 +442,13 @@ class TaggingPipeline:
             tags=list(entry.tags or []),
             session_date=entry.session_date,
             sender=entry.sender,
+            user_origin_channel_id=user_channel_id,
+            user_origin_channel_label=user_channel_label,
+            assistant_origin_channel_id=asst_channel_id,
+            assistant_origin_channel_label=asst_channel_label,
             fact_signals=list(entry.fact_signals or []),
             code_refs=list(entry.code_refs or []),
+            expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
         )
         if result.rows:
             entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
@@ -453,6 +498,17 @@ class TaggingPipeline:
                 version=row.hash_version or HASH_VERSION,
             )
             tagged_at = utcnow_iso()
+            # A legacy combined row has two source messages but one provenance
+            # pair. Use user-first, missing-field-only precedence: the user's
+            # derivation fills what it can, the assistant's fills what remains,
+            # and the stored value survives when neither derives.
+            combined_channel_id, combined_channel_label = self._merge_row_channel(
+                user_msg, row,
+            )
+            if not combined_channel_id or not combined_channel_label:
+                asst_id, asst_label = self._merge_row_channel(asst_msg, row)
+                combined_channel_id = combined_channel_id or asst_id
+                combined_channel_label = combined_channel_label or asst_label
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -483,6 +539,8 @@ class TaggingPipeline:
                 created_at=row.created_at,
                 updated_at=tagged_at,
                 turn_group_number=row.turn_group_number,
+                origin_channel_id=combined_channel_id,
+                origin_channel_label=combined_channel_label,
             )
             entry.canonical_turn_id = row.canonical_turn_id or entry.canonical_turn_id
             return 1
@@ -531,6 +589,9 @@ class TaggingPipeline:
             # derived speaker name. An assistant row keeps whatever it stored
             # (possibly a legacy logical-turn value) and gains nothing new.
             row_sender = (entry.sender or row.sender) if role == "user" else row.sender
+            # Per-entry channel derivation: this physical message's own
+            # metadata, else the row's stored value, per field.
+            row_channel_id, row_channel_label = self._merge_row_channel(message, row)
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -558,6 +619,8 @@ class TaggingPipeline:
                 created_at=row.created_at,
                 updated_at=tagged_at,
                 turn_group_number=row.turn_group_number,
+                origin_channel_id=row_channel_id,
+                origin_channel_label=row_channel_label,
             )
         entry.canonical_turn_id = window[0].canonical_turn_id or entry.canonical_turn_id
         # Report rows consumed from the head of ``existing_rows``: the offset
@@ -1224,6 +1287,10 @@ class TaggingPipeline:
             created_at=row.created_at,
             updated_at=row.updated_at,
             turn_group_number=row.turn_group_number,
+            # No message metadata on the background sweep: pass the stored
+            # provenance straight back so the upsert cannot default it away.
+            origin_channel_id=row.origin_channel_id,
+            origin_channel_label=row.origin_channel_label,
         )
 
     def retag_canonical_turns(
@@ -1425,6 +1492,8 @@ class TaggingPipeline:
                     created_at=row.created_at,
                     updated_at=tagged_at,
                     turn_group_number=row.turn_group_number,
+                    origin_channel_id=row.origin_channel_id,
+                    origin_channel_label=row.origin_channel_label,
                 )
             for tag in tag_result.tags:
                 if tag not in store_tags:
