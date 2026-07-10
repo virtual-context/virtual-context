@@ -1103,6 +1103,7 @@ def _search_find_quote_candidates(
     mode: str,
     conversation_id: str | None,
     include_tool_outputs: bool = True,
+    channel: str = "",
 ) -> list[QuoteResult]:
     results: list[QuoteResult] = []
     lexical_limit = limit
@@ -1112,6 +1113,14 @@ def _search_find_quote_candidates(
         semantic_limit = max(1, min(limit // 3, 8))
         lexical_limit = max(1, limit - semantic_limit)
 
+    # Both sources are scoped at their own boundary, before their own limits.
+    # Fetching a global top-N and filtering the returned list here would
+    # underfill the result and rank globally before scoping.
+    #
+    # ``channel`` is omitted entirely on an unscoped call so a store or
+    # semantic manager predating this argument keeps working unchanged.
+    scope: dict[str, str] = {"channel": channel} if channel else {}
+
     search_turn_text = getattr(store, "search_canonical_turn_text", None)
     if callable(search_turn_text):
         results.extend(
@@ -1119,6 +1128,7 @@ def _search_find_quote_candidates(
                 query,
                 limit=lexical_limit,
                 conversation_id=conversation_id,
+                **scope,
             )
         )
 
@@ -1131,6 +1141,7 @@ def _search_find_quote_candidates(
                 query,
                 max_results=semantic_limit,
                 conversation_id=conversation_id,
+                **scope,
             )
         )
 
@@ -2958,8 +2969,15 @@ def find_quote(
     session_filter: str = "",
     mode: str = "lookup",
     conversation_id: str | None = None,
+    channel: str = "",
 ) -> dict:
-    """Search canonical archived turns only."""
+    """Search canonical archived turns only.
+
+    A non-empty ``channel`` scopes both candidate sources to rows whose stored
+    channel provenance matches, before their limits and before reranking, and
+    labels each excerpt with an outer ``[#channel]`` prefix. An empty
+    ``channel`` is byte-identical to the unscoped behavior.
+    """
     if not query.strip():
         return {"error": "empty query"}
 
@@ -2985,6 +3003,7 @@ def find_quote(
         limit=limit,
         mode=mode,
         conversation_id=conversation_id,
+        channel=channel,
     )
     results = _rerank_quote_results(
         results,

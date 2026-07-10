@@ -3325,6 +3325,7 @@ class VirtualContextEngine:
         intent_context: str = "",
         session_filter: str = "",
         mode: str = "lookup",
+        channel: str = "",
     ) -> dict:
         return self._search.find_quote(
             query,
@@ -3332,6 +3333,7 @@ class VirtualContextEngine:
             intent_context=intent_context,
             session_filter=session_filter,
             mode=mode,
+            channel=channel,
         )
 
     def get_turns_by_tag(

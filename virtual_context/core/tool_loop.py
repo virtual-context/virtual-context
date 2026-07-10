@@ -159,6 +159,16 @@ def vc_tool_definitions() -> list[dict]:
                             "summaries across older compacted memory."
                         ),
                     },
+                    "channel": {
+                        "type": "string",
+                        "description": (
+                            "Optional source channel to restrict the search to: a "
+                            "channel name with or without a leading '#', or a "
+                            "stored channel id. Pass it only when the question is "
+                            "explicitly scoped to one channel; omit it otherwise "
+                            "so the whole conversation is searched."
+                        ),
+                    },
                 },
                 "required": ["query", "mode"],
             },
@@ -1071,12 +1081,14 @@ def execute_vc_tool(
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
             fq_mode = tool_input.get("mode", "lookup")
+            fq_channel = tool_input.get("channel", "") or ""
             _fq_max = engine.config.search.find_quote_max_results
             result = engine.find_quote(
                 query=fq_query,
                 max_results=_fq_max,
                 intent_context=intent_context,
                 mode=fq_mode,
+                channel=fq_channel,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)

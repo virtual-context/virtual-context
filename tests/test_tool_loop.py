@@ -227,6 +227,7 @@ class TestExecuteVCTool:
             max_results=20,
             intent_context="",
             mode="lookup",
+            channel="",
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
@@ -1113,6 +1114,7 @@ class TestRunToolLoop:
             max_results=20,
             intent_context="test",
             mode="lookup",
+            channel="",
         )
 
     def test_passes_last_user_text_as_intent_context(self):
@@ -1150,6 +1152,7 @@ class TestRunToolLoop:
             max_results=20,
             intent_context="Where do I currently keep my old sneakers?",
             mode="lookup",
+            channel="",
         )
 
     def test_strips_injected_context_from_intent_context_and_adds_lookup_grounding_hint(self):
@@ -1220,6 +1223,7 @@ class TestRunToolLoop:
             max_results=20,
             intent_context=question,
             mode="lookup",
+            channel="",
         )
 
         sent_body = mock_client.post.call_args[1]["json"]

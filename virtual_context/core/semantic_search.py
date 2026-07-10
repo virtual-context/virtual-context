@@ -9,7 +9,16 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ..types import ChunkEmbedding, FactSignal, CanonicalTurnChunkEmbedding, QuoteResult, StoredSegment, VirtualContextConfig
+from ..types import (
+    ChunkEmbedding,
+    FactSignal,
+    CanonicalTurnChunkEmbedding,
+    QuoteResult,
+    StoredSegment,
+    VirtualContextConfig,
+    channel_excerpt_prefix,
+    channel_matches,
+)
 from .math_utils import cosine_similarity
 from .store import ContextStore
 
@@ -280,14 +289,38 @@ class SemanticSearchManager:
                 canonical_turn_id=canonical_turn_id,
             )
 
+    def _physical_rows_by_canonical_id(self, conversation_id: str) -> dict:
+        """Physical canonical rows keyed by ``canonical_turn_id``.
+
+        ``get_canonical_turn_rows`` returns LOGICAL rows keyed by
+        ``turn_group_number`` after merging siblings, so an assistant chunk at
+        physical ordinal 1 can hydrate logical group 1 — a different row. A
+        channel filter must never inherit a sibling's provenance or excerpt,
+        so scoped search resolves the physical row the chunk actually points
+        at. The raw loader already returns physical rows.
+        """
+        try:
+            rows = self._store.get_all_canonical_turns(conversation_id or "")
+        except Exception:
+            logger.debug("Failed to load physical canonical rows for channel scoping")
+            return {}
+        return {row.canonical_turn_id: row for row in rows if row.canonical_turn_id}
+
     def semantic_canonical_turn_search(
         self,
         query: str,
         *,
         max_results: int = 5,
         conversation_id: str | None = None,
+        channel: str = "",
     ) -> list[QuoteResult]:
-        """Run semantic retrieval over canonical turn chunks."""
+        """Run semantic retrieval over canonical turn chunks.
+
+        A non-empty ``channel`` filters scored chunks post-score but
+        PRE-acceptance-limit: scanning continues down the ranking until
+        ``max_results`` in-channel results are accepted, so a global top hit
+        outside the channel cannot starve a lower-ranked in-channel one.
+        """
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
@@ -310,6 +343,15 @@ class SemanticSearchManager:
             if sim >= 0.25:
                 scored.append((sim, chunk))
         scored.sort(key=lambda item: item[0], reverse=True)
+
+        wanted_channel = (channel or "").strip()
+        if wanted_channel:
+            return self._scoped_semantic_turn_results(
+                scored,
+                max_results=max_results,
+                conversation_id=conversation_id,
+                channel=wanted_channel,
+            )
 
         grouped: list[QuoteResult] = []
         seen_turn_sides: set[tuple[int, str]] = set()
@@ -364,6 +406,75 @@ class SemanticSearchManager:
             if len(grouped) >= max_results:
                 break
         return grouped
+
+    def _scoped_semantic_turn_results(
+        self,
+        scored: list[tuple[float, CanonicalTurnChunkEmbedding]],
+        *,
+        max_results: int,
+        conversation_id: str | None,
+        channel: str,
+    ) -> list[QuoteResult]:
+        """Accept only in-channel chunks, formatting from the physical row.
+
+        A chunk whose physical row is missing or out of channel is rejected
+        and the scan continues, so the channel filter bites before the
+        acceptance limit rather than after it.
+        """
+        physical = self._physical_rows_by_canonical_id(conversation_id or "")
+        results: list[QuoteResult] = []
+        seen_turn_sides: set[tuple[int, str]] = set()
+        for sim, chunk in scored:
+            if len(results) >= max_results:
+                break
+            identity = (chunk.turn_number, chunk.side)
+            if identity in seen_turn_sides:
+                continue
+            row = physical.get(chunk.canonical_turn_id or "")
+            if row is None:
+                # No physical row to prove provenance: never guess.
+                continue
+            if not channel_matches(
+                channel, row.origin_channel_id, row.origin_channel_label,
+            ):
+                continue
+            seen_turn_sides.add(identity)
+
+            # Format from THIS physical row so a sibling half cannot supply
+            # its excerpt. Semantic user chunks keep the ``User:`` label; the
+            # shipped semantic path never gained sender formatting.
+            user_text = row.user_content or ""
+            assistant_text = row.assistant_content or ""
+            if chunk.side == "user":
+                excerpt = f"User: {user_text}".strip()
+                matched_side = "user"
+            elif chunk.side == "assistant":
+                excerpt = f"Assistant: {assistant_text}".strip()
+                matched_side = "assistant"
+            else:
+                excerpt = (
+                    f"User: {user_text}\n\nAssistant: {assistant_text}"
+                ).strip()
+                matched_side = "unknown"
+            excerpt = channel_excerpt_prefix(
+                row.origin_channel_id, row.origin_channel_label,
+            ) + excerpt
+
+            results.append(
+                QuoteResult(
+                    text=excerpt,
+                    tag=row.primary_tag,
+                    segment_ref=f"turn_{chunk.turn_number}",
+                    tags=list(row.tags or []),
+                    match_type="full_text_semantic",
+                    similarity=round(sim, 3),
+                    session_date=row.session_date,
+                    source_scope="turn",
+                    turn_number=chunk.turn_number,
+                    matched_side=matched_side,
+                )
+            )
+        return results
 
     def semantic_search(
         self, query: str, max_results: int = 5,
