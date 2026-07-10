@@ -6360,6 +6360,75 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return int(cursor.rowcount or 0)
 
+    def update_canonical_turn_senders_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set ``sender`` on rows whose stored value is empty.
+
+        Narrow UPDATE by ``canonical_turn_id`` with ``WHERE sender = ''`` so a
+        stored attribution is never overwritten and a re-run is a no-op. The
+        optional epoch predicate makes the write fail closed when the
+        conversation was resurrected under a new ``lifecycle_epoch``.
+        """
+        updates = {
+            ct_id: (sender or "").strip()
+            for ct_id, sender in (updates or {}).items()
+            if ct_id and (sender or "").strip()
+        }
+        if not updates:
+            return 0
+        conn = self._get_conn()
+        if expected_lifecycle_epoch is not None:
+            row = conn.execute(
+                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None or int(row[0]) != int(expected_lifecycle_epoch):
+                return 0
+        updated = 0
+        now = utcnow_iso()
+        for canonical_turn_id, sender in updates.items():
+            cursor = conn.execute(
+                """UPDATE canonical_turns
+                      SET sender = ?, updated_at = ?
+                    WHERE conversation_id = ?
+                      AND canonical_turn_id = ?
+                      AND COALESCE(TRIM(sender), '') = ''""",
+                (sender, now, conversation_id, canonical_turn_id),
+            )
+            updated += int(cursor.rowcount or 0)
+        conn.commit()
+        return updated
+
+    def list_canonical_conversation_ids(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Conversations owning at least one canonical row, tenant-scoped
+        through ``conversations`` (``canonical_turns`` has no tenant column).
+        """
+        conn = self._get_conn()
+        sql = "SELECT DISTINCT ct.conversation_id AS cid FROM canonical_turns ct"
+        params: list[object] = []
+        if tenant_id:
+            sql += (
+                " JOIN conversations c ON c.conversation_id = ct.conversation_id"
+                " WHERE c.tenant_id = ?"
+            )
+            params.append(tenant_id)
+        sql += " ORDER BY cid"
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [str(row["cid"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
+
     def recompute_canonical_turn_groups(
         self,
         conversation_id: str,

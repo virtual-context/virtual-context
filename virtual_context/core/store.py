@@ -505,6 +505,43 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def update_canonical_turn_senders_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set ``sender`` on rows that currently have none.
+
+        ``updates`` maps ``canonical_turn_id`` to the derived sender. A row is
+        only touched when its stored ``sender`` is empty, so a non-empty value
+        is never overwritten and a re-run is a no-op. When
+        ``expected_lifecycle_epoch`` is given, the write is additionally
+        guarded on the conversation's current epoch so a CAS issued against a
+        conversation that was deleted and resurrected mid-flight cannot leak
+        into the new lifecycle.
+
+        Returns the number of rows updated. Backends without canonical-row
+        storage keep the no-op default.
+        """
+        return 0
+
+    def list_canonical_conversation_ids(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Enumerate conversations that own at least one canonical row.
+
+        ``get_conversation_stats`` enumerates ``segments``, so it misses
+        conversations that have been ingested but never compacted. Tenant
+        scoping filters through ``conversations`` because ``canonical_turns``
+        carries no ``tenant_id`` column.
+        """
+        return []
+
     def replace_canonical_turn_anchors(
         self,
         conversation_id: str,
