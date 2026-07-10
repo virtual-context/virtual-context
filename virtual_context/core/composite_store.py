@@ -353,18 +353,15 @@ class CompositeStore:
         fn = getattr(self._segments, "reconstruct_history_for_conv", None)
         if callable(fn):
             return list(fn(conversation_id))
-        # Fallback: reuse the ContextStore base body shape so cloud
-        # gets a consistent result no matter which delegate is wired
-        # under the composite.
-        history: list[Message] = []
-        for row in self.get_all_canonical_turns(conversation_id):
-            user_text = row.user_content or ""
-            asst_text = row.assistant_content or ""
-            if not asst_text.strip():
-                continue
-            history.append(Message(role="user", content=user_text))
-            history.append(Message(role="assistant", content=asst_text))
-        return history
+        # Fallback: reuse the ContextStore base body shape — including its
+        # logical-turn grouping and sender-metadata contract — so callers
+        # get a consistent result no matter which delegate is wired under
+        # the composite.
+        from .store import canonical_rows_to_history
+
+        return canonical_rows_to_history(
+            list(self.get_all_canonical_turns(conversation_id))
+        )
 
     def get_compaction_fence_mode(self):
         """Forwarder for the runtime fence holder. Cloud's sweeper

@@ -170,7 +170,20 @@ class CompactionPipeline:
         )
         messages: list[Message] = []
         for row in rows:
-            messages.append(Message(role="user", content=row.user_content))
+            # ``_format_conversation`` labels a message with
+            # ``get_sender_name(metadata) or role.capitalize()``. Carry the
+            # stored sender in metadata, never in content: content feeds
+            # hashes, excerpts, and the summary text itself. Only the user
+            # half is attributed; a legacy row may carry the logical-turn
+            # sender on both halves, and the assistant is not that speaker.
+            user_metadata = None
+            if (row.sender or "").strip() and (row.user_content or "").strip():
+                user_metadata = {"sender": {"name": row.sender}}
+            messages.append(Message(
+                role="user",
+                content=row.user_content,
+                metadata=user_metadata,
+            ))
             messages.append(Message(role="assistant", content=row.assistant_content))
         return rows, messages
 

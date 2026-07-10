@@ -1279,7 +1279,15 @@ class TaggingPipeline:
         message_rows: dict[int, "CanonicalTurnRow"] = {}
         for row in rows:
             if (row.user_content or "").strip():
-                msg = Message(role="user", content=row.user_content)
+                msg = Message(
+                    role="user",
+                    content=row.user_content,
+                    metadata=(
+                        {"sender": {"name": row.sender}}
+                        if (row.sender or "").strip()
+                        else None
+                    ),
+                )
                 messages.append(msg)
                 message_rows[id(msg)] = row
             if (row.assistant_content or "").strip():
