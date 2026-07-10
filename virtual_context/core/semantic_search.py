@@ -12,6 +12,7 @@ from typing import Callable
 from ..types import (
     ChunkEmbedding,
     FactSignal,
+    CanonicalTurnRow,
     CanonicalTurnChunkEmbedding,
     QuoteResult,
     StoredSegment,
@@ -289,8 +290,11 @@ class SemanticSearchManager:
                 canonical_turn_id=canonical_turn_id,
             )
 
-    def _physical_rows_by_canonical_id(self, conversation_id: str) -> dict:
-        """Physical canonical rows keyed by ``canonical_turn_id``.
+    def _physical_rows_by_canonical_id(
+        self,
+        conversation_ids: set[str],
+    ) -> dict[tuple[str, str], CanonicalTurnRow]:
+        """Physical canonical rows keyed by conversation and canonical id.
 
         ``get_canonical_turn_rows`` returns LOGICAL rows keyed by
         ``turn_group_number`` after merging siblings, so an assistant chunk at
@@ -299,12 +303,21 @@ class SemanticSearchManager:
         so scoped search resolves the physical row the chunk actually points
         at. The raw loader already returns physical rows.
         """
-        try:
-            rows = self._store.get_all_canonical_turns(conversation_id or "")
-        except Exception:
-            logger.debug("Failed to load physical canonical rows for channel scoping")
-            return {}
-        return {row.canonical_turn_id: row for row in rows if row.canonical_turn_id}
+        physical: dict[tuple[str, str], CanonicalTurnRow] = {}
+        for conversation_id in conversation_ids:
+            try:
+                rows = self._store.get_all_canonical_turns(conversation_id)
+            except Exception:
+                logger.debug(
+                    "Failed to load physical canonical rows for channel scoping",
+                )
+                continue
+            for row in rows:
+                if not row.canonical_turn_id:
+                    continue
+                row_conversation_id = row.conversation_id or conversation_id
+                physical[(row_conversation_id, row.canonical_turn_id)] = row
+        return physical
 
     def semantic_canonical_turn_search(
         self,
@@ -421,16 +434,32 @@ class SemanticSearchManager:
         and the scan continues, so the channel filter bites before the
         acceptance limit rather than after it.
         """
-        physical = self._physical_rows_by_canonical_id(conversation_id or "")
+        if conversation_id is None:
+            physical_conversation_ids = {
+                chunk.conversation_id
+                for _similarity, chunk in scored
+                if chunk.conversation_id
+            }
+        else:
+            physical_conversation_ids = {conversation_id}
+        physical = self._physical_rows_by_canonical_id(physical_conversation_ids)
         results: list[QuoteResult] = []
-        seen_turn_sides: set[tuple[int, str]] = set()
+        seen_turn_sides: set[tuple[str, str, str]] = set()
         for sim, chunk in scored:
             if len(results) >= max_results:
                 break
-            identity = (chunk.turn_number, chunk.side)
+            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
+            identity = (
+                chunk_conversation_id,
+                chunk.canonical_turn_id or "",
+                chunk.side,
+            )
             if identity in seen_turn_sides:
                 continue
-            row = physical.get(chunk.canonical_turn_id or "")
+            row = physical.get((
+                chunk_conversation_id,
+                chunk.canonical_turn_id or "",
+            ))
             if row is None:
                 # No physical row to prove provenance: never guess.
                 continue
@@ -459,18 +488,21 @@ class SemanticSearchManager:
             excerpt = channel_excerpt_prefix(
                 row.origin_channel_id, row.origin_channel_label,
             ) + excerpt
+            turn_number = (
+                row.turn_number if row.turn_number >= 0 else chunk.turn_number
+            )
 
             results.append(
                 QuoteResult(
                     text=excerpt,
                     tag=row.primary_tag,
-                    segment_ref=f"turn_{chunk.turn_number}",
+                    segment_ref=f"turn_{turn_number}",
                     tags=list(row.tags or []),
                     match_type="full_text_semantic",
                     similarity=round(sim, 3),
                     session_date=row.session_date,
                     source_scope="turn",
-                    turn_number=chunk.turn_number,
+                    turn_number=turn_number,
                     matched_side=matched_side,
                 )
             )

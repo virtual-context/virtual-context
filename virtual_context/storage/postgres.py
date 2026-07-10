@@ -5415,14 +5415,17 @@ class PostgresStore(ContextStore):
                 # A filter, not another text match: it never yields a new
                 # ``matched_side``. Applied before ORDER BY / LIMIT so an
                 # out-of-channel top hit cannot starve an in-channel one.
-                sql += """ AND (origin_channel_id = %s
-                                OR LOWER(CASE
+                sql += " AND (origin_channel_id = %s"
+                params.append(wanted_channel)
+                wanted_label = strip_channel_hash(wanted_channel).lower()
+                if wanted_label:
+                    sql += """ OR LOWER(CASE
                                        WHEN origin_channel_label LIKE '#%%'
                                        THEN SUBSTRING(origin_channel_label FROM 2)
                                        ELSE origin_channel_label
-                                   END) = %s)"""
-                params.append(wanted_channel)
-                params.append(strip_channel_hash(wanted_channel).lower())
+                                   END) = %s"""
+                    params.append(wanted_label)
+                sql += ")"
             sql += " ORDER BY sort_key DESC LIMIT %s"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()

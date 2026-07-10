@@ -161,6 +161,15 @@ class TestLexicalChannelFilter:
         )
         assert results == []
 
+    def test_hash_only_scope_does_not_match_an_empty_label(self, tmp_path: Path):
+        """Removing one optional hash must not turn missing provenance into a
+        successful empty-string label match.
+        """
+        store = self._seed(tmp_path)
+        assert store.search_canonical_turn_text(
+            "peptide", conversation_id="c", channel="#",
+        ) == []
+
     def test_filter_applies_before_the_limit(self, tmp_path: Path):
         """The out-of-channel rows sort first (higher sort_key). With the
         filter applied after LIMIT 1 they would starve the in-channel row.
@@ -290,7 +299,10 @@ class _FakeSemanticStore:
         return self._chunks
 
     def get_all_canonical_turns(self, conversation_id):
-        return self._rows
+        return [
+            row for row in self._rows
+            if row.conversation_id == conversation_id
+        ]
 
     def get_canonical_turn_rows(self, conversation_id, turn_numbers):
         # The LOGICAL seam. A scoped search must not use it.
@@ -319,9 +331,16 @@ def _vec(text: str) -> list[float]:
     return [1.0, 0.0] if "MATCH" in text else [0.8, 0.6]
 
 
-def _chunk(ct_id: str, turn_number: int, side: str, text: str):
+def _chunk(
+    ct_id: str,
+    turn_number: int,
+    side: str,
+    text: str,
+    *,
+    conversation_id: str = "c",
+):
     return CanonicalTurnChunkEmbedding(
-        conversation_id="c",
+        conversation_id=conversation_id,
         side=side,
         chunk_index=0,
         text=text,
@@ -331,10 +350,10 @@ def _chunk(ct_id: str, turn_number: int, side: str, text: str):
     )
 
 
-def _physical(ct_id, turn_number, **kw):
+def _physical(ct_id, turn_number, *, conversation_id="c", **kw):
     from virtual_context.types import CanonicalTurnRow
     base = dict(
-        conversation_id="c",
+        conversation_id=conversation_id,
         canonical_turn_id=ct_id,
         turn_number=turn_number,
         turn_group_number=turn_number // 2,
@@ -425,6 +444,33 @@ class TestSemanticChannelFilter:
             "MATCH", max_results=5, conversation_id="c", channel="#vasttest",
         )
         assert results == []
+
+    def test_global_scope_resolves_each_chunks_physical_conversation(self):
+        """The physical identity is the chunk's conversation/id pair, not the
+        optional search argument plus a globally keyed canonical id.
+        """
+        rows = [
+            _physical(
+                "ct-1", 0, conversation_id="c1", user_content="one MATCH",
+                origin_channel_label="#vasttest",
+            ),
+            _physical(
+                "ct-2", 0, conversation_id="c2", user_content="two MATCH",
+                origin_channel_label="#vasttest",
+            ),
+        ]
+        chunks = [
+            _chunk("ct-1", 0, "user", "one MATCH", conversation_id="c1"),
+            _chunk("ct-2", 0, "user", "two MATCH", conversation_id="c2"),
+        ]
+        store = _FakeSemanticStore(rows, chunks)
+        results = _semantic(store).semantic_canonical_turn_search(
+            "MATCH", max_results=5, conversation_id=None, channel="#vasttest",
+        )
+        assert {result.text for result in results} == {
+            "[#vasttest] User: one MATCH",
+            "[#vasttest] User: two MATCH",
+        }
 
     def test_scoped_semantic_user_excerpt_keeps_the_user_label(self):
         """Semantic search never gained sender formatting; scoping must not
