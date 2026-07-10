@@ -97,6 +97,18 @@ class TestSenderOnlyMatch:
         assert store.search_canonical_turn_text("BIGTEX", conversation_id="c")
         assert store.search_canonical_turn_text("bigtex", conversation_id="c")
 
+    @pytest.mark.parametrize("query", ["Big_ex", "Big%ex"])
+    def test_sender_match_treats_like_wildcards_literally(
+        self,
+        tmp_path: Path,
+        query: str,
+    ):
+        store = _store(tmp_path)
+        _row(store, ct_id="ct-1", sort_key=1000.0,
+             user_content="hello", sender="BigTex")
+
+        assert store.search_canonical_turn_text(query, conversation_id="c") == []
+
 
 class TestSenderLabelOnTextMatches:
     def test_user_text_match_on_sender_row_uses_sender_label(self, tmp_path: Path):
@@ -126,6 +138,53 @@ class TestSenderLabelOnTextMatches:
         assert qr.matched_side == "both"
         assert qr.text.startswith("BigTex: ")
         assert "\n\nAssistant: " in qr.text
+
+    def test_sender_label_keeps_the_user_statement_ranking_signal(self):
+        from virtual_context.core.quote_search import _rerank_quote_results
+        from virtual_context.types import QuoteResult
+
+        results = [
+            QuoteResult(
+                text="Assistant: tingling",
+                tag="chat",
+                segment_ref="assistant",
+                match_type="full_text_search",
+                source_scope="turn",
+                matched_side="assistant",
+            ),
+            QuoteResult(
+                text="An Extremely Long Sender Name: tingling",
+                tag="chat",
+                segment_ref="user",
+                match_type="full_text_search",
+                source_scope="turn",
+                matched_side="user",
+            ),
+        ]
+
+        ranked = _rerank_quote_results(
+            results,
+            "tingling",
+            max_results=2,
+            mode="lookup",
+        )
+
+        assert [result.segment_ref for result in ranked] == ["user", "assistant"]
+
+    def test_sender_label_keeps_the_first_person_value_signal(self):
+        from virtual_context.core.quote_search import _build_exact_value_candidates
+
+        candidates = _build_exact_value_candidates(
+            [{
+                "excerpt": "BigTex: I was using version 1.2.3",
+                "matched_side": "user",
+                "match_type": "full_text_search",
+            }],
+            query="what version was I using",
+            intent_context="",
+        )
+
+        assert candidates[0]["user_statement"] is True
 
 
 class TestUnchangedWithoutSender:
@@ -165,7 +224,11 @@ class TestFindQuoteEndToEnd:
     def test_find_quote_surfaces_a_sender_only_match(self, tmp_path: Path):
         from virtual_context.config import VirtualContextConfig
         from virtual_context.engine import VirtualContextEngine
-        from virtual_context.types import StorageConfig, TagGeneratorConfig
+        from virtual_context.types import (
+            RetrieverConfig,
+            StorageConfig,
+            TagGeneratorConfig,
+        )
 
         config = VirtualContextConfig(
             conversation_id="c",
@@ -174,6 +237,7 @@ class TestFindQuoteEndToEnd:
                 backend="sqlite", sqlite_path=str(tmp_path / "vc.db"),
             ),
             tag_generator=TagGeneratorConfig(type="keyword"),
+            retriever=RetrieverConfig(inbound_tagger_type="llm"),
         )
         engine = VirtualContextEngine(config=config)
         store = engine._store
