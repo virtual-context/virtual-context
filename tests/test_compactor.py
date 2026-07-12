@@ -57,6 +57,17 @@ def test_compact_preserves_metadata(compactor, legal_segment):
     assert results[0].metadata.key_decisions == ["decision1"]
 
 
+def test_compact_preserves_message_provenance_metadata(compactor, legal_segment):
+    legal_segment.messages[0].metadata = {
+        "sender": {"name": "BigTex"},
+        "_vc_source_canonical_turn_ids": ["ct-user"],
+    }
+
+    result = compactor.compact([legal_segment])[0]
+
+    assert result.messages[0]["metadata"] == legal_segment.messages[0].metadata
+
+
 @pytest.mark.regression("BUG-004")
 def test_compact_refined_tags(compactor, legal_segment):
     results = compactor.compact([legal_segment])
