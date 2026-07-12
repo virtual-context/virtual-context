@@ -1111,15 +1111,31 @@ class VirtualContextEngine:
         )
 
     def _build_inbound_embedding_tagger(self) -> TagGenerator:
-        """Build an EmbeddingTagGenerator for inbound vocabulary matching."""
+        """Build an EmbeddingTagGenerator for inbound vocabulary matching.
+
+        When the shared provider yields no embed callable — permanently
+        disabled, not installed, or failed to load — inbound matching
+        degrades to the keyword tagger. Passing ``embed_fn=None`` through
+        instead would let the generator construct its own local model,
+        which a disabled provider exists to forbid.
+        """
         from .core.embedding_tag_generator import EmbeddingTagGenerator
 
+        embed_fn = self._embedding_provider.get_embed_fn() if self._embedding_provider else None
+        if embed_fn is None and self._embedding_provider is not None:
+            from .core.tag_generator import KeywordTagGenerator
+            from .types import KeywordTagConfig
+
+            logger.info(
+                "Inbound embedding matching unavailable (provider yields no "
+                "embed fn) — using keyword matching",
+            )
+            return KeywordTagGenerator(config=KeywordTagConfig())
         logger.info(
             "Using embedding-based inbound matching (model=%s, threshold=%.2f)",
             self.config.retriever.embedding_model,
             self.config.retriever.embedding_threshold,
         )
-        embed_fn = self._embedding_provider.get_embed_fn() if self._embedding_provider else None
         return EmbeddingTagGenerator(
             config=self.config.tag_generator,
             model_name=self.config.retriever.embedding_model,

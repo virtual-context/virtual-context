@@ -802,6 +802,18 @@ def build_tag_generator(
         from .embedding_tag_generator import EmbeddingTagGenerator
         # Use embed_fn from factory if available (shared EmbeddingProvider)
         _embed_fn = embed_fn_factory() if embed_fn_factory else None
+        if embed_fn_factory is not None and _embed_fn is None:
+            # A supplied factory that yields nothing means embeddings are
+            # deliberately unavailable (disabled or failed provider). Falling
+            # through to the generator's own local model load would override
+            # that decision, so degrade to keyword tagging instead.
+            logger.info(
+                "Embedding tag generation unavailable (factory yields no "
+                "embed fn) — using keyword tagging",
+            )
+            if config.keyword_fallback:
+                return KeywordTagGenerator(config=config.keyword_fallback)
+            return KeywordTagGenerator(config=KeywordTagConfig())
         return EmbeddingTagGenerator(
             config=config,
             embed_fn=_embed_fn,

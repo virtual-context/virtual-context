@@ -45,6 +45,9 @@ class EmbeddingTagGenerator:
         self._load_cached_embeddings = load_cached_embeddings
         self._save_cached_embeddings = save_cached_embeddings
 
+        self._runtime_fallback = None
+        self._degraded_logged = False
+
         if embed_fn:
             self._embed = embed_fn
         else:
@@ -143,6 +146,43 @@ class EmbeddingTagGenerator:
         return local_hits, shared_hits, embedded_missing
 
     def generate_tags(
+        self, text: str, existing_tags: list[str] | None = None,
+        context_turns: list[str] | None = None,
+    ) -> TagResult:
+        """Generate tags, degrading to keyword matching if embedding fails.
+
+        The embed callable can be remote; a runtime failure there must not
+        fail the request and must not trigger any local model load. Keyword
+        matching is the degraded mode, and recovery happens automatically on
+        the next successful embedded call.
+        """
+        try:
+            result = self._generate_tags_embedded(text, existing_tags, context_turns)
+        except Exception:
+            if not self._degraded_logged:
+                logger.warning(
+                    "EMBED_TAGGER_DEGRADED: embed callable failed; using "
+                    "keyword matching until it recovers",
+                    exc_info=True,
+                )
+                self._degraded_logged = True
+            return self._keyword_fallback_result(text, existing_tags)
+        if self._degraded_logged:
+            logger.info("EMBED_TAGGER_RECOVERED: embedded matching restored")
+            self._degraded_logged = False
+        return result
+
+    def _keyword_fallback_result(
+        self, text: str, existing_tags: list[str] | None,
+    ) -> TagResult:
+        if self._runtime_fallback is None:
+            from ..types import KeywordTagConfig
+            from .tag_generator import KeywordTagGenerator
+
+            self._runtime_fallback = KeywordTagGenerator(config=KeywordTagConfig())
+        return self._runtime_fallback.generate_tags(text, existing_tags)
+
+    def _generate_tags_embedded(
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:

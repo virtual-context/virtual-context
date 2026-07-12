@@ -114,7 +114,14 @@ class SemanticSearchManager:
         """
         if self._embed_fn is _EMBED_NOT_LOADED:
             if self._embedding_provider is not None:
-                self._embed_fn = self._embedding_provider.get_embed_fn()
+                fn = self._embedding_provider.get_embed_fn()
+                if fn is None:
+                    # Do not cache a provider's None: for a disabled provider
+                    # re-consulting is free, and for a provider that has not
+                    # produced its callable yet, caching None here would make
+                    # a transient condition permanent.
+                    return None
+                self._embed_fn = fn
             else:
                 # Original lazy-load path for backward compat
                 try:
@@ -635,7 +642,14 @@ class SemanticSearchManager:
         else:
             recent = " ".join(context_pairs)
 
-        embeddings = embed_fn([current_text[:2000], recent[:2000]])
+        try:
+            embeddings = embed_fn([current_text[:2000], recent[:2000]])
+        except Exception:
+            # A failed embed call gets the same graceful pass-through as an
+            # unavailable one: the gate may not turn an embedding outage into
+            # dropped context.
+            logger.debug("Context bleed gate embed failed; passing through")
+            return True, -1.0
         sim = cosine_similarity(embeddings[0], embeddings[1])
         threshold = self._config.tag_generator.context_bleed_threshold
 
