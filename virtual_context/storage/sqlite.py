@@ -236,6 +236,17 @@ ACTOR_REPLY_COLUMN_DEFS: dict[str, str] = {
 }
 ACTOR_REPLY_COLUMNS: tuple[str, ...] = tuple(ACTOR_REPLY_COLUMN_DEFS)
 
+# Fact authorship. Same manifest discipline as the canonical columns above:
+# CREATE TABLE, forward migration, and startup assertion must agree, or a
+# half-migrated database silently drops every fact's author.
+FACT_AUTHOR_COLUMN_DEFS: dict[str, str] = {
+    "author_actor_id": "TEXT NOT NULL DEFAULT ''",
+    "author_attribution_version": "INTEGER NOT NULL DEFAULT 0",
+    "author_source_role": "TEXT NOT NULL DEFAULT ''",
+    "author_source_message_id": "TEXT NOT NULL DEFAULT ''",
+}
+FACT_AUTHOR_COLUMNS: tuple[str, ...] = tuple(FACT_AUTHOR_COLUMN_DEFS)
+
 FTS_SQL = """\
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
     ref UNINDEXED,
@@ -592,6 +603,13 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
         start_timestamp=_str_to_dt(row["start_timestamp"]),
         end_timestamp=_str_to_dt(row["end_timestamp"]),
     )
+
+
+def _fact_author_col(row: sqlite3.Row, name: str) -> str:
+    """Read a fact authorship column that a legacy projection may not select."""
+    if name not in row.keys():
+        return ""
+    return row[name] or ""
 
 
 def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
@@ -1440,8 +1458,16 @@ class SQLiteStore(ContextStore):
                 turn_numbers_json TEXT NOT NULL DEFAULT '[]',
                 mentioned_at TEXT NOT NULL DEFAULT '',
                 session_date TEXT NOT NULL DEFAULT '',
-                superseded_by TEXT
+                superseded_by TEXT,
+                author_actor_id TEXT NOT NULL DEFAULT '',
+                author_attribution_version INTEGER NOT NULL DEFAULT 0,
+                author_source_role TEXT NOT NULL DEFAULT '',
+                author_source_message_id TEXT NOT NULL DEFAULT ''
             );
+            -- idx_facts_author_actor is created by _ensure_fact_author_schema,
+            -- not here: on a pre-existing facts table this CREATE TABLE is a
+            -- no-op, so an index naming author_actor_id would reference a
+            -- column that the forward migration has not added yet.
             CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
             CREATE INDEX IF NOT EXISTS idx_facts_verb ON facts(verb);
             CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status);
@@ -1766,6 +1792,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._ensure_canonical_turn_views(conn)
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
+        # Deliberately its OWN try: an unrelated failure in the canonical
+        # bootstrap above must not skip this migration and leave the assertion
+        # below to condemn a database it could have repaired.
+        try:
+            self._ensure_fact_author_schema(conn)
+        except Exception:
+            logger.warning("fact author bootstrap failed", exc_info=True)
         # The bootstrap above swallows broad failures, so a half-migrated
         # schema would otherwise run silently and drop identity on every
         # write. Assert the actor column on both the base table and the
@@ -1859,6 +1892,37 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 "idx_canonical_turns_source_message; reply-target resolution "
                 "would fall back to a full scan of canonical_turns"
             )
+
+        # Fact authorship, same rule: a swallowed migration must not become a
+        # database that quietly forgets who said what.
+        fact_columns = _columns("facts")
+        if not fact_columns:
+            return
+        missing = [c for c in FACT_AUTHOR_COLUMNS if c not in fact_columns]
+        if missing:
+            raise RuntimeError(
+                f"facts schema is missing {', '.join(missing)}; refusing to "
+                f"run fact authorship on a half-migrated schema"
+            )
+        fact_indexes = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute("PRAGMA index_list(facts)").fetchall()
+        }
+        if "idx_facts_author_actor" not in fact_indexes:
+            raise RuntimeError(
+                "facts schema is missing idx_facts_author_actor; the "
+                "cross-conversation actor lookup would fall back to a full scan"
+            )
+
+    def _ensure_fact_author_schema(self, conn: sqlite3.Connection) -> None:
+        """Forward-migrate fact authorship onto an existing database."""
+        for column, definition in FACT_AUTHOR_COLUMN_DEFS.items():
+            self._add_column_if_missing(conn, "facts", column, definition)
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_facts_author_actor
+                   ON facts(author_actor_id, conversation_id)
+                   WHERE author_actor_id <> ''"""
+        )
 
     def _ensure_canonical_turn_views(self, conn: sqlite3.Connection) -> None:
         conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
@@ -7622,8 +7686,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by,
+                         author_actor_id, author_attribution_version, author_source_role,
+                         author_source_message_id, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -7649,6 +7716,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             _dt_to_str(fact.mentioned_at),
                             fact.session_date or "",
                             fact.superseded_by,
+                            fact.author_actor_id or "",
+                            int(fact.author_attribution_version or 0),
+                            fact.author_source_role or "",
+                            fact.author_source_message_id or "",
                             operation_id,
                             # WHERE clause params:
                             operation_id,
@@ -7679,8 +7750,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         turn_numbers_json, mentioned_at, session_date, superseded_by,
+                         author_actor_id, author_attribution_version, author_source_role,
+                         author_source_message_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?)""",
                         (
                             fact.id,
                             fact.subject,
@@ -7700,6 +7774,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             _dt_to_str(fact.mentioned_at),
                             fact.session_date or "",
                             fact.superseded_by,
+                            fact.author_actor_id or "",
+                            int(fact.author_attribution_version or 0),
+                            fact.author_source_role or "",
+                            fact.author_source_message_id or "",
                         ),
                     )
                 # Update fact_tags junction (same for both paths)
@@ -7921,8 +7999,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by,
+                         author_actor_id, author_attribution_version, author_source_role,
+                         author_source_message_id, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -7935,7 +8016,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                             fact.conversation_id, json.dumps(fact.turn_numbers),
                             _dt_to_str(fact.mentioned_at), fact.session_date or "",
-                            fact.superseded_by, operation_id,
+                            fact.superseded_by,
+                            fact.author_actor_id or "",
+                            int(fact.author_attribution_version or 0),
+                            fact.author_source_role or "",
+                            fact.author_source_message_id or "",
+                            operation_id,
                             # WHERE clause params:
                             operation_id, fact.conversation_id,
                             owner_worker_id, lifecycle_epoch,
@@ -7959,8 +8045,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         turn_numbers_json, mentioned_at, session_date, superseded_by,
+                         author_actor_id, author_attribution_version, author_source_role,
+                         author_source_message_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?)""",
                         (
                             fact.id, fact.subject, fact.verb, fact.object, fact.status,
                             fact.what, fact.who, fact.when_date, fact.where, fact.why,
@@ -7968,6 +8057,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             fact.conversation_id, json.dumps(fact.turn_numbers),
                             _dt_to_str(fact.mentioned_at), fact.session_date or "",
                             fact.superseded_by,
+                            fact.author_actor_id or "",
+                            int(fact.author_attribution_version or 0),
+                            fact.author_source_role or "",
+                            fact.author_source_message_id or "",
                         ),
                     )
                 # fact_tags junction (same for both paths)
@@ -8444,6 +8537,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
                     session_date=row["session_date"] if row["session_date"] else "",
                     superseded_by=row["superseded_by"],
+                    # This BFS builds Fact objects by hand rather than through
+                    # from_dict, so authorship has to be carried explicitly or
+                    # a linked fact silently loses its author.
+                    author_actor_id=_fact_author_col(row, "author_actor_id"),
+                    author_attribution_version=int(
+                        _fact_author_col(row, "author_attribution_version") or 0
+                    ),
+                    author_source_role=_fact_author_col(row, "author_source_role"),
+                    author_source_message_id=_fact_author_col(
+                        row, "author_source_message_id"
+                    ),
                 )
                 results.append(LinkedFact(
                     fact=fact,

@@ -67,6 +67,27 @@ class Fact:
     session_date: str = ""  # original conversation date, e.g. "2023/05/25 (Thu) 10:04"
     # Knowledge update chain
     superseded_by: str | None = None  # fact_id that replaces this fact
+    # Authorship — WHO SAID IT. Deliberately NOT ``who``, which is a content
+    # dimension listing every person a fact is *about* ("we" means the speaker
+    # plus someone) and is rendered as ``[who: ...]``. Overwriting it with the
+    # speaker would destroy that meaning and corrupt existing facts.
+    #
+    # The actor id is never LLM text: the model may only supply a display label
+    # it can see in the transcript, which is resolved against the segment's own
+    # rows. An empty author is honest and behaves exactly as today.
+    author_actor_id: str = ""
+    # 0=historical, 1=sole-actor model label, 2=reply lane. Stamped even when
+    # the actor resolves empty, so backfill is idempotent and "we looked and
+    # found nobody" is distinguishable from "we never looked".
+    author_attribution_version: int = 0
+    # The structurally known lane: requester | subject | assistant |
+    # unattributed. This records the lane, NOT whether an actor resolved, so an
+    # unresolved subject-lane fact stays ``subject`` with an empty actor. That
+    # preserves the audit proof that a quoted claim never passed through the
+    # requester's lane. ``unattributed`` is reserved for invalid, combined, or
+    # unassociated model output.
+    author_source_role: str = ""
+    author_source_message_id: str = ""
 
     @classmethod
     def from_dict(cls, d: dict, *, dt_parser=None) -> Fact:
@@ -115,6 +136,12 @@ class Fact:
             mentioned_at=mentioned,
             session_date=d.get("session_date", ""),
             superseded_by=sup,
+            author_actor_id=d.get("author_actor_id", "") or "",
+            author_attribution_version=int(
+                d.get("author_attribution_version") or 0
+            ),
+            author_source_role=d.get("author_source_role", "") or "",
+            author_source_message_id=d.get("author_source_message_id", "") or "",
         )
 
     def format_for_prompt(self, include_index: int | None = None) -> str:
@@ -931,6 +958,104 @@ class SegmentMetadata:
     generated_by_turn_id: str = ""
     time_span: tuple[datetime, datetime] | None = None
     session_date: str = ""         # propagated from constituent turns
+    # True only when every non-empty message in the segment carries at least one
+    # source canonical id AND every distinct id resolves to a physical row.
+    # ``turn_count`` cannot stand in for this: topic grouping is noncontiguous
+    # and the session splitter can turn one source message into two, so a
+    # positional slice is not a row mapping. An incomplete mapping makes fact
+    # authorship empty rather than guessed.
+    source_mapping_complete: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Actor rosters and fact lanes
+# ---------------------------------------------------------------------------
+
+# Fact author roles. These record the structurally known LANE, not whether an
+# actor id resolved: an unresolved subject-lane fact stays ``subject`` with an
+# empty actor, which preserves the audit proof that a quoted claim never passed
+# through the requester's lane.
+AUTHOR_ROLE_REQUESTER = "requester"
+AUTHOR_ROLE_SUBJECT = "subject"
+AUTHOR_ROLE_ASSISTANT = "assistant"
+AUTHOR_ROLE_UNATTRIBUTED = "unattributed"
+
+AUTHOR_VERSION_SOLE_ACTOR = 1   # model label validated against a one-human roster
+AUTHOR_VERSION_REPLY_LANE = 2   # attribution from the row/edge, never model text
+
+
+@dataclass
+class FactLane:
+    """One structurally isolated fact-extraction input.
+
+    A reply-bearing segment is hard-partitioned into lanes so a claim quoted
+    FROM someone can never be extracted as a claim made BY the person quoting
+    them. Each lane carries exactly one physical message side: a requester lane
+    holds that row's own words and never its quote block; a subject lane holds
+    only the structured quote and never the replying question or the assistant's
+    analysis.
+
+    The actor is attached from the lane's canonical row or reply edge, never
+    chosen by the model.
+    """
+    role: str = AUTHOR_ROLE_UNATTRIBUTED
+    text: str = ""
+    actor_id: str = ""
+    source_message_id: str = ""
+    canonical_turn_id: str = ""
+    speaker_label: str = ""
+
+
+@dataclass
+class ActorRoster:
+    """Per-segment actor provenance, derived from physical rows only.
+
+    ``complete`` mirrors ``SegmentMetadata.source_mapping_complete``. A roster
+    that is not complete, or that spans more than one human, yields no
+    model-selected author: a valid roster name is still capable of cross-user
+    misattribution, and roster cardinality alone does not prove who uttered a
+    fact.
+    """
+    actor_ids: set[str] = field(default_factory=set)
+    # casefolded display label -> set of actor ids that have worn it. A label
+    # mapping to more than one actor is ambiguous and never resolves.
+    labels: dict[str, set[str]] = field(default_factory=dict)
+    complete: bool = False
+    # Any user row carrying content but no actor id. A one-human roster with an
+    # unidentified row cannot be blanket-attributed.
+    has_unidentified_user_row: bool = False
+    # Set when any backing physical user row carries a reply edge. Only then is
+    # the whole-segment fact output discarded in favour of the lane partition.
+    reply_bearing: bool = False
+    lanes: list[FactLane] = field(default_factory=list)
+
+    @property
+    def sole_actor_id(self) -> str:
+        """The single actor this segment can attribute to, or ``""``."""
+        if not self.complete or self.has_unidentified_user_row:
+            return ""
+        if len(self.actor_ids) != 1:
+            return ""
+        return next(iter(self.actor_ids))
+
+    def resolve_label(self, label: str) -> str:
+        """Resolve a model-supplied display label to the sole actor, or ``""``.
+
+        The model may only supply a name it can see in the transcript. It is
+        accepted solely for a complete one-human roster, and solely by exact
+        casefolded match against a label that roster actually observed.
+        ``Assistant``, a missing speaker, or any non-roster label yields ``""``.
+        """
+        sole = self.sole_actor_id
+        if not sole:
+            return ""
+        key = (label or "").strip().casefold()
+        if not key:
+            return ""
+        owners = self.labels.get(key) or set()
+        if owners == {sole}:
+            return sole
+        return ""
 
 
 # ---------------------------------------------------------------------------

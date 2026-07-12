@@ -195,6 +195,10 @@ For each fact:
   If truly unresolvable ("recently", "a while ago", no temporal reference) → use "".
 - "where": location (populate when present, empty string if n/a)
 - "why": context or significance (populate when present, empty string if n/a)
+- "speaker": the EXACT display label, as shown in the transcript, of the person
+  who STATED this fact. Copy the label verbatim; never invent one. Use
+  "Assistant" for information the assistant supplied. This is authorship (who
+  said it), which is not the same as "who" (everyone the fact is about).
 When the same event is disclosed directly in the current turn AND referenced in passing
 (e.g. asking a follow-up question about it), emit ONE fact using the direct disclosure
 as the primary source, enriched with any additional detail from the reference.
@@ -207,6 +211,43 @@ extract both the receiving and the implied playing.
 If two signals describe the same event, emit one fact with the richest details.
 Include "facts" in the JSON response.
 Only extract facts with genuine substance. Skip greetings and filler."""
+
+
+# Fact extraction over ONE lane of a reply-bearing segment. The lane's text is
+# the only material supplied, so the model cannot cross roles even in principle.
+# It is never asked who spoke: the author comes from the canonical row or the
+# reply edge, in application code.
+_FACT_ONLY_INSTRUCTIONS = """\
+SESSION DATE: {session_date}
+
+Extract structured facts from the text below. Do not summarize.
+
+For each fact:
+- "subject": who or what the fact is about
+- "verb": the EXACT action verb from the text (e.g. "prefers", "built", "lives in")
+- "object": the specific noun phrase, preserving numbers, names, dates, amounts
+- "status": one of: active, completed, planned, abandoned, recurring
+- "fact_type": "personal", "experience", or "world"
+- "what": one full sentence capturing the complete fact with all specifics
+- "who": ALL people the fact involves (empty string if n/a). Resolve pronouns.
+- "when": the resolved calendar date (e.g. "2023-05-20"), else ""
+- "where": location (empty string if n/a)
+- "why": context or significance (empty string if n/a)
+
+Extract only facts genuinely supported by this text. Skip greetings and filler.
+Respond with JSON only."""
+
+# Per-lane framing. This is orientation, not permission: the engine decides the
+# author from durable state regardless of what the model believes.
+_LANE_ROLE_HINTS = {
+    "requester": "The following is a message written by one person. "
+                 "Extract facts they stated about themselves or their world.",
+    "subject": "The following is a message written by a DIFFERENT person, "
+               "quoted for context. Extract only facts that this quoted "
+               "message itself states.",
+    "assistant": "The following is an assistant's reply. Extract only "
+                 "substantive information it supplied.",
+}
 
 
 CODE_SUMMARY_PROMPT = """\
@@ -278,7 +319,7 @@ Respond with JSON:
   "date_references": ["..."],
   "refined_tags": ["tag1", "tag2"],
   "related_tags": ["alternate-term1", "alternate-term2"],
-  "facts": [{{"subject": "...", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "...", "who": "...", "when": "...", "where": "...", "why": "..."}}],
+  "facts": [{{"subject": "...", "verb": "...", "object": "...", "status": "...", "fact_type": "personal|experience|world", "what": "...", "who": "...", "when": "...", "where": "...", "why": "...", "speaker": "exact display label of whoever stated this, or Assistant"}}],
   "code_refs": [{{"file": "...", "line": 123, "symbol": "..."}}]
 }}
 
@@ -344,6 +385,7 @@ class DomainCompactor:
         segments: list[TaggedSegment],
         fact_signals_by_segment: dict[str, list[FactSignal]] | None = None,
         code_refs_by_segment: dict[str, list[dict]] | None = None,
+        actor_rosters_by_segment: dict[str, "ActorRoster"] | None = None,
         progress_callback: Callable[..., None] | None = None,
     ) -> list[CompactionResult]:
         """Summarize each segment independently.
@@ -354,9 +396,14 @@ class DomainCompactor:
         *fact_signals_by_segment* maps segment.id → list of FactSignal
         collected from per-turn tagging.  Passed as hints to the compactor
         prompt for verification and consolidation.
+
+        *actor_rosters_by_segment* maps segment.id → ActorRoster built from the
+        segment's own physical canonical rows. It is what makes a fact's author
+        derivable without ever letting the model choose an actor id.
         """
         signals = fact_signals_by_segment or {}
         code_refs = code_refs_by_segment or {}
+        rosters = actor_rosters_by_segment or {}
         import sys as _sys
         import time as _time
         from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -422,6 +469,7 @@ class DomainCompactor:
                     signals.get(segment.id, []),
                     code_refs.get(segment.id, []),
                     prev_context=prev_contexts[idx - 1],
+                    roster=rosters.get(segment.id),
                 )
                 results.append(result)
                 _emit_progress(idx, result, in_flight=max(len(segments) - idx, 0))
@@ -441,6 +489,7 @@ class DomainCompactor:
                     signals.get(segment.id, []),
                     code_refs.get(segment.id, []),
                     prev_context=prev_contexts[i],
+                    roster=rosters.get(segment.id),
                 ): i
                 for i, segment in enumerate(segments)
             }
@@ -498,6 +547,7 @@ class DomainCompactor:
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         prev_context: str = "",
+        roster: "ActorRoster | None" = None,
     ) -> CompactionResult:
         conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
@@ -729,7 +779,13 @@ class DomainCompactor:
                     fact_type=f.get("fact_type", "personal"),
                     tags=refined_tags,
                     session_date=sess_date,
+                    # Carried only so the authorship pass below can read it.
+                    # Never persisted as an actor id: the model supplies a
+                    # display label it can see, never an id.
+                    author_source_role=_str(f.get("speaker", "")),
                 ))
+
+        facts = self._attribute_facts(facts, roster, segment=segment)
 
         return CompactionResult(
             segment_id=segment.id,
@@ -745,6 +801,182 @@ class DomainCompactor:
             timestamp=segment.start_timestamp,
             facts=facts,
         )
+
+    def _attribute_facts(
+        self,
+        facts: list[Fact],
+        roster: "ActorRoster | None",
+        *,
+        segment: TaggedSegment,
+    ) -> list[Fact]:
+        """Attach a durable author to each fact, or leave it honestly empty.
+
+        Two regimes, and the model never picks an actor id in either:
+
+        * **Ordinary segment.** The model may name the speaker with a display
+          label it can see in the transcript. That label is accepted only for a
+          COMPLETE ONE-HUMAN roster, and only by exact casefolded match against
+          a label that roster actually observed. Anything else — ``Assistant``,
+          a missing speaker, an unidentified user row, or a multi-human segment
+          — resolves empty. Roster cardinality alone does not prove who uttered
+          a fact, so a one-human segment is never blanket-attributed either: the
+          fact prompt explicitly classifies assistant-provided information as
+          ``experience``.
+
+        * **Reply-bearing segment.** The whole-segment fact output is discarded
+          and facts are re-extracted per lane, because a claim quoted FROM
+          someone must never become a claim made BY the person quoting them.
+          Attribution then comes from the lane's canonical row or reply edge.
+        """
+        from ..types import (
+            AUTHOR_ROLE_ASSISTANT,
+            AUTHOR_ROLE_REQUESTER,
+            AUTHOR_ROLE_SUBJECT,
+            AUTHOR_ROLE_UNATTRIBUTED,
+            AUTHOR_VERSION_REPLY_LANE,
+            AUTHOR_VERSION_SOLE_ACTOR,
+        )
+
+        if roster is None:
+            # No provenance at all (legacy/synthesized segment). Strip the
+            # speaker label we parked on the role field and leave author empty.
+            for fact in facts:
+                fact.author_source_role = ""
+            return facts
+
+        if roster.reply_bearing:
+            return self._extract_lane_facts(roster, segment=segment)
+
+        for fact in facts:
+            label = fact.author_source_role  # the model's "speaker" label
+            actor = roster.resolve_label(label)
+            fact.author_actor_id = actor
+            fact.author_attribution_version = AUTHOR_VERSION_SOLE_ACTOR
+            # Role records the structurally known lane. Without lanes we only
+            # know it came from a human turn when the label resolved.
+            fact.author_source_role = (
+                AUTHOR_ROLE_REQUESTER if actor else AUTHOR_ROLE_UNATTRIBUTED
+            )
+            fact.author_source_message_id = ""
+        return facts
+
+    def _extract_lane_facts(
+        self,
+        roster: "ActorRoster",
+        *,
+        segment: TaggedSegment,
+    ) -> list[Fact]:
+        """Re-extract facts independently per lane and stamp them from the lane.
+
+        Every non-empty physical message side appears in exactly one base lane,
+        so discarding the whole-segment output cannot silently lose facts from
+        earlier non-reply rows. Each lane is extracted on its own text: a
+        requester lane never contains its own quote block, and a subject lane
+        never contains the replying question or the assistant's analysis.
+        """
+        from ..types import (
+            AUTHOR_ROLE_ASSISTANT,
+            AUTHOR_ROLE_SUBJECT,
+            AUTHOR_VERSION_REPLY_LANE,
+        )
+
+        out: list[Fact] = []
+        for lane in roster.lanes:
+            if not (lane.text or "").strip():
+                continue
+            try:
+                lane_facts = self._extract_facts_for_text(
+                    lane.text, segment=segment, role=lane.role,
+                )
+            except Exception:
+                logger.warning(
+                    "lane fact extraction failed ref=%s role=%s",
+                    segment.id[:8], lane.role, exc_info=True,
+                )
+                continue
+
+            for fact in lane_facts:
+                fact.author_attribution_version = AUTHOR_VERSION_REPLY_LANE
+                fact.author_source_role = lane.role
+                fact.author_source_message_id = lane.source_message_id or ""
+                if lane.role == AUTHOR_ROLE_ASSISTANT:
+                    # An assistant lane has no human author, ever.
+                    fact.author_actor_id = ""
+                    fact.author_source_message_id = ""
+                else:
+                    # Requester lanes use their own row's actor; subject lanes
+                    # use ONLY the resolved reply subject. An empty actor stays
+                    # empty — it never falls back to the other human in the
+                    # exchange, which is precisely the contamination this
+                    # partition exists to prevent.
+                    fact.author_actor_id = lane.actor_id or ""
+                out.extend([fact])
+        return out
+
+    def _extract_facts_for_text(
+        self,
+        text: str,
+        *,
+        segment: TaggedSegment,
+        role: str,
+    ) -> list[Fact]:
+        """Run a fact-only extraction over one lane's text."""
+        from ..types import TemporalStatus
+
+        system = _FACT_ONLY_INSTRUCTIONS.format(
+            session_date=segment.session_date or "unknown",
+        )
+        # The lane text is the ONLY thing the model sees. That structural
+        # isolation, not prompt wording, is what prevents a quoted claim from
+        # being attributed to the person who quoted it.
+        user = (
+            f"{_LANE_ROLE_HINTS.get(role, '')}\n\n"
+            f"{text}\n\n"
+            'Respond with JSON only: {"facts": [...]}'
+        ).strip()
+        t0 = time.time()
+        response_text, usage = self.llm.complete(
+            system=system,
+            user=user,
+            max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
+        )
+        self._log_usage(
+            "lane_fact_extract", duration_ms=(time.time() - t0) * 1000, usage=usage,
+        )
+        parsed = self._parse_response(response_text)
+        raw_facts = parsed.get("facts", [])
+        if not isinstance(raw_facts, list):
+            return []
+
+        valid_statuses = {e.value for e in TemporalStatus}
+
+        def _str(val) -> str:
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val)
+            return str(val) if val else ""
+
+        facts: list[Fact] = []
+        for f in raw_facts:
+            if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
+                continue
+            status = f.get("status", "active")
+            if status not in valid_statuses:
+                status = "active"
+            facts.append(Fact(
+                subject=_str(f.get("subject", "")),
+                verb=_str(f.get("verb", f.get("role", ""))),
+                object=_str(f.get("object", "")),
+                status=status,
+                what=_str(f.get("what", "")),
+                who=_str(f.get("who", "")),
+                when_date=_str(f.get("when", "")) or (segment.session_date or ""),
+                where=_str(f.get("where", "")),
+                why=_str(f.get("why", "")),
+                fact_type=f.get("fact_type", "personal"),
+                tags=list(segment.tags),
+                session_date=segment.session_date or "",
+            ))
+        return facts
 
     @staticmethod
     def _normalize_tag_list(tags: list) -> list[str]:
